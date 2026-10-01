@@ -83,9 +83,7 @@ class TestFusedRsSequenceParallel(CustomTestCase):
                 torch.ones(2, 4),
             ),
         )
-        layer = SimpleNamespace(
-            _tpu_fused_rs_tp_rank_to_device_id=torch.arange(2, dtype=torch.int32)
-        )
+        layer = SimpleNamespace(moe_ep_size=2)
         plan = FusedMoeSequenceParallelPlan(True, True, True)
 
         with (

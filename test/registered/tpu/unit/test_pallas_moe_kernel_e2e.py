@@ -178,7 +178,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         )
 
         out = self._run(hidden, w1, w2, w_tk, ids, "silu").cpu().float()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         ref = _ref_moe_torch(
             hidden.cpu(), w1.cpu(), w2.cpu(), w_tk.cpu(), ids.cpu(), "silu"
@@ -208,7 +208,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         )
 
         out = self._run(hidden, w1, w2, w_tk, ids, "silu").cpu().float()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         ref = _ref_moe_torch(
             hidden.cpu(), w1.cpu(), w2.cpu(), w_tk.cpu(), ids.cpu(), "silu"
@@ -229,7 +229,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         )
 
         out = self._run(hidden, w1, w2, w_tk, ids, "gelu").cpu().float()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         ref = _ref_moe_torch(
             hidden.cpu(), w1.cpu(), w2.cpu(), w_tk.cpu(), ids.cpu(), "gelu"
@@ -316,7 +316,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
             .cpu()
             .float()
         )
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         ref = _ref_moe_torch(
             hidden.cpu(),
@@ -392,11 +392,11 @@ class TestPallasFusedMoETorchCompile(unittest.TestCase):
             topk=topk,
             activation="silu",
         )
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         compiled = self._compiled_callable("silu")
         out_compiled = compiled(hidden, w1, w2, w_tk, ids)
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         e = out_eager.cpu().float()
         c = out_compiled.cpu().float()

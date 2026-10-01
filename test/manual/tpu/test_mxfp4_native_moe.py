@@ -333,7 +333,7 @@ class TestNativeMxfp4FusedMoE(unittest.TestCase):
 
         native_out = self._run_native(layer, hs, topk_ids, topk_w)
         ref_out = self._run_bf16_reference(layer, hs, topk_ids, topk_w)
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         self.assertEqual(native_out.shape, ref_out.shape)
         self.assertTrue(torch.isfinite(native_out).all().item(), "native NaN/Inf")

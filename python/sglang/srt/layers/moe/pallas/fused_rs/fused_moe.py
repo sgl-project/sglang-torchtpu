@@ -129,7 +129,6 @@ def moe_gmm_local_rs_nodedup(
     topk_weights: jax.Array,
     topk_indices: jax.Array,
     post_expert_norm_weight_input: jax.Array | None,
-    tp_rank_to_device_id: jax.Array | None,
     *,
     activation: str,
     topk: int,
@@ -156,7 +155,7 @@ def moe_gmm_local_rs_nodedup(
     )
 
     # Compiler workaround for the non-SP fused remote-DMA graph: materialize
-    # IDs and weights from physical device 0 in one BF16 psum and feed both
+    # IDs and weights from logical rank 0 in one BF16 psum and feed both
     # slices forward. Altering this dataflow can halt the compiled graph. This
     # should not be interpreted as evidence that routing IDs differ across
     # ranks; the ablations establish a lowering dependency, not its root cause.
@@ -265,7 +264,6 @@ def moe_gmm_local_rs_nodedup(
         caller_tile_m=tile_m,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
-        tp_rank_to_device_id=tp_rank_to_device_id,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -338,7 +336,6 @@ def expert_parallel_gmm_rs(
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
-    tp_rank_to_device_id: jax.Array | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -375,9 +372,6 @@ def expert_parallel_gmm_rs(
         group_offset_input
         if group_offset_input is not None
         else jnp.arange(0, num_experts, num_experts_per_shard)
-    )
-    assert tp_rank_to_device_id is not None, (
-        "tp_rank_to_device_id must be explicitly provided and cannot be None"
     )
 
     # Weight tensors and group_offset are already partitioned per-rank on the PyTorch side.
@@ -423,7 +417,6 @@ def expert_parallel_gmm_rs(
             topk_w_spec,  # topk_weights (SP-sharded local chunk; replicated when SP off)
             topk_i_spec,  # topk_indices (replicated when SP off)
             P(),  # post_expert_norm_weight (replicated)
-            P(),  # tp_rank_to_device_id (replicated)
         ),
         out_specs=moe_out_spec,
         # SP on: token sharded over data plus the runtime expert axes;
@@ -443,7 +436,6 @@ def expert_parallel_gmm_rs(
         topk_weights,
         topk_indices,
         _pnw_rs,
-        tp_rank_to_device_id,
     )
 
     return result
@@ -487,7 +479,6 @@ def fused_moe_func_rs(
     topk_indices: jax.Array | None = None,
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
-    tp_rank_to_device_id: jax.Array | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -546,7 +537,6 @@ def fused_moe_func_rs(
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_direct_write=fp8_direct_write,
-        tp_rank_to_device_id=tp_rank_to_device_id,
     )
 
     return result[:num_tokens, :hidden_size]

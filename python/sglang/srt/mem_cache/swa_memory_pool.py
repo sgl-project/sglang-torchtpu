@@ -42,6 +42,7 @@ class SWAKVPool(BaseSWAKVPool):
         swa_kv_pool_class: Optional[type] = None,
         full_kv_pool_kwargs: Optional[dict] = None,
         swa_kv_pool_kwargs: Optional[dict] = None,
+        start_layer: int = 0,
         **kwargs,
     ):
         self.size = size
@@ -53,7 +54,10 @@ class SWAKVPool(BaseSWAKVPool):
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
-        self.start_layer = 0
+        # The sub-pools index their own layers from 0; this is the global id
+        # callers walk [start_layer, +layer_num) from, so it is the pipeline
+        # stage's first layer and 0 without pipeline parallelism.
+        self.start_layer = start_layer
         self.page_size = page_size
         self.layer_transfer_counter = None
 

@@ -26,6 +26,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
+import importlib.util
 import unittest
 
 import torch
@@ -92,6 +93,46 @@ class TestGDNDistribution(CustomTestCase):
         self.assertIsNot(a, c)
         d = self.backend._get_distribution(False, 4, self.device)
         self.assertIsNot(a, d)
+
+
+@unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
+class TestGDNRequestTilePadding(CustomTestCase):
+    def test_partial_verify_tiles_have_inert_metadata_rows(self):
+        from types import SimpleNamespace
+
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.gdn.metadata import (
+            compute_batched_seq_metadata,
+        )
+
+        for requests in (1, 3, 5):
+            with self.subTest(requests=requests):
+                md = compute_batched_seq_metadata(
+                    cfg=SimpleNamespace(seq_tile_size=4, tile_size=4),
+                    seq_lens=jnp.full((requests,), 19, dtype=jnp.int32),
+                    query_start_loc=jnp.arange(requests + 1, dtype=jnp.int32) * 3,
+                    state_indices=1 + jnp.arange(requests, dtype=jnp.int32) * 3,
+                    read_offsets=jnp.zeros(requests, dtype=jnp.int32),
+                    end_seq=jnp.asarray(requests, dtype=jnp.int32),
+                )
+                padded = ((requests + 3) // 4) * 4
+                self.assertEqual(
+                    md.p_id_to_r_size.data.tolist(),
+                    [3] * requests + [0] * (padded - requests),
+                )
+                self.assertEqual(
+                    md.p_id_is_first_tile.data.tolist(),
+                    [True] * requests + [False] * (padded - requests),
+                )
+                self.assertEqual(
+                    md.p_id_is_last_tile.data.tolist(),
+                    [True] * requests + [False] * (padded - requests),
+                )
+                self.assertEqual(
+                    md.p_id_to_s_idx.data.tolist(),
+                    list(range(requests)) + [0] * (padded - requests),
+                )
 
 
 if __name__ == "__main__":

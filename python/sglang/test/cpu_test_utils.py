@@ -12,6 +12,30 @@ precision = {
 }
 
 
+def get_cpu_export_mesh(axis_names, mesh_shape, device_ids=None):
+    """Build a native TorchTPU mesh for CPU export with mocked runtime metadata."""
+    from unittest.mock import patch
+
+    from torch_tpu._internal.pallas import pallas
+
+    world_size = math.prod(mesh_shape)
+    if device_ids is None:
+        device_ids = list(range(world_size))
+    with (
+        patch.object(pallas.dist, "is_initialized", return_value=True),
+        patch.object(pallas.dist, "get_world_size", return_value=world_size),
+        patch.object(
+            pallas._device_ops_backend,
+            "_get_local_device_attributes",
+            return_value={"device_kind": "TPU7x"},
+        ),
+        patch.object(
+            pallas.device_mesh, "get_device_assignment", return_value=device_ids
+        ),
+    ):
+        return pallas.get_pallas_mesh(axis_names, mesh_shape)
+
+
 BLOCK_N, BLOCK_K = 64, 128
 factor_for_scale = 1e-3
 fp8_max, fp8_min = 400, -400

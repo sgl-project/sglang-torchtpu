@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import time
 from collections.abc import Callable, Hashable, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
@@ -23,6 +24,7 @@ from torch_tpu._internal.compile import tpu_torch_compile
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.pp_proxy_pytree import (
     register_pp_proxy_pytree,
 )
@@ -149,6 +151,9 @@ def direct_compile(
     values are graph inputs.
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
 
+    ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
+    Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
+
     This API is specialized for SGLang inference. A more general API adds
     complexity and can be added when needed.
 
@@ -260,6 +265,20 @@ class CompiledFunction:
         self._prune_unused_inputs = prune_unused_inputs
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        artifact = self._get_artifact(args, kwargs)
+        return artifact((args, kwargs))
+
+    def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
+        artifact = self._get_artifact(args, kwargs, async_compile=True)
+        return PendingCall(lambda: artifact((args, kwargs)))
+
+    def _get_artifact(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        async_compile: bool = False,
+    ) -> _CompiledArtifact:
         key = self.specialization_key(*args, **kwargs)
         artifact = self.cache.get(key)
         if artifact is None:
@@ -270,12 +289,19 @@ class CompiledFunction:
                     "'fail_on_recompile'. direct_compile specialization key: "
                     f"{key!r}"
                 )
-            artifact = self._compile(args, kwargs)
+            logger.info(
+                "[direct_compile] new specialization %r (async=%s)", key, async_compile
+            )
+            artifact = self._compile(args, kwargs, async_compile=async_compile)
             self.cache[key] = artifact
-        return artifact((args, kwargs))
+        return artifact
 
     def _compile(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        async_compile: bool = False,
     ) -> _CompiledArtifact:
         """Compile one specialization into a PJRT executable."""
 
@@ -469,20 +495,38 @@ class CompiledFunction:
             len(kv_pool_inputs),
             len(inserted_callbacks),
         )
-        with dynamo_timed("direct_compile_traverse_and_compile"):
-            # Placeholders do not retain the physical layout of their buffers.
-            argument_layouts = []
-            for tensor in flat_inputs:
-                layout = None
-                if tensor.device.type == "tpu":
-                    layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
-                argument_layouts.append(layout[0] if layout is not None else [])
-            compile_result = tpu_torch_compile.traverse_and_compile(
-                result_tensors, graph_inputs, argument_layouts=argument_layouts
+        # Placeholders do not retain the physical layout of their buffers.
+        argument_layouts = []
+        for tensor in flat_inputs:
+            layout = None
+            if tensor.device.type == "tpu":
+                layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
+            argument_layouts.append(layout[0] if layout is not None else [])
+        pending_compile = None
+        executable = None
+        start = time.perf_counter()
+        if async_compile:
+            with dynamo_timed("direct_compile_async_submit"):
+                pending_compile = tpu_torch_compile.async_traverse_and_compile(
+                    result_tensors, graph_inputs, argument_layouts=argument_layouts
+                )
+            logger.info(
+                "[direct_compile] native async submission %.3fs (ready=%s)",
+                time.perf_counter() - start,
+                pending_compile.is_ready(),
             )
-        logger.info("[direct_compile] compilation finished")
+        else:
+            with dynamo_timed("direct_compile_traverse_and_compile"):
+                compile_result = tpu_torch_compile.traverse_and_compile(
+                    result_tensors, graph_inputs, argument_layouts=argument_layouts
+                )
+            executable = compile_result.executable
+            logger.info(
+                "[direct_compile] synchronous compilation %.3fs",
+                time.perf_counter() - start,
+            )
         return _CompiledArtifact(
-            executable=compile_result.executable,
+            executable=executable,
             model_inputs=tuple(model_inputs),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
@@ -492,10 +536,11 @@ class CompiledFunction:
             output_treespec=output_treespec,
             output_count=len(output_leaves),
             callbacks=tuple(entry.callback for entry in inserted_callbacks),
+            pending_compile=pending_compile,
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CompiledArtifact:
     """Wrap a TorchTPU PJRT executable with input/output/mutation handling."""
 
@@ -507,8 +552,17 @@ class _CompiledArtifact:
     output_treespec: Any
     output_count: int
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
+    pending_compile: Any | None = None
 
     def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+        if self.pending_compile is not None:
+            start = time.perf_counter()
+            self.executable = self.pending_compile.get()
+            self.pending_compile = None
+            logger.info(
+                "[direct_compile] native async resolution %.3fs",
+                time.perf_counter() - start,
+            )
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.

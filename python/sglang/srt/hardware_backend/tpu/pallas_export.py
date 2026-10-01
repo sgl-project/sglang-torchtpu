@@ -1,4 +1,3 @@
-import os
 import threading
 from contextlib import contextmanager
 
@@ -7,81 +6,6 @@ _PALLAS_DEVICE_KIND_BY_TORCHTPU = {
     "TPU v6e": "TPU v6 lite",
     "TPU v7": "TPU7x",
 }
-
-
-class _ExportMockClient:
-    """Mock PJRT client for abstract AOT compilation devices."""
-
-    platform: str = "tpu"
-    platform_version: str = "TPU v7"
-    runtime_type: str = "tpu"
-
-    def process_index(self) -> int:
-        return 0
-
-    def device_count(self) -> int:
-        return int(os.environ.get("WORLD_SIZE", "1"))
-
-    def devices(self) -> list:
-        return []
-
-    def local_devices(self) -> list:
-        return []
-
-
-_MOCK_CLIENT = _ExportMockClient()
-
-
-class ExportAbstractDevice:
-    """Compile-only abstract device compatible with JAX mesh/sharding property inspection."""
-
-    def __init__(
-        self,
-        device_kind: str,
-        num_cores: int = 1,
-        platform: str = "tpu",
-        id: int = 0,
-        process_index: int = 0,
-    ):
-        self.device_kind = device_kind
-        self.num_cores = num_cores
-        self.platform = platform
-        self.id = id
-        self.process_index = process_index
-        self.client = _MOCK_CLIENT
-
-    def __repr__(self) -> str:
-        return f"AbstractDevice(id={self.id}, device_kind='{self.device_kind}', platform='{self.platform}')"
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, ExportAbstractDevice):
-            return False
-        return (
-            self.id == other.id
-            and self.device_kind == other.device_kind
-            and self.platform == other.platform
-        )
-
-    def __hash__(self) -> int:
-        return hash((self.id, self.device_kind, self.platform))
-
-
-def get_torchtpu_export_devices(world_size: int | None = None):
-    """Return the ordered abstract TPU devices for global partitions without calling jax.devices()."""
-    if world_size is None:
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    device_kind = get_pallas_tpu_device_kind()
-    abstract_devices = [
-        ExportAbstractDevice(
-            device_kind=device_kind,
-            num_cores=1,
-            platform="tpu",
-            id=i,
-            process_index=0,
-        )
-        for i in range(world_size)
-    ]
-    return tuple(abstract_devices)
 
 
 def get_torch_tpu_device_kind() -> str:

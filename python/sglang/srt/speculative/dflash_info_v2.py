@@ -61,6 +61,15 @@ class DFlashDraftInputV2(SpecInput):
 
     verify_token_budget: Optional[int] = None
 
+    # TPU device-resident verify addressing. The flag states that
+    # batch.seq_lens_cpu holds the committed base rather than the published
+    # length, so host consumers must treat it as a lower bound and widen their
+    # planning bounds by one extra block. It outlives the candidate window:
+    # filter/merge may drop the window, but the host mirror stays committed.
+    tpu_host_seq_lens_is_committed: bool = False
+    tpu_verify_cache_candidates: Optional[torch.Tensor] = None
+    tpu_committed_lens: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
         # Spec v2 draft state itself does not change token accounting.
@@ -235,11 +244,44 @@ class DFlashDraftInputV2(SpecInput):
 
         for req in batch.reqs:
             req.decode_batch_idx += 1
-        # Seed committed; overlap's resolve overwrites it with the published value.
+        # Seed committed. Overlap's resolve overwrites it with the published
+        # value unless device-resident addressing keeps this committed base.
         batch.seq_lens_cpu = batch_seq_lens_cpu_t
         batch.seq_lens_sum = committed_seq_lens_sum
         self.nxt_kv_lens_cpu = nxt_kv_lens_cpu_t
         self.nxt_kv_lens_sum = nxt_kv_lens_sum
+        self._maybe_prepare_device_accept_tpu(
+            batch, bs=bs, block_size=block_size, committed_lens_cpu=batch_seq_lens_cpu_t
+        )
+
+    def _maybe_prepare_device_accept_tpu(
+        self,
+        batch: ScheduleBatch,
+        *,
+        bs: int,
+        block_size: int,
+        committed_lens_cpu: torch.Tensor,
+    ) -> None:
+        """Record this step's device-resident verify addressing, if eligible."""
+        plan = None
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+                plan_dflash_device_accept,
+            )
+
+            plan = plan_dflash_device_accept(
+                batch,
+                bs=bs,
+                block_size=block_size,
+                committed_lens_cpu=committed_lens_cpu,
+                compact_draft_cache=get_spec().speculative_draft_window_size
+                is not None,
+            )
+        self.tpu_verify_cache_candidates = (
+            plan.verify_cache_candidates if plan is not None else None
+        )
+        self.tpu_committed_lens = plan.committed_lens if plan is not None else None
+        self.tpu_host_seq_lens_is_committed = plan is not None
 
     def filter_batch(
         self,
@@ -252,6 +294,12 @@ class DFlashDraftInputV2(SpecInput):
             else:
                 self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices.cpu()]
             self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
+
+        if self.tpu_verify_cache_candidates is not None:
+            self.tpu_verify_cache_candidates = self.tpu_verify_cache_candidates[
+                new_indices
+            ]
+            self.tpu_committed_lens = self.tpu_committed_lens[new_indices]
 
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
@@ -273,6 +321,29 @@ class DFlashDraftInputV2(SpecInput):
         elif spec_info.nxt_kv_lens_cpu is not None:
             self.nxt_kv_lens_cpu = spec_info.nxt_kv_lens_cpu
             self.nxt_kv_lens_sum = spec_info.nxt_kv_lens_sum
+
+        if (
+            self.tpu_verify_cache_candidates is not None
+            and spec_info.tpu_verify_cache_candidates is not None
+        ):
+            self.tpu_verify_cache_candidates = torch.cat(
+                [
+                    self.tpu_verify_cache_candidates,
+                    spec_info.tpu_verify_cache_candidates,
+                ]
+            )
+            self.tpu_committed_lens = torch.cat(
+                [self.tpu_committed_lens, spec_info.tpu_committed_lens]
+            )
+        else:
+            # Mismatched generations: drop to the synchronizing addressing path.
+            # The committed-base flag stays so host bounds remain widened.
+            self.tpu_verify_cache_candidates = None
+            self.tpu_committed_lens = None
+        self.tpu_host_seq_lens_is_committed = (
+            self.tpu_host_seq_lens_is_committed
+            and spec_info.tpu_host_seq_lens_is_committed
+        )
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None

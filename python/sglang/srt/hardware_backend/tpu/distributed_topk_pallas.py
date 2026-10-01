@@ -20,14 +20,9 @@ _OPS_LOCK = Lock()
 
 @functools.cache
 def _get_mesh(world_size: int):
-    import numpy as np
-    from jax.sharding import Mesh
+    from torch_tpu._internal.pallas import get_pallas_mesh
 
-    from sglang.srt.hardware_backend.tpu.pallas_export import (
-        get_torchtpu_export_devices,
-    )
-
-    return Mesh(np.asarray(get_torchtpu_export_devices(world_size)), ("model",))
+    return get_pallas_mesh(("model",), (world_size,))
 
 
 def _build_op(world_size: int) -> Callable:
@@ -40,7 +35,6 @@ def _build_op(world_size: int) -> Callable:
 
     def _local(
         local_logits: jax.Array,
-        rank_input: jax.Array,
         org_vocab_size: int,
         global_vocab_size: int,
         org_vocab_padded_count: int,
@@ -48,7 +42,6 @@ def _build_op(world_size: int) -> Callable:
     ) -> tuple[jax.Array, jax.Array]:
         return distributed_top_k_kernel(
             local_logits,
-            rank_input,
             world_size=world_size,
             org_vocab_size=org_vocab_size,
             global_vocab_size=global_vocab_size,
@@ -59,14 +52,13 @@ def _build_op(world_size: int) -> Callable:
     sharded = jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(P(None, "model"), P("model"), None, None, None, None),
+        in_specs=(P(None, "model"), None, None, None, None),
         out_specs=(P(), P()),
         check_vma=False,
     )
 
     def _wrapped(
         local_logits: jax.Array,
-        rank_input: jax.Array,
         org_vocab_size: int,
         global_vocab_size: int,
         org_vocab_padded_count: int,
@@ -74,7 +66,6 @@ def _build_op(world_size: int) -> Callable:
     ) -> tuple[jax.Array, jax.Array]:
         return sharded(
             local_logits,
-            rank_input,
             org_vocab_size,
             global_vocab_size,
             org_vocab_padded_count,
@@ -87,7 +78,6 @@ def _build_op(world_size: int) -> Callable:
         mesh=mesh,
         input_partition_specs=(
             P(None, "model"),
-            P("model"),
             None,
             None,
             None,
@@ -123,28 +113,16 @@ def register_pallas_distributed_top_k_op(world_size: int) -> None:
 def pallas_distributed_top_k(
     local_logits: torch.Tensor,
     *,
-    rank_input: torch.Tensor,
     org_vocab_size: int,
     global_vocab_size: int,
     org_vocab_padded_count: int,
     k: int,
     world_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return replicated exact global TopK values and unpadded token IDs.
-
-    ``rank_input`` carries this rank's vocabulary index into the kernel, which
-    cannot read it from ``lax.axis_index`` because the mesh order need not match
-    torch.distributed rank order. It must be a tensor direct_compile already
-    lifted into the graph (the lm_head buffer registered by
-    ``register_distributed_top_k_rank``) -- building it here with ``new_tensor``
-    materializes a device buffer inside the traced region that is reachable from
-    the outputs but is not a graph input, and TraverseAndCompile aborts the
-    process with "identified an argument that was not provided: ... int32[1]".
-    """
+    """Return exact global TopK using the native mesh for vocabulary ownership."""
 
     values, token_ids = get_pallas_distributed_top_k_op(world_size)(
         local_logits,
-        rank_input,
         org_vocab_size,
         global_vocab_size,
         org_vocab_padded_count,

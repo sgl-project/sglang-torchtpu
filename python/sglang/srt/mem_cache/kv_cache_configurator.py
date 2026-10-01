@@ -1584,6 +1584,7 @@ class KVCacheConfigurator:
                 "v_head_dim": self.model_config.v_head_dim,
             }
         token_to_kv_pool = SWAKVPool(
+            start_layer=self.layer_info.start_layer,
             size=full_max_total_num_tokens,
             size_swa=swa_max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1710,8 +1711,10 @@ class KVCacheConfigurator:
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
         PoolCls = self._tpu_mha_pool_class()
-        swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
-        full_attention_layer_ids = self.model_config.full_attention_layer_ids
+        # This stage's own layers, not the model's: under PP the global lists
+        # would size every stage's pool to the whole model.
+        swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
+        full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         size_swa = swa_max_total_num_tokens
         if self.kv_cache_dtype_str == "mxint8" and self.is_hybrid_swa_mtp_draft:
             # Local MTP depths use the allocator's full-capacity identity map.
@@ -1767,6 +1770,7 @@ class KVCacheConfigurator:
                 },
             }
         return SWAKVPool(
+            start_layer=self.layer_info.start_layer,
             size=full_max_total_num_tokens,
             size_swa=size_swa,
             page_size=self.pool_page_size,
@@ -1878,6 +1882,7 @@ class KVCacheConfigurator:
             )
 
         return SWAKVPool(
+            start_layer=self.layer_info.start_layer,
             size=full_max_total_num_tokens,
             size_swa=swa_max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -1967,6 +1972,7 @@ class KVCacheConfigurator:
             else swa_max_total_num_tokens
         )
         token_to_kv_pool = SWAKVPool(
+            start_layer=self.layer_info.start_layer,
             size=full_max_total_num_tokens,
             size_swa=size_swa,
             page_size=self.pool_page_size,

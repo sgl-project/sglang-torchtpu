@@ -988,7 +988,6 @@ class LogitsProcessor(nn.Module):
             TpuVocabShard.from_lm_head(lm_head),
             top_k,
             group=get_attn_tp_group() if self.use_attn_tp_group else get_tp_group(),
-            lm_head=lm_head,
         )
         if self.final_logit_softcapping:
             global_top_k_logits = self.final_logit_softcapping * torch.tanh(

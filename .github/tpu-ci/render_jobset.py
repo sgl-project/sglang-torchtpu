@@ -43,8 +43,9 @@ _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
 
 # P/D mode: two engines to bring up (weight load + compile warmup on both
-# slices) before the probe + accuracy eval even start.
-_PD_ACTIVE_DEADLINE = 10800
+# slices) before the probe + accuracy eval even start. Longest seen: 100 min;
+# kept under 3h so _tpu-test.yml's 6h job cap leaves a 3h admission window.
+_PD_ACTIVE_DEADLINE = 8700
 
 # Indentation matches jobset-tpu.yaml: volume items under `volumes:` at 16 spaces,
 # volumeMount items under `volumeMounts:` at 20 spaces.

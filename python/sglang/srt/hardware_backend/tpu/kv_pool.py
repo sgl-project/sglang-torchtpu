@@ -266,7 +266,12 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                 maybe_build_backup,
             )
 
-            self._raiden_backup_obj = maybe_build_backup(self)
+            # A staged backup restores whole pages verbatim, while
+            # SWAKVPool.load_cpu_copy row-filters its SWA member's payload
+            # whenever the resume allocation maps fewer window tokens than the
+            # save did. That member takes the row path instead.
+            swa_member = self.allocation_label == "SWA"
+            self._raiden_backup_obj = None if swa_member else maybe_build_backup(self)
         return self._raiden_backup_obj
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):

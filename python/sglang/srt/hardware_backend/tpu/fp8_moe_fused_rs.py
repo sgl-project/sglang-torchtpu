@@ -235,7 +235,7 @@ def _apply_fp8_fused_rs(
         # sequence-parallel local-shard paths. A direct FP8 write would add row
         # quantization and scale DMAs before a BF16 consumer.
         fp8_direct_write=False,
-        tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
+        world_size=layer.moe_ep_size,
         keep_token_shard=keep_output_shard,
     )
     return StandardCombineInput(

@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _materialize_out,
     _unpad_decoder_outputs,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecoderTpuCompilePolicy,
     _kv_appender_specialization_key,
@@ -50,6 +51,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     LogitsOutputMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.runtime_context import get_context, get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -285,6 +288,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         model_runner = SimpleNamespace(
             model=model,
             token_to_kv_pool=kv_pool,
+            device="cpu",
             is_draft_worker=False,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
@@ -300,7 +304,19 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
         with patch.dict(sys.modules, {compile_module_name: compile_module}):
-            policy._direct_compile(model.forward)
+            call, warmup_async = policy._direct_compile(model.forward)
+
+        trace_forward = compile_module.direct_compile.call_args.args[0]
+        compiled = compile_module.direct_compile.return_value
+        compiled.side_effect = trace_forward
+        compiled.warmup_async.side_effect = trace_forward
+        backend = SimpleNamespace(forward_metadata=object())
+        inputs = (torch.ones(2), None, None)
+        with forward_context(ForwardContext(attn_backend=backend)):
+            for invoke in (call, warmup_async):
+                with self.subTest(invoke=invoke.__name__):
+                    self.assertIs(invoke(*inputs), model.forward.return_value)
+        self.assertEqual(model.forward.call_count, 2)
 
         compile_module.direct_compile.assert_called_once()
         kwargs = compile_module.direct_compile.call_args.kwargs
@@ -1181,6 +1197,37 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
 
 
 class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
+    def test_plain_idle_decode_matches_warmup_cache_location_dtype(self):
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(allocator_dtype=dtype):
+                policy = _make_policy()
+                policy.model_runner.token_to_kv_pool_allocator.free_pages = (
+                    torch.arange(4, dtype=dtype)
+                )
+                seen = []
+                policy.model_runner.forward = lambda batch: seen.append(
+                    (batch.forward_mode, batch.out_cache_loc.dtype)
+                )
+                policy._install_dp_idle_as_decode()
+                warmup = policy._make_dummy_forward_batch(
+                    num_tokens=4, bs=4, mode=ForwardMode.DECODE
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.IDLE,
+                    global_num_tokens_cpu=[0, 1],
+                    # ScheduleBatch.prepare_for_idle uses int64 regardless of
+                    # the allocator dtype used by active peers and warmup.
+                    out_cache_loc=torch.empty(0, dtype=torch.int64),
+                )
+
+                with _dp_attention(True):
+                    policy.model_runner.forward(batch)
+
+                self.assertEqual(
+                    seen, [(ForwardMode.DECODE, warmup.out_cache_loc.dtype)]
+                )
+                self.assertEqual(batch.out_cache_loc.shape, (0,))
+
     def test_prepare_materializes_zero_row_spec_batch(self):
         policy = _make_spec_policy()
         spec_info = EagleDraftInput(
@@ -1214,6 +1261,48 @@ class TestPrecompileLoops(_PolicyTestCase):
     """``precompile`` fires one forward per TPU precompile variant:
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
     (tokens == bs)."""
+
+    def test_compile_timings_include_waits_without_counting_other_queued_work(self):
+        for async_warmup in (False, True):
+            with self.subTest(async_warmup=async_warmup):
+                policy = _make_policy()
+                policy.model_runner.draft_model_idx = None
+                policy.compile_timing_recorder = CompileTimingRecorder()
+                clock = [100.0]
+
+                def run_one(**kwargs):
+                    clock[0] += 2.0
+
+                    def execute():
+                        clock[0] += 3.0
+
+                    if async_warmup:
+                        return PendingCall(execute)
+                    execute()
+                    return None
+
+                with (
+                    patch.object(policy, "_run_one", side_effect=run_one),
+                    patch(
+                        "sglang.srt.hardware_backend.tpu.compilation."
+                        "decoder_compile_policy.time.perf_counter",
+                        side_effect=lambda: clock[0],
+                    ),
+                    get_parallel().override(tp_rank=1),
+                ):
+                    pending = policy._precompile_decode()
+                    if async_warmup:
+                        self.assertEqual(policy.compile_timing_recorder.snapshot(), [])
+                        self.assertEqual(len(pending), 2)
+                    clock[0] += 1000.0
+                    for call in pending:
+                        call.wait()
+
+                steps = policy.compile_timing_recorder.snapshot()
+                self.assertEqual([step["batch_size"] for step in steps], [1, 4])
+                self.assertEqual(
+                    [step["duration_seconds"] for step in steps], [5.0, 5.0]
+                )
 
     def test_extend_iterates_token_buckets_at_fixed_batch_cap(self):
         mr = _model_runner()
@@ -1471,6 +1560,35 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     serving uses: ``prepare_forward_batch`` → ``init_forward_metadata``
     → compiled ``forward``."""
 
+    def test_pipeline_profile_executes_outer_model_synchronously(self):
+        mr = _model_runner()
+        policy = _make_policy(mr)
+        policy.tracer = "direct"
+        policy.owner = SimpleNamespace(forward=MagicMock())
+        with (
+            patch.object(envs.SGLANG_DIRECT_COMPILE_ASYNC, "get", return_value=True),
+            patch.object(policy, "_supports_async_warmup", return_value=True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.pp_profile.set_profile_inputs",
+                side_effect=lambda policy, batch, args, kwargs, tokens, prefix: (
+                    args,
+                    kwargs,
+                ),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "decoder_compile_policy.time.perf_counter",
+                side_effect=[10.0, 10.25],
+            ),
+        ):
+            elapsed_ms = policy._run_one(
+                num_tokens=64, bs=4, mode=ForwardMode.EXTEND, profile_prefix=0
+            )
+        self.assertEqual(elapsed_ms, 250.0)
+        mr.model.forward.assert_called_once()
+        policy.owner.forward.assert_not_called()
+        policy.owner.forward.warmup_async.assert_not_called()
+
     def test_run_one_calls_prepare_then_metadata_then_forward(self):
         mr = _model_runner()
 
@@ -1563,6 +1681,16 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         self.assertEqual(kwargs, {"wait": True})
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
+
+        for result in (kv0, (kv0, {"aux": kv1})):
+            with self.subTest(result_type=type(result).__name__):
+                with (
+                    patch.dict(sys.modules, stubs),
+                    patch("torch_tpu._internal.sync.sync.synchronize") as sync,
+                ):
+                    _materialize_out(result, SimpleNamespace(), None)
+                expected = [kv0] if isinstance(result, torch.Tensor) else [kv0, kv1]
+                sync.assert_called_once_with(expected, wait=True)
 
 
 def _spec_model_runner(device="cpu", is_draft_worker=False):
@@ -2398,6 +2526,33 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(fb.extend_prefix_lens.tolist(), [0] * 4)
         self.assertEqual(fb.extend_num_tokens, 16)
 
+    def test_block_embed_warmup_reused_under_serving_grad_mode(self):
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        policy, _ = self._make_dflash_policy(bs_buckets=(1, 4, 64), draft_token_num=6)
+        policy.backend = "eager"
+        policy.dynamic = False
+        embedding = torch.nn.Embedding(16, 8)
+
+        def embed_draft_block_ids(*, block_ids):
+            return embedding(block_ids).flatten(0, 1)
+
+        worker = SimpleNamespace(
+            embed_draft_block_ids=embed_draft_block_ids,
+            ensure_embed_module=lambda: embedding,
+        )
+        with torch.enable_grad(), get_parallel().override(tp_rank=1):
+            policy._precompile_embed_draft_block_ids(worker)
+            self.assertTrue(torch.is_grad_enabled())
+
+        # Startup runs with gradients enabled; the scheduler disables them.
+        # Every warmed bucket must remain usable once recompiles are forbidden.
+        with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
+            for bs in (1, 4, 64):
+                block_ids = torch.arange(bs * 6).reshape(bs, 6) % 16
+                actual = worker.embed_draft_block_ids(block_ids=block_ids)
+                torch.testing.assert_close(actual, embedding(block_ids).flatten(0, 1))
+
     def test_precompile_draft_pd_prefill_mode_skips_verify(self):
         policy, mr = self._make_dflash_policy(
             token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4
@@ -2630,10 +2785,11 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
             spec_info=spec_info,
             global_num_tokens_cpu=[0, 300],
             input_ids=torch.empty((0,), dtype=torch.int64),
-            seq_lens=torch.empty((0,), dtype=torch.int32),
-            out_cache_loc=torch.empty((0,), dtype=torch.int32),
-            req_pool_indices=torch.empty((0,), dtype=torch.int32),
-            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens=torch.empty((0,), dtype=torch.int64),
+            # Match ScheduleBatch.prepare_for_idle, not the allocator's dtype.
+            out_cache_loc=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int64),
             seq_lens_cpu=None,
         )
         with _dp_attention(True):
@@ -2643,6 +2799,12 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
         self.assertEqual(forward_batch.batch_size, 1)
         self.assertEqual(forward_batch.seq_lens.tolist(), [300])
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [300])
+        self.assertEqual(forward_batch.out_cache_loc.dtype, torch.int32)
+
+        for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
+            self.assertEqual(getattr(forward_batch, name).dtype, torch.int32, name)
+        for name in ("seq_lens", "req_pool_indices", "req_pool_indices_cpu"):
+            self.assertEqual(getattr(forward_batch, name).dtype, torch.int64, name)
 
 
 class TestDpSyncNumTokens(_SpecPolicyTestCase):
@@ -3196,10 +3358,17 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             )
             return torch.zeros(forward_batch.batch_size)
 
-        with get_parallel().override(tp_rank=1):
+        with (
+            get_parallel().override(tp_rank=1),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3._materialize_out"
+            ) as materialize,
+        ):
             policy._precompile_fused_draft_decode(
                 FakeDraftBackend(), fused_draft_forward
             )
+        self.assertEqual(materialize.call_count, 2)
 
         self.assertEqual(
             seen_shapes,
@@ -3235,6 +3404,31 @@ def _policy():
         )
 
 
+def _cpu_top_k_renorm(probs, top_ks, need_top_k_sampling=True):
+    """CPU stand-in for the TPU filter: keep values >= the k-th largest."""
+    if not need_top_k_sampling:
+        return probs
+    ks = top_ks.clamp(1, probs.shape[-1]).long().reshape(-1, 1)
+    kth = probs.sort(dim=-1, descending=True).values.gather(-1, ks - 1)
+    kept = torch.where(probs >= kth, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _cpu_top_p_renorm(probs, top_ps):
+    """CPU stand-in for the TPU filter: keep values >= the first value whose
+    prefix mass reaches p; an unreachable p keeps the whole row."""
+    ordered = probs.sort(dim=-1, descending=True).values
+    reached = ordered.cumsum(dim=-1) >= top_ps.to(probs.dtype).reshape(-1, 1)
+    first = reached.to(torch.int64).argmax(dim=-1, keepdim=True)
+    cutoff = torch.where(
+        reached.any(dim=-1, keepdim=True),
+        ordered.gather(-1, first),
+        torch.zeros_like(first, dtype=probs.dtype),
+    )
+    kept = torch.where(probs >= cutoff, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
 @contextlib.contextmanager
 def _serving_stubs():
     """Select TPU-native sampling and stub serving process state.
@@ -3263,6 +3457,15 @@ def _serving_stubs():
             eager_scaling_penalties,
         ),
         patch("sglang.srt.speculative.eagle_utils._is_tpu", True),
+        # The TPU renorm filter only accepts TPU tensors.
+        patch(
+            "sglang.srt.speculative.eagle_utils.top_k_renorm_prob_func",
+            _cpu_top_k_renorm,
+        ),
+        patch(
+            "sglang.srt.speculative.eagle_utils.top_p_renorm_prob_func",
+            _cpu_top_p_renorm,
+        ),
         patch(
             "sglang.srt.distributed.get_tp_group",
             return_value=SimpleNamespace(world_size=1),

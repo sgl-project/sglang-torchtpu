@@ -168,41 +168,6 @@ def _group_spans_world(group) -> bool:
     )
 
 
-# The kernel reads this rank's vocabulary index from an operand rather than from
-# lax.axis_index, because the mesh order need not follow torch.distributed rank
-# order. It lives as an lm_head buffer so direct_compile lifts it into the graph:
-# every tensor reachable from model execution has to be an explicit argument, a
-# parameter/buffer, or KV-pool state, and a tensor built inside the traced region
-# instead aborts TraverseAndCompile with "identified an argument that was not
-# provided". Non-persistent, so it stays out of the checkpoint.
-DISTRIBUTED_TOP_K_RANK_BUFFER = "tpu_distributed_top_k_rank"
-
-
-def register_distributed_top_k_rank(lm_head, *, group) -> None:
-    """Publish this rank's vocabulary index on lm_head, before graph capture.
-
-    Called from capability negotiation, which runs at startup: direct_compile
-    snapshots named_buffers() when it traces, so a buffer registered later (on
-    the first forward, say) would never become a graph input.
-    """
-    # Only an nn.Module can carry a buffer, and only an nn.Module can be part of
-    # a captured model, so anything else (a negotiation test double) has nothing
-    # to publish to.
-    if not isinstance(lm_head, torch.nn.Module):
-        return
-    if getattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER, None) is not None:
-        return
-    lm_head.register_buffer(
-        DISTRIBUTED_TOP_K_RANK_BUFFER,
-        torch.tensor(
-            [int(group.rank_in_group)],
-            dtype=torch.int32,
-            device=lm_head.weight.device,
-        ),
-        persistent=False,
-    )
-
-
 def negotiate_pallas_distributed_top_k_config(
     lm_head,
     *,
@@ -418,7 +383,6 @@ def distributed_tpu_top_k(
     k: int,
     *,
     group,
-    lm_head=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run exact distributed TopK through the direct-HBM Pallas ring."""
 
@@ -472,23 +436,8 @@ def distributed_tpu_top_k(
         pallas_distributed_top_k,
     )
 
-    if lm_head is None:
-        # Eager callers (the kernel's own unit test) have no module to hang the
-        # operand on and are not traced, so building it here is safe. Every
-        # caller that can be captured passes lm_head.
-        rank_input = local_logits.new_tensor((model_rank,), dtype=torch.int32)
-    else:
-        rank_input = getattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER, None)
-        if rank_input is None:
-            raise RuntimeError(
-                f"lm_head has no {DISTRIBUTED_TOP_K_RANK_BUFFER} buffer; "
-                "register_distributed_top_k_rank must run before the graph is "
-                "captured, or TraverseAndCompile aborts on the rank operand"
-            )
-
     return pallas_distributed_top_k(
         local_logits,
-        rank_input=rank_input,
         org_vocab_size=shard.org_vocab_size,
         global_vocab_size=shard.global_vocab_size,
         org_vocab_padded_count=shard.org_vocab_padded_count,

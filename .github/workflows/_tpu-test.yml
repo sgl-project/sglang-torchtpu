@@ -203,7 +203,7 @@ jobs:
           #     formula), and this must OUTLAST it so the JobSet -- not this loop --
           #     decides the outcome.
           if [ '${{ inputs.pd_prefill_hosts }}' != '0' ]; then
-            wait_s=11400         # outlast P/D mode's activeDeadlineSeconds=10800 + margin
+            wait_s=9300          # outlast P/D mode's activeDeadlineSeconds=8700 + margin
           elif [ -n "${{ inputs.launch_script }}" ]; then
             nf=$(wc -w <<< "${{ inputs.files }}")
             wait_s=$(( 3600 + nf * ${{ inputs.timeout_per_file }} + 600 ))  # deadline + margin

@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Adapted for SGLang-TorchTPU from vllm-project/tpu-inference
-# `tpu_inference.kernels.gdn.v3.metadata` (Apache-2.0).
-# Changes: import paths rebased to `sglang.srt.layers.attention.pallas.gdn`;
-# no functional changes.
+# Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: src/vllm_torchtpu/kernels/gdn/v3/metadata.py
 
 import jax
 import jax.numpy as jnp
@@ -29,15 +27,29 @@ def compute_batched_seq_metadata(
     seq_lens: jax.Array,
     query_start_loc: jax.Array,
     state_indices: jax.Array,
+    read_offsets: jax.Array,
     end_seq: jax.Array,
+    ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
-    """Metadata for computing multiple sequences per tile."""
+    """Metadata for computing multiple sequences per tile.
+
+    A sequence contributes exactly one tile holding all of its query tokens:
+    a single decoded token, or a speculative verify window of up to
+    `cfg.window_size` of them. The initial state is read from
+    `state_indices[s] + read_offsets[s]` and one state checkpoint per window
+    position is written back to `state_indices[s] + t`.
+    """
 
     max_seqs = seq_lens.size
-    all_seqs = jnp.arange(max_seqs)
+    # Pallas walks a complete request tile, including its final padded rows.
+    # Verify windows have several tokens per request, so the token-derived
+    # tile size can exceed the number of request metadata rows (even at BS=1).
+    # Materialize inert rows instead of reading beyond the SMEM arrays.
+    padded_seqs = pl.cdiv(max_seqs, cfg.seq_tile_size) * cfg.seq_tile_size
+    all_seqs = jnp.arange(padded_seqs)
 
-    # NOTE: Only supports use case where query_lens[i] = 1 where i < end_seq.
-    # This must be guaranteed by the function caller.
+    # NOTE: Only supports use case where query_lens[i] <= cfg.window_size where
+    # i < end_seq. This must be guaranteed by the function caller.
     # TODO(kyuyeunk): Add error handling when above condition is not met.
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     is_valid_seqs = jnp.where(all_seqs < end_seq, True, False)
@@ -48,12 +60,14 @@ def compute_batched_seq_metadata(
         cfgs=cfg,
         num_tiles=pl.cdiv(end_seq, cfg.tile_size),
         p_id_to_s_idx=all_valid_seqs,
-        p_id_to_r_base=all_valid_seqs,
-        p_id_to_r_size=jnp.where(is_valid_seqs, 1, 0),
+        p_id_to_r_base=query_start_loc[all_valid_seqs],
+        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens[all_valid_seqs], 0),
         p_id_is_first_tile=is_valid_seqs,
         p_id_is_last_tile=is_valid_seqs,
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
+        s_idx_to_read_offset=read_offsets,
+        s_idx_to_ckpt_indices=ckpt_indices,
     )
 
 
@@ -62,11 +76,20 @@ def compute_per_seq_metadata(
     seq_lens: jax.Array,
     query_start_loc: jax.Array,
     state_indices: jax.Array,
+    read_offsets: jax.Array,
     start_seq: jax.Array,
     end_seq: jax.Array,
+    ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
-    """Metadata for computing single sequence per tile."""
+    """Metadata for computing single sequence per tile.
 
+    `read_offsets` selects the checkpoint a resuming sequence's initial state
+    is read from. It is 0 in the common cases (a fresh or chunked prefill
+    resumes from the single state its previous chunk wrote), but a
+    prefix-cache resume on the unified pool may land on a boundary state
+    block whose committed state is a non-zero checkpoint from a verify step.
+    The final state is always written to checkpoint 0.
+    """
     max_seqs = seq_lens.size
     max_tokens = cfg.batch_size
     all_seqs = jnp.arange(max_seqs)
@@ -76,6 +99,11 @@ def compute_per_seq_metadata(
     query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
     seq_lens = jnp.roll(seq_lens, shift=-start_seq)
     state_indices = jnp.roll(state_indices, shift=-start_seq)
+    read_offsets = jnp.roll(read_offsets, shift=-start_seq)
+    if ckpt_indices is not None:
+        # Sequence-major axis only: the checkpoint axis must stay put or the
+        # read offset would select another slot's block.
+        ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -136,4 +164,6 @@ def compute_per_seq_metadata(
         p_id_is_last_tile=p_id_is_last_tile,
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
+        s_idx_to_read_offset=read_offsets,
+        s_idx_to_ckpt_indices=ckpt_indices,
     )

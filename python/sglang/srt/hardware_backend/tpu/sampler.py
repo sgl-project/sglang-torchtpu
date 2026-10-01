@@ -111,15 +111,8 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
         from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
             register_pallas_distributed_top_k_op,
         )
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            register_distributed_top_k_rank,
-        )
 
         register_pallas_distributed_top_k_op(config.world_size)
-        # Must happen here, not on the first forward: direct_compile lifts the
-        # model's buffers into graph inputs when it traces, and the kernel's
-        # rank operand has to be one of them.
-        register_distributed_top_k_rank(lm_head, group=group)
 
     # Publish only after consensus and registration both succeed. A transport
     # or export failure must remain fatal instead of becoming a local fallback.

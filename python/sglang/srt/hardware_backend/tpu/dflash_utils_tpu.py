@@ -1,8 +1,16 @@
-"""TPU helpers shared by the DFlash-family draft loops (DFLASH, DSpark)."""
+"""TPU helpers shared by the DFlash-family draft loops (DFLASH, DSpark).
+
+Also hosts device-resident verify-block addressing. The host trails device
+acceptance by one commit, so kv_committed_len is an exact base: the true prefix
+is base + commit_lens with commit_lens in [0, block_size]. That bound lets the
+host pre-gather every slot the next verify block could occupy and leave the
+choice to the device. page_aligned_decode_alloc_lens already reserves
+2 * block_size for the lag, so the window costs no extra allocation.
+"""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import torch
@@ -13,6 +21,7 @@ from sglang.srt.distributed import get_tp_group, model_parallel_is_initialized
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
+    make_dflash_verify_cache_locs_args,
 )
 from sglang.srt.hardware_backend.tpu.top_k import (
     TpuVocabShard,
@@ -20,13 +29,15 @@ from sglang.srt.hardware_backend.tpu.top_k import (
     supports_distributed_tpu_top_k,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+
 
 class TpuDraftExtendMetadata(msgspec.Struct, frozen=True):
     """Extend split for a fixed-width draft block.
 
     The Pallas RPA backend plans the block as an extend from the host, so the
-    draft forward carries the split explicitly. Off TPU every field is None;
-    see EMPTY_TPU_DRAFT_EXTEND.
+    draft forward carries the split explicitly; it is built on TPU only.
 
     Attributes:
       seq_lens: Post-block sequence lengths, [bs] on device, dtype of the
@@ -45,9 +56,6 @@ class TpuDraftExtendMetadata(msgspec.Struct, frozen=True):
     extend_prefix_lens_cpu: Optional[list[int]] = None
     extend_seq_lens_cpu: Optional[list[int]] = None
     extend_num_tokens: Optional[int] = None
-
-
-EMPTY_TPU_DRAFT_EXTEND = TpuDraftExtendMetadata()
 
 
 def build_tpu_draft_extend_metadata(
@@ -256,7 +264,6 @@ def argmax_draft_tokens_tpu(
             TpuVocabShard.from_lm_head(lm_head),
             k=1,
             group=get_tp_group(),
-            lm_head=lm_head,
         )
         tokens = global_token_ids.squeeze(-1).to(torch.long)
         return tokens.view(bs, block_size - 1)
@@ -273,3 +280,270 @@ def argmax_draft_tokens_tpu(
     if org_vocab_start > 0:
         tokens.add_(org_vocab_start)
     return tokens.view(bs, block_size - 1)
+
+
+def _dflash_device_accept_eligible(
+    batch: ScheduleBatch, bs: int, *, compact_draft_cache: bool
+) -> bool:
+    """Whether this batch may address its verify block without a host sync.
+
+    DFLASH commits at most one block, which is the single bounded offset the
+    window enumerates. Grammar is excluded because grammar_retained_tokens can
+    be shorter than commit_lens, which breaks that bound. The compact draft
+    cache rebuilds its own windowed mapping from host lengths and is left on
+    the synchronizing path.
+
+    Args:
+      batch: Batch being prepared for decode.
+      bs: Number of live requests in the batch.
+      compact_draft_cache: Whether the windowed draft KV cache is enabled.
+
+    Returns:
+      True when the device may pick the verify block on its own.
+    """
+    return (
+        bs > 0
+        and not compact_draft_cache
+        and batch.enable_overlap
+        and batch.spec_algorithm.is_dflash()
+        and batch.req_to_token_pool.host_resident
+        and not batch.return_logprob
+        and not batch.has_grammar
+        and all(req.lora_id is None for req in batch.reqs)
+    )
+
+
+def _select_verify_cache_locs(
+    candidates: torch.Tensor,
+    seq_lens: torch.Tensor,
+    committed_lens: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Slice the block starting at seq_lens - committed_lens out of candidates.
+
+    Args:
+      candidates: Slot ids for [base, base + 2 * block_size),
+        [bs, 2 * block_size].
+      seq_lens: Device prefix lengths, [bs].
+      committed_lens: Device mirror of the host base, [bs].
+      block_size: Verify block width.
+
+    Returns:
+      Slot ids, [bs, block_size].
+    """
+    device = candidates.device
+    # Binds only on the uninitialized bucket-padding rows; live rows stay inside
+    # [0, block_size] by the one-commit lag.
+    offsets = (seq_lens.to(torch.int64) - committed_lens.to(torch.int64)).clamp_(
+        0, block_size
+    )
+    columns = offsets[:, None] + torch.arange(
+        block_size, device=device, dtype=torch.int64
+    )
+    rows = torch.arange(candidates.shape[0], device=device, dtype=torch.int64)
+    return candidates[rows[:, None], columns]
+
+
+@compiled_op(warmup=make_dflash_verify_cache_locs_args)
+def select_dflash_verify_cache_locs_tpu(
+    candidates: torch.Tensor,
+    seq_lens: torch.Tensor,
+    committed_lens: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Pick the verify block's slots out of the pre-gathered candidate window.
+
+    Args:
+      candidates: Slot ids for [base, base + 2 * block_size),
+        [bs, 2 * block_size].
+      seq_lens: Device prefix lengths, [bs], equal to base plus the previous
+        step's commit length.
+      committed_lens: Device mirror of the host base, [bs].
+      block_size: Verify block width.
+
+    Returns:
+      Slot ids, [bs, block_size].
+    """
+    return _select_verify_cache_locs(candidates, seq_lens, committed_lens, block_size)
+
+
+class DeviceVerifyBlockSelector:
+    """Bucket-padded driver for select_dflash_verify_cache_locs_tpu.
+
+    The op is specialized per physical batch bucket, so live rows are staged into
+    buffers sized to that bucket. Rows past the live batch stay uninitialized:
+    the selection clamps its offsets, so they only ever produce in-bounds garbage
+    that the caller trims off.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        block_size: int,
+        pad_bs: Callable[[int], int],
+    ) -> None:
+        """Set up the staging buffers for one decode loop.
+
+        Args:
+          device: Device the staging buffers live on.
+          block_size: Verify block width.
+          pad_bs: Maps a live batch size to its compiled bucket size.
+        """
+        self.block_size = int(block_size)
+        self._device = device
+        self._pad_bs = pad_bs
+        self._candidates: Optional[torch.Tensor] = None
+        self._committed_lens: Optional[torch.Tensor] = None
+        self._prefix_lens: Optional[torch.Tensor] = None
+
+    def select(
+        self,
+        *,
+        candidates: torch.Tensor,
+        committed_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        bs: int,
+    ) -> torch.Tensor:
+        """Pick each request's verify block out of its candidate window.
+
+        Args:
+          candidates: Slot ids for [base, base + 2 * block_size),
+            [bs, 2 * block_size].
+          committed_lens: Device mirror of the host base, [bs].
+          prefix_lens: Device prefix lengths, [bs].
+          bs: Number of live requests.
+
+        Returns:
+          Slot ids, [bs, block_size].
+        """
+        pad_bs = self._pad_bs(bs)
+        self._ensure_capacity(pad_bs)
+        padded_candidates = self._candidates[:pad_bs]
+        padded_committed = self._committed_lens[:pad_bs]
+        padded_prefix = self._prefix_lens[:pad_bs]
+        padded_candidates[:bs].copy_(candidates)
+        padded_committed[:bs].copy_(committed_lens)
+        padded_prefix[:bs].copy_(prefix_lens)
+        return select_dflash_verify_cache_locs_tpu(
+            padded_candidates, padded_prefix, padded_committed, self.block_size
+        )[:bs]
+
+    def _ensure_capacity(self, pad_bs: int) -> None:
+        """Grow the staging buffers to hold pad_bs rows.
+
+        Args:
+          pad_bs: Bucket-padded batch size the next select needs.
+        """
+        # The capacity is itself a bucket, so pad_bs <= cap holds for every later
+        # bs <= cap and buf[:pad_bs] never overruns; the ladder bounds regrowth.
+        cap = 0 if self._candidates is None else int(self._candidates.shape[0])
+        if cap >= pad_bs:
+            return
+        self._candidates = torch.empty(
+            (pad_bs, 2 * self.block_size), dtype=torch.int64, device=self._device
+        )
+        self._committed_lens = torch.empty(
+            (pad_bs,), dtype=torch.int64, device=self._device
+        )
+        self._prefix_lens = torch.empty(
+            (pad_bs,), dtype=torch.int64, device=self._device
+        )
+
+
+def gather_dflash_candidate_window(
+    req_to_token: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    committed_lens_cpu: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Host-gather the slots the next verify block can land on.
+
+    The window spans [base, base + 2 * block_size): offset 0 covers an extend or
+    idle predecessor that committed nothing, offset block_size the maximal
+    commit, and each start needs block_size slots.
+
+    Args:
+      req_to_token: Host req-to-slot mapping, [max_num_reqs, max_context_len].
+      req_pool_indices_cpu: Pool row of each request, [bs] on CPU.
+      committed_lens_cpu: Host committed prefix lengths, [bs] on CPU.
+      block_size: Verify block width.
+
+    Returns:
+      Slot ids spanning the window, [bs, 2 * block_size].
+    """
+    rows = req_pool_indices_cpu.to(torch.int64)[:, None]
+    columns = committed_lens_cpu.to(torch.int64)[:, None] + torch.arange(
+        2 * block_size, dtype=torch.int64
+    )
+    return req_to_token[rows, columns]
+
+
+class DFlashDeviceAcceptPlan(msgspec.Struct, frozen=True):
+    """Device-resident verify addressing for one decode step.
+
+    Attributes:
+      verify_cache_candidates: Slot ids for [base, base + 2 * block_size),
+        [bs, 2 * block_size] int64 on device.
+      committed_lens: Device mirror of the host base, [bs] int64.
+    """
+
+    verify_cache_candidates: torch.Tensor
+    committed_lens: torch.Tensor
+
+
+def plan_dflash_device_accept(
+    batch: ScheduleBatch,
+    *,
+    bs: int,
+    block_size: int,
+    committed_lens_cpu: torch.Tensor,
+    compact_draft_cache: bool,
+) -> Optional[DFlashDeviceAcceptPlan]:
+    """Pre-gather every slot the next verify block could occupy.
+
+    The published length is base + commit_lens of the previous step, which only
+    the device knows. Enumerating the bounded window here lets the worker select
+    on device instead of synchronizing on that length.
+
+    Args:
+      batch: Batch being prepared for decode.
+      bs: Number of live requests in the batch.
+      block_size: Verify block width.
+      committed_lens_cpu: Host committed prefix lengths, [bs] on CPU.
+      compact_draft_cache: Whether the windowed draft KV cache is enabled.
+
+    Returns:
+      The window and its base, or None when the batch must stay on the
+      synchronizing path.
+
+    Raises:
+      AssertionError: A request reserved fewer than two blocks past its base.
+    """
+    if not _dflash_device_accept_eligible(
+        batch, bs, compact_draft_cache=compact_draft_cache
+    ):
+        return None
+    req_pool_indices_cpu = batch.req_pool_indices_cpu
+    if not isinstance(req_pool_indices_cpu, torch.Tensor):
+        return None
+    # page_aligned_decode_alloc_lens reserved 2 * block_size from the same
+    # committed base, so the whole window is already mapped.
+    assert all(
+        int(committed_lens_cpu[i]) + 2 * block_size <= req.kv.kv_allocated_len
+        for i, req in enumerate(batch.reqs)
+    ), "DFLASH device accept routing requires two blocks of reserved KV"
+    candidates = gather_dflash_candidate_window(
+        batch.req_to_token_pool.req_to_token,
+        req_pool_indices_cpu[:bs],
+        committed_lens_cpu[:bs],
+        block_size,
+    )
+    return DFlashDeviceAcceptPlan(
+        verify_cache_candidates=candidates.to(
+            batch.device, dtype=torch.int64, non_blocking=True
+        ),
+        committed_lens=committed_lens_cpu[:bs].to(
+            batch.device, dtype=torch.int64, non_blocking=True
+        ),
+    )

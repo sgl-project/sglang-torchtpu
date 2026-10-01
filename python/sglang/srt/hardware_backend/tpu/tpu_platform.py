@@ -35,7 +35,7 @@ _LOAD_WEIGHT_SYNC_TENSORS = 64
 def _sync_weight_stream(weights):
     """Yield weights and periodically drain torch_tpu pending work.
 
-    ``torch.tpu.synchronize()`` blocks until async device work and deferred
+    ``torch.accelerator.synchronize()`` blocks until async device work and deferred
     operations on the TPU have completed, which lets transient buffers be freed.
     This bounds HBM peak usage only when the loader copies parameters while
     iterating.
@@ -55,7 +55,7 @@ def _sync_weight_stream(weights):
             pending_bytes >= _LOAD_WEIGHT_SYNC_BYTES
             or pending_tensors >= _LOAD_WEIGHT_SYNC_TENSORS
         ):
-            torch.tpu.synchronize()
+            torch.accelerator.synchronize()
             pending_bytes = 0
             pending_tensors = 0
 
@@ -675,7 +675,7 @@ class TpuSRTPlatform(SRTPlatform):
         return None
 
     def synchronize(self) -> None:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
     @contextmanager
     def weight_loading_context(self, weights):
@@ -689,7 +689,7 @@ class TpuSRTPlatform(SRTPlatform):
                 yield _sync_weight_stream(weights)
             return
 
-        # No eager drain at load exit: torch.tpu.synchronize() here deadlocks
+        # No eager drain at load exit: torch.accelerator.synchronize() here deadlocks
         # EAGLE3 draft init under TP>1 -- rank 0 blocks on an async buffer while
         # peers reach the post-load barrier. Let it resolve at the first aligned
         # sync instead. Periodic syncs in _sync_weight_stream still bound HBM

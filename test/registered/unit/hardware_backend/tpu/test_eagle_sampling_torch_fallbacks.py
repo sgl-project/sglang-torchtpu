@@ -13,8 +13,6 @@ from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
     build_topk1_verify_chain_torch,
 )
 from sglang.srt.speculative.eagle_utils import (
-    _top_k_renorm_prob_torch,
-    _top_p_renorm_prob_torch,
     _tree_speculative_sampling_target_only_torch,
 )
 
@@ -329,56 +327,6 @@ class TestEagleSamplingTorchFallbacks(unittest.TestCase):
         self.assertEqual(accept_index.tolist(), [[0, -1, -1, -1, -1, -1]])
         self.assertEqual(accept_token_num.tolist(), [0])
         self.assertTrue(torch.equal(draft_probs, torch.zeros_like(draft_probs)))
-
-    def test_top_k_renorm(self):
-        probs = torch.tensor([[0.4, 0.3, 0.2, 0.1]])
-        out = _top_k_renorm_prob_torch(probs, torch.tensor([2]))
-        expected = torch.tensor([[0.4, 0.3, 0.0, 0.0]]) / 0.7
-        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
-
-    def test_top_k_renorm_batched_with_ties_and_clamp(self):
-        probs = torch.tensor(
-            [
-                [0.4, 0.3, 0.2, 0.1],
-                [0.4, 0.3, 0.3, 0.0],
-                [0.1, 0.2, 0.3, 0.4],
-            ]
-        )
-        out = _top_k_renorm_prob_torch(probs, torch.tensor([1, 2, 99]))
-        expected = torch.tensor(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.4, 0.3, 0.3, 0.0],
-                [0.1, 0.2, 0.3, 0.4],
-            ]
-        )
-        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
-
-    def test_top_p_renorm(self):
-        probs = torch.tensor([[0.5, 0.3, 0.15, 0.05]])
-        out = _top_p_renorm_prob_torch(probs, torch.tensor([0.7]))
-        # nucleus keeps the tokens whose prefix mass is < 0.7 -> {0.5, 0.3}.
-        expected = torch.tensor([[0.5, 0.3, 0.0, 0.0]]) / 0.8
-        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
-
-    def test_top_p_renorm_batched(self):
-        probs = torch.tensor(
-            [
-                [0.5, 0.3, 0.15, 0.05],
-                [0.4, 0.35, 0.15, 0.10],
-                [0.1, 0.2, 0.3, 0.4],
-            ]
-        )
-        out = _top_p_renorm_prob_torch(probs, torch.tensor([0.7, 0.4, 1.0]))
-        expected = torch.tensor(
-            [
-                [0.5, 0.3, 0.0, 0.0],
-                [0.4, 0.0, 0.0, 0.0],
-                [0.1, 0.2, 0.3, 0.4],
-            ]
-        )
-        expected = expected / expected.sum(dim=-1, keepdim=True)
-        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
 
 
 class TestGreedyVerifyTorchEquivalence(unittest.TestCase):

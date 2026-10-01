@@ -2,7 +2,7 @@ import logging
 import math
 import os
 from dataclasses import replace
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -22,6 +22,8 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+    DeviceVerifyBlockSelector,
+    build_tpu_draft_extend_metadata,
     dflash_verify_argmax_torch,
     dflash_verify_bookkeeping_torch,
 )
@@ -570,6 +572,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_extend_seq_lens_buf: torch.Tensor | None = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: torch.Tensor | None = None  # [cap_bs] on CPU
+        self._verify_block_selector = (
+            DeviceVerifyBlockSelector(
+                device=self.device,
+                block_size=int(self.block_size),
+                pad_bs=self._maybe_pad_draft_bs,
+            )
+            if _is_tpu
+            else None
+        )
         self._embed_module: torch.nn.Module | None = None
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
@@ -657,22 +668,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "Target model must have an lm_head for DFLASH TPU draft sampling."
             )
         self.draft_model.lm_head = target_model.lm_head
-        # The draft's distributed-TopK path borrows this head but never runs the
-        # target's capability negotiation, so publish the kernel's rank operand
-        # here -- it has to be a graph input before the draft graphs below are
-        # captured. Same guard as the draft's use site, so heads that cannot take
-        # the path do not gain an unused buffer (and a changed graph signature).
-        from sglang.srt.distributed import get_tp_group
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            register_distributed_top_k_rank,
-            supports_distributed_tpu_top_k,
-        )
-
-        tp_group = get_tp_group()
-        if int(tp_group.world_size) > 1 and supports_distributed_tpu_top_k(
-            target_model.lm_head, top_k=1
-        ):
-            register_distributed_top_k_rank(target_model.lm_head, group=tp_group)
         self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         compile_policy = getattr(self.draft_model_runner, "compile_policy", None)
         if compile_policy is not None:
@@ -1118,43 +1113,44 @@ class DFlashWorkerV2(BaseSpecWorker):
             (new_cap,), dtype=torch.int32, device="cpu"
         )
 
-    def _prepare_tpu_draft_forward_metadata(
+    def _fill_verify_block_cache_locs(
         self,
+        *,
         batch: ScheduleBatch,
+        prefix_lens: torch.Tensor,
+        candidates: Optional[torch.Tensor],
+        committed_lens: Optional[torch.Tensor],
+        out_2d: torch.Tensor,
         bs: int,
         block_size: int,
-        draft_prefix_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[int], int]:
-        """Prepare TPU-specific extend metadata for DFlash draft forward.
+        device,
+    ) -> None:
+        """Write the verify block's KV slots into out_2d.
 
-        Args:
-          batch: Active schedule batch.
-          bs: Batch size.
-          block_size: Number of draft tokens per request.
-          draft_prefix_lens: Prefix length tensor for each request.
-
-        Returns:
-          Tuple of (draft_seq_lens, extend_prefix_lens, extend_seq_lens,
-          extend_prefix_lens_cpu, extend_seq_lens_cpu, extend_num_tokens).
+        With a pre-gathered window the slots are picked on device from the
+        committed base; otherwise the lengths round-trip through the host copy of
+        req_to_token, which synchronizes on the published lengths.
         """
-        draft_seq_lens = draft_prefix_lens + block_size
-        extend_prefix_lens = draft_prefix_lens.to(torch.int32)
-        extend_seq_lens = self._draft_extend_seq_lens_buf[:bs]
-        extend_seq_lens.fill_(block_size)
-        extend_prefix_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if batch.seq_lens_cpu is not None
-            else extend_prefix_lens.cpu().tolist()
-        )
-        extend_seq_lens_cpu = [block_size] * bs
-        extend_num_tokens = bs * block_size
-        return (
-            draft_seq_lens,
-            extend_prefix_lens,
-            extend_seq_lens,
-            extend_prefix_lens_cpu,
-            extend_seq_lens_cpu,
-            extend_num_tokens,
+        if candidates is None:
+            locs = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                start_offset=prefix_lens,
+                end_offset=prefix_lens + block_size,
+                batch_size=bs,
+                draft_token_num=block_size,
+                device=device,
+            )
+            out_2d.copy_(locs.view(bs, block_size))
+            return
+
+        out_2d.copy_(
+            self._verify_block_selector.select(
+                candidates=candidates,
+                committed_lens=committed_lens,
+                prefix_lens=prefix_lens,
+                bs=bs,
+            )
         )
 
     def __getattr__(self, name):
@@ -2737,6 +2733,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         block_ids = self._draft_block_ids_buf[:bs]
         prefix_lens = batch.seq_lens
+        # Set when prepare_for_decode pre-gathered the verify window; the block's
+        # slots are then picked on device instead of read back from req_to_token.
+        verify_cache_candidates = draft_input.tpu_verify_cache_candidates
+        # The host mirror then holds the committed base, one commit behind the
+        # device length, so every bound derived from it needs a second block.
+        host_len_slack = block_size if draft_input.tpu_host_seq_lens_is_committed else 0
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
         if self._use_triton_prepare_block:
@@ -2764,17 +2766,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._block_pos_offsets,
                     out=positions_2d,
                 )
-                end_offset = prefix_lens + block_size
-                verify_out_cache_loc = assign_extend_cache_locs_func(
-                    req_pool_indices=batch.req_pool_indices,
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    start_offset=prefix_lens,
-                    end_offset=end_offset,
-                    batch_size=bs,
-                    draft_token_num=block_size,
+                self._fill_verify_block_cache_locs(
+                    batch=batch,
+                    prefix_lens=prefix_lens,
+                    candidates=verify_cache_candidates,
+                    committed_lens=draft_input.tpu_committed_lens,
+                    out_2d=verify_out_cache_loc_2d,
+                    bs=bs,
+                    block_size=block_size,
                     device=device,
                 )
-                verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
         else:
             block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.bonus_tokens)
@@ -2783,17 +2784,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._block_pos_offsets,
                 out=positions_2d,
             )
-            end_offset = prefix_lens + block_size
-            verify_out_cache_loc = assign_extend_cache_locs_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                start_offset=prefix_lens,
-                end_offset=end_offset,
-                batch_size=bs,
-                draft_token_num=block_size,
+            self._fill_verify_block_cache_locs(
+                batch=batch,
+                prefix_lens=prefix_lens,
+                candidates=verify_cache_candidates,
+                committed_lens=draft_input.tpu_committed_lens,
+                out_2d=verify_out_cache_loc_2d,
+                bs=bs,
+                block_size=block_size,
                 device=device,
             )
-            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         if _is_tpu:
             # Feed the bucket-padded buffer so the compiled artifact stays on a
@@ -2834,9 +2834,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_prefix_lens = prefix_lens
             draft_seq_lens = prefix_lens
             if batch.seq_lens_cpu is not None:
-                # Host bound = committed prefix + one verify block.
+                # Host bound = committed prefix + one verify block, plus another
+                # block when the mirror trails the device by an unread commit.
                 seq_lens_cpu.copy_(batch.seq_lens_cpu)
-                seq_lens_cpu.add_(block_size)
+                seq_lens_cpu.add_(block_size + host_len_slack)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
             elif draft_input.nxt_kv_lens_cpu is not None:
                 # GPU-only backend: reserved is a safe over-estimate.
@@ -2847,26 +2848,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
 
+        # Only the Pallas RPA backend plans the draft block as an extend, so
+        # the split is TPU-only; ForwardBatch leaves the fields None elsewhere.
+        extend_split: dict[str, Any] = {}
         if _is_tpu:
-            (
-                draft_seq_lens,
-                extend_prefix_lens,
-                extend_seq_lens,
-                extend_prefix_lens_cpu,
-                extend_seq_lens_cpu,
-                extend_num_tokens,
-            ) = self._prepare_tpu_draft_forward_metadata(
-                batch=batch,
+            tpu_extend = build_tpu_draft_extend_metadata(
                 bs=bs,
-                block_size=block_size,
+                width=block_size,
                 draft_prefix_lens=draft_prefix_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                extend_seq_lens_buf=self._draft_extend_seq_lens_buf,
             )
-        else:
-            extend_prefix_lens = None
-            extend_seq_lens = None
-            extend_prefix_lens_cpu = None
-            extend_seq_lens_cpu = None
-            extend_num_tokens = None
+            draft_seq_lens = tpu_extend.seq_lens
+            extend_split = {
+                "extend_prefix_lens": tpu_extend.extend_prefix_lens,
+                "extend_seq_lens": tpu_extend.extend_seq_lens,
+                "extend_prefix_lens_cpu": tpu_extend.extend_prefix_lens_cpu,
+                "extend_seq_lens_cpu": tpu_extend.extend_seq_lens_cpu,
+                "extend_num_tokens": tpu_extend.extend_num_tokens,
+            }
 
         req_pool_indices_cpu = (
             batch.req_pool_indices_cpu
@@ -2895,11 +2895,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
-            extend_num_tokens=extend_num_tokens,
+            **extend_split,
             num_token_non_padded=(
                 torch.tensor(bs * block_size, dtype=torch.int32, device=device)
                 if enable_num_token_non_padded()
@@ -3035,7 +3031,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
             # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            verify_host_seq_lens = seq_lens_cpu_backup + block_size + host_len_slack
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:

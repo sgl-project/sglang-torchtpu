@@ -11,11 +11,19 @@ from jax import tree_util
 from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
+from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
+    use_attention_rank_tensors,
+)
+from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+)
+from sglang.srt.layers import dp_attention
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -227,26 +235,107 @@ class TestDirectCompile(CustomTestCase):
                 specialization_key=lambda value: tuple(value.shape),
             )
 
-        value = torch.ones(2, device="tpu")
-        expected = torch.full((2,), 2.0)
-        torch.tpu._clear_cache()
-        requests_before = torch.tpu._get_cache_requests()
-        hits_before = torch.tpu._get_cache_hits()
-        misses_before = torch.tpu._get_cache_misses()
+        def run(compiled_fn, value, async_compile):
+            if async_compile:
+                return compiled_fn.warmup_async(value).wait()
+            return compiled_fn(value)
 
-        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
-        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-        self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
-        self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
+        for async_compile in (False, True):
+            with self.subTest(async_compile=async_compile):
+                value = torch.ones(2, device="tpu")
+                expected = torch.full((2,), 2.0)
+                torch.tpu._clear_cache()
+                requests_before = torch.tpu._get_cache_requests()
+                hits_before = torch.tpu._get_cache_hits()
+                misses_before = torch.tpu._get_cache_misses()
 
-        requests_before = torch.tpu._get_cache_requests()
-        hits_before = torch.tpu._get_cache_hits()
-        misses_before = torch.tpu._get_cache_misses()
+                result = run(new_compiled_fn(), value, async_compile)
+                torch.testing.assert_close(result.cpu(), expected)
+                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+                self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
+                self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
 
-        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
-        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-        self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
-        self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+                requests_before = torch.tpu._get_cache_requests()
+                hits_before = torch.tpu._get_cache_hits()
+                misses_before = torch.tpu._get_cache_misses()
+
+                result = run(new_compiled_fn(), value, async_compile)
+                torch.testing.assert_close(result.cpu(), expected)
+                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+                self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
+                self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+
+    @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+    def test_native_async_grid_preserves_model_kv_and_callbacks(self):
+        model = _ModelWithObjectTensorState().to("tpu")
+        model.object_state.value = model.object_state.value.to("tpu")
+        model.object_state.weight_alias = model.weight
+        pool = _KVPool(torch.zeros(2, device="tpu"))
+        original_pool = pool.value
+        callbacks = []
+
+        def fn(value):
+            pool.value.add_(value.sum(dim=0))
+            out = value + model.weight + model.object_state.value
+            direct_compile.insert_callback(out[0], callbacks.append)
+            return out
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+            model_extra_tensor_attrs=(
+                "object_state.value",
+                "object_state.weight_alias",
+            ),
+            kv_pool=pool,
+        )
+        values = [torch.full((bs, 2), float(bs), device="tpu") for bs in (1, 2, 4)]
+        compiler = direct_compile.tpu_torch_compile
+        with (
+            torch.no_grad(),
+            patch.object(compiler, "execute", wraps=compiler.execute) as execute,
+        ):
+            pending = [compiled.warmup_async(value) for value in values]
+            execute.assert_not_called()
+            self.assertEqual(len(compiled.cache), 3)
+            self.assertEqual(callbacks, [])
+            self.assertIs(pool.value, original_pool)
+            self.assertTrue(torch.equal(pool.value.cpu(), torch.zeros(2)))
+
+            expected_pool = torch.zeros(2)
+            for warmup, value in zip(pending, values):
+                actual = warmup.wait()
+                expected = value.cpu() + 3
+                expected_pool += value.cpu().sum(dim=0)
+                self.assertTrue(torch.equal(actual.cpu(), expected))
+                self.assertTrue(torch.equal(pool.value.cpu(), expected_pool))
+                self.assertTrue(torch.equal(callbacks[-1].cpu(), expected[0]))
+                self.assertIs(pool.value, original_pool)
+
+            replacement = torch.full((2, 2), 7.0, device="tpu")
+            self.assertTrue(
+                torch.equal(compiled(replacement).cpu(), torch.full((2, 2), 10.0))
+            )
+            self.assertEqual(len(compiled.cache), 3)
+            self.assertEqual(execute.call_count, 4)
+            self.assertEqual(len(callbacks), 4)
+            self.assertTrue(torch.equal(pool.value.cpu(), expected_pool + 14))
+            self.assertTrue(
+                all(
+                    artifact.pending_compile is None
+                    for artifact in compiled.cache.values()
+                )
+            )
+
+    def test_native_async_failure_propagates_before_execution(self):
+        artifact = _make_artifact(((2,),))
+        artifact.pending_compile = MagicMock()
+        artifact.pending_compile.get.side_effect = RuntimeError("native compile failed")
+        with patch.object(direct_compile.tpu_torch_compile, "execute") as execute:
+            with self.assertRaisesRegex(RuntimeError, "native compile failed"):
+                artifact(((torch.ones(2),), {}))
+            execute.assert_not_called()
 
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_preserves_model_and_argument_layouts(self):
@@ -1111,6 +1200,87 @@ class TestDirectCompile(CustomTestCase):
             artifact(((torch.ones(2),), {}))
 
         self.assertEqual(len(executed), 1)
+
+
+class _RankModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("bias", torch.zeros((), device="tpu"))
+
+    def forward(self, input_ids, positions, forward_batch):
+        mask = dp_attention._dp_rank_slot_mask(2, input_ids.device)
+        scale = dp_attention.attn_rank0_scale(input_ids)
+        return torch.where(mask[:, None], input_ids[None, :] * scale, self.bias)
+
+
+class _RankPolicy(DecoderTpuCompilePolicy):
+    def _direct_compile_specialization_key(self, metadata, input_ids, *args, **kwargs):
+        return tuple(input_ids.shape)
+
+
+class TestAttentionRankTensorScope(unittest.TestCase):
+    def test_nested_scopes_restore_rank_state_after_error(self):
+        original = {("attn_tp", torch.device("cpu")): torch.tensor(7)}
+        outer = (torch.tensor(0), torch.tensor(1))
+        inner = (torch.tensor(2), torch.tensor(3))
+        with patch.object(dp_attention, "_RANK_TENSORS", original):
+            with use_attention_rank_tensors(outer):
+                self.assertIs(
+                    dp_attention._rank_tensor("attn_dp", torch.device("cpu")), outer[1]
+                )
+                with self.assertRaisesRegex(RuntimeError, "trace failed"):
+                    with use_attention_rank_tensors(inner):
+                        self.assertIs(
+                            dp_attention._rank_tensor("attn_tp", torch.device("cpu")),
+                            inner[0],
+                        )
+                        raise RuntimeError("trace failed")
+                self.assertIs(
+                    dp_attention._rank_tensor("attn_dp", torch.device("cpu")), outer[1]
+                )
+            self.assertIs(dp_attention._RANK_TENSORS, original)
+
+
+@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+class TestDirectCompileDpRanks(unittest.TestCase):
+    def test_rank_selectors_are_runtime_inputs(self):
+        model = _RankModel()
+        policy = _RankPolicy(
+            model_runner=SimpleNamespace(
+                model=model, token_to_kv_pool=None, device="tpu"
+            ),
+            owner=model,
+            tracer="direct",
+        )
+        ranks = {
+            axis: torch.tensor(0, dtype=torch.int64, device="tpu")
+            for axis in ("attn_tp", "attn_dp")
+        }
+        cache = {
+            (axis, device): value
+            for axis, value in ranks.items()
+            for device in (torch.device("tpu"), value.device)
+        }
+        values = torch.tensor([2.0, 3.0], device="tpu")
+        backend = SimpleNamespace(forward_metadata=None)
+        with (
+            patch.object(dp_attention, "_RANK_TENSORS", cache),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            compiled, warmup_async = policy._direct_compile(model.forward)
+            torch.testing.assert_close(
+                warmup_async(values, None, None).wait().cpu(),
+                model(values, None, None).cpu(),
+            )
+            # Reuse one executable while changing both scalar rank buffers.
+            # Constants baked during tracing would return the first rank's result.
+            for tp_rank, dp_rank in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                ranks["attn_tp"].fill_(tp_rank)
+                ranks["attn_dp"].fill_(dp_rank)
+                expected = model(values, None, None).cpu()
+                actual = compiled(values, None, None).cpu()
+                torch.testing.assert_close(actual, expected)
+                self.assertIs(dp_attention._RANK_TENSORS, cache)
 
 
 if __name__ == "__main__":

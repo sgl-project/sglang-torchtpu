@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.compilation import direct_compile
 from sglang.srt.hardware_backend.tpu.graph_runner import (
     vit_tpu_compile_runner as vit_runner,
 )
@@ -22,6 +23,7 @@ from sglang.srt.layers.attention.vision import (
     VisionTpuAttention,
     _build_tpu_segment_ids,
 )
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
@@ -106,7 +108,91 @@ class _FakeVisionPolicy(VisionTpuCompilePolicy):
         return result[: ctx["real_rows"]]
 
 
+class _DirectVisionPolicy(_FakeVisionPolicy):
+    def make_warmup_inputs(self, patch_count):
+        return self.prepare_call(torch.zeros(patch_count, dtype=torch.int64))[0]
+
+    def get_compile_model(self):
+        return self.vit
+
+
 class TestViTTpuCompileRunner(unittest.TestCase):
+    def test_direct_warmup_queues_buckets_before_execution(self):
+        owner = SimpleNamespace(forward=lambda x, extra=None: x * 2)
+        recorder = CompileTimingRecorder()
+        policy = _DirectVisionPolicy(
+            nn.Identity(),
+            owner=owner,
+            compile_timing_recorder=recorder,
+            model_runner=SimpleNamespace(
+                server_args=SimpleNamespace(
+                    tpu_compile_tracer="direct",
+                    unsafe_save_torch_compile_bundle=None,
+                    unsafe_load_torch_compile_bundle=None,
+                )
+            ),
+        )
+        events = []
+        clock = SimpleNamespace(now=0.0)
+
+        def compile_artifact(args, kwargs, **options):
+            events.append(("compile", len(args[0]), options["async_compile"]))
+            clock.now += 1
+
+            def execute(call):
+                args, kwargs = call
+                events.append(("execute", len(args[0])))
+                clock.now += 2
+                return policy.compiled_fn.fn(*args, **kwargs)
+
+            return execute
+
+        def synchronize(*args, **kwargs):
+            clock.now += 3
+
+        with (
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            patch.object(vit_runner, "_precompiled_max_patch_count", None),
+            patch.object(
+                vit_runner, "time", SimpleNamespace(perf_counter=lambda: clock.now)
+            ),
+            patch.object(vit_runner, "tpu_sync", side_effect=synchronize) as sync,
+            patch.object(
+                direct_compile.CompiledFunction,
+                "_compile",
+                side_effect=compile_artifact,
+            ),
+        ):
+            self.assertTrue(policy.install())
+            self.assertIs(owner.forward, policy.compiled_fn)
+            pending = policy.precompile([4, 8])
+            self.assertEqual(events, [("compile", 4, True), ("compile", 8, True)])
+            sync.assert_not_called()
+            self.assertEqual(recorder.snapshot(), [])
+
+            clock.now += 100  # Other warmups must not inflate this shape's timing.
+            for call in pending:
+                call.wait()
+            self.assertEqual(events[-2:], [("execute", 4), ("execute", 8)])
+            self.assertEqual(sync.call_count, 2)
+            self.assertTrue(all(c.kwargs["wait"] for c in sync.call_args_list))
+            steps = recorder.snapshot()
+            self.assertEqual([step["num_tokens"] for step in steps], [4, 8])
+            self.assertEqual([step["duration_seconds"] for step in steps], [6, 6])
+
+            self.assertEqual(policy.run(torch.arange(4)).tolist(), [0, 2])
+            self.assertEqual(len(policy.compiled_fn.cache), 2)
+
+    def test_default_policy_keeps_dynamo_with_async_enabled(self):
+        policy = _FakeVisionPolicy(
+            model_runner=SimpleNamespace(
+                server_args=SimpleNamespace(tpu_compile_tracer="direct")
+            )
+        )
+        with envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True):
+            compiled = policy._compile_method(lambda x: x, use_bundle=False)
+        self.assertNotIsInstance(compiled, direct_compile.CompiledFunction)
+
     def test_policy_declares_tpu_platform(self):
         self.assertEqual(VisionTpuCompilePolicy.platform, "tpu")
 
@@ -178,15 +264,26 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         self.assertEqual(ladder[-1], 4900)
 
     def test_precompile_publishes_the_top_warmed_bucket(self):
-        policy = _FakeVisionPolicy()
+        recorder = CompileTimingRecorder()
+        policy = _FakeVisionPolicy(compile_timing_recorder=recorder)
         policy.owner = SimpleNamespace()
         policy.compiled_fn = MagicMock(return_value=torch.zeros(1))
         with (
             patch.object(vit_runner, "_precompiled_max_patch_count", None),
             patch.object(vit_runner, "tpu_sync"),
+            patch.object(
+                vit_runner,
+                "time",
+                SimpleNamespace(
+                    perf_counter=MagicMock(side_effect=[0, 1, 10, 12, 20, 23])
+                ),
+            ),
         ):
             policy.precompile(patch_counts=[196, 324, 4900])
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 4900)
+        steps = recorder.snapshot()
+        self.assertEqual([step["num_tokens"] for step in steps], [196, 324, 4900])
+        self.assertEqual([step["duration_seconds"] for step in steps], [1, 2, 3])
 
     def test_qwen3_vl_warmup_covers_the_whole_pass_not_just_the_compiled_region(self):
         """Warmup must enter at the encoder, ahead of patch_embed.

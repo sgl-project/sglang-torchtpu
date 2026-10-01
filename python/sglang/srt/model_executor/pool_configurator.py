@@ -150,8 +150,8 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
             ROW_ALIGNMENT,
         )
 
-        # The estimator reports raw INT8 payload bytes. Quantization groups
-        # vary, but physical exponent rows retain their fixed alignment.
+        # The estimator reports raw INT8 payload bytes. Exponent-byte rows share
+        # the payload's INT8 page and pad to a whole 32-row tile.
         group_size = getattr(
             getattr(kvc, "server_args", None), "tpu_mxint8_group_size", 32
         )

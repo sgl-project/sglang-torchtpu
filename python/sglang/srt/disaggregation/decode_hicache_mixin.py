@@ -240,10 +240,13 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
+        # Look up only the first decode_prefix_len tokens, the ones decode told
+        # prefill it already holds. Prefill sends the rest, and admission reserved
+        # device slots only for these tokens.
         rematch = match_prefix_for_req(
             self.tree_cache,
             dr.req,
-            dr.req.origin_input_ids,
+            dr.req.origin_input_ids[: pm.decode_prefix_len],
             cow_mamba=False,
             include_req=True,
         )
