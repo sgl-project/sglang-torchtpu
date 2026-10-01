@@ -1,14 +1,14 @@
 """Unit tests for the TPU raiden hybrid (full + SWA) KV-offload path.
 
-Covers the hardware-agnostic contracts with fake pools/futures (no TPU, no
-raiden): the hybrid assembler consults the platform host-pool hook (the bug
-that routed TPU hybrid models to the CUDA host pool), each transfer issues one
-all-layer DMA per pool and its ack completes only when every pool's DMA has
-landed, load-back keeps index tensors host-resident by rewriting the
+Covers the hardware-agnostic contracts with fake pools/futures and a CPU model
+of raiden (no TPU): the hybrid assembler consults the platform host-pool hook
+(the bug that routed TPU hybrid models to the CUDA host pool), each transfer
+issues one all-layer DMA per pool and its ack completes only when every pool's
+DMA has landed, load-back keeps index tensors host-resident by rewriting the
 tree-owned PoolTransfer in place, a transfer with SWA pages but no Full pages
-leaves the Full pool's KV untouched, and speculative-decoding draft sidecars ride
-the same rounds (draft DMA issued per transfer, reload ack gates on it, draft
-device pool wired to the whole-batch counter, host pool picked via the
+leaves the Full pool's KV untouched, and speculative-decoding draft sidecars
+ride the same rounds (draft DMA issued per transfer, reload ack gates on it,
+draft device pool wired to the whole-batch counter, host pool picked via the
 platform hook).
 """
 
@@ -267,7 +267,7 @@ class TestHybridLoad(CustomTestCase):
         swa_alloc.assert_called_once_with(4)
 
 
-class _ReadyRaidenFuture:
+class _FakeReadyFuture:
     def is_ready(self) -> bool:
         return True
 
@@ -275,7 +275,7 @@ class _ReadyRaidenFuture:
         return True
 
 
-class _RaidenManagerModel:
+class _FakeRaidenManager:
     """CPU model of raiden's ``d2h`` / ``h2d`` over one sub-pool's layers.
 
     A non-empty page list copies those pages in every layer. An empty list
@@ -296,17 +296,17 @@ class _RaidenManagerModel:
             self.host[:, : self.device.shape[1]] = self.device
         else:
             self.host[:, host_pages] = self.device[:, device_pages]
-        return _ReadyRaidenFuture()
+        return _FakeReadyFuture()
 
     def h2d(self, host_pages, device_pages, block_counts):
         if not host_pages:
             self.device[:] = self.host[:, : self.device.shape[1]]
         else:
             self.device[:, device_pages] = self.host[:, host_pages]
-        return _ReadyRaidenFuture()
+        return _FakeReadyFuture()
 
 
-def _raiden_host_pool(mgr: _RaidenManagerModel, page_size: int):
+def _raiden_host_pool(mgr: _FakeRaidenManager, page_size: int):
     """A real raiden host pool and transfer driving ``mgr``."""
     pool = object.__new__(TpuRaidenHostKVCache)
     pool.page_size = page_size
@@ -332,8 +332,8 @@ class TestHybridTransferWithoutFullPages(CustomTestCase):
     PAGE_SIZE = 2
 
     def setUp(self):
-        self.full_mgr = _RaidenManagerModel(layers=2, device_pages=4, host_pages=8)
-        self.swa_mgr = _RaidenManagerModel(layers=2, device_pages=4, host_pages=8)
+        self.full_mgr = _FakeRaidenManager(layers=2, device_pages=4, host_pages=8)
+        self.swa_mgr = _FakeRaidenManager(layers=2, device_pages=4, host_pages=8)
         self.ctrl = _make_controller()
         self.ctrl.mem_pool_host = HostPoolGroup(
             [
