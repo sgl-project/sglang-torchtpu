@@ -33,6 +33,8 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 
 WORKLOAD = "8k1k"
+# CONCUR must match CONCURRENCY in the launch config: the server is sized for
+# it, and a client driving more would measure a pool-bound shape.
 ISL, OSL, CONCUR = 8192, 1024, 16
 
 MODEL = "google/gemma-4-26B-A4B-it"
@@ -46,7 +48,7 @@ MODEL_CONFIG = {
     "display_name": "Gemma 4 26B-A4B",
     "variant": "TP8+EP8",
     "launch": {
-        "recipe": "recipe/gemma4_26b_a4b_perf_tp8.sh",
+        "config": "recipe/configs/gemma4_26b_a4b/perf.py",
         "env": {"MODEL": WEIGHTS},
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-gemma4-26b-a4b",

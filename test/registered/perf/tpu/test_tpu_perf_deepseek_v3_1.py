@@ -31,6 +31,8 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "2400"))
 
 WORKLOAD = "8k1k"
+# CONCUR must match CONCURRENCY in the launch config: the server is sized for
+# it, and a client driving more would measure a pool-bound shape.
 ISL, OSL, CONCUR = 8192, 1024, 16
 
 MODEL = "deepseek-ai/DeepSeek-V3.1"
@@ -44,16 +46,10 @@ MODEL_CONFIG = {
     "display_name": "DeepSeek V3.1",
     "variant": "TP8+EP8-FP8KV",
     "launch": {
-        # The R1-0528 recipe: V3.1 is the same 671B blockwise-fp8 architecture,
-        # and the only per-checkpoint delta is MODEL.
-        "recipe": "recipe/deepseek_v3_perf_tp8.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "EXTRA_ARGS": f"--served-model-name {MODEL}",
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-        },
+        # Imports the R1-0528 config: same 671B blockwise-fp8 architecture, so
+        # the only per-checkpoint deltas are the path and the served name.
+        "config": "recipe/configs/deepseek_v3_1/perf.py",
+        "env": {"MODEL": WEIGHTS},
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-v3-1",
     },

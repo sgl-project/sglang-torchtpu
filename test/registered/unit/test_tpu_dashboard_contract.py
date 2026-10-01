@@ -287,13 +287,16 @@ class TestNightlyConfigLabelLint(CustomTestCase):
     def test_perf_measures_through_recipe_and_bench_serving_only(self):
         # RecipeLauncher + bench_serving.sh is what puts the server/bench config
         # panels on the dashboard; a hand-booted server or hand-rolled bench
-        # produces a chart nobody can reproduce from.
+        # produces a chart nobody can reproduce from. Either launch form goes
+        # through RecipeLauncher and dumps launch_meta.json: `config` is a Python
+        # recipe served by benchmark.tpu.launch_server, `recipe` a shell script.
         for path, mod in self.perf:
             config = mod.MODEL_CONFIG
             launch = config.get("launch") or {}
             self.assertTrue(
-                launch.get("recipe"),
-                f"{path.name}: perf must launch through a recipe (RecipeLauncher)",
+                launch.get("recipe") or launch.get("config"),
+                f"{path.name}: perf must launch through a recipe or a launcher "
+                "config (RecipeLauncher)",
             )
             self.assertFalse(launch.get("external"), path.name)
             for gate in config["gates"]:

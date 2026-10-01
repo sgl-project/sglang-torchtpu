@@ -43,6 +43,8 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 # 8192 in + 1024 out, the same shape gpt-oss-120b and the DeepSeek pair are
 # measured at, so the models sit on one axis of the Workload dropdown.
 WORKLOAD = "8k1k"
+# CONCUR must match CONCURRENCY in the launch config: the server is sized for
+# it, and a client driving more would measure a pool-bound shape.
 ISL, OSL, CONCUR = 8192, 1024, 16
 
 MODEL = "google/gemma-4-31B-it"
@@ -58,9 +60,9 @@ MODEL_CONFIG = {
     "display_name": "Gemma 4 31B",
     "variant": "TP8",
     "launch": {
-        # Thin shell entry point over the Python config; MODEL is the only
-        # delta the measurement supplies, since the config owns the shape.
-        "recipe": "recipe/gemma4_31b_perf_tp8.sh",
+        # Derives from server.py next to it, so a tuning change to the serve
+        # moves this trend with it.
+        "config": "recipe/configs/gemma4_31b/perf.py",
         "env": {"MODEL": WEIGHTS},
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-gemma4-31b",

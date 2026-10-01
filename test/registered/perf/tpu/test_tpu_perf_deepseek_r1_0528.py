@@ -41,6 +41,8 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "2400"))
 # 8192 in + 1024 out, named for the dashboard's Workload dropdown -- the same
 # shape gpt-oss-120b is measured at, so the models sit on one axis.
 WORKLOAD = "8k1k"
+# CONCUR must match CONCURRENCY in the launch config: the server is sized for
+# it, and a client driving more would measure a pool-bound shape.
 ISL, OSL, CONCUR = 8192, 1024, 16
 
 # Served from the shared weights PVC at /weights; the canonical HF id is what the
@@ -59,17 +61,10 @@ MODEL_CONFIG = {
     "display_name": "DeepSeek R1-0528",
     "variant": "TP8+EP8-FP8KV",
     "launch": {
-        # The recipe derives context, prefill chunk and compile buckets from
-        # ISL/OSL/CONCUR; everything else about how this model is served lives
-        # there, not here.
-        "recipe": "recipe/deepseek_v3_perf_tp8.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "EXTRA_ARGS": f"--served-model-name {MODEL}",
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-        },
+        # Serving config, launched through benchmark.tpu.launch_server. It
+        # owns the shape; a `config` launch reads only MODEL/HOST/PORT from env.
+        "config": "recipe/configs/deepseek_r1_0528/perf.py",
+        "env": {"MODEL": WEIGHTS},
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-r1-0528",
     },

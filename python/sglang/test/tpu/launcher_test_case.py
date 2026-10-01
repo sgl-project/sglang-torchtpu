@@ -1,14 +1,16 @@
 """Class fixtures that invoke the shared TPU launcher as a separate program."""
 
-import json
 import os
-import sys
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
 from typing import ClassVar
 
-from sglang.test.tpu.eval_support import RecipeLauncher, wait_for_health
+from sglang.test.tpu.eval_support import (
+    RecipeLauncher,
+    python_launcher_command,
+    wait_for_health,
+)
 
 
 class TPULauncherTestCase(unittest.TestCase):
@@ -47,32 +49,11 @@ class TPULauncherTestCase(unittest.TestCase):
     @classmethod
     def _start_launcher(cls, config_module, runtime_envs, *, log_path=None):
         root = Path(cls.repo_root).absolute()
-        if os.environ.get("RUNFILES_DIR") or os.environ.get("RUNFILES_MANIFEST_FILE"):
-            from python.runfiles import runfiles
-
-            executable = runfiles.Create().Rlocation(
-                "sglang_torchtpu/benchmark/tpu/launch_server"
-            )
-            if not executable or not Path(executable).is_file():
-                raise FileNotFoundError(
-                    "Missing Bazel launcher; depend on //python:tpu_launcher_test_support"
-                )
-            command = [executable]
-        else:
-            if not (root / "benchmark/tpu/launch_server.py").is_file():
-                raise FileNotFoundError(
-                    f"No TPU launcher in {root}; set repo_root to the repository checkout"
-                )
-            command = [sys.executable, "-u", "-m", "benchmark.tpu.launch_server"]
-        command.extend(
-            [
-                "--config",
-                config_module,
-                "--runtime-envs",
-                json.dumps(dict(runtime_envs)),
-                "--working-directory",
-                os.path.abspath(cls.cwd or root / "benchmark/tpu"),
-            ]
+        command = python_launcher_command(
+            config_module,
+            repo_root=root,
+            working_directory=cls.cwd or root / "benchmark/tpu",
+            runtime_envs=dict(runtime_envs),
         )
         launcher = RecipeLauncher(
             command=command,

@@ -34,6 +34,8 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "2400"))
 
 WORKLOAD = "8k1k"
+# CONCUR must match CONCURRENCY in the launch config: the server is sized for
+# it, and a client driving more would measure a pool-bound shape.
 ISL, OSL, CONCUR = 8192, 1024, 16
 
 # No public HF id for this checkpoint, so the mount path is the served name too.
@@ -48,13 +50,8 @@ MODEL_CONFIG = {
     "display_name": "Kimi K2.6",
     "variant": "TP8+EP8-INT4-FP8KV",
     "launch": {
-        "recipe": "recipe/kimi_k26_perf_tp8.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-        },
+        "config": "recipe/configs/kimi_k26/perf.py",
+        "env": {"MODEL": WEIGHTS},
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-kimi-k26",
     },

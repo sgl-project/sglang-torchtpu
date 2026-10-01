@@ -97,6 +97,52 @@ def _tee_log(pipe, log):
                 pass  # Keep file logging if the caller's stdout has closed.
 
 
+REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+def python_launcher_command(
+    config_module: str,
+    *,
+    repo_root: Path | str = REPO_ROOT,
+    working_directory: Path | str | None = None,
+    runtime_envs: dict[str, str | None] | None = None,
+) -> list[str]:
+    """argv for benchmark.tpu.launch_server serving one Python recipe.
+
+    The one way a test starts a TPU server from a recipe module, so a CI boot and
+    a hand-run repro are the same command. Runs from the repository root (the
+    module is not part of the installed package) and serves from benchmark/tpu.
+    """
+    root = Path(repo_root).absolute()
+    if os.environ.get("RUNFILES_DIR") or os.environ.get("RUNFILES_MANIFEST_FILE"):
+        from python.runfiles import runfiles
+
+        executable = runfiles.Create().Rlocation(
+            "sglang_torchtpu/benchmark/tpu/launch_server"
+        )
+        if not executable or not Path(executable).is_file():
+            raise FileNotFoundError(
+                "Missing Bazel launcher; depend on //python:tpu_launcher_test_support"
+            )
+        command = [executable]
+    else:
+        if not (root / "benchmark/tpu/launch_server.py").is_file():
+            raise FileNotFoundError(
+                f"No TPU launcher in {root}; set repo_root to the repository checkout"
+            )
+        command = [sys.executable, "-u", "-m", "benchmark.tpu.launch_server"]
+    command.extend(["--config", config_module])
+    if runtime_envs is not None:
+        command.extend(["--runtime-envs", json.dumps(dict(runtime_envs))])
+    command.extend(
+        [
+            "--working-directory",
+            os.path.abspath(working_directory or root / "benchmark/tpu"),
+        ]
+    )
+    return command
+
+
 class RecipeLauncher:
     """Manage a shell recipe or an explicit launcher command.
 
