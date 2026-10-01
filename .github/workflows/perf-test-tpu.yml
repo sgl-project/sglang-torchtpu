@@ -21,7 +21,8 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, gpt-oss-120b, deepseek-r1-0528, deepseek-v3-1, kimi-k26, gemma4-31b, gemma4-26b-a4b]
+        options: [all, gpt-oss-120b, deepseek-r1-0528, deepseek-v3-1, kimi-k26, gemma4-31b,
+          gemma4-26b-a4b, qwen3-5-397b]
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -124,6 +125,58 @@ jobs:
       nightly: true
       weights_pvc: ${{ matrix.entry.weights_pvc }}
       timeout_per_file: ${{ matrix.entry.timeout }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Multi-host perf: the JobSet runs the recipe on every host of the slice and
+  # rank 0 measures against it, so these are discovered from their own suite
+  # rather than listed in the single-host matrix above.
+  discover-multihost:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","qwen3-5-397b"]'), inputs.model || 'all') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      groups: ${{ steps.d.outputs.groups }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - id: d
+        run: |
+          set -euo pipefail
+          groups="$(python3 .github/tpu-ci/discover_multihost.py \
+                      --suite nightly-tpu-perf-multihost-qwen3-5-397b)"
+          echo "groups=$groups" >> "$GITHUB_OUTPUT"
+          echo "discovered groups: $groups"
+
+  perf-multihost:
+    needs: [build, discover-multihost]
+    if: >-
+      ${{ !cancelled() && needs.discover-multihost.result == 'success'
+          && needs.discover-multihost.outputs.groups != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.discover-multihost.outputs.groups) }}
+    name: ${{ matrix.group.name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ matrix.group.name }}
+      lane: nightly
+      nightly: true
+      launch_script: ${{ matrix.group.launch_script }}
+      files: ${{ matrix.group.files }}
+      hosts: ${{ matrix.group.hosts }}
+      weights_pvc: ${{ matrix.group.weights_pvc }}
+      timeout_per_file: ${{ matrix.group.timeout_per_file }}
+      run_name: ${{ matrix.group.run_name }}
     permissions:
       contents: read
       id-token: write
