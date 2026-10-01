@@ -217,6 +217,8 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-deepseek-r1-0528",
         "nightly-tpu-perf-deepseek-v3-1",
         "nightly-tpu-perf-kimi-k26",
+        "nightly-tpu-perf-gemma4-31b",
+        "nightly-tpu-perf-gemma4-26b-a4b",
         "nightly-perf-tpu",
         # One suite per quality eval so each gets an independent TPU slice.
         "nightly-tpu-accuracy-gpt-oss-120b-aime",
