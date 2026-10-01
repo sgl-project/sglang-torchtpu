@@ -306,21 +306,12 @@ class TestNightlyConfigLabelLint(CustomTestCase):
         for path, mod in self.perf:
             config = mod.MODEL_CONFIG
             launch = config.get("launch") or {}
-            multihost = getattr(mod, "MULTIHOST_LAUNCH", None) or {}
             self.assertTrue(
-                launch.get("recipe")
-                or self._fixture_config_module(mod)
-                or multihost.get("launch_script"),
+                launch.get("recipe") or self._fixture_config_module(mod),
                 f"{path.name}: perf must serve through a recipe -- launch.recipe, "
-                "a TPULauncherTestCase subclass with config_module, or a "
-                "MULTIHOST_LAUNCH the JobSet runs",
+                "or a TPULauncherTestCase subclass with config_module",
             )
-            # A multi-host server is the JobSet's to launch: every host runs the
-            # recipe, which a per-test launcher on rank 0 cannot do. Single-host
-            # perf has no such excuse -- `external` there means a server nobody
-            # can reproduce from the dashboard's config panels.
-            if not multihost:
-                self.assertFalse(launch.get("external"), path.name)
+            self.assertFalse(launch.get("external"), path.name)
             for gate in config["gates"]:
                 self.assertTrue(
                     "sweep" in gate or gate.get("smoke"),

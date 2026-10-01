@@ -1,35 +1,39 @@
-"""Throughput sweep for Qwen3.5-397B-A17B on the 8k1k workload, tp16 / 2 hosts.
+"""Throughput sweep for Qwen3.5-397B-A17B-FP8 on the 8k1k workload, tp8.
 
-The single-host siblings in this directory launch their own server through
-TPULauncherTestCase. This one cannot: 397B of bf16 weights needs both hosts of a
-2x2x2 slice, and every host has to run the recipe. So the JobSet launches
-recipe/configs/qwen3_5_397b/perf.py on both and rank 0 attaches to it, the same
-split the multi-host accuracy files use.
+tpu/nightly-perf/test_tpu_perf_gpt_oss_120b.py carries the ADDING A MODEL guide.
+What is specific to this model:
 
-Text only: the checkpoint serves images, but a random-ids sweep sends none.
+  * hybrid: 45 of 60 layers are GDN linear attention with a fixed-size recurrent
+    state, 15 are full attention. The recurrent slots bill against the same token
+    budget as KV, so the config sizes the pool for both and keeps four spare
+    slots -- without them a replacement request waits on one specific request to
+    finish (p99 TTFT 10797 ms vs 1108 ms, measured at c4).
+  * TEXT ONLY, which is what makes the RoPE cache slice and skipping the ViT
+    precompile safe.
+
+Serving config lives in recipe/configs/qwen3_5_397b/perf.py, ported from the
+measured recipe on branch haolin/qwen35-recipe-dp-attention -- the same 8k1k
+shape its published numbers came from.
 """
 
 import os
+import unittest
+from typing import ClassVar
+from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
-from sglang.test.tpu import model_config_main
+from sglang.test.tpu import run_model_config
+from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
-    est_time=5400,
-    suite="nightly-tpu-perf-multihost-qwen3-5-397b",
+    est_time=3600,
+    suite="nightly-tpu-perf-qwen3-5-397b",
     nightly=True,
-    labels=["multihost", "qwen3.5-397b", "perf"],
+    labels=["singlehost", "qwen3.5-397b", "perf"],
 )
 
-MULTIHOST_LAUNCH = {
-    "hosts": 2,
-    "launch_script": "recipe/configs/qwen3_5_397b/perf.py",
-    "weights_pvc": "model-weights",
-    "timeout_per_file": 5400,
-}
-
-BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
+LAUNCH_CONFIG_MODULE = "recipe/configs/qwen3_5_397b/perf.py"
+BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 
 # 8192 in + 1024 out, the same shape the other models on this lane are measured
@@ -39,8 +43,8 @@ WORKLOAD = "8k1k"
 # it, and a client driving more would measure a pool-bound shape.
 ISL, OSL, CONCUR = 8192, 1024, 16
 
-MODEL = "Qwen/Qwen3.5-397B-A17B"
-WEIGHTS = "/weights/Qwen3.5-397B-A17B"
+MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
+WEIGHTS = "/weights/Qwen3.5-397B-A17B-FP8"
 
 
 MODEL_CONFIG = {
@@ -50,18 +54,7 @@ MODEL_CONFIG = {
     # rename is recorded in .github/tpu-ci/dashboard_aliases.json instead.
     "id": "perf-qwen3-5-397b",
     "display_name": "Qwen3.5 397B-A17B",
-    "variant": "2host-TP16+EP16",
-    "launch": {
-        # The JobSet owns the server: it runs the recipe on every host of the
-        # slice, which a per-test launcher on rank 0 cannot do.
-        "external": True,
-        "health_timeout": HEALTH_TIMEOUT,
-        "tag": "perf-qwen3-5-397b",
-    },
-    "skip_unless": (
-        os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
-        "multi-host live-server not provided (the JobSet launches the server)",
-    ),
+    "variant": "TP8+EP8-FP8",
     "gates": [
         {
             "dataset": "bench_serving",
@@ -90,5 +83,22 @@ MODEL_CONFIG = {
 }
 
 
+class TestQwen35397BPerfSingleHost(TPULauncherTestCase):
+    config_module = LAUNCH_CONFIG_MODULE
+    base_url = BASE_URL
+    health_timeout = HEALTH_TIMEOUT
+    health_endpoint = "/health_generate"
+    tag = "perf-qwen3-5-397b"
+    runtime_envs: ClassVar[dict[str, str | None]] = {
+        # Drop an inherited MODEL so the config's own checkpoint path wins.
+        "MODEL": None,
+        "HOST": urlsplit(BASE_URL).hostname,
+        "PORT": str(urlsplit(BASE_URL).port),
+    }
+
+    def test_throughput(self):
+        run_model_config(MODEL_CONFIG, base_url=self.base_url)
+
+
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    unittest.main()
