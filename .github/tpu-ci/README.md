@@ -627,60 +627,39 @@ The old per-manifest files (`job-integration.yaml`, `job-nightly.yaml`,
 `jobset-nightly.yaml`) and `_tpu-test-stage.yml` were replaced by the unified
 template + `_tpu-build`/`_tpu-test`.
 
-### Full accuracy runs from an unmerged branch
+### Accuracy evals: what runs when
 
-The scheduled accuracy suite includes R1-0528 (GPQA, AIME25, full MMLU-Redux
-2.0), V3.1, GPT-OSS-20B, Gemma-4-31B and Gemma-4-26B-A4B (AIME26, GPQA,
-MMMU-Pro each), Qwen3.5-397B (MMMU-Pro) and two Kimi MMMU-Pro shards.
+`accuracy-test-tpu.yml` owns every accuracy model. Serving settings are Python
+`CONFIG` recipes under `benchmark/tpu/recipe/configs/<model>/`, launched by
+`benchmark/tpu/launch_server.py` -- single-host through `TPULauncherTestCase`,
+multi-host by the JobSet, which runs the same config on every host.
 
-MMMU-Pro stays off the nightly's slices. `accuracy-test-tpu.yml` runs it on its
-own schedule, in Pacific time: the Kimi shards at 10:00 (`model=mmmu-kimi`, both
-2-host slices for up to ~5 h), and both Gemma 4 sizes plus Qwen3.5 at 17:00
-(`model=mmmu-gemma4-qwen35`, two 1-host slices and one 2-host slice). Scheduled
-runs reach the dashboard like the nightly's; they appear after the next daily
-sync (12:00 UTC). `model=nightly` is everything else.
+| when | `model` | evals |
+|---|---|---|
+| nightly 00:30 PT (stage [2]) | `nightly` | R1-0528, V3.1, GPT-OSS-20B, Gemma 4 31B + 26B-A4B (AIME/GPQA) |
+| 10:00 PT | `mmmu-kimi` | both Kimi K2.6 MMMU-Pro shards (2 x 2-host) |
+| 17:00 PT | `mmmu-gemma4-qwen35` | Gemma 4 MMMU-Pro (2 x 1-host), Qwen3.5-397B MMMU-Pro (2-host) |
 
-Each Kimi shard uses its
-own two-host 2x2x2 slice and evaluates 865 distinct questions, one pass at 98,304
-output tokens. The two independent TP16/EP16 servers provide data parallelism
-by splitting requests; each uses DP size 1 with DP attention disabled, 128
-client threads, and a 4,096-token prefill budget. The collector rejects
-missing/duplicate IDs and reports the
-combined 1,730-question score. Predictions and metrics are retained in the
-`full-evaluation-results` workflow artifact.
+MMMU-Pro has its own slots because it is the long pole; everything else stays in
+the nightly. Scheduled runs reach the dashboard without opting in, at the next
+daily sync (12:00 UTC).
 
-GPT-OSS-20B evaluates AIME25 four times in one shared 128-thread pool (120
-responses total), then averages the per-sample scores. GPQA runs once and MMLU
-uses one 250-question subset; all three use high reasoning and a 131,072-token
-output request capped by the remaining model context. Its single TP8/EP8 server
-admits up to 128 requests. V3.1 also retains a single 250-question MMLU subset.
-These gates use the existing pinned sgl-eval harness, not the OpenAI CLI used
-by the separate manual tpu-inference comparison.
+Three scoring facts the configs do not carry:
 
-Each Gemma 4 size runs one single-host job per benchmark, and Qwen3.5-397B one
-two-host job; all score the 1,730 MMMU-Pro questions with sgl-eval's own grader,
-thinking on through `enable_thinking`. Gemma 4 publishes it as `mmmu_pro_strict`,
-apart from the lenient manual re-grades: 31B answers `Answer: $X`, which that
-grader misses.
+- **Kimi MMMU-Pro is sharded** across two servers, 865 questions each.
+  `collect_full_evals.py` rejects a missing or duplicated id and reports the
+  combined 1,730-question score; a shard alone is not the benchmark.
+- **Gemma 4 publishes `mmmu_pro_strict`**, a series of its own: 31B answers
+  `Answer: $X`, which sgl-eval's grader scores wrong, so these numbers sit far
+  below the lenient manual re-grades.
+- **Redux scores 5,431 of 5,700 rows** -- those marked `ok`, plus the ones whose
+  corrected answer key is unambiguous. It is neither the original
+  14,042-question MMLU nor an exact model-card reproduction.
 
-Redux generates all 5,700 rows at 65,536 output tokens, scoring only rows marked
-`ok` or with an unambiguous corrected answer key (5,431 rows in the pinned
-revision). This preserves the September experiment's protocol; it is not the
-original 14,042-question MMLU benchmark or an exact model-card reproduction.
-
-Run the same accuracy configuration from an unmerged branch:
+Run the whole set from an unmerged branch (`full-set` is every model, both
+schedules included):
 
 ```sh
-gh workflow run accuracy-test-tpu.yml --ref test/deepseek-r1-0528-dpa \
-  -f ref=test/deepseek-r1-0528-dpa -f model=full-set -f update-dashboard=false
+gh workflow run accuracy-test-tpu.yml --ref <branch> \
+  -f ref=<branch> -f model=full-set -f update-dashboard=false
 ```
-
-`model=full-set` selects one serving configuration each for R1-0528, V3.1,
-GPT-OSS-20B, both Gemma 4 sizes, Qwen3.5-397B and Kimi. Kimi has two jobs using the same recipe, solely to split
-MMMU-Pro into disjoint halves. The former R1 DPA variant and older on-demand
-R1/Kimi accuracy entries are removed. Feature-specific tests remain separate.
-
-Model settings are Python `CONFIG` recipes under `benchmark/tpu/recipe/configs/`,
-launched by `benchmark/tpu/launch_server.py`; single-host tests boot them through
-`TPULauncherTestCase`. Kimi uses main's native W4A16 path; this PR does not add #725's
-optimized kernel or claim its previously measured performance.

@@ -245,9 +245,11 @@ class TestJobMapsToOneTest(CustomTestCase):
 
         groups = discover("full-set")
         recipes = [g["launch_script"] for g in groups]
-        self.assertEqual(recipes.count("recipe/deepseek_r1_0528_fp8kv_mh.sh"), 1)
-        self.assertEqual(recipes.count("recipe/kimi_k26_mmmu.sh"), 2)
-        self.assertEqual(recipes.count("recipe/qwen3_5_397b_mh.sh"), 1)
+        self.assertEqual(
+            recipes.count("recipe/configs/deepseek_r1_0528/accuracy.py"), 1
+        )
+        self.assertEqual(recipes.count("recipe/configs/kimi_k26/mmmu.py"), 2)
+        self.assertEqual(recipes.count("recipe/configs/qwen3_5_397b/server.py"), 1)
         for group in groups:
             self.assertTrue((REPO / "benchmark/tpu" / group["launch_script"]).is_file())
             # A hosted runner has six hours, including startup and cleanup.

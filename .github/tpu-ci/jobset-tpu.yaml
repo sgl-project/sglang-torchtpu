@@ -6,7 +6,8 @@
 #   TOPOLOGY/POOL node labels (looked up by host count in topology.yaml)
 #   RUN_NAME      DNS-safe label for the JobSet (a suite name or a launch-group name)
 #   SUITE         single-host: the run_suite suite; NIGHTLY_FLAG: --nightly or empty
-#   LAUNCH_SCRIPT multi-host: the launch group's recipe (relative to benchmark/tpu/)
+#   LAUNCH_SCRIPT multi-host: the launch group's recipe (relative to benchmark/tpu/);
+#                 a .py is a recipe config run by benchmark/tpu/launch_server.py
 #   TEST_FILES    multi-host: space-separated test files rank-0 runs against the server
 #   WEIGHTS_VOLUME / WEIGHTS_MOUNT   indented YAML blocks (empty when no weights PVC)
 #   TIMEOUT_PER_FILE per-file timeout (run_suite.py single-host; `timeout` per live-server file)
@@ -165,8 +166,17 @@ ${WEIGHTS_VOLUME}
                       # that does not exist. Printed once, unconditionally, so attribution never
                       # depends on how far the run got.
                       echo "== test files: ${TEST_FILES} =="
+                      # A .py launch script is a recipe config the Python launcher runs
+                      # directly (it resolves this host's rank from the JobSet topology);
+                      # anything else is a shell recipe that execs launch_server.sh itself.
+                      case "${LAUNCH_SCRIPT}" in
+                        *.py) launch=(python3 -m benchmark.tpu.launch_server
+                                      --config "${LAUNCH_SCRIPT}"
+                                      --working-directory benchmark/tpu) ;;
+                        *)    launch=(bash "benchmark/tpu/${LAUNCH_SCRIPT}") ;;
+                      esac
                       ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
-                          bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > >(tee /tmp/server.log) 2>&1 &
+                          "${launch[@]}" ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!
                       if [ "$RANK" = "0" ]; then
                         ok=0

@@ -15,7 +15,7 @@ register_tpu_ci(
 )
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/kimi_k26_mmmu.sh",
+    "launch_script": "recipe/configs/kimi_k26/mmmu.py",
     "weights_pvc": "model-weights",
     "timeout_per_file": 14400,
 }

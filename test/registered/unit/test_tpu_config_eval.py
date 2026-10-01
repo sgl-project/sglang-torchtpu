@@ -134,19 +134,28 @@ class TestAccuracyRecipes(unittest.TestCase):
                 self.assertEqual(plan.env["SGLANG_TPU_PRELOAD_TELEMETRY_STUB"], "1")
                 self.assertIn("--enable-torch-compile", plan.command)
 
-    def test_multihost_shell_recipes_exec_their_python_config(self):
-        for recipe in self.MULTIHOST:
-            name = {
-                "deepseek_r1_0528": "deepseek_r1_0528_fp8kv_mh.sh",
-                "deepseek_v3_1": "deepseek_v3_1_fp8kv_mh.sh",
-                "kimi_k26": "kimi_k26_mmmu.sh",
-                "qwen3_5_397b": "qwen3_5_397b_mh.sh",
-            }[recipe.split("/")[2]]
-            with self.subTest(script=name):
-                script = (ROOT / "benchmark/tpu/recipe" / name).read_text()
-                self.assertIn(
-                    "-m benchmark.tpu.launch_server --config " + recipe, script
-                )
+    def test_every_multihost_accuracy_test_launches_one_of_these_recipes(self):
+        """The JobSet runs MULTIHOST_LAUNCH["launch_script"] on every host.
+
+        A .py value is handed to the Python launcher by jobset-tpu.yaml; a typo
+        would only surface as a JobSet that never serves.
+        """
+        import ast
+
+        declared = set()
+        for path in sorted(
+            (ROOT / "test/registered/tpu/nightly-accuracy").glob("test_*.py")
+        ):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", "") == "MULTIHOST_LAUNCH" for t in node.targets
+                ):
+                    script = ast.literal_eval(node.value)["launch_script"]
+                    self.assertTrue(
+                        (ROOT / "benchmark/tpu" / script).is_file(), f"{path}: {script}"
+                    )
+                    declared.add(script)
+        self.assertEqual(declared, set(self.MULTIHOST))
 
 
 if __name__ == "__main__":

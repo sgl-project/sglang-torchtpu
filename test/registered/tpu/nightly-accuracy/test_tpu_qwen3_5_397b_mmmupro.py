@@ -19,7 +19,7 @@ register_tpu_ci(
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/qwen3_5_397b_mh.sh",
+    "launch_script": "recipe/configs/qwen3_5_397b/server.py",
     "weights_pvc": "model-weights",
     # Measured 2 h 13 min for the full set at 128 concurrent requests.
     "timeout_per_file": 10800,

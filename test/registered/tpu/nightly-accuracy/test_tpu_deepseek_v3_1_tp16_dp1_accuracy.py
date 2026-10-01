@@ -18,7 +18,7 @@ register_tpu_ci(
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/deepseek_v3_1_fp8kv_mh.sh",
+    "launch_script": "recipe/configs/deepseek_v3_1/accuracy.py",
     "weights_pvc": "deepseek-v3-1-rox",
     "timeout_per_file": 10800,
 }
