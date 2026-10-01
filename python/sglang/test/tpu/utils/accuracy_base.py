@@ -7,12 +7,20 @@ plain unittest.TestCase beside its evaluation.
 """
 
 import os
+import unittest
 from typing import Any, ClassVar
 
+from sglang.test.tpu.evals.eval_support import wait_for_health
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
+# The multi-host JobSet starts one server across the slice and runs this file on
+# rank 0 only, so there the fixture attaches rather than starting a second one.
+LIVE_SERVER = os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1"
+live_server_only = unittest.skipUnless(
+    LIVE_SERVER, "multi-host live server not provided (the JobSet starts it)"
+)
 
 
 def validate_model_source(model_path: str, *, env_var: str = "MODEL") -> None:
@@ -86,6 +94,17 @@ class AccuracyTestCase(TPULauncherTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        if LIVE_SERVER:
+            # Attach. Starting a server here would be a second copy on chips the
+            # JobSet's is already using, and on a TP-spanning slice only rank 0
+            # serves HTTP, so there is nothing for this process to launch.
+            wait_for_health(
+                cls.base_url,
+                cls.health_timeout,
+                endpoint=cls.health_endpoint,
+                tag=cls.tag,
+            )
+            return
         if cls.model_path:
             validate_model_source(cls.model_path)
         super().setUpClass()

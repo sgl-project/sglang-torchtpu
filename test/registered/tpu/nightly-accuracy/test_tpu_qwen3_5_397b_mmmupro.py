@@ -5,10 +5,15 @@ sgl-eval's own loader and grader, thinking on, with the model card's sampling.
 """
 
 import os
+import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
-from sglang.test.tpu import QWEN3_5_397B, make_runner, model_config_main
+from sglang.test.tpu import QWEN3_5_397B, make_runner
+from sglang.test.tpu.utils.accuracy_base import (
+    AccuracyTestCase,
+    live_server_only,
+)
 
 register_tpu_ci(
     est_time=9000,
@@ -42,15 +47,6 @@ def build_model_config():
         "model": QWEN3_5_397B["served_model_name"],
         "test_name": "Qwen3.5-397B-multihost-mmmupro",
         "variant": QWEN3_5_397B["variant"],
-        "launch": {
-            "external": True,
-            "health_timeout": float(os.environ.get("HEALTH_TIMEOUT", "3000")),
-            "tag": "qwen3-5-mmmupro-e2e",
-        },
-        "skip_unless": (
-            os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
-            "multi-host live-server not provided (the JobSet launches the server)",
-        ),
         "gates": [
             {
                 "dataset": "mmmu_pro",
@@ -62,5 +58,27 @@ def build_model_config():
     }
 
 
+@live_server_only
+class TestQwen35MMMUPro(AccuracyTestCase):
+    """Score this file's gates on the server the JobSet started."""
+
+    config_module = CONFIG_MODULE
+    tag = "qwen3-5-mmmupro-e2e"
+
+    @classmethod
+    def build_model_config(cls):
+        return build_model_config()
+
+    def test_accuracy(self):
+        self.run_evaluations()
+
+
+class TestQwen35MMMUProConfiguration(unittest.TestCase):
+    """Host-side configuration tests, runnable without TPU hardware."""
+
+    def test_the_jobset_launches_this_files_recipe(self):
+        self.assertEqual(MULTIHOST_LAUNCH["launch_script"], CONFIG_MODULE)
+
+
 if __name__ == "__main__":
-    model_config_main(build_model_config(), base_url=BASE_URL)
+    unittest.main()

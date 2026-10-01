@@ -1,11 +1,15 @@
 """MMMU-Pro shard 0/2: 865 distinct questions on one 2x2x2 slice."""
 
-import os
+import unittest
 from functools import partial
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import KIMI_K26, model_config_main
+from sglang.test.tpu import KIMI_K26
 from sglang.test.tpu.evals.mmmu_full import run_shard
+from sglang.test.tpu.utils.accuracy_base import (
+    AccuracyTestCase,
+    live_server_only,
+)
 
 register_tpu_ci(
     est_time=14400,
@@ -34,11 +38,6 @@ def build_model_config():
         "model": KIMI_K26["served_model_name"],
         "test_name": "Kimi-K2.6-MMMU-shard0",
         "variant": KIMI_K26["variant"],
-        "launch": {"external": True, "health_timeout": 3600},
-        "skip_unless": (
-            os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
-            "live server required",
-        ),
         "gates": [
             {
                 "dataset": "mmmu_pro",
@@ -56,5 +55,27 @@ def build_model_config():
     }
 
 
+@live_server_only
+class TestKimiMMMUShard0(AccuracyTestCase):
+    """Score this file's gates on the server the JobSet started."""
+
+    config_module = CONFIG_MODULE
+    tag = "kimi-mmmu-shard0-e2e"
+
+    @classmethod
+    def build_model_config(cls):
+        return build_model_config()
+
+    def test_accuracy(self):
+        self.run_evaluations()
+
+
+class TestKimiMMMUShard0Configuration(unittest.TestCase):
+    """Host-side configuration tests, runnable without TPU hardware."""
+
+    def test_the_jobset_launches_this_files_recipe(self):
+        self.assertEqual(MULTIHOST_LAUNCH["launch_script"], CONFIG_MODULE)
+
+
 if __name__ == "__main__":
-    model_config_main(build_model_config())
+    unittest.main()
