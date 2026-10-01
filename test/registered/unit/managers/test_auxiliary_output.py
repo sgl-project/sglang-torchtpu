@@ -608,6 +608,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         cache_unfinished_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
+        transfer_backend=None,
         maybe_send_health_check_signal=Mock(),
     )
 

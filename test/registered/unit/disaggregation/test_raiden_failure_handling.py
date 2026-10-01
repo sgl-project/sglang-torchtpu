@@ -387,9 +387,13 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
             ),
             _failed=set(),
             _native_failed=set(),
+            _pipeline=None,
             sender_has_active_io=lambda room: False,
         )
         mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
+        mgr._decode_asked_locked = types.MethodType(
+            RaidenKVManager._decode_asked_locked, mgr
+        )
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr
         )
@@ -930,6 +934,7 @@ class TestFailureWaitsForActiveIo(unittest.TestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._pipeline = None
         mgr._pulling = StagingAdmission(4)
         mgr._pulling.admit(str(ROOM), 1)
         mgr._swa_req_id = lambda room: f"swa:{room}"

@@ -313,6 +313,37 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertEqual(groups.full, [_Pool.buffers[0], _Pool.buffers[2]])
         self.assertEqual(groups.swa, [_Pool.buffers[1], _Pool.buffers[3]])
 
+    def test_hybrid_pipeline_grouping_uses_global_layer_mapping(self):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        class _LocalPool:
+            def __init__(self, blocks):
+                self.buffers = [torch.empty(blocks, 4), torch.empty(blocks, 4)]
+
+            def get_fused_kv_buffer(self, layer_id):
+                return self.buffers[layer_id]
+
+        for first_layer in (0, 8, 31):
+            with self.subTest(first_layer=first_layer):
+                pool = object.__new__(SWAKVPool)
+                pool.start_layer = 0
+                pool.layer_num = 4
+                pool.full_kv_pool = _LocalPool(3)
+                pool.swa_kv_pool = _LocalPool(2)
+                pool.layers_mapping = {
+                    first_layer: (0, False),
+                    first_layer + 2: (1, False),
+                    first_layer + 1: (0, True),
+                    first_layer + 3: (1, True),
+                }
+                groups = get_raiden_kv_caches(pool)
+                self.assertEqual(groups.full, pool.full_kv_pool.buffers)
+                self.assertEqual(groups.swa, pool.swa_kv_pool.buffers)
+                self.assertEqual(groups.full_layer_ids, [first_layer, first_layer + 2])
+                self.assertEqual(
+                    groups.swa_layer_ids, [first_layer + 1, first_layer + 3]
+                )
+
     def test_speculative_draft_caches_join_target_page_namespaces(self):
         class _TargetPool:
             start_layer = 0
@@ -1571,6 +1602,7 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
             mgr.disaggregation_mode = disaggregation_mode
             mgr.attn_tp_rank = mgr.attn_dp_rank = mgr.attn_cp_rank = 0
             mgr.attn_tp_size = mgr.attn_dp_size = mgr.attn_cp_size = 1
+            mgr.pp_rank, mgr.pp_size = 0, 1
             mgr.system_dp_rank = 0
             mgr.request_status = {}
             mgr.failure_records = {}

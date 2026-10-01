@@ -158,6 +158,11 @@ class RaidenReceiverMixin:
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
     ) -> None:
+        if self._pipeline is not None:
+            self._pipeline.register_decode(
+                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+            )
+            return
         if len(bootstrap_infos) != 1:
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
@@ -358,6 +363,8 @@ class RaidenReceiverMixin:
         Returns True once at least one read is in flight for the room. A False
         return is a retry: the caller polls again on the next scheduler pass.
         """
+        if self._pipeline is not None:
+            return self._pipeline.maybe_start_pull(room)
         if self.chunked_transfer:
             return self._start_chunked_pull(room)
         return self._start_whole_pull(room)

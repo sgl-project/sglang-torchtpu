@@ -83,20 +83,22 @@ sliding-window at symmetric TP and under push-resharding), decode in
 chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
 push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
-as this fork (tpu-sync `build.sh`). Not covered: MLA, PP, Mamba/NSA,
+as this fork (tpu-sync `build.sh`). Not covered: MLA, Mamba/NSA,
 speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 ## Tunables (env)
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 4*node_worker_rank` over every CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
+| `SGLANG_RAIDEN_PIPELINE_TRANSFER` | `0` | named layer pools for a PP producer and a DP, TP, or matching-PP consumer; set to `1` on a decode that is not itself a pipeline |
+| `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 4*node_worker_rank` over every PP/CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
 | `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; each rank's pool is sized for at most one max-length transfer per running request and seats in-flight transfers page by page. Startup fails with the required and available sizes when not even one max-length transfer fits |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
 | `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer deadline, set the same on prefill and decode: the prefill keeps a read registered for this long after announcing it and then releases its pages; a decode read that waited longer than this for a staging slot is failed instead of pulled |
 | `TPU_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden seats each transfer in its own pages of the pool pinned at startup; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots, where every transfer takes a whole max-length slot, and rejects asymmetric resharding, which needs per-transfer staging |
+| `TPU_PREMAPPED_BUFFER_SIZE` | `4 GiB` (set by the TPU platform) | libtpu's premapped DMA buffer. Raiden builds that stage through libtpu's host allocator (full-mirror staging; tpu-sync before [49d29c0f](https://github.com/google/tpu-sync/commit/49d29c0fc07046bcda8640c3841c579665e93e24), including builds with PP pool resharding) carve each rank's host staging out of it, and staging past the buffer is DMA-mapped as each copy lands, which stalls the decode steps. Set it per rank above the rank's staging (`mirror_peak_bytes` in the `Raiden pipeline ready` line, about the rank's share of `SGLANG_RAIDEN_HOST_POOL_GB`; the pipeline warns when the buffer is smaller). Builds from 49d29c0f on DMA-map their staging when allocating it and do not draw on this buffer |
 
 A decode rank issues a pull only while its host staging pool has the pages for it; requests past that stay in the transfer queue, in order, and are retried as pages free, so the pool does not have to hold a max-length transfer per running request. A pull that does not fit waits at the head of the queue, so smaller pulls cannot starve it. A request that waits in that queue for longer than `SGLANG_RAIDEN_TIMEOUT_S` fails with that reason: its KV is gone from the prefill by then, so the pull is never sent.
 
@@ -125,3 +127,60 @@ Drive both through the standard SGLang PD router, same as mooncake.
   `python -m pytest test/manual/kv_transfer/test_reshard_schedule.py`
 - End-to-end correctness + throughput: TPU VM only (via the team cdk flow);
   compare decode output token-for-token against a single-instance run.
+
+## Pipeline-parallel prefill
+
+A PP prefill transfers KV to an attention-DP decode, a tensor-parallel decode,
+or a decode pipeline with the same stage count; set
+`SGLANG_RAIDEN_PIPELINE_TRANSFER=1` on the decode when it is not itself a
+pipeline. The producer uses attention TP=1 and
+CP=1 (`--pp-size 8 --tp-size 1`); an eight-way attention-DP consumer uses
+`--tp-size 8 --dp-size 8 --enable-dp-attention`, a tensor-parallel consumer
+uses `--tp-size 8`, and a matching pipeline consumer uses
+`--pp-size 8 --tp-size 1`.
+
+A tensor-parallel consumer receives every source page split by kv-head:
+each rank's engine lands its own head slice of every token, and rank 0
+plans the one transfer that fills all ranks. A slice must be whole 32-bit
+packs of the fused page, so BF16 KV takes any head count per rank and FP8
+KV needs an even head count per rank.
+
+This path requires a tpu-sync with PP pool resharding: per-layer pool
+pairing, sender-local pool indices on the wire, registered transfer ranks,
+shared claims across destination pipeline stages, and per-destination strided
+byte spans (one strided entry per page and destination rank). The strided
+spans a tensor-parallel consumer needs are in tpu-sync
+[6182fb3d](https://github.com/google/tpu-sync/commit/6182fb3d933d0d1f2703a1b8f8f7edf3aeb11db6),
+not yet on tpu-sync main; without them each such transfer fails at planning. For
+full throughput the controller also needs its own thread pool for worker
+RPCs ([tpu-sync main 6b3e8206](https://github.com/google/tpu-sync/commit/6b3e8206f5a0f4ad7bf4717790bff4c8eb7e1c1c)):
+a transfer coordinates every source stage, and on asyncio's default
+executor concurrent transfers queue behind each other.
+Each engine registers the full-attention and sliding-window layers it owns
+as `fa.lN` and `swa.lN`. A single native transfer moves both namespaces after
+the prefill finishes. Full-attention and window page lists remain independent,
+and a cached decode prefix is clipped from each layer's transfer.
+
+Each worker owns one Raiden engine. Pipeline stages share one controller hosted
+by stage zero; independent attention-DP workers each own one. Pool geometry and
+materialized TPU layouts must match between peers. Every pipeline stage needs
+at least one full-attention layer, and speculative decoding is unsupported.
+Host staging uses bounded leases when the installed Raiden supports per-pool
+staging. Older PP-capable wheels use full host mirrors; startup measures their
+materialized block-major page layouts and bounds their
+peak allocation, including a temporary replacement buffer, against each
+rank's share of `SGLANG_RAIDEN_HOST_POOL_GB`. Over-budget mirrors are rejected;
+reduce `--max-total-tokens` or increase the host budget to fit them. Shared-memory
+mirrors (`RAIDEN_SHM_KEY`) are unsupported. Both modes limit concurrent
+transfers before calling the coordinator.
+A failed or aborted request retains its pages until native transfer completion
+or atomic cancellation of an unclaimed source registration. A transfer the
+controller rejects fails its request only, and the decode keeps that request's
+pages until its engine settles the transfer or the native deadline passes. A stage whose
+entire decode prefix is cached releases only its matching source stage after
+the shared request has been claimed. If every stage hits its full prefix,
+source pages remain reserved until the unclaimed registration expires
+(`SGLANG_RAIDEN_TIMEOUT_S`, 120 seconds by default).
+
+The pipeline unit tests are in
+`test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py`.

@@ -215,5 +215,132 @@ class ReceiverRequestTest(unittest.TestCase):
         self.assertEqual(req.shard_push_schedules[5].entries[0].dst_block_id, 1)
 
 
+class PackedKVScheduleTest(unittest.TestCase):
+    @staticmethod
+    def packed_page(heads, packing, itemsize, page, dim, block=None):
+        result = bytearray()
+        lanes = [value for head in heads for value in [(head, 0), (head, 1)]]
+        lanes += [None] * (-len(lanes) % packing)
+        for token in range(page):
+            for start in range(0, len(lanes), packing):
+                for column in range(dim):
+                    for lane in lanes[start : start + packing]:
+                        for byte in range(itemsize):
+                            if block is None or lane is None:
+                                value = 253
+                            else:
+                                head, kv = lane
+                                value = (
+                                    block * 17
+                                    + token * 29
+                                    + head * 37
+                                    + kv * 43
+                                    + column * 61
+                                    + byte * 73
+                                ) % 251
+                            result.append(value)
+        return result
+
+    def check_transfer(self, src_tp, dst_tp, packing, itemsize, page, dim):
+        geom = rs.ReshardGeometry(
+            src_tp,
+            dst_tp,
+            2 * dim * itemsize,
+            8,
+            kv_packing=packing,
+            element_size=itemsize,
+        )
+        src_heads, dst_heads = 8 // src_tp, 8 // dst_tp
+        source_ids, destination_ids, live = [1, 3, 4], [2, 5, 6], [page, page - 3, 0]
+        for decode_rank in range(dst_tp):
+            wanted_heads = list(
+                range(decode_rank * dst_heads, (decode_rank + 1) * dst_heads)
+            )
+            senders = [
+                rank
+                for rank in range(src_tp)
+                if set(range(rank * src_heads, (rank + 1) * src_heads))
+                & set(wanted_heads)
+            ]
+            blank = self.packed_page(wanted_heads, packing, itemsize, page, dim)
+            destination = [bytearray(blank) for _ in range(7)]
+            expected = [bytearray(blank) for _ in range(7)]
+            receiver = rs.build_receiver_request(
+                _Pb2,
+                uuid=42,
+                req_id="42",
+                peer="localhost:31000",
+                decode_rank=decode_rank,
+                geom=geom,
+                sources=[(rank + src_tp, source_ids) for rank in senders],
+                dst_block_ids=destination_ids,
+                live_tokens=live,
+            )
+            self.assertEqual(receiver.expected_block_count, len(senders) * 2)
+            for rank in senders:
+                heads = list(range(rank * src_heads, (rank + 1) * src_heads))
+                sources = [
+                    self.packed_page(heads, packing, itemsize, page, dim, block)
+                    for block in range(5)
+                ]
+                sender = rs.build_sender_request(
+                    _Pb2,
+                    uuid=42,
+                    req_id="42",
+                    peer="localhost:31000",
+                    prefill_rank=rank + src_tp,
+                    decode_rank=decode_rank,
+                    geom=geom,
+                    src_block_ids=source_ids,
+                    dst_block_ids=destination_ids,
+                    live_tokens=live,
+                )
+                sent = sender.shard_push_schedules[0].entries
+                received = receiver.shard_push_schedules[rank + src_tp].entries
+                self.assertEqual(
+                    [vars(entry) for entry in sent], [vars(entry) for entry in received]
+                )
+                for entry in received:
+                    source = sources[entry.src_block_id]
+                    target = destination[entry.dst_block_id]
+                    for repeat in range(entry.count):
+                        src = entry.src_offset_bytes + repeat * entry.src_stride_bytes
+                        dst = entry.dst_offset_bytes + repeat * entry.dst_stride_bytes
+                        size = entry.size_bytes
+                        self.assertLessEqual(src + size, len(source))
+                        self.assertLessEqual(dst + size, len(target))
+                        target[dst : dst + size] = source[src : src + size]
+            for source_id, destination_id, tokens in zip(
+                source_ids, destination_ids, live
+            ):
+                filled = self.packed_page(
+                    wanted_heads, packing, itemsize, page, dim, source_id
+                )
+                end = len(blank) // page * tokens
+                # Padding lanes retain their original bytes in both buffers.
+                expected[destination_id][:end] = filled[:end]
+            self.assertEqual(destination, expected)
+
+    def test_bf16_full_and_partial_pages(self):
+        for src_tp, dst_tp in [(8, 1), (8, 4), (4, 1), (8, 2), (4, 2), (8, 8)]:
+            with self.subTest(src_tp=src_tp, dst_tp=dst_tp):
+                self.check_transfer(src_tp, dst_tp, 2, 2, 128, 64)
+
+    def test_fan_out_takes_the_decode_ranks_head_slice(self):
+        geom = rs.ReshardGeometry(1, 8, 512, 8, kv_packing=2, element_size=2)
+        self.assertEqual(geom.ratio, 1)
+        self.assertEqual(geom.entry_bytes(0, 3), (1536, 512, 4096, 0, 512))
+        # Consecutive decode ranks share a kv-head when the model has fewer
+        # kv-heads than decode ranks.
+        geom = rs.ReshardGeometry(1, 8, 512, 4, kv_packing=2, element_size=2)
+        self.assertEqual(geom.entry_bytes(0, 5), (1024, 512, 2048, 0, 512))
+        self.assertEqual(rs.head_slice_params(1, 8, 0, 5, 4), (2, 1, 0, 4, 1))
+        geom = rs.ReshardGeometry(1, 8, 256, 8, kv_packing=4, element_size=1)
+        with self.assertRaises(ValueError):
+            geom.entry_bytes(0, 3)
+        with self.assertRaises(ValueError):
+            rs.reshard_ratio(3, 8)
+
+
 if __name__ == "__main__":
     unittest.main()

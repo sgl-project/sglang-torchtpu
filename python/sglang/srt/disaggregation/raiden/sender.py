@@ -232,6 +232,8 @@ class RaidenSenderMixin:
         finalized room and fails it terminally, or wins and this returns
         False without touching the status.
         """
+        if self._pipeline is not None:
+            return self._pipeline.finalize_send(room, aux_index)
         self._ensure_engine()
         with self._state_lock:
             if room in self._aborted:
@@ -254,6 +256,15 @@ class RaidenSenderMixin:
             self._maybe_reply(room)
         return True
 
+    def _decode_asked_locked(self, room: int) -> bool:
+        """Whether the decode asked to pull the room, cleared it to push, or
+        requested its pipeline transfer."""
+        return (
+            room in self._prefill.decode_addr
+            or room in self._prefill.reshard_ready
+            or (self._pipeline is not None and room in self._pipeline.replies)
+        )
+
     def awaiting_decode_since(self, room: int, since: float) -> Optional[float]:
         """When the prefill started waiting on the decode for ``room``.
 
@@ -266,7 +277,7 @@ class RaidenSenderMixin:
         decode's court, the window is timed from that latest progress.
         """
         with self._state_lock:
-            if room in self._prefill.decode_addr or room in self._prefill.reshard_ready:
+            if self._decode_asked_locked(room):
                 return None
             if room in self._prefill.reshard_req:
                 return self._prefill.reshard_replied_at.get(room)
@@ -281,7 +292,7 @@ class RaidenSenderMixin:
         decode can never be told to pull KV whose room just failed.
         """
         with self._state_lock:
-            if room in self._prefill.decode_addr or room in self._prefill.reshard_ready:
+            if self._decode_asked_locked(room):
                 return False
             if room in self._prefill.reshard_req:
                 started = self._prefill.reshard_replied_at.get(room)
@@ -376,6 +387,8 @@ class RaidenSenderMixin:
         room whose closing read has settled: the decode will never pull it,
         so it stops counting then (see _settle_sender_reads_locked).
         """
+        if self._pipeline is not None:
+            return self._pipeline.active(room)
         with self._state_lock:
             if self._send_reads.get(room):
                 return True

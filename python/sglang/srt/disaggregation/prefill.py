@@ -73,6 +73,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    free_swa_out_of_window_slots,
     kv_to_page_indices,
     kv_to_page_num,
     maybe_cache_unfinished_req,
@@ -923,6 +924,11 @@ class SchedulerDisaggregationPrefillMixin:
                         continue
 
                 self.cache_unfinished_disagg_prefill(req)
+                if (
+                    self.transfer_backend == TransferBackend.RAIDEN
+                    and get_parallel().pp_size > 1
+                ):
+                    self._release_swa_beyond_window(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -1361,6 +1367,21 @@ class SchedulerDisaggregationPrefillMixin:
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+
+    def _release_swa_beyond_window(self: Scheduler, req: Req) -> None:
+        """Free a finished prefill's SWA KV outside the sliding window while the
+        transfer is pending; the Raiden pipeline transfer reads the window only."""
+        if not (self.tree_cache.is_chunk_cache() and self.tree_cache.supports_swa()):
+            return
+        free_swa_out_of_window_slots(
+            req,
+            min(req.extend_range.end, len(req.origin_input_ids)),
+            sliding_window_size=self.tree_cache.sliding_window_size,
+            page_size=self.tree_cache.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            is_chunk_cache=True,
+        )
 
     def send_kv_chunk(
         self,

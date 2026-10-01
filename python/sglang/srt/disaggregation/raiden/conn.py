@@ -68,6 +68,7 @@ from sglang.srt.disaggregation.raiden.serde import (
 )
 from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -101,6 +102,10 @@ class RaidenKVManager(
     instead of reimplementing the coordination.
     """
 
+    # The legacy transport unless set_kv_caches builds a pipeline transfer.
+    _pipeline = None
+    _pipeline_enabled = False
+
     def __init__(
         self,
         args: KVArgs,
@@ -127,6 +132,15 @@ class RaidenKVManager(
         self._swa_kv_caches: Optional[list] = None
         self.raiden_endpoint: Optional[str] = None
         self.swa_raiden_endpoint: Optional[str] = None
+        self._pipeline = None
+        # Pipeline stages always transfer by named layer pools; a DP or TP
+        # decode opts in to consume from a pipeline prefill.
+        self._pipeline_enabled = self.pp_size > 1 or (
+            disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+        )
+        self._pipeline_init_lock = threading.Lock()
+        self._pipeline_messages = []
         # Each rank reserves control+data ports for full KV and SWA KV. The
         # rank counts every worker on the node -- attention-TP ranks of every
         # context-parallel, attention-DP, and system-DP replica -- so
@@ -140,6 +154,8 @@ class RaidenKVManager(
             self.system_dp_rank,
             self.attn_cp_rank,
             self.attn_cp_size,
+            self.pp_rank,
+            self.pp_size,
         )
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
@@ -300,6 +316,19 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        if self._pipeline_enabled:
+            from sglang.srt.disaggregation.raiden.pipeline import PipelineTransfer
+
+            pipeline = PipelineTransfer(self, kv_caches)
+            self._engine = pipeline.engine
+            self.raiden_endpoint = pipeline.controller
+            self.chunked_transfer = False
+            with self._pipeline_init_lock:
+                self._pipeline = pipeline
+                for message in self._pipeline_messages:
+                    pipeline.on_message(message)
+                self._pipeline_messages.clear()
+            return
         # Full-attention KV moves piece by piece during the prefill. A hybrid
         # model's sliding-window pool holds only the last window, which is
         # settled when the prefill ends, so it rides on the closing read.
@@ -436,6 +465,7 @@ class RaidenKVManager(
             self.system_dp_size,
             self.server_args.nnodes,
             self.attn_cp_size,
+            self.pp_size,
         )
         budget /= local_ranks * max(1, engines)
         slot_bytes = slot_host_bytes(kv_caches, max_blocks)
@@ -489,6 +519,14 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        if self._pipeline is not None:
+            sent, received, failed = self._pipeline.poll()
+            with self._state_lock:
+                self._completed_send.update(sent)
+                self._completed_recv.update(received)
+                self._native_failed.update(failed)
+                self._failed.update(failed)
+            return
         if self._engine is None and self._swa_engine is None:
             return
         for name, engine in (("full", self._engine), ("swa", self._swa_engine)):
@@ -758,11 +796,48 @@ class RaidenKVManager(
         if tag == MessageTag.ABORT:
             self._on_abort(msg)
             return
+        if tag in (
+            MessageTag.PIPELINE_REQ,
+            MessageTag.PIPELINE_READY,
+            MessageTag.PIPELINE_RELEASE,
+        ):
+            self._on_pipeline_message(msg)
+            return
         handler = self._message_handlers.get(tag)
         if handler is None:
             logger.error("RaidenKVManager unknown message tag: %s", tag)
             return
         handler(msg)
+
+    def _on_pipeline_message(self, msg: List[bytes]) -> None:
+        """Hand a frame to the pipeline transfer, or hold it until the pools
+        register; a frame the pipeline rejects fails its room."""
+        room = int(msg[1])
+        try:
+            if not self._pipeline_enabled:
+                raise ValueError(
+                    "Raiden pipeline transfer requires a pipeline-parallel prefill"
+                )
+            with self._pipeline_init_lock:
+                if self._pipeline is None:
+                    self._pipeline_messages.append(msg)
+                    return
+                pipeline = self._pipeline
+            pipeline.on_message(msg)
+        except Exception as error:
+            with self._state_lock:
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(room, f"Raiden pipeline transfer: {error}")
+                self.update_status(room, KVPoll.Failed)
+            raise
+
+    @staticmethod
+    def _require_frames(msg: List[bytes], tag: MessageTag, n: int) -> None:
+        """Validate the frame count of a positional pipeline message."""
+        if len(msg) != n:
+            raise ValueError(
+                f"malformed {tag.name} message: expected {n} frames, got {len(msg)}"
+            )
 
     # ----- prefill side ------------------------------------------------------
 
@@ -832,6 +907,8 @@ class RaidenKVManager(
         transfer would write them under their next owner. Raiden's own
         transfer deadline bounds how long this can stay true.
         """
+        if self._pipeline is not None:
+            return self._pipeline.active(room)
         rid, swa_rid, chunk_prefix = str(room), self._swa_req_id(room), f"{room}#"
 
         def belongs(key: str) -> bool:
@@ -856,6 +933,8 @@ class RaidenKVManager(
         An abort tombstone survives the room: frames for it can still arrive
         and must stay rejected. Tombstones age out on their own.
         """
+        if self._pipeline is not None:
+            self._pipeline.clear(room)
         self._drop_room_state(room, clear_failure_record=True)
 
     def _drop_room_state(
