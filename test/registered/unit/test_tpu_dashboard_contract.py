@@ -366,7 +366,11 @@ class TestNightlyConfigLabelLint(CustomTestCase):
 
     def test_required_fields_present(self):
         for path, mod, _kind in self._all_configs():
-            config = mod.MODEL_CONFIG
+            config = (
+                mod.build_model_config()
+                if hasattr(mod, "build_model_config")
+                else mod.MODEL_CONFIG
+            )
             for field in ("id", "display_name", "model"):
                 self.assertTrue(config.get(field), f"{path.name} misses {field!r}")
             self.assertRegex(
@@ -380,7 +384,11 @@ class TestNightlyConfigLabelLint(CustomTestCase):
         # Two tests claiming one id would merge unrelated trends into one plot.
         seen = {}
         for path, mod, _kind in self._all_configs():
-            series_id = mod.MODEL_CONFIG["id"]
+            series_id = (
+                mod.build_model_config()
+                if hasattr(mod, "build_model_config")
+                else mod.MODEL_CONFIG
+            )["id"]
             self.assertNotIn(
                 series_id, seen, f"{path.name} reuses id of {seen.get(series_id)}"
             )
@@ -388,13 +396,31 @@ class TestNightlyConfigLabelLint(CustomTestCase):
 
     def test_accuracy_gate_labels_carry_identity(self):
         for path, mod in self.accuracy:
-            for params in model_config.build_gates(mod.MODEL_CONFIG):
+            for params in model_config.build_gates(
+                (
+                    mod.build_model_config()
+                    if hasattr(mod, "build_model_config")
+                    else mod.MODEL_CONFIG
+                )
+            ):
                 labels = params.metric_labels or {}
                 self.assertEqual(labels.get("kind"), "accuracy", path.name)
-                self.assertEqual(labels.get("id"), mod.MODEL_CONFIG["id"], path.name)
+                self.assertEqual(
+                    labels.get("id"),
+                    (
+                        mod.build_model_config()
+                        if hasattr(mod, "build_model_config")
+                        else mod.MODEL_CONFIG
+                    )["id"],
+                    path.name,
+                )
                 self.assertEqual(
                     labels.get("display_name"),
-                    mod.MODEL_CONFIG["display_name"],
+                    (
+                        mod.build_model_config()
+                        if hasattr(mod, "build_model_config")
+                        else mod.MODEL_CONFIG
+                    )["display_name"],
                     path.name,
                 )
 
@@ -403,7 +429,11 @@ class TestNightlyConfigLabelLint(CustomTestCase):
         # panels on the dashboard; a hand-booted server or hand-rolled bench
         # produces a chart nobody can reproduce from.
         for path, mod in self.perf:
-            config = mod.MODEL_CONFIG
+            config = (
+                mod.build_model_config()
+                if hasattr(mod, "build_model_config")
+                else mod.MODEL_CONFIG
+            )
             launch = config.get("launch") or {}
             self.assertTrue(
                 launch.get("recipe"),
@@ -428,7 +458,11 @@ class TestAliasRegistry(CustomTestCase):
     def setUpClass(cls):
         cls.aliases = json.loads(ALIASES_FILE.read_text(encoding="utf-8"))["aliases"]
         cls.live_ids = {
-            mod.MODEL_CONFIG["id"]
+            (
+                mod.build_model_config()
+                if hasattr(mod, "build_model_config")
+                else mod.MODEL_CONFIG
+            )["id"]
             for subdir in ("nightly-accuracy", "nightly-perf")
             for _path, mod in _config_modules(subdir)
         }

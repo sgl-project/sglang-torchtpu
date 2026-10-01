@@ -26,62 +26,67 @@ MULTIHOST_LAUNCH = {
 }
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
-MODEL_CONFIG = {
-    "id": "accuracy-deepseek-v3-1",
-    "display_name": "DeepSeek V3.1",
-    "dashboard": "accuracy",
-    "dashboard_model": "deepseek-v3-1",
-    "model": os.environ.get("MODEL", "/weights/DeepSeek-V3.1"),
-    "test_name": "DeepSeek-V3.1-multihost-fp8kv",
-    "variant": "2host-TP16+EP16+DP1-FP8KV",
-    "launch": {
-        "external": True,
-        "health_timeout": float(os.environ.get("HEALTH_TIMEOUT", "3000")),
-        "tag": "v3-1-fp8kv-e2e",
-    },
-    "skip_unless": (
-        os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
-        "multi-host live-server not provided (the JobSet launches the server)",
-    ),
-    "gates": [
-        {
-            "dataset": "gpqa",
-            "label": "gpqa_diamond",
-            "report_only": True,
-            "thinking": True,
-            "repeat": 1,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 32768,
+CONFIG_MODULE = "recipe/configs/deepseek_v3_1/accuracy.py"
+
+
+def build_model_config():
+    """Assemble this file's gates against the model's identity."""
+    return {
+        "id": "accuracy-deepseek-v3-1",
+        "display_name": "DeepSeek V3.1",
+        "dashboard": "accuracy",
+        "dashboard_model": "deepseek-v3-1",
+        "model": os.environ.get("MODEL", "/weights/DeepSeek-V3.1"),
+        "test_name": "DeepSeek-V3.1-multihost-fp8kv",
+        "variant": "2host-TP16+EP16+DP1-FP8KV",
+        "launch": {
+            "external": True,
+            "health_timeout": float(os.environ.get("HEALTH_TIMEOUT", "3000")),
+            "tag": "v3-1-fp8kv-e2e",
         },
-        {
-            "dataset": "aime25",
-            "label": "aime25",
-            "report_only": True,
-            "thinking": True,
-            "repeat": 1,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 32768,
-        },
-        {
-            "dataset": "mmlu",
-            "label": "mmlu",
-            "report_only": True,
-            "thinking": True,
-            "repeat": 1,
-            # Match the non-DPA test: 250 sampled questions per repeat.
-            "num_examples": 250,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 16384,
-        },
-    ],
-}
+        "skip_unless": (
+            os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
+            "multi-host live-server not provided (the JobSet launches the server)",
+        ),
+        "gates": [
+            {
+                "dataset": "gpqa",
+                "label": "gpqa_diamond",
+                "report_only": True,
+                "thinking": True,
+                "repeat": 1,
+                "num_threads": 128,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_tokens": 32768,
+            },
+            {
+                "dataset": "aime25",
+                "label": "aime25",
+                "report_only": True,
+                "thinking": True,
+                "repeat": 1,
+                "num_threads": 128,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_tokens": 32768,
+            },
+            {
+                "dataset": "mmlu",
+                "label": "mmlu",
+                "report_only": True,
+                "thinking": True,
+                "repeat": 1,
+                # Match the non-DPA test: 250 sampled questions per repeat.
+                "num_examples": 250,
+                "num_threads": 128,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_tokens": 16384,
+            },
+        ],
+    }
 
 
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    model_config_main(build_model_config(), base_url=BASE_URL)

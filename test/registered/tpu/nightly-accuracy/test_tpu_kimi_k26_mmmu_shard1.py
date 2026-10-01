@@ -21,33 +21,40 @@ MULTIHOST_LAUNCH = {
     "schedule": "mmmu-kimi",
     "timeout_per_file": 14400,
 }
-MODEL_CONFIG = {
-    "id": "accuracy-kimi-k26-mmmu-shard1",
-    "display_name": "Kimi K2.6 MMMU-Pro shard 1/2",
-    "dashboard": "accuracy",
-    "dashboard_model": "kimi-k26-mmmu-shard1",
-    "model": KIMI_K26["served_model_name"],
-    "test_name": "Kimi-K2.6-MMMU-shard1",
-    "variant": KIMI_K26["variant"],
-    "launch": {"external": True, "health_timeout": 3600},
-    "skip_unless": (
-        os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
-        "live server required",
-    ),
-    "gates": [
-        {
-            "dataset": "mmmu_pro",
-            "label": "mmmu_pro_shard1",
-            "report_only": True,
-            "runner": partial(
-                run_shard,
-                shard=1,
-                shards=2,
-                model=KIMI_K26["served_model_name"],
-                **KIMI_K26["sampling"],
-            ),
-        }
-    ],
-}
+CONFIG_MODULE = "recipe/configs/kimi_k26/mmmu.py"
+
+
+def build_model_config():
+    """Assemble this file's gates against the model's identity."""
+    return {
+        "id": "accuracy-kimi-k26-mmmu-shard1",
+        "display_name": "Kimi K2.6 MMMU-Pro shard 1/2",
+        "dashboard": "accuracy",
+        "dashboard_model": "kimi-k26-mmmu-shard1",
+        "model": KIMI_K26["served_model_name"],
+        "test_name": "Kimi-K2.6-MMMU-shard1",
+        "variant": KIMI_K26["variant"],
+        "launch": {"external": True, "health_timeout": 3600},
+        "skip_unless": (
+            os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
+            "live server required",
+        ),
+        "gates": [
+            {
+                "dataset": "mmmu_pro",
+                "label": "mmmu_pro_shard1",
+                "report_only": True,
+                "runner": partial(
+                    run_shard,
+                    shard=1,
+                    shards=2,
+                    model=KIMI_K26["served_model_name"],
+                    **KIMI_K26["sampling"],
+                ),
+            }
+        ],
+    }
+
+
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG)
+    model_config_main(build_model_config())

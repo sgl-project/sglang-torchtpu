@@ -615,7 +615,7 @@ class TestPerfConfigsAreValid(CustomTestCase):
     def test_every_config_builds(self):
         names, suites = set(), set()
         for path, mod in self._perf_modules():
-            config = mod.MODEL_CONFIG
+            config = _model_config(mod)
             model_config.build_model(config)  # rejects unknown launch keys
             self.assertTrue(model_config.build_gates(config))
             case = model_config.build_test_case(config)
@@ -633,7 +633,7 @@ class TestPerfConfigsAreValid(CustomTestCase):
         # The dashboard groups by workload name; an unnamed point would fall back to
         # its raw shape and sit in a separate dropdown entry from its siblings.
         for _path, mod in self._perf_modules():
-            for gate in mod.MODEL_CONFIG["gates"]:
+            for gate in _model_config(mod)["gates"]:
                 for point in gate.get("sweep") or []:
                     self.assertTrue(point["workload"])
 
@@ -666,14 +666,18 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
         # Without a launch entry, the file's TPULauncherTestCase boots the recipe.
         from pathlib import Path
 
+        from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase
         from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
+        # The imported bases are in the module namespace too; only the concrete
+        # subclass this file defines counts.
+        bases = (TPULauncherTestCase, AccuracyTestCase)
         fixtures = [
             value
             for value in vars(mod).values()
             if isinstance(value, type)
             and issubclass(value, TPULauncherTestCase)
-            and value is not TPULauncherTestCase
+            and value not in bases
         ]
         self.assertEqual(len(fixtures), 1, f"{path.name} needs one launcher fixture")
         recipe = (
@@ -686,7 +690,7 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
     def test_every_config_builds(self):
         names, suites = set(), set()
         for path, mod in self._accuracy_modules():
-            config = mod.MODEL_CONFIG
+            config = _model_config(mod)
             if "launch" in config:
                 model_config.build_model(config)  # rejects unknown launch keys
             else:
@@ -715,8 +719,8 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
 
     def test_every_gate_declares_its_accuracy_policy(self):
         for path, mod in self._accuracy_modules():
-            for gate in mod.MODEL_CONFIG["gates"]:
-                if (mod.MODEL_CONFIG["id"], gate["dataset"]) in self.R1_GATED:
+            for gate in _model_config(mod)["gates"]:
+                if (_model_config(mod)["id"], gate["dataset"]) in self.R1_GATED:
                     self.assertFalse(gate.get("report_only"), path.name)
                     self.assertIn("baseline", gate, path.name)
                     self.assertIn("atol", gate, path.name)
@@ -729,8 +733,8 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
         # "accuracy" is the literal the dashboard's metric_kind() matches on; a
         # renamed key or value empties the tab without failing anything here.
         for path, mod in self._accuracy_modules():
-            self.assertEqual(mod.MODEL_CONFIG.get("dashboard"), "accuracy", path.name)
-            for params in model_config.build_gates(mod.MODEL_CONFIG):
+            self.assertEqual(_model_config(mod).get("dashboard"), "accuracy", path.name)
+            for params in model_config.build_gates(_model_config(mod)):
                 self.assertEqual(
                     (params.metric_labels or {}).get("kind"),
                     "accuracy",
@@ -738,7 +742,7 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                 )
                 self.assertEqual(
                     (params.metric_labels or {}).get("model"),
-                    mod.MODEL_CONFIG["dashboard_model"],
+                    _model_config(mod)["dashboard_model"],
                     f"{path.name}: gate {params.name} has the wrong model series",
                 )
 
@@ -768,6 +772,17 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
         for path, _mod in self._accuracy_modules():
             suite = _registered_suite(path)
             self.assertIn(f'"{suite}"', runner, f"{suite} missing from run_suite.py")
+
+
+def _model_config(mod):
+    """The file's MODEL_CONFIG, however it declares it.
+
+    #836's shape builds it in a function so the gates can close over values the
+    fixture resolves; older files still assign the dict at import.
+    """
+    if hasattr(mod, "build_model_config"):
+        return mod.build_model_config()
+    return mod.MODEL_CONFIG
 
 
 def _config_modules(subdir, pattern):

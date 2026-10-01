@@ -1,19 +1,17 @@
 """GPT-OSS 120B TPU AIME 2025 nightly score."""
 
 import unittest
-from typing import ClassVar
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import (
-    BASE_URL,
     GPT_OSS_120B,
-    HEALTH_TIMEOUT,
     aime25_openai_runner,
-    fixture_runtime_envs,
     make_model_config,
-    run_model_config,
 )
-from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
+from sglang.test.tpu.utils.accuracy_base import (
+    AccuracyTestCase,
+    gate_server_failures,
+)
 
 register_tpu_ci(
     est_time=4500,
@@ -37,24 +35,39 @@ GATE = {
     "report_only": True,
 }
 
-MODEL_CONFIG = make_model_config(
-    GPT_OSS_120B,
-    test_name="gpt-oss-120b-aime",
-    series_id="accuracy-gpt-oss-120b-aime",
-    gate=GATE,
-)
+CONFIG_MODULE = "recipe/configs/gpt_oss_120b/accuracy_aime.py"
 
 
-class TestGptOss120bAIME(TPULauncherTestCase):
-    config_module = "recipe/configs/gpt_oss_120b/accuracy_aime.py"
-    base_url = BASE_URL
-    health_timeout = HEALTH_TIMEOUT
-    health_endpoint = "/health_generate"
+def build_model_config():
+    """Assemble this benchmark's gate against the model's shared identity."""
+    return make_model_config(
+        GPT_OSS_120B,
+        test_name="gpt-oss-120b-aime",
+        series_id="accuracy-gpt-oss-120b-aime",
+        gate=GATE,
+    )
+
+
+class TestGptOss120bAIME(AccuracyTestCase):
+    """Score GPT-OSS-120B aime on the server its recipe starts."""
+
+    config_module = CONFIG_MODULE
+    model_path = "/weights/gpt-oss-120b"
     tag = "gpt-oss-120b-aime-e2e"
-    runtime_envs: ClassVar[dict[str, str | None]] = fixture_runtime_envs()
+
+    @classmethod
+    def build_model_config(cls):
+        return build_model_config()
 
     def test_accuracy(self):
-        run_model_config(MODEL_CONFIG, base_url=self.base_url)
+        self.run_evaluations()
+
+
+class TestGptOss120bAIMEConfiguration(unittest.TestCase):
+    """Host-side configuration tests, runnable without TPU hardware."""
+
+    def test_gate_fits_the_server_its_recipe_starts(self):
+        self.assertEqual(gate_server_failures(CONFIG_MODULE, GATE), [])
 
 
 if __name__ == "__main__":

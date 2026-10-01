@@ -711,6 +711,21 @@ GEMMA4_31B = {
     "sampling": _GEMMA4_SAMPLING,
 }
 
+QWEN3_5_397B = {
+    "served_model_name": "/weights/Qwen3.5-397B-A17B",
+    "display_name": "Qwen3.5 397B-A17B",
+    "variant": "2host-TP16+EP16-bf16",
+    "config_module": "recipe/configs/qwen3_5_397b/server.py",
+    "sampling": {
+        "max_tokens": 32768,
+        "num_threads": 128,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        # The Qwen3.5 template reads enable_thinking, not the generic thinking.
+        "chat_template_kwargs": {"enable_thinking": True},
+    },
+}
+
 KIMI_K26 = {
     "served_model_name": "/weights/Kimi-K2.6",
     "display_name": "Kimi K2.6",

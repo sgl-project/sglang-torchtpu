@@ -26,63 +26,68 @@ MULTIHOST_LAUNCH = {
 }
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
-MODEL_CONFIG = {
-    "id": "accuracy-deepseek-r1-0528",
-    "display_name": "DeepSeek R1-0528",
-    "dashboard": "accuracy",
-    "dashboard_model": "deepseek-r1-0528",
-    "model": os.environ.get("MODEL", "/weights/DeepSeek-R1-0528"),
-    "test_name": "DeepSeek-R1-0528-multihost-fp8kv",
-    "variant": "2host-TP16+EP16+DP1-FP8KV",
-    "launch": {
-        "external": True,
-        "health_timeout": float(os.environ.get("HEALTH_TIMEOUT", "3000")),
-        "tag": "r1-fp8kv-e2e",
-    },
-    "skip_unless": (
-        os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
-        "multi-host live-server not provided (the JobSet launches the server)",
-    ),
-    "gates": [
-        {
-            "dataset": "gpqa",
-            "label": "gpqa_diamond",
-            "baseline": 0.715,
-            "atol": 0.10,
-            "repeat": 1,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 32768,
+CONFIG_MODULE = "recipe/configs/deepseek_r1_0528/accuracy.py"
+
+
+def build_model_config():
+    """Assemble this file's gates against the model's identity."""
+    return {
+        "id": "accuracy-deepseek-r1-0528",
+        "display_name": "DeepSeek R1-0528",
+        "dashboard": "accuracy",
+        "dashboard_model": "deepseek-r1-0528",
+        "model": os.environ.get("MODEL", "/weights/DeepSeek-R1-0528"),
+        "test_name": "DeepSeek-R1-0528-multihost-fp8kv",
+        "variant": "2host-TP16+EP16+DP1-FP8KV",
+        "launch": {
+            "external": True,
+            "health_timeout": float(os.environ.get("HEALTH_TIMEOUT", "3000")),
+            "tag": "r1-fp8kv-e2e",
         },
-        {
-            "dataset": "aime25",
-            "label": "aime25",
-            # Preserve the existing serving-regression threshold.
-            "baseline": 0.875,
-            "atol": 0.20,
-            "repeat": 1,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 32768,
-        },
-        {
-            "dataset": "mmlu",
-            "label": "mmlu",
-            "report_only": True,
-            "repeat": 1,
-            # The same seeded 250 rows every model and every night: sgl-eval's
-            # mmlu pins the archive revision and samples with sample_seed=0.
-            "num_examples": 250,
-            "num_threads": 128,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 16384,
-        },
-    ],
-}
+        "skip_unless": (
+            os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
+            "multi-host live-server not provided (the JobSet launches the server)",
+        ),
+        "gates": [
+            {
+                "dataset": "gpqa",
+                "label": "gpqa_diamond",
+                "baseline": 0.715,
+                "atol": 0.10,
+                "repeat": 1,
+                "num_threads": 128,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_tokens": 32768,
+            },
+            {
+                "dataset": "aime25",
+                "label": "aime25",
+                # Preserve the existing serving-regression threshold.
+                "baseline": 0.875,
+                "atol": 0.20,
+                "repeat": 1,
+                "num_threads": 128,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_tokens": 32768,
+            },
+            {
+                "dataset": "mmlu",
+                "label": "mmlu",
+                "report_only": True,
+                "repeat": 1,
+                # The same seeded 250 rows every model and every night: sgl-eval's
+                # mmlu pins the archive revision and samples with sample_seed=0.
+                "num_examples": 250,
+                "num_threads": 128,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "max_tokens": 16384,
+            },
+        ],
+    }
 
 
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    model_config_main(build_model_config(), base_url=BASE_URL)
