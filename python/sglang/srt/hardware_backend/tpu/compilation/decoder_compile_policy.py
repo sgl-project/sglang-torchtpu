@@ -693,6 +693,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return compiled.warmup_async(
                 backend.forward_metadata,
                 *args,
+                attention_rank_tensors=get_attention_rank_tensors(
+                    torch.device(self.model_runner.device)
+                ),
                 **kwargs,
             )
 

@@ -51,6 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     LogitsOutputMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.runtime_context import get_context, get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -287,6 +288,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         model_runner = SimpleNamespace(
             model=model,
             token_to_kv_pool=kv_pool,
+            device="cpu",
             is_draft_worker=False,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
@@ -302,7 +304,19 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
         with patch.dict(sys.modules, {compile_module_name: compile_module}):
-            policy._direct_compile(model.forward)
+            call, warmup_async = policy._direct_compile(model.forward)
+
+        trace_forward = compile_module.direct_compile.call_args.args[0]
+        compiled = compile_module.direct_compile.return_value
+        compiled.side_effect = trace_forward
+        compiled.warmup_async.side_effect = trace_forward
+        backend = SimpleNamespace(forward_metadata=object())
+        inputs = (torch.ones(2), None, None)
+        with forward_context(ForwardContext(attn_backend=backend)):
+            for invoke in (call, warmup_async):
+                with self.subTest(invoke=invoke.__name__):
+                    self.assertIs(invoke(*inputs), model.forward.return_value)
+        self.assertEqual(model.forward.call_count, 2)
 
         compile_module.direct_compile.assert_called_once()
         kwargs = compile_module.direct_compile.call_args.kwargs

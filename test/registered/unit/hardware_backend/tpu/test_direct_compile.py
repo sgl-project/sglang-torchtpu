@@ -1267,7 +1267,11 @@ class TestDirectCompileDpRanks(unittest.TestCase):
             patch.object(dp_attention, "_RANK_TENSORS", cache),
             forward_context(ForwardContext(attn_backend=backend)),
         ):
-            compiled = policy._direct_compile(model.forward)
+            compiled, warmup_async = policy._direct_compile(model.forward)
+            torch.testing.assert_close(
+                warmup_async(values, None, None).wait().cpu(),
+                model(values, None, None).cpu(),
+            )
             # Reuse one executable while changing both scalar rank buffers.
             # Constants baked during tracing would return the first rank's result.
             for tp_rank, dp_rank in ((0, 0), (0, 1), (1, 0), (1, 1)):
