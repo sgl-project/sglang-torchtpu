@@ -10,8 +10,9 @@ Pure dataclass logic — CPU only.
 """
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -56,6 +57,108 @@ def _global_top_k_output(num_rows: int) -> LogitsProcessorOutput:
 
 
 class TestMlpSyncPadUnpad(CustomTestCase):
+    def test_decode_during_peer_prefill_preserves_backend_behavior(self):
+        for is_tpu, hybrid in (
+            (True, True),
+            (True, False),
+            (False, True),
+            (False, False),
+        ):
+            for host_lengths in (True, False):
+                with self.subTest(
+                    is_tpu=is_tpu, hybrid=hybrid, host_lengths=host_lengths
+                ):
+                    self._check_decode_during_peer_prefill(is_tpu, hybrid, host_lengths)
+
+    def _check_decode_during_peer_prefill(self, is_tpu, hybrid, host_lengths):
+        from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=2,
+            input_ids=torch.tensor([11, 12]),
+            req_pool_indices=torch.tensor([5, 6]),
+            seq_lens=torch.tensor([7, 9]),
+            seq_lens_cpu=torch.tensor([7, 9]) if host_lengths else None,
+            out_cache_loc=torch.tensor([20, 21]),
+            seq_lens_sum=16,
+            positions=torch.tensor([6, 8]),
+            is_extend_in_batch=True,
+            global_num_tokens_cpu=[2, 8],
+            global_num_tokens_gpu=torch.tensor([2, 8]),
+            global_num_tokens_for_logprob_cpu=[2, 1],
+        )
+        runner = _mock_model_runner()
+        runner.compile_policy = NoopCompilePolicy()
+        runner.is_draft_worker = False
+        runner.attn_tp_sequence_sharded.return_value = False
+        runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
+        module = "sglang.srt.model_executor.forward_batch_info"
+        with (
+            patch(f"{module}._is_tpu", is_tpu),
+            patch(f"{module}._is_cpu", True),
+            patch(
+                f"{module}.mambaish_config", return_value=object() if hybrid else None
+            ),
+            patch(
+                f"{module}._elastic_should_preserve_local_token_counts",
+                return_value=False,
+            ),
+            patch(
+                f"{module}.get_parallel",
+                return_value=SimpleNamespace(attn_tp_size=2, attn_dp_rank=0),
+            ),
+            patch(
+                f"{module}.get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(
+                        cuda_graph_config=SimpleNamespace(
+                            prefill=SimpleNamespace(bs=None)
+                        )
+                    )
+                ),
+            ),
+            patch(
+                f"{module}.DpPaddingMode.get_dp_padding_mode",
+                return_value=DpPaddingMode.MAX_LEN,
+            ),
+            patch(f"{module}.set_dp_buffer_len"),
+            patch(f"{module}.set_is_extend_in_batch"),
+            patch(
+                "sglang.srt.batch_overlap.two_batch_overlap.TboForwardBatchPreparer.prepare"
+            ),
+            (
+                patch.object(
+                    torch.Tensor,
+                    "cpu",
+                    side_effect=AssertionError(
+                        "unexpected device-to-host synchronization"
+                    ),
+                )
+                if is_tpu and host_lengths
+                else nullcontext()
+            ),
+        ):
+            if hybrid and not is_tpu:
+                with self.assertRaisesRegex(AssertionError, "expects an empty rank"):
+                    batch.prepare_mlp_sync_batch(runner)
+                return
+            batch.prepare_mlp_sync_batch(runner)
+
+        self.assertEqual(batch.forward_mode, ForwardMode.EXTEND)
+        self.assertEqual(batch._original_forward_mode, ForwardMode.DECODE)
+        self.assertEqual(batch.extend_num_tokens, 2)
+        self.assertEqual(batch.extend_prefix_lens_cpu, [6, 8])
+        self.assertEqual(batch.extend_seq_lens_cpu, [1, 1])
+        torch.testing.assert_close(batch.req_pool_indices, torch.tensor([5, 6]))
+        torch.testing.assert_close(batch.seq_lens, torch.tensor([7, 9]))
+        torch.testing.assert_close(batch.out_cache_loc[:2], torch.tensor([20, 21]))
+        self.assertEqual(batch.input_ids.shape[0], 8)
+        batch.post_forward_mlp_sync_batch(_logits_output(2))
+        self.assertEqual(batch.forward_mode, ForwardMode.DECODE)
+        torch.testing.assert_close(batch.positions, torch.tensor([6, 8]))
+
     def test_idle_rank_does_not_index_dummy_last_token(self):
         # MLP-sync turns an idle rank into a dummy zero-token EXTEND batch.
         empty = torch.empty(0, dtype=torch.int64)
@@ -259,6 +362,67 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [4])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
+
+    def test_idle_mrope_positions_survive_dp_padding(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        for is_tpu, is_mrope in (
+            (True, True),
+            (True, False),
+            (False, True),
+            (False, False),
+        ):
+            with self.subTest(is_tpu=is_tpu, is_mrope=is_mrope):
+                empty = torch.empty(0, dtype=torch.int64)
+                scheduled = ScheduleBatch(
+                    reqs=[],
+                    forward_mode=ForwardMode.IDLE,
+                    input_ids=empty,
+                    req_pool_indices=empty,
+                    seq_lens=empty,
+                    seq_lens_cpu=empty,
+                    orig_seq_lens=empty,
+                    out_cache_loc=empty,
+                    seq_lens_sum=0,
+                )
+                runner = _mock_model_runner()
+                runner.device = "cpu"
+                runner.model_config.model_is_mrope = is_mrope
+                runner.model_config.requires_mm_token_modalities = False
+                runner.lora_manager = None
+                runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
+                with (
+                    patch(
+                        "sglang.srt.model_executor.forward_batch_info.enable_num_token_non_padded",
+                        return_value=False,
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.forward_batch_info._is_tpu", is_tpu
+                    ),
+                ):
+                    batch = ForwardBatch.init_new(
+                        scheduled,
+                        runner,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        return_hidden_states_before_norm=False,
+                    )
+                if is_tpu and is_mrope:
+                    self.assertEqual(batch.mrope_positions.shape, (3, 0))
+                    self.assertEqual(batch.mrope_positions.dtype, torch.int64)
+                else:
+                    self.assertIsNone(batch.mrope_positions)
+                batch._pad_inputs_to_size(runner, num_tokens=8, bs=1)
+                if is_tpu and is_mrope:
+                    torch.testing.assert_close(
+                        batch.mrope_positions, torch.zeros(3, 8, dtype=torch.int64)
+                    )
+                    self.assertEqual(
+                        batch.mrope_positions.device, batch.positions.device
+                    )
+                else:
+                    self.assertIsNone(batch.mrope_positions)
+                self.assertEqual(scheduled.input_ids.numel(), 0)
 
 
 if __name__ == "__main__":

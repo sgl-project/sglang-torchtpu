@@ -1018,6 +1018,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if _is_tpu and model_runner.model_config.model_is_mrope:
+                # TPU DP synchronization can turn this idle batch into a padded
+                # extend. Seed MRoPE metadata so padding supplies dummy positions
+                # instead of leaving the multimodal wrapper with None.
+                ret.mrope_positions = ret.positions.new_empty((3, 0))
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
@@ -1581,12 +1586,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
-                # Fabricate a single dummy request covering num_tokens for an
-                # empty (idle) rank. Hybrid-SSM families always take this path;
-                # non-hybrid ranks reach it once MAX_LEN is forced for the
-                # prefill breakable CUDA graph (idle + prefill), which needs
-                # every DP rank to run the same captured shape. The `else`
-                # branch handles decode rows padded to a 1-token extend.
                 if model_runner.compile_policy.materialize_dp_idle_extend(
                     self, num_tokens
                 ):
@@ -1599,7 +1598,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     if self.num_token_non_padded is not None:
                         self.num_token_non_padded.fill_(num_tokens)
                     self.num_token_non_padded_cpu = num_tokens
+                elif _is_tpu and self.seq_lens.shape[0] > 0:
+                    # TPU continues live requests through a one-token extend,
+                    # including hybrid models with cached recurrent state.
+                    from sglang.srt.hardware_backend.tpu.forward_batch import (
+                        prepare_decode_as_extend,
+                    )
+
+                    prepare_decode_as_extend(self, bs)
                 elif hybrid_ssm or self.seq_lens.shape[0] == 0:
+                    # Fabricate a single dummy request covering num_tokens for an
+                    # empty (idle) rank. Non-TPU hybrid-SSM models retain this
+                    # empty-rank contract. Non-hybrid ranks also need this when
+                    # MAX_LEN is forced for prefill breakable CUDA graphs, so every
+                    # DP rank runs the same captured shape. Live TPU rows are
+                    # handled above; the final else converts remaining live decode
+                    # rows to one-token extends.
                     dev = self.seq_lens.device
                     assert self.seq_lens.shape[0] == 0, (
                         "extend-idle conversion expects an empty rank"
