@@ -93,7 +93,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_schedule,
 )
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_npu, is_tpu
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -105,6 +105,13 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.prefill_early_send import (
+        tpu_clip_cached_prefix_send_end,
+        tpu_update_inflight_kv_write_pages,
+    )
 
 
 def should_force_retry(req: Req) -> bool:
@@ -697,6 +704,10 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
+        if _is_tpu:
+            # KV page ids the in-flight forward may write, None when nothing is
+            # in flight. The cached-prefix early send must not read these pages.
+            self.tpu_inflight_kv_write_page_ids = None
 
         while True:
             # Receive requests
@@ -736,6 +747,9 @@ class SchedulerDisaggregationPrefillMixin:
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            if _is_tpu and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
+                tpu_update_inflight_kv_write_pages(self, batch)
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -1296,15 +1310,20 @@ class SchedulerDisaggregationPrefillMixin:
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
             return
+        if self.enable_overlap and _is_tpu:
+            # TPU cannot send pages the in-flight forward might write, since
+            # those pages might be partially updated.
+            cached_end = tpu_clip_cached_prefix_send_end(self, req, cached_end)
+            if cached_end <= req.start_send_idx:
+                return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
         # be writing these prefix pages on forward_stream. Record a completion
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
         # The completion event is consumed by the CUDA transfer workers,
-        # which read KV concurrently with the forward. Backends without such
-        # workers (TPU) start their reads only after the final chunk is
-        # finalized, when these writes have already landed.
+        # which read KV concurrently with the forward. TPU has no such event
+        # and clips the send to the pages already written instead, see above.
         if self.enable_overlap and _is_cuda:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
