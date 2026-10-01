@@ -623,10 +623,10 @@ def sgl_eval_runner(
 ):
     """Score a gate with ``sgl-eval run <eval_name>`` over its full dataset.
 
-    run_eval's sgl-eval path can only toggle ``chat_template_kwargs.thinking``;
-    templates that read another key (Gemma 4 and Qwen3.5: ``enable_thinking``)
-    need ``chat_template_kwargs``. It also sends ``mmmu_pro`` through sgl-eval,
-    where the shared runner takes NeMo-Skills' 500-sample subset.
+    Two reasons to prefer this over run_eval's sgl-eval path: that path can only
+    toggle ``chat_template_kwargs.thinking``, so a template reading any other key
+    needs ``chat_template_kwargs``; and it routes ``mmmu_pro`` to the shared
+    runner, which scores NeMo-Skills' 500-sample subset rather than the full set.
     """
 
     def run(base_url: str) -> dict[str, Any]:
@@ -677,10 +677,10 @@ def sgl_eval_runner(
 # --- accuracy models ----------------------------------------------------------
 # Per-model identity for the accuracy nightlies, as data: a new model is an entry
 # here, not a module of its own. An entry says how its server starts -- either a
-# `config_module` recipe its test's TPULauncherTestCase boots. Serving settings
-# are NOT here: a benchmark that needs a different server gets its own recipe
-# rather than env patched in at launch, so the shape a score was measured at
-# stays with the score. `sampling` is the model card's decoding settings.
+# `config_module` recipe its test's fixture boots. Serving settings are NOT here:
+# a benchmark that needs a different server gets its own recipe rather than env
+# patched in at launch, so the shape a score was measured at stays with the
+# score. `sampling` is the model card's decoding settings.
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", DEFAULT_HEALTH_TIMEOUT))
@@ -693,7 +693,7 @@ GPT_OSS_120B = {
     "config_module": "recipe/configs/gpt_oss_120b/accuracy.py",
 }
 
-# Both Gemma 4 checkpoints take the same card sampling; only the recipe differs.
+# Shared by the entries below that differ only in checkpoint and recipe.
 _GEMMA4_SAMPLING = {
     "max_tokens": 32768,
     "num_threads": 64,

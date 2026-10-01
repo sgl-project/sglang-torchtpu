@@ -5,8 +5,8 @@ own grader scores it, so a shard is comparable with an unsharded run of the
 same benchmark. The shards partition the set by stride, and the collector
 rejects a missing or duplicated id before reporting the combined score.
 
-A model too slow to finish the set inside one CI job runs it in shards; any
-model can, so nothing here names one.
+Sharding is for a model too slow to finish the set inside one CI job; the caller
+supplies the model and its sampling.
 """
 
 import argparse
