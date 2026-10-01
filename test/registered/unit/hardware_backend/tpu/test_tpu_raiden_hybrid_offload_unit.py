@@ -5,7 +5,8 @@ raiden): the hybrid assembler consults the platform host-pool hook (the bug
 that routed TPU hybrid models to the CUDA host pool), each transfer issues one
 all-layer DMA per pool and its ack completes only when every pool's DMA has
 landed, load-back keeps index tensors host-resident by rewriting the
-tree-owned PoolTransfer in place, and speculative-decoding draft sidecars ride
+tree-owned PoolTransfer in place, a transfer with SWA pages but no Full pages
+leaves the Full pool's KV untouched, and speculative-decoding draft sidecars ride
 the same rounds (draft DMA issued per transfer, reload ack gates on it, draft
 device pool wired to the whole-batch counter, host pool picked via the
 platform hook).
@@ -15,15 +16,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import threading
 import unittest
 from typing import List
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.kv_pool_host import (
+    RAIDEN_LAYOUT,
+    TpuRaidenHostKVCache,
+)
 from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
+from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
 from sglang.srt.managers.cache_controller import BatchDoneCounter, LayerDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -31,6 +38,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
 )
+from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -257,6 +265,125 @@ class TestHybridLoad(CustomTestCase):
         self.assertIsNotNone(tree_transfer.device_indices)
         self.assertEqual(tree_transfer.device_indices.device.type, "cpu")
         swa_alloc.assert_called_once_with(4)
+
+
+class _ReadyRaidenFuture:
+    def is_ready(self) -> bool:
+        return True
+
+    def ok(self) -> bool:
+        return True
+
+
+class _RaidenManagerModel:
+    """CPU model of raiden's ``d2h`` / ``h2d`` over one sub-pool's layers.
+
+    A non-empty page list copies those pages in every layer. An empty list
+    selects raiden's whole-buffer mode: each layer's entire device buffer is
+    copied to (``d2h``) or from (``h2d``) the start of its host buffer.
+    """
+
+    def __init__(self, layers: int, device_pages: int, host_pages: int):
+        self.device = torch.arange(layers * device_pages * 2.0).view(
+            layers, device_pages, 2
+        )
+        self.host = -1 - torch.arange(layers * host_pages * 2.0).view(
+            layers, host_pages, 2
+        )
+
+    def d2h(self, device_pages, host_pages, block_counts):
+        if not device_pages:
+            self.host[:, : self.device.shape[1]] = self.device
+        else:
+            self.host[:, host_pages] = self.device[:, device_pages]
+        return _ReadyRaidenFuture()
+
+    def h2d(self, host_pages, device_pages, block_counts):
+        if not host_pages:
+            self.device[:] = self.host[:, : self.device.shape[1]]
+        else:
+            self.device[:, device_pages] = self.host[:, host_pages]
+        return _ReadyRaidenFuture()
+
+
+def _raiden_host_pool(mgr: _RaidenManagerModel, page_size: int):
+    """A real raiden host pool and transfer driving ``mgr``."""
+    pool = object.__new__(TpuRaidenHostKVCache)
+    pool.page_size = page_size
+    pool.page_num = mgr.host.shape[1]
+    pool.size = pool.page_num * page_size
+    pool.layout = RAIDEN_LAYOUT
+    pool.device = "cpu"
+    pool.size_per_token = 1
+    pool.lock = threading.RLock()
+    pool.transfer = object.__new__(RaidenKVTransfer)
+    pool.transfer._mgr = mgr
+    pool.clear()
+    return pool
+
+
+class TestHybridTransferWithoutFullPages(CustomTestCase):
+    """A hybrid transfer can carry SWA pages but no Full pages, under either
+    write policy: load-back when a node's Full KV is still on device but its
+    SWA KV was evicted, backup when its Full KV is already on host. The
+    controller still issues the Full pool's DMA, and raiden must not see the
+    empty page list as the whole buffer."""
+
+    PAGE_SIZE = 2
+
+    def setUp(self):
+        self.full_mgr = _RaidenManagerModel(layers=2, device_pages=4, host_pages=8)
+        self.swa_mgr = _RaidenManagerModel(layers=2, device_pages=4, host_pages=8)
+        self.ctrl = _make_controller()
+        self.ctrl.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=_raiden_host_pool(self.full_mgr, self.PAGE_SIZE),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name=PoolName.SWA,
+                    host_pool=_raiden_host_pool(self.swa_mgr, self.PAGE_SIZE),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                ),
+            ]
+        )
+        self.ctrl.mem_pool_device_allocator = None
+        self.ctrl.device = "cpu"
+
+    def _tokens(self, pages: List[int]) -> torch.Tensor:
+        pages = torch.tensor(pages, dtype=torch.int64)
+        return (pages[:, None] * self.PAGE_SIZE + torch.arange(self.PAGE_SIZE)).view(-1)
+
+    def test_swa_only_load_leaves_full_device_kv_intact(self):
+        full_device = self.full_mgr.device.clone()
+        swa = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=self._tokens([5]),
+            device_indices=self._tokens([1]),
+        )
+        self.ctrl.load(host_indices=self._tokens([]), node_id=1, extra_pools=[swa])
+        self.ctrl.start_loading()
+        self.ctrl.ack_load_queue[0].finish_event.synchronize()
+
+        torch.testing.assert_close(self.swa_mgr.device[:, 1], self.swa_mgr.host[:, 5])
+        torch.testing.assert_close(self.full_mgr.device, full_device)
+
+    def test_swa_only_backup_leaves_full_host_kv_intact(self):
+        full_host = self.full_mgr.host.clone()
+        swa = PoolTransfer(name=PoolName.SWA, device_indices=self._tokens([2]))
+        self.ctrl.write(device_indices=self._tokens([]), node_id=1, extra_pools=[swa])
+        self.ctrl.ack_write_queue[0].finish_event.synchronize()
+
+        (host_page,) = (swa.host_indices[:: self.PAGE_SIZE] // self.PAGE_SIZE).tolist()
+        torch.testing.assert_close(
+            self.swa_mgr.host[:, host_page], self.swa_mgr.device[:, 2]
+        )
+        torch.testing.assert_close(self.full_mgr.host, full_host)
 
 
 class TestAssemblerPlatformHook(CustomTestCase):
