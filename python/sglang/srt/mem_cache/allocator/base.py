@@ -16,11 +16,13 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Protocol
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, ContextManager, Protocol
 
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
@@ -39,6 +41,9 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Holds freed pages back from DMA write targets; None frees at once.
+    kv_free_fence: KVFreeFence | None = None
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -189,6 +194,21 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.release_pages is None or len(self.release_pages) == 0:
             return self.free_pages
         return torch.cat((self.free_pages, self.release_pages))
+
+    def dma_write_target(self) -> ContextManager:
+        """Scope allocations whose pages a DMA unordered against device
+        compute writes, such as a host-to-device KV load."""
+        if self.kv_free_fence is None:
+            return nullcontext()
+        return self.kv_free_fence.dma_write_target()
+
+    def freeing_released_values(self, release_time: float | None) -> ContextManager:
+        """Scope frees of cached values no forward formed after
+        ``release_time`` (the radix tree's time counter) can write; None when
+        unknown."""
+        if self.kv_free_fence is None:
+            return nullcontext()
+        return self.kv_free_fence.freeing_released_values(release_time)
 
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"

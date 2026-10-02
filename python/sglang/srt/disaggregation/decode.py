@@ -3044,6 +3044,8 @@ class SchedulerDisaggregationDecodeMixin:
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
+            if batch and self.kv_free_fence is not None:
+                self.kv_free_fence.on_batch_formed()
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
@@ -3053,6 +3055,8 @@ class SchedulerDisaggregationDecodeMixin:
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                if self.kv_free_fence is not None:
+                    self.kv_free_fence.on_forward_launched(batch_result)
             else:
                 batch_result = None
                 self._sched_idled = True

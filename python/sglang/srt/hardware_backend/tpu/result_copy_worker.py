@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -16,7 +16,7 @@ class TpuAsyncCopyEvent:
     synchronize() to block until the copy's results are ready.
     """
 
-    def __init__(self, event, submitted: Future[None]) -> None:
+    def __init__(self, event, submitted: Future[Optional[torch.Tensor]]) -> None:
         self.event = event
         self.submitted = submitted
 
@@ -36,7 +36,8 @@ class TPUAsyncCopyWorker:
     copy submission can still block waiting for the source TPU buffer handle.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, copy_draft_tail: bool = False) -> None:
+        self.copy_draft_tail = copy_draft_tail
         self.device_module = torch.get_device_module("tpu")
         self.device_index = torch.accelerator.current_device_index()
         # TPU events track work by stream. Keep copy events from capturing
@@ -72,10 +73,26 @@ class TPUAsyncCopyWorker:
         result: GenerationBatchResult,
         return_logprob: bool,
         return_hidden_states: bool,
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
         with (
             torch.accelerator.device_index(self.device_index),
             self.device_module.stream(self.stream),
         ):
+            # EAGLE draft-extend runs after verify and writes draft KV; copying
+            # one of its outputs makes copy_done cover it. The KV writes DFLASH,
+            # DSPARK, and NGRAM issue after their results are not covered; the
+            # scheduler rejects them with raiden. The returned copy stays
+            # referenced by the submission future.
+            draft_tail = None
+            draft_input = result.next_draft_input
+            if (
+                self.copy_draft_tail
+                and isinstance(draft_input, EagleDraftInput)
+                and draft_input.topk_index is not None
+            ):
+                draft_tail = draft_input.topk_index.to("cpu", non_blocking=True)
             # copy_to_cpu calls result.copy_done.record() after issuing the copies.
             result.copy_to_cpu(return_logprob, return_hidden_states)
+            return draft_tail

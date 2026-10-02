@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.tpu.result_copy_worker import (
     TpuAsyncCopyEvent,
     TPUAsyncCopyWorker,
 )
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -105,7 +106,7 @@ def test_worker_preserves_context_and_serializes_copies(monkeypatch):
     def make_result(first):
         event = DelayedCopyEvent()
         event.transferred.set()
-        result = SimpleNamespace(copy_done=event)
+        result = SimpleNamespace(copy_done=event, next_draft_input=None)
 
         def copy_to_cpu(return_logprob, return_hidden_states):
             assert get_ident() != scheduler_thread
@@ -142,6 +143,48 @@ def test_worker_preserves_context_and_serializes_copies(monkeypatch):
         release_first.set()
         worker.close()
     assert contexts == []
+
+
+@pytest.mark.parametrize("copy_draft_tail", [True, False])
+def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail):
+    """Draft-extend writes draft KV after the verify outputs are produced, so
+    under the KV free fence copy_done must also wait for one of its outputs;
+    otherwise the extra copy would only delay result processing."""
+    device_module = SimpleNamespace(
+        current_device=lambda: 0,
+        Stream=Mock(),
+        device=lambda value: contextmanager(lambda: (yield))(),
+        stream=lambda value: contextmanager(lambda: (yield))(),
+    )
+    monkeypatch.setattr(torch, "get_device_module", Mock(return_value=device_module))
+    issued = []
+    draft_tail = object()
+    topk_index = Mock()
+    topk_index.to.side_effect = lambda *args, **kwargs: (
+        issued.append("draft") or draft_tail
+    )
+    event = Mock()
+    event.record.side_effect = lambda: issued.append("record")
+    result = SimpleNamespace(
+        copy_done=event, next_draft_input=EagleDraftInput(topk_index=topk_index)
+    )
+    result.copy_to_cpu = lambda *args: (
+        issued.append("copy"),
+        result.copy_done.record(),
+    )
+
+    worker = TPUAsyncCopyWorker(copy_draft_tail=copy_draft_tail)
+    try:
+        worker.submit(result, return_logprob=False, return_hidden_states=False)
+        tail = result.copy_done.submitted.result(timeout=5)
+    finally:
+        worker.close()
+    if copy_draft_tail:
+        assert tail is draft_tail
+        assert issued == ["draft", "copy", "record"]
+    else:
+        assert tail is None
+        assert issued == ["copy", "record"]
 
 
 if __name__ == "__main__":

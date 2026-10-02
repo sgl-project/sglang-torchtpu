@@ -62,6 +62,8 @@ from torch.distributed import barrier
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
+    from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
+
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
         initialize_mamba_selective_state_update_backend,
@@ -454,6 +456,7 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    kv_free_fence: Optional["KVFreeFence"] = None
 
     def __init__(
         self,
@@ -674,6 +677,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+        self.maybe_init_kv_free_fence()
         if current_platform.is_tpu() and self.draft_worker is not None:
             self.precompile_tpu_spec_ops()
 
@@ -1677,8 +1681,29 @@ class Scheduler(
                 TPUAsyncCopyWorker,
             )
 
-            self.tpu_async_copy_worker = TPUAsyncCopyWorker()
+            self.tpu_async_copy_worker = TPUAsyncCopyWorker(
+                # The KV free fence releases pages once copy_done completes.
+                copy_draft_tail=self.enable_hierarchical_cache
+                and get_memory().hicache_io_backend == "raiden"
+            )
             logger.info("TPU async result-copy worker enabled")
+        if (
+            self.tpu_async_copy_worker is not None
+            and self.enable_overlap
+            and self.enable_hierarchical_cache
+            and get_memory().hicache_io_backend == "raiden"
+            and (
+                self.spec_algorithm.is_dflash_family() or self.spec_algorithm.is_ngram()
+            )
+        ):
+            # The KV free fence releases pages on copy_done, which the async
+            # copy worker records before these algorithms' KV writes that
+            # follow the result tensors.
+            raise ValueError(
+                f"{self.spec_algorithm.name} speculative decoding is not supported "
+                "with the raiden HiCache backend and the TPU async copy worker "
+                "under overlap scheduling."
+            )
 
         # CUDA-style forward/copy/schedule streams only buy overlap on backends
         # with real multi-stream execution. Single-queue backends (see
@@ -1755,6 +1780,23 @@ class Scheduler(
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def maybe_init_kv_free_fence(self):
+        """Hold KV pages freed under overlap back from raiden HiCache loads."""
+        if (
+            self.device == "tpu"
+            and self.enable_overlap
+            and self.enable_hierarchical_cache
+            and get_memory().hicache_io_backend == "raiden"
+        ):
+            from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+                install_kv_free_fence,
+            )
+
+            self.kv_free_fence = install_kv_free_fence(
+                self.token_to_kv_pool_allocator,
+                synchronize_device=self.device_module.synchronize,
+            )
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
@@ -2106,6 +2148,8 @@ class Scheduler(
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
+            if batch and self.kv_free_fence is not None:
+                self.kv_free_fence.on_batch_formed()
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -2126,6 +2170,8 @@ class Scheduler(
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                if self.kv_free_fence is not None:
+                    self.kv_free_fence.on_forward_launched(batch_result)
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -5016,6 +5062,8 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        if self.kv_free_fence is not None:
+            self.kv_free_fence.on_forward_done(result)
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

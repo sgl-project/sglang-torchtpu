@@ -1,0 +1,345 @@
+"""KV pages freed under overlap stay out of DMA-written allocations until the
+forwards in flight at free time are processed."""
+
+import subprocess
+import sys
+import textwrap
+import unittest
+from array import array
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+
+import sglang
+from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+    TpuPagedTokenToKVPoolAllocator,
+)
+from sglang.srt.hardware_backend.tpu.kv_free_fence import install_kv_free_fence
+from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+
+PAGE = 4
+
+
+class _CopyDone:
+    def __init__(self, log):
+        self.log = log
+
+    def synchronize(self):
+        self.log.append("copy_done")
+
+
+class TestKVFreeFence(CustomTestCase):
+    def _setup(self, num_pages=4, need_sort=False):
+        self.log = []
+        self.allocator = TpuPagedTokenToKVPoolAllocator(
+            size=num_pages * PAGE,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=need_sort,
+        )
+        self.fence = install_kv_free_fence(
+            self.allocator, synchronize_device=lambda: self.log.append("device")
+        )
+
+    def _launch(self):
+        result = SimpleNamespace(copy_done=_CopyDone(self.log))
+        self.fence.on_batch_formed()
+        self.fence.on_forward_launched(result)
+        return result
+
+    def _pages(self, locs):
+        return set((locs[::PAGE] // PAGE).tolist())
+
+    def _alloc_dma(self, num_pages):
+        with self.allocator.dma_write_target():
+            return self.allocator.alloc(num_pages * PAGE)
+
+    def test_dma_target_never_gets_a_page_an_in_flight_forward_may_write(self):
+        """A page freed while forward N runs can be overwritten by forward N, so
+        a host-to-device load into it must not be issued before N finishes."""
+        for need_sort in (False, True):
+            with self.subTest(need_sort=need_sort):
+                self._setup(need_sort=need_sort)
+                busy = self.allocator.alloc(2 * PAGE)
+                spare = self.allocator.alloc(2 * PAGE)
+                self._launch()
+                self.allocator.free(busy)
+                self.allocator.free(spare[:PAGE])
+
+                # Free pages exist only on the held side, so the DMA waits.
+                self.assertEqual(self.allocator.available_size(), 3 * PAGE)
+                loaded = self._alloc_dma(3)
+                self.assertEqual(self.log, ["device"])
+                self.assertEqual(
+                    self._pages(loaded), self._pages(busy) | self._pages(spare[:PAGE])
+                )
+
+    def test_dma_target_uses_free_pages_without_waiting(self):
+        self._setup()
+        busy = self.allocator.alloc(2 * PAGE)
+        self._launch()
+        self.allocator.free(busy)
+
+        loaded = self._alloc_dma(2)
+        self.assertEqual(self.log, [])
+        self.assertTrue(self._pages(loaded).isdisjoint(self._pages(busy)))
+        self.assertIsNone(self._alloc_dma(3))
+        self.assertEqual(self.log, [])
+
+    def test_forward_allocation_borrows_held_pages_without_waiting(self):
+        """Device compute runs in launch order, so a later forward's write to a
+        held page lands after the in-flight forward's write."""
+        self._setup()
+        busy = self.allocator.alloc(4 * PAGE)
+        self._launch()
+        self.allocator.free(busy)
+
+        out = self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([0]),
+            prefix_lens_cpu=torch.tensor([0]),
+            seq_lens=torch.tensor([PAGE + 1]),
+            seq_lens_cpu=torch.tensor([PAGE + 1]),
+            last_loc=torch.tensor([-1]),
+            extend_num_tokens=PAGE + 1,
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(self.log, [])
+        self.assertEqual(self.allocator.available_size(), 2 * PAGE)
+
+    def test_pages_release_once_every_forward_in_flight_at_free_is_processed(self):
+        self._setup()
+        early, late = self.allocator.alloc(2 * PAGE).split(PAGE)
+        first = self._launch()
+        self.allocator.free(early)
+        second = self._launch()
+        self.allocator.free(late)
+
+        self.fence.on_forward_done(first)
+        self.assertEqual(self.log, ["copy_done"])
+        self.assertEqual(self.allocator.held_pages.num_pages, 1)
+        self.fence.on_forward_done(second)
+        self.assertEqual(self.allocator.held_pages.num_pages, 0)
+        self.assertEqual(len(self.allocator.free_pages), 4)
+
+        # With nothing in flight, frees go straight to the free list.
+        self.allocator.free(self.allocator.alloc(PAGE))
+        self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+    def test_unqueued_result_is_ignored_and_a_skipped_result_asserts(self):
+        """Loops without overlap process results they never queued; a queued
+        result processed out of order would hold its pages forever."""
+        self._setup()
+        busy = self.allocator.alloc(PAGE)
+        first = self._launch()
+        second = self._launch()
+        self.allocator.free(busy)
+
+        self.fence.on_forward_done(SimpleNamespace(copy_done=None))
+        self.assertEqual(self.allocator.held_pages.num_pages, 1)
+        with self.assertRaises(AssertionError):
+            self.fence.on_forward_done(second)
+        self.fence.on_forward_done(first)
+        self.fence.on_forward_done(second)
+        self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+    def test_frees_after_a_device_sync_are_not_held(self):
+        """A device sync finishes every launched forward, so frees made before
+        their results are processed have nothing left to wait for."""
+        self._setup()
+        early, late = self.allocator.alloc(2 * PAGE).split(PAGE)
+        self._launch()
+        self.allocator.free(early)
+        self.fence.wait_for_in_flight()
+        self.allocator.free(late)
+        self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+        # A forward launched after the sync is running again.
+        self._launch()
+        self.allocator.free(self.allocator.alloc(PAGE))
+        self.assertEqual(self.allocator.held_pages.num_pages, 1)
+
+    def test_frees_before_a_formed_batch_launches_wait_for_it(self):
+        """With overlap off for a batch, the previous result is processed after
+        the batch formed but before it launches; a request it finishes is
+        still in the batch, which writes the request's freed pages."""
+        self._setup()
+        busy = self.allocator.alloc(2 * PAGE)
+        prev = self._launch()
+        self.fence.on_batch_formed()
+        self.allocator.free(busy[:PAGE])
+        self.fence.on_forward_done(prev)
+        # A sync before launch does not cover the formed batch's writes.
+        self.assertIsNone(self._alloc_dma(3))
+        self.assertEqual(self.log, ["copy_done", "device"])
+        self.assertEqual(self.allocator.held_pages.num_pages, 1)
+
+        nxt = SimpleNamespace(copy_done=None)
+        self.fence.on_forward_launched(nxt)
+        self.allocator.free(busy[PAGE:])
+        self.fence.on_forward_done(nxt)
+        self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+    def test_install_covers_swa_sub_pools_and_rejects_other_allocators(self):
+        full, swa = (
+            TpuPagedTokenToKVPoolAllocator(
+                size=4 * PAGE,
+                page_size=PAGE,
+                dtype=torch.bfloat16,
+                device="cpu",
+                kvcache=None,
+                need_sort=False,
+            )
+            for _ in range(2)
+        )
+        wrapper = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
+        wrapper.full_attn_allocator = full
+        wrapper.swa_attn_allocator = swa
+        fence = install_kv_free_fence(wrapper, synchronize_device=lambda: None)
+        self.assertIs(full.kv_free_fence, fence)
+        self.assertIs(swa.kv_free_fence, fence)
+
+        generic = PagedTokenToKVPoolAllocator(
+            size=4 * PAGE,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        with self.assertRaises(ValueError):
+            install_kv_free_fence(generic, synchronize_device=lambda: None)
+
+
+class TestRadixEvictionUnderFence(CustomTestCase):
+    """Radix eviction frees skip the hold only for nodes no running forward can
+    write: last inserted or unlocked before the oldest running batch formed."""
+
+    def setUp(self):
+        size = 16 * PAGE
+        kv_pool = MHATokenToKVPool(
+            size=size,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=8,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        self.allocator = TpuPagedTokenToKVPoolAllocator(
+            size=size,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        self.fence = install_kv_free_fence(
+            self.allocator, synchronize_device=lambda: None
+        )
+        self.cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=ReqToTokenPool(
+                    size=4,
+                    max_context_len=64,
+                    device="cpu",
+                    enable_memory_saver=False,
+                ),
+                token_to_kv_pool_allocator=self.allocator,
+                page_size=PAGE,
+                eviction_policy="lru",
+                tree_components=(ComponentType.FULL,),
+            )
+        )
+
+    def _insert(self, token_ids):
+        self.cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", token_ids)),
+                value=self.allocator.alloc(len(token_ids)).to(torch.int64),
+            )
+        )
+
+    def _launch(self):
+        result = SimpleNamespace(copy_done=None)
+        self.fence.on_batch_formed()
+        self.fence.on_forward_launched(result)
+        return result
+
+    def _evict_all(self):
+        self.cache.evict(EvictParams(num_tokens=self.cache.evictable_size()))
+        self.assertEqual(self.cache.evictable_size(), 0)
+
+    def test_node_released_before_batch_formed_is_freed_at_once(self):
+        self._insert(list(range(2 * PAGE)))
+        self._launch()
+        # Splitting after the batch formed keeps the stamp of the node it split.
+        self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", list(range(PAGE)) + [99] * PAGE)))
+        )
+        self._evict_all()
+        self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+    def test_node_inserted_or_unlocked_after_batch_formed_is_held(self):
+        """A request in a running forward's batch can insert or unlock its
+        pages once the batch formed, even before launch; evicting them early
+        lets a load land under that forward's write."""
+        self._insert(list(range(PAGE)))
+        locked = self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", list(range(PAGE)))))
+        ).last_device_node
+        receipt = self.cache.inc_lock_ref(locked)
+        self.fence.on_batch_formed()
+        self.cache.dec_lock_ref(locked, receipt.to_dec_params())
+        first = SimpleNamespace(copy_done=None)
+        self.fence.on_forward_launched(first)
+        self._insert([100 + i for i in range(PAGE)])
+        self._evict_all()
+        self.assertEqual(self.allocator.held_pages.num_pages, 2)
+
+        self.fence.on_forward_done(first)
+        self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+
+class TestTpuImportOrder(CustomTestCase):
+    def test_swa_allocator_imports_first_on_tpu(self):
+        # On TPU the SWA allocator imports the TPU allocator, which imports the
+        # fence; the fence must not import the unified cache components then.
+        script = textwrap.dedent("""
+            import sglang.srt.utils
+            sglang.srt.utils.is_tpu = lambda: True
+            import sglang.srt.mem_cache.allocator.swa
+            import sys
+            assert "sglang.srt.hardware_backend.tpu.kv_free_fence" in sys.modules
+            """)
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=Path(sglang.__file__).parents[1],
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+
+
+if __name__ == "__main__":
+    unittest.main()
