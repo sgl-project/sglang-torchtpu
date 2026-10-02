@@ -33,6 +33,7 @@ def _decode_manager(engine, chunked=False):
     mgr._failed = set()
     mgr._native_failed = set()
     mgr._completed_send = set()
+    mgr._send_done_at = {}
     mgr._completed_recv = set()
     mgr._pulling_cleared = set()
     mgr._cleared_plans = {}

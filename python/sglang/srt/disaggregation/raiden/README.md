@@ -14,8 +14,11 @@ staging, D2H/H2D DMA, and completion tracking.
 Per request (keyed by `bootstrap_room`): prefill `register_read`s its page
 block-ids; decode pushes a pull request with its rank endpoint; prefill replies
 with its block-ids + raiden endpoint + aux blob; decode issues `start_read`.
-Both sides drain `poll_stats()` in `poll()` — prefill frees on `done_sending`,
-decode runs on `done_recving`. Cross-rank status first reduces to the minimum
+Both sides drain `poll_stats_with_details()` in `poll()` — prefill frees on
+`sent`, decode runs on `received`. Each settled transfer carries raiden's finish
+time; on TPU the prefill's `prefill_transfer_kv_cache` stage ends there, not at
+the later poll (`hardware_backend/tpu/patches.py`).
+Cross-rank status first reduces to the minimum
 over the complete attention-TP/CP group. If any rank fails, every Raiden poller
 tombstones the room before a second reduction confirms that accepted native
 I/O has drained on every rank; only then can the framework release KV pages.

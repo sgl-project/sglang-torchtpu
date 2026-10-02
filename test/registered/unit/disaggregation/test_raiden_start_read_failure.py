@@ -4,6 +4,7 @@ import ast
 import inspect
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
@@ -17,6 +18,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 ROOM = 53
+
+
+def _polled(sent=(), received=(), failed=(), completed_ns=None):
+    """Fake poll_stats_with_details() result for the given req ids."""
+
+    def settled(ids):
+        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+
+    return SimpleNamespace(
+        sent=settled(sent), received=settled(received), failed=settled(failed)
+    )
 
 
 def _decode_manager(*, hybrid, chunked):
@@ -35,7 +47,7 @@ def _decode_manager(*, hybrid, chunked):
     mgr._swa_engine = Mock() if hybrid else None
     for engine in (mgr._engine, mgr._swa_engine):
         if engine is not None:
-            engine.poll_stats.return_value = ([], [], [])
+            engine.poll_stats_with_details.return_value = _polled([], [], [])
     mgr._dynamic_host_staging = True
     mgr._pulling = StagingAdmission(64, 8 if hybrid else None)
     mgr._pulling_cleared = set()
@@ -106,7 +118,9 @@ class TestStartReadFailure(unittest.TestCase):
             self.assertEqual(recv.poll(), KVPoll.Transferring)
             self.assertEqual(len(mgr._pulling), 1)
 
-            mgr._engine.poll_stats.return_value = ([], [str(ROOM)], [])
+            mgr._engine.poll_stats_with_details.return_value = _polled(
+                [], [str(ROOM)], []
+            )
             self.assertEqual(recv.poll(), KVPoll.Failed)
 
         self.assertEqual(len(mgr._pulling), 0)

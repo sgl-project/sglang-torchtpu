@@ -50,6 +50,17 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.test_utils import CustomTestCase
 
 
+def _polled(sent=(), received=(), failed=(), completed_ns=None):
+    """Fake poll_stats_with_details() result for the given req ids."""
+
+    def settled(ids):
+        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+
+    return SimpleNamespace(
+        sent=settled(sent), received=settled(received), failed=settled(failed)
+    )
+
+
 class _Inbox:
     """Stand-in for a manager's bound PULL socket.
 
@@ -117,9 +128,9 @@ class _FakeRaidenEngine:
     def push_registered_plan(self, *args, **kwargs):
         self.pushes.append((args, kwargs))
 
-    def poll_stats(self):
+    def poll_stats_with_details(self):
         stats, self._stats = self._stats, []
-        return stats
+        return _polled(*stats)
 
 
 class _AuxBuffers:

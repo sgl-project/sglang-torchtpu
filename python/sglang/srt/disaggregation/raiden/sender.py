@@ -979,6 +979,8 @@ class RaidenKVSender(CommonKVSender):
         self._last_chunk = False
         self._started = False
         self._transfer_start_time: Optional[float] = None
+        # Raiden's finish time for this room (perf_counter seconds), set on Success.
+        self.transfer_finish_time: Optional[float] = None
         self.init_time = time.time()
         # Raiden is consumer-pull: the prefill need not wait for any decode
         # handshake before computing (decode pulls once prefill registers its
@@ -1032,12 +1034,16 @@ class RaidenKVSender(CommonKVSender):
             self.kv_mgr.finalize_send(self.bootstrap_room, self.aux_index)
 
     def _finalize_transfer_latency(self) -> None:
-        if (
-            self._transfer_start_time is not None
-            and self._transfer_metric.transfer_latency_s is None
-        ):
+        if self._transfer_metric.transfer_latency_s is not None:
+            return
+        # Save it now: clear() runs before the scheduler stamps the stage.
+        self.transfer_finish_time = self.kv_mgr.send_done_time(self.bootstrap_room)
+        if self._transfer_start_time is not None:
+            finish = self.transfer_finish_time
+            if finish is None:
+                finish = time.perf_counter()
             self._transfer_metric.transfer_latency_s = (
-                time.perf_counter() - self._transfer_start_time
+                finish - self._transfer_start_time
             )
 
     def poll(self) -> KVPoll:
