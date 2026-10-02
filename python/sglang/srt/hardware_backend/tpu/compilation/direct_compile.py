@@ -140,7 +140,7 @@ def direct_compile(
     model_extra_tensor_attrs: Sequence[str] = (),
     kv_pool: KVPool | None = None,
     ignored_argnames: tuple[str, ...] = (),
-    prune_unused_inputs: bool = True,
+    prune_unused_inputs: bool = False,
 ) -> CompiledFunction:
     """Compile and dispatch ``fn`` directly, without torch.compile's
     Dynamo or AOTAutograd.
@@ -185,9 +185,9 @@ def direct_compile(
     change during inference.
 
     `prune_unused_inputs` excludes model tensors unused by a specialization
-    from its executable and runtime arguments. Set it to False to retain all
-    model tensors and skip pruning's MLIR inspection and extra lowerings.
-    This option is fixed when constructing the compiled function; explicit
+    from its executable and runtime arguments. It defaults to False, which
+    retains all model tensors and skips pruning's MLIR inspection and extra
+    lowerings. This option is fixed when constructing the compiled function; explicit
     function inputs and KV-pool state are never pruned.
 
     `kv_pool` exposes every KV-cache Tensor through `get_state`; all of
@@ -246,7 +246,7 @@ class CompiledFunction:
         model_extra_tensor_attrs: Sequence[str] = (),
         kv_pool: KVPool | None = None,
         ignored_argnames: tuple[str, ...] = (),
-        prune_unused_inputs: bool = True,
+        prune_unused_inputs: bool = False,
     ) -> None:
         self.fn = fn
         self.specialization_key = specialization_key
