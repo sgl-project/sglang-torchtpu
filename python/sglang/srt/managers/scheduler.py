@@ -4286,6 +4286,15 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
+                and adder.host_load_indices
+            ):
+                new_batch.hicache_load_page_ids = (
+                    torch.cat(adder.host_load_indices).cpu().to(torch.int64)
+                    // self.token_to_kv_pool_allocator.page_size
+                )
 
         new_batch.prepare_for_extend()
 
@@ -4554,7 +4563,9 @@ class Scheduler(
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
+                self.maybe_send_cached_prefix_chunk(
+                    req, hicache_load_page_ids=batch.hicache_load_page_ids
+                )
 
         # Run forward
         if self.is_generation:

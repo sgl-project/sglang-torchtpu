@@ -1,4 +1,4 @@
-"""TPU prefill early send never reads KV pages the in-flight forward writes.
+"""PD prefill early send never reads KV pages that are not written yet.
 
 Under overlap scheduling, ``run_batch`` for step n+1 runs while step n's
 forward may still be executing on device. A chunked request's step-n chunk is
@@ -7,25 +7,34 @@ so the cached-prefix early send would read pages that are still being written.
 On TPU that forward has to finish before its KV cache can be read from HBM, so
 the early send is clipped to the pages step n does not write, and the rest
 goes out with the request's next send.
+
+A HiCache load-back has the same problem within one batch on every platform:
+its pages enter the radix tree when it is queued, and a later request in the
+batch matches them as device-resident. The batch's forward waits for the load,
+but the early send runs before the forward, so it stops at those pages too.
 """
 
 import contextlib
 import unittest
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Set, Tuple
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
 from sglang.srt.disaggregation import prefill
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    find_prefix_send_end_before_pages,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.prefill_early_send import (
     _collect_prefill_write_page_ids,
-    _find_safe_prefix_send_end,
     tpu_clip_cached_prefix_send_end,
     tpu_update_inflight_kv_write_pages,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,12 +44,15 @@ PAGE_SIZE = 4
 
 
 @contextlib.contextmanager
-def _platform(*, is_tpu: bool, early_send: bool = True, update_write_pages=None):
+def _platform(
+    *, is_tpu: bool, early_send: bool = True, update_write_pages=None, pp_size=1
+):
     """prefill.py as it is imported on TPU (or not): it binds the TPU helpers
     only under ``_is_tpu``, which is False on the CPU runners."""
     with (
         patch.object(prefill, "_is_tpu", is_tpu),
         patch.object(prefill, "_is_cuda", False),
+        patch.object(prefill, "get_parallel", lambda: SimpleNamespace(pp_size=pp_size)),
         patch.object(
             prefill,
             "tpu_clip_cached_prefix_send_end",
@@ -168,12 +180,16 @@ class _Harness:
         )[: end - start].to(torch.int32)
 
     def step(self, batch_reqs: Optional[list]) -> None:
-        batch = None if batch_reqs is None else SimpleNamespace(reqs=batch_reqs)
+        batch = (
+            None
+            if batch_reqs is None
+            else SimpleNamespace(reqs=batch_reqs, hicache_load_page_ids=None)
+        )
         if batch is not None:
             # run_batch: early send while the previous forward is still
             # running, then this forward starts writing its own pages.
             for req in batch.reqs:
-                self.s.maybe_send_cached_prefix_chunk(req)
+                self.s.maybe_send_cached_prefix_chunk(req, hicache_load_page_ids=None)
             pages = {
                 int(p)
                 for req in batch.reqs
@@ -318,13 +334,11 @@ class TestEarlySendAvoidsInflightWrites(CustomTestCase):
 
 class TestFindSafePrefixSendEnd(CustomTestCase):
     def _safe_end(self, pages, candidate_send_end, *, inflight, start_send_idx=0):
-        return _find_safe_prefix_send_end(
+        return find_prefix_send_end_before_pages(
             prefix_indices=_slots(pages),
             start_send_idx=start_send_idx,
             candidate_send_end=candidate_send_end,
-            inflight_write_page_ids=(
-                None if inflight is None else torch.tensor(inflight)
-            ),
+            unready_page_ids=(None if inflight is None else torch.tensor(inflight)),
             page_size=PAGE_SIZE,
         )
 
@@ -383,12 +397,12 @@ class TestCollectPrefillWritePageIds(CustomTestCase):
 
 
 class TestUpdateInflightKvWritePages(CustomTestCase):
-    def _batch(self, s):
+    def _batch(self, s, hicache_load_page_ids=None):
         req = SimpleNamespace(
             kv=SimpleNamespace(req_pool_idx=1), extend_range=_Range(0, 8)
         )
         s.req_to_token_pool.req_to_token[1, :8] = _slots([5, 7]).to(torch.int32)
-        return SimpleNamespace(reqs=[req])
+        return SimpleNamespace(reqs=[req], hicache_load_page_ids=hicache_load_page_ids)
 
     def test_tracks_the_launched_batch(self):
         s = _Scheduler(enable_overlap=True)
@@ -396,6 +410,15 @@ class TestUpdateInflightKvWritePages(CustomTestCase):
         with _platform(is_tpu=True):
             tpu_update_inflight_kv_write_pages(s, self._batch(s))
         self.assertEqual(s.tpu_inflight_kv_write_page_ids.tolist(), [5, 7])
+
+    def test_tracks_the_launched_batch_hicache_load_pages(self):
+        # A torch_tpu load scatters on device with the forward, so a later
+        # batch must not send its pages before that forward finishes either.
+        s = _Scheduler(enable_overlap=True)
+        batch = self._batch(s, hicache_load_page_ids=torch.tensor([3, 4]))
+        with _platform(is_tpu=True):
+            tpu_update_inflight_kv_write_pages(s, batch)
+        self.assertEqual(set(s.tpu_inflight_kv_write_page_ids.tolist()), {3, 4, 5, 7})
 
     def test_no_inflight_batch_clears_the_write_page_ids(self):
         s = _Scheduler(enable_overlap=True)
@@ -406,7 +429,7 @@ class TestUpdateInflightKvWritePages(CustomTestCase):
 
 
 class TestMaybeSendCachedPrefixChunk(CustomTestCase):
-    def _send(self, *, is_tpu, enable_overlap, inflight_write_page_ids):
+    def _send(self, *, is_tpu, enable_overlap, inflight_write_page_ids, pp_size=1):
         scheduler = _Scheduler(enable_overlap=enable_overlap)
         scheduler.tpu_inflight_kv_write_page_ids = inflight_write_page_ids
         scheduler.send_kv_chunk = Mock()
@@ -418,8 +441,8 @@ class TestMaybeSendCachedPrefixChunk(CustomTestCase):
             pending_bootstrap=False,
             early_send_prefix_end=None,
         )
-        with _platform(is_tpu=is_tpu):
-            scheduler.maybe_send_cached_prefix_chunk(req)
+        with _platform(is_tpu=is_tpu, pp_size=pp_size):
+            scheduler.maybe_send_cached_prefix_chunk(req, hicache_load_page_ids=None)
         return scheduler.send_kv_chunk, req
 
     def test_tpu_overlap_skips_when_the_whole_prefix_is_in_flight(self):
@@ -451,6 +474,18 @@ class TestMaybeSendCachedPrefixChunk(CustomTestCase):
             is_tpu=False, enable_overlap=True, inflight_write_page_ids=torch.tensor([1])
         )
         send.assert_called_once_with(req, last_chunk=False, end_idx=2 * PAGE_SIZE)
+
+    def test_pipeline_parallel_skips_early_send(self):
+        # PP turns overlap off, so nothing orders the send after earlier
+        # microbatches that are still in flight.
+        for is_tpu in (True, False):
+            send, _ = self._send(
+                is_tpu=is_tpu,
+                enable_overlap=False,
+                inflight_write_page_ids=None,
+                pp_size=2,
+            )
+            send.assert_not_called()
 
 
 class TestOverlapLoopOrder(CustomTestCase):
@@ -515,6 +550,98 @@ class TestOverlapLoopOrder(CustomTestCase):
         order = self._loop([batch, None], last_batch=None)
         self.assertEqual(order.update_write_pages.call_count, 2)
         self.assertIsNone(order.update_write_pages.call_args[0][1])
+
+
+class TestEarlySendSkipsHiCacheLoadPages(CustomTestCase):
+    """One batch admits A, then B:
+
+    - A matched pages 1,2 on device and pages 3,4 on host only. Admitting A
+      queues a load-back into device pages 3,4 and puts them in the radix
+      tree. A computes [16, 20) into page 5.
+    - B is matched after that, so it finds pages 1-4 all on device. B computes
+      [16, 20) into page 6.
+
+    The load fills pages 3,4 once the batch's forward starts waiting for it.
+    """
+
+    def _run(self, *, pass_load_page_ids: bool, is_tpu: bool = False):
+        s = _Scheduler(enable_overlap=is_tpu)
+        harness = _Harness(s)
+        a = _req("A", 1, harness.sender("A"), input_len=20)
+        b = _req("B", 2, harness.sender("B"), input_len=20)
+        for req, own_page in ((a, 5), (b, 6)):
+            harness.write_chunk(req, 16, 20, [own_page])
+            s.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :16] = _slots(
+                [1, 2, 3, 4]
+            ).to(torch.int32)
+            req.prefix_indices = _slots([1, 2, 3, 4])
+        a.host_hit_length = 2 * PAGE_SIZE
+        harness.device.launch({3, 4})
+        load_page_ids = torch.tensor([3, 4]) if pass_load_page_ids else None
+
+        with _platform(is_tpu=is_tpu):
+            for req in (a, b):
+                s.maybe_send_cached_prefix_chunk(
+                    req, hicache_load_page_ids=load_page_ids
+                )
+            early = [(r, p) for r, p, _ in harness.log]
+            harness.device.land()
+            # Each request's send after its forward.
+            for req in (a, b):
+                s.send_kv_chunk(req, last_chunk=False, end_idx=20)
+        return harness, early
+
+    def test_unclipped_early_send_reads_pages_still_loading(self):
+        # Negative control: without the load's page IDs, B's early send reads
+        # pages 3,4 before the load has filled them. This is the bug.
+        harness, _ = self._run(pass_load_page_ids=False)
+        self.assertEqual(harness.inflight_reads(), [("B", [3, 4])])
+
+    def test_no_send_reads_a_page_still_loading(self):
+        for is_tpu in (False, True):
+            harness, _ = self._run(pass_load_page_ids=True, is_tpu=is_tpu)
+            self.assertEqual(harness.inflight_reads(), [], is_tpu)
+
+    def test_device_resident_prefix_still_goes_early(self):
+        _, early = self._run(pass_load_page_ids=True)
+        self.assertEqual(early, [("A", [1, 2]), ("B", [1, 2])])
+
+    def test_every_page_is_sent_exactly_once_per_request(self):
+        harness, _ = self._run(pass_load_page_ids=True)
+        for rid, expected in (("A", [1, 2, 3, 4, 5]), ("B", [1, 2, 3, 4, 6])):
+            sent = [p for pages in harness.sends_of(rid) for p in pages]
+            self.assertEqual(sent, expected, rid)
+
+
+class _StopRunBatch(Exception):
+    pass
+
+
+class TestRunBatchPassesHiCacheLoadPages(CustomTestCase):
+    def test_early_send_gets_the_batch_load_page_ids(self):
+        load_page_ids = torch.tensor([3, 4])
+        reqs = [SimpleNamespace(rid="A"), SimpleNamespace(rid="B")]
+        batch = Mock(
+            reqs=reqs, hicache_load_page_ids=load_page_ids, extend_num_tokens=0
+        )
+        batch.forward_mode.is_split_prefill.return_value = False
+        batch.forward_mode.is_prebuilt.return_value = False
+        s = Mock(
+            forward_ct=0,
+            processed_tokens_counter=0,
+            scripted_scheduler_hook=None,
+            forward_sleep_time=None,
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            is_generation=True,
+        )
+        # The forward reads enable_overlap first; stop there.
+        type(s).enable_overlap = property(Mock(side_effect=_StopRunBatch))
+        with self.assertRaises(_StopRunBatch):
+            Scheduler.run_batch(s, batch)
+        self.assertEqual(
+            s.maybe_send_cached_prefix_chunk.call_args_list,
+            [call(req, hicache_load_page_ids=load_page_ids) for req in reqs],
+        )
 
 
 if __name__ == "__main__":

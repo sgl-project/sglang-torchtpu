@@ -820,6 +820,50 @@ def filter_kv_indices_for_cp_rank(
 #########################
 
 
+def find_prefix_send_end_before_pages(
+    prefix_indices: torch.Tensor,
+    start_send_idx: int,
+    candidate_send_end: int,
+    unready_page_ids: Optional[torch.Tensor],
+    page_size: int,
+) -> int:
+    """Find where a prefix send must stop to avoid KV pages that are not ready.
+
+    The send covers token positions ``[start_send_idx, candidate_send_end)``,
+    and the proposed end must be page-aligned. ``prefix_indices`` maps each token
+    position to a physical KV slot. Return the start of the first page whose
+    ID is in ``unready_page_ids``, or the proposed end if no page conflicts.
+
+    Example: page_size=4, start_send_idx=0, candidate_send_end=12::
+
+        Token positions:    [0, 4)    [4, 8)    [8, 12)
+        Physical page IDs:     5         9          2
+        Unready page IDs:  {9}
+
+    Return 4: only tokens [0, 4) can be sent now. Page 2 is also ready, but
+    the send must stop before page 9 to keep the token range contiguous.
+    With no matching unready pages, return the proposed end, 12.
+    """
+    if unready_page_ids is None or unready_page_ids.numel() == 0:
+        return candidate_send_end
+    # Include the page containing the first unsent token, even if that token
+    # is not at the start of the page.
+    start = start_send_idx - start_send_idx % page_size
+    if candidate_send_end <= start:
+        return candidate_send_end
+    if prefix_indices.device.type != "cpu":
+        prefix_indices = prefix_indices.cpu()
+    # Token positions and KV slots share page boundaries. Sample one slot per
+    # page and divide by page_size to obtain its physical page ID.
+    page_ids = (
+        prefix_indices[start:candidate_send_end:page_size].to(torch.int64) // page_size
+    )
+    hit = torch.isin(page_ids, unready_page_ids)
+    if not bool(hit.any()):
+        return candidate_send_end
+    return start + int(hit.nonzero()[0].item()) * page_size
+
+
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool

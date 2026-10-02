@@ -662,6 +662,8 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
+        # Device KV indices of the HiCache load-backs queued by add_one_req.
+        self.host_load_indices: List[torch.Tensor] = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
@@ -1416,6 +1418,8 @@ class PrefillAdder:
                 if loaded is None:
                     return AddReqResult.OTHER
                 new_indices, req.last_node = loaded
+                if len(new_indices) > 0:
+                    self.host_load_indices.append(new_indices)
                 req.host_loaded_length = len(new_indices)
                 if 0 < req.host_loaded_length < promised_host_hit:
                     raise RuntimeError(

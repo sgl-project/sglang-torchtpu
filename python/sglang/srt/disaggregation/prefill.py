@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    find_prefix_send_end_before_pages,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -1314,8 +1315,14 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
-    def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(
+        self: Scheduler, req: Req, hicache_load_page_ids: Optional[torch.Tensor]
+    ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
+            return
+        if get_parallel().pp_size > 1:
+            # PP turns overlap off, so neither the TPU clip nor the CUDA wait
+            # event below runs, yet earlier microbatches are still in flight.
             return
 
         # Staging sends into positional grid slots, so the early-send boundary
@@ -1341,6 +1348,17 @@ class SchedulerDisaggregationPrefillMixin:
             # DCP radix hits can end on a logical cache-page boundary that is
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
+            return
+        # This batch's HiCache load-backs land after this send, before its forward;
+        # their pages are already in the radix tree, so any request can match them.
+        cached_end = find_prefix_send_end_before_pages(
+            prefix_indices=req.prefix_indices,
+            start_send_idx=req.start_send_idx,
+            candidate_send_end=cached_end,
+            unready_page_ids=hicache_load_page_ids,
+            page_size=self.token_to_kv_pool_allocator.page_size,
+        )
+        if cached_end <= req.start_send_idx:
             return
         if self.enable_overlap and _is_tpu:
             # TPU cannot send pages the in-flight forward might write, since

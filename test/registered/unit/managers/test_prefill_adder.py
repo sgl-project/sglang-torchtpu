@@ -180,6 +180,7 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_one_req(req, True, None)
         self.assertEqual(result, AddReqResult.OTHER)
         self.mock_tree_cache.init_load_back.assert_called_once()
+        self.assertEqual(adder.host_load_indices, [])
         self.assertEqual(req.kv.cache_protected_len, 0)
         self.assertEqual(len(req.prefix_indices), 0)
         req.set_extend_range.assert_not_called()
@@ -200,6 +201,9 @@ class TestPrefillAdder(CustomTestCase):
         )
         adder.add_one_req(req, True, None)
         self.mock_tree_cache.init_load_back.assert_called_once()
+        # PD prefill early send must skip these pages until the load lands.
+        self.assertEqual(len(adder.host_load_indices), 1)
+        self.assertTrue(torch.equal(adder.host_load_indices[0], torch.arange(16384)))
         self.assertEqual(req.kv.cache_protected_len, 16384)
         self.assertEqual(len(req.prefix_indices), 16384)
         self.assertEqual(adder.can_run_list, [req])
