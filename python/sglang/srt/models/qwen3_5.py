@@ -1591,17 +1591,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if not _is_npu and not _is_tpu:
-                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
-            else:
-                # NPU / TPU have no Triton fused_sigmoid_mul.
+            if _is_npu:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
-                if _is_tpu:
-                    attn_output = attn_output * torch.sigmoid(gate_val)
-                else:
-                    attn_output = npu_fused_sigmoid_mul(
-                        attn_output, gate_val.contiguous()
-                    )
+                attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
+            elif _is_tpu:
+                # TPU has no Triton fused_sigmoid_mul.
+                gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+                attn_output = attn_output * torch.sigmoid(gate_val)
+            else:
+                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
 
         output, _ = self.o_proj(attn_output)
         return output
