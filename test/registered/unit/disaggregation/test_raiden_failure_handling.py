@@ -59,6 +59,7 @@ def _prefill_manager():
     mgr._engine_poll_failing_since = {}
     mgr.chunked_transfer = False
     mgr._send_reads = {}
+    mgr._superseded_sender_reads = set()
     mgr._timeout_s = 120.0
     mgr._reshard_pushes_pending = {}
     mgr._message_handlers = {

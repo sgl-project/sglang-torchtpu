@@ -23,6 +23,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.test.test_utils import published_topology
+
+
+@pytest.fixture(autouse=True)
+def pipeline_topology():
+    # The scheduler reads its stage count from the published parallel config.
+    with published_topology(pp_size=8):
+        yield
 
 
 def cost():
@@ -64,7 +72,6 @@ def adder(model=None):
 def scheduler(waiting, chunked=None, mbs=(), last_mbs=()):
     return NS(
         _tpu_pp_chunk_cost=cost(),
-        ps=NS(pp_size=8),
         waiting_queue=waiting,
         chunked_req=chunked,
         mbs=list(mbs),

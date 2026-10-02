@@ -8,6 +8,7 @@ import math
 import time
 from abc import abstractmethod
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 
@@ -187,13 +189,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
             server_args.unsafe_save_torch_compile_bundle is not None
             or server_args.unsafe_load_torch_compile_bundle is not None
         )
-        compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
-        self.compiled_fn = compiler(
-            torch.no_grad()(method),
-            backend=self.backend,
-            fullgraph=self.fullgraph,
-            dynamic=self.dynamic,
-        )
+        self.compiled_fn = self._compile_method(method, use_bundle=use_bundle)
         setattr(runner, self.method_name, self.compiled_fn)
 
         self._install_run_adapter(runner)
@@ -204,6 +200,44 @@ class VisionTpuCompilePolicy(CompilePolicy):
             self.method_name,
         )
         return True
+
+    def _compile_method(self, method: Any, *, use_bundle: bool) -> Any:
+        if (
+            self.model_runner.server_args.tpu_compile_tracer == "direct"
+            and envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
+        ):
+            model = self.get_compile_model()
+            if model is not None:
+                if use_bundle:
+                    raise ValueError(
+                        "Async direct vision compilation does not support bundles"
+                    )
+                from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+                    direct_compile,
+                )
+
+                return direct_compile(
+                    torch.no_grad()(method),
+                    specialization_key=lambda *args: tuple(
+                        (tuple(t.shape), t.dtype) for t in args
+                    ),
+                    model=model,
+                )
+        compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        return compiler(
+            torch.no_grad()(method),
+            backend=self.backend,
+            fullgraph=self.fullgraph,
+            dynamic=self.dynamic,
+        )
+
+    def get_compile_model(self) -> torch.nn.Module | None:
+        """Opt into direct compilation by supplying the compiled region's state.
+
+        All parameters and buffers read by the region must be registered here.
+        The default keeps Dynamo compilation and model-specific eager warmups.
+        """
+        return None
 
     def resolve_patch_buckets(self) -> list[int]:
         if self._patch_buckets is None:
@@ -216,8 +250,10 @@ class VisionTpuCompilePolicy(CompilePolicy):
                 return bucket
         return None
 
-    def precompile(self, patch_counts: list[int] | None = None) -> None:
-        """Warm the torch.compile cache for common patch counts."""
+    def precompile(
+        self, patch_counts: list[int] | None = None
+    ) -> list[PendingCall] | None:
+        """Warm common patch counts, returning any deferred executions."""
         owner = self.owner
         runner = self._resolve_runner()
         if owner is None or runner is None:
@@ -257,6 +293,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
         init_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.float32)
+        pending_warmups = []
         try:
             with torch.no_grad():
                 for index, patch_count in enumerate(patch_counts):
@@ -267,19 +304,46 @@ class VisionTpuCompilePolicy(CompilePolicy):
                         patch_count,
                     )
                     start = time.perf_counter()
-                    self.warmup_once(patch_count)
-                    if self.compile_timing_recorder is not None:
-                        self.compile_timing_recorder.record(
-                            component="vision",
-                            phase="vision_encode",
-                            policy=type(self).__name__,
-                            duration_seconds=time.perf_counter() - start,
-                            num_tokens=patch_count,
-                        )
+                    pending = self.warmup_once(patch_count)
+                    pending = self._record_warmup(
+                        patch_count, time.perf_counter() - start, pending
+                    )
+                    if pending is not None:
+                        pending_warmups.append(pending)
         finally:
             torch.set_default_dtype(init_dtype)
 
-        logger.info("VisionTpuCompilePolicy.precompile: done.")
+        logger.info(
+            "VisionTpuCompilePolicy.precompile: submitted; %d deferred warmups.",
+            len(pending_warmups),
+        )
+        return pending_warmups or None
+
+    def _record_warmup(
+        self, patch_count: int, duration_seconds: float, pending: PendingCall | None
+    ) -> PendingCall | None:
+        if self.compile_timing_recorder is None:
+            return pending
+        record = partial(
+            self.compile_timing_recorder.record,
+            component="vision",
+            phase="vision_encode",
+            policy=type(self).__name__,
+            num_tokens=patch_count,
+        )
+        if pending is None:
+            record(duration_seconds=duration_seconds)
+            return None
+
+        def wait_and_record():
+            start = time.perf_counter()
+            result = pending.wait()
+            # Match decoder timing: submission plus blocking wait/execution,
+            # excluding time spent submitting other overlapping warmups.
+            record(duration_seconds=duration_seconds + time.perf_counter() - start)
+            return result
+
+        return PendingCall(wait_and_record)
 
     def run(self, *raw: Any) -> torch.Tensor:
         if self.compiled_fn is None:
@@ -311,13 +375,23 @@ class VisionTpuCompilePolicy(CompilePolicy):
         precompile.
         """
 
-    def warmup_once(self, patch_count: int) -> None:
-        """Warm one patch count, blocking until it lands.
+    def warmup_once(self, patch_count: int) -> PendingCall | None:
+        """Warm one patch count, deferring execution for direct compilation.
 
         Defaults to the compiled region. Override when the encoder has an
         eager prologue or epilogue that is shape-static per bucket too.
         """
-        result = self.compiled_fn(*self.make_warmup_inputs(patch_count))
+        from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+            CompiledFunction,
+        )
+
+        inputs = self.make_warmup_inputs(patch_count)
+        if isinstance(self.compiled_fn, CompiledFunction):
+            return self.compiled_fn.warmup_async(*inputs).then(self._sync_warmup)
+        self._sync_warmup(self.compiled_fn(*inputs))
+
+    @staticmethod
+    def _sync_warmup(result: torch.Tensor) -> None:
         tpu_sync([result], wait=True)
 
     def make_warmup_inputs(self, patch_count: int) -> tuple[Any, ...]:

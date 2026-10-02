@@ -64,7 +64,11 @@ class RaidenReceiverMixin:
         blocks = req.blocks
         endpoint = req.endpoint
         with self._state_lock:
-            if room in self._aborted:
+            if (
+                room in self._aborted
+                or room in self._decode.final_seen
+                or req_id in self._decode.announced_at
+            ):
                 return
             self._decode.announced_at[req_id] = self._monotonic()
             self._decode.remote_total[room] = total_pages
@@ -92,7 +96,7 @@ class RaidenReceiverMixin:
 
         aux_index = None
         with self._state_lock:
-            if room in self._aborted:
+            if room in self._aborted or room in self._decode.final_seen:
                 return
             self._decode.remote_blocks[room] = remote_blocks
             self._decode.remote_endpoint[room] = endpoint
@@ -646,7 +650,12 @@ class RaidenReceiverMixin:
         blocks = req.blocks
         src_rank = req.src_rank
         with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
+            if (
+                room not in self._decode.reshard_meta
+                or room in self._aborted
+                or room in self._decode.final_seen
+                or room in self._decode.reshard_registered
+            ):
                 return
             per_source = self._decode.reshard_chunk_sources.setdefault(
                 room, {}
@@ -763,7 +772,12 @@ class RaidenReceiverMixin:
         ready = False
         aux_index = None
         with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
+            if (
+                room not in self._decode.reshard_meta
+                or room in self._aborted
+                or room in self._decode.final_seen
+                or room in self._decode.reshard_registered
+            ):
                 return
             self._decode.reshard_sources[room][src_rank] = prefill_blocks
             self._decode.reshard_swa_sources.setdefault(room, {})[src_rank] = (

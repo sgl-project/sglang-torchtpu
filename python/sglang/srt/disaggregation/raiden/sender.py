@@ -305,9 +305,11 @@ class RaidenSenderMixin:
 
         ``register_read`` publishes physical device block ids to raiden. The
         consumer may not pull them until later, so the lease starts before
-        the potentially blocking registration and ends only when poll_stats
+        the potentially blocking registration and ends when poll_stats
         reports the request id settled: raiden expires a read nobody pulls at
-        its own deadline and reports it, so no second timer runs here. A
+        its own deadline and reports it, so no second timer runs here. The
+        one exception is an unread chunk lease of a room whose closing read
+        has settled, which ends early (see _settle_sender_reads_locked). A
         false return means raiden accepted no work, so no lease is left
         behind; a registration failure fails the room.
         """
@@ -342,6 +344,22 @@ class RaidenSenderMixin:
     def _settle_sender_reads_locked(self) -> None:
         settled = self._completed_send | self._native_failed
         for room, reads in list(self._send_reads.items()):
+            closing_done = str(room) in self._completed_send and (
+                self._swa_engine is None
+                or self._swa_req_id(room) in self._completed_send
+            )
+            if closing_done:
+                # The closing read covers every page the decode asked for
+                # (whole_pull_registration), and the decode issues it only
+                # after its earlier chunk reads settled and drops any CHUNK
+                # that arrives after BLOCKS (final_seen). So an unread chunk
+                # lease here will never be pulled, and the room's pages can be
+                # released now rather than held to the native deadline.
+                # Raiden cannot cancel the read; record it so _drain_engine
+                # ignores its eventual expiry instead of failing the room.
+                self._superseded_sender_reads.update(reads - settled)
+                self._send_reads.pop(room, None)
+                continue
             reads -= settled
             if not reads:
                 self._send_reads.pop(room, None)
@@ -354,7 +372,9 @@ class RaidenSenderMixin:
         While any holds, the pages must not be handed back -- the transfer
         would read them under their next owner. A read the decode never
         comes for is expired by raiden at its own deadline and settles
-        through poll_stats like any other.
+        through poll_stats like any other, except an unread chunk read of a
+        room whose closing read has settled: the decode will never pull it,
+        so it stops counting then (see _settle_sender_reads_locked).
         """
         with self._state_lock:
             if self._send_reads.get(room):

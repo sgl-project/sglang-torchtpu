@@ -37,6 +37,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _DummyForwardBatchFields,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
@@ -1393,13 +1394,39 @@ class TestShimInputLogprobPath(CustomTestCase):
         self.assertEqual(seen["start_lens"], [0, 0])
 
     def test_caller_state_is_restored_after_the_forward(self):
-        fb = self._fb(starts=(2, 3))
-        self._shim({}, model=_StubModel())(None, None, fb)
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                fb = self._fb(starts=(2, 3))
+                shim = self._shim({}, model=_StubModel())
+                finalized = []
 
-        self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
-        self.assertTrue(fb.return_logprob)
-        self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
-        self.assertFalse(fb.is_prefill_only)
+                def finalize(out, batch):
+                    finalized.append(batch.capture_hidden_mode)
+                    self.assertFalse(batch.return_logprob)
+                    return out
+
+                shim.policy.finalize_forward_batch = finalize
+                if deferred:
+
+                    def warmup(*args, **kwargs):
+                        out = shim.fn(*args, **kwargs)
+                        return PendingCall(lambda: out)
+
+                    shim.warmup_async_fn = warmup
+                    out = shim.warmup_async(None, None, fb)
+                    self.assertEqual(finalized, [])
+                    self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+                    self.assertTrue(fb.return_logprob)
+                    out = out.wait()
+                else:
+                    out = shim(None, None, fb)
+
+                self.assertEqual(finalized, [CaptureHiddenMode.FULL])
+                self.assertIsNotNone(out.input_token_logprobs)
+                self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+                self.assertTrue(fb.return_logprob)
+                self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
+                self.assertFalse(fb.is_prefill_only)
 
     def test_state_is_restored_even_when_the_forward_raises(self):
         with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):

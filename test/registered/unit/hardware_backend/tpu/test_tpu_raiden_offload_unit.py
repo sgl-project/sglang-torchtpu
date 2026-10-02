@@ -209,7 +209,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         queue.tp_rank = 1
         queue.pp_rank = 0
         queue.scheduler = SimpleNamespace(
-            ps=SimpleNamespace(dp_rank=2, gpu_id=3),
             tp_worker=SimpleNamespace(
                 model_runner=SimpleNamespace(kv_cache_dtype_str="bfloat16")
             ),
@@ -229,7 +228,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         with (
             patch(
                 "sglang.srt.disaggregation.decode.get_parallel",
-                return_value=SimpleNamespace(attn_tp_size=2),
+                return_value=SimpleNamespace(attn_tp_size=2, dp_rank=2),
             ),
             patch(
                 "sglang.srt.disaggregation.decode.get_kv_class",
@@ -1758,6 +1757,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._decode = None
         mgr._aborted = {}
         mgr._send_reads = {}
+        mgr._superseded_sender_reads = set()
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
@@ -1968,6 +1968,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._superseded_sender_reads = set()
         mgr._socket = Mock()
         mgr._socket_send_locks = collections.defaultdict(threading.Lock)
         mgr._socket_lock = threading.Lock()
@@ -2107,6 +2108,69 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
         self.assertFalse(mgr._completed_recv)
+
+    def test_reshard_decode_chunk_failure_after_closing_push_fails_room(self):
+        """When closing push completes first on reshard decode, a later failure of
+        a chunk receive plan must NOT be filtered out: the room must be marked failed
+        and room_has_active_io must clear (preventing permanent hang / leak)."""
+        mgr, _ = self._decode_with_chunk_plan()
+        with patch.dict(sys.modules, _pb2_modules()):
+            for rank in (0, 1):
+                mgr._on_reshard_blocks(
+                    _reshard_blocks_frames(
+                        41,
+                        list(range(100 + 200 * rank, 164 + 200 * rank)),
+                        rank,
+                    )
+                )
+        # Closing plan "41" settles in _completed_recv
+        mgr._completed_recv.add("41")
+        self.assertFalse(mgr.is_recv_done(self.ROOM))
+        self.assertTrue(mgr.room_has_active_io(self.ROOM))
+
+        # Raiden reports chunk plan "41#0" failed
+        mgr._engine.poll_stats = Mock(return_value=([], [], ["41#0"]))
+        mgr._drain_engine()
+
+        # The failure MUST NOT be masked by "41" in _completed_recv
+        self.assertIn("41#0", mgr._failed)
+        self.assertIn("41#0", mgr._native_failed)
+        self.assertTrue(mgr.is_failed(self.ROOM))
+        self.assertFalse(mgr.room_has_active_io(self.ROOM))
+
+    def test_late_reshard_chunk_after_final_seen_is_dropped(self):
+        mgr = self._decode()
+        mgr._decode.final_seen.add(self.ROOM)
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_chunk(
+                _reshard_chunk_frames(41, 0, 24, 64, list(range(124, 132)), 0)
+            )
+        self.assertNotIn(self.ROOM, mgr._decode.reshard_chunk_sources)
+        mgr._engine.register_active_plan.assert_not_called()
+
+    def test_late_reshard_chunk_after_reshard_registered_is_dropped(self):
+        mgr = self._decode()
+        mgr._decode.reshard_registered.add(self.ROOM)
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_chunk(
+                _reshard_chunk_frames(41, 0, 24, 64, list(range(124, 132)), 0)
+            )
+        self.assertNotIn(self.ROOM, mgr._decode.reshard_chunk_sources)
+        mgr._engine.register_active_plan.assert_not_called()
+
+    def test_duplicate_reshard_blocks_after_final_seen_is_dropped(self):
+        mgr = self._decode()
+        mgr._decode.final_seen.add(self.ROOM)
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_blocks(_reshard_blocks_frames(41, [100, 101], 0))
+        self.assertEqual(mgr._decode.reshard_sources[self.ROOM], {})
+
+    def test_duplicate_reshard_blocks_after_reshard_registered_is_dropped(self):
+        mgr = self._decode()
+        mgr._decode.reshard_registered.add(self.ROOM)
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_blocks(_reshard_blocks_frames(41, [100, 101], 0))
+        self.assertEqual(mgr._decode.reshard_sources[self.ROOM], {})
 
     def test_timed_out_stage_keeps_its_plan_until_the_copy_settles(self):
 

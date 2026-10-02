@@ -804,7 +804,7 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
             overlap_utils_tpu.device_accept_resolved_tpu,
             create=True,
         ),
-        patch.object(overlap_utils, "gather_spec_extras_func", side_effect=gather),
+        patch.object(kernels, "gather_spec_extras_func", side_effect=gather),
         patch.object(overlap_utils, "_DEBUG_ASSERT", True),
         patch.object(
             overlap_utils, "_assert_nonneg_and_invalidate", side_effect=invalidate

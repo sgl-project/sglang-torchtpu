@@ -68,7 +68,7 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
 
     hidden_buf = future_map.hidden_states_buf if future_map.need_hidden_states else None
     width = (candidate_locs.shape[1] + 1) // 2
-    from sglang.srt.managers.overlap_utils import gather_spec_extras_func
+    from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 
     probs, topk, bonus, hidden = gather_spec_extras_func(
         indices,

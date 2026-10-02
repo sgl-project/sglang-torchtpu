@@ -46,6 +46,7 @@ def _decode_manager(*, hybrid, chunked):
     mgr._completed_recv = set()
     mgr._failed = set()
     mgr._native_failed = set()
+    mgr._superseded_sender_reads = set()
     mgr._send_reads = {}
     mgr._cleared_plans = {}
     mgr._stale_plans = []

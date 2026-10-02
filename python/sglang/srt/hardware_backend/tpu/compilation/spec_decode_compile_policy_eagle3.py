@@ -13,6 +13,10 @@ import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
+    get_attention_rank_tensors,
+    use_attention_rank_tensors,
+)
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
@@ -264,6 +268,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             attention_metadata: Any,
             forward_batch: ForwardBatch,
             *args: Any,
+            attention_rank_tensors: tuple[torch.Tensor, ...],
             **kwargs: Any,
         ) -> Any:
             backend = get_forward_context().attn_backend
@@ -280,7 +285,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             backbone.forward = self._draft_eager_backbone_forward
             logits_processor.forward = self._draft_eager_logits_forward
             try:
-                return fn(forward_batch, *args, **kwargs)
+                with use_attention_rank_tensors(attention_rank_tensors):
+                    return fn(forward_batch, *args, **kwargs)
             finally:
                 logits_processor.forward = previous_logits_forward
                 backbone.forward = previous_backbone_forward
@@ -311,7 +317,14 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         @functools.wraps(fn)
         def call(*args: Any, **kwargs: Any) -> Any:
             backend = get_forward_context().attn_backend
-            return compiled(backend.forward_metadata, *args, **kwargs)
+            return compiled(
+                backend.forward_metadata,
+                *args,
+                attention_rank_tensors=get_attention_rank_tensors(
+                    torch.device(self.model_runner.device)
+                ),
+                **kwargs,
+            )
 
         return call
 

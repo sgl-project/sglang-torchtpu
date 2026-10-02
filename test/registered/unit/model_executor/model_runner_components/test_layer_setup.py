@@ -10,7 +10,6 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -84,7 +83,6 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
                         model=model,
                         model_config=_hybrid_swa_model_config(),
                         is_draft_worker=False,
-                        spec_algorithm=SpeculativeAlgorithm.NONE,
                     )
                     self.assertEqual(
                         sorted(
@@ -107,7 +105,6 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
                 model=SimpleNamespace(start_layer=start, end_layer=end),
                 model_config=model_config,
                 is_draft_worker=False,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
             )
             self.assertEqual(model_config.full_attention_layer_ids, GLOBAL_FULL_IDS)
             self.assertEqual(model_config.swa_attention_layer_ids, GLOBAL_SWA_IDS)
@@ -127,7 +124,6 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
                     model=SimpleNamespace(mtp_layer_id_is_depth=True),
                     model_config=model_config,
                     is_draft_worker=True,
-                    spec_algorithm=SpeculativeAlgorithm.NONE,
                     draft_model_idx=depth,
                 )
                 self.assertTrue(layer_info.is_hybrid_swa_mtp_draft)
@@ -144,7 +140,6 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
             model=SimpleNamespace(),
             model_config=model_config,
             is_draft_worker=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
             draft_model_idx=1,
         )
 

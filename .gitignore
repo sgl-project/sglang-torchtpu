@@ -166,8 +166,6 @@ cython_debug/
 *.swp
 
 # SGL
-benchmark/mmlu/data
-benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
@@ -179,6 +177,7 @@ benchmark/tpu/**/profile/
 benchmark/tpu/**/hlo_dump/
 tmp*.txt
 /tmp/
+.tmp/
 
 # HLO / XLA dumps (--xla_dump_to --xla_dump_hlo_as_text/--xla_dump_hlo_as_proto):
 # dump dirs land as hlo_dump/ or xla_dump_*/ next to cwd; each holds per-module

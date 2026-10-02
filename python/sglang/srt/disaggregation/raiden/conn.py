@@ -171,10 +171,17 @@ class RaidenKVManager(
         # publish time. This is populated only by prefill managers, but the
         # shared engine-drain path settles it for both manager roles. A lease
         # is the room's claim on its pages: it starts before the (possibly
-        # blocking) registration, settles when the engine reports the read
-        # served or failed, and ages out after the transfer deadline for a
-        # read the decode never comes for.
+        # blocking) registration and settles when the engine reports the read
+        # served or failed (raiden expires a read nobody pulls at its
+        # deadline). Exception: once the room's closing read has settled, its
+        # unread chunk leases are dropped early -- see
+        # _settle_sender_reads_locked.
         self._send_reads: Dict[int, Set[str]] = {}
+        # Chunk read ids dropped early by that exception. Raiden cannot cancel
+        # a read, so each still expires natively at its deadline; when
+        # poll_stats reports that expiry, the id is removed from here instead
+        # of failing the room.
+        self._superseded_sender_reads: Set[str] = set()
         # Reads issued and not yet settled, with the host staging pages each
         # holds. Raiden seats a read in pages of the pool it allocated at
         # startup and rejects a read it cannot seat, so the decode side admits
@@ -496,16 +503,21 @@ class RaidenKVManager(
                     self._completed_send.update(self._norm_req_id(r) for r in done_send)
                     self._completed_recv.update(self._norm_req_id(r) for r in done_recv)
                     norm_failed = {self._norm_req_id(r) for r in failed}
-                    self._native_failed.update(norm_failed)
-                    self._failed.update(norm_failed)
+                    superseded = self._superseded_sender_reads
+                    real_failed = norm_failed - superseded
+                    superseded -= norm_failed
+                    self._native_failed.update(real_failed)
+                    self._failed.update(real_failed)
                     self._release_pull_slots_locked()
                     self._settle_sender_reads_locked()
                     settled_plans = self._settled_cleared_plans_locked()
                 for uuid in settled_plans:
                     self._unregister_plan(uuid)
-                if failed:
+                if real_failed:
                     logger.error(
-                        "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
+                        "RaidenKVManager rank%d failed=%s",
+                        self.attn_tp_rank,
+                        real_failed,
                     )
         with self._state_lock:
             settled_stale = [e for e in self._stale_plans if e[2].is_ready()]

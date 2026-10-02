@@ -54,7 +54,9 @@ TPU_WAN22_CASES = [
             prompt="A curious raccoon peers through a field of sunflowers",
             output_size="832x480",
             num_frames=NUM_FRAMES,
-            extras={"num_inference_steps": 4, "seed": 0},
+            # Workaround: seeding a TPU torch.Generator can deadlock on the GIL in
+            # torch_tpu's blocking host-to-device copy; drop once TorchTPU fixes it.
+            extras={"num_inference_steps": 4, "seed": 0, "generator_device": "cpu"},
         ),
         run_perf_check=False,
         run_consistency_check=False,
