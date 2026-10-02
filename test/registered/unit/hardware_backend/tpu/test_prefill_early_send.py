@@ -108,6 +108,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_overlap = enable_overlap
         self.enable_staging = False
         self.kv_checksum_computer = None
+        # The overlap loop checks this first; _StopLoop is what ends the test.
+        self.gracefully_exit = False
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=PAGE_SIZE,
             # Identity: this harness's req_to_token already holds physical ids.
