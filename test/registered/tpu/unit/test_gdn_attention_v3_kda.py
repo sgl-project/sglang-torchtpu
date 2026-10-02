@@ -11,8 +11,10 @@ silu the fused kernel folds in. Both gate forms are covered:
 (Kimi-Linear); a float gives ``gate_lower_bound * sigmoid(exp(A_log) *
 (g + dt_bias))`` (Kimi-K3, at -5.0). Decode runs the token recurrence and
 prefill the chunked solve; cases cover fresh slots, slots continuing a
-context (stale state must be ignored when the context is empty), and padded
-buckets (trailing empty sequence rows and tokens, as TPU serving pads them).
+context (stale state must be ignored when the context is empty), padded
+buckets (trailing empty sequence rows and tokens, as TPU serving pads them),
+``prefill_only``, and speculative verify windows (per-token checkpoints,
+resumed from a checkpoint offset).
 
 Requires a TPU device; skipped otherwise. Adapted from vllm-torchtpu
 ``tests/kernels/test_gdn_attention_v3_kda.py``.
@@ -22,7 +24,7 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
 import unittest
 
@@ -202,6 +204,89 @@ def _kda_attention_ref(
     return (new_conv_state, new_recurrent_state), output
 
 
+def _kda_attention_spec_ref(
+    qkv,
+    b,
+    a,
+    conv_state,
+    recurrent_state,
+    conv_weight,
+    conv_bias,
+    a_log,
+    dt_bias,
+    query_start_loc,
+    state_indices,
+    distribution,
+    seq_lens,
+    read_offsets,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    gate_lower_bound: float | None,
+):
+    """Token reference for verify windows: read from ``base + read_offset``,
+    checkpoint conv and recurrent state after token t at ``base + t``."""
+    new_conv_state = jnp.array(conv_state)
+    new_recurrent_state = jnp.array(recurrent_state)
+    output = np.zeros((qkv.shape[0], n_v * d_v), np.float64)
+    a_log_np = np.asarray(a_log, np.float64).reshape(n_v, 1)
+    dt_bias_np = np.asarray(dt_bias, np.float64).reshape(n_v, d_k)
+    scale = float(d_k**-0.5)
+
+    for req_idx in range(int(distribution[0])):
+        base = int(state_indices[req_idx])
+        read_slot = base + int(read_offsets[req_idx])
+        start = int(query_start_loc[req_idx])
+        end = int(query_start_loc[req_idx + 1])
+        query_len = end - start
+        if query_len <= 0:
+            continue
+
+        has_init = bool((seq_lens[req_idx] - query_len) > 0)
+        c_state = conv_state[read_slot]
+        running = np.asarray(recurrent_state[read_slot], np.float64)
+        if not has_init:
+            c_state = jnp.zeros_like(c_state)
+            running = np.zeros_like(running)
+
+        x_full = jnp.concatenate([c_state, qkv[start:end]], axis=0)
+        acc = _conv1d(x_full, conv_weight, conv_bias, query_len, kernel_size)
+        # silu and beta run in float32 and are stored in the activation dtype.
+        conv_out = np.asarray(jax.nn.silu(acc).astype(qkv.dtype), np.float64)
+        q_seq, k_seq, v_seq = _split_qkv(conv_out, query_len, n_kq, n_v, d_k, d_v)
+        q_seq = _l2_normalize(q_seq)
+        k_seq = _l2_normalize(k_seq)
+        beta_seq = np.asarray(
+            jax.nn.sigmoid(b[start:end].astype(jnp.float32)).astype(b.dtype),
+            np.float64,
+        )
+        a_seq = np.asarray(a[start:end], np.float64).reshape(query_len, n_v, d_k)
+        gate_seq = _activate_gate(a_seq, a_log_np, dt_bias_np, gate_lower_bound)
+
+        for t in range(query_len):
+            step = slice(t, t + 1)
+            out_t, running = _recurrence(
+                q_seq[step],
+                k_seq[step],
+                v_seq[step],
+                gate_seq[step],
+                beta_seq[step],
+                running,
+                scale,
+            )
+            output[start + t] = out_t.reshape(-1)
+            new_conv_state = new_conv_state.at[base + t].set(
+                x_full[t + 1 : t + kernel_size]
+            )
+            new_recurrent_state = new_recurrent_state.at[base + t].set(
+                jnp.asarray(running, recurrent_state.dtype)
+            )
+
+    return (new_conv_state, new_recurrent_state), jnp.asarray(output, qkv.dtype)
+
+
 # (name, query lens, context lens, distribution, extra); context 0 is a fresh
 # slot. extra: n_v, and pad_seqs / pad_tokens for empty rows past the real
 # sequences, which carry the null slot 0 and zero length.
@@ -214,6 +299,8 @@ _SHAPES = [
     # 40 is not a multiple of the 16-row triangular block.
     ("prefill_nonmult16_40", [40], [0], [0, 1, 1], {}),
     ("mixed_prefill", [192, 128, 64], [0, 0, 0], [0, 3, 3], {}),
+    # 65 crosses a 64-token tile; the 1-token row is a prefill, not a decode.
+    ("ragged_prefill", [65, 65, 1, 64], [0] * 4, [0, 4, 4], {}),
     ("prefill_long", [1000], [0], [0, 1, 1], {}),
     ("prefill_with_context", [100], [50], [0, 1, 1], {}),
     ("decode_and_prefill", [1, 1, 38], [5, 9, 0], [2, 3, 3], {}),
@@ -311,41 +398,148 @@ class TestGDNAttentionV3KDA(CustomTestCase):
 
         kernel = self._kernel()
         for name, query_lens, context_lens, distribution, extra in _SHAPES:
+            # Without decode rows, prefill_only must give the same result.
+            prefill_only_modes = (False, True) if distribution[0] == 0 else (False,)
             for gate_name, gate_lower_bound in _GATES:
-                with self.subTest(case=f"{name}_{gate_name}"):
-                    kwargs = self._inputs(
-                        query_lens,
-                        context_lens,
-                        distribution,
-                        gate_lower_bound,
-                        **extra,
-                    )
-                    # The kernel donates both state inputs; build the reference first.
-                    (ref_conv, ref_state), ref_out = _kda_attention_ref(**kwargs)
-                    (out_conv, out_state), out = kernel(
-                        **kwargs, attention_mode=config.AttentionMode.KDA
-                    )
+                args = (query_lens, context_lens, distribution, gate_lower_bound)
+                (ref_conv, ref_state), ref_out = _kda_attention_ref(
+                    **self._inputs(*args, **extra)
+                )
+                for prefill_only in prefill_only_modes:
+                    with self.subTest(
+                        case=f"{name}_{gate_name}", prefill_only=prefill_only
+                    ):
+                        # The kernel donates both state inputs; each call gets its own.
+                        kwargs = self._inputs(*args, **extra)
+                        (out_conv, out_state), out = kernel(
+                            **kwargs,
+                            attention_mode=config.AttentionMode.KDA,
+                            prefill_only=prefill_only,
+                        )
 
-                    # |out| peaks near 0.3 (L2 norm and d_k**-0.5 scale); a 2e-2 atol
-                    # would hide gate-layout errors.
-                    np.testing.assert_allclose(
-                        np.asarray(out, np.float64), ref_out, rtol=2e-2, atol=5e-3
-                    )
-                    # Looser than the output: the state accumulates the delta rule
-                    # over the whole sequence without the output's norm and scale.
-                    slots = np.asarray(kwargs["state_indices"])[: len(query_lens)]
-                    np.testing.assert_allclose(
-                        np.asarray(out_state, np.float64)[slots],
-                        np.asarray(ref_state, np.float64)[slots],
-                        rtol=2e-2,
-                        atol=1e-2,
-                    )
-                    np.testing.assert_allclose(
-                        np.asarray(out_conv, np.float64)[slots],
-                        np.asarray(ref_conv, np.float64)[slots],
-                        rtol=1e-5,
-                        atol=1e-5,
-                    )
+                        # |out| peaks near 0.3 (L2 norm and d_k**-0.5 scale); a 2e-2
+                        # atol would hide gate-layout errors.
+                        np.testing.assert_allclose(
+                            np.asarray(out, np.float64), ref_out, rtol=2e-2, atol=5e-3
+                        )
+                        # Looser than the output: the state accumulates the delta rule
+                        # over the whole sequence without the output's norm and scale.
+                        slots = np.asarray(kwargs["state_indices"])[: len(query_lens)]
+                        np.testing.assert_allclose(
+                            np.asarray(out_state, np.float64)[slots],
+                            np.asarray(ref_state, np.float64)[slots],
+                            rtol=2e-2,
+                            atol=1e-2,
+                        )
+                        np.testing.assert_allclose(
+                            np.asarray(out_conv, np.float64)[slots],
+                            np.asarray(ref_conv, np.float64)[slots],
+                            rtol=1e-5,
+                            atol=1e-5,
+                        )
+
+    def test_speculative_window_checkpoints(self):
+        """8-token verify windows: reads resume at ``base + read_offset``, each
+        real token checkpoints to ``base + t``, unused window slots stay intact."""
+        from sglang.srt.layers.attention.pallas.gdn import config
+
+        num_spec_tokens = 7
+        window = num_spec_tokens + 1
+        d_k, d_v, kernel_size = self.D_K, self.D_V, self.KERNEL_SIZE
+        # (name, heads, window lengths, read offsets): Kimi-K3's local heads at
+        # TP32 (32 windows span several decode tiles) and TP8 (large fp32 state).
+        cases = [
+            (
+                "tp32_multi_tile_recurrent_window",
+                3,
+                [1, 6, 3, 8, 5, 2, 7, 4] * 4,
+                [0, 2, 4, 6, 0, 2, 4, 6] * 4,
+            ),
+            (
+                "tp8_large_recurrent_window",
+                12,
+                [1, 6, 3, 8, 5, 2, 7, 4],
+                [0, 2, 4, 6, 0, 2, 4, 6],
+            ),
+        ]
+        for name, n_v, spec_lengths, read_offsets in cases:
+            with self.subTest(case=name):
+                n_kq = n_v
+                num_seqs = len(spec_lengths)
+                num_tokens = sum(spec_lengths)
+                # One group of `window` slots per sequence after the null slot 0.
+                num_blocks = 1 + num_seqs * window
+                dim_size = 2 * n_kq * d_k + n_v * d_v
+                rngs = iter(jax.random.split(jax.random.key(11), 8))
+                kwargs = dict(
+                    qkv=jax.random.normal(
+                        next(rngs), (num_tokens, dim_size), jnp.bfloat16
+                    ),
+                    b=jax.random.normal(next(rngs), (num_tokens, n_v), jnp.bfloat16),
+                    a=jax.random.normal(
+                        next(rngs), (num_tokens, n_v * d_k), jnp.bfloat16
+                    ),
+                    conv_state=jax.random.normal(
+                        next(rngs),
+                        (num_blocks, kernel_size - 1, dim_size),
+                        jnp.bfloat16,
+                    ),
+                    recurrent_state=jax.random.normal(
+                        next(rngs), (num_blocks, n_v, d_k, d_v)
+                    ),
+                    conv_weight=jax.random.normal(
+                        next(rngs), (dim_size, 1, kernel_size), jnp.bfloat16
+                    ),
+                    conv_bias=None,
+                    a_log=jax.random.normal(next(rngs), (n_v,)),
+                    dt_bias=jax.random.normal(next(rngs), (n_v, d_k)),
+                    query_start_loc=jnp.array(
+                        np.cumsum([0] + spec_lengths), dtype=jnp.int32
+                    ),
+                    state_indices=jnp.array(
+                        [1 + i * window for i in range(num_seqs)], dtype=jnp.int32
+                    ),
+                    distribution=jnp.array([num_seqs] * 3, dtype=jnp.int32),
+                    # Every window continues a 32-token context.
+                    seq_lens=jnp.array(
+                        [32 + length for length in spec_lengths], dtype=jnp.int32
+                    ),
+                    read_offsets=jnp.array(read_offsets, dtype=jnp.int32),
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    gate_lower_bound=-5.0,
+                )
+                # The kernel donates both state inputs; build the reference first.
+                (ref_conv, ref_rec), ref_out = _kda_attention_spec_ref(**kwargs)
+                (out_conv, out_rec), out = self._kernel()(
+                    **kwargs,
+                    num_spec_tokens=num_spec_tokens,
+                    batched_only=True,
+                    attention_mode=config.AttentionMode.KDA,
+                )
+
+                np.testing.assert_allclose(
+                    np.asarray(out, np.float64),
+                    np.asarray(ref_out, np.float64),
+                    rtol=2e-2,
+                    atol=5e-3,
+                )
+                # Every slot, including the null slot and unused window slots.
+                np.testing.assert_allclose(
+                    np.asarray(out_conv, np.float64),
+                    np.asarray(ref_conv, np.float64),
+                    rtol=2e-2,
+                    atol=5e-3,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(out_rec, np.float64),
+                    np.asarray(ref_rec, np.float64),
+                    rtol=2e-2,
+                    atol=1e-2,
+                )
 
     def test_rejects_invalid_gate_bound(self):
         """The entry point's gate guards, which all fail silently if dropped."""
