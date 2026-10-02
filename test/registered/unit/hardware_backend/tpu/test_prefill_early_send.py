@@ -90,8 +90,6 @@ class _Sender:
         self.device, self.rid, self.log = device, rid, log
 
     def get_max_transfer_tokens(self) -> Optional[int]:
-        # None keeps _send_kv_chunk on one segment per chunk, which is what the
-        # page-accounting assertions below are written against.
         return None
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
@@ -107,13 +105,10 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self, *, enable_overlap: bool, num_slots: int = 64):
         self.enable_overlap = enable_overlap
         self.enable_staging = False
-        self.kv_checksum_computer = None
-        # The overlap loop checks this first; _StopLoop is what ends the test.
         self.gracefully_exit = False
+        self.kv_checksum_computer = None
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=PAGE_SIZE,
-            # Identity: this harness's req_to_token already holds physical ids.
-            translate_kv_indices_for_transfer=lambda kv: kv,
+            page_size=PAGE_SIZE, translate_kv_indices_for_transfer=lambda kv: kv
         )
         self.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((8, num_slots), dtype=torch.int32)
