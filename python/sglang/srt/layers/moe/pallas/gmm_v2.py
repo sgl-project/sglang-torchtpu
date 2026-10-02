@@ -1,9 +1,8 @@
 # Uses the latest torchtpu-vllm gmm_v2 kernel
 #   (https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
 # This cut adds in-kernel fused activation (``fuse_act``: silu / gelu /
-# swigluoai) and fused gate+up weight support over the prior sglang-jax vendor.
-# SiTU follows vllm-torchtpu #233 (8f573113e); dequantizing small-block rhs
-# before the matmul follows vllm-torchtpu #307 (4019b1352), limited to fp4 here.
+# swigluoai / situ) and fused gate+up weight support over the prior sglang-jax
+# vendor.
 # The Pallas fused-MoE bridge (``fused_moe_op.py``) passes ``fuse_act`` so the
 # GMM1 gated activation runs in-kernel instead of as a separate JAX pass.
 # The ``swigluoai`` activation in particular is required for GPT-OSS.
@@ -313,7 +312,7 @@ class InputConfigs:
     @property
     def should_dequantize_before_matmul(self) -> bool:
         """Dequantize rhs before matmul if block size limits MXU utilization."""
-        # fp4 only, so int4 W4A16 and fp8 block-128 keep their per-block matmuls.
+        # fp4 only; int4 W4A16 and fp8 block-128 keep per-block matmuls.
         return (
             self.has_scale
             and self.scale_block_n == 1
@@ -1366,8 +1365,7 @@ def make_gmm_configs(
             f"(NVFP4), got {block_size}."
         )
 
-    # FP4 scale blocks narrower than the lhs block run W4A16 (bf16 activations),
-    # the same rule as fused_rs get_maybe_quantize_lhs; wider ones run W4A8.
+    # FP4 scale blocks narrower than the lhs block run W4A16; wider ones run W4A8.
     fp4_w4a16 = packed_fp4 and block_size < lhs_quant_block_size
     lhs_q_dtype = None
     if maybe_quantize_lhs and rhs_quant_dtype is not None and not fp4_w4a16:

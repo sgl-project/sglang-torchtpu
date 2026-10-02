@@ -750,8 +750,7 @@ def fused_moe_call(
     when ``no_combine`` is True.
     """
     if activation == "situ":
-        # SiTU's (beta, linear_beta) travel in the activation string, as in
-        # vllm-torchtpu; they are the runner's gemm1 (alpha, clamp_limit).
+        # SiTU (beta, linear_beta) are the runner's gemm1 (alpha, clamp_limit).
         if gemm1_alpha is None:
             raise ValueError("SiTU fused MoE requires gemm1_alpha (SiTU beta).")
         linear_beta = "none" if gemm1_clamp_limit is None else gemm1_clamp_limit

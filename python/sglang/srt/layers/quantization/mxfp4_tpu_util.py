@@ -296,7 +296,7 @@ def process_mxfp4_moe_weights_native(
     w13_s = _e8m0_to_fp32(w13_s)  # (E, 2*N_padded, num_blocks) fp32
     # Transpose to (E, num_blocks, 2*N_padded) and add the size-1 mid dim.
     # Unsqueeze before contiguous: torch_tpu re-materializes a rank-4 view of a
-    # rank-3 buffer on every compiled call (vllm-torchtpu uses _fresh() for this).
+    # rank-3 buffer on every compiled call.
     w13_s = (
         w13_s.permute(0, 2, 1).unsqueeze(2).contiguous()
     )  # (E, num_blocks, 1, 2*N_padded)
@@ -402,8 +402,7 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module, *, with_bias: bool) ->
     (:func:`process_mxfp4_moe_weights_native`). Interleaved GPT-OSS (SWIGLUOAI)
     stays on the bf16 dequant-at-load path.
     """
-    # GPT-OSS (SWIGLUOAI) ships w13 interleaved as [gate_0, up_0, ...]. Mirrors
-    # tpu-inference's ``w13_interleave = layer.activation == SWIGLUOAI``.
+    # GPT-OSS (SWIGLUOAI) ships w13 interleaved as [gate_0, up_0, ...].
     w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
     # The packed path does not pad K, so it needs a lane-aligned hidden size.
     hidden_aligned = (layer.w13_weight.shape[-1] * PACKING) % 128 == 0
