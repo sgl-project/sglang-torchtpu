@@ -103,6 +103,7 @@ class _FakeRaidenEngine:
 
     def register_read(self, req_id, uuid, block_ids):
         self.reads.append((req_id, uuid, list(block_ids)))
+        return True
 
     def start_read(self, *args, **kwargs):
         self.started.append((args, kwargs))
@@ -176,6 +177,8 @@ class RaidenRendezvousTestCase(CustomTestCase):
             m._socket_lock = threading.Lock()
             m._socket_send_locks = {}
             m.request_status = {}
+            m.failure_records = {}
+            m.failure_lock = threading.Lock()
 
             def _connect(ep, is_ipv6=False):
                 # The real _connect guarantees a cached socket always has its
@@ -208,7 +211,11 @@ class RaidenRendezvousTestCase(CustomTestCase):
         ):
             m = RaidenKVManager(kv_args, mode, server_args)
 
+        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+
         m._engine = _FakeRaidenEngine()
+        m._full_engine_max_blocks = 256
+        m._pulling = StagingAdmission(256)
         m.raiden_endpoint = f"raiden://127.0.0.1:{port + 1000}"
         m.aux = aux
         m.endpoint = endpoint
@@ -507,6 +514,148 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         )
         self.assertEqual(prefill._prefill.decode_pages[room], pages)
         self.assertEqual(prefill._prefill.decode_swa_pages[room], swa_pages)
+
+    def test_chunk_arriving_after_blocks_is_dropped(self):
+        """When BLOCKS overtakes CHUNK across a ZMQ disconnect/reconnect,
+        Decode must drop the late chunk so it never queues a duplicate pull or
+        reads from already-settled/freed prefill KV memory (issue #656)."""
+        prefill, decode = self._prefill(), self._decode()
+        decode.chunked_transfer = True
+        room = 7204
+        local_blocks = [101, 102, 103, 104]
+
+        decode.register_decode_request(
+            room,
+            local_blocks,
+            [],
+            aux_index=None,
+            bootstrap_infos=self._bootstrap_info(prefill),
+        )
+        prefill._on_pull_req(self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ))
+
+        # Prefill announces chunk 0 covering 2 pages [11, 12] out of 4 total pages.
+        prefill.append_send_blocks(room, [11, 12])
+        prefill._announce_chunk(room, 0, [11, 12], total_pages=4)
+        chunk_frames = self.inboxes[decode.endpoint].take(MessageTag.CHUNK)
+
+        # Prefill finalizes send with all 4 pages [11, 12, 13, 14].
+        prefill.append_send_blocks(room, [13, 14])
+        prefill.finalize_send(room, aux_index=None)
+        blocks_frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
+
+        # Reordering simulation: BLOCKS arrives first at decode.
+        decode._dispatch(blocks_frames)
+        self.assertIn(room, decode._decode.final_seen)
+        # Because chunk 0 was not received yet, BLOCKS treated all 4 pages as missing.
+        self.assertEqual(len(decode._decode.chunk_queue[room]), 1)
+        req_id, _, missing, missing_blocks, _ = decode._decode.chunk_queue[room][0]
+        self.assertEqual(req_id, str(room))
+        self.assertEqual(missing, [0, 1, 2, 3])
+        self.assertEqual(missing_blocks, [11, 12, 13, 14])
+
+        # Decode starts pull for the closing read (str(room)).
+        self.assertTrue(decode._start_chunked_pull(room))
+
+        # Complete the transfer for str(room) on both sides.
+        decode._engine._stats = ([], [str(room)], [])
+        decode._drain_engine()
+        prefill._engine._stats = ([str(room)], [], [])
+        prefill._drain_engine()
+
+        self.assertTrue(decode.is_recv_done(room))
+        self.assertTrue(prefill.is_send_done(room))
+
+        # Late CHUNK 0 arrives after BLOCKS has already completed.
+        decode._dispatch(chunk_frames)
+
+        # The late chunk must be discarded: chunk_queue remains empty and no new read is started.
+        self.assertEqual(decode._decode.chunk_queue.get(room, []), [])
+        self.assertEqual(len(decode._engine.started), 1)
+
+    def _announced_chunked_room(self, room):
+        """A chunked room with chunk 0 announced (pages 0-1 of 4) and prefill
+        finalized. Returns (prefill, decode, CHUNK frames, BLOCKS frames), both
+        still undelivered to the decode."""
+        prefill, decode = self._prefill(), self._decode()
+        decode.chunked_transfer = True
+        decode.register_decode_request(
+            room,
+            [101, 102, 103, 104],
+            [],
+            aux_index=None,
+            bootstrap_infos=self._bootstrap_info(prefill),
+        )
+        prefill._on_pull_req(self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ))
+        prefill.append_send_blocks(room, [11, 12])
+        prefill._announce_chunk(room, 0, [11, 12], total_pages=4)
+        chunk_frames = self.inboxes[decode.endpoint].take(MessageTag.CHUNK)
+        prefill.append_send_blocks(room, [13, 14])
+        prefill.finalize_send(room, aux_index=None)
+        blocks_frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
+        return prefill, decode, chunk_frames, blocks_frames
+
+    def test_duplicate_chunk_is_queued_once(self):
+        """A CHUNK delivered twice must queue one read, not a second pull of
+        the same pages."""
+        _, decode, chunk_frames, _ = self._announced_chunked_room(7205)
+
+        decode._dispatch(chunk_frames)
+        decode._dispatch(chunk_frames)
+
+        self.assertEqual(len(decode._decode.chunk_queue[7205]), 1)
+        self.assertEqual(decode._decode.announced_spans[7205], [(0, 2)])
+
+    def test_duplicate_blocks_does_not_requeue_the_closing_read(self):
+        """A BLOCKS delivered again after the closing read was issued must not
+        queue a second closing read of the uncovered pages."""
+        room = 7207
+        _, decode, chunk_frames, blocks_frames = self._announced_chunked_room(room)
+        decode._dispatch(chunk_frames)
+        decode._dispatch(blocks_frames)
+        # Chunk 0 read, then the closing read of pages 2-3.
+        self.assertTrue(decode._start_chunked_pull(room))
+        decode._engine._stats = ([], [f"{room}#0"], [])
+        decode._drain_engine()
+        self.assertTrue(decode._start_chunked_pull(room))
+        self.assertEqual(decode._decode.chunk_reads[room], [f"{room}#0", str(room)])
+
+        decode._dispatch(blocks_frames)
+
+        self.assertEqual(decode._decode.chunk_queue.get(room, []), [])
+        self.assertEqual(len(decode._engine.started), 2)
+
+    def test_superseded_chunk_read_protocol_driven(self):
+        """Drive prefill through _announce_chunk and finalize_send, settle the closing
+        read, and verify superseded chunk timeout is safely discarded."""
+        prefill, decode = self._prefill(), self._decode()
+        prefill.chunked_transfer = True
+        room = 7206
+
+        prefill._on_pull_req(self._pull_req_frames(decode, room, 4))
+        prefill.append_send_blocks(room, [11, 12])
+        prefill._announce_chunk(room, 0, [11, 12], total_pages=4)
+        self.assertIn(f"{room}#0", prefill._send_reads[room])
+
+        prefill.append_send_blocks(room, [13, 14])
+        prefill.finalize_send(room, aux_index=None)
+        self.assertIn(str(room), prefill._send_reads[room])
+
+        # Closing read completes on native engine
+        prefill._engine._stats = ([str(room)], [], [])
+        prefill._drain_engine()
+
+        self.assertNotIn(room, prefill._send_reads)
+        self.assertIn(f"{room}#0", prefill._superseded_sender_reads)
+        self.assertFalse(prefill.sender_has_active_io(room))
+        self.assertTrue(prefill.is_send_done(room))
+
+        # Chunk 0 times out on native engine
+        prefill._engine._stats = ([], [], [f"{room}#0"])
+        prefill._drain_engine()
+
+        self.assertNotIn(f"{room}#0", prefill._superseded_sender_reads)
+        self.assertNotIn(f"{room}#0", prefill._failed)
+        self.assertFalse(prefill.is_failed(room))
 
 
 class TestRaidenMessageValidation(CustomTestCase):

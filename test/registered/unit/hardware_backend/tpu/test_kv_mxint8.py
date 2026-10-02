@@ -8,18 +8,25 @@ import torch
 
 from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
     EXPONENT_BIAS,
-    EXPONENT_DTYPE,
+    EXPONENT_PAD_BYTE,
     GROUP_SIZE,
     QUANT_DTYPE,
     ROW_ALIGNMENT,
     _validate_geometry,
     cache_bytes_per_token,
-    exponent_cache_shape,
+    merged_cache_shape,
+    merged_rows,
+    payload_rows,
+    scale_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def _align(rows: int) -> int:
+    return math.ceil(rows / ROW_ALIGNMENT) * ROW_ALIGNMENT
 
 
 class TestMXINT8Geometry(CustomTestCase):
@@ -37,37 +44,42 @@ class TestMXINT8Geometry(CustomTestCase):
                 self.assertIsNone(
                     _validate_geometry(head_num, head_dim, page_size, group_size)
                 )
-                rows = math.ceil(2 * head_num * head_dim / group_size / 32) * 32
-                shape = exponent_cache_shape(
+                payload = 2 * head_num * _align(head_dim)
+                scales = 2 * head_num * head_dim // group_size
+                self.assertEqual(payload_rows(head_num, head_dim), payload)
+                self.assertEqual(scale_rows(head_num, head_dim, group_size), scales)
+                rows = payload + _align(scales)
+                self.assertEqual(merged_rows(head_num, head_dim, group_size), rows)
+                shape = merged_cache_shape(
                     num_blocks, head_num, head_dim, page_size, group_size
                 )
                 self.assertEqual(shape, (num_blocks, rows, page_size))
-                payload = torch.empty(
-                    (num_blocks, page_size, 2 * head_num, head_dim), dtype=QUANT_DTYPE
-                )
-                exponents = torch.empty(shape, dtype=EXPONENT_DTYPE)
+                # The merged page carries the payload and the exponent bytes in
+                # one INT8 tensor, so its size is the whole physical footprint.
+                cache = torch.empty(shape, dtype=QUANT_DTYPE)
                 self.assertEqual(
                     cache_bytes_per_token(head_num, head_dim, page_size, group_size)
                     * num_blocks
                     * page_size,
-                    payload.nbytes + exponents.nbytes,
+                    cache.nbytes,
                 )
 
     def test_default_group_and_exponent_row_boundaries(self):
         self.assertEqual(GROUP_SIZE, 32)
         self.assertEqual(ROW_ALIGNMENT, 32)
         self.assertEqual(EXPONENT_BIAS, 127)
-        self.assertIs(EXPONENT_DTYPE, torch.uint8)
+        # Padding exponent bytes decode to 2**0 so untouched rows are neutral.
+        self.assertEqual(EXPONENT_PAD_BYTE, EXPONENT_BIAS)
         self.assertIs(QUANT_DTYPE, torch.int8)
-        for head_num, expected_rows, expected_bytes in (
+        for head_num, expected_scale_rows, expected_bytes in (
             (7, 32, 928),
             (8, 32, 1056),
             (9, 64, 1216),
         ):
             with self.subTest(heads=head_num):
                 self.assertEqual(
-                    exponent_cache_shape(2, head_num, 64, 128),
-                    (2, expected_rows, 128),
+                    merged_cache_shape(2, head_num, 64, 128),
+                    (2, 2 * head_num * 64 + expected_scale_rows, 128),
                 )
                 self.assertEqual(
                     cache_bytes_per_token(head_num, 64, 128), expected_bytes
@@ -104,10 +116,10 @@ class TestMXINT8Geometry(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         function(heads, dim, page, group)
             with self.subTest(
-                function="exponent_cache_shape", geometry=(heads, dim, page, group)
+                function="merged_cache_shape", geometry=(heads, dim, page, group)
             ):
                 with self.assertRaisesRegex(ValueError, message):
-                    exponent_cache_shape(1, heads, dim, page, group)
+                    merged_cache_shape(1, heads, dim, page, group)
 
     def test_requires_dummy_page_even_without_allocatable_blocks(self):
         for num_blocks in (0, -1):
@@ -115,8 +127,8 @@ class TestMXINT8Geometry(CustomTestCase):
                 self.subTest(blocks=num_blocks),
                 self.assertRaisesRegex(ValueError, "num_blocks must be positive"),
             ):
-                exponent_cache_shape(num_blocks, 1, 64, 128)
-        self.assertEqual(exponent_cache_shape(1, 1, 64, 128), (1, 32, 128))
+                merged_cache_shape(num_blocks, 1, 64, 128)
+        self.assertEqual(merged_cache_shape(1, 1, 64, 128), (1, 160, 128))
 
 
 if __name__ == "__main__":

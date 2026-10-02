@@ -67,7 +67,7 @@ def test_raiden_dma_roundtrip():
 
     _poll(transfer.backup([1, 2], [0, 1]), "D2h")  # device 1,2 -> host 0,1
     _poll(transfer.load([0, 1], [4, 5]), "H2d")  # host 0,1 -> device 4,5
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     got4 = float(data[4, 0, 0, 0, 0].cpu())
     got5 = float(data[5, 0, 0, 0, 0].cpu())
@@ -114,7 +114,7 @@ def test_host_pool_wiring():
         "host backup",
     )
     _poll(host.load_all_layer(pool, host_indices, device_indices), "host load")
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     print("  alloc/backup/load executed + completed OK")
 
     free_before = host.available_size()

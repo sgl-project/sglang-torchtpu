@@ -211,5 +211,69 @@ class TestGatheredBlockFilterEquivalence(CustomTestCase):
                     np.testing.assert_array_equal(row_full, row_block)
 
 
+@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+class TestEagleVerifyRenorm(CustomTestCase):
+    """EAGLE verify renormalizes top-k, then top-p on the top-k-renormalized
+    distribution. Each stage must keep the sort reference's support."""
+
+    @staticmethod
+    def _renormalized(kept):
+        return kept / kept.sum(axis=-1, keepdims=True)
+
+    def test_top_k_then_top_p_stages_match_sort_reference(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            top_k_renorm_prob_tpu,
+            top_p_renorm_prob_tpu,
+        )
+
+        rng = np.random.default_rng(29)
+        rows = 64
+        probs = _random_rows(rng, batch_size=rows, vocab_size=4096)
+        top_ks = rng.choice([1, 2, 50, 64, 1 << 30], rows).astype(np.int32)
+        top_ps = rng.choice([0.5, 0.9, 1.0], rows).astype(np.float32)
+        unused_ks = np.ones(rows, np.int32)
+        unused_ps = np.ones(rows, np.float32)
+        min_ps = np.zeros(rows, np.float32)
+
+        after_top_k = top_k_renorm_prob_tpu(
+            torch.from_numpy(probs).to("tpu"), torch.from_numpy(top_ks).to("tpu")
+        )
+        expected = self._renormalized(
+            _reference_filter(probs, top_ks, unused_ps, min_ps, True, False, False)
+        )
+        actual = after_top_k.cpu().numpy()
+        np.testing.assert_array_equal(actual > 0, expected > 0)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-7)
+
+        # Feed top-p the device's own top-k output so both sides see the same input.
+        after_top_p = top_p_renorm_prob_tpu(
+            after_top_k, torch.from_numpy(top_ps).to("tpu")
+        )
+        expected = self._renormalized(
+            _reference_filter(actual, unused_ks, top_ps, min_ps, False, True, False)
+        )
+        actual = after_top_p.cpu().numpy()
+        partial = top_ps < 1.0
+        np.testing.assert_array_equal(actual[partial] > 0, expected[partial] > 0)
+        np.testing.assert_allclose(
+            actual[partial], expected[partial], rtol=1e-5, atol=1e-7
+        )
+        # top_p == 1.0 on a renormalized row: whether a float32 sum reaches 1.0
+        # depends on reduction order, so either side may drop a tail of
+        # epsilon mass. Bound the difference instead of comparing supports.
+        self.assertLess(
+            np.abs(actual[~partial] - expected[~partial]).sum(-1).max(), 1e-5
+        )
+
+    def test_boundary_ties_are_kept_inclusively(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            top_k_renorm_prob_tpu,
+        )
+
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.2]])
+        actual = top_k_renorm_prob_tpu(probs.to("tpu"), torch.tensor([2]).to("tpu"))
+        torch.testing.assert_close(actual.cpu(), probs)
+
+
 if __name__ == "__main__":
     unittest.main()

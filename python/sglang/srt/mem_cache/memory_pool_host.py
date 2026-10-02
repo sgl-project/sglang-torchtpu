@@ -16,7 +16,6 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
-from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -33,7 +32,11 @@ _is_npu = is_npu()
 _is_tpu = is_tpu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
+if _is_xpu:
+    from sgl_kernel import transfer_cache_dsv4_mla
+else:
+    from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
@@ -344,6 +347,8 @@ class LogicalHostPool:
     compressed side pools use these logical FULL indices as stable page anchors.
     """
 
+    shared_allocation_domain = None
+
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:
             raise ValueError(
@@ -431,6 +436,26 @@ class LogicalHostPool:
     ):
         pass
 
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        return host_indices, device_indices
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        pass
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        pass
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -453,6 +478,9 @@ class LogicalHostPool:
         pass
 
     def get_page_buffer_meta(self, indices):
+        return None
+
+    def get_page_buffer_element_size(self, split_factor: int = 1):
         return None
 
     def get_ksize_per_token(self):
@@ -478,9 +506,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
-        # A page row of the FP4 indexer buffers is a grouped slot layout rather
-        # than a flat token array, so the token-granular copy used for fused
-        # DSv4 C4 rows does not apply and only whole pages may move.
+        # The token-granular copy below addresses the fused DSv4 C4 row. Neither
+        # the FP4 indexer, whose page rows group their slots, nor unified_kv,
+        # whose page row is a flat run of tokens, has that layout, so those may
+        # only move whole pages.
         self.page_aligned_only = page_aligned_only
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size

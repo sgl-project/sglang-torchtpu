@@ -19,7 +19,7 @@ from sglang.srt.hardware_backend.tpu.pp_chunks import (
 )
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def pending_step_limit(scheduler):
         if batch is not None and batch is not done:
             pending += _prefill_tokens(batch)
     granule = cost.granularity
-    share = -(-pending // scheduler.ps.pp_size)
+    share = -(-pending // get_parallel().pp_size)
     return min(cost.buckets[-1], max(granule, -(-share // granule) * granule))
 
 
@@ -193,7 +193,7 @@ def profile_and_install_cost_model(scheduler):
             policy._run_one(**kwargs)
             elapsed = min(policy._run_one(**kwargs) for _ in range(2))
             samples.append((tokens, prefix, elapsed))
-    reports = [None] * scheduler.ps.pp_size
+    reports = [None] * get_parallel().pp_size
     torch.distributed.all_gather_object(
         reports, (samples, schedule), group=scheduler.pp_group.cpu_group
     )

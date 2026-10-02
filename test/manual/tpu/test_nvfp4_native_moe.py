@@ -242,7 +242,7 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
             .cpu()
             .float()
         )
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         self.assertEqual(native.shape, ref.shape)
         self.assertTrue(torch.isfinite(native).all().item(), "native NaN/Inf")

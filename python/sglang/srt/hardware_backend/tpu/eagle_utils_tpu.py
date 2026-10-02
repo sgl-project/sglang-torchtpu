@@ -351,3 +351,41 @@ def fused_draft_extend_select_argmax_func(
     topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
     topk_p = torch.ones_like(topk_index, dtype=torch.float32)
     return selected_logits, selected_hidden, topk_p, topk_index
+
+
+def _renorm_filtered(kept: torch.Tensor) -> torch.Tensor:
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def top_k_renorm_prob_tpu(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    """Sort-free top-k renormalization; keeps every value tied with the k-th."""
+    from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+
+    rows = probs.shape[0]
+    kept = tpu_filter_probs(
+        probs,
+        top_ks,
+        torch.ones(rows, dtype=torch.float32, device=probs.device),
+        torch.zeros(rows, dtype=torch.float32, device=probs.device),
+        need_top_k=True,
+        need_top_p=False,
+        need_min_p=False,
+    )
+    return _renorm_filtered(kept)
+
+
+def top_p_renorm_prob_tpu(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    """Sort-free top-p renormalization; keeps every value tied with the cutoff."""
+    from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+
+    rows = probs.shape[0]
+    kept = tpu_filter_probs(
+        probs,
+        torch.ones(rows, dtype=torch.int32, device=probs.device),
+        top_ps,
+        torch.zeros(rows, dtype=torch.float32, device=probs.device),
+        need_top_k=False,
+        need_top_p=True,
+        need_min_p=False,
+    )
+    return _renorm_filtered(kept)

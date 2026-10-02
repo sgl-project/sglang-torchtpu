@@ -243,16 +243,17 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         tp_group = types.SimpleNamespace(world_size=4)
         world_group = types.SimpleNamespace(world_size=4)
-        parallel = types.SimpleNamespace(attn_dp_size=1, enable_dp_attention=False)
+        parallel = types.SimpleNamespace(
+            attn_dp_size=1,
+            enable_dp_attention=False,
+            tp_group=tp_group,
+            world_group=world_group,
+        )
         exec_ns = types.SimpleNamespace(
             moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
         )
         a2a_backend = types.SimpleNamespace(is_none=lambda: True)
         with (
-            mock.patch(
-                "sglang.srt.distributed.get_world_group", return_value=world_group
-            ),
-            mock.patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel", return_value=parallel
             ),
@@ -341,16 +342,17 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         tp_group = types.SimpleNamespace(world_size=4)
         world_group = types.SimpleNamespace(world_size=4)
-        parallel = types.SimpleNamespace(attn_dp_size=1, enable_dp_attention=False)
+        parallel = types.SimpleNamespace(
+            attn_dp_size=1,
+            enable_dp_attention=False,
+            tp_group=tp_group,
+            world_group=world_group,
+        )
         exec_ns = types.SimpleNamespace(
             moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
         )
         a2a_backend = types.SimpleNamespace(is_none=lambda: True)
         with (
-            mock.patch(
-                "sglang.srt.distributed.get_world_group", return_value=world_group
-            ),
-            mock.patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel", return_value=parallel
             ),
@@ -481,14 +483,12 @@ class TestNvfp4Block512Contract(CustomTestCase):
         from sglang.srt.hardware_backend.tpu import fp4_moe
 
         layer = _make_block512_layer()
+        layer.moe_ep_size = 1
 
         def fake_prepare_fused_moe_rs(prepared_layer):
             # Mirrors fused_moe_rs_op.prepare_fused_moe_rs, which cannot run
             # here (it needs an initialized TP group). Keep the attribute names
             # in sync with that function.
-            prepared_layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
-                [0], dtype=torch.int32
-            )
             prepared_layer._tpu_fused_rs_group_offset = torch.tensor(
                 [0, 0], dtype=torch.int32
             )
@@ -528,14 +528,11 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 use_fused_rs=True,
             )
 
-        # Every layer-owned value the kernel receives came from prepare, not
-        # from the fixture, so dropping or renaming one fails here.
+        # The prepared group offset must reach the kernel unchanged.
         call = fused_moe_rs_gather.call_args.kwargs
         self.assertNotIn("collective_id", call)
         self.assertIs(call["group_offset"], layer._tpu_fused_rs_group_offset)
-        self.assertIs(
-            call["tp_rank_to_device_id"], layer._tpu_fused_rs_tp_rank_to_device_id
-        )
+        self.assertEqual(call["world_size"], layer.moe_ep_size)
         self.assertFalse(call["has_post_expert_norm"])
 
     def test_fused_apply_uses_shared_gather_without_fp8_payload(self):
@@ -551,7 +548,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
-        layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor([0], dtype=torch.int32)
+        layer.moe_ep_size = 1
         from sglang.srt.layers.moe.pallas import fused_moe_rs_op
 
         # Autospec is intentional: it catches adapter/backend API skew during a
@@ -602,9 +599,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 layer._tpu_fused_rs_group_offset = torch.tensor(
                     [0, 0], dtype=torch.int32
                 )
-                layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
-                    [0], dtype=torch.int32
-                )
+                layer.moe_ep_size = 1
                 fused_moe_rs_gather = mock.Mock(
                     side_effect=lambda **kwargs: kwargs["hidden_states"]
                 )
@@ -668,9 +663,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
-        layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
-            [0, 1], dtype=torch.int32
-        )
+        layer.moe_ep_size = 2
 
         # Model rank 0's output is the first partition of each kernel result.
         fused_moe_rs_gather = mock.Mock(
@@ -1317,17 +1310,12 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 return_value=MoeRunnerBackend(backend),
             ),
             mock.patch(
-                "sglang.srt.distributed.get_world_group",
-                return_value=types.SimpleNamespace(world_size=world_size),
-            ),
-            mock.patch(
-                "sglang.srt.distributed.get_tp_group",
-                return_value=types.SimpleNamespace(world_size=world_size),
-            ),
-            mock.patch(
                 "sglang.srt.runtime_context.get_parallel",
                 return_value=types.SimpleNamespace(
-                    attn_dp_size=1, enable_dp_attention=False
+                    attn_dp_size=1,
+                    enable_dp_attention=False,
+                    tp_group=types.SimpleNamespace(world_size=world_size),
+                    world_group=types.SimpleNamespace(world_size=world_size),
                 ),
             ),
             mock.patch(

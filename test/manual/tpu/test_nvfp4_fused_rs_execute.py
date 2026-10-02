@@ -178,7 +178,6 @@ def _make_fused_rs_kernel(
             activation="silu",
             has_post_expert_norm=False,
             fp8_direct_write=False,
-            tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
         )
 
     return kernel

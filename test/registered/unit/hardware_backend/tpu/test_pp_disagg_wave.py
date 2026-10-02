@@ -34,9 +34,11 @@ def batch(mode):
 def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     """Run every loop statement, stopping only at the next request-receive turn."""
     scheduler = SchedulerPPMixin()
-    scheduler.ps = SimpleNamespace(pp_size=4, pp_rank=rank)
     scheduler.pp_group = SimpleNamespace(
-        is_first_rank=rank == 0, is_last_rank=rank == 3
+        rank_in_group=rank,
+        world_size=4,
+        is_first_rank=rank == 0,
+        is_last_rank=rank == 3,
     )
     scheduler.pp_group.send_object = Mock(return_value=[])
     scheduler.pp_group.recv_object = Mock(return_value=[])
@@ -128,16 +130,20 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
         elif use_wave and rank != 0:
             assert set(proxy.tensors) == {"hidden_states", "residual"}
         result = SimpleNamespace(
+            can_run_cuda_graph=False,
             pp_hidden_states_proxy_tensors=PPProxyTensors(
                 {"hidden_states": torch.ones(2, 4), "residual": torch.zeros(2, 4)}
-            )
+            ),
         )
         return result, Mock()
 
     scheduler._pp_launch_batch = Mock(side_effect=launch)
     scheduler._pp_process_batch_result = Mock()
     parallel = SimpleNamespace(
-        pp_async_batch_depth=depth, enable_dsa_prefill_context_parallel=False
+        pp_size=4,
+        pp_rank=rank,
+        pp_async_batch_depth=depth,
+        enable_dsa_prefill_context_parallel=False,
     )
     with (
         patch.object(scheduler_pp_mixin, "_is_tpu", use_wave),

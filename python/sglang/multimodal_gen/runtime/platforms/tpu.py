@@ -135,6 +135,10 @@ class TpuPlatform(Platform):
         # tpu_dist implements collectives only; send/recv raise.
         return False
 
+    def supports_distributed_device_id(self) -> bool:
+        # PJRT owns the chiplet binding.
+        return False
+
     @classmethod
     def supports_device_tensor_pickle(cls) -> bool:
         # Reducing a PrivateUse1 storage aborts in tensor_to_buffer.cc.

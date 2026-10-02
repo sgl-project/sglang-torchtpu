@@ -70,7 +70,14 @@ ${PREFILL_POOL_AFFINITY}
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                    sizeLimit: 16Gi
+                    # Holds tier-2 AND tier-3 now; 16Gi fit neither for a 120B run.
+                    sizeLimit: 64Gi
+                # Unmounted, /tmp is the container writable layer: unbounded node
+                # ephemeral-storage. Overrunning it evicts whoever the kubelet picks,
+                # so a pod's own logs took out unrelated jobs on the same node.
+                - name: tmp
+                  emptyDir:
+                    sizeLimit: 64Gi
 ${WEIGHTS_VOLUME}
               containers:
                 - name: test
@@ -91,6 +98,11 @@ ${WEIGHTS_VOLUME}
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
+                      # overlay; warmup fills the node disk and the kubelet evicts the pod.
+                      # EXEC_CMD reaches launch_server.sh without the ENABLE_COMPILE_CACHE=0
+                      # that the multi-host path sets, so this route does write it.
+                      export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
                       # GKE treats a JobSet with two TPU replicated jobs as one
                       # Multislice workload and injects MEGASCALE_* coordination
                       # env spanning both slices; with it set, the TPU runtime
@@ -99,6 +111,18 @@ ${WEIGHTS_VOLUME}
                       # (the KV transfer is application-level), so drop it.
                       for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
                       echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      # Print /tmp usage to debug a disk eviction after the fact: the
+                      # kubelet only reports a total, and the container log is unreadable
+                      # by then. Past 20 GiB each line grows a du breakdown.
+                      #   == prefill /tmp 24K ==
+                      #   == decode /tmp 3220292K ==
+                      if [ "${TPU_WORKER_ID:-0}" = "0" ]; then
+                        ( while sleep 120; do
+                            tot=$(du -sxk /tmp 2>/dev/null | cut -f1)
+                            echo "== $CI_PD_ROLE /tmp ${tot:-?}K =="
+                            [ "${tot:-0}" -gt 20971520 ] && du -xhd2 /tmp 2>/dev/null | sort -rh | head -10
+                          done ) &
+                      fi
                       # Name the test BEFORE anything can fail. A P/D run can
                       # spend an hour in weight load and compile before dying,
                       # and with no test named the dashboard files the red row
@@ -142,11 +166,16 @@ ${WEIGHTS_VOLUME}
                       google.com/tpu: "4"
                       cpu: "4"
                       memory: 32Gi
+                      # No ephemeral-storage here: kueue-tpu.yaml's coveredResources
+                      # omit it, and Kueue silently never admits a workload asking
+                      # for a resource the ClusterQueue does not cover.
                     limits:
                       google.com/tpu: "4"
                   volumeMounts:
                     - name: dshm
                       mountPath: /dev/shm
+                    - name: tmp
+                      mountPath: /tmp
 ${WEIGHTS_MOUNT}
                   securityContext:
                     privileged: true
@@ -177,7 +206,14 @@ ${DECODE_POOL_AFFINITY}
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                    sizeLimit: 16Gi
+                    # Holds tier-2 AND tier-3 now; 16Gi fit neither for a 120B run.
+                    sizeLimit: 64Gi
+                # Unmounted, /tmp is the container writable layer: unbounded node
+                # ephemeral-storage. Overrunning it evicts whoever the kubelet picks,
+                # so a pod's own logs took out unrelated jobs on the same node.
+                - name: tmp
+                  emptyDir:
+                    sizeLimit: 64Gi
 ${WEIGHTS_VOLUME}
               containers:
                 - name: test
@@ -198,6 +234,11 @@ ${WEIGHTS_VOLUME}
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
+                      # overlay; warmup fills the node disk and the kubelet evicts the pod.
+                      # EXEC_CMD reaches launch_server.sh without the ENABLE_COMPILE_CACHE=0
+                      # that the multi-host path sets, so this route does write it.
+                      export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
                       # GKE treats a JobSet with two TPU replicated jobs as one
                       # Multislice workload and injects MEGASCALE_* coordination
                       # env spanning both slices; with it set, the TPU runtime
@@ -206,6 +247,18 @@ ${WEIGHTS_VOLUME}
                       # (the KV transfer is application-level), so drop it.
                       for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
                       echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      # Print /tmp usage to debug a disk eviction after the fact: the
+                      # kubelet only reports a total, and the container log is unreadable
+                      # by then. Past 20 GiB each line grows a du breakdown.
+                      #   == prefill /tmp 24K ==
+                      #   == decode /tmp 3220292K ==
+                      if [ "${TPU_WORKER_ID:-0}" = "0" ]; then
+                        ( while sleep 120; do
+                            tot=$(du -sxk /tmp 2>/dev/null | cut -f1)
+                            echo "== $CI_PD_ROLE /tmp ${tot:-?}K =="
+                            [ "${tot:-0}" -gt 20971520 ] && du -xhd2 /tmp 2>/dev/null | sort -rh | head -10
+                          done ) &
+                      fi
                       # Same announcement as the prefill side; the verdict is
                       # the prefill leader's alone, so no TIMINGS record here.
                       echo "== test files: ${TEST_FILES} =="
@@ -226,11 +279,16 @@ ${WEIGHTS_VOLUME}
                       google.com/tpu: "4"
                       cpu: "4"
                       memory: 32Gi
+                      # No ephemeral-storage here: kueue-tpu.yaml's coveredResources
+                      # omit it, and Kueue silently never admits a workload asking
+                      # for a resource the ClusterQueue does not cover.
                     limits:
                       google.com/tpu: "4"
                   volumeMounts:
                     - name: dshm
                       mountPath: /dev/shm
+                    - name: tmp
+                      mountPath: /tmp
 ${WEIGHTS_MOUNT}
                   securityContext:
                     privileged: true

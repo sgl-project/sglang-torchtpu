@@ -117,7 +117,7 @@ def _requantize_tpu_fp8_moe_block_to_channelwise(
             del q_chunk
             scales.append(s_chunk)
             # Drain so this chunk's float32 transient frees before the next.
-            torch.tpu.synchronize()
+            torch.accelerator.synchronize()
         copy_or_rebind_param(layer, f"{w_name}_scale", torch.cat(scales, dim=0))
         _clear_replaced_param(layer, scale_inv_name)
     layer.weight_block_size = None

@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MXINT8 storage geometry, independent of backend and kernel implementations."""
+"""MXINT8 storage geometry, independent of backend and kernel implementations.
+
+The cache is one INT8 page tensor ``[pages, R, tokens]``: ``2*H*align32(D)``
+payload rows followed by one biased-exponent byte (``e + 127``) per
+(head, K/V, group) row, padded with 127 to a whole 32-row int8 sublane tile.
+"""
 
 import torch
 
 GROUP_SIZE = 32
 EXPONENT_BIAS = 127
-EXPONENT_DTYPE = torch.uint8
+EXPONENT_PAD_BYTE = EXPONENT_BIAS
 QUANT_DTYPE = torch.int8
 ROW_ALIGNMENT = 32
 
@@ -25,26 +30,43 @@ def _validate_geometry(
         raise ValueError("MXINT8 page_size must be a power of two and at least 128")
 
 
-def exponent_cache_shape(
+def _align(rows: int) -> int:
+    return (rows + ROW_ALIGNMENT - 1) // ROW_ALIGNMENT * ROW_ALIGNMENT
+
+
+def payload_rows(head_num: int, head_dim: int) -> int:
+    """Rows of INT8 payload; row = (2 * head + K0V1) * align32(D) + channel."""
+    return 2 * head_num * _align(head_dim)
+
+
+def scale_rows(head_num: int, head_dim: int, group_size: int = GROUP_SIZE) -> int:
+    """Exponent-byte rows actually used; row = (2 * head + K0V1) * G + group."""
+    return 2 * head_num * (head_dim // group_size)
+
+
+def merged_rows(head_num: int, head_dim: int, group_size: int = GROUP_SIZE) -> int:
+    return payload_rows(head_num, head_dim) + _align(
+        scale_rows(head_num, head_dim, group_size)
+    )
+
+
+def merged_cache_shape(
     num_blocks: int,
     head_num: int,
     head_dim: int,
     page_size: int,
     group_size: int = GROUP_SIZE,
 ) -> tuple[int, int, int]:
-    """[pages, padded rows, tokens]; row = (2 * head + K0V1) * G + group."""
+    """[pages, merged rows, tokens] for the single INT8 MXINT8 page tensor."""
     _validate_geometry(head_num, head_dim, page_size, group_size)
     if num_blocks <= 0:
         raise ValueError("MXINT8 num_blocks must be positive (including dummy page)")
-    rows = 2 * head_num * (head_dim // group_size)
-    rows = (rows + ROW_ALIGNMENT - 1) // ROW_ALIGNMENT * ROW_ALIGNMENT
-    return num_blocks, rows, page_size
+    return num_blocks, merged_rows(head_num, head_dim, group_size), page_size
 
 
 def cache_bytes_per_token(
     head_num: int, head_dim: int, page_size: int, group_size: int = GROUP_SIZE
 ) -> int:
     """Physical bytes per layer, excluding the extra dummy page's token count."""
-    _, rows, _ = exponent_cache_shape(1, head_num, head_dim, page_size, group_size)
-    aligned_dim = (head_dim + ROW_ALIGNMENT - 1) // ROW_ALIGNMENT * ROW_ALIGNMENT
-    return 2 * head_num * aligned_dim + rows
+    _validate_geometry(head_num, head_dim, page_size, group_size)
+    return merged_rows(head_num, head_dim, group_size)

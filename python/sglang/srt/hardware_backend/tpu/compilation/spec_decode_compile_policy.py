@@ -19,7 +19,9 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _COMPILE_BAR_FORMAT,
     _get_hbm_usage_mb,
     _hbm_delta_str,
+    _warmup_progress,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -70,25 +72,30 @@ class BaseSpecDecodeCompilePolicyMixin:
             return ()
         return ("forward_batch.spec_info",)
 
-    def precompile(self) -> None:
-        """Warm target graphs during graph-runner initialization."""
+    def precompile(self) -> list[PendingCall]:
+        """Schedule target warmups during graph-runner initialization.
+
+        Draft warmup is deferred to ``precompile_draft()`` because its custom
+        attention backends are initialized later by the EAGLE worker.
+        """
         if self.is_draft_worker:
             logger.info(
                 "[spec compile policy] DRAFT: deferring warmup until its "
                 "attention backends are initialized."
             )
-            return
-        super().precompile()
+            return []
+        pending = super().precompile()
         # A PD prefill pool has no SpeculativeState, so a TARGET_VERIFY dummy
         # forward would trip the backend's pool-type assert; a PD decode server
         # never runs prefill.
         disagg_mode = get_disagg().disaggregation_mode
         if disagg_mode != "prefill":
-            self._precompile_target_verify()
+            pending += self._precompile_target_verify()
         if disagg_mode != "decode":
-            self._precompile_extend_full()
+            pending += self._precompile_extend_full()
+        return pending
 
-    def _precompile_target_verify(self) -> None:
+    def _precompile_target_verify(self) -> list[PendingCall]:
         """Compile TARGET_VERIFY across the batch-size buckets."""
         assert self.b_bucketer is not None
         draft_token_num = self.draft_token_num
@@ -109,27 +116,29 @@ class BaseSpecDecodeCompilePolicyMixin:
             if get_parallel().tp_rank == 0
             else bs_buckets
         )
+        pending = []
         for bs in compile_range:
             num_tokens = bs * draft_token_num
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.TARGET_VERIFY,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self.make_verify_spec_info(),
             )
+            if warmup is not None:
+                pending.append(warmup)
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
-                hbm_after = _get_hbm_usage_mb()
-                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
-                    f"Compiled TARGET_VERIFY (bs={bs}, tokens={num_tokens})"
+                    f"{status} TARGET_VERIFY (bs={bs}, tokens={num_tokens})"
                     f" in {elapsed:.1f}s{hbm_str}"
                 )
+        return pending
 
-    def _precompile_extend_full(self) -> None:
+    def _precompile_extend_full(self) -> list[PendingCall]:
         """Compile target prefill with and without speculative input state."""
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
@@ -159,10 +168,11 @@ class BaseSpecDecodeCompilePolicyMixin:
             if get_parallel().tp_rank == 0
             else valid_shapes
         )
+        pending = []
         for num_tokens, bs, has_spec_info, variant in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.EXTEND,
@@ -170,16 +180,17 @@ class BaseSpecDecodeCompilePolicyMixin:
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self.make_null_spec_info() if has_spec_info else None,
             )
+            if warmup is not None:
+                pending.append(warmup)
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
-                hbm_after = _get_hbm_usage_mb()
-                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
-                    f"Compiled EXTEND(FULL) (tokens={num_tokens}, bs={bs}, "
+                    f"{status} EXTEND(FULL) (tokens={num_tokens}, bs={bs}, "
                     f"variant={variant}, "
                     f"spec_info={'set' if has_spec_info else 'none'})"
                     f" in {elapsed:.1f}s{hbm_str}"
                 )
+        return pending
 
     def _precompile_shapes(
         self, desc: str, items: list[Any], run: Callable[[Any], str]

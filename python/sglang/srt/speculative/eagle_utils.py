@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import fill_bonus_tokens_func
 from sglang.srt.utils import (
     is_cpu,
@@ -60,11 +60,17 @@ if _is_tpu:
         build_topk1_verify_tree_tpu,
         prepare_device_accept_tpu,
         prepare_verify_cache_locs_tpu,
+        top_k_renorm_prob_tpu,
+        top_p_renorm_prob_tpu,
     )
 
 logger = logging.getLogger(__name__)
 
-if _is_cuda or _is_hip or _is_musa:
+if _is_cuda or _is_hip:
+    from sglang.kernels.ops.speculative.tree import (
+        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+    )
+elif _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -549,7 +555,10 @@ def verify_tree_greedy_func(
     next_token_logits: Optional[torch.Tensor] = None,
 ):
     if _is_cuda or _is_hip or _is_musa:
-        from sgl_kernel import verify_tree_greedy
+        if _is_cuda or _is_hip:
+            from sglang.kernels.ops.speculative.tree import verify_tree_greedy
+        else:
+            from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,  # mutable
@@ -944,10 +953,10 @@ def eagle_sample(
     """
     import torch.nn.functional as F
 
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -1042,7 +1051,7 @@ def eagle_sample(
             tp_group = (
                 get_parallel().attn_tp_group
                 if is_dp_attention_enabled()
-                else get_tp_group()
+                else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
@@ -1078,7 +1087,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
@@ -1107,10 +1116,17 @@ def eagle_sample(
                 chain_speculative_sampling_triton,
             )
 
+            # if/else, not a ternary: the CUDA-only name still has to resolve in the
+            # branch not taken, and HIP only reaches here with rejection sampling on.
             if use_rejection_sampling:
                 sampling_fn = chain_speculative_sampling_triton
             else:
-                from sgl_kernel import tree_speculative_sampling_target_only
+                if _is_cuda:
+                    from sglang.kernels.ops.speculative.sampling import (
+                        tree_speculative_sampling_target_only,
+                    )
+                else:
+                    from sgl_kernel import tree_speculative_sampling_target_only
 
                 sampling_fn = tree_speculative_sampling_target_only
 
@@ -1122,6 +1138,9 @@ def eagle_sample(
                 from sglang.kernels.ops.sampling.renorm_triton import (
                     top_p_renorm_probs_triton as top_p_renorm_prob,
                 )
+            elif _is_cuda:
+                from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+                from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
             else:
                 from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
@@ -1205,7 +1224,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
@@ -1362,30 +1381,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         prepare_device_accept_tpu(batch, bs=bs, double_alloc=double_alloc)
 
 
-def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
-    """Keep the top-k probabilities per row and renormalize (torch fallback)."""
-    vocab = probs.shape[-1]
-    ks = top_ks.clamp(min=1, max=vocab).to(torch.long).reshape(-1, 1)
-    sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
-    kth = sorted_probs.gather(-1, ks - 1)  # k-th largest prob per row
-    kept = torch.where(probs >= kth, probs, torch.zeros_like(probs))
-    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-
-def _top_p_renorm_prob_torch(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
-    """Keep the nucleus (top-p) per row and renormalize (torch fallback)."""
-    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
-    cumsum = torch.cumsum(sorted_probs, dim=-1)
-    ps = top_ps.to(probs.dtype).reshape(-1, 1)
-    # Keep a token if the prefix mass *before* it is still below p (so the token
-    # that crosses the threshold is included).
-    keep_sorted = (cumsum - sorted_probs) < ps
-    keep = torch.zeros_like(probs, dtype=torch.bool)
-    keep.scatter_(-1, sorted_idx, keep_sorted)
-    kept = torch.where(keep, probs, torch.zeros_like(probs))
-    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-
 def top_k_renorm_prob_func(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -1394,7 +1389,7 @@ def top_k_renorm_prob_func(
     if _is_tpu:
         if not need_top_k_sampling:
             return probs
-        return _top_k_renorm_prob_torch(probs, top_ks)
+        return top_k_renorm_prob_tpu(probs, top_ks)
     from sgl_kernel import top_k_renorm_prob
 
     return top_k_renorm_prob(probs, top_ks)
@@ -1402,7 +1397,7 @@ def top_k_renorm_prob_func(
 
 def top_p_renorm_prob_func(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
     if _is_tpu:
-        return _top_p_renorm_prob_torch(probs, top_ps)
+        return top_p_renorm_prob_tpu(probs, top_ps)
     from sgl_kernel import top_p_renorm_prob
 
     return top_p_renorm_prob(probs, top_ps)

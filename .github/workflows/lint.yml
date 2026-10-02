@@ -76,6 +76,9 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Test PR health action
+        run: node --test .github/actions/check-pr-test-health/action.test.cjs
+
       # Hard gate: docs internal links/anchors/redirects must resolve.
       # mint is pinned for reproducibility (its heading-slug rules are
       # version-sensitive); bump deliberately after re-verifying locally.

@@ -67,8 +67,8 @@ class _ForceTpuContext:
         spec_utils._is_tpu = True
         spec_utils._use_torch_native = True
         self.par_override = get_parallel().override(
-            world_size=1,
-            world_rank=0,
+            launch_world_size=1,
+            launch_world_rank=0,
             tp_size=1,
             tp_rank=0,
             pp_size=1,
@@ -196,11 +196,16 @@ def _create_dflash_worker_for_tpu(
     worker.page_size = 16
     worker.device = dev
     worker.gpu_id = 0
-    worker.ps = SimpleNamespace(tp_rank=0, world_size=1)
     # world size 1: every sync is a pass-through.
     worker._tp_sync = SpecTpSync(SimpleNamespace(world_size=1, rank_in_group=0))
     # plain DFlash: no candidate selector.
     worker.selector = None
+    # No LiLiCorr reranker, and the draft does not own an attention group.
+    worker.lilicorr = None
+    worker._lilicorr_sampling_enabled = False
+    worker._lilicorr_anchor = None
+    worker._warned_lilicorr_eager = False
+    worker.draft_owns_attention = False
     worker._selector_sample = None
     worker._draft_probs_buf = None
     # This fixture bypasses DFlashWorkerV2.__init__; mirror its DP-attention state.
@@ -309,7 +314,9 @@ def _create_dflash_worker_for_tpu(
         decode_cuda_graph_runner=None,
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         server_args=SimpleNamespace(enable_lora=False),
-        ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+        attn_dcp_size=1,
+        attn_dcp_rank=0,
+        tp_rank=0,
         compile_policy=_MockCompilePolicy(
             b_bucketer=Bucketer(name="Bs", buckets=[1, 2, 4, 8, 16])
         ),
@@ -372,7 +379,9 @@ def _create_dflash_worker_for_tpu(
         lora_manager=None,
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         prefill_attention_backend_str="torch_native",
-        ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+        attn_dcp_size=1,
+        attn_dcp_rank=0,
+        tp_rank=0,
         tp_group=None,
         model=draft_model,
         model_config=SimpleNamespace(
@@ -456,6 +465,8 @@ def _make_schedule_batch(
         mamba_track_indices=None,
         mamba_track_mask=None,
         mamba_track_seqlens=None,
+        mamba_track_seqlens_cpu=None,
+        mamba_prefill_track_mask_cpu=None,
         mamba_cow_src_indices=None,
         mamba_cow_dst_indices=None,
         mamba_clear_indices=None,
@@ -489,6 +500,7 @@ def _make_schedule_batch(
         encoder_lens_cpu=None,
         global_num_tokens=None,
         global_num_tokens_for_logprob=None,
+        dp_spec_prefill_coordination_applied=False,
         dllm_config=None,
         model_config=SimpleNamespace(is_matryoshka=False, hidden_size=2880),
     )

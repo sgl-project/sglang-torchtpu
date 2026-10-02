@@ -171,18 +171,11 @@ def main():
 
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
         _build_fused_moe_rs_op,
-        _get_tp_rank_to_device_id_mapping,
         fused_moe_rs_call,
         fused_moe_rs_padded_tokens,
     )
 
     _build_fused_moe_rs_op()
-    _, tp_rank_to_device_id = _get_tp_rank_to_device_id_mapping()
-    tp_rank_to_device_id_tensor = torch.tensor(
-        tp_rank_to_device_id,
-        dtype=torch.int32,
-        device=device,
-    )
 
     def kernel(
         x,
@@ -194,7 +187,6 @@ def main():
         ids,
         group_offset,
         norm_weight,
-        tp_rank_to_dev_id,
     ):
         valid = ids >= 0
         ids = torch.where(valid, ids, torch.zeros_like(ids))
@@ -219,7 +211,6 @@ def main():
                     activation="silu",
                     has_post_expert_norm=test_post_expert_norm,
                     fp8_direct_write=fp8_direct_write,
-                    tp_rank_to_device_id=tp_rank_to_dev_id,
                 )
             )
         return outputs[0] if layers == 1 else tuple(outputs)
@@ -247,7 +238,6 @@ def main():
             if test_post_expert_norm
             else torch.zeros(1, dtype=torch.bfloat16, device=device)
         ),
-        tp_rank_to_device_id_tensor,
     )
     if layers == 1:
         actual_outputs = (actual_outputs,)

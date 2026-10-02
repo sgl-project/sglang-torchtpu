@@ -141,9 +141,18 @@ class Fabric:
 
 def stage(fabric, rank, mode, schedule):
     scheduler = SchedulerPPMixin()
-    scheduler.ps = SimpleNamespace(pp_size=fabric.size, pp_rank=rank)
+    # Every stage shares this process, so each thread reads its own topology.
+    scheduler.test_parallel = SimpleNamespace(
+        pp_size=fabric.size,
+        pp_rank=rank,
+        pp_async_batch_depth=1,
+        enable_dsa_prefill_context_parallel=False,
+    )
     scheduler.pp_group = SimpleNamespace(
-        is_first_rank=rank == 0, is_last_rank=rank == fabric.size - 1
+        rank_in_group=rank,
+        world_size=fabric.size,
+        is_first_rank=rank == 0,
+        is_last_rank=rank == fabric.size - 1,
     )
     step = [-1]
     processed = []
@@ -271,7 +280,10 @@ def stage(fabric, rank, mode, schedule):
     scheduler._pp_send_dict_to_next_stage = lambda data, **kwargs: fabric.send(
         rank, "output", data
     )
-    scheduler._pp_recv_dict_from_prev_stage = lambda: fabric.receive(rank, "output")
+    scheduler._pp_recv_dict_from_prev_stage = lambda: (
+        fabric.receive(rank, "output"),
+        None,
+    )
     scheduler._pp_prep_batch_result = lambda target, metadata, outputs: SimpleNamespace(
         logits_output=None, next_token_ids=outputs["next_token_ids"]
     )
@@ -318,6 +330,7 @@ class TestMultiStageDisaggregatedWave(unittest.TestCase):
                 stages = [stage(fabric, rank, mode, schedule) for rank in range(8)]
 
                 def run(scheduler):
+                    stage_parallel.value = scheduler.test_parallel
                     try:
                         loop = (
                             scheduler.event_loop_pp_disagg_prefill
@@ -332,13 +345,13 @@ class TestMultiStageDisaggregatedWave(unittest.TestCase):
                             fabric.errors.append(exc)
                         fabric.stop.set()
 
-                parallel = SimpleNamespace(
-                    pp_async_batch_depth=1, enable_dsa_prefill_context_parallel=False
-                )
+                stage_parallel = threading.local()
                 with (
                     patch.object(scheduler_pp_mixin, "_is_tpu", True),
                     patch.object(
-                        scheduler_pp_mixin, "get_parallel", return_value=parallel
+                        scheduler_pp_mixin,
+                        "get_parallel",
+                        side_effect=lambda: stage_parallel.value,
                     ),
                     patch.object(
                         scheduler_pp_mixin,

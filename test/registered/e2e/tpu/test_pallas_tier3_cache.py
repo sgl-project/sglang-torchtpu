@@ -43,7 +43,7 @@ _WORKER = textwrap.dedent("""
         model.weight.copy_(torch.eye(128))
         model.bias.zero_()
     model = model.to("tpu")
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     import jax
     import jax.numpy as jnp
@@ -74,7 +74,7 @@ _WORKER = textwrap.dedent("""
         model=model,
     )
     value = torch.ones((32, 128), dtype=torch.float32, device="tpu")
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     result = compiled(value).cpu()
     expected = torch.full((32, 128), 1 + int(sys.argv[2]), dtype=torch.float32)
     if not torch.equal(result, expected):

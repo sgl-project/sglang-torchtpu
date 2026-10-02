@@ -183,11 +183,11 @@ def _run_distributed_worker() -> None:
         """Return synchronized mean device latency over the fixed iteration count.
         Synchronization excludes asynchronous dispatch from the measurement."""
 
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         for _ in range(_ITERATIONS):
             fn()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         return (time.perf_counter() - start) * 1_000 / _ITERATIONS
 
     def _measure_pair(reference, pallas, batch_size: int) -> tuple[float, float]:
@@ -200,7 +200,7 @@ def _run_distributed_worker() -> None:
                 functions = tuple(reversed(functions))
             for fn in functions:
                 fn()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
 
         reference_times = []
         pallas_times = []

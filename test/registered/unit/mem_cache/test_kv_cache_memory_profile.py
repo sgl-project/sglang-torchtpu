@@ -43,7 +43,11 @@ class TestKVCacheMemoryProfile(unittest.TestCase):
         self.world_group = SimpleNamespace(world_size=16, cpu_group=object())
         stack.enter_context(
             patch.object(
-                kv_cache_configurator, "get_world_group", return_value=self.world_group
+                kv_cache_configurator,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    launch_world_size=16, world_group=self.world_group
+                ),
             )
         )
 

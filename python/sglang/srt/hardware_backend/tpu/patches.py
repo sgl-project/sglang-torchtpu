@@ -766,6 +766,43 @@ def _patch_future_map_direct_handoff() -> None:
     FutureMap.resolve_mixed_spec_tails = resolve_mixed_spec_tails
 
 
+_raiden_is_load_back_event_done_patched = False
+
+
+def _patch_raiden_is_load_back_event_done() -> None:
+    """Route ``UnifiedRadixCache.is_load_back_event_done`` to the raiden controller.
+
+    The PD decode restore loop polls this method, which reads a per-layer
+    ``finish_event`` from the done counter's slot. Raiden stores the combined
+    future-event itself in a ``BatchDoneCounter`` slot, and the answer must
+    agree across ranks before ``loading_check`` runs its collectives. Other
+    controllers keep the original method.
+    """
+    global _raiden_is_load_back_event_done_patched
+    if _raiden_is_load_back_event_done_patched:
+        return
+    _raiden_is_load_back_event_done_patched = True
+
+    from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
+        TpuRaidenHybridCacheController,
+    )
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    orig_is_load_back_event_done = UnifiedRadixCache.is_load_back_event_done
+
+    def is_load_back_event_done(self, consumer_index):
+        controller = self.cache_controller
+        if not isinstance(controller, TpuRaidenHybridCacheController):
+            return orig_is_load_back_event_done(self, consumer_index)
+        if not controller.is_load_back_event_done(consumer_index, self._all_reduce):
+            return False
+        if consumer_index >= 0:
+            self.loading_check()
+        return True
+
+    UnifiedRadixCache.is_load_back_event_done = is_load_back_event_done
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -783,3 +820,4 @@ def apply_tpu_patches() -> None:
     _register_aten_fallbacks()
     _patch_tpu_torch_pallas_register_positional()
     _patch_future_map_direct_handoff()
+    _patch_raiden_is_load_back_event_done()

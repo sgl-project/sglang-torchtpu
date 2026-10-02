@@ -240,10 +240,13 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
+        # Look up only the first decode_prefix_len tokens, the ones decode told
+        # prefill it already holds. Prefill sends the rest, and admission reserved
+        # device slots only for these tokens.
         rematch = match_prefix_for_req(
             self.tree_cache,
             dr.req,
-            dr.req.origin_input_ids,
+            dr.req.origin_input_ids[: pm.decode_prefix_len],
             cow_mamba=False,
             include_req=True,
         )
@@ -291,9 +294,6 @@ class DecodeHiCacheTransferMixin:
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
-        if not hasattr(self.tree_cache, "is_load_back_event_done"):
-            return
-
         # Filter once: keep only PENDING reqs that still need restore work;
         # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
         active: List[DecodeRequest] = []

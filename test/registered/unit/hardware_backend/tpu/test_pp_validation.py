@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
+from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -22,7 +23,7 @@ def _args(**overrides):
         attention_backend=None,
         sampling_backend=None,
         disable_cuda_graph=False,
-        disable_piecewise_cuda_graph=False,
+        cuda_graph_config=default_cuda_graph_config(),
         enable_torch_compile=False,
         disable_overlap_schedule=False,
         mem_fraction_static=None,

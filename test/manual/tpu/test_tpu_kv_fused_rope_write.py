@@ -146,7 +146,7 @@ def _compare(
         kv_bufs=got,
         max_span_len=max_span_len,
     )
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     bad = []
     for layer in range(LAYERS):
