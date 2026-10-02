@@ -11,9 +11,8 @@
 #                     once, rank-0 runs the group's files).
 #   * pd-*         -> static P/D disaggregation gates (2 engines per job).
 #   * static exec  -> no server, every host runs the file (exec mode).
-# Jobs default to the `nightly` lane (topology.yaml) and map to exactly ONE test
-# file, so a red job names its test (the dashboard contract). The standalone
-# topology artifact probe can opt into the PR lane's two-host slice.
+# Every job runs in the `nightly` lane (topology.yaml) and maps to exactly ONE
+# test file, so a red job names its test (the dashboard contract).
 name: Feature Validation (TPU)
 run-name: "Feature Validation (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
@@ -46,12 +45,6 @@ on:
           - pd-sh-gpt-120b-spec
           - pd-sh-gpt-120b-decode-radix
           - sh
-      topology_artifact_lane:
-        description: "Lane for the standalone topology artifact test"
-        required: false
-        default: nightly
-        type: choice
-        options: [nightly, pr-gate]
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
         required: false
@@ -75,10 +68,6 @@ on:
       image:
         required: false
         default: ""
-        type: string
-      topology_artifact_lane:
-        required: false
-        default: nightly
         type: string
       test_filter:
         required: false
@@ -498,7 +487,7 @@ jobs:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
       display_name: test_topology_artifact_transfer
-      lane: ${{ inputs.topology_artifact_lane || 'nightly' }}
+      lane: nightly
       hosts: 2
       vbar_tcp: true
       exec_cmd: env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_topology_artifact_transfer.py -v
