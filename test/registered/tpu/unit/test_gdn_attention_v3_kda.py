@@ -10,8 +10,9 @@ silu the fused kernel folds in. Both gate forms are covered:
 ``gate_lower_bound=None`` gives ``-exp(A_log) * softplus(g + dt_bias)``
 (Kimi-Linear); a float gives ``gate_lower_bound * sigmoid(exp(A_log) *
 (g + dt_bias))`` (Kimi-K3, at -5.0). Decode runs the token recurrence and
-prefill the chunked solve; cases cover fresh slots and slots continuing a
-context (stale state must be ignored when the context is empty).
+prefill the chunked solve; cases cover fresh slots, slots continuing a
+context (stale state must be ignored when the context is empty), and padded
+buckets (trailing empty sequence rows and tokens, as TPU serving pads them).
 
 Requires a TPU device; skipped otherwise. Adapted from vllm-torchtpu
 ``tests/kernels/test_gdn_attention_v3_kda.py``.
@@ -21,7 +22,7 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import unittest
 
@@ -126,7 +127,6 @@ def _kda_attention_ref(
     d_v: int,
     kernel_size: int,
     gate_lower_bound: float | None = None,
-    **_,
 ):
     """Reference conv1d + silu + KDA, sequence by sequence in eager mode."""
     num_tokens = qkv.shape[0]
@@ -202,29 +202,42 @@ def _kda_attention_ref(
     return (new_conv_state, new_recurrent_state), output
 
 
-# (name, query lens, context lens, distribution); context 0 is a fresh slot.
+# (name, query lens, context lens, distribution, extra); context 0 is a fresh
+# slot. extra: n_v, and pad_seqs / pad_tokens for empty rows past the real
+# sequences, which carry the null slot 0 and zero length.
 _SHAPES = [
-    ("decode_only", [1] * 8, [0] * 8, [8, 8, 8]),
-    ("decode_single", [1], [0], [1, 1, 1]),
-    ("decode_three", [1] * 3, [0] * 3, [3, 3, 3]),
-    ("decode_with_context", [1] * 8, [3, 17, 64, 1, 250, 7, 33, 2], [8, 8, 8]),
+    ("decode_only", [1] * 8, [0] * 8, [8, 8, 8], {}),
+    ("decode_single", [1], [5], [1, 1, 1], {}),
+    ("decode_with_context", [1] * 8, [3, 17, 64, 1, 250, 7, 33, 2], [8, 8, 8], {}),
+    # 3 real sequences in a 4-row decode bucket.
+    ("padded_decode", [1] * 3, [5, 9, 2], [3, 3, 3], dict(pad_seqs=1, pad_tokens=1)),
     # 40 is not a multiple of the 16-row triangular block.
-    ("prefill_nonmult16_40", [40], [0], [0, 1, 1]),
-    ("mixed_prefill", [192, 128, 64], [0, 0, 0], [0, 3, 3]),
-    ("prefill_long", [1000], [0], [0, 1, 1]),
-    ("prefill_with_context", [100], [50], [0, 1, 1]),
-    ("decode_and_prefill", [1, 1, 38], [5, 9, 0], [2, 3, 3]),
+    ("prefill_nonmult16_40", [40], [0], [0, 1, 1], {}),
+    ("mixed_prefill", [192, 128, 64], [0, 0, 0], [0, 3, 3], {}),
+    ("prefill_long", [1000], [0], [0, 1, 1], {}),
+    ("prefill_with_context", [100], [50], [0, 1, 1], {}),
+    ("decode_and_prefill", [1, 1, 38], [5, 9, 0], [2, 3, 3], {}),
+    # 2 real prefills in a 4-row, 128-token bucket.
+    (
+        "padded_prefill",
+        [40, 24],
+        [0, 0],
+        [0, 2, 2],
+        dict(pad_seqs=2, pad_tokens=64),
+    ),
+    # Kimi-Linear-48B's 32 heads use a different triangular sub-block (8).
+    ("kimi_linear_heads", [192, 64], [0, 0], [0, 2, 2], dict(n_v=32)),
 ]
 
 # Kimi-Linear sets no bound; Kimi-K3 sets -5.0.
 _GATES = [("softplus", None), ("bounded", -5.0)]
 
 
+@unittest.skipUnless(_has_jax_tpu(), _SKIP_REASON)
 class TestGDNAttentionV3KDA(CustomTestCase):
     """Compare the KDA mode of the fused kernel against a float64 recurrence."""
 
     # K3 and Kimi-Linear both run KDA without GQA, so n_kq == n_v.
-    N_V = 4
     D_K = 128
     D_V = 128
     KERNEL_SIZE = 4
@@ -234,12 +247,23 @@ class TestGDNAttentionV3KDA(CustomTestCase):
 
         return fused_conv1d_gdn
 
-    def _inputs(self, query_lens, context_lens, distribution, gate_lower_bound):
-        n_kq = n_v = self.N_V
+    def _inputs(
+        self,
+        query_lens,
+        context_lens,
+        distribution,
+        gate_lower_bound,
+        *,
+        n_v=4,
+        pad_seqs=0,
+        pad_tokens=0,
+    ):
+        n_kq = n_v
         d_k, d_v, kernel_size = self.D_K, self.D_V, self.KERNEL_SIZE
         num_seqs = len(query_lens)
-        q_loc = jnp.array(np.cumsum([0] + query_lens), dtype=jnp.int32)
-        num_tokens = int(q_loc[-1])
+        ends = np.cumsum([0] + query_lens)
+        q_loc = jnp.array(list(ends) + [ends[-1]] * pad_seqs, dtype=jnp.int32)
+        num_tokens = int(ends[-1]) + pad_tokens
         dim_size = 2 * n_kq * d_k + n_v * d_v
         # Slot 0 is the reserved null block for invalid / padded tokens.
         num_blocks = num_seqs + 1
@@ -266,10 +290,13 @@ class TestGDNAttentionV3KDA(CustomTestCase):
             # over (head, channel).
             dt_bias=jax.random.normal(next(rngs), (n_v, d_k)),
             query_start_loc=q_loc,
-            state_indices=jnp.arange(1, num_seqs + 1),
+            state_indices=jnp.array(
+                list(range(1, num_seqs + 1)) + [0] * pad_seqs, dtype=jnp.int32
+            ),
             distribution=jnp.array(distribution, dtype=jnp.int32),
             seq_lens=jnp.array(
-                [q + c for q, c in zip(query_lens, context_lens)], dtype=jnp.int32
+                [q + c for q, c in zip(query_lens, context_lens)] + [0] * pad_seqs,
+                dtype=jnp.int32,
             ),
             n_kq=n_kq,
             n_v=n_v,
@@ -283,11 +310,15 @@ class TestGDNAttentionV3KDA(CustomTestCase):
         from sglang.srt.layers.attention.pallas.gdn import config
 
         kernel = self._kernel()
-        for name, query_lens, context_lens, distribution in _SHAPES:
+        for name, query_lens, context_lens, distribution, extra in _SHAPES:
             for gate_name, gate_lower_bound in _GATES:
                 with self.subTest(case=f"{name}_{gate_name}"):
                     kwargs = self._inputs(
-                        query_lens, context_lens, distribution, gate_lower_bound
+                        query_lens,
+                        context_lens,
+                        distribution,
+                        gate_lower_bound,
+                        **extra,
                     )
                     # The kernel donates both state inputs; build the reference first.
                     (ref_conv, ref_state), ref_out = _kda_attention_ref(**kwargs)
@@ -295,15 +326,14 @@ class TestGDNAttentionV3KDA(CustomTestCase):
                         **kwargs, attention_mode=config.AttentionMode.KDA
                     )
 
-                    # Tighter than the GDN suite's 2e-2/2e-2 on purpose: KDA feeds
-                    # the output through an L2 norm and a d_k**-0.5 scale, so |out|
-                    # peaks around 0.3 and 2e-2 would swallow gate-layout errors.
+                    # |out| peaks near 0.3 (L2 norm and d_k**-0.5 scale); a 2e-2 atol
+                    # would hide gate-layout errors.
                     np.testing.assert_allclose(
                         np.asarray(out, np.float64), ref_out, rtol=2e-2, atol=5e-3
                     )
                     # Looser than the output: the state accumulates the delta rule
                     # over the whole sequence without the output's norm and scale.
-                    slots = np.asarray(kwargs["state_indices"])
+                    slots = np.asarray(kwargs["state_indices"])[: len(query_lens)]
                     np.testing.assert_allclose(
                         np.asarray(out_state, np.float64)[slots],
                         np.asarray(ref_state, np.float64)[slots],
