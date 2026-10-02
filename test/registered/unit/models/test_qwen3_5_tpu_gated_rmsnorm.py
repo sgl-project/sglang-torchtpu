@@ -58,6 +58,15 @@ class TestTpuGatedRMSNorm(CustomTestCase):
         exp = _ref(x, norm.weight, None, self.EPS)
         torch.testing.assert_close(out, exp, rtol=1e-5, atol=1e-5)
 
+    def test_qwen38_swish_gate_matches_reference(self):
+        """The original Qwen3.8-27B config names its SiLU gate 'swish'."""
+        torch.manual_seed(0)
+        norm = self._norm("swish").to(torch.bfloat16)
+        x = torch.randn(4, self.H, dtype=torch.bfloat16)
+        z = torch.randn_like(x)
+        expected = _ref(x, norm.weight, z, self.EPS)
+        torch.testing.assert_close(norm(x, z), expected)
+
     def test_unsupported_activation_raises(self):
         # A non-silu gate must fail loudly, not silently drop the gate.
         with self.assertRaises(NotImplementedError):
