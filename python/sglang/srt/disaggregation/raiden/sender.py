@@ -476,6 +476,7 @@ class RaidenSenderMixin:
         dst_attn_tp = req.dst_attn_tp
         decode_swa_blocks = req.decode_swa_blocks
         swa_push_endpoint = req.swa_push_endpoint
+        self._require_matching_kv_layout(room, req.dst_kv_layout)
         with self._state_lock:
             if room in self._aborted:
                 return

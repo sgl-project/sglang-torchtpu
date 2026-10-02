@@ -113,6 +113,11 @@ class ReshardReq(WireMessage):
     dst_attn_tp: int
     decode_swa_blocks: list[int]
     swa_push_endpoint: str
+    # The decode pool's KV layout. The sender computes the push geometry from
+    # its OWN pool, so the two must agree or the bytes land scrambled -- and
+    # nothing downstream would notice. Empty means a peer that predates this
+    # field, which could only have been token-major.
+    dst_kv_layout: str = ""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

@@ -270,8 +270,8 @@ class RaidenKVManager(
         matches keeps the two pools free to differ in dtype or head_dim.
         """
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
+            BlockLayout,
             ReshardGeometry,
-            head_pair_bytes,
         )
 
         tensors = self._swa_kv_caches if swa else self._kv_caches
@@ -282,11 +282,69 @@ class RaidenKVManager(
                 + " KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
-        hp = head_pair_bytes(tensor)
+        block = BlockLayout.from_tensor(tensor, self._kv_block_layout())
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+        geometry = ReshardGeometry(
+            src_attn_tp, dst_attn_tp, block.hp_bytes, total_kv_heads, block
+        )
+        # Not every (src_tp, dst_tp, dtype, layout) combination is a byte-strided
+        # copy -- see ``BlockLayout.head_span``. Reject the whole deployment here
+        # rather than let each room discover it inside the handshake.
+        geometry.validate()
+        return geometry
+
+    def _kv_block_layout(self) -> str:
+        """Which of the two TPU KV layouts the local pool uses.
+
+        ``uses_seq_along_lane_kv()`` reads only the env flag, so it reports the
+        same answer on prefill and decode (both engines run the same image and
+        the same flag) without pulling in a backend. Anything unexpected falls
+        back to the historical token-major layout, which is what every
+        deployment predating HND ran.
+        """
+        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+            LAYOUT_HEAD_ALONG_SUBLANE,
+            LAYOUT_SEQ_ALONG_LANE,
+        )
+
+        try:
+            from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+                uses_seq_along_lane_kv,
+            )
+
+            if uses_seq_along_lane_kv():
+                return LAYOUT_SEQ_ALONG_LANE
+        except Exception:  # pragma: no cover - non-TPU / import-time fallback
+            logger.debug("Could not probe the KV layout; assuming token-major")
+        return LAYOUT_HEAD_ALONG_SUBLANE
+
+    def _require_matching_kv_layout(self, room: int, peer_layout: str) -> None:
+        """Reject a reshard whose peer stores KV in the other layout.
+
+        The push geometry is computed from the sender's own pool and applied
+        verbatim to the receiver's blocks, so the two layouts must agree. They
+        would only diverge through a misconfiguration --
+        ``SGLANG_TPU_USE_SEQ_ALONG_LANE_KV`` set on one deployment and not the
+        other -- but nothing downstream validates the bytes, so the failure mode
+        is silently wrong attention output. Fail the handshake instead.
+
+        An empty ``peer_layout`` is a peer predating this field; it can only
+        have been token-major, so treat it as such.
+        """
+        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+            LAYOUT_HEAD_ALONG_SUBLANE,
+        )
+
+        peer = peer_layout or LAYOUT_HEAD_ALONG_SUBLANE
+        local = self._kv_block_layout()
+        if peer != local:
+            raise RuntimeError(
+                f"Raiden reshard room {room}: decode KV layout {peer!r} does not "
+                f"match this prefill's {local!r}. Set "
+                "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV identically on both engines."
+            )
 
     # ----- engine lifecycle -------------------------------------------------
 
