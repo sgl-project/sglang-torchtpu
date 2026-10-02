@@ -320,7 +320,7 @@ _SHAPES = [
 _GATES = [("softplus", None), ("bounded", -5.0)]
 
 
-@unittest.skipUnless(_has_jax_tpu(), _SKIP_REASON)
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestGDNAttentionV3KDA(CustomTestCase):
     """Compare the KDA mode of the fused kernel against a float64 recurrence."""
 
