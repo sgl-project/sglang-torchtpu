@@ -151,10 +151,25 @@ class TestPallasMoeCallContract(CustomTestCase):
             1,  # use_sc_gather (int(True))
             0,  # w_quant_bits (0 => not weight-only quantized)
             128,  # permute_dense_threshold
-            True,  # quantize_lhs
-            0.0,  # gemm1_alpha (None)
-            0.0,  # gemm1_clamp_limit (None)
         )
+
+    def test_situ_params_are_encoded_in_the_activation(self):
+        """SiTU (beta, linear_beta) reach the op in the activation string."""
+        import sglang.srt.layers.moe.pallas.fused_moe_op as fused_moe_op
+
+        t = torch.empty(2, 2)
+        op = Mock(return_value=t)
+        call = dict(hidden_states=t, w1=t, w2=t, topk_weights=t, topk_ids=t, topk=2)
+        with patch.object(fused_moe_op, "_build_fused_moe_op", return_value=op):
+            fused_moe_op.fused_moe_call(
+                **call, activation="situ", gemm1_alpha=4.0, gemm1_clamp_limit=25.0
+            )
+            self.assertEqual(op.call_args.args[10], "situ:4.0:25.0")
+            fused_moe_op.fused_moe_call(**call, activation="situ", gemm1_alpha=4.0)
+            self.assertEqual(op.call_args.args[10], "situ:4.0:none")
+            # A missing beta must fail, not silently default.
+            with self.assertRaises(ValueError):
+                fused_moe_op.fused_moe_call(**call, activation="situ")
 
 
 if __name__ == "__main__":

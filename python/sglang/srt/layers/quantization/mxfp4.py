@@ -1591,13 +1591,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+        # TODO(qinghan): once the packed-FP4 fast path lands, gate this on a
+        # config flag instead of unconditionally taking the BF16 triage path.
         if is_tpu():
-            # forward_tpu reads the packed-FP4 scales when the loader kept them.
             from sglang.srt.layers.quantization.unquant import (
                 UnquantizedFusedMoEMethod,
             )
 
-            return UnquantizedFusedMoEMethod.forward_tpu(self, layer, dispatch_output)
+            # Scales are None on the BF16 path, packed-FP4 block scales otherwise.
+            return UnquantizedFusedMoEMethod.forward_tpu(
+                self,
+                layer,
+                dispatch_output,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
 
         if self.use_deep_gemm:
             # Handles standard AND deepep_ll/deepep_normal dispatch formats via

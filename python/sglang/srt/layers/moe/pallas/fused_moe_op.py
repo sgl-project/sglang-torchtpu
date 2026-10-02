@@ -41,7 +41,8 @@ Activation
 ----------
 Only ``"silu"`` (SwiGLU: ``silu(gate) * up``) is exercised today, which
 is what Qwen3-MoE uses. ``"gelu"`` is supported for parity with the
-mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, ``"situ"`` for Kimi-K3.
+mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
+``"situ:{beta}:{linear_beta|none}"`` (built by ``fused_moe_call``) for Kimi-K3.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here —
@@ -283,20 +284,21 @@ def _fuse_act_name(activation_name):
     The gated activation now runs *in-kernel* in GMM1 (gmm_v2 splits the
     ``2*n`` gate/up accumulator and applies ``act(gate) * up`` before writing
     only ``n`` columns to HBM). ``gmm_v2.apply_act_fn`` accepts
-    ``silu`` / ``gelu`` / ``swigluoai``; SGLang spells the GPT-OSS one
-    ``swiglu_oai``.
+    ``silu`` / ``gelu`` / ``swigluoai`` / ``situ:{beta}:{linear_beta|none}``;
+    SGLang spells the GPT-OSS one ``swiglu_oai``.
     """
+    if activation_name.startswith("situ:"):
+        return activation_name
     mapping = {
         "silu": "silu",
         "gelu": "gelu",
         "swiglu_oai": "swigluoai",
         "swigluoai": "swigluoai",
-        "situ": "situ",
     }
     if activation_name not in mapping:
         raise NotImplementedError(
             f"Unsupported activation '{activation_name}' for the Pallas "
-            "fused-MoE op. Supported: silu, gelu, swiglu_oai, situ."
+            "fused-MoE op. Supported: silu, gelu, swiglu_oai."
         )
     return mapping[activation_name]
 
@@ -319,9 +321,6 @@ def _fused_moe_jax(
     use_sc_gather=0,
     w_quant_bits=0,  # 4 => w1/w2 are checkpoint-packed int4 words (W4A16)
     permute_dense_threshold=0,
-    quantize_lhs=True,
-    gemm1_alpha=0.0,
-    gemm1_clamp_limit=0.0,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -352,8 +351,7 @@ def _fused_moe_jax(
     w2_packed = w2.dtype == jnp.uint8
 
     rhs_quant_dtype = None
-    # False keeps bf16 activations against quantized rhs (MXFP4 W4A16).
-    maybe_quantize_lhs = quantize_lhs
+    maybe_quantize_lhs = True
     if w_quant_bits:
         assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
         # W4A16: checkpoint-packed int4 rhs (8 per int32), bf16 activations.
@@ -439,12 +437,7 @@ def _fused_moe_jax(
     # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
     # rhs scales, so the activation is applied in JAX below.
     unfused_gmm1 = compact_block_scales or bool(w_quant_bits)
-    fuse_act = _fuse_act_name(activation_name)
-    if fuse_act == "situ":
-        # SiTU (beta, linear_beta) = runner gemm1 (alpha, clamp_limit). 0.0 encodes
-        # None (the op's static args are floats); beta defaults to 1.0 as in SituAndMul.
-        fuse_act = f"situ:{gemm1_alpha or 1.0}:{gemm1_clamp_limit or 'none'}"
-    gmm1_fuse_act = None if unfused_gmm1 else fuse_act
+    gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
     if compact_block_scales:
@@ -510,7 +503,9 @@ def _fused_moe_jax(
         rhs_quant_dtype=rhs_quant_dtype,
     )
     if unfused_gmm1:
-        gmm1_out = apply_act_fn(gmm1_out, int(gmm1_out.shape[-1] // 2), fuse_act)
+        gmm1_out = apply_act_fn(
+            gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
+        )
     # gmm1_out: [m*topk, n_intermediate]
 
     # same padding
@@ -664,9 +659,6 @@ def _build_fused_moe_op():
         use_sc_gather: int = 0,
         w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
-        quantize_lhs: bool = True,
-        gemm1_alpha: float = 0.0,
-        gemm1_clamp_limit: float = 0.0,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -686,9 +678,6 @@ def _build_fused_moe_op():
             use_sc_gather,
             w_quant_bits,
             permute_dense_threshold,
-            quantize_lhs,
-            gemm1_alpha,
-            gemm1_clamp_limit,
         )
 
     custom_op = jax_op(op_name, _wrapped)
@@ -711,9 +700,6 @@ def _build_fused_moe_op():
         use_sc_gather: int = 0,
         w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
-        quantize_lhs: bool = True,
-        gemm1_alpha: float = 0.0,
-        gemm1_clamp_limit: float = 0.0,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -747,7 +733,6 @@ def fused_moe_call(
     global_num_experts: int = 0,
     expert_group_offset: int = 0,
     w_quant_bits: int = 0,
-    quantize_lhs: bool = True,
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
@@ -764,9 +749,13 @@ def fused_moe_call(
     or the un-combined per-expert ``[num_tokens, topk, hidden_size]``
     when ``no_combine`` is True.
     """
-    if activation == "situ" and gemm1_alpha is None:
-        # SiTU needs the runner's beta; a missing one would silently use 1.0.
-        raise ValueError("SiTU fused MoE requires gemm1_alpha (SiTU beta).")
+    if activation == "situ":
+        # SiTU's (beta, linear_beta) travel in the activation string, as in
+        # vllm-torchtpu; they are the runner's gemm1 (alpha, clamp_limit).
+        if gemm1_alpha is None:
+            raise ValueError("SiTU fused MoE requires gemm1_alpha (SiTU beta).")
+        linear_beta = "none" if gemm1_clamp_limit is None else gemm1_clamp_limit
+        activation = f"situ:{gemm1_alpha}:{linear_beta}"
     op = _build_fused_moe_op()
     return op(
         hidden_states,
@@ -786,7 +775,4 @@ def fused_moe_call(
         int(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()),
         w_quant_bits,
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
-        quantize_lhs,
-        0.0 if gemm1_alpha is None else float(gemm1_alpha),
-        0.0 if gemm1_clamp_limit is None else float(gemm1_clamp_limit),
     )

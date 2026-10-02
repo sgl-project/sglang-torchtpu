@@ -1,13 +1,10 @@
-"""Experimental scaffold for the unwired native MXFP4 fused-MoE path.
+"""Manual check: packed MXFP4 fused MoE vs a BF16-dequantized reference.
 
-``process_mxfp4_moe_weights_native`` creates packed FP4 weights and block
-scales, but ``fused_moe_call`` does not yet expand the packed weights to their
-logical K dimension. This test therefore currently fails during GMM input
-validation before reaching its numerical comparison. Production uses BF16
-dequantization through ``prepare_tpu_mxfp4_moe_weights`` instead.
-
-Keep this test manual until the packed path is wired into the fused kernel.
-It requires torch_tpu and a TPU device.
+Uses GPT-OSS's interleaved, biased layout on the packed path, which production
+does not take (GPT-OSS stays on BF16 dequantization in
+``prepare_tpu_mxfp4_moe_weights``); the registered
+``test_fused_moe_situ_mxfp4`` covers the production packed path.
+Requires torch_tpu and a TPU device.
 """
 
 from __future__ import annotations

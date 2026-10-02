@@ -1,8 +1,9 @@
 # Uses the latest torchtpu-vllm gmm_v2 kernel
 #   (https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
 # This cut adds in-kernel fused activation (``fuse_act``: silu / gelu /
-# swigluoai / situ) and fused gate+up weight support over the prior sglang-jax
-# vendor.
+# swigluoai) and fused gate+up weight support over the prior sglang-jax vendor.
+# SiTU follows vllm-torchtpu #233 (8f573113e); dequantizing small-block rhs
+# before the matmul follows vllm-torchtpu #307 (4019b1352), limited to fp4 here.
 # The Pallas fused-MoE bridge (``fused_moe_op.py``) passes ``fuse_act`` so the
 # GMM1 gated activation runs in-kernel instead of as a separate JAX pass.
 # The ``swigluoai`` activation in particular is required for GPT-OSS.
@@ -57,7 +58,7 @@ def swigluoai(
     return (up + 1.0) * glu
 
 
-def situ(
+def situ_and_mul(
     gate: jax.Array, up: jax.Array, *, beta: float, linear_beta: float | None
 ) -> jax.Array:
     """SiTU gated activation used by Kimi-K3 (see SituAndMul in activation.py)."""
@@ -65,6 +66,9 @@ def situ(
     if linear_beta is not None:
         up = linear_beta * jnp.tanh(up / linear_beta)
     return gate_act * up
+
+
+_MXFP4_BLOCK_SIZE = 32
 
 
 def _dequantize_rhs_tile(rhs, block_scales, *, quant_block_size):
@@ -113,7 +117,9 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
         case str() if fuse_act.startswith("situ:"):
             _, beta, linear_beta = fuse_act.split(":")
             linear_beta = None if linear_beta == "none" else float(linear_beta)
-            return situ(acc_gate, acc_up, beta=float(beta), linear_beta=linear_beta)
+            return situ_and_mul(
+                acc_gate, acc_up, beta=float(beta), linear_beta=linear_beta
+            )
         case _:
             raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
@@ -304,6 +310,17 @@ class InputConfigs:
     # share of the cost-model byte estimate. None when the rhs is unscaled.
     scale_dtype: jnp.dtype | None = None
 
+    @property
+    def should_dequantize_before_matmul(self) -> bool:
+        """Dequantize rhs before matmul if block size limits MXU utilization."""
+        # fp4 only, so int4 W4A16 and fp8 block-128 keep their per-block matmuls.
+        return (
+            self.has_scale
+            and self.scale_block_n == 1
+            and self.quant_dtype == jnp.float4_e2m1fn.dtype
+            and self.quant_block_size < pltpu.get_tpu_info().mxu_column_size
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
@@ -319,19 +336,6 @@ class GmmConfigs:
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
         return pl.cdiv(self.tiles.tile_k, self.rhs_cfgs.quant_block_size)
-
-    @property
-    def dequantize_rhs_before_matmul(self) -> bool:
-        # Blocks narrower than the MXU would each issue a K=block matmul; scale
-        # the fp4 rhs in VMEM instead and run one full-tile_k matmul.
-        rhs = self.rhs_cfgs
-        return (
-            self.lhs_cfgs.quant_dtype is None
-            and rhs.has_scale
-            and rhs.scale_block_n == 1
-            and rhs.quant_dtype == jnp.float4_e2m1fn.dtype
-            and rhs.quant_block_size < pltpu.get_tpu_info().mxu_column_size
-        )
 
 
 TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None], TileSizes]
@@ -537,7 +541,7 @@ def inner_kernel(
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
             apply_rhs_scale = cfgs.rhs_cfgs.has_scale
-            if cfgs.dequantize_rhs_before_matmul:
+            if cfgs.rhs_cfgs.should_dequantize_before_matmul:
                 tiled_rhs = _dequantize_rhs_tile(
                     tiled_rhs,
                     tiled_rhs_ref.get_block_scales(),
@@ -1356,14 +1360,17 @@ def make_gmm_configs(
     )
 
     lhs_quant_block_size = 512
-    if packed_fp4 and block_size not in (32, lhs_quant_block_size):
+    if packed_fp4 and block_size not in (_MXFP4_BLOCK_SIZE, lhs_quant_block_size):
         raise NotImplementedError(
             "Packed FP4 GMM requires quantization block size 32 (MXFP4) or 512 "
             f"(NVFP4), got {block_size}."
         )
 
+    # FP4 scale blocks narrower than the lhs block run W4A16 (bf16 activations),
+    # the same rule as fused_rs get_maybe_quantize_lhs; wider ones run W4A8.
+    fp4_w4a16 = packed_fp4 and block_size < lhs_quant_block_size
     lhs_q_dtype = None
-    if maybe_quantize_lhs and rhs_quant_dtype is not None:
+    if maybe_quantize_lhs and rhs_quant_dtype is not None and not fp4_w4a16:
         # Choose lhs quantization dtype based on TPU hardware support.
         is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
         tpu_info = pltpu.get_tpu_info()
@@ -1375,9 +1382,9 @@ def make_gmm_configs(
             if tpu_info.int8_ops_per_second > 0:
                 lhs_q_dtype = jnp.int8.dtype
 
-    if packed_fp4 and lhs_q_dtype not in (None, jnp.float8_e4m3fn.dtype):
+    if packed_fp4 and not fp4_w4a16 and lhs_q_dtype != jnp.float8_e4m3fn.dtype:
         raise NotImplementedError(
-            f"Packed FP4 GMM supports bf16 or fp8 activations only, got {lhs_q_dtype}."
+            "Packed FP4 GMM requires TPU FP8 activation quantization support."
         )
 
     if lhs_q_dtype is not None and num_blocks > 1:

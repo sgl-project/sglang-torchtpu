@@ -525,6 +525,16 @@ class TestForwardTpuContract(CustomTestCase):
                 f"{name} must be None for a bf16 layer",
             )
 
+    def test_situ_params_come_from_the_runner_config(self):
+        """SiTU beta / linear_beta reach the kernel bridge from moe_runner_config."""
+        cfg = self.runner.method.moe_runner_config
+        cfg.gemm1_alpha, cfg.gemm1_clamp_limit = 4.0, 25.0
+        self.runner.tpu_forward(
+            self.runner.make_layer(), self.runner.make_dispatch_output()
+        )
+        kw = self.runner.kernel_kwargs
+        self.assertEqual((kw["gemm1_alpha"], kw["gemm1_clamp_limit"]), (4.0, 25.0))
+
 
 class TestForwardTpuViaDispatch(CustomTestCase):
     """Integration: ``BaseFusedOp.forward`` -> dispatch -> ``forward_tpu``

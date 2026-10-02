@@ -46,7 +46,7 @@ class TestFusedActScales(CustomTestCase):
     # N2: 2 * intermediate (gate || up).
     G, M, K, N2 = 4, 512, 256, 512
 
-    def _fused_vs_unfused(self, quant_mode):
+    def _fused_vs_unfused(self, quant_mode, fuse_act="silu"):
         from sglang.srt.layers.moe.pallas.gmm_v2 import apply_act_fn, gmm_v2
 
         key = jax.random.key(0)
@@ -63,7 +63,7 @@ class TestFusedActScales(CustomTestCase):
             rhs=rhs,
             group_sizes=group_sizes,
             rhs_scale=scale,
-            fuse_act="silu",
+            fuse_act=fuse_act,
             preferred_element_type=jnp.bfloat16,
         )
         plain = gmm_v2(
@@ -74,7 +74,7 @@ class TestFusedActScales(CustomTestCase):
             preferred_element_type=jnp.bfloat16,
         )
         ref = apply_act_fn(
-            plain.astype(jnp.float32), plain.shape[-1] // 2, "silu"
+            plain.astype(jnp.float32), plain.shape[-1] // 2, fuse_act
         ).astype(jnp.bfloat16)
 
         diff = jnp.max(jnp.abs(fused.astype(jnp.float32) - ref.astype(jnp.float32)))
@@ -93,6 +93,10 @@ class TestFusedActScales(CustomTestCase):
 
     def test_fused_act_channelwise_scales(self):
         self._fused_vs_unfused("channelwise")
+
+    def test_fused_situ_bf16(self):
+        # Kimi-K3's SiTU params, encoded as gmm_v2 parses them.
+        self._fused_vs_unfused("bf16", fuse_act="situ:4.0:25.0")
 
     def test_misaligned_gate_up_boundary_asserts(self):
         from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
