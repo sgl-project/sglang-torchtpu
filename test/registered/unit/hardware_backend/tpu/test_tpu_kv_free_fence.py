@@ -324,9 +324,8 @@ class TestRadixEvictionUnderFence(CustomTestCase):
         self.assertEqual(self.allocator.held_pages.num_pages, 0)
 
     def test_every_tree_device_free_records_its_node_stamp(self):
-        """An eviction's frees share one release time, the latest stamp it
-        recorded; a device value freed without recording its node's stamp would
-        be released early whenever it is drained with an older node's free."""
+        """A device value freed without recording its node's stamp is released
+        early whenever its eviction also frees an older node's value."""
         stray = []
         for location, func in _srt_functions():
             for call in _attribute_calls(func):
@@ -345,9 +344,8 @@ class TestRadixEvictionUnderFence(CustomTestCase):
         self.assertEqual(stray, [])
 
     def test_every_device_lock_release_stamps_its_node(self):
-        """Eviction frees a node's pages at once when its stamp predates every
-        running forward; a lock release that keeps an older stamp lets pages the
-        releasing request's in-flight forward still writes be freed early."""
+        """A lock release must stamp before it can evict; a stale stamp frees
+        pages the releasing request's in-flight forward still writes."""
         releases = {
             "release_component_lock",
             "release_window_lock",
@@ -361,18 +359,22 @@ class TestRadixEvictionUnderFence(CustomTestCase):
         )
         stray = []
         for location, func in _srt_functions():
-            calls = {call.func.attr for call in _attribute_calls(func)}
-            if (
-                calls & releases
-                and "_stamp_release" not in calls
-                and func.name not in exempt
+            if func.name in exempt:
+                continue
+            lines = {}
+            for call in _attribute_calls(func):
+                lines.setdefault(call.func.attr, []).append(call.lineno)
+            release_lines = [n for name in releases for n in lines.get(name, ())]
+            stamp_lines = lines.get("_stamp_release", [])
+            if release_lines and min(stamp_lines, default=float("inf")) > min(
+                release_lines
             ):
                 stray.append(f"{location}:{func.name}")
         self.assertEqual(stray, [])
 
 
 @functools.cache
-def _srt_functions() -> List[Tuple[Path, ast.FunctionDef]]:
+def _srt_functions() -> List[Tuple[Path, ast.FunctionDef | ast.AsyncFunctionDef]]:
     """(path, function) for every function under sglang/srt."""
     srt = Path(sglang.__file__).parent / "srt"
     functions = []
@@ -392,7 +394,7 @@ def _srt_functions() -> List[Tuple[Path, ast.FunctionDef]]:
     return functions
 
 
-def _attribute_calls(func: ast.FunctionDef) -> List[ast.Call]:
+def _attribute_calls(func: ast.FunctionDef | ast.AsyncFunctionDef) -> List[ast.Call]:
     return [
         node
         for node in ast.walk(func)

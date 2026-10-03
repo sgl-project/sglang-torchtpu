@@ -193,13 +193,14 @@ class TestDecSwaLockSkip(unittest.TestCase):
         full = _RecordingComp(ComponentType.FULL, 2)
         swa = _RecordingComp(ComponentType.SWA, 1)
         mamba = _RecordingComp(ComponentType.MAMBA, 0)
-        node = SimpleNamespace(id=7)
+        node = SimpleNamespace(id=7, parent=None)
         tree_core = SimpleNamespace(
             root_node=object(),
             components=(full, swa, mamba),
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
             _assert_receipt_anchor=UnifiedTreeCore._assert_receipt_anchor,
+            _stamp_release=UnifiedTreeCore._stamp_release,
         )
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,

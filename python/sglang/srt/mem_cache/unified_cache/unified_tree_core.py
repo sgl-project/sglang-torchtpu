@@ -728,8 +728,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._assert_receipt_anchor(node, params)
         # After an SWA early release (dec_swa_lock_only), SWA and the
         # lower-priority components it dropped are already released.
-        self._release_components(node, params, skip_swa_and_below=skip_swa)
         self._stamp_release(node)
+        self._release_components(node, params, skip_swa_and_below=skip_swa)
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
@@ -745,10 +745,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def dec_full_pin(self, node_id: NodeId) -> None:
         node = self.node_by_id(node_id)
+        self._stamp_release(node)
         self.components_by_type[BASE_COMPONENT_TYPE].release_component_lock(
             node=node, params=None
         )
-        self._stamp_release(node)
         self._update_evictable_leaf_sets(node)
 
     def dec_window_lock_only(
