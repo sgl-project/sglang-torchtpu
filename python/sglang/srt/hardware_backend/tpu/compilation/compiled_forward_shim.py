@@ -1078,6 +1078,9 @@ class CompiledForwardShim:
                     args=args, input_ids=input_ids, forward_batch=forward_batch
                 )
         try:
+            note_graph = getattr(self.policy, "note_forward_graph", None)
+            if note_graph is not None:
+                note_graph(input_ids, forward_batch, kwargs)
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
             spec_info = forward_batch.spec_info
             if spec_info is None or not spec_info.keep_outputs_padded:

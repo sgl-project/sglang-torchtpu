@@ -211,6 +211,176 @@ class TestWaveProtocol(CustomTestCase):
         self.assertEqual(ici.count, [3, 3])
 
 
+class TestWaveLaunchSlots(CustomTestCase):
+    """torch_tpu runs every multi-device program on the whole slice's device
+    assignment, matched by launch count; every hand-off must sit at the same
+    launch index on every device, whatever the stages launch in between."""
+
+    def _run(self, size, schedule, forward_launches, slot):
+        ici = _FakeIci(size)
+        streams = [[] for _ in range(size)]
+        waves = []
+        for r in range(size):
+            base = ici.launcher(r)
+
+            def launcher(x, r=r, base=base):
+                streams[r].append("H")
+                return base(x)
+
+            wave = PPWave(
+                rank=r,
+                size=size,
+                rows=ROWS,
+                hidden=HIDDEN,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                launcher=launcher,
+                slot_size=slot,
+                slot_filler=lambda r=r: streams[r].append("f"),
+            )
+            wave.forward_launches = forward_launches[r]
+            waves.append(wave)
+        errors = []
+
+        def run(rank):
+            wave = waves[rank]
+            try:
+                for has_batch in schedule:
+                    wave.begin_iteration(has_batch)
+                    tensors = None
+                    if has_batch:
+                        wave.receive()
+                        streams[rank].extend("L" * wave.forward_launches)
+                        wave.note_stage_launches(wave.forward_launches)
+                        if rank < size - 1:
+                            out = torch.zeros((ROWS, HIDDEN))
+                            tensors = {"hidden_states": out, "residual": out}
+                    wave.end_iteration(tensors)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((rank, exc))
+                with ici.cond:
+                    ici.failed = True
+                    ici.cond.notify_all()
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        return streams, waves, errors
+
+    def test_hand_offs_sit_at_the_same_launch_index_on_every_stage(self):
+        size, slot = 4, 3
+        schedule = _drained(size, [True, True, False, True] + [False] * 5 + [True])
+        streams, waves, errors = self._run(size, schedule, [2, 1, 3, 0], slot)
+        self.assertEqual(errors, [])
+        hand_offs = [[i for i, p in enumerate(s) if p == "H"] for s in streams]
+        for r in range(1, size):
+            # Stage r runs up to r-1 hand-offs ahead; compare the common prefix.
+            n = min(len(hand_offs[0]), len(hand_offs[r]))
+            self.assertEqual(hand_offs[r][:n], hand_offs[0][:n], f"stage {r}")
+        # Drained: every stage issued the same programs count.
+        self.assertEqual(len({len(s) for s in streams}), 1, streams)
+        for s in streams:
+            self.assertEqual(s[-1], "H")
+        for wave in waves:
+            self.assertEqual(wave.slot_used, 0)
+
+    def test_a_forward_above_the_slot_is_an_error(self):
+        wave = PPWave(
+            rank=1,
+            size=3,
+            rows=ROWS,
+            hidden=HIDDEN,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            launcher=lambda x: x,
+            slot_size=2,
+            slot_filler=lambda: None,
+        )
+        wave.note_stage_launches(2)
+        with self.assertRaisesRegex(RuntimeError, "above the slot of 2"):
+            wave.note_stage_launches(1)
+
+    def test_per_graph_counts_keep_hand_offs_aligned(self):
+        # Each stage's forwards issue different counts per graph (mode), as
+        # reported by the measured-table counter.
+        size, slot = 4, 3
+        per_forward = [[2, 1, 3], [1, 1, 2], [0, 3, 1], [2, 2, 2]]
+        schedule = _drained(size, [True, True, True, False, True] + [False] * 3)
+        ici = _FakeIci(size)
+        streams = [[] for _ in range(size)]
+        waves = []
+        for r in range(size):
+            base = ici.launcher(r)
+
+            def launcher(x, r=r, base=base):
+                streams[r].append("H")
+                return base(x)
+
+            wave = PPWave(
+                rank=r,
+                size=size,
+                rows=ROWS,
+                hidden=HIDDEN,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                launcher=launcher,
+                slot_size=slot,
+                slot_filler=lambda r=r: streams[r].append("f"),
+            )
+            waves.append(wave)
+        errors = []
+
+        def run(rank):
+            wave = waves[rank]
+            forwards = iter(per_forward[rank] * 4)
+            try:
+                for has_batch in schedule:
+                    wave.begin_iteration(has_batch)
+                    tensors = None
+                    if has_batch:
+                        wave.receive()
+                        n = next(forwards)
+                        streams[rank].extend("L" * n)
+                        wave.forward_launch_counter = lambda n=n: n
+                        wave.note_forward()
+                        if rank < size - 1:
+                            out = torch.zeros((ROWS, HIDDEN))
+                            tensors = {"hidden_states": out, "residual": out}
+                    wave.end_iteration(tensors)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((rank, exc))
+                with ici.cond:
+                    ici.failed = True
+                    ici.cond.notify_all()
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        hand_offs = [[i for i, p in enumerate(s) if p == "H"] for s in streams]
+        for r in range(1, size):
+            n = min(len(hand_offs[0]), len(hand_offs[r]))
+            self.assertEqual(hand_offs[r][:n], hand_offs[0][:n], f"stage {r}")
+        self.assertEqual(len({len(s) for s in streams}), 1, streams)
+
+    def test_a_slot_needs_a_filler(self):
+        with self.assertRaisesRegex(ValueError, "needs a filler"):
+            PPWave(
+                rank=0,
+                size=2,
+                rows=ROWS,
+                hidden=HIDDEN,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                launcher=lambda x: x,
+                slot_size=1,
+            )
+
+
 class TestWaveGuards(CustomTestCase):
     def test_rejects_rows_above_the_buffer(self):
         wave = _wave(0, 2)
@@ -315,6 +485,123 @@ class TestWaveGuards(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "cannot form"):
             pipeline_permutation(physical=(0, 1, 2), size=2, columns=2)
+
+
+class _CountMatchedSlice:
+    """Devices that start their k-th multi-device program only once every
+    device issued k: a program's output is ready iff every count reached it.
+    With ``latency``, an output reads not ready on its first query (still
+    computing)."""
+
+    def __init__(self, counts, latency=False):
+        self.counts = list(counts)
+        self.latency = latency
+        self.queried = set()
+        self.lock = threading.Lock()
+
+    def filler(self, rank):
+        def launch():
+            with self.lock:
+                self.counts[rank] += 1
+                return (rank, self.counts[rank])
+
+        return launch
+
+    def is_ready(self, token):
+        with self.lock:
+            if self.latency and token not in self.queried:
+                self.queried.add(token)
+                return False
+            return all(c >= token[1] for c in self.counts)
+
+
+class _HostGroup:
+    def __init__(self, n):
+        self.buf = [None] * n
+        self.barrier = threading.Barrier(n, timeout=10)
+
+    def member(self, rank):
+        group = self
+
+        class _Member:
+            def all_gather_object(self, obj):
+                group.buf[rank] = obj
+                group.barrier.wait()
+                out = list(group.buf)
+                group.barrier.wait()
+                return out
+
+        return _Member()
+
+
+class TestLaunchLeveling(CustomTestCase):
+    def _level(self, stage_counts, columns, latency=False):
+        import sys
+        import types
+        from unittest import mock
+
+        from sglang.srt.hardware_backend.tpu.pp_wave import level_stage_launches
+
+        size = len(stage_counts)
+        n = size * columns
+        dev = _CountMatchedSlice(
+            [stage_counts[r // columns] for r in range(n)], latency=latency
+        )
+        sync = types.ModuleType("torch_tpu._internal.sync.sync")
+        sync.is_ready = dev.is_ready
+        mods = {
+            "torch_tpu": types.ModuleType("torch_tpu"),
+            "torch_tpu._internal": types.ModuleType("torch_tpu._internal"),
+            "torch_tpu._internal.sync": types.ModuleType("torch_tpu._internal.sync"),
+            "torch_tpu._internal.sync.sync": sync,
+        }
+        host = _HostGroup(n)
+        stage_group = types.SimpleNamespace(world_size=columns)
+        fillers = [None] * n
+        errors = []
+
+        def run(rank):
+            try:
+                fillers[rank] = level_stage_launches(
+                    stage_group=stage_group,
+                    world_group=host.member(rank),
+                    filler=dev.filler(rank),
+                    pp_rank=rank // columns,
+                    pp_size=size,
+                    poll_s=0.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append((rank, exc))
+
+        with mock.patch.dict(sys.modules, mods):
+            threads = [threading.Thread(target=run, args=(r,)) for r in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        return dev.counts, fillers, errors
+
+    def test_the_lowest_stages_fill_up_to_the_highest_count(self):
+        counts, fillers, errors = self._level([5, 3, 3, 7], columns=2)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(counts)), 1, counts)
+        # One uniform filler, then exactly the gap to the highest stage.
+        self.assertEqual(counts[0], 7 + 1)
+        self.assertEqual(fillers, [2, 2, 4, 4, 4, 4, 0, 0])
+
+    def test_converges_when_launches_are_still_computing(self):
+        counts, fillers, errors = self._level([2, 6, 4], columns=2, latency=True)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(counts)), 1, counts)
+        # A stage's devices always issue the same fillers.
+        for s in range(3):
+            self.assertEqual(fillers[2 * s], fillers[2 * s + 1])
+
+    def test_level_counts_issue_no_filler(self):
+        counts, fillers, errors = self._level([4, 4], columns=2)
+        self.assertEqual(errors, [])
+        self.assertEqual(fillers, [0, 0, 0, 0])
+        self.assertEqual(counts, [5, 5, 5, 5])
 
 
 if __name__ == "__main__":

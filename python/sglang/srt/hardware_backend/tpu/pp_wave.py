@@ -41,6 +41,20 @@ device wait would block for good.
 
 Every launch runs the same compiled program: one buffer padded to the largest
 batch a forward can hand on.
+
+Stage-local launch slots. torch_tpu compiles every program holding a
+collective, a stage group's included, for the whole slice's device
+assignment, and a device starts its i-th such program only once every device
+of the slice has started its i-th, whichever program that is. A hand-off must
+therefore sit at the same launch index on every device. With ``slot_size``
+set, every device issues exactly ``slot_size`` stage-local multi-device
+programs between consecutive hand-offs: a stage reports the programs its
+forward launched (``note_stage_launches``) and the wave tops the slot up with
+a filler program over the stage group (a tiny all-reduce) right before the
+next hand-off. Stage-local programs of different stages may differ in content
+and order; only the count must match. Every forward is followed by at least
+one hand-off of its wave (the drain), so the counts are level when the wave
+goes quiet. Single-device programs do not count.
 """
 
 import logging
@@ -137,6 +151,104 @@ def launch_now(op: Any, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def make_stage_filler(stage_group: Any, device: torch.device) -> Callable[[], Any]:
+    """A filler program: a tiny all-reduce over the stage group, flushed on
+    both sides so it is one multi-device program of its own. Returns its
+    output, whose readiness tells when the program ran."""
+    from torch_tpu._internal.sync.sync import synchronize
+
+    stage_pg = stage_group.device_group
+
+    def filler() -> torch.Tensor:
+        synchronize(None, wait=False)
+        x = torch.zeros((8, 128), dtype=torch.float32, device=device)
+        torch.distributed.all_reduce(x, group=stage_pg)
+        synchronize([x], wait=False)
+        return x
+
+    return filler
+
+
+def ready_probe(x: torch.Tensor) -> Callable[[], bool]:
+    """A non-blocking check that the program producing ``x`` has run.
+
+    ``sync.is_ready`` where torch_tpu has it; otherwise a daemon thread
+    blocks reading ``x`` back and the check reports whether the read
+    returned. (The experimental ``TpuEvent.query`` crashed on the torch_tpu
+    this was validated on.) The read always returns once the slice is
+    levelled, so the thread does not outlive the leveling.
+    """
+    try:
+        from torch_tpu._internal.sync.sync import is_ready
+    except ImportError:
+        import threading
+
+        done = threading.Event()
+
+        def read() -> None:
+            x.cpu()
+            done.set()
+
+        threading.Thread(target=read, daemon=True, name="pp-ready-probe").start()
+        return done.is_set
+    return lambda: bool(is_ready(x))
+
+
+def level_stage_launches(
+    *,
+    stage_group: Any,
+    world_group: Any,
+    filler: Callable[[], Any],
+    pp_rank: int,
+    pp_size: int,
+    poll_s: float = 0.005,
+    report_s: float = 60.0,
+) -> int:
+    """Bring every device of the slice to the same multi-device launch count
+    without knowing the counts; returns the fillers this stage issued.
+
+    A device's latest launch completes only once every device has issued at
+    least as many, so the stages whose latest launch is ready are exactly
+    the stages at the lowest count (a stage still computing reads as not
+    ready and simply waits a round). Each round every rank shares its
+    readiness over the host channel and the lowest stages add one filler,
+    until every stage is ready. A stage acts only when all its devices are
+    ready, so its devices issue the same fillers. Must be called at the same
+    point on every rank, with no device wait pending.
+    """
+    import time
+
+    columns = int(stage_group.world_size)
+    # Uniform: every stage's latest launch is now its own.
+    ready = ready_probe(filler())
+    fillers = 0
+    start = time.monotonic()
+    next_report = start + report_s
+    while True:
+        flags = world_group.all_gather_object(ready())
+        stage_ready = [
+            all(flags[s * columns : (s + 1) * columns]) for s in range(pp_size)
+        ]
+        if all(stage_ready):
+            return fillers
+        if stage_ready[pp_rank]:
+            ready = ready_probe(filler())
+            fillers += 1
+        # Let fresh launches finish so the next round's readiness is not
+        # stale; a stale "not ready" only costs extra (harmless) fillers.
+        time.sleep(poll_s)
+        if time.monotonic() > next_report:
+            next_report += report_s
+            logger.warning(
+                "pipeline launch leveling stage %d: %d fillers after %.0fs, "
+                "stage readiness %s",
+                pp_rank,
+                fillers,
+                time.monotonic() - start,
+                stage_ready,
+            )
+
+
 class PPWave:
     """Per-stage bookkeeping of the hand-off wave; see the module docstring.
 
@@ -157,9 +269,15 @@ class PPWave:
         dtype: torch.dtype,
         device: torch.device,
         launcher: Callable[[torch.Tensor], torch.Tensor],
+        slot_size: int = 0,
+        slot_filler: Callable[[], None] | None = None,
     ) -> None:
         if size < 2:
             raise ValueError("the pipeline wave needs at least two stages")
+        if slot_size < 0 or (slot_size > 0 and slot_filler is None):
+            raise ValueError(
+                f"a launch slot of {slot_size} needs a filler program"
+            )
         self.rank = int(rank)
         self.size = int(size)
         self.last = self.size - 1
@@ -178,9 +296,49 @@ class PPWave:
         self.forwards = 0
         self.runs = 0
         self._has_batch = False
+        # Stage-local programs since the last hand-off (module docstring).
+        self.slot_size = int(slot_size)
+        self._slot_filler = slot_filler
+        self.slot_used = 0
+        self.fillers = 0
+        # Stage-local programs one forward of this stage issues (set by the
+        # scheduler; counted with note_stage_launches after each forward).
+        # ``forward_launch_counter``, when set, reports the forward just run
+        # instead (its graph's measured count).
+        self.forward_launches = 0
+        self.forward_launch_counter: Callable[[], int] | None = None
 
     # -- launches -------------------------------------------------------------
+    def note_forward(self) -> None:
+        """Count the stage-local programs of the forward this stage just ran."""
+        if self.slot_size == 0:
+            return
+        counter = self.forward_launch_counter
+        self.note_stage_launches(
+            counter() if counter is not None else self.forward_launches
+        )
+
+    def note_stage_launches(self, n: int) -> None:
+        """Count ``n`` stage-local multi-device programs (a forward's) issued
+        since the last hand-off."""
+        if self.slot_size == 0:
+            return
+        self.slot_used += int(n)
+        if self.slot_used > self.slot_size:
+            raise RuntimeError(
+                f"pipeline wave stage {self.rank}: {self.slot_used} stage-local "
+                f"launches between two hand-offs, above the slot of "
+                f"{self.slot_size}; raise SGLANG_TPU_PP_SLOT_LAUNCHES"
+            )
+
+    def _fill_slot(self) -> None:
+        for _ in range(self.slot_size - self.slot_used):
+            self._slot_filler()
+            self.fillers += 1
+        self.slot_used = 0
+
     def _launch(self, x: torch.Tensor) -> torch.Tensor:
+        self._fill_slot()
         out = self._launcher(x)
         self.launches += 1
         return out
@@ -230,12 +388,13 @@ class PPWave:
                 self.runs += 1
                 if self.runs <= 3 or self.runs % 500 == 0:
                     logger.info(
-                        "pipeline wave stage %d: drain %d complete, %d forwards "
-                        "and %d launches so far",
+                        "pipeline wave stage %d: drain %d complete, %d forwards, "
+                        "%d hand-offs and %d slot fillers so far",
                         self.rank,
                         self.runs,
                         self.forwards,
                         self._target(),
+                        self.fillers,
                     )
         if self.rank == 0:
             return
@@ -334,12 +493,14 @@ def build_pp_wave(
     hidden: int,
     dtype: torch.dtype,
     device: torch.device,
+    slot_size: int = 0,
 ) -> PPWave:
     """Create the stage's wave on the device and verify the hand-off routing.
 
     The permute is routed by mesh position, which follows physical device
     order; each column's cycle closes from the last stage back to the first,
-    and every device of the slice launches the same program.
+    and every device of the slice launches the same program. ``slot_size``
+    stage-local launches separate consecutive hand-offs (module docstring).
     """
     rank = int(pp_group.rank_in_group)
     size = int(pp_group.world_size)
@@ -351,9 +512,29 @@ def build_pp_wave(
             f"the pipeline wave needs the pipeline stages to cover the whole slice "
             f"(pp {size} stages of {columns} devices, world {world_size})"
         )
+    if slot_size > 0 and columns < 2:
+        raise ValueError(
+            "pipeline launch slots need a stage group of at least two devices"
+        )
     physical = physical_device_by_rank(world_group)
     perm = pipeline_permutation(physical=physical, size=size, columns=columns)
     op = build_pp_permute_op(perm)
+    filler = make_stage_filler(stage_group, device) if slot_size > 0 else None
+    if columns > 1:
+        # Start-up (model load, warmup) may leave the stages at different
+        # launch counts; the first hand-off must sit at one index everywhere.
+        levelled = level_stage_launches(
+            stage_group=stage_group,
+            world_group=world_group,
+            filler=make_stage_filler(stage_group, device),
+            pp_rank=rank,
+            pp_size=size,
+        )
+        logger.info(
+            "pipeline wave stage %d: %d fillers levelled the start-up launches",
+            rank,
+            levelled,
+        )
     wave = PPWave(
         rank=rank,
         size=size,
@@ -362,6 +543,8 @@ def build_pp_wave(
         dtype=dtype,
         device=device,
         launcher=lambda x: launch_now(op, x),
+        slot_size=slot_size,
+        slot_filler=filler,
     )
     ok = wave.probe(column=column, columns=columns)
     # Every device must agree on the routing, so the verdict is gathered.

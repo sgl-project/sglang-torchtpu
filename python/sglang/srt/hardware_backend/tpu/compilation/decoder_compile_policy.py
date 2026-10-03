@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import time
 from collections.abc import Callable
 from typing import Any, ClassVar, Literal
@@ -83,13 +84,15 @@ def max_extend_tokens(*, context_len: int) -> int:
     )
 
 
-def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
+def _materialize_out(
+    out: Any, attn_backend: Any, token_to_kv_pool: Any, wait: bool = True
+) -> None:
     """Sync returned tensors and backend-marked KV side effects.
 
     attn_backend / token_to_kv_pool come from the model_runner: upstream moved
     both off ForwardBatch (attn_backend now flows through ForwardContext, and the
     KV pool is held by the attention backend / model_runner), so warmup reads them
-    from the runner rather than the batch.
+    from the runner rather than the batch. ``wait=False`` only enqueues.
     """
     tensors: list[torch.Tensor] = []
 
@@ -118,7 +121,7 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
         return
     from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
-    tpu_sync(tensors, wait=True)
+    tpu_sync(tensors, wait=wait)
 
 
 def _get_hbm_usage_mb() -> tuple[float, float] | None:
@@ -707,6 +710,27 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         return call
 
+    def note_forward_graph(
+        self, input_ids: torch.Tensor | None, forward_batch: Any, kwargs: dict
+    ) -> None:
+        """Record which compiled graph the shim is about to run (pipeline
+        stages pad their launches by it): the specialization fields plus
+        whether context parallelism is active, since CP and plain extend can
+        share every other field but issue different multi-device programs."""
+        rows = input_ids if input_ids is not None else kwargs.get("input_embeds")
+        self._last_launch_key = (
+            forward_batch.forward_mode,
+            forward_batch.capture_hidden_mode,
+            forward_batch.batch_size,
+            None if rows is None else int(rows.shape[0]),
+            (
+                getattr(forward_batch, "logits_output_mode", None)
+                if self._compiles_logits_processor()
+                else None
+            ),
+            bool(is_cp_active(forward_batch)),
+        )
+
     def get_direct_compile_kv_pool(self):
         return self.model_runner.token_to_kv_pool
 
@@ -805,12 +829,30 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         return distributed_top_k_candidate_width_for_model(self.model_runner.model)
 
+    def _warmup_top_k_width(self) -> int | None:
+        """The distributed TopK width the warmup grid is built for.
+
+        Under pipeline parallelism every stage warms the last stage's grid:
+        torch_tpu starts a device's i-th multi-device program only once every
+        device of the slice has started its i-th, so all stages must run as
+        many warmup forwards. A non-last stage's compile key ignores the
+        logits mode, so its extra entries rerun a cached graph. Gathered once
+        over the host channel, before any warmup forward.
+        """
+        pp_group = self.model_runner.pp_group
+        if pp_group is None or pp_group.world_size == 1:
+            return self._distributed_top_k_width()
+        if not hasattr(self, "_pp_warmup_top_k_width"):
+            widths = pp_group.all_gather_object(self._distributed_top_k_width())
+            self._pp_warmup_top_k_width = widths[-1]
+        return self._pp_warmup_top_k_width
+
     def _warmup_logits_output_modes(
         self, batch_size: int
     ) -> tuple[LogitsOutputMode, ...]:
         """Return every logits mode reachable at this physical batch size."""
 
-        if self._distributed_top_k_width() is None:
+        if self._warmup_top_k_width() is None:
             return (LogitsOutputMode.FULL_VOCAB,)
         spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
         if spec_algorithm is not None and not spec_algorithm.is_none():
@@ -985,6 +1027,157 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             "[decoder compile policy] precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
+        fillers = getattr(self, "_pp_warmup_fillers", None)
+        if fillers:
+            logger.info(
+                "[decoder compile policy] pipeline stage %d launch leveling: "
+                "%d fillers over %d warmup forwards %s",
+                self.model_runner.pp_group.rank_in_group,
+                sum(fillers),
+                len(fillers),
+                fillers,
+            )
+        self._finish_launch_measurement()
+
+    # -- pipeline launch counts ----------------------------------------------
+    # torch_tpu starts a device's i-th multi-device program only once every
+    # device of the slice started its i-th, so pipeline stages, which run
+    # different graphs, must issue the same number of multi-device programs
+    # between two hand-offs. Warmup measures how many each compiled graph
+    # issues on this stage; the hand-off wave pads every interval to the
+    # slice-wide maximum (``pp_slot_launches``).
+
+    def _measure_launches_enabled(self) -> bool:
+        return os.environ.get("SGLANG_TPU_PP_MEASURE_LAUNCHES", "1") != "0"
+
+    def _measure_stage_launches(self, rerun: Callable[[], None]) -> None:
+        """Measure, after a levelled warmup forward, the absolute number of
+        multi-device programs that forward issues on each stage.
+
+        Stage j alone reruns the (now cached) forward, then the slice levels:
+        every other stage issues exactly as many more fillers as the rerun
+        launched, so their filler surplus over stage j is stage j's count.
+        Must run on every rank at the same point, like the leveler.
+        """
+        from sglang.srt.distributed import get_tp_group, get_world_group
+
+        key = getattr(self, "_last_launch_key", None)
+        world = get_world_group()
+        columns = int(get_tp_group().world_size)
+        pp_group = self.model_runner.pp_group
+        pp_rank, pp_size = int(pp_group.rank_in_group), int(pp_group.world_size)
+        counts = []
+        for j in range(pp_size):
+            if pp_rank == j:
+                rerun()
+            mine = self._pp_leveler()
+            fillers = world.all_gather_object(mine)
+            per_stage = [fillers[s * columns : (s + 1) * columns] for s in range(pp_size)]
+            others = {f for s in range(pp_size) if s != j for f in per_stage[s]}
+            if len(set(per_stage[j])) != 1 or len(others) != 1:
+                raise RuntimeError(
+                    f"pipeline launch measurement of stage {j}: uneven fillers "
+                    f"{fillers}; the slice was not level before the rerun"
+                )
+            counts.append(others.pop() - per_stage[j][0])
+        if key is None:
+            raise RuntimeError(
+                "pipeline launch measurement: the warmup forward did not run a "
+                "compiled graph"
+            )
+        table = self._pp_launch_counts
+        if table.get(key, counts[pp_rank]) != counts[pp_rank]:
+            logger.warning(
+                "pipeline stage %d: graph %s measured %d launches, earlier %d; "
+                "keeping the larger",
+                pp_rank,
+                key,
+                counts[pp_rank],
+                table[key],
+            )
+        table[key] = max(table.get(key, 0), counts[pp_rank])
+        self._pp_measured_counts.append(counts)
+
+    def _finish_launch_measurement(self) -> None:
+        """Agree on the slot size: the most programs any graph issues on any
+        stage between two hand-offs."""
+        self._last_launch_key = None
+        self.pp_slot_launches = 0
+        table = getattr(self, "_pp_launch_counts", None)
+        if table is None:
+            return
+        from sglang.srt.distributed import get_world_group
+
+        local = max(table.values(), default=0)
+        self.pp_slot_launches = int(max(get_world_group().all_gather_object(local)))
+        logger.info(
+            "[decoder compile policy] pipeline stage %d launch counts per warmup "
+            "forward (all stages) %s; %d graphs on this stage; slot %d",
+            self.model_runner.pp_group.rank_in_group,
+            self._pp_measured_counts,
+            len(table),
+            self.pp_slot_launches,
+        )
+
+    def pp_take_forward_launches(self) -> int:
+        """The measured multi-device programs of the forward that just ran on
+        this stage; fails loudly on a graph warmup never measured, which
+        would otherwise hang the slice."""
+        key = getattr(self, "_last_launch_key", None)
+        self._last_launch_key = None
+        table = getattr(self, "_pp_launch_counts", None) or {}
+        if key is None or key not in table:
+            raise RuntimeError(
+                f"pipeline stage {self.model_runner.pp_group.rank_in_group}: no "
+                f"measured launch count for graph {key}; measured graphs "
+                f"{sorted(map(str, table))}"
+            )
+        return table[key]
+
+    def _pp_launch_leveler(self) -> Callable[[], int] | None:
+        """Per-warmup-forward launch leveling across pipeline stages, or None.
+
+        torch_tpu starts a device's i-th multi-device program only once every
+        device of the slice started its i-th, and stages run different
+        programs, so a stage's warmup read could wait on launches its peers
+        never issue. On by default for pipeline stages of several devices;
+        SGLANG_TPU_PP_LEVEL_WARMUP=0 turns it off.
+        """
+        if hasattr(self, "_pp_leveler"):
+            return self._pp_leveler
+        self._pp_leveler = None
+        self._pp_warmup_fillers: list[int] = []
+        pp_group = self.model_runner.pp_group
+        if (
+            pp_group is None
+            or pp_group.world_size == 1
+            or os.environ.get("SGLANG_TPU_PP_LEVEL_WARMUP", "1") == "0"
+        ):
+            return None
+        from sglang.srt.distributed import get_tp_group, get_world_group
+        from sglang.srt.hardware_backend.tpu.pp_wave import (
+            level_stage_launches,
+            make_stage_filler,
+        )
+
+        stage_group = get_tp_group()
+        if stage_group.world_size < 2:
+            return None
+        filler = make_stage_filler(stage_group, torch.device(self.model_runner.device))
+        world_group = get_world_group()
+        pp_rank, pp_size = int(pp_group.rank_in_group), int(pp_group.world_size)
+        self._pp_leveler = lambda: level_stage_launches(
+            stage_group=stage_group,
+            world_group=world_group,
+            filler=filler,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
+        if self._measure_launches_enabled():
+            # Graph launch key -> multi-device programs it issues on this stage.
+            self._pp_launch_counts: dict[Any, int] = {}
+            self._pp_measured_counts: list[list[int]] = []
+        return self._pp_leveler
 
     def _assert_cp_family_compiled(self) -> None:
         """Raise if prefill context parallelism is on but warmup compiled no
@@ -1210,8 +1403,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        _launch_rerun: bool = False,
     ) -> float | None:
-        """Build and execute one dummy forward pass for compilation."""
+        """Build and execute one dummy forward pass for compilation.
+
+        ``_launch_rerun`` only launches the forward again on fresh inputs,
+        without leveling or waiting (pipeline launch measurement)."""
         self._compiled_extend_variants.add(variant)
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
@@ -1283,11 +1480,38 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             started = time.perf_counter()
             out = entry.forward(*args, **kwargs)
             # Materialize lazy outputs and backend-marked side effects.
+            leveler = None if _launch_rerun else self._pp_launch_leveler()
             _materialize_out(
                 out,
                 forward_attn_backend,
                 self.model_runner.token_to_kv_pool,
+                wait=leveler is None and not _launch_rerun,
             )
+            if leveler is not None:
+                # Pipeline stages run different programs per warmup forward;
+                # level the slice's launch counts before this stage waits.
+                self._pp_warmup_fillers.append(leveler())
+                if getattr(self, "_pp_launch_counts", None) is not None:
+                    self._measure_stage_launches(
+                        functools.partial(
+                            self._run_one,
+                            num_tokens=num_tokens,
+                            bs=bs,
+                            mode=mode,
+                            variant=variant,
+                            logits_output_mode=logits_output_mode,
+                            capture_hidden_mode=capture_hidden_mode,
+                            spec_info=spec_info,
+                            attn_backend=attn_backend,
+                            profile_prefix=profile_prefix,
+                            _launch_rerun=True,
+                        )
+                    )
+                _materialize_out(
+                    out,
+                    forward_attn_backend,
+                    self.model_runner.token_to_kv_pool,
+                )
 
         if profile_prefix is not None:
             return (time.perf_counter() - started) * 1000
