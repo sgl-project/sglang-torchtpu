@@ -3,8 +3,9 @@
 Under overlap scheduling, the scheduler processes result N-1 while forward N
 still runs. A request that finished at N-1 is still in forward N's batch, so
 its last pages are freed while forward N is still writing them. DMAs such as
-raiden's H2D loads are not ordered against device compute, so a DMA into one
-of those pages can land before forward N's write and be overwritten.
+raiden's H2D loads and KV arriving on a PD decode server are not ordered
+against device compute, so a DMA into one of those pages can land before
+forward N's write and be overwritten.
 
 ``KVFreeFence`` holds every page freed while a queued forward result is
 unprocessed, tagged with the latest formed forward, and releases it once that
@@ -248,20 +249,26 @@ def assert_not_forward_write_target(allocator: BaseTokenToKVPoolAllocator) -> No
     )
 
 
-def install_kv_free_fence(
+def _page_pools(allocator: BaseTokenToKVPoolAllocator) -> list:
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+    if type(allocator) is SWATokenToKVPoolAllocator:
+        return [allocator.full_attn_allocator, allocator.swa_attn_allocator]
+    return [allocator]
+
+
+def kv_free_fence_unsupported_reason(
     allocator: BaseTokenToKVPoolAllocator,
     *,
-    synchronize_device: Callable[[], None],
     spec_algorithm: SpeculativeAlgorithm | CustomSpecAlgo,
     copies_draft_tail: bool,
-) -> KVFreeFence:
-    """Attach a fence to ``allocator`` and its page pools. Raises unless every
-    pool is a TPU paged allocator, whose frees and allocations it hooks, and
-    every KV write of a forward precedes a tensor its result copies to host."""
+) -> Optional[str]:
+    """Why a fence on ``allocator`` would miss KV writes, or None. Every pool
+    must be a TPU paged allocator, whose frees and allocations it hooks, and
+    every KV write of a forward must precede a tensor its result copies to host."""
     from sglang.srt.hardware_backend.tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
-    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
     if not spec_algorithm.supports_kv_free_fence(copies_draft_tail=copies_draft_tail):
         # copy_done would complete before the KV writes that follow every copy.
@@ -270,22 +277,38 @@ def install_kv_free_fence(
             if spec_algorithm.supports_kv_free_fence(copies_draft_tail=True)
             else ""
         )
-        raise ValueError(
+        return (
             f"{spec_algorithm.name} speculative decoding is not supported with "
-            f"the raiden HiCache backend under overlap scheduling on TPU{hint}."
+            f"the KV free fence under overlap scheduling on TPU{hint}."
         )
-    if type(allocator) is SWATokenToKVPoolAllocator:
-        pools = [allocator.full_attn_allocator, allocator.swa_attn_allocator]
-    else:
-        pools = [allocator]
-    for pool in pools:
-        if not isinstance(pool, TpuPagedTokenToKVPoolAllocator):
-            raise ValueError(
-                "The raiden HiCache free fence needs TPU paged KV allocators; "
-                f"got {type(pool).__name__} under {type(allocator).__name__}."
-            )
+    pools = _page_pools(allocator)
+    if not all(isinstance(pool, TpuPagedTokenToKVPoolAllocator) for pool in pools):
+        return (
+            "The KV free fence needs TPU paged KV allocators; got "
+            f"{[type(pool).__name__ for pool in pools]} under "
+            f"{type(allocator).__name__}."
+        )
+    return None
+
+
+def install_kv_free_fence(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    synchronize_device: Callable[[], None],
+    spec_algorithm: SpeculativeAlgorithm | CustomSpecAlgo,
+    copies_draft_tail: bool,
+) -> KVFreeFence:
+    """Attach a fence to ``allocator`` and its page pools. Raises if
+    ``kv_free_fence_unsupported_reason`` gives a reason."""
+    reason = kv_free_fence_unsupported_reason(
+        allocator,
+        spec_algorithm=spec_algorithm,
+        copies_draft_tail=copies_draft_tail,
+    )
+    if reason is not None:
+        raise ValueError(reason)
     fence = KVFreeFence(synchronize_device)
     allocator.kv_free_fence = fence
-    for pool in pools:
+    for pool in _page_pools(allocator):
         fence.attach(pool)
     return fence
