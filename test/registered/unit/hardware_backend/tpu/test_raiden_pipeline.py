@@ -37,17 +37,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _polled(sent=(), received=(), failed=()):
+def _polled(sent=(), received=(), failed=(), completed_ns=None):
     """Fake poll_stats_with_details() result for the given req ids."""
+
+    def settled(ids):
+        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+
     return SimpleNamespace(
-        **{
-            name: [SimpleNamespace(req_id=r) for r in ids]
-            for name, ids in (
-                ("sent", sent),
-                ("received", received),
-                ("failed", failed),
-            )
-        }
+        sent=settled(sent), received=settled(received), failed=settled(failed)
     )
 
 
