@@ -940,7 +940,7 @@ class PipelineTransfer:
             status = mgr._poll_engine_status(name="pipeline", engine=self.engine)
             if status is not None:
                 sent, received, failed = (
-                    {int(mgr._norm_req_id(r)) for r in rooms} for rooms in status
+                    {int(mgr._norm_req_id(t.req_id)) for t in rooms} for rooms in status
                 )
                 self.done_send.update(sent)
                 self.done_recv.update(received)

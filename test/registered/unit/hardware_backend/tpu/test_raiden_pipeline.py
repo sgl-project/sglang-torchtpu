@@ -37,6 +37,20 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+def _polled(sent=(), received=(), failed=()):
+    """Fake poll_stats_with_details() result for the given req ids."""
+    return SimpleNamespace(
+        **{
+            name: [SimpleNamespace(req_id=r) for r in ids]
+            for name, ids in (
+                ("sent", sent),
+                ("received", received),
+                ("failed", failed),
+            )
+        }
+    )
+
+
 class Buffer:
     dtype = "torch.float8_e4m3fn"
 
@@ -124,7 +138,7 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
         )
     pipe.producer = producer
     pipe.lock = threading.RLock()
-    pipe.engine = SimpleNamespace(poll_stats=Mock(return_value=([], [], [])))
+    pipe.engine = SimpleNamespace(poll_stats_with_details=Mock(return_value=_polled()))
     layers = groups(full=(6,), swa=(7,), buffer=Bf16Buffer)
     pipe.pools = pool_manifest(layers)
     pipe.tensors = list(layers.full) + list(layers.swa)
@@ -524,7 +538,7 @@ class TestPipelineLifetimes(unittest.TestCase):
         self.assertTrue(pipe.maybe_start_pull(7))
         pipe.executor.submit.assert_not_called()
         self.assertTrue(pipe.active(7))
-        pipe.engine.poll_stats.return_value = ([], ["7"], [])
+        pipe.engine.poll_stats_with_details.return_value = _polled(received=["7"])
         _, received, _ = pipe.poll()
         self.assertFalse(pipe.active(7))
         self.assertIn("7", received)
@@ -663,7 +677,9 @@ class TestPipelineLifetimes(unittest.TestCase):
         request = receive()
         pipe.receives[7] = request
         pipe.maybe_start_pull(7)
-        pipe.engine.poll_stats.return_value = ([], ["resharded_transfer_7"], [])
+        pipe.engine.poll_stats_with_details.return_value = _polled(
+            received=["resharded_transfer_7"]
+        )
         _, received, _ = pipe.poll()
         self.assertTrue(pipe.active(7))
         self.assertNotIn("7", received)
@@ -732,7 +748,7 @@ class TestPipelineLifetimes(unittest.TestCase):
                     self.assertIn(str(outcome), pipe.manager.failure_records[7])
                 self.assertTrue(pipe.active(7))
                 self.assertIn(7, pipe.admission)
-                pipe.engine.poll_stats.return_value = ([], [], ["7"])
+                pipe.engine.poll_stats_with_details.return_value = _polled(failed=["7"])
                 pipe.poll()
                 self.assertFalse(pipe.active(7))
                 self.assertNotIn(7, pipe.admission)
@@ -750,16 +766,16 @@ class TestPipelineLifetimes(unittest.TestCase):
         self.assertNotIn(7, pipe.admission)
 
     def test_raising_engine_poll_is_retried_on_the_next_poll(self):
-        """A raising poll_stats takes no completion; the pipeline polls through
-        the manager's retry instead of stopping the scheduler."""
+        """A raising poll_stats_with_details takes no completion; the pipeline
+        polls through the manager's retry instead of stopping the scheduler."""
         pipe = transfer(attn_tp_size=2, attn_tp_rank=1)
         pipe.receives[7] = receive()
         pipe.maybe_start_pull(7)
-        pipe.engine.poll_stats.side_effect = RuntimeError("injected")
+        pipe.engine.poll_stats_with_details.side_effect = RuntimeError("injected")
         self.assertEqual(pipe.poll(), (set(), set(), set()))
         self.assertTrue(pipe.active(7))
-        pipe.engine.poll_stats.side_effect = None
-        pipe.engine.poll_stats.return_value = ([], ["7"], [])
+        pipe.engine.poll_stats_with_details.side_effect = None
+        pipe.engine.poll_stats_with_details.return_value = _polled(received=["7"])
         _, received, _ = pipe.poll()
         self.assertIn("7", received)
 
@@ -772,7 +788,7 @@ class TestPipelineLifetimes(unittest.TestCase):
         self.assertTrue(pipe.active(7))
         pipe.clear(7)
         self.assertIn(7, pipe.sent)
-        pipe.engine.poll_stats.return_value = (["7"], [], [])
+        pipe.engine.poll_stats_with_details.return_value = _polled(sent=["7"])
         pipe.poll()
         self.assertFalse(pipe.active(7))
         self.assertNotIn(7, pipe.sent)
@@ -797,7 +813,7 @@ class TestPipelineLifetimes(unittest.TestCase):
         self.assertTrue(pulling.active(7))
         cached.client.complete_request_blocks.assert_called_with("7", 7, cached.unit)
         cached.client.cancel_request_blocks_if_unclaimed.assert_not_called()
-        pulling.engine.poll_stats.return_value = (["7"], [], [])
+        pulling.engine.poll_stats_with_details.return_value = _polled(sent=["7"])
         pulling.poll()
         self.assertFalse(pulling.active(7))
         pulling.client.complete_request_blocks.assert_called_once_with(
@@ -828,9 +844,9 @@ class TestPipelineLifetimes(unittest.TestCase):
     def test_native_source_completion_retires_exactly_once(self):
         pipe = transfer(producer=True)
         pipe.sent[7] = sent()
-        pipe.engine.poll_stats.return_value = (["7"], [], [])
+        pipe.engine.poll_stats_with_details.return_value = _polled(sent=["7"])
         pipe.poll()
-        pipe.engine.poll_stats.return_value = ([], [], [])
+        pipe.engine.poll_stats_with_details.return_value = _polled()
         pipe.poll()
         pipe.client.complete_request_blocks.assert_called_once_with("7", 7, pipe.unit)
 
