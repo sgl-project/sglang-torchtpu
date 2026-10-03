@@ -86,7 +86,7 @@ def worker(phase, source):
     print(json.dumps({"phase": phase, "rank": rank, "hits": hits}), flush=True)
     dist.barrier()
     dist.destroy_process_group()
-    print(f"{phase}: logical rank {rank} entering interpreter teardown", flush=True)
+    print(f"{phase}: logical rank {rank} exiting", flush=True)
 
 
 class TestCollectiveCompileCache(unittest.TestCase):
@@ -148,5 +148,10 @@ class TestCollectiveCompileCache(unittest.TestCase):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--worker":
         worker(sys.argv[2], sys.argv[3])
+        # Skip libtpu's atexit vBAR StopSession, which can hang forever on GKE
+        # and wedge the next phase's PJRT init. This test covers cache keys,
+        # not native teardown; the next phase reuses the chips like a restart.
+        sys.stderr.flush()
+        os._exit(0)
     else:
         unittest.main()

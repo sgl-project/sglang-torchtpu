@@ -155,10 +155,12 @@ class TestNodeNormalization(unittest.TestCase):
             chips_per_host=(1, 1, 1),
             devices_per_host=2,
         )
-        for worker, timeout, error in (
-            (_cpu_node_rank, 30, None),
-            (_cpu_probe_failure, 30, mp.ProcessRaisedException),
-            (_cpu_probe_timeout, 0.1, TimeoutError),
+        # Failures must keep the worker's traceback even though the worker
+        # exits without running the native teardown.
+        for worker, timeout, error, message in (
+            (_cpu_node_rank, 30, None, None),
+            (_cpu_probe_failure, 30, RuntimeError, "worker 0:(.|\n)*probe failed"),
+            (_cpu_probe_timeout, 0.1, TimeoutError, "timed out"),
         ):
             with (
                 self.subTest(worker=worker.__name__),
@@ -171,7 +173,7 @@ class TestNodeNormalization(unittest.TestCase):
                         1,
                     )
                 else:
-                    with self.assertRaises(error):
+                    with self.assertRaisesRegex(error, message):
                         normalization.query_node_rank(config, 0, timeout)
                 self.assertTrue(all(not p.is_alive() for p in contexts[-1].processes))
 

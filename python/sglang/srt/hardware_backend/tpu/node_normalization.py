@@ -15,7 +15,12 @@ import json
 import logging
 import math
 import os
+import re
+import shutil
+import sys
+import tempfile
 import time
+import traceback
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 
@@ -163,6 +168,23 @@ def _coordinate_worker(local_rank, config, host_index, timeout, writer):
         writer.close()
 
 
+def _exit_without_native_teardown(local_rank, error_dir, worker, *args):
+    # libtpu's atexit teardown sends vBAR StopSession, which can hang forever
+    # on GKE. Exit like a killed server instead: closing the device files
+    # releases the chips for the scheduler workers that start next. Failures
+    # too: mp.spawn would record them and then run the teardown via sys.exit.
+    status = 0
+    try:
+        worker(local_rank, *args)
+    except Exception:
+        with open(os.path.join(error_dir, str(local_rank)), "w") as file:
+            file.write(traceback.format_exc())
+        status = 1
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(status)
+
+
 def query_node_rank(config: TopologyConfig, host_index: int, timeout: int) -> int:
     # GKE needs a full SliceBuilder world before local_device_coords() works.
     # Use disposable spawn workers: discovery must release PJRT before the
@@ -170,19 +192,41 @@ def query_node_rank(config: TopologyConfig, host_index: int, timeout: int) -> in
     import torch.multiprocessing as mp
 
     reader, writer = mp.get_context("spawn").Pipe(duplex=False)
+    error_dir = tempfile.mkdtemp(prefix="sglang-tpu-discovery-")
     context = None
     deadline = time.monotonic() + timeout
     try:
         context = mp.spawn(
-            _coordinate_worker,
-            args=(config, host_index, timeout, writer),
+            _exit_without_native_teardown,
+            args=(error_dir, _coordinate_worker, config, host_index, timeout, writer),
             nprocs=config.devices_per_host,
             join=False,
         )
         writer.close()
-        while not context.join(timeout=max(0, deadline - time.monotonic())):
-            if time.monotonic() >= deadline:
-                raise TimeoutError("TPU coordinate discovery timed out")
+        try:
+            while not context.join(timeout=max(0, deadline - time.monotonic())):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("TPU coordinate discovery timed out")
+        except mp.ProcessExitedException:
+            # One failure breaks its peers' collectives, often before the
+            # failing worker records its own error. Let peers exit briefly,
+            # then report each distinct error rather than whichever landed first.
+            grace = time.monotonic() + 5
+            for process in context.processes:
+                process.join(timeout=max(0, min(grace, deadline) - time.monotonic()))
+            errors = {}
+            for name in sorted(os.listdir(error_dir), key=int):
+                with open(os.path.join(error_dir, name)) as file:
+                    text = file.read()
+                # Peer addresses and ports differ; the failure kind does not.
+                last = text.strip().splitlines()[-1]
+                kind = re.sub(r"\d+", "N", re.sub(r"\[[^\]/]*\]", "[peer]", last))
+                errors.setdefault(kind, f"worker {name}: {text}")
+            if not errors:
+                raise
+            raise RuntimeError(
+                "TPU coordinate workers failed:\n" + "\n".join(errors.values())
+            ) from None
         rank = reader.recv()
         if type(rank) is not int or not 0 <= rank < len(config.hosts):
             raise ValueError(f"TorchTPU returned invalid node rank: {rank}")
@@ -196,6 +240,7 @@ def query_node_rank(config: TopologyConfig, host_index: int, timeout: int) -> in
                 process.join()
         reader.close()
         writer.close()
+        shutil.rmtree(error_dir, ignore_errors=True)
 
 
 def discover_host_order(
