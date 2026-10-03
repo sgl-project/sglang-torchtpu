@@ -2,6 +2,7 @@
 forwards in flight at free time are processed."""
 
 import ast
+import functools
 import subprocess
 import sys
 import textwrap
@@ -10,6 +11,7 @@ import warnings
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
+from typing import List, Tuple
 
 import torch
 
@@ -325,38 +327,77 @@ class TestRadixEvictionUnderFence(CustomTestCase):
         """An eviction's frees share one release time, the latest stamp it
         recorded; a device value freed without recording its node's stamp would
         be released early whenever it is drained with an older node's free."""
-        srt = Path(sglang.__file__).parent / "srt"
         stray = []
-        for path in srt.rglob("*.py"):
-            # The Rust core reports no release time, so all its frees are held.
-            if "rust_tree_core" in path.parts:
-                continue
-            with warnings.catch_warnings():
-                # Some modules carry invalid escapes in non-raw strings.
-                warnings.simplefilter("ignore", SyntaxWarning)
-                tree = ast.parse(path.read_text())
-            for func in ast.walk(tree):
-                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                for node in ast.walk(func):
-                    if not (
-                        isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Attribute)
-                    ):
-                        continue
-                    target = node.func.value
-                    if (
-                        node.func.attr == "evict_component"
-                        and func.name != "_evict_component_and_detach_lru"
-                    ) or (
-                        node.func.attr in ("append", "extend")
-                        and isinstance(target, ast.Subscript)
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id == "device_frees"
-                        and func.name != "evict_component"
-                    ):
-                        stray.append(f"{path.relative_to(srt)}:{node.lineno}")
+        for location, func in _srt_functions():
+            for call in _attribute_calls(func):
+                target = call.func.value
+                if (
+                    call.func.attr == "evict_component"
+                    and func.name != "_evict_component_and_detach_lru"
+                ) or (
+                    call.func.attr in ("append", "extend")
+                    and isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "device_frees"
+                    and func.name != "evict_component"
+                ):
+                    stray.append(f"{location}:{call.lineno}")
         self.assertEqual(stray, [])
+
+    def test_every_device_lock_release_stamps_its_node(self):
+        """Eviction frees a node's pages at once when its stamp predates every
+        running forward; a lock release that keeps an older stamp lets pages the
+        releasing request's in-flight forward still writes be freed early."""
+        releases = {
+            "release_component_lock",
+            "release_window_lock",
+            "_release_components",
+        }
+        exempt = (
+            # The shared helper; its callers stamp.
+            "_release_components",
+            # Host locks keep host values, which no forward writes.
+            "dec_host_lock_ref",
+        )
+        stray = []
+        for location, func in _srt_functions():
+            calls = {call.func.attr for call in _attribute_calls(func)}
+            if (
+                calls & releases
+                and "_stamp_release" not in calls
+                and func.name not in exempt
+            ):
+                stray.append(f"{location}:{func.name}")
+        self.assertEqual(stray, [])
+
+
+@functools.cache
+def _srt_functions() -> List[Tuple[Path, ast.FunctionDef]]:
+    """(path, function) for every function under sglang/srt."""
+    srt = Path(sglang.__file__).parent / "srt"
+    functions = []
+    for path in srt.rglob("*.py"):
+        # The Rust core reports no release time, so all its frees are held.
+        if "rust_tree_core" in path.parts:
+            continue
+        with warnings.catch_warnings():
+            # Some modules carry invalid escapes in non-raw strings.
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(path.read_text())
+        functions.extend(
+            (path.relative_to(srt), func)
+            for func in ast.walk(tree)
+            if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+    return functions
+
+
+def _attribute_calls(func: ast.FunctionDef) -> List[ast.Call]:
+    return [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
 
 
 class TestTpuImportOrder(CustomTestCase):
