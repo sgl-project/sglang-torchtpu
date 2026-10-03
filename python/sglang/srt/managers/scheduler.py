@@ -4288,6 +4288,7 @@ class Scheduler(
             )
             if (
                 self.disaggregation_mode == DisaggregationMode.PREFILL
+                and current_platform.is_tpu()
                 and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
                 and adder.host_load_indices
             ):

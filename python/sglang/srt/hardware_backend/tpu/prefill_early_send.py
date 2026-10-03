@@ -17,6 +17,12 @@ unfinished forward may write. The scheduler tracks their physical page IDs in
 - After processing the previous result, ``tpu_update_inflight_kv_write_pages``
   replaces the tracked IDs with those of the newly launched forward, plus the
   pages its HiCache load-backs fill.
+
+A HiCache load-back has the same problem within one batch, in every prefill
+loop: it commits its pages to the radix tree when it is queued, so a request
+admitted later in the same pass matches them as device-resident. The batch's
+forward waits for the load, but the early send runs first.
+``tpu_clip_hicache_load_send_end`` stops the send before those pages.
 """
 
 from __future__ import annotations
@@ -24,8 +30,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
-
-from sglang.srt.disaggregation.utils import find_prefix_send_end_before_pages
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -42,11 +46,31 @@ def tpu_clip_cached_prefix_send_end(
     position, already aligned to a page boundary. The returned position stops
     before the first conflicting page, or keeps the proposed end if none match.
     """
-    return find_prefix_send_end_before_pages(
+    return _find_safe_prefix_send_end(
         prefix_indices=req.prefix_indices,
         start_send_idx=req.start_send_idx,
         candidate_send_end=candidate_send_end,
-        unready_page_ids=scheduler.tpu_inflight_kv_write_page_ids,
+        inflight_write_page_ids=scheduler.tpu_inflight_kv_write_page_ids,
+        page_size=scheduler.token_to_kv_pool_allocator.page_size,
+    )
+
+
+def tpu_clip_hicache_load_send_end(
+    scheduler: Scheduler,
+    req: Req,
+    candidate_send_end: int,
+    hicache_load_page_ids: Optional[torch.Tensor],
+) -> int:
+    """Limit a cached-prefix send to pages this batch's HiCache loads do not fill.
+
+    ``hicache_load_page_ids`` holds the KV page IDs of the load-backs queued for
+    the batch about to launch. Same contract as ``tpu_clip_cached_prefix_send_end``.
+    """
+    return _find_safe_prefix_send_end(
+        prefix_indices=req.prefix_indices,
+        start_send_idx=req.start_send_idx,
+        candidate_send_end=candidate_send_end,
+        inflight_write_page_ids=hicache_load_page_ids,
         page_size=scheduler.token_to_kv_pool_allocator.page_size,
     )
 
@@ -72,6 +96,50 @@ def tpu_update_inflight_kv_write_pages(
         # queued with the forward, so it may not have landed yet either.
         page_ids = torch.cat([page_ids, inflight_batch.hicache_load_page_ids])
     scheduler.tpu_inflight_kv_write_page_ids = page_ids
+
+
+def _find_safe_prefix_send_end(
+    prefix_indices: torch.Tensor,
+    start_send_idx: int,
+    candidate_send_end: int,
+    inflight_write_page_ids: Optional[torch.Tensor],
+    page_size: int,
+) -> int:
+    """Find where a prefix send must stop to avoid pending KV writes.
+
+    The send covers token positions ``[start_send_idx, candidate_send_end)``,
+    and the proposed end must be page-aligned. ``prefix_indices`` maps each token
+    position to a physical KV slot. Return the start of the first page whose
+    ID is tracked as a pending write, or the proposed end if no page conflicts.
+
+    Example: page_size=4, start_send_idx=0, candidate_send_end=12::
+
+        Token positions:    [0, 4)    [4, 8)    [8, 12)
+        Physical page IDs:     5         9          2
+        Pending write IDs: {9}
+
+    Return 4: only tokens [0, 4) can be sent now. Page 2 is also ready, but
+    the send must stop before page 9 to keep the token range contiguous.
+    With no matching pending writes, return the proposed end, 12.
+    """
+    if inflight_write_page_ids is None or inflight_write_page_ids.numel() == 0:
+        return candidate_send_end
+    # Include the page containing the first unsent token, even if that token
+    # is not at the start of the page.
+    start = start_send_idx - start_send_idx % page_size
+    if candidate_send_end <= start:
+        return candidate_send_end
+    if prefix_indices.device.type != "cpu":
+        prefix_indices = prefix_indices.cpu()
+    # Token positions and KV slots share page boundaries. Sample one slot per
+    # page and divide by page_size to obtain its physical page ID.
+    page_ids = (
+        prefix_indices[start:candidate_send_end:page_size].to(torch.int64) // page_size
+    )
+    hit = torch.isin(page_ids, inflight_write_page_ids)
+    if not bool(hit.any()):
+        return candidate_send_end
+    return start + int(hit.nonzero()[0].item()) * page_size
 
 
 def _collect_prefill_write_page_ids(

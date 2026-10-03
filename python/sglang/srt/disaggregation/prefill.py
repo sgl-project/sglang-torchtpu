@@ -51,7 +51,6 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
-    find_prefix_send_end_before_pages,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -112,6 +111,7 @@ _is_tpu = is_tpu()
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.prefill_early_send import (
         tpu_clip_cached_prefix_send_end,
+        tpu_clip_hicache_load_send_end,
         tpu_update_inflight_kv_write_pages,
     )
 
@@ -1320,9 +1320,9 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
-        if get_parallel().pp_size > 1:
-            # PP turns overlap off, so neither the TPU clip nor the CUDA wait
-            # event below runs, yet earlier microbatches are still in flight.
+        if _is_tpu and get_parallel().pp_size > 1:
+            # PP turns overlap off, so the TPU clip below never runs, yet
+            # earlier microbatches are still in flight.
             return
 
         # Staging sends into positional grid slots, so the early-send boundary
@@ -1349,17 +1349,13 @@ class SchedulerDisaggregationPrefillMixin:
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
             return
-        # This batch's HiCache load-backs land after this send, before its forward;
-        # their pages are already in the radix tree, so any request can match them.
-        cached_end = find_prefix_send_end_before_pages(
-            prefix_indices=req.prefix_indices,
-            start_send_idx=req.start_send_idx,
-            candidate_send_end=cached_end,
-            unready_page_ids=hicache_load_page_ids,
-            page_size=self.token_to_kv_pool_allocator.page_size,
-        )
-        if cached_end <= req.start_send_idx:
-            return
+        if _is_tpu:
+            # This batch's HiCache loads land after this send, before its forward.
+            cached_end = tpu_clip_hicache_load_send_end(
+                self, req, cached_end, hicache_load_page_ids
+            )
+            if cached_end <= req.start_send_idx:
+                return
         if self.enable_overlap and _is_tpu:
             # TPU cannot send pages the in-flight forward might write, since
             # those pages might be partially updated.
