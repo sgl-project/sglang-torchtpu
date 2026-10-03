@@ -417,7 +417,19 @@ class TestHiCacheLoadPageIds(CustomTestCase):
             scheduler=scheduler,
             load_indices=[torch.arange(0, 8), torch.arange(8, 16)],
         )
-        self.assertEqual(sorted(set(page_ids.tolist())), [0, 1])
+        self.assertEqual(sorted(page_ids.tolist()), [0, 1])
+
+    def test_deduplicates_pages_across_loads(self):
+        """Repeated pages across loads must not enlarge every request's scan."""
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=64)
+        )
+        page_ids = tpu_hicache_load_page_ids(
+            scheduler=scheduler,
+            load_indices=[torch.arange(64, 192), torch.arange(128, 256)],
+        )
+        # Page 2 appears in both loads; each physical page needs only one entry.
+        self.assertEqual(sorted(page_ids.tolist()), [1, 2, 3])
 
 
 class TestUpdateInflightKvWritePages(CustomTestCase):
