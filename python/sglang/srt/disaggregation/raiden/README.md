@@ -149,9 +149,9 @@ This path requires a tpu-sync with PP pool resharding: per-layer pool
 pairing, sender-local pool indices on the wire, registered transfer ranks,
 shared claims across destination pipeline stages, and per-destination strided
 byte spans (one strided entry per page and destination rank). The strided
-spans a tensor-parallel consumer needs are in tpu-sync
-[6182fb3d](https://github.com/google/tpu-sync/commit/6182fb3d933d0d1f2703a1b8f8f7edf3aeb11db6),
-not yet on tpu-sync main; without them each such transfer fails at planning. For
+spans a tensor-parallel consumer needs are on tpu-sync main from
+[120bab96](https://github.com/google/tpu-sync/commit/120bab966c3a6c360abc752cf55357ebeddb5b41);
+with an older build each such transfer fails at planning. For
 full throughput the controller also needs its own thread pool for worker
 RPCs ([tpu-sync main 6b3e8206](https://github.com/google/tpu-sync/commit/6b3e8206f5a0f4ad7bf4717790bff4c8eb7e1c1c)):
 a transfer coordinates every source stage, and on asyncio's default
