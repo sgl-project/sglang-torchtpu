@@ -80,7 +80,11 @@ class TestRuntimeEnvironment(unittest.TestCase):
         self.assertNotIn(tier3, env)
 
     def test_migrated_recipes_include_shell_runtime_defaults(self):
-        for recipe in ("gpt_oss_120b/singlehost_spec.py", "qwen3_coder_30b_a3b_fp8.py"):
+        for recipe in (
+            "gpt_oss_120b/singlehost_spec.py",
+            "qwen3_coder_30b_a3b_fp8.py",
+            "qwen3_5_397b/server.py",
+        ):
             with self.subTest(recipe=recipe):
                 recipe_config = load_recipe("recipe/configs/" + recipe)
                 _, env = resolve_server(LaunchConfig.from_dict(recipe_config), {})

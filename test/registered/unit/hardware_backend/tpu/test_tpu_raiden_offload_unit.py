@@ -72,6 +72,17 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
+def _polled(sent=(), received=(), failed=(), completed_ns=None):
+    """Fake poll_stats_with_details() result for the given req ids."""
+
+    def settled(ids):
+        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+
+    return SimpleNamespace(
+        sent=settled(sent), received=settled(received), failed=settled(failed)
+    )
+
+
 def _reshard_chunk_frames(room, index, start, total_pages, blocks, src_rank):
     return ReshardChunk(room, index, start, total_pages, blocks, src_rank).to_frames()
 
@@ -459,6 +470,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.raiden_endpoint = "127.0.0.1:31020"
         mgr.swa_raiden_endpoint = "127.0.0.1:31022"
         mgr._completed_send = set()
+        mgr._send_done_at = {}
         socket = Mock()
         mgr._socket_send_locks = defaultdict(threading.Lock)
         mgr._socket_lock = threading.Lock()
@@ -675,6 +687,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._full_engine_max_blocks = full_limit
         mgr._swa_engine_max_blocks = swa_limit or 0
         mgr._completed_send = set()
+        mgr._send_done_at = {}
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
@@ -1073,6 +1086,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._decode.remote_total = {room: 64}
         mgr._timeout_s = 120.0
         mgr._completed_send = set()
+        mgr._send_done_at = {}
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
@@ -1785,6 +1799,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._prefill.announce_pages = 16
         mgr._reshard_pushes_pending = {}
         mgr._completed_send = set()
+        mgr._send_done_at = {}
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
@@ -1965,6 +1980,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._decode.announced_at = {}
         mgr._timeout_s = 120.0
         mgr._completed_send = set()
+        mgr._send_done_at = {}
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
@@ -2022,12 +2038,16 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertFalse(mgr._completed_send)
 
         # An unrelated completion does not touch it.
-        mgr._engine.poll_stats = Mock(return_value=([], ["7#0"], []))
+        mgr._engine.poll_stats_with_details = Mock(
+            return_value=_polled([], ["7#0"], [])
+        )
         mgr._drain_engine()
         mgr._engine.unregister_active_plan.assert_not_called()
 
         # The push lands late: the plan goes, exactly once, with its record.
-        mgr._engine.poll_stats = Mock(return_value=([], ["41#0"], []))
+        mgr._engine.poll_stats_with_details = Mock(
+            return_value=_polled([], ["41#0"], [])
+        )
         mgr._drain_engine()
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
@@ -2046,7 +2066,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 f"UUID {uuid} is not registered"
             )
         )
-        mgr._engine.poll_stats = Mock(return_value=([], [], ["41#0"]))
+        mgr._engine.poll_stats_with_details = Mock(
+            return_value=_polled([], [], ["41#0"])
+        )
         mgr._drain_engine()
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
@@ -2129,7 +2151,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertTrue(mgr.room_has_active_io(self.ROOM))
 
         # Raiden reports chunk plan "41#0" failed
-        mgr._engine.poll_stats = Mock(return_value=([], [], ["41#0"]))
+        mgr._engine.poll_stats_with_details = Mock(
+            return_value=_polled([], [], ["41#0"])
+        )
         mgr._drain_engine()
 
         # The failure MUST NOT be masked by "41" in _completed_recv
@@ -2204,7 +2228,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._engine.unregister_active_plan.assert_not_called()
         self.assertEqual([(u, r) for u, r, _ in mgr._stale_plans], [(7, self.ROOM)])
 
-        mgr._engine.poll_stats = Mock(return_value=([], [], []))
+        mgr._engine.poll_stats_with_details = Mock(return_value=_polled([], [], []))
         mgr._drain_engine()
         mgr._engine.unregister_active_plan.assert_not_called()
 
@@ -2585,6 +2609,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._prefill.decode_swa_pages = {self.ROOM: 0}
         mgr._prefill.reshard_finalized = {self.ROOM}
         mgr._completed_send = set()
+        mgr._send_done_at = {}
         mgr._failed = set()
         mgr.record_failure = Mock()
         mgr.update_status = Mock()

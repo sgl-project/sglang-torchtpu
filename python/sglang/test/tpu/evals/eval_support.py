@@ -17,10 +17,12 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -564,6 +566,234 @@ def aime25_openai_runner(
     return run
 
 
+def sgl_eval_args(
+    eval_name: str,
+    *,
+    base_url: str,
+    model: str,
+    out_dir: str,
+    max_tokens: int,
+    num_threads: int,
+    temperature: float,
+    top_p: float,
+    n_repeats: int = 1,
+    chat_template_kwargs: dict[str, Any] | None = None,
+) -> list[str]:
+    """The sgl-eval argv for one gate, shared by the runner and the sharder.
+
+    One builder so a sharded eval sends the same prompt and sampling as an
+    unsharded one; only the row list differs.
+    """
+    args = [
+        "run",
+        eval_name,
+        "--base-url",
+        base_url.rstrip("/") + "/v1",
+        "--model",
+        model,
+        "--max-tokens",
+        str(max_tokens),
+        "--num-threads",
+        str(num_threads),
+        "--temperature",
+        str(temperature),
+        "--top-p",
+        str(top_p),
+        "--n-repeats",
+        str(n_repeats),
+        "--out-dir",
+        str(out_dir),
+    ]
+    for key, value in (chat_template_kwargs or {}).items():
+        # --thinking is the same thing: both land in chat_template_kwargs.
+        args += ["--chat-template-kwarg", f"{key}={json.dumps(value)}"]
+    return args
+
+
+def sgl_eval_runner(
+    eval_name: str,
+    *,
+    model: str,
+    max_tokens: int,
+    num_threads: int,
+    temperature: float,
+    top_p: float,
+    n_repeats: int = 1,
+    chat_template_kwargs: dict[str, Any] | None = None,
+):
+    """Score a gate with ``sgl-eval run <eval_name>`` over its full dataset.
+
+    Two reasons to prefer this over run_eval's sgl-eval path: that path can only
+    toggle ``chat_template_kwargs.thinking``, so a template reading any other key
+    needs ``chat_template_kwargs``; and it routes ``mmmu_pro`` to the shared
+    runner, which scores NeMo-Skills' 500-sample subset rather than the full set.
+    """
+
+    def run(base_url: str) -> dict[str, Any]:
+        out_dir = Path(tempfile.mkdtemp(prefix=f"sgl-eval-{eval_name}-"))
+        cmd = [
+            "sgl-eval",
+            *sgl_eval_args(
+                eval_name,
+                base_url=base_url,
+                model=model,
+                out_dir=str(out_dir),
+                max_tokens=max_tokens,
+                num_threads=num_threads,
+                temperature=temperature,
+                top_p=top_p,
+                n_repeats=n_repeats,
+                chat_template_kwargs=chat_template_kwargs,
+            ),
+        ]
+        print("Running: " + shlex.join(cmd), flush=True)
+        subprocess.run(cmd, check=True)
+
+        metrics_files = list(out_dir.glob(f"sgl_eval_{eval_name}_*/metrics.json"))
+        if len(metrics_files) != 1:
+            raise RuntimeError(
+                f"Expected one sgl-eval metrics.json, found {metrics_files}"
+            )
+        payload = json.loads(metrics_files[0].read_text())
+        print(
+            f"{eval_name} (sgl-eval, n_repeats={n_repeats}): "
+            f"score={payload['aggregate']['score']:.4f} "
+            f"examples={payload.get('num_examples')} metrics={payload['aggregate']}"
+        )
+        dump_metric(
+            f"{eval_name}_sgl_eval",
+            payload["aggregate"]["score"],
+            labels={"model": model, "eval": eval_name},
+        )
+        return {
+            **payload["aggregate"],
+            "latency": payload.get("latency_seconds", 0.0),
+            "output_throughput": payload.get("output_throughput_tps", 0.0),
+        }
+
+    return run
+
+
+# --- accuracy models ----------------------------------------------------------
+# Per-model identity for the accuracy nightlies, as data: a new model is an entry
+# here, not a module of its own. An entry says how its server starts -- either a
+# `config_module` recipe its test's fixture boots. Serving settings are NOT here:
+# a benchmark that needs a different server gets its own recipe rather than env
+# patched in at launch, so the shape a score was measured at stays with the
+# score. `sampling` is the model card's decoding settings.
+
+BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
+HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", DEFAULT_HEALTH_TIMEOUT))
+
+GPT_OSS_120B = {
+    "served_model_name": "gpt-oss-120b",
+    "display_name": "GPT-OSS 120B",
+    "variant": "TP8+EP8",
+    # Per benchmark: recipe/configs/gpt_oss_120b/accuracy_<benchmark>.py.
+    "config_module": "recipe/configs/gpt_oss_120b/accuracy.py",
+}
+
+# Shared by the entries below that differ only in checkpoint and recipe.
+_GEMMA4_SAMPLING = {
+    "max_tokens": 32768,
+    "num_threads": 64,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    # The Gemma 4 template reads enable_thinking; sgl-eval's --thinking sets `thinking`.
+    "chat_template_kwargs": {"enable_thinking": True},
+}
+
+GEMMA4_31B = {
+    "served_model_name": "gemma4-31b",
+    "display_name": "Gemma 4 31B",
+    "variant": "TP8",
+    "config_module": "recipe/configs/gemma4_31b/accuracy.py",
+    "sampling": _GEMMA4_SAMPLING,
+}
+
+QWEN3_5_397B = {
+    "served_model_name": "/weights/Qwen3.5-397B-A17B",
+    "display_name": "Qwen3.5 397B-A17B",
+    "variant": "2host-TP16+EP16-bf16",
+    "config_module": "recipe/configs/qwen3_5_397b/server.py",
+    "sampling": {
+        "max_tokens": 32768,
+        "num_threads": 128,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        # The Qwen3.5 template reads enable_thinking, not the generic thinking.
+        "chat_template_kwargs": {"enable_thinking": True},
+    },
+}
+
+KIMI_K26 = {
+    "served_model_name": "/weights/Kimi-K2.6",
+    "display_name": "Kimi K2.6",
+    "variant": "2host-TP16+EP16+DPA4",
+    "config_module": "recipe/configs/kimi_k26/mmmu.py",
+    # The 2026-09-23 full-set run's settings; its template reads `thinking`.
+    "sampling": {
+        "max_tokens": 98304,
+        "num_threads": 256,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "chat_template_kwargs": {"thinking": True},
+    },
+}
+
+GEMMA4_26B_A4B = {
+    "served_model_name": "gemma4-26b-a4b",
+    "display_name": "Gemma 4 26B-A4B",
+    "variant": "TP8+EP8",
+    "config_module": "recipe/configs/gemma4_26b_a4b/accuracy.py",
+    "sampling": _GEMMA4_SAMPLING,
+}
+
+
+def fixture_runtime_envs(base_url: str = BASE_URL) -> dict[str, str | None]:
+    """Fixture environment: MODEL=None keeps a stray job MODEL from winning."""
+    return {
+        "MODEL": None,
+        "HOST": urlsplit(base_url).hostname,
+        "PORT": str(urlsplit(base_url).port),
+    }
+
+
+def make_runner(model: dict[str, Any], eval_name: str, *, n_repeats: int = 1):
+    """Score one benchmark through sgl-eval with this model's card sampling."""
+    return sgl_eval_runner(
+        eval_name,
+        model=model["served_model_name"],
+        n_repeats=n_repeats,
+        **model["sampling"],
+    )
+
+
+def make_model_config(
+    model: dict[str, Any],
+    *,
+    test_name: str,
+    series_id: str,
+    gate: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one isolated model configuration for one benchmark."""
+    served = model["served_model_name"]
+    return {
+        "model": served,
+        "test_name": test_name,
+        # The dashboard's series join key: never renamed, never shown. A forced
+        # rename is recorded in .github/tpu-ci/dashboard_aliases.json instead.
+        "id": series_id,
+        # Cosmetic and free to change -- the split from `id` is what makes a
+        # display rename a non-event for the trend.
+        "display_name": model["display_name"],
+        "variant": model["variant"],
+        "dashboard": "accuracy",
+        "dashboard_model": served,
+        "gates": [gate],
+    }
+
+
 # --- perf ---------------------------------------------------------------------
 # A throughput sweep is an AccuracyTestParams.runner like the two above, not a
 # parallel harness: it wants the same recipe launch, the same one-boot-many-gates
@@ -571,7 +801,7 @@ def aime25_openai_runner(
 # cannot serve here -- it launches with popen_launch_server, and a TPU server only
 # comes up through launch_server.sh (chiplet visibility, compile cache, topology).
 
-_TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
+_TPU_BENCH_DIR = Path(__file__).resolve().parents[5] / "benchmark" / "tpu"
 
 
 # bench_serving.sh's own per-point file stem. Its tag and this must agree, or the

@@ -433,11 +433,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_swa_indices is not None
 
+        # TPU mappings live on CPU. Slice after the copy so request-dependent
+        # lengths do not accumulate native TPU slice compilations in host RAM.
+        mapping_full_indices = alloc_full_indices.to(
+            self.full_to_swa_index_mapping.device
+        )
         self.set_full_to_swa_mapping(
-            alloc_full_indices[-swa_tail_len:], alloc_swa_indices
+            mapping_full_indices[-swa_tail_len:], alloc_swa_indices
         )
         if swa_tail_len < extend_num_tokens:
-            self.clear_full_to_swa_mapping(alloc_full_indices[:-swa_tail_len])
+            self.clear_full_to_swa_mapping(mapping_full_indices[:-swa_tail_len])
         return alloc_full_indices
 
     def alloc_decode(

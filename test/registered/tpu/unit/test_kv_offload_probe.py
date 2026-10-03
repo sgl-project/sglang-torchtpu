@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.kv_offload_probe import (
+from sglang.test.tpu.utils.kv_offload_probe import (
     CacheObservation,
     KvOffloadProbe,
     generate_with_cache_report,
@@ -113,7 +113,7 @@ class TestKvOffloadOutputOracle(unittest.TestCase):
 
 
 class TestDpRouting(unittest.TestCase):
-    @patch("sglang.test.tpu.kv_offload_probe.requests.post")
+    @patch("sglang.test.tpu.utils.kv_offload_probe.requests.post")
     def test_generate_routes_to_requested_dp_rank(self, post: Mock) -> None:
         response = post.return_value
         response.json.return_value = {
@@ -136,7 +136,7 @@ class TestDpRouting(unittest.TestCase):
         self.assertEqual(observation.device_tokens, 64)
         self.assertEqual(post.call_args.kwargs["json"]["routed_dp_rank"], 3)
 
-    @patch("sglang.test.tpu.kv_offload_probe.requests.post")
+    @patch("sglang.test.tpu.utils.kv_offload_probe.requests.post")
     def test_generate_rejects_wrong_dp_rank(self, post: Mock) -> None:
         post.return_value.json.return_value = {
             "text": "ok",

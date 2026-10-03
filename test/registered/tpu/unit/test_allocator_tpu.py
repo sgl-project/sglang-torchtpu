@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -634,6 +635,93 @@ class TestAllocatorOnTpuDevice(CustomTestCase):
     with ``.cpu()``) equals the CPU reference. A correct H2D->formula->D2H
     round-trip is the only way they can match.
     """
+
+    def _make_swa_allocator(self):
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+        # The allocator only registers its mapping with the KV pool; no KV
+        # payload is needed to exercise the real full/SWA index allocators.
+        pool = Mock(
+            spec=BaseSWAKVPool,
+            full_kv_pool=None,
+            swa_kv_pool=None,
+            swa_req_ring_size=None,
+        )
+        return SWATokenToKVPoolAllocator(
+            size=4096,
+            size_swa=2048,
+            page_size=128,
+            dtype=torch.bfloat16,
+            device="tpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+
+    def _check_swa_tail_allocation(self, allocator, length, tail_length):
+        allocator.clear()
+        mapping = allocator.full_to_swa_index_mapping
+        # Nonzero old mappings expose a missing/overbroad clear of the head.
+        mapping[:-1].fill_(7)
+        expected_mapping = mapping.clone()
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([length], dtype=torch.int64)
+        result = allocator.alloc_extend_swa_tail(
+            prefix.to("tpu"),
+            prefix,
+            seq.to("tpu"),
+            seq,
+            torch.tensor([-1], dtype=torch.int64, device="tpu"),
+            extend_num_tokens=length,
+            swa_tail_len=tail_length,
+        )
+
+        self.assertEqual(result.device.type, "tpu")
+        self.assertEqual(result.dtype, torch.int32)
+        locations = torch.arange(128, 128 + length, dtype=torch.int64)
+        self.assertTrue(torch.equal(result.cpu().long(), locations))
+        expected_mapping[locations[:-tail_length]] = 0
+        expected_mapping[locations[-tail_length:]] = torch.arange(
+            128, 128 + tail_length, dtype=torch.int64
+        )
+        self.assertEqual(mapping.device.type, "cpu")
+        self.assertTrue(torch.equal(mapping, expected_mapping))
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            4096 - _ceil_div(length, 128) * 128,
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(),
+            2048 - _ceil_div(tail_length, 128) * 128,
+        )
+
+    def test_swa_tail_mapping_boundaries(self):
+        allocator = self._make_swa_allocator()
+        for length, tail_length in (
+            (257, 257),
+            (257, 128),
+            (257, 129),
+        ):
+            with self.subTest(length=length, tail_length=tail_length):
+                self._check_swa_tail_allocation(allocator, length, tail_length)
+
+    def test_swa_tail_does_not_compile_request_lengths(self):
+        """New prompt lengths must not retain one TPU program per KV-index slice."""
+        allocator = self._make_swa_allocator()
+        # A prior run must not hide the regression by warming these lengths.
+        torch.tpu._clear_cache()
+        self._check_swa_tail_allocation(allocator, 512, 256)
+        torch.tpu.synchronize()
+        misses = torch.tpu._get_cache_misses()
+
+        for length in range(1025, 1041):
+            # A page-aligned window start makes the live tail vary with the
+            # prompt length too; both operands of the mapping must stay stable.
+            tail_length = 256 + length % allocator.page_size
+            self._check_swa_tail_allocation(allocator, length, tail_length)
+
+        torch.tpu.synchronize()
+        self.assertEqual(torch.tpu._get_cache_misses(), misses)
 
     def test_decode_device_matches_cpu(self):
         # Mixed batch: continue / new / continue / new. last_loc values

@@ -97,9 +97,8 @@ jobs:
       contents: read
       id-token: write
 
-  # Stage [2]: accuracy evals, one job per benchmark. `model: nightly` is every
-  # single-host accuracy suite but not the ondemand multihost models parked out
-  # of the nightly lane.
+  # Stage [2]: scheduled single-host and multihost accuracy suites, minus MMMU-Pro,
+  # which accuracy-test-tpu.yml runs on its own 10 AM / 5 PM schedule.
   accuracy:
     needs: build
     if: ${{ contains(fromJSON('["all","accuracy"]'), inputs.only || 'all') }}

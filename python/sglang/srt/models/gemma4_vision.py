@@ -41,10 +41,12 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_tpu,
 )
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = _is_cpu and cpu_has_amx_support()
+_is_tpu = is_tpu()
 
 # ---------------------------------------------------------------------------
 # 2-D Multidimensional RoPE (matches HF Gemma4RotaryEmbedding for vision)
@@ -572,6 +574,16 @@ class Gemma4VisionEncoder(nn.Module):
             config, mask_pad_before_pool=mask_pad_before_pool
         )
 
+        # TPU: the encoder becomes a torch.compile boundary, entered through the
+        # runner so the patch axis is padded to a precompiled bucket first.
+        self.graph_runners = None
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.graph_runner.gemma4_vision_tpu_compile_runner import (
+                Gemma4VisionTpuCompileRunner,
+            )
+
+            self.graph_runners = Gemma4VisionTpuCompileRunner(self)
+
         # Post-pooling standardization (normalizes vision tokens before projection)
         self.standardize = getattr(config, "standardize", False)
         if self.standardize:
@@ -625,3 +637,14 @@ class Gemma4VisionEncoder(nn.Module):
             pooled = (pooled - self.std_bias) * self.std_scale
 
         return pooled, pooler_mask
+
+
+if _is_tpu:
+    # Register the encoder as a torch.compile boundary for the TPU graph runner
+    # to discover (inert unless --enable-torch-compile).
+    from sglang.srt.compilation.support_torch_compile import support_torch_compile
+    from sglang.srt.hardware_backend.tpu.graph_runner.gemma4_vision_tpu_compile_runner import (
+        Gemma4VisionTpuCompilePolicy,
+    )
+
+    support_torch_compile(Gemma4VisionEncoder, policy=Gemma4VisionTpuCompilePolicy)

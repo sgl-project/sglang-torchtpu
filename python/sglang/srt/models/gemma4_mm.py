@@ -66,13 +66,23 @@ from sglang.srt.models.gemma4_causal import (
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_tpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
+
+
+def _encode(vision_tower, pixel_values, position_ids):
+    """Run the vision tower, through its TPU compile runner when it has one."""
+    runner = getattr(vision_tower, "graph_runners", None)
+    if runner is not None:
+        return runner.run(pixel_values, position_ids)
+    return vision_tower(pixel_values, position_ids)
+
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -180,6 +190,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     embedding_modules = {}
     embedding_padding_modules = []
     supports_lora = True
+    # Read by the TPU VL compile policy: decode feeds input_embeds, not input_ids.
+    decode_embeds_in_language_model = False
 
     def __init__(
         self,
@@ -244,6 +256,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+
+        if _is_tpu:
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                Qwen3VLDecoderTpuCompilePolicy,
+            )
+
+            support_torch_compile(
+                self.language_model, policy=Qwen3VLDecoderTpuCompilePolicy
+            )
 
         # Tied embeddings: under PP the embed_tokens lives on the first rank
         # while logits run on the last rank, so we can't reuse the embedding
@@ -454,7 +478,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 pv = pv.to(device=vt.device, dtype=self.language_model.dtype())
                 pp = pp.to(device=vt.device)
 
-                pooled, pooler_mask = vt(pv, pp)
+                pooled, pooler_mask = _encode(vt, pv, pp)
 
                 for hs, mask in zip(pooled, pooler_mask):
                     real_tokens = hs[mask]

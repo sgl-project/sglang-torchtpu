@@ -59,7 +59,7 @@ export TORCH_LOGS=${TORCH_LOGS:-+recompiles}
 
 # XLA / libtpu tuning for TP/EP TPU serving. Latency-hiding scheduler + async
 # collective fusion keep collectives off the matmul critical path; the post-SPMD
-# collective-matmul modes and the four SparseCore-offload=false flags are the
+# collective-matmul modes and the SparseCore-offload=false flags are the
 # DP-attention hardening set (avoid TP correctness issues / SparseCore halts).
 # Overriding this string invalidates the compile cache.
 export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=65536 \
@@ -72,5 +72,4 @@ export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=655
 --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative \
 --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false \
 --xla_tpu_offload_gather_to_sparsecore=false \
---xla_tpu_enable_sparse_core_collective_offload_all_gather=false \
 --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false"}

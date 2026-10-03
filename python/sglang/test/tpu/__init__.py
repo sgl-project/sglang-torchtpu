@@ -1,17 +1,29 @@
 """TPU-specific test support for this fork."""
 
-from sglang.test.tpu.eval_support import (
+from sglang.test.tpu.evals.eval_support import (
+    BASE_URL,
+    GEMMA4_26B_A4B,
+    GEMMA4_31B,
+    GPT_OSS_120B,
+    HEALTH_TIMEOUT,
+    KIMI_K26,
+    QWEN3_5_397B,
     ExternalServerLauncher,
     RecipeLauncher,
     TpuModelLaunchSettings,
     aime25_openai_runner,
     bench_serving_runner,
     emit_result_payload,
+    fixture_runtime_envs,
     gpqa_openai_runner,
     lm_eval_runner,
+    make_model_config,
+    make_runner,
+    sgl_eval_args,
+    sgl_eval_runner,
     wait_for_health,
 )
-from sglang.test.tpu.model_config import (
+from sglang.test.tpu.evals.model_config import (
     build_gates,
     build_model,
     build_test_case,
@@ -20,6 +32,13 @@ from sglang.test.tpu.model_config import (
 )
 
 __all__ = [
+    "BASE_URL",
+    "GEMMA4_26B_A4B",
+    "GEMMA4_31B",
+    "GPT_OSS_120B",
+    "HEALTH_TIMEOUT",
+    "KIMI_K26",
+    "QWEN3_5_397B",
     "ExternalServerLauncher",
     "RecipeLauncher",
     "TpuModelLaunchSettings",
@@ -29,9 +48,14 @@ __all__ = [
     "build_model",
     "build_test_case",
     "emit_result_payload",
+    "fixture_runtime_envs",
     "gpqa_openai_runner",
     "lm_eval_runner",
+    "make_model_config",
+    "make_runner",
     "model_config_main",
     "run_model_config",
+    "sgl_eval_args",
+    "sgl_eval_runner",
     "wait_for_health",
 ]

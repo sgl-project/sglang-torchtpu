@@ -2,13 +2,18 @@
 """Discover multi-host test files as one matrix row per test file.
 
 A multi-host test file declares a module-level MULTIHOST_LAUNCH dict:
-    MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/x.sh", "weights_pvc": "..."}
+    MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/x.sh", "weights_pvc": "...",
+                        "schedule": "nightly"}
 and registers to a suite via register_tpu_ci(suite=..., nightly=...). This scans
 test/registered/**.py (AST only -- no imports/TPU), keeps files registered to --suite
 (and nightly when --nightly), then emits each file as its own matrix row so GitHub reports its status directly.
 
+`schedule` names the lane that runs the file -- "nightly" unless the file belongs to
+one of accuracy-test-tpu.yml's own cron slots. A workflow selects on this value, so a
+new file runs where it says it runs rather than where its name happens to sort.
+
 Prints a JSON array for the CI matrix:
-    [{"name","launch_script","weights_pvc","hosts","files"}]   (files = space-separated)
+    [{"name","launch_script","weights_pvc","hosts","files","schedule"}]  (files = space-separated)
 """
 
 import argparse
@@ -86,6 +91,7 @@ def main():
                 "hosts": hosts,
                 "files": path,
                 "timeout_per_file": timeout_per_file,
+                "schedule": str(spec.get("schedule", "nightly")),
             }
         )
     print(json.dumps(out))

@@ -825,6 +825,9 @@ class Gemma4TextModel(PreTrainedModel):
                 self.padding_idx,
                 embed_scale=self.config.hidden_size**0.5,  # embedded normalizer
             )
+            # Plain nn.Embedding requires grad by default; compile guards on the
+            # input_embeds it produces, so freeze it to match no_grad serving.
+            self.embed_tokens.weight.requires_grad_(False)
         else:
             self.embed_tokens = PPMissingLayer()
 

@@ -78,6 +78,7 @@ gates -- one entry per evaluation
                   for how to size it against the single-pass sigma.
     reasoning_effort   "low"/"medium"/"high". Cards report a different score per
                   level, so this must match whichever the baseline came from.
+    thinking      Pass --thinking to sgl-eval for hybrid reasoning checkpoints.
     runner        runner(base_url) -> score or metrics dict. Scores the gate with a
                   harness this module has no dependency on.
     lm_eval_config     YAML under test/lm_eval_configs/. It owns the ground truths and
@@ -126,7 +127,7 @@ from typing import Any
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
-from sglang.test.tpu.eval_support import (
+from sglang.test.tpu.evals.eval_support import (
     DEFAULT_HEALTH_TIMEOUT,
     ExternalServerLauncher,
     RecipeLauncher,
@@ -135,7 +136,7 @@ from sglang.test.tpu.eval_support import (
     lm_eval_runner,
 )
 
-_TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
+_TPU_BENCH_DIR = Path(__file__).resolve().parents[5] / "benchmark" / "tpu"
 
 _CONFIG_KEYS = {
     "model",
@@ -171,6 +172,7 @@ _GATE_PASSTHROUGH = {
 _GATE_TRANSLATED = {
     "baseline",
     "reasoning_effort",
+    "thinking",
     "lm_eval_config",
     "sweep",
     "bench_env",
@@ -271,8 +273,13 @@ def _build_gate(
 
     if "baseline" in gate:
         kwargs["baseline_accuracy"] = gate["baseline"]
+    extra_eval_args = {}
     if "reasoning_effort" in gate:
-        kwargs["extra_eval_args"] = {"reasoning_effort": gate["reasoning_effort"]}
+        extra_eval_args["reasoning_effort"] = gate["reasoning_effort"]
+    if "thinking" in gate:
+        extra_eval_args["sgl_eval_thinking"] = gate["thinking"]
+    if extra_eval_args:
+        kwargs["extra_eval_args"] = extra_eval_args
     if "lm_eval_config" in gate:
         if "runner" in gate:
             raise ValueError("a gate takes either lm_eval_config or runner, not both")

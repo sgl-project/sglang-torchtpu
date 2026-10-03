@@ -337,7 +337,7 @@ class TestDirectCompile(CustomTestCase):
                 artifact(((torch.ones(2),), {}))
             execute.assert_not_called()
 
-    @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_preserves_model_and_argument_layouts(self):
         """Compile against live buffer layouts, not placeholder defaults."""
         cache_cpu = torch.arange(256 * 64, dtype=torch.float32).reshape(256, 64)
@@ -605,14 +605,14 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(rebuilt[1].hidden_states, draft_extend_hidden_states)
         self.assertIsNone(rebuilt[1].input_ids)
 
-    def test_prunes_model_inputs_and_preserves_runtime_state(self):
+    def test_model_input_pruning_preserves_runtime_state(self):
+        self._check_model_input_pruning(prune_unused_inputs=True)
+
+    def test_preserves_all_model_inputs_by_default(self):
         self._check_model_input_pruning()
 
-    def test_disabling_model_input_pruning_preserves_all_inputs(self):
-        self._check_model_input_pruning(prune_unused_inputs=False)
-
     def _check_model_input_pruning(self, **compile_options):
-        prune_unused_inputs = compile_options.get("prune_unused_inputs", True)
+        prune_unused_inputs = compile_options.get("prune_unused_inputs", False)
         model = _ModelWithUnusedInputs()
         kv_pool = _KVPool(torch.zeros(2))
         pool_input = kv_pool.value
@@ -812,6 +812,7 @@ class TestDirectCompile(CustomTestCase):
             lambda value: tuple(torch.topk(value + model.bias, 2)),
             specialization_key=lambda value: tuple(value.shape),
             model=model,
+            prune_unused_inputs=True,
         )
 
         for rows in (1, 4, 1):
@@ -847,15 +848,15 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(artifact.model_inputs[0], model.integers)
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
-    def test_pruned_model_inputs_on_tpu_across_specializations(self):
-        self._check_model_input_pruning_on_tpu()
+    def test_model_input_pruning_on_tpu_across_specializations(self):
+        self._check_model_input_pruning_on_tpu(prune_unused_inputs=True)
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
-    def test_disabled_model_input_pruning_on_tpu_across_specializations(self):
-        self._check_model_input_pruning_on_tpu(prune_unused_inputs=False)
+    def test_preserves_all_model_inputs_by_default_on_tpu(self):
+        self._check_model_input_pruning_on_tpu()
 
     def _check_model_input_pruning_on_tpu(self, **compile_options):
-        prune_unused_inputs = compile_options.get("prune_unused_inputs", True)
+        prune_unused_inputs = compile_options.get("prune_unused_inputs", False)
         model = _ModelWithUnusedInputs(device="tpu")
         kv_pool = _KVPool(torch.zeros(2, device="tpu"))
         pool_input = kv_pool.value

@@ -89,11 +89,11 @@ class _Sender:
     ):
         self.device, self.rid, self.log = device, rid, log
 
-    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
-        return num_pages > 0
-
     def get_max_transfer_tokens(self) -> Optional[int]:
         return None
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0
 
     def send(self, page_indices, state_indices=None, num_kv_tokens=None):
         self.log.append(
@@ -103,13 +103,12 @@ class _Sender:
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self, *, enable_overlap: bool, num_slots: int = 64):
-        self.gracefully_exit = False
         self.enable_overlap = enable_overlap
         self.enable_staging = False
+        self.gracefully_exit = False
         self.kv_checksum_computer = None
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=PAGE_SIZE,
-            translate_kv_indices_for_transfer=lambda indices: indices,
+            page_size=PAGE_SIZE, translate_kv_indices_for_transfer=lambda kv: kv
         )
         self.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((8, num_slots), dtype=torch.int32)

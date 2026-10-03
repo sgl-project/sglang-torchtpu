@@ -100,12 +100,12 @@ claims; an empty value mounts no weights. The container mount remains `/weights`
 manifests must still name the actual cluster resources; changing `weights.yaml`
 selects a claim, it does not create one.
 
-`launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
-and execs `launch_server.sh`. `discover_multihost.py` scans the files registered to a
-suite, **groups** those with an identical `(launch_script, weights_pvc, hosts)`, and
-emits one group per unique setup. Each group → **one** JobSet: launch the server once,
-rank 0 runs every file in the group against it. So files with the same setup **share a
-launched server** (no redundant bring-up); different setups get their own server.
+`launch_script` is relative to `benchmark/tpu/`: a shell recipe, or a `.py`
+recipe config the JobSet hands to `benchmark/tpu/launch_server.py`, which
+resolves each host's rank from the JobSet topology. `discover_multihost.py`
+emits one JobSet per registered test file, even when several name the same
+recipe -- which is how the two Kimi MMMU-Pro shards get independent slices with
+identical serving settings.
 
 To add a **single-host** suite: `register_*_ci(..., suite="…")`, add it to `run_suite.py`,
 and call `_tpu-test` with that `suite`. To add a **multi-host** test: drop a file with a

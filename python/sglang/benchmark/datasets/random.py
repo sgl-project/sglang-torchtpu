@@ -27,9 +27,10 @@ def _sends_token_ids(args: Namespace) -> bool:
     """
     if getattr(args, "tokenize_prompt", False):
         return True
-    return getattr(args, "dataset_name", "") == "random-ids" and getattr(
-        args, "backend", ""
-    ) in ("sglang", "sglang-native")
+    return getattr(args, "dataset_name", "") in (
+        "random-ids",
+        "random-ids-shared-prefix",
+    ) and getattr(args, "backend", "") in ("sglang", "sglang-native")
 
 
 @dataclass

@@ -1809,6 +1809,12 @@ class KVCacheConfigurator:
             ),
             head_dim=self.model_config.head_dim,
             swa_head_num=swa_head_num,
+            # ``head_dim`` above sizes the FULL sub-pool; Gemma4's SWA layers are
+            # 256 against 512. V is passed too because the pool resolves it as
+            # swa_v_head_dim -> v_head_dim -> head_dim, and that last fallback is
+            # the full width, which trips its own v_head_dim <= head_dim check.
+            swa_head_dim=self.model_config.swa_head_dim,
+            swa_v_head_dim=self.model_config.swa_v_head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,

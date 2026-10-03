@@ -160,6 +160,8 @@ class RaidenKVManager(
         # until clear() so repeated poll() calls before the framework advances
         # keep reporting the same terminal state.
         self._completed_send: Set[str] = set()
+        # Raiden's finish time (perf_counter seconds) per sent id, if reported.
+        self._send_done_at: Dict[str, float] = {}
         self._completed_recv: Set[str] = set()
         self._failed: Set[str] = set()
         # Transfer ids the engine reported failed. Only these mean raiden has
@@ -500,9 +502,15 @@ class RaidenKVManager(
             done_send, done_recv, failed = status
             if done_send or done_recv or failed:
                 with self._state_lock:
-                    self._completed_send.update(self._norm_req_id(r) for r in done_send)
-                    self._completed_recv.update(self._norm_req_id(r) for r in done_recv)
-                    norm_failed = {self._norm_req_id(r) for r in failed}
+                    for t in done_send:
+                        rid = self._norm_req_id(t.req_id)
+                        self._completed_send.add(rid)
+                        if t.completed_ns is not None:
+                            self._send_done_at[rid] = t.completed_ns / 1e9
+                    self._completed_recv.update(
+                        self._norm_req_id(t.req_id) for t in done_recv
+                    )
+                    norm_failed = {self._norm_req_id(t.req_id) for t in failed}
                     superseded = self._superseded_sender_reads
                     real_failed = norm_failed - superseded
                     superseded -= norm_failed
@@ -528,19 +536,20 @@ class RaidenKVManager(
 
     def _poll_engine_status(
         self, *, name: str, engine: Any
-    ) -> Tuple[List[str], List[str], List[str]] | None:
-        """One engine's completions, or None when its poll raised.
+    ) -> Tuple[List[Any], List[Any], List[Any]] | None:
+        """One engine's sent, received and failed transfers, or None if the
+        poll raised.
 
         Runs inside the scheduler's poll, so an escaping exception would take
-        down every request on this worker. Raiden raises from ``poll_stats``
-        only before it takes any completion, so a failed poll loses nothing
-        and the next one reports it. Raiden's transfer deadlines are reported
-        through ``poll_stats`` too: once polls have failed for longer than one
-        deadline no transfer can settle, and that is raised rather than left
-        to hang every request with its pages held.
+        down every request on this worker. Raiden raises from
+        ``poll_stats_with_details`` only before it takes any completion, so a
+        failed poll loses nothing and the next one reports it. Raiden's
+        transfer deadlines are reported through it too: once polls have failed
+        for longer than one deadline no transfer can settle, and that is raised
+        rather than left to hang every request with its pages held.
         """
         try:
-            status = engine.poll_stats()
+            stats = engine.poll_stats_with_details()
         except Exception as e:
             now = self._monotonic()
             since = self._engine_poll_failing_since.setdefault(name, now)
@@ -565,7 +574,15 @@ class RaidenKVManager(
                 self.attn_tp_rank,
                 name,
             )
-        return status
+        return stats.sent, stats.received, stats.failed
+
+    def send_done_time(self, room: int) -> Optional[float]:
+        """Raiden's finish time for the room's send, or None if not reported."""
+        rids = [str(room)]
+        if self._swa_engine is not None:
+            rids.append(self._swa_req_id(room))
+        times = [self._send_done_at.get(rid) for rid in rids]
+        return None if None in times else max(times)
 
     def _unregister_plan(self, uuid: int) -> None:
         """Drops a receiver plan whose push has settled.
@@ -900,6 +917,8 @@ class RaidenKVManager(
             self._completed_send.difference_update(
                 [k for k in self._completed_send if belongs(k)]
             )
+            for key in [k for k in self._send_done_at if belongs(k)]:
+                del self._send_done_at[key]
             for ids in (self._completed_recv, self._failed, self._native_failed):
                 ids.difference_update([k for k in ids if belongs(k) and k not in held])
             announced = self._decode.announced_at if self._decode is not None else None
