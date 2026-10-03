@@ -38,6 +38,19 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 
 logger = logging.getLogger(__name__)
 
+# Pools indexed by KV allocator pages, which the KV free fence keeps from loads
+# while a forward may still write them; any other pool's slots are unfenced.
+_KV_PAGE_POOLS = frozenset(
+    (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA)
+)
+
+
+def _check_kv_page_pool(name: PoolName) -> None:
+    if name not in _KV_PAGE_POOLS:
+        raise NotImplementedError(
+            f"The TPU raiden hybrid HiCache path does not offload the {name.value} pool."
+        )
+
 
 class TpuRaidenHybridCacheController(HybridCacheController):
     """Hybrid (multi-pool) HiCache controller whose transfers go through
@@ -45,6 +58,8 @@ class TpuRaidenHybridCacheController(HybridCacheController):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        for entry in self.mem_pool_host.entries:
+            _check_kv_page_pool(entry.name)
         # raiden gates the whole forward at once (no per-layer device streams).
         # Swap the per-layer LayerDoneCounter for a BatchDoneCounter and
         # re-register it on the device pool wrapper (SWAKVPool holds the
@@ -72,6 +87,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
     # ----- sidecar registration ----------------------------------------------
 
     def register_host_pool_entry(self, entry) -> None:
+        _check_kv_page_pool(entry.name)
         super().register_host_pool_entry(entry)
         # Draft sidecar KV is consumed by the draft model's forward, whose
         # CompiledForwardShim gates on the draft pool's own transfer counter.
@@ -107,6 +123,10 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        # The fence keeps in-flight forward writes off only the pages allocated
+        # inside dma_write_target(); this DMA's targets are allocated below.
+        fence = self.mem_pool_device_allocator.kv_free_fence
+        assert fence is None or fence.in_dma_write_target
         device_indices = super().load(
             host_indices=host_indices,
             priority=priority,

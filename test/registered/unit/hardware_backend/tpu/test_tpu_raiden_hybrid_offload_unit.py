@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
@@ -92,6 +93,7 @@ class _FakeEntry:
 class _FakeGroup:
     def __init__(self, anchor: _FakeEntry, extra: List[_FakeEntry]):
         self.anchor_entry = anchor
+        self.entries = [anchor, *extra]
         self.entry_map = {anchor.name: anchor}
         for entry in extra:
             self.entry_map[entry.name] = entry
@@ -135,6 +137,9 @@ class TestPlainKvController(CustomTestCase):
 
         def init_base(controller, *args, **kwargs):
             controller.mem_pool_device = device_pool
+            controller.mem_pool_host = _FakeGroup(
+                _FakeEntry(PoolName.KV, _FakeHostPool(), device_pool), []
+            )
             controller.layer_done_counter = object.__new__(LayerDoneCounter)
 
         with (
@@ -353,7 +358,7 @@ class TestHybridTransferWithoutFullPages(CustomTestCase):
                 ),
             ]
         )
-        self.ctrl.mem_pool_device_allocator = None
+        self.ctrl.mem_pool_device_allocator = MagicMock(kv_free_fence=None)
         self.ctrl.device = "cpu"
 
     def _tokens(self, pages: List[int]) -> torch.Tensor:
@@ -502,6 +507,39 @@ class TestDraftCounterRegistration(CustomTestCase):
         # controller init; re-registering per entry would be wrong.
         ctrl, entry = self._register(PoolName.SWA)
         entry.device_pool.register_layer_transfer_counter.assert_not_called()
+
+
+class TestKVFreeFenceCoverage(CustomTestCase):
+    def test_pool_not_indexed_by_kv_pages_is_rejected(self):
+        """A load into a Mamba state slot bypasses the KV free fence, so a
+        forward still writing the freed slot could overwrite the loaded state."""
+        mamba = _FakeEntry(PoolName.MAMBA, _FakeHostPool(), device_pool=MagicMock())
+        with self.assertRaises(NotImplementedError):
+            _make_controller().register_host_pool_entry(mamba)
+
+        def init_base(controller, *args, **kwargs):
+            controller.mem_pool_host = _FakeGroup(
+                _FakeEntry(PoolName.KV, _FakeHostPool(), MagicMock()), [mamba]
+            )
+
+        with patch.object(HybridCacheController, "__init__", init_base):
+            with self.assertRaises(NotImplementedError):
+                TpuRaidenHybridCacheController()
+
+    def test_load_allocated_outside_dma_write_target_is_rejected(self):
+        """A load path that allocates its DMA targets outside
+        dma_write_target() can be given pages an in-flight forward still writes."""
+        ctrl = _make_controller()
+        allocator = MagicMock()
+        allocator.full_attn_allocator.alloc.return_value = torch.arange(8)
+        allocator.kv_free_fence = KVFreeFence(synchronize_device=MagicMock())
+        ctrl.mem_pool_device_allocator = allocator
+        with self.assertRaises(AssertionError):
+            ctrl.load(host_indices=torch.arange(8))
+        allocator.full_attn_allocator.alloc.assert_not_called()
+
+        with allocator.kv_free_fence.dma_write_target():
+            self.assertIsNotNone(ctrl.load(host_indices=torch.arange(8)))
 
 
 class TestDraftSidecarPlatformHook(CustomTestCase):

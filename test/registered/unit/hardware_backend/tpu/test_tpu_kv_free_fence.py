@@ -1,10 +1,12 @@
 """KV pages freed under overlap stay out of DMA-written allocations until the
 forwards in flight at free time are processed."""
 
+import ast
 import subprocess
 import sys
 import textwrap
 import unittest
+import warnings
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
@@ -318,6 +320,43 @@ class TestRadixEvictionUnderFence(CustomTestCase):
 
         self.fence.on_forward_done(first)
         self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+    def test_every_tree_device_free_records_its_node_stamp(self):
+        """An eviction's frees share one release time, the latest stamp it
+        recorded; a device value freed without recording its node's stamp would
+        be released early whenever it is drained with an older node's free."""
+        srt = Path(sglang.__file__).parent / "srt"
+        stray = []
+        for path in srt.rglob("*.py"):
+            # The Rust core reports no release time, so all its frees are held.
+            if "rust_tree_core" in path.parts:
+                continue
+            with warnings.catch_warnings():
+                # Some modules carry invalid escapes in non-raw strings.
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(path.read_text())
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(func):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                    ):
+                        continue
+                    target = node.func.value
+                    if (
+                        node.func.attr == "evict_component"
+                        and func.name != "_evict_component_and_detach_lru"
+                    ) or (
+                        node.func.attr in ("append", "extend")
+                        and isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "device_frees"
+                        and func.name != "evict_component"
+                    ):
+                        stray.append(f"{path.relative_to(srt)}:{node.lineno}")
+        self.assertEqual(stray, [])
 
 
 class TestTpuImportOrder(CustomTestCase):
