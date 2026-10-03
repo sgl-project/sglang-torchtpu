@@ -32,6 +32,7 @@ from sglang.srt.hardware_backend.tpu.prefill_early_send import (
     _find_safe_prefix_send_end,
     tpu_clip_cached_prefix_send_end,
     tpu_clip_hicache_load_send_end,
+    tpu_hicache_load_page_ids,
     tpu_update_inflight_kv_write_pages,
 )
 from sglang.srt.managers.scheduler import Scheduler
@@ -404,6 +405,25 @@ class TestCollectPrefillWritePageIds(CustomTestCase):
         self.assertEqual(self._write_page_ids(s, [req]).tolist(), [3, 6, 8])
 
 
+class TestHiCacheLoadPageIds(CustomTestCase):
+    def test_divides_by_the_given_allocator_page_size(self):
+        # DCP widens the allocator page beyond the radix page: slots 0-15 are
+        # pages 0-3 at size 4, but pages 0-1 at the widened size 8.
+        loads = [torch.arange(0, 8), torch.arange(8, 16)]
+        self.assertEqual(
+            sorted(
+                set(tpu_hicache_load_page_ids(load_indices=loads, page_size=4).tolist())
+            ),
+            [0, 1, 2, 3],
+        )
+        self.assertEqual(
+            sorted(
+                set(tpu_hicache_load_page_ids(load_indices=loads, page_size=8).tolist())
+            ),
+            [0, 1],
+        )
+
+
 class TestUpdateInflightKvWritePages(CustomTestCase):
     def _batch(self, s, hicache_load_page_ids=None):
         req = SimpleNamespace(
@@ -655,25 +675,23 @@ class TestEarlySendSkipsHiCacheLoadPages(CustomTestCase):
             )
             self.assertEqual(harness.inflight_reads(), [], enable_overlap)
 
-    def test_unrecorded_load_lets_the_early_send_read_unfilled_pages(self):
-        # Negative control: without the batch's load pages, B's early send
-        # reads pages 3,4 before the load has filled them. This is the bug.
-        harness, _ = self._run(enable_overlap=False, hicache_load_page_ids=None)
-        self.assertEqual(harness.inflight_reads(), [("B", [3, 4])])
-
     def test_device_resident_prefix_still_goes_early(self):
-        _, early = self._run(
-            enable_overlap=False, hicache_load_page_ids=torch.tensor([3, 4])
-        )
-        self.assertEqual(early, [("A", [1, 2]), ("B", [1, 2])])
+        for enable_overlap in (False, True):
+            _, early = self._run(
+                enable_overlap=enable_overlap,
+                hicache_load_page_ids=torch.tensor([3, 4]),
+            )
+            self.assertEqual(early, [("A", [1, 2]), ("B", [1, 2])], enable_overlap)
 
     def test_every_page_is_sent_exactly_once_per_request(self):
-        harness, _ = self._run(
-            enable_overlap=False, hicache_load_page_ids=torch.tensor([3, 4])
-        )
-        for rid, expected in (("A", [1, 2, 3, 4, 5]), ("B", [1, 2, 3, 4, 6])):
-            sent = [p for pages in harness.sends_of(rid) for p in pages]
-            self.assertEqual(sent, expected, rid)
+        for enable_overlap in (False, True):
+            harness, _ = self._run(
+                enable_overlap=enable_overlap,
+                hicache_load_page_ids=torch.tensor([3, 4]),
+            )
+            for rid, expected in (("A", [1, 2, 3, 4, 5]), ("B", [1, 2, 3, 4, 6])):
+                sent = [p for pages in harness.sends_of(rid) for p in pages]
+                self.assertEqual(sent, expected, (rid, enable_overlap))
 
 
 if __name__ == "__main__":

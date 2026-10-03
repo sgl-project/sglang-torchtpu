@@ -4292,9 +4292,13 @@ class Scheduler(
                 and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
                 and adder.host_load_indices
             ):
-                new_batch.hicache_load_page_ids = (
-                    torch.cat(adder.host_load_indices).cpu().to(torch.int64)
-                    // self.token_to_kv_pool_allocator.page_size
+                from sglang.srt.hardware_backend.tpu.prefill_early_send import (
+                    tpu_hicache_load_page_ids,
+                )
+
+                new_batch.hicache_load_page_ids = tpu_hicache_load_page_ids(
+                    load_indices=adder.host_load_indices,
+                    page_size=self.token_to_kv_pool_allocator.page_size,
                 )
 
         new_batch.prepare_for_extend()

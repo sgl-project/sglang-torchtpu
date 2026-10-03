@@ -1321,8 +1321,8 @@ class SchedulerDisaggregationPrefillMixin:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
         if _is_tpu and get_parallel().pp_size > 1:
-            # PP turns overlap off, so the TPU clip below never runs, yet
-            # earlier microbatches are still in flight.
+            # PP turns overlap off, so the in-flight-write clip below never runs,
+            # yet earlier microbatches are still in flight.
             return
 
         # Staging sends into positional grid slots, so the early-send boundary
@@ -1352,7 +1352,10 @@ class SchedulerDisaggregationPrefillMixin:
         if _is_tpu:
             # This batch's HiCache loads land after this send, before its forward.
             cached_end = tpu_clip_hicache_load_send_end(
-                self, req, cached_end, hicache_load_page_ids
+                scheduler=self,
+                req=req,
+                candidate_send_end=cached_end,
+                hicache_load_page_ids=hicache_load_page_ids,
             )
             if cached_end <= req.start_send_idx:
                 return
