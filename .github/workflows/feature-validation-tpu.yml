@@ -44,6 +44,7 @@ on:
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - pd-sh-gpt-120b-decode-radix
+          - pd-sh-gpt-120b-offload
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
@@ -113,6 +114,7 @@ jobs:
       pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
       pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
       pd_singlehost_decode_radix: ${{ steps.tests.outputs.pd_singlehost_decode_radix }}
+      pd_singlehost_offload: ${{ steps.tests.outputs.pd_singlehost_offload }}
       pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
       diffusion_mh_collectives: ${{ steps.tests.outputs.diffusion_mh_collectives }}
       node_normalization: ${{ steps.tests.outputs.node_normalization }}
@@ -149,6 +151,7 @@ jobs:
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_decode_radix=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py)" >> "$GITHUB_OUTPUT"
           echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
           echo "diffusion_mh_collectives=$($discover_files --entry test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py)" >> "$GITHUB_OUTPUT"
           echo "node_normalization=$($discover_files --entry test/registered/e2e/hardware_backend/tpu/test_node_normalization.py)" >> "$GITHUB_OUTPUT"
@@ -345,6 +348,32 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
       weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_decode_radix)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # RAM KV offload on both engines: a conversation pushed out of HBM comes
+  # back from host RAM on prefill and decode with the device-resident output.
+  pd-sh-gpt-120b-offload:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-gpt-120b-offload"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_singlehost_kv_offload
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py
+      weights_pvc: model-weights
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_offload)[0].run_name }}
     permissions:
       contents: read
       id-token: write

@@ -862,6 +862,16 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
     )
 
 
+def _patch_pd_decode_swa_hicache() -> None:
+    """Allow PD decode prefix cache + RAM offload on sliding-window models.
+
+    Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
+    """
+    from sglang.srt.hardware_backend.tpu import pd_decode_swa_hicache
+
+    pd_decode_swa_hicache.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -881,3 +891,4 @@ def apply_tpu_patches() -> None:
     _patch_future_map_direct_handoff()
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
+    _patch_pd_decode_swa_hicache()
