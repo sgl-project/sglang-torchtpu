@@ -1876,6 +1876,8 @@ class Envs:
     # ladder; set-but-empty disables precompile entirely.
     SGLANG_TPU_VIT_PRECOMPILE_SIZES = EnvTuple(tuple())
     SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
+    # Rungs in the computed ladder: more rungs trade compiles for padding waste.
+    SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(6)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: use onehot dense matmul for small permute and unpermute/combine

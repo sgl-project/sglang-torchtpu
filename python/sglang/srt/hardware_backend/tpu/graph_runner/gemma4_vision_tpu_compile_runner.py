@@ -24,10 +24,6 @@ from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import 
 
 logger = logging.getLogger(__name__)
 
-# Buckets to warm. Each costs one compile; the gap between them is the padding
-# a small image pays. Six is a guess, not a measurement.
-_NUM_PATCH_BUCKETS = 6
-
 
 class Gemma4VisionRunContext(Struct, frozen=True):
     """Threaded from ``prepare_call`` to ``unpad_outputs``."""
@@ -105,7 +101,16 @@ class Gemma4VisionTpuCompilePolicy(VisionTpuCompilePolicy):
         max_patches = (
             envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get() // window * window
         )
-        step = max(window, max_patches // _NUM_PATCH_BUCKETS // window * window)
+        # Each rung costs one compile; the gap between them is the padding a
+        # small image pays. The default is a guess, not a measurement.
+        num_buckets = envs.SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS.get()
+        if num_buckets <= 0:
+            raise ValueError(
+                "SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS must be positive; got "
+                f"{num_buckets}. Set SGLANG_TPU_VIT_PRECOMPILE_SIZES to an empty "
+                "value to disable precompile instead."
+            )
+        step = max(window, max_patches // num_buckets // window * window)
         buckets = list(range(step, max_patches + 1, step))
         if buckets and buckets[-1] != max_patches:
             buckets.append(max_patches)
