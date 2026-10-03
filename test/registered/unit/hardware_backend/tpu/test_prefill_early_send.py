@@ -406,22 +406,18 @@ class TestCollectPrefillWritePageIds(CustomTestCase):
 
 
 class TestHiCacheLoadPageIds(CustomTestCase):
-    def test_divides_by_the_given_allocator_page_size(self):
-        # DCP widens the allocator page beyond the radix page: slots 0-15 are
-        # pages 0-3 at size 4, but pages 0-1 at the widened size 8.
-        loads = [torch.arange(0, 8), torch.arange(8, 16)]
-        self.assertEqual(
-            sorted(
-                set(tpu_hicache_load_page_ids(load_indices=loads, page_size=4).tolist())
-            ),
-            [0, 1, 2, 3],
+    def test_uses_the_allocator_page_size(self):
+        # DCP widens the allocator page beyond the radix page. Slots 0-15 are
+        # pages 0-3 at the radix size 4 but pages 0-1 at the allocator size 8,
+        # the unit the early-send clips compare against.
+        scheduler = SimpleNamespace(
+            page_size=4, token_to_kv_pool_allocator=SimpleNamespace(page_size=8)
         )
-        self.assertEqual(
-            sorted(
-                set(tpu_hicache_load_page_ids(load_indices=loads, page_size=8).tolist())
-            ),
-            [0, 1],
+        page_ids = tpu_hicache_load_page_ids(
+            scheduler=scheduler,
+            load_indices=[torch.arange(0, 8), torch.arange(8, 16)],
         )
+        self.assertEqual(sorted(set(page_ids.tolist())), [0, 1])
 
 
 class TestUpdateInflightKvWritePages(CustomTestCase):

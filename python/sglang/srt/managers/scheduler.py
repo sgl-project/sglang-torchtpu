@@ -4297,8 +4297,7 @@ class Scheduler(
                 )
 
                 new_batch.hicache_load_page_ids = tpu_hicache_load_page_ids(
-                    load_indices=adder.host_load_indices,
-                    page_size=self.token_to_kv_pool_allocator.page_size,
+                    scheduler=self, load_indices=adder.host_load_indices
                 )
 
         new_batch.prepare_for_extend()
