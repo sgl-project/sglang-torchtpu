@@ -111,8 +111,8 @@ def ref_ragged_paged_attention(
     attention_sink: jax.Array | float | None = None,
 ):
     """Reference implementation for ragged paged attention."""
-    if not causal:
-        assert custom_mask is not None and custom_mask.size > jnp.cumsum(kv_lens)[-1], (
+    if not causal and custom_mask is not None:
+        assert custom_mask.size > jnp.cumsum(kv_lens)[-1], (
             f"use custom_mask, custom_mask length {custom_mask.size=} must larger than total kv length {jnp.cumsum(kv_lens)[-1]=}"
         )
     if mask_value is None:
@@ -151,12 +151,13 @@ def ref_ragged_paged_attention(
         v = jnp.repeat(v, num_query_per_kv, axis=1)
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
         attn *= sm_scale
+        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
+        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         if causal:
-            q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
-                jnp.int32, attn.shape, 1
-            )
-            kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
             mask = q_span < kv_span
+        elif custom_mask is None:
+            # Bidirectional: every query sees all kv_len keys.
+            mask = jnp.zeros(attn.shape, dtype=jnp.bool_)
         else:
             mask_start = cu_mask_lens[i]
             mask_end = cu_mask_lens[i + 1]
@@ -1755,7 +1756,9 @@ def ragged_paged_attention(
       distribution: (i, j, k) decode/prefill/mixed sequence ranges.
       custom_mask: custom attention mask for speculative decoding.
       attention_sink: per-head sink logits for streaming inference.
-      causal: 1 for causal mask, 0 for custom mask.
+      causal: 1 for causal mask. 0 for non-causal: apply ``custom_mask`` when
+        given, else attend bidirectionally (every query sees all ``kv_lens``
+        keys, still subject to ``sliding_window``).
       sm_scale: softmax scale applied to Q@K^T.
       sliding_window: sliding window size.
       soft_cap: logit soft cap.
@@ -1859,6 +1862,9 @@ def ragged_paged_attention(
     init_bkv_update_ids = jnp.full((6,), -1, jnp.int32)
 
     use_causal_mask = causal == 1
+    use_custom_mask = custom_mask is not None
+    if use_custom_mask and use_causal_mask:
+        raise ValueError("custom_mask requires causal=0.")
     tpu_version = get_tpu_version()
 
     def run_rpa_kernel(
@@ -1910,7 +1916,7 @@ def ragged_paged_attention(
 
         bo_double_buf = bq_double_buf
 
-        if use_causal_mask:
+        if not use_custom_mask:
             bkvmask_double_buf = None
         else:
             bkvmask_double_buf = pltpu.VMEM(
@@ -2059,7 +2065,7 @@ def ragged_paged_attention(
                 pages_per_seq,
                 case=case,
                 vmem_limit_bytes=vmem_limit_bytes,
-                use_custom_mask=not use_causal_mask,
+                use_custom_mask=use_custom_mask,
                 sliding_window=sliding_window,
                 decode_query_size=decode_query_size,
             )

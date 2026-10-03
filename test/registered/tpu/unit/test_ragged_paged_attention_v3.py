@@ -17,6 +17,8 @@ Cases covered:
 * decode with logit soft-cap
 * mixed batch: one decode sequence + one extend sequence in the same
   call (exercises the MIXED case path with heterogeneous q_lens)
+* bidirectional (``causal=0`` without ``custom_mask``) on the DECODE and
+  MIXED ranges, with and without a sliding window
 
 The tests require JAX on a TPU device and are skipped otherwise. They
 do **not** depend on torch_tpu or the SGLang server runtime.
@@ -278,7 +280,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         ref_kwargs = {
             k: v
             for k, v in kernel_kwargs.items()
-            if k in ("sliding_window", "soft_cap", "xai_temperature_len")
+            if k in ("causal", "sliding_window", "soft_cap", "xai_temperature_len")
         }
         # fp8 KV cache: feed the same per-tensor scales to both impls so each
         # dequantizes the (identical) fp8 K/V the same way. ``None`` for the
@@ -463,6 +465,121 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
                     4, (2, 2, 2), inputs["new_v"].at[3].set(100), **features
                 )
                 np.testing.assert_array_equal(changed[:3], static[:3])
+
+    # ------------------------------------------------------------------ #
+    # Bidirectional attention (causal=0 without a custom mask).
+    # ------------------------------------------------------------------ #
+
+    def test_bidirectional_decode_query_size_matches_reference(self):
+        """Every row of a fixed-width block sees the whole block."""
+        import jax.numpy as jnp
+
+        for width in (1, 4, 8, 16):
+            for kv_dtype in (jnp.bfloat16, jnp.float8_e4m3fn):
+                with self.subTest(width=width, kv_dtype=kv_dtype):
+                    inputs = self._build_inputs(
+                        [(16 + width, width), (31 + width, width)],
+                        num_kv_heads=2,
+                        noncontiguous_pages=True,
+                        kv_dtype=kv_dtype,
+                        k_scale=0.5,
+                        v_scale=0.25,
+                    )
+                    self._run_and_compare(
+                        inputs,
+                        distribution=(2, 2, 2),
+                        causal=0,
+                        decode_query_size=width,
+                    )
+
+    def test_bidirectional_sliding_window(self):
+        """The window drops old keys but never future block keys."""
+        for window in (5, 20):
+            with self.subTest(window=window):
+                inputs = self._build_inputs(
+                    [(24, 8), (47, 8)], noncontiguous_pages=True
+                )
+                self._run_and_compare(
+                    inputs,
+                    distribution=(2, 2, 2),
+                    causal=0,
+                    decode_query_size=8,
+                    sliding_window=window,
+                )
+
+    def test_bidirectional_mixed_range(self):
+        """Ragged rows fall back to MIXED and stay bidirectional."""
+        inputs = self._build_inputs([(19, 3), (37, 8)], noncontiguous_pages=True)
+        self._run_and_compare(
+            inputs, distribution=(2, 2, 2), causal=0, decode_query_size=8
+        )
+        inputs = self._build_inputs([(33, 8)])
+        self._run_and_compare(inputs, distribution=(0, 0, 1), causal=0)
+
+    def test_bidirectional_matches_all_ones_custom_mask(self):
+        """No-mask bidirectional equals the custom-mask path with all ones,
+        and differs from causal on the earlier rows of the block."""
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+
+        seqs = [(24, 8), (47, 8)]
+        inputs = self._build_inputs(seqs, noncontiguous_pages=True)
+
+        def run(causal, custom_mask=None):
+            out, _ = ragged_paged_attention(
+                inputs["q"].copy(),
+                inputs["new_k"].copy(),
+                inputs["new_v"].copy(),
+                inputs["kv_fused"].copy(),
+                inputs["kv_lens"],
+                inputs["page_indices_flat"],
+                inputs["cu_q_lens"],
+                inputs["cu_kv_lens"],
+                jnp.array((2, 2, 2), jnp.int32),
+                custom_mask,
+                None,
+                causal=causal,
+                sm_scale=1.0 / np.sqrt(self.HEAD_DIM),
+                decode_query_size=8,
+            )
+            return np.asarray(out[:16]).astype(np.float32)
+
+        ones = jnp.ones((sum(q * kv for kv, q in seqs) + 1,), jnp.int32)
+        bidirectional = run(0)
+        np.testing.assert_allclose(bidirectional, run(0, ones), atol=0.05, rtol=0.05)
+        causal = run(1)
+        # The last row of each block already sees the whole block.
+        np.testing.assert_allclose(
+            bidirectional[[7, 15]], causal[[7, 15]], atol=0.05, rtol=0.05
+        )
+        self.assertGreater(np.abs(bidirectional[0] - causal[0]).max(), 0.1)
+
+    def test_custom_mask_requires_noncausal(self):
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+
+        inputs = self._build_inputs([(24, 8)])
+        with self.assertRaisesRegex(ValueError, "custom_mask requires causal=0"):
+            ragged_paged_attention(
+                inputs["q"],
+                inputs["new_k"],
+                inputs["new_v"],
+                inputs["kv_fused"],
+                inputs["kv_lens"],
+                inputs["page_indices_flat"],
+                inputs["cu_q_lens"],
+                inputs["cu_kv_lens"],
+                jnp.array((1, 1, 1), jnp.int32),
+                jnp.ones((24 * 8 + 1,), jnp.int32),
+                None,
+                causal=1,
+            )
 
     # ------------------------------------------------------------------ #
     # Original two cases — kept (single seq), now via the multi-seq helper.

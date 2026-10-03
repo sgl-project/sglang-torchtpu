@@ -44,6 +44,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_spec
@@ -166,6 +167,7 @@ class InvokeKernelFn(Protocol):
         k_scale,
         v_scale,
         decode_query_size: int = 1,
+        use_causal_mask: bool = True,
     ) -> tuple: ...
 
 
@@ -282,6 +284,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         v_scale: float | None = None,
         decode_query_size: int = 1,
         prefill_kv_tile_hint: jax.Array | None = None,
+        use_causal_mask: bool = True,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -312,6 +315,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             k_scale=k_scale,
             v_scale=v_scale,
             decode_query_size=decode_query_size,
+            use_causal_mask=use_causal_mask,
             **hint_options,
         )
 
@@ -320,8 +324,8 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
         # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
-        # 15=decode_query_size.
-        static_argnums=(10, 11, 12, 13, 14, 15),
+        # 15=decode_query_size, 17=use_causal_mask.
+        static_argnums=(10, 11, 12, 13, 14, 15, 17),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -350,6 +354,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         v_scale: float | None = None,
         decode_query_size: int = 1,
         prefill_kv_tile_hint: torch.Tensor | None = None,
+        use_causal_mask: bool = True,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -370,6 +375,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 v_scale,
                 decode_query_size,
                 prefill_kv_tile_hint,
+                use_causal_mask,
             )
         return output
 
@@ -1045,6 +1051,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             page_indices = self.forward_metadata.page_indices
 
         soft_cap = layer.logit_cap if getattr(layer, "logit_cap", 0) else None
+        # Same rule as the other attention backends; DFlash draft layers are
+        # ENCODER_ONLY and attend bidirectionally within the block.
+        use_causal_mask = not (
+            layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY
+        )
 
         # fp8 KV cache: quantize new K/V to fp8 here (the kernel writes them to
         # the fp8 cache itself and reads them back for the current tokens), and
@@ -1084,6 +1095,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k_scale,
             v_scale,
             self.forward_metadata.decode_query_size,
+            use_causal_mask=use_causal_mask,
         )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)

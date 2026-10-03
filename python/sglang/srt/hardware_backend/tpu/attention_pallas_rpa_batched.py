@@ -83,7 +83,13 @@ def _invoke_batched_kernel(
     k_scale,
     v_scale,
     decode_query_size=1,
+    use_causal_mask=True,
 ):
+    if not use_causal_mask:
+        raise NotImplementedError(
+            "pallas_tpu_rpa_batched supports only causal attention; "
+            "use pallas_tpu_rpa_v3."
+        )
     # cu_kv_lens and attention_sink are not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
     # the two arguments the shared shell passes for kernels that do are

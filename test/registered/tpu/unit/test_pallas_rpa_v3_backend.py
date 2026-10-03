@@ -45,6 +45,7 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
 )
 from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.test_utils import CustomTestCase
@@ -136,7 +137,7 @@ def _build_meta(backend, fb) -> PallasForwardMetadata:
 class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
     """The shared adapter translates SGLang window spans for RPA kernels."""
 
-    def _forward_with_window(self, sliding_window_size):
+    def _forward_with_window(self, sliding_window_size, **layer_attrs):
         backend = _BackendUnderTest(
             page_size=16,
             req_to_token=_build_req_to_token(num_reqs=1, max_context_len=16),
@@ -174,8 +175,10 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             k_scale,
             v_scale,
             decode_query_size=1,
+            use_causal_mask=True,
         ):
             captured["sliding_window"] = sliding_window
+            captured["use_causal_mask"] = use_causal_mask
             return torch.zeros_like(q)
 
         backend._op = recording_op
@@ -189,7 +192,10 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             sliding_window_size=sliding_window_size,
             logit_cap=0,
             scaling=1.0,
+            is_cross_attention=False,
+            attn_type=AttentionType.DECODER,
         )
+        vars(layer).update(layer_attrs)
         forward_batch = types.SimpleNamespace(
             spec_info=None,
             capture_hidden_mode=None,
@@ -202,6 +208,7 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             layer=layer,
             forward_batch=forward_batch,
         )
+        self._captured = captured
         return captured["sliding_window"]
 
     def test_positive_window_is_converted_to_total_token_count(self):
@@ -211,6 +218,16 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
         for sliding_window_size in (None, 0, -1):
             with self.subTest(sliding_window_size=sliding_window_size):
                 self.assertIsNone(self._forward_with_window(sliding_window_size))
+
+    def test_attention_type_selects_causal_mask(self):
+        for attrs, use_causal_mask in (
+            ({}, True),
+            ({"attn_type": AttentionType.ENCODER_ONLY}, False),
+            ({"is_cross_attention": True}, False),
+        ):
+            with self.subTest(attrs=attrs):
+                self._forward_with_window(7, **attrs)
+                self.assertIs(self._captured["use_causal_mask"], use_causal_mask)
 
 
 class TestPallasRpaV3MetadataDecode(CustomTestCase):
@@ -742,6 +759,7 @@ class TestFixedWidthAsDecode(CustomTestCase):
             k_scale,
             v_scale,
             decode_query_size=1,
+            use_causal_mask=True,
         ):
             captured["width"] = decode_query_size
 
@@ -766,6 +784,7 @@ class TestFixedWidthAsDecode(CustomTestCase):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 decode_query_size=decode_query_size,
+                use_causal_mask=use_causal_mask,
             )
             return torch.zeros_like(q)
 
@@ -780,6 +799,8 @@ class TestFixedWidthAsDecode(CustomTestCase):
             sliding_window_size=None,
             logit_cap=0,
             scaling=1.0,
+            is_cross_attention=False,
+            attn_type=AttentionType.DECODER,
         )
         num_tokens = int(backend.forward_metadata.cu_q_lens[-1])
         backend._forward(
