@@ -107,6 +107,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_staging = False
         self.gracefully_exit = False
         self.kv_checksum_computer = None
+        self.kv_free_fence = None
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=PAGE_SIZE, translate_kv_indices_for_transfer=lambda kv: kv
         )
