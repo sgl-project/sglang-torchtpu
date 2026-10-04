@@ -28,6 +28,7 @@ from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
@@ -1012,8 +1013,14 @@ class CompiledForwardShim:
             forward_batch.mm_input_embeds = mm_embeds
 
         def finish(result: Any) -> Any:
-            # Re-attach the embeds the graph did not see; the async path lands here too.
-            if mm_embeds is not None and result.mm_input_embeds is None:
+            # Re-attach the embeds the graph did not see. Only a logits output
+            # carries them; a hidden-state boundary (Gemma4, Qwen3.5) leaves
+            # them on the batch for the wrapper's eager tail.
+            if (
+                mm_embeds is not None
+                and isinstance(result, LogitsProcessorOutput)
+                and result.mm_input_embeds is None
+            ):
                 result.mm_input_embeds = mm_embeds
             return self._finish_forward(result, forward_batch, wants_input_logprob)
 
