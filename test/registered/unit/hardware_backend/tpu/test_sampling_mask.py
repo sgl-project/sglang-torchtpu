@@ -84,6 +84,20 @@ class TestFilterProbsOpMatchesSortReference(CustomTestCase):
         )
         np.testing.assert_array_equal(actual, expected)
 
+    def test_rows_off_the_power_of_two_bucket_match_reference(self):
+        """Row counts between buckets are padded with ghost rows for the op and
+        sliced back, so the caller sees its own shape and unchanged values."""
+        rng = np.random.default_rng(23)
+        for batch_size in (1, 3, 5, 13):
+            probs = _random_rows(rng, batch_size=batch_size, vocab_size=256)
+            top_ks = rng.integers(1, 200, size=batch_size).astype(np.int32)
+            top_ps = rng.uniform(0.1, 0.99, size=batch_size).astype(np.float32)
+            min_ps = rng.uniform(0.0, 0.3, size=batch_size).astype(np.float32)
+            with self.subTest(batch_size=batch_size):
+                actual = _filter_on_tpu(probs, top_ks, top_ps, min_ps, 1, 1, 1)
+                self.assertEqual(actual.shape, probs.shape)
+                self._assert_matches_reference(probs, top_ks, top_ps, min_ps, 1, 1, 1)
+
     def test_randomized_mixed_filters_match_sort_reference(self):
         rng = np.random.default_rng(17)
         for trial in range(5):
@@ -273,6 +287,19 @@ class TestEagleVerifyRenorm(CustomTestCase):
         probs = torch.tensor([[0.4, 0.2, 0.2, 0.2]])
         actual = top_k_renorm_prob_tpu(probs.to("tpu"), torch.tensor([2]).to("tpu"))
         torch.testing.assert_close(actual.cpu(), probs)
+
+
+class TestRowBucket(CustomTestCase):
+    """The filter op compiles per shape; rows round up to a power of two so a
+    batch draining one request at a time compiles log2(bs) times, not bs."""
+
+    def test_rounds_up_to_the_next_power_of_two(self):
+        from sglang.srt.hardware_backend.tpu.sampling_mask import row_bucket
+
+        self.assertEqual(
+            [row_bucket(n) for n in (0, 1, 2, 3, 5, 8, 9, 63, 64, 65)],
+            [1, 1, 2, 4, 8, 8, 16, 64, 64, 128],
+        )
 
 
 if __name__ == "__main__":

@@ -131,6 +131,11 @@ def _get_tpu_filter_probs_op() -> Callable:
     return op
 
 
+def row_bucket(rows: int) -> int:
+    """Smallest power of two >= rows (1 for an empty batch)."""
+    return 1 << max(rows - 1, 0).bit_length()
+
+
 def tpu_filter_probs(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -147,12 +152,28 @@ def tpu_filter_probs(
         raise ValueError(f"tpu_filter_probs requires a TPU tensor, got {probs.device}")
     if probs.ndim != 2:
         raise ValueError(f"tpu_filter_probs expects a 2D tensor, got {probs.shape}")
-    return _get_tpu_filter_probs_op()(
-        probs.float(),
-        top_ks.to(torch.int32),
-        top_ps.float(),
-        min_ps.float(),
+    # The exported op compiles once per argument shape, inside the decode step;
+    # power-of-two row buckets keep a draining batch at log2(bs) compiles.
+    # Ghost rows: zero probs, k=0 (clipped to 1), top_p=1, min_p=0.
+    rows = probs.shape[0]
+    bucket = row_bucket(rows)
+    probs = probs.float()
+    top_ks = top_ks.to(torch.int32)
+    top_ps = top_ps.float()
+    min_ps = min_ps.float()
+    if bucket != rows:
+        pad = bucket - rows
+        probs = torch.cat([probs, probs.new_zeros((pad, probs.shape[1]))])
+        top_ks = torch.cat([top_ks, top_ks.new_zeros(pad)])
+        top_ps = torch.cat([top_ps, top_ps.new_ones(pad)])
+        min_ps = torch.cat([min_ps, min_ps.new_zeros(pad)])
+    filtered = _get_tpu_filter_probs_op()(
+        probs,
+        top_ks,
+        top_ps,
+        min_ps,
         int(need_top_k),
         int(need_top_p),
         int(need_min_p),
     )
+    return filtered[:rows] if bucket != rows else filtered
