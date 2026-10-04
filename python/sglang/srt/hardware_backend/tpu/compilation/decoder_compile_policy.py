@@ -31,6 +31,9 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _restore_forward_batch_inputs,
     build_bucketers,
 )
+from sglang.srt.hardware_backend.tpu.compilation.frame_stack import (
+    call_with_reserved_frame_stack,
+)
 from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -1214,9 +1217,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 and self._supports_async_warmup()
                 and async_warmup is not None
             ):
-                out = self.owner.forward.warmup_async(*args, **kwargs)
+                out = call_with_reserved_frame_stack(
+                    self.owner.forward.warmup_async, *args, **kwargs
+                )
             else:
-                out = entry.forward(*args, **kwargs)
+                out = call_with_reserved_frame_stack(entry.forward, *args, **kwargs)
             if isinstance(out, PendingCall):
                 return out.then(
                     lambda result: _materialize_out(
