@@ -36,7 +36,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
-from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, LogitsOutputMode
 from sglang.srt.model_executor.runner import eager_runner as eager_runner_module
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1069,6 +1069,88 @@ class TestTpuTopKLayout(CustomTestCase):
         self.assertEqual(values.dtype, torch.float32)
         self.assertEqual(ids.shape, (0, 64))
         self.assertEqual(ids.dtype, torch.int32)
+
+
+class TestTpuLmHeadRowBuckets(CustomTestCase):
+    """The LM head runs eagerly on TPU for the multimodal wrappers, and each new
+    row count compiles a fresh program (Gemma4 and Qwen3.5 stalled 40-100 s at
+    every batch size of a draining batch). Rows pad to a power of two for the
+    matmul and the caller still gets its own row count back."""
+
+    def test_rows_pad_to_a_power_of_two_for_the_matmul(self):
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        processor.use_fp32_lm_head = False
+        processor.rl_on_policy_target = None
+        torch.manual_seed(0)
+        hidden = torch.randn(5, 16)
+        lm_head = SimpleNamespace(weight=torch.randn(32, 16))
+        seen = []
+        original = LogitsProcessor._compute_lm_head_rows
+
+        def record(self_, hidden_states, head, bias=None):
+            seen.append(tuple(hidden_states.shape))
+            return original(self_, hidden_states, head, bias)
+
+        with (
+            patch.object(logits_processor_module, "_is_tpu", True),
+            patch.object(LogitsProcessor, "_compute_lm_head_rows", record),
+        ):
+            logits = processor._compute_lm_head(hidden, lm_head)
+
+        self.assertEqual(seen, [(8, 16)])
+        self.assertEqual(tuple(logits.shape), (5, 32))
+        torch.testing.assert_close(logits, hidden @ lm_head.weight.T)
+
+        with patch.object(logits_processor_module, "_is_tpu", False):
+            direct = processor._compute_lm_head(hidden, lm_head)
+        torch.testing.assert_close(direct, logits)
+
+    def test_get_logits_pads_through_the_softcap_and_slices_back(self):
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        processor.use_fp32_lm_head = False
+        processor.rl_on_policy_target = None
+        processor.do_tensor_parallel_all_gather_dp_attn = False
+        processor.do_tensor_parallel_all_gather = False
+        processor.logit_scale = None
+        processor.final_logit_softcapping = 30.0
+        processor.vocab_size = 32
+        torch.manual_seed(1)
+        hidden = torch.randn(5, 16)
+        lm_head = SimpleNamespace(weight=torch.randn(32, 16))
+        metadata = SimpleNamespace(
+            next_token_logits_buffer=None, forward_mode=ForwardMode.DECODE
+        )
+        seen = []
+        original = LogitsProcessor._compute_lm_head_rows
+
+        def record(self_, hidden_states, head, bias=None):
+            seen.append(tuple(hidden_states.shape))
+            return original(self_, hidden_states, head, bias)
+
+        scoped = MagicMock()
+        scoped.scoped.return_value.__enter__ = lambda *a: None
+        scoped.scoped.return_value.__exit__ = lambda *a: None
+        with (
+            patch.object(logits_processor_module, "_is_tpu", True),
+            patch.object(logits_processor_module, "get_forward", return_value=scoped),
+            patch.object(
+                logits_processor_module,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_size=1, attn_dp_size=1),
+            ),
+            patch.object(
+                LogitsProcessor,
+                "_gather_dp_attn_hidden_states",
+                lambda self_, h, m: (h, h),
+            ),
+            patch.object(LogitsProcessor, "_compute_lm_head_rows", record),
+        ):
+            logits = processor._get_logits(hidden, lm_head, metadata)
+
+        self.assertEqual(seen, [(8, 16)])
+        self.assertEqual(tuple(logits.shape), (5, 32))
+        expected = 30.0 * torch.tanh((hidden @ lm_head.weight.T).float() / 30.0)
+        torch.testing.assert_close(logits, expected)
 
 
 if __name__ == "__main__":
