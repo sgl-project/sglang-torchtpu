@@ -224,6 +224,21 @@ class TestGatheredBlockFilterEquivalence(CustomTestCase):
                 ):
                     np.testing.assert_array_equal(row_full, row_block)
 
+    def test_top_k_rows_off_the_power_of_two_bucket_match_torch(self):
+        """Row counts between buckets are padded for the exported TopK op and
+        sliced back, so the caller sees its own shape, values and indices."""
+        from sglang.srt.hardware_backend.tpu.top_k import tpu_top_k
+
+        rng = np.random.default_rng(29)
+        for batch_size in (1, 3, 5, 13):
+            probs = _random_rows(rng, batch_size=batch_size, vocab_size=512)
+            with self.subTest(batch_size=batch_size):
+                values, ids = tpu_top_k(torch.from_numpy(probs).to("tpu"), 7)
+                expected = torch.topk(torch.from_numpy(probs), 7, dim=-1)
+                self.assertEqual(tuple(values.shape), (batch_size, 7))
+                torch.testing.assert_close(values.cpu(), expected.values)
+                self.assertEqual(ids.cpu().tolist(), expected.indices.tolist())
+
 
 @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
 class TestEagleVerifyRenorm(CustomTestCase):

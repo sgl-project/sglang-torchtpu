@@ -369,7 +369,18 @@ def tpu_top_k(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]
         raise ValueError(f"tpu_top_k expects a 2D tensor, got shape {values.shape}")
     if not 0 < k <= values.shape[-1]:
         raise ValueError(f"k must be in [1, {values.shape[-1]}], got {k}")
-    return _get_tpu_top_k_op()(values, k)
+    from sglang.srt.hardware_backend.tpu.sampling_mask import row_bucket
+
+    # The exported op compiles once per argument shape, inside the decode step;
+    # power-of-two row buckets keep a draining batch at log2(bs) compiles.
+    rows = values.shape[0]
+    bucket = row_bucket(rows)
+    if bucket != rows:
+        values = torch.cat([values, values.new_zeros((bucket - rows, values.shape[1]))])
+    top_values, top_ids = _get_tpu_top_k_op()(values, k)
+    if bucket != rows:
+        return top_values[:rows], top_ids[:rows]
+    return top_values, top_ids
 
 
 def register_tpu_top_k_ops() -> None:
