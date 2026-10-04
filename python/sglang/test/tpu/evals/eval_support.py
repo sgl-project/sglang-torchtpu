@@ -712,9 +712,9 @@ GEMMA4_31B = {
 }
 
 QWEN3_5_397B = {
-    "served_model_name": "/weights/Qwen3.5-397B-A17B",
+    "served_model_name": "Qwen/Qwen3.5-397B-A17B-FP8",
     "display_name": "Qwen3.5 397B-A17B",
-    "variant": "2host-TP16+EP16-bf16",
+    "variant": "TP8+EP8-fp8",
     "config_module": "recipe/configs/qwen3_5_397b/server.py",
     "sampling": {
         "max_tokens": 32768,

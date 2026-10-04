@@ -233,6 +233,7 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-gemma4-26b-a4b-aime",
         "nightly-tpu-accuracy-gemma4-26b-a4b-gpqa",
         "nightly-tpu-accuracy-gemma4-26b-a4b-mmmupro",
+        "nightly-tpu-accuracy-qwen3-5-397b-mmmupro",
         "nightly-tpu-accuracy-gpt-oss-120b-aime",
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",

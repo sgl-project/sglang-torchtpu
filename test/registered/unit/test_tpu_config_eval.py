@@ -87,9 +87,9 @@ class TestAccuracyRecipes(unittest.TestCase):
         "recipe/configs/deepseek_r1_0528/accuracy.py",
         "recipe/configs/deepseek_v3_1/accuracy.py",
         "recipe/configs/kimi_k26/mmmu.py",
-        "recipe/configs/qwen3_5_397b/server.py",
     )
     SINGLE_HOST = (
+        "recipe/configs/qwen3_5_397b/server.py",
         "recipe/configs/gpt_oss_20b/accuracy.py",
         "recipe/configs/gemma4_31b/accuracy.py",
         "recipe/configs/gemma4_26b_a4b/accuracy.py",

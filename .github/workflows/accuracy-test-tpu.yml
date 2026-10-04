@@ -20,7 +20,7 @@ on:
   schedule:
     - cron: "0 10 * * *"  # mmmu-kimi: both Kimi shards, one 2-host slice each
       timezone: "America/Los_Angeles"
-    - cron: "0 17 * * *"  # mmmu-gemma4-qwen35: two 1-host slices and one 2-host slice
+    - cron: "0 17 * * *"  # mmmu-gemma4-qwen35: three 1-host slices
       timezone: "America/Los_Angeles"
   workflow_dispatch:
     inputs:
@@ -234,6 +234,30 @@ jobs:
       hosts: 1
       suite: ${{ matrix.suite }}
       run_name: ${{ matrix.run_name }}
+      nightly: true
+      weights_pvc: model-weights
+      timeout_per_file: 10800
+    permissions:
+      contents: read
+      id-token: write
+
+  # The 5 PM slot with the Gemma4 MMMU-Pro legs. FP8 checkpoint on one host:
+  # the bf16 one needs two. Measured 2 h 16 min for the full set at 128
+  # concurrent requests on bf16/tp16.
+  accuracy-qwen3-5-mmmupro:
+    needs: [build, plan]
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","full-set","qwen3-5-397b","mmmu-gemma4-qwen35"]'), needs.plan.outputs.model) }}
+    name: nightly-tpu-accuracy-qwen3-5-397b-mmmupro
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: nightly-tpu-accuracy-qwen3-5-397b-mmmupro
+      run_name: accuracy-qwen3-5-397b-mmmupro
       nightly: true
       weights_pvc: model-weights
       timeout_per_file: 10800
