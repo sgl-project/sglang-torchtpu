@@ -41,7 +41,9 @@ CONFIG["server_args"].update(
         "max_prefill_tokens": PREFILL_TOKENS,
         "tpu_compile_tokens": [4096],
         "tpu_compile_bs": [1, 16, 32, 64, 128],
-        "mem_fraction_static": 0.88,
+        # 0.88 left 6.9 GB per core after a 45.8 GB pool and the extend precompile
+        # could not load an 827 MB program (run 37242007042, main's W4A16 path).
+        "mem_fraction_static": 0.85,
         "trust_remote_code": True,
         "skip_server_warmup": True,
         "scheduler_recv_interval": 8,
