@@ -182,10 +182,10 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                 )
             ]
 
-        self.assertEqual(rejected(1535), [])
         # The fresh tail holds less than a window before the insert boundary.
-        self.assertEqual(rejected(1000), list(range(4585, 4608)))
-        self.assertEqual(rejected(1535, eagle=True), [4096])
+        self.assertEqual(rejected(1535), [4607])
+        self.assertEqual(rejected(1000), list(range(4584, 4608)))
+        self.assertEqual(rejected(1535, eagle=True), [4096, 4607])
         self.assertEqual(rejected(1535, hicache=True), list(fill_lens))
         self.assertEqual(rejected(1535, tail_prealloc=False), list(fill_lens))
 

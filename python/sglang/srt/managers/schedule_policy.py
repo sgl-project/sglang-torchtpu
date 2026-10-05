@@ -218,11 +218,17 @@ def match_prefix_for_req(
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
+    ignore_swa_kv_miss: bool = False,
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
     match_result = _match_prefix_result(
-        tree_cache, req, token_ids, cow_mamba=cow_mamba, include_req=include_req
+        tree_cache,
+        req,
+        token_ids,
+        cow_mamba=cow_mamba,
+        include_req=include_req,
+        ignore_swa_kv_miss=ignore_swa_kv_miss,
     )
     (
         req.prefix_indices,
