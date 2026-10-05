@@ -85,6 +85,25 @@ def max_extend_tokens(*, context_len: int) -> int:
     )
 
 
+def sync_mrope_positions_to_positions(forward_batch: ForwardBatch) -> None:
+    """Rebuild mrope positions after a DP idle rank's positions were replaced.
+
+    The materialized rows are dummies, so text-style [3, N] positions are
+    enough; a stale width would break the compiled graph's input shape.
+    """
+    mrope_positions = getattr(forward_batch, "mrope_positions", None)
+    if (
+        mrope_positions is not None
+        and mrope_positions.shape[-1] != forward_batch.positions.shape[0]
+    ):
+        forward_batch.mrope_positions = (
+            forward_batch.positions.to(mrope_positions.dtype)
+            .unsqueeze(0)
+            .expand(3, -1)
+            .contiguous()
+        )
+
+
 def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
     """Sync returned tensors and backend-marked KV side effects.
 
@@ -935,6 +954,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch.positions = torch.arange(
             num_tokens, dtype=torch.int64, device=device
         )
+        sync_mrope_positions_to_positions(forward_batch)
         if isinstance(forward_batch.out_cache_loc, torch.Tensor):
             forward_batch.out_cache_loc = torch.zeros(
                 num_tokens,
@@ -1465,22 +1485,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
-
-    def install(self) -> bool:
-        # This policy is attached to the shared backbone (`Qwen3_5ForCausalLM`),
-        # not to a wrapper, so the TEXT-ONLY entry (`Qwen3_5TextForCausalLM`)
-        # gets it too. It only diverges from the plain decoder policy on the VL
-        # input_embeds path, so the DP restriction -- which is a property of that
-        # path -- must be gated the same way. Raising unconditionally blocked DP
-        # attention for text-only serving, where none of the VL machinery runs.
-        outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        if is_multimodal and is_dp_attention_enabled():
-            raise NotImplementedError(
-                "Qwen3-VL TPU decoder compilation does not support DP attention; "
-                "disable --enable-torch-compile for this configuration."
-            )
-        return super().install()
 
     @property
     def _num_deepstack(self) -> int:

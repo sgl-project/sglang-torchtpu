@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _get_hbm_usage_mb,
     _hbm_delta_str,
     _materialize_out,
+    sync_mrope_positions_to_positions,
 )
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
@@ -524,6 +525,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             rows, dtype=forward_batch.input_ids.dtype, device=device
         )
         forward_batch.positions = torch.zeros(rows, dtype=torch.int64, device=device)
+        sync_mrope_positions_to_positions(forward_batch)
         if isinstance(forward_batch.out_cache_loc, torch.Tensor):
             forward_batch.out_cache_loc = torch.zeros(
                 rows, dtype=forward_batch.out_cache_loc.dtype, device=device
@@ -579,6 +581,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         forward_batch.positions = torch.arange(
             max_tokens, dtype=torch.int64, device=device
         )
+        sync_mrope_positions_to_positions(forward_batch)
         if isinstance(getattr(forward_batch, "out_cache_loc", None), torch.Tensor):
             forward_batch.out_cache_loc = torch.zeros(
                 max_tokens,

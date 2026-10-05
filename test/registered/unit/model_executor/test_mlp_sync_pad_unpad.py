@@ -243,6 +243,39 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             global_top_k_output.next_token_global_top_k_token_ids.shape[0], 2
         )
 
+    def _idle_batch(self) -> ForwardBatch:
+        return ForwardBatch(
+            forward_mode=ForwardMode.IDLE,
+            batch_size=0,
+            input_ids=torch.empty(0, dtype=torch.int64),
+            req_pool_indices=torch.empty(0, dtype=torch.int64),
+            seq_lens=torch.empty(0, dtype=torch.int64),
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
+            seq_lens_sum=0,
+            positions=torch.empty(0, dtype=torch.int64),
+        )
+
+    def test_idle_rank_gets_mrope_positions_for_mrope_models(self):
+        # MAX_LEN DP padding gives an idle rank rows, so an mrope model's
+        # rotary runs on them; init_new never built mrope_positions for IDLE.
+        runner = _mock_model_runner()
+        runner.model_config.model_is_mrope = True
+        fb = self._idle_batch()
+        fb._pad_inputs_to_size(runner, num_tokens=8, bs=2)
+        self.assertEqual(tuple(fb.mrope_positions.shape), (3, 8))
+        self.assertEqual(fb.mrope_positions.dtype, torch.int64)
+
+    def test_idle_rank_leaves_mrope_positions_unset_for_other_models(self):
+        runner = _mock_model_runner()
+        runner.model_config.model_is_mrope = False
+        fb = self._idle_batch()
+        fb._pad_inputs_to_size(runner, num_tokens=8, bs=2)
+        self.assertIsNone(fb.mrope_positions)
+        # A MagicMock attribute is truthy but not True; it must not opt in.
+        fb = self._idle_batch()
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=8, bs=2)
+        self.assertIsNone(fb.mrope_positions)
+
     def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
         spec_info = MagicMock()
         spec_info.num_tokens_per_req = 4

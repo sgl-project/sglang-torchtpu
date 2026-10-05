@@ -987,39 +987,46 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             model.get_image_feature = lambda *args, **kwargs: None
         return Qwen3VLDecoderTpuCompilePolicy(model_runner=SimpleNamespace(model=model))
 
-    def test_rejects_dp_attention_at_multimodal_install(self):
-        policy = self._policy_for(multimodal=True)
+    def test_allows_dp_attention_at_install(self):
+        # DP idle ranks get mrope positions from ForwardBatch padding and the
+        # idle materializers, so neither the VL nor the text-only backbone
+        # needs to refuse DP attention.
+        for multimodal in (True, False):
+            with self.subTest(multimodal=multimodal):
+                policy = self._policy_for(multimodal=multimodal)
+                with (
+                    patch(
+                        "sglang.srt.hardware_backend.tpu.compilation."
+                        "decoder_compile_policy.is_dp_attention_enabled",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        DecoderTpuCompilePolicy, "install", return_value=True
+                    ) as base_install,
+                ):
+                    self.assertTrue(policy.install())
+                base_install.assert_called_once()
 
-        with (
-            patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
-                return_value=True,
-            ),
-            self.assertRaisesRegex(
-                NotImplementedError, "does not support DP attention"
-            ),
-        ):
-            policy.install()
+    def test_idle_extend_materialization_resizes_mrope_positions(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            seq_lens=torch.zeros(0, dtype=torch.int64),
+            seq_lens_cpu=None,
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int64),
+            mrope_positions=torch.zeros(3, 4, dtype=torch.int64),
+            out_cache_loc=None,
+            req_pool_indices=torch.zeros(0, dtype=torch.int64),
+            req_pool_indices_cpu=None,
+        )
 
-    def test_allows_dp_attention_at_text_only_install(self):
-        # This policy is also attached to the text-only backbone, where none of
-        # the VL machinery the DP restriction covers is reachable.
-        policy = self._policy_for(multimodal=False)
+        self.assertTrue(policy.materialize_dp_idle_extend(forward_batch, 8))
 
-        with (
-            patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
-                return_value=True,
-            ),
-            patch.object(
-                DecoderTpuCompilePolicy, "install", return_value=True
-            ) as base_install,
-        ):
-            self.assertTrue(policy.install())
-
-        base_install.assert_called_once()
+        self.assertEqual(tuple(forward_batch.mrope_positions.shape), (3, 8))
+        torch.testing.assert_close(
+            forward_batch.mrope_positions[1], forward_batch.positions
+        )
 
     def test_restores_extend_metadata_before_logits_processing(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
@@ -3021,6 +3028,30 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
         self.assertTrue(spec_info.keep_outputs_padded)
         self.assertEqual(forward_batch.req_pool_indices.tolist(), [0, 0])
         self.assertEqual(forward_batch.req_pool_indices_cpu.tolist(), [0, 0])
+
+    def test_dp_idle_draft_extend_resizes_mrope_positions(self):
+        policy = _make_spec_policy(bs_buckets=(1, 4))
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            _original_forward_mode=None,
+            spec_info=EagleDraftExtendInput(
+                hidden_states=torch.zeros((0, 16)),
+                num_tokens_per_req=4,
+                num_tokens_for_logprob_per_req=4,
+            ),
+            global_num_tokens_cpu=[0, 8],
+            input_ids=torch.empty((0,), dtype=torch.int64),
+            seq_lens=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices=torch.empty((0,), dtype=torch.int32),
+            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int32),
+            mrope_positions=torch.empty((3, 0), dtype=torch.int64),
+        )
+
+        with _dp_attention(True):
+            policy.normalize_spec_forward_batch(forward_batch)
+
+        self.assertEqual(tuple(forward_batch.mrope_positions.shape), (3, 8))
+        self.assertEqual(forward_batch.mrope_positions[0].tolist(), list(range(8)))
 
     def test_dp_idle_verify_relabels_as_target_verify(self):
         policy = _make_spec_policy(bs_buckets=(1, 4))

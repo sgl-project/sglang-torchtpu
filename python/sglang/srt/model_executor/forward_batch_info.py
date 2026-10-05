@@ -1877,6 +1877,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ],
                 dim=1,
             )
+        elif getattr(model_runner.model_config, "model_is_mrope", False) is True:
+            # IDLE batches skip mrope construction in init_new, but DP MAX_LEN
+            # padding (always on TPU) gives them rows, so attention runs and the
+            # mrope rotary needs [3, N]. The rows are padding; text-style
+            # positions are enough.
+            self.mrope_positions = (
+                self.positions.to(torch.int64).unsqueeze(0).expand(3, -1).contiguous()
+            )
 
         # Draft-extend padding uses the fixed per-request token width.
         dummy_extend_len = 0
