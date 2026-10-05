@@ -152,9 +152,8 @@ def tpu_filter_probs(
         raise ValueError(f"tpu_filter_probs requires a TPU tensor, got {probs.device}")
     if probs.ndim != 2:
         raise ValueError(f"tpu_filter_probs expects a 2D tensor, got {probs.shape}")
-    # The exported op compiles once per argument shape, inside the decode step;
-    # power-of-two row buckets keep a draining batch at log2(bs) compiles.
-    # Ghost rows: zero probs, k=0 (clipped to 1), top_p=1, min_p=0.
+    # The exported op compiles once per argument shape: bucket rows to a power
+    # of two. Ghost rows: zero probs, k=0 (clipped to 1), top_p=1, min_p=0.
     rows = probs.shape[0]
     bucket = row_bucket(rows)
     probs = probs.float()

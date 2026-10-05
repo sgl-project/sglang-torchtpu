@@ -241,9 +241,8 @@ jobs:
       contents: read
       id-token: write
 
-  # The 5 PM slot with the Gemma4 MMMU-Pro legs. FP8 checkpoint on one host:
-  # the bf16 one needs two. Measured 2 h 16 min for the full set at 128
-  # concurrent requests on bf16/tp16.
+  # The 5 PM slot with the Gemma4 MMMU-Pro legs. FP8 fits one host (bf16 needs
+  # two); the full set measured 2 h 22 min in CI.
   accuracy-qwen3-5-mmmupro:
     needs: [build, plan]
     if: >-

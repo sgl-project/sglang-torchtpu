@@ -43,6 +43,8 @@ class TestQwen35MMMUPro(AccuracyTestCase):
     config_module = CONFIG_MODULE
     model_path = "/weights/Qwen3.5-397B-A17B-FP8"
     tag = "qwen3-5-mmmupro-e2e"
+    # One host at tp8: the FP8 bring-up measured 42-44 min in CI.
+    health_timeout = 3600
 
     @classmethod
     def build_model_config(cls):

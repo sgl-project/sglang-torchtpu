@@ -59,9 +59,8 @@ MODEL_CONFIG = {
                 }
             ],
             "bench_env": {
-                # random-ids + exact input_ids, matching the InferenceX harness
-                # the published TPU numbers come from; a tokenizer round-trip
-                # would otherwise move the real ISL.
+                # random-ids + exact input_ids, as the InferenceX harness sends them;
+                # a tokenizer round-trip would move the real ISL.
                 "DATASET_NAME": "random-ids",
                 "TOKENIZE_PROMPT": "1",
                 # Tokenizer from the local checkpoint (no HF fetch in the pod);
