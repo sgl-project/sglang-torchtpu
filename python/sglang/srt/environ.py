@@ -1895,9 +1895,6 @@ class Envs:
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
     # and tune from there.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
-    # xprof scope per task. Values <= 0 trace all chips or SparseCores.
-    SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
-    SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
     # xprof python tracer. Off by default: it dominates host busy time.
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # raiden KV-offload backend
@@ -2076,6 +2073,16 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
         note="The unified radix tree is the default tree cache now; unset this env."
+    ),
+    # The xprof trace backend reads only the three tracer levels; the chip and
+    # SparseCore keys never reached libtpu, so these never did anything.
+    "SGLANG_TPU_PROFILE_NUM_CHIPS": _DeprecatedEnv(
+        note="xprof captures cannot be narrowed to fewer chips on this torch_tpu; "
+        "the option never reached the trace backend."
+    ),
+    "SGLANG_TPU_PROFILE_NUM_SPARSE_CORES": _DeprecatedEnv(
+        note="xprof captures cannot be narrowed to fewer SparseCores on this "
+        "torch_tpu; the option never reached the trace backend."
     ),
 }
 

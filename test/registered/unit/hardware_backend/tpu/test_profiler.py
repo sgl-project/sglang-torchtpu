@@ -58,52 +58,15 @@ def _fake_torch_tpu(profile_options_cls=_BaseProfileOptions, calls=None):
 
 
 class TestTpuProfileOptions(CustomTestCase):
-    def _options(
-        self,
-        *,
-        num_chips,
-        num_sparse_cores,
-        with_cpu=True,
-        profile_options_cls=_BaseProfileOptions,
-    ):
-        with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(num_sparse_cores),
-            patch.dict(sys.modules, _fake_torch_tpu(profile_options_cls)),
-        ):
+    def _options(self, *, with_cpu=True, profile_options_cls=_BaseProfileOptions):
+        with patch.dict(sys.modules, _fake_torch_tpu(profile_options_cls)):
             return _tpu_profile_options(with_cpu=with_cpu)
 
-    def test_limits_enabled(self):
-        options = self._options(num_chips=1, num_sparse_cores=2)
-
-        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
-        self.assertEqual(options.tpu_num_sparse_cores_to_trace, 2)
-        # Tile cap only kicks in at a single SparseCore; here 2 leaves it off.
-        self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
-        # Levels survive the narrowing subclass.
-        self.assertEqual(options.host_tracer_level, 2)
-        self.assertEqual(options.device_tracer_level, 1)
-
-    def test_single_sparse_core_narrows_to_one_tile(self):
-        options = self._options(num_chips=1, num_sparse_cores=1)
-
-        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
-        self.assertEqual(options.tpu_num_sparse_cores_to_trace, 1)
-        self.assertEqual(options.tpu_num_sparse_core_tiles_to_trace, 1)
-
-    def test_one_limit_disabled(self):
-        options = self._options(num_chips=4, num_sparse_cores=0)
-
-        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 4)
-        self.assertIsNone(options.tpu_num_sparse_cores_to_trace)
-        self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
-
-    def test_both_limits_disabled_traces_everything(self):
-        # No narrowing fields at all, so start_trace sends the levels alone.
-        options = self._options(num_chips=0, num_sparse_cores=-1)
-
+    def test_sends_only_the_three_levels(self):
+        # The trace backend reads host/device/python_tracer_level by name and
+        # drops every other key, so these are the whole payload.
         self.assertEqual(
-            dataclasses.asdict(options),
+            dataclasses.asdict(self._options()),
             {
                 "host_tracer_level": 2,
                 "device_tracer_level": 1,
@@ -112,42 +75,25 @@ class TestTpuProfileOptions(CustomTestCase):
         )
 
     def test_host_tracer_off_without_cpu(self):
-        # with_cpu was a no-op on the first cut of this PR: the levels went
-        # unset, and the backend default fills the host plane either way.
-        options = self._options(num_chips=1, num_sparse_cores=1, with_cpu=False)
+        # with_cpu was a no-op for one revision: the levels went unset, and the
+        # backend default fills the host plane either way.
+        options = self._options(with_cpu=False)
 
         self.assertEqual(options.host_tracer_level, 0)
         self.assertEqual(options.device_tracer_level, 1)
 
-    def test_python_tracer_off_by_default(self):
+    def test_python_tracer_opt_in(self):
         # torch_tpu's profile() sets python_tracer_level=1 whenever CPU
         # activity is on, at 4.9 s of host busy time against 0.36 s.
-        options = self._options(num_chips=1, num_sparse_cores=1)
-
-        self.assertEqual(options.python_tracer_level, 0)
-
-    def test_python_tracer_opt_in(self):
         with envs.SGLANG_TPU_PROFILE_PYTHON_TRACER.override(True):
-            options = self._options(num_chips=1, num_sparse_cores=1)
+            options = self._options()
 
         self.assertEqual(options.python_tracer_level, 1)
 
-    def test_non_dataclass_profile_options_degrades(self):
-        class _NotADataclass:
-            pass
-
-        # A torch_tpu that reshapes ProfileOptions must lose the narrowing, not
-        # break capture altogether.
-        self.assertIsNone(
-            self._options(
-                num_chips=1, num_sparse_cores=1, profile_options_cls=_NotADataclass
-            )
-        )
-
     def test_missing_profile_options_degrades(self):
-        self.assertIsNone(
-            self._options(num_chips=1, num_sparse_cores=1, profile_options_cls=None)
-        )
+        # A torch_tpu without ProfileOptions must fall back to the backend
+        # defaults, not break the capture.
+        self.assertIsNone(self._options(profile_options_cls=None))
 
 
 class TestStartStopUsesLibtpuTrace(CustomTestCase):
@@ -161,29 +107,21 @@ class TestStartStopUsesLibtpuTrace(CustomTestCase):
 
     def test_start_calls_start_trace_with_output_dir(self):
         calls = []
-        with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(0),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(0),
-            patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
-        ):
+        with patch.dict(sys.modules, _fake_torch_tpu(calls=calls)):
             trace = start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
 
         self.assertEqual([c[0] for c in calls], ["start"])
         self.assertEqual(calls[0][1], "/tmp/xprof-unit-test")
         self.assertEqual(trace.output_dir, Path("/tmp/xprof-unit-test"))
 
-    def test_start_forwards_narrowing_options(self):
+    def test_start_forwards_the_levels(self):
         calls = []
-        with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(1),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(1),
-            patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
-        ):
+        with patch.dict(sys.modules, _fake_torch_tpu(calls=calls)):
             start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
 
         options = calls[0][2]
-        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
-        self.assertEqual(options.tpu_num_sparse_core_tiles_to_trace, 1)
+        self.assertEqual(options.device_tracer_level, 1)
+        self.assertEqual(options.host_tracer_level, 2)
 
     def test_stop_calls_stop_trace(self):
         calls = []
