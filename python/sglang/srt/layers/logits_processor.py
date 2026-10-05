@@ -1091,13 +1091,12 @@ class LogitsProcessor(nn.Module):
             _trace_e2e_logits("pre_lm_head_sync_returned")
 
         _trace_e2e_logits("lm_head_enter", hidden_shape=tuple(hidden_states.shape))
-        # Eager on TPU, every op below compiles once per row count; a draining
-        # batch would compile at every size (40-100 s each on a 262k vocab).
-        # Power-of-two row buckets, sliced off at the return. Not under the DP
-        # attention gather: its scatter accounts rows per rank.
+        # Eager on TPU, each row count compiles its own program (40-100 s on a
+        # 262k vocab): bucket rows to a power of two, sliced back at the return.
         rows = hidden_states.shape[0]
         pad_rows = (
             _is_tpu
+            and not torch.compiler.is_compiling()
             and not self.do_tensor_parallel_all_gather_dp_attn
             and hidden_states.ndim == 2
         )
@@ -1203,11 +1202,10 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if _is_tpu and hidden_states.ndim == 2:
+        if _is_tpu and hidden_states.ndim == 2 and not torch.compiler.is_compiling():
             from sglang.srt.hardware_backend.tpu.sampling_mask import row_bucket
 
-            # Eager on TPU, each new row count compiles a fresh program;
-            # power-of-two buckets keep a draining batch at log2(bs) of them.
+            # Eager on TPU, each row count compiles its own program; bucket rows.
             rows = hidden_states.shape[0]
             bucket = row_bucket(rows)
             if bucket != rows:

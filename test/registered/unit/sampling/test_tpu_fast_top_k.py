@@ -1105,6 +1105,31 @@ class TestTpuLmHeadRowBuckets(CustomTestCase):
             direct = processor._compute_lm_head(hidden, lm_head)
         torch.testing.assert_close(direct, logits)
 
+    def test_a_traced_graph_keeps_its_own_row_count(self):
+        # Shapes are static inside a compiled graph; padding there would only
+        # change the HLO of every compiled model.
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        processor.use_fp32_lm_head = False
+        processor.rl_on_policy_target = None
+        hidden = torch.randn(5, 16)
+        lm_head = SimpleNamespace(weight=torch.randn(32, 16))
+        seen = []
+        original = LogitsProcessor._compute_lm_head_rows
+
+        def record(self_, hidden_states, head, bias=None):
+            seen.append(tuple(hidden_states.shape))
+            return original(self_, hidden_states, head, bias)
+
+        with (
+            patch.object(logits_processor_module, "_is_tpu", True),
+            patch.object(torch.compiler, "is_compiling", return_value=True),
+            patch.object(LogitsProcessor, "_compute_lm_head_rows", record),
+        ):
+            logits = processor._compute_lm_head(hidden, lm_head)
+
+        self.assertEqual(seen, [(5, 16)])
+        self.assertEqual(tuple(logits.shape), (5, 32))
+
     def test_get_logits_pads_through_the_softcap_and_slices_back(self):
         processor = LogitsProcessor.__new__(LogitsProcessor)
         processor.use_fp32_lm_head = False
