@@ -12,10 +12,6 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.native_debug import (
-    runtime_diagnostic_environment,
-    trace_slow_workers,
-)
 
 register_tpu_ci(
     est_time=120,
@@ -68,17 +64,10 @@ class TestNodeNormalization(unittest.TestCase):
                     dist_init_addr=f"{input_hosts[0]}:{config.master_port}",
                     tpu_node_normalization=True,
                 )
-                with patch.dict(
-                    os.environ,
-                    {
-                        **runtime_diagnostic_environment(),
-                        **input_config.environment(input_index),
-                    },
-                ):
-                    # Do not mock discovery or bypass worker shutdown: this is
-                    # the same preparation step that Engine startup calls.
-                    with trace_slow_workers():
-                        normalization.prepare_tpu_environment(args)
+                with patch.dict(os.environ, input_config.environment(input_index)):
+                    # Do not mock discovery: this is the same preparation step
+                    # that Engine startup calls.
+                    normalization.prepare_tpu_environment(args)
                     cfg = resolving_view(args)
                     ordered_hosts = tuple(cfg.tpu_worker_hostnames.split(","))
                     self.assertCountEqual(ordered_hosts, hosts)

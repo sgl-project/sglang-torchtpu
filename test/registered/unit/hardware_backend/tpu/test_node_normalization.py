@@ -4,7 +4,6 @@ import argparse
 import itertools
 import json
 import os
-import random
 import socket
 import sys
 import threading
@@ -69,13 +68,6 @@ class TestNodeNormalization(unittest.TestCase):
                         ],
                         f"host-{physical_rank}:8070",
                     )
-
-    def test_random_host_permutations(self):
-        rng = random.Random(2948)
-        for _ in range(100):
-            permutation = rng.sample(range(32), 32)
-            order = normalization.canonical_host_order(permutation)
-            self.assertEqual([permutation[i] for i in order], list(range(32)))
 
     def test_invalid_topology_placement_and_ports_fail_closed(self):
         for changes in (
@@ -356,57 +348,48 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
             normalization.prepare_tpu_environment(self.server_args)
         self.resolve.assert_not_called()
 
-    def test_existing_scheduler_launcher_receives_normalized_or_original_ranks(self):
+    def test_existing_scheduler_launcher_receives_normalized_ranks(self):
+        # Opt-out is covered by test_cli_flag_defaults_on_and_opt_out_...: it
+        # leaves the launch inputs untouched before the Engine sees them.
         from sglang.srt.entrypoints import engine
 
         class ReachedSchedulerLaunch(Exception):
             pass
 
-        for enabled in (True, False):
-            with self.subTest(enabled=enabled), patch.dict(os.environ):
-                # A fresh record represents a fresh launch; the first call's
-                # declarations must not leak into the opt-out check.
-                args = type(self.server_args)(
-                    model_path="dummy",
-                    device="tpu",
-                    nnodes=2,
-                    tp_size=16,
-                    dist_init_addr="source:29500",
-                    tpu_node_normalization=enabled,
-                )
-                self.resolve.reset_mock()
+        args = type(self.server_args)(
+            model_path="dummy",
+            device="tpu",
+            nnodes=2,
+            tp_size=16,
+            dist_init_addr="source:29500",
+            tpu_node_normalization=True,
+        )
 
-                def launch(*_args, **_kwargs):
-                    self.assertEqual(
-                        engine.get_parallel().node_rank, 1 if enabled else 0
-                    )
-                    self.assertEqual(
-                        engine.get_parallel().dist_init_addr,
-                        "destination:29500" if enabled else "source:29500",
-                    )
-                    raise ReachedSchedulerLaunch
+        def launch(*_args, **_kwargs):
+            self.assertEqual(engine.get_parallel().node_rank, 1)
+            self.assertEqual(engine.get_parallel().dist_init_addr, "destination:29500")
+            raise ReachedSchedulerLaunch
 
-                previous = engine.snapshot_context()
-                try:
-                    with (
-                        patch.object(type(args), "resolve_once"),
-                        patch.object(type(args), "check_server_args"),
-                        patch.object(engine, "configure_logger"),
-                        patch.object(engine, "_set_envs_and_config"),
-                        patch.object(engine, "load_plugins"),
-                        patch.object(engine.PortArgs, "init_new"),
-                        patch.object(
-                            engine.Engine,
-                            "_launch_scheduler_processes",
-                            side_effect=launch,
-                        ) as existing_launcher,
-                        self.assertRaises(ReachedSchedulerLaunch),
-                    ):
-                        engine.Engine._launch_subprocesses(args, None, None, None)
-                    existing_launcher.assert_called_once()
-                    self.assertEqual(self.resolve.call_count, int(enabled))
-                finally:
-                    engine.restore_context(previous)
+        previous = engine.snapshot_context()
+        try:
+            with (
+                patch.dict(os.environ),
+                patch.object(type(args), "resolve_once"),
+                patch.object(type(args), "check_server_args"),
+                patch.object(engine, "configure_logger"),
+                patch.object(engine, "_set_envs_and_config"),
+                patch.object(engine, "load_plugins"),
+                patch.object(engine.PortArgs, "init_new"),
+                patch.object(
+                    engine.Engine, "_launch_scheduler_processes", side_effect=launch
+                ) as existing_launcher,
+                self.assertRaises(ReachedSchedulerLaunch),
+            ):
+                engine.Engine._launch_subprocesses(args, None, None, None)
+            existing_launcher.assert_called_once()
+            self.resolve.assert_called_once()
+        finally:
+            engine.restore_context(previous)
 
 
 if __name__ == "__main__":

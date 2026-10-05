@@ -42,11 +42,16 @@ class TestCollectiveCompileCache(unittest.TestCase):
             original.startswith("user|pallas-sources|tpu-rank-assignment-v1:")
         )
         self.assertEqual(self.install(), original)
-        # A remote swap matters even when this worker stays on device zero.
+        # Installing over an already-guarded tag is a no-op, even with later tags.
+        for existing in (original, original + "|later-tag"):
+            with self.subTest(existing=existing):
+                self.assertEqual(self.install(existing), existing)
+        # A remote swap matters even when this worker stays on device zero, and
+        # is rechecked on an already-guarded tag.
         self.assignment.return_value = [0, 2, 1, 3]
         swapped = self.install()
         self.assertNotEqual(swapped, original)
-        self.assertEqual(self.install(), swapped)
+        self.assertNotEqual(self.install(original), original)
         self.assignment.return_value = [0, 1, 2, 3]
         self.assertEqual(self.install(), original)
 
@@ -57,14 +62,6 @@ class TestCollectiveCompileCache(unittest.TestCase):
         self.rank.return_value = 0
         os.environ["TORCH_TPU_TOPOLOGY"] = "4,1,1,1"
         self.assertNotEqual(self.install(), original)
-
-    def test_repeated_install_preserves_tag_and_rechecks_assignment(self):
-        original = self.install()
-        for existing in (original, original + "|later-tag"):
-            with self.subTest(existing=existing):
-                self.assertEqual(self.install(existing), existing)
-        self.assignment.return_value = [0, 2, 1, 3]
-        self.assertNotEqual(self.install(original), original)
 
     def test_empty_user_tag(self):
         self.assertEqual(self.install(None), self.install(""))
