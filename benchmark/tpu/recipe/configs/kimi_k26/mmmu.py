@@ -52,10 +52,10 @@ CONFIG["server_args"].update(
 )
 CONFIG["runtime_env"].update(
     {
-        # The 2026-09-17 full-set run's MoE path: int4 experts dequantized in
-        # VMEM; the W4A16 unpack path serves about one token per second per
-        # request at this load.
+        # int4 experts dequantized in VMEM; the W4A16 path serves ~1 tok/s per
+        # request at this load. f32 scales as in the validated run.
         "SGLANG_TPU_INT4_MOE_MODE": "vmem-bf16",
+        "SGLANG_TPU_INT4_MOE_FP32_SCALES": "1",
         # MoE permute on the TensorCore below 1024 routed rows; measured crossover.
         "SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS": "1024",
         "SGLANG_TPU_MM_EMBED_ON_DEVICE": "1",

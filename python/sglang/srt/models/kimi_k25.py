@@ -829,6 +829,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
     # Text-only prefill takes the same direct path; the routine's eager embeds
     # are sized by real tokens and disagree with the DP-padded bucket.
     text_prefill_in_language_model: bool = _is_tpu
+    # Image steps take one input_embeds program on every rank, the logits
+    # processor is compiled, and the vision tower runs collective-free.
+    serves_dp_attention: bool = _is_tpu
 
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
@@ -892,9 +895,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-        # TPU compile boundary: the language model with its logits processor
-        # (an eager logits processor deadlocks under DP attention). Vision
-        # encoder and embed merge stay eager in front.
+        # Compile the language model with its logits processor: eager logits
+        # collectives deadlock under DP attention. Vision and embed merge stay eager.
         if _is_tpu and self.language_model is not None:
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,

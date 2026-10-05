@@ -10,7 +10,7 @@ with ``w_quant_bits=4``. Checkpoint layout (group strategy, symmetric):
 ``pltpu.bitcast(..., int4)`` reads nibbles as two's complement, so each nibble's
 top bit is flipped once at load ((q+8) ^ 0x8 == int4(q)); the words then go to
 gmm_v2 as-is. Scales are stored in the kernel's ``[E, blocks, 1, out]`` layout,
-f32 by default (``SGLANG_TPU_INT4_MOE_FP32_SCALES``).
+f32 when ``SGLANG_TPU_INT4_MOE_FP32_SCALES`` is set, else bf16.
 """
 
 from __future__ import annotations
@@ -88,8 +88,8 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
 
     Keeps the packed int32 weights exactly as loaded (their [E, K//8, N]
     orientation is already gmm_v2's (g, k, n) convention) and converts the
-    group scales to the kernel's [E, num_blocks, 1, out] layout, f32 unless
-    SGLANG_TPU_INT4_MOE_FP32_SCALES=0.
+    group scales to the kernel's [E, num_blocks, 1, out] layout, f32 when
+    SGLANG_TPU_INT4_MOE_FP32_SCALES=1, else bf16.
     """
     if getattr(layer, "is_tpu_w4a16_converted", False):
         return

@@ -54,10 +54,8 @@ class TestInt4Fp8Gmm(CustomTestCase):
                         tile_info=TileSizes(16, 512, 128),
                         fuse_act=fused,
                     )
-                    # Use the established FP8 kernel for activation quantization:
-                    # eager JAX BF16 arithmetic rounds at different boundaries
-                    # than the Pallas implementation. Materialize the RHS above
-                    # independently to isolate unpacking and group-scale logic.
+                    # Quantize activations with the kernel's own FP8 path: eager JAX
+                    # bf16 rounds at different boundaries than Pallas.
                     materialized = gmm_v2(
                         x,
                         weights,
@@ -83,9 +81,8 @@ class TestInt4Fp8Gmm(CustomTestCase):
                             np.asarray(out), np.asarray(expected)
                         )
                     else:
-                        # Fusing SiLU changes BF16 rounding boundaries. Use
-                        # the same max-normalized tolerance as the existing
-                        # fused-activation tests, plus an L2 error bound.
+                        # Fused SiLU moves bf16 rounding: the fused-activation tests'
+                        # max-normalized tolerance, plus an L2 bound.
                         actual_f32 = np.asarray(out, np.float32)
                         expected_f32 = np.asarray(expected, np.float32)
                         delta = actual_f32 - expected_f32

@@ -768,9 +768,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Only the final pipeline stage runs the logits processor.
             return False
         runner_model = self.model_runner.model
-        # A multimodal wrapper compiles its language model, which owns the logits.
+        # A wrapper may compile its language model with the logits processor
+        # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
         owns_logits = self.owner is runner_model or (
             self.owner is getattr(runner_model, "language_model", None)
+            and getattr(self.owner, "logits_processor", None) is not None
         )
         return owns_logits and not bool(
             getattr(self.model_runner, "is_draft_worker", False)
@@ -1473,13 +1475,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     def install(self) -> bool:
         outer = getattr(self.model_runner, "model", None)
-        if hasattr(outer, "get_image_feature") and is_dp_attention_enabled():
-            # Image steps run the padded input_embeds variant on every rank
-            # (ScheduleBatch.is_tpu_mm_extend_in_batch).
-            logger.info(
-                "[decoder compile policy] DP attention with multimodal "
-                "serving: image steps use the padded input_embeds variant "
-                "on every rank."
+        if (
+            hasattr(outer, "get_image_feature")
+            and is_dp_attention_enabled()
+            # A wrapper that routes every rank through one input_embeds program
+            # on image steps and compiles its logits processor (Kimi).
+            and not getattr(outer, "serves_dp_attention", False)
+        ):
+            raise NotImplementedError(
+                "Qwen3-VL TPU decoder compilation does not support DP attention; "
+                "disable --enable-torch-compile for this configuration."
             )
         return super().install()
 

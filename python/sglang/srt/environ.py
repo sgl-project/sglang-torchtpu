@@ -1860,14 +1860,12 @@ class Envs:
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
     # Preserve FP32 expert scales and apply GMM partial scales in FP32.
     SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
-    # INT4 MoE mode (packed INT4 stays in HBM in all of them). Unset: W4A16,
-    # scale after each 32-K group dot. "vmem-bf16": dequantize in VMEM, one
-    # bf16 dot per tile. "vmem-fp8": fp8 weight tiles and fp8 activations.
+    # INT4 MoE kernel mode. Unset: W4A16 group dots. "vmem-bf16": dequantize in
+    # VMEM, one bf16 dot per tile. "vmem-fp8": fp8 weight tiles and activations.
     SGLANG_TPU_INT4_MOE_MODE = EnvStr(None)
-    # Store INT4 MoE group scales as f32 so gmm_v2 does not re-cast them from
-    # bf16 every step (8.4 ms of a 47 ms bs=1 step on Kimi-K2.6). Costs 66 MB
-    # per layer per device there; False keeps bf16. vmem-fp8 always uses f32.
-    SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(True)
+    # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
+    # device on Kimi-K2.6). vmem-fp8 always uses f32.
+    SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)

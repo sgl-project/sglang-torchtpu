@@ -758,6 +758,11 @@ class CompiledForwardShim:
         # it is frozen for this shim's lifetime. Caching it also keeps the
         # disabled path at a single attribute read per forward.
         self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        runner = policy.model_runner
+        # Draft models read the multimodal embeds inside their forward.
+        self._draft_worker = bool(
+            runner is not None and getattr(runner, "is_draft_worker", False)
+        )
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -982,8 +987,12 @@ class CompiledForwardShim:
             saved.update(
                 _pin_fields(forward_batch, {"extend_logprob_start_lens_cpu": None})
             )
-        # Keep the multimodal embeds out of the graph's guards; re-attached below.
-        mm_embeds = getattr(forward_batch, "mm_input_embeds", None)
+        # Keep the multimodal embeds out of a target graph's guards; re-attached below.
+        mm_embeds = (
+            None
+            if self._draft_worker
+            else getattr(forward_batch, "mm_input_embeds", None)
+        )
         if mm_embeds is not None:
             saved["mm_input_embeds"] = mm_embeds
             forward_batch.mm_input_embeds = None
@@ -1013,9 +1022,8 @@ class CompiledForwardShim:
             forward_batch.mm_input_embeds = mm_embeds
 
         def finish(result: Any) -> Any:
-            # Re-attach the embeds the graph did not see. Only a logits output
-            # carries them; a hidden-state boundary (Gemma4, Qwen3.5) leaves
-            # them on the batch for the wrapper's eager tail.
+            # Re-attach the embeds the graph did not see; a hidden-state boundary
+            # leaves them on the batch for the wrapper's eager tail.
             if (
                 mm_embeds is not None
                 and isinstance(result, LogitsProcessorOutput)

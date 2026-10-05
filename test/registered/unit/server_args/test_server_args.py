@@ -125,9 +125,8 @@ _mock_device.start()
 
 class TestEnableMultimodalFlag(CustomTestCase):
     def test_enable_multimodal_is_a_boolean_optional_flag(self):
-        # Optional[bool] used to fall through to type=str: "--enable-multimodal
-        # false" stored the truthy string "false" and --no-enable-multimodal
-        # did not exist.
+        # Optional[bool] fell through to type=str: "--enable-multimodal false"
+        # stored the truthy string "false" and --no-enable-multimodal did not exist.
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
         base = ["--model-path", "dummy"]

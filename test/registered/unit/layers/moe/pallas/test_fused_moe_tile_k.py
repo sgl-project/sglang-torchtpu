@@ -339,9 +339,8 @@ class TestVmemSafePackedTileN(CustomTestCase):
         self.assertEqual(tiles.tile_n, 4096)
 
     def test_fp8_weights_are_untouched(self):
-        # As make_gmm_configs builds them: quant_dtype fp8 and packing 4 (four
-        # codes per 32-bit word). fp8 has no unpack staging tile, so the DeepSeek
-        # GMM1 tile must keep the kernel's choice.
+        # As make_gmm_configs builds them (fp8, four codes per word); fp8 has no
+        # unpack tile, so the DeepSeek GMM1 tile keeps the kernel's choice.
         cfgs = gmm_v2.InputConfigs(
             quant_dtype=jnp.float8_e4m3fn.dtype,
             quant_block_size=128,
