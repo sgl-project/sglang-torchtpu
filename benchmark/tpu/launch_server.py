@@ -41,6 +41,9 @@ MULTIHOST_ENV = (
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
     "TORCH_TPU_TOPOLOGY",
 )
+# The name torch_tpu itself reads for the tier-2 cache; the launcher's
+# TORCH_TPU_INTERNAL_* spelling is mirrored onto it by the TPU env override.
+TIER2_CACHE_ENV = "TORCH_TPU_TIER2_COMPILATION_CACHE"
 
 
 def _object(value: Any, name: str) -> dict:
@@ -191,6 +194,12 @@ def resolve_server(config: LaunchConfig, inherited, *, single_host=False):
         for name, value in cache_defaults.items():
             if name not in config.runtime_envs:
                 env.setdefault(name, value)
+    elif env.get("ENABLE_COMPILE_CACHE", "1") != "1":
+        # Leaving the names unset is not enough: torch_tpu then falls back to
+        # an implicit tier-2 cache (/dev/shm/torch_tpu_cache/default) whenever
+        # WORLD_SIZE > 1. "disabled" is its sentinel for really off.
+        if TIER2_CACHE_ENV not in config.runtime_envs:
+            env.setdefault(TIER2_CACHE_ENV, "disabled")
     if settings.get("tp_size", 1) > 1:
         for key in (
             "TPU_VISIBLE_CHIPS",

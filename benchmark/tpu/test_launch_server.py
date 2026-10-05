@@ -79,6 +79,23 @@ class TestRuntimeEnvironment(unittest.TestCase):
         self.assertNotIn(tier2, env)
         self.assertNotIn(tier3, env)
 
+    def test_cache_off_disables_torch_tpu_implicit_tier2(self):
+        # With no tier-2 name torch_tpu falls back to an implicit "default"
+        # tier-2 cache whenever WORLD_SIZE > 1; off must say "disabled".
+        sentinel = "TORCH_TPU_TIER2_COMPILATION_CACHE"
+        _, env = resolve_server(self.config(), {"ENABLE_COMPILE_CACHE": "0"})
+        self.assertEqual(env[sentinel], "disabled")
+        _, env = resolve_server(
+            self.config(), {"ENABLE_COMPILE_CACHE": "0", sentinel: "explicit"}
+        )
+        self.assertEqual(env[sentinel], "explicit")
+        _, env = resolve_server(
+            self.config(**{sentinel: None}), {"ENABLE_COMPILE_CACHE": "0"}
+        )
+        self.assertNotIn(sentinel, env)
+        _, env = resolve_server(self.config(), {})
+        self.assertNotIn(sentinel, env)
+
     def test_migrated_recipes_include_shell_runtime_defaults(self):
         for recipe in (
             "gpt_oss_120b/singlehost_spec.py",
