@@ -45,15 +45,12 @@ PAGE_SIZE = 4
 
 
 @contextlib.contextmanager
-def _platform(
-    *, is_tpu: bool, early_send: bool = True, update_write_pages=None, pp_size=1
-):
+def _platform(*, is_tpu: bool, early_send: bool = True, update_write_pages=None):
     """prefill.py as it is imported on TPU (or not): it binds the TPU helpers
     only under ``_is_tpu``, which is False on the CPU runners."""
     with (
         patch.object(prefill, "_is_tpu", is_tpu),
         patch.object(prefill, "_is_cuda", False),
-        patch.object(prefill, "get_parallel", lambda: SimpleNamespace(pp_size=pp_size)),
         patch.object(
             prefill,
             "tpu_clip_cached_prefix_send_end",
@@ -473,7 +470,6 @@ class TestMaybeSendCachedPrefixChunk(CustomTestCase):
         enable_overlap,
         inflight_write_page_ids,
         hicache_load_page_ids=None,
-        pp_size=1,
     ):
         scheduler = _Scheduler(enable_overlap=enable_overlap)
         scheduler.tpu_inflight_kv_write_page_ids = inflight_write_page_ids
@@ -486,7 +482,7 @@ class TestMaybeSendCachedPrefixChunk(CustomTestCase):
             pending_bootstrap=False,
             early_send_prefix_end=None,
         )
-        with _platform(is_tpu=is_tpu, pp_size=pp_size):
+        with _platform(is_tpu=is_tpu):
             scheduler.maybe_send_cached_prefix_chunk(
                 req, hicache_load_page_ids=hicache_load_page_ids
             )
@@ -522,20 +518,6 @@ class TestMaybeSendCachedPrefixChunk(CustomTestCase):
             enable_overlap=True,
             inflight_write_page_ids=torch.tensor([1]),
             hicache_load_page_ids=torch.tensor([2]),
-        )
-        send.assert_called_once_with(req, last_chunk=False, end_idx=2 * PAGE_SIZE)
-
-    def test_tpu_pipeline_parallel_skips_early_send(self):
-        # PP turns overlap off, so the in-flight clip never runs while earlier
-        # microbatches are still writing.
-        send, _ = self._send(
-            is_tpu=True, enable_overlap=False, inflight_write_page_ids=None, pp_size=2
-        )
-        send.assert_not_called()
-
-    def test_other_backends_keep_early_send_under_pipeline_parallel(self):
-        send, req = self._send(
-            is_tpu=False, enable_overlap=False, inflight_write_page_ids=None, pp_size=2
         )
         send.assert_called_once_with(req, last_chunk=False, end_idx=2 * PAGE_SIZE)
 

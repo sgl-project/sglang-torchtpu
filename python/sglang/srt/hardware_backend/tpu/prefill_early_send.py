@@ -18,12 +18,11 @@ unfinished forward may write. The scheduler tracks their physical page IDs in
   replaces the tracked IDs with those of the newly launched forward, plus the
   pages its HiCache load-backs fill.
 
-A HiCache load-back has the same problem within one batch, in the normal and
-overlap loops (PP disables early send on TPU). It commits its pages to the
-radix tree when it is queued, so a request admitted later in the same pass
-matches them as device-resident. The batch's forward waits for the load, but
-the early send runs first. ``tpu_clip_hicache_load_send_end`` stops the send
-before those pages.
+A HiCache load-back has the same problem within one batch, in every prefill
+loop. It commits its pages to the radix tree when it is queued, so a request
+admitted later in the same pass matches them as device-resident. The batch's
+forward waits for the load, but the early send runs first.
+``tpu_clip_hicache_load_send_end`` stops the send before those pages.
 """
 
 from __future__ import annotations

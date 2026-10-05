@@ -1320,10 +1320,6 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
-        if _is_tpu and get_parallel().pp_size > 1:
-            # PP turns overlap off, so the in-flight-write clip below never runs,
-            # yet earlier microbatches are still in flight.
-            return
 
         # Staging sends into positional grid slots, so the early-send boundary
         # must stay stable across the request's batches: snapshot the at-rest
