@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.eval_support import RecipeLauncher
+from sglang.test.tpu.evals.eval_support import RecipeLauncher
 from sglang.test.tpu.native_debug import (
     log_runtime_environment,
     runtime_diagnostic_environment,
