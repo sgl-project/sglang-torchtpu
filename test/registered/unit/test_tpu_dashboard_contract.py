@@ -211,11 +211,11 @@ class TestJobMapsToOneTest(CustomTestCase):
             selected[cron] = out["model"]
         self.assertEqual(
             selected,
-            {"0 10 * * *": "mmmu-kimi", "0 17 * * *": "mmmu-gemma4-qwen35"},
+            {"0 10 * * *": "day-10am", "0 17 * * *": "day-5pm"},
         )
-        # A called run sees its caller's schedule; the nightly's input must win.
-        _, out = self._run_step(plan, {"MODEL": "nightly", "SCHEDULE": "0 1 * * *"})
-        self.assertEqual(out["model"], "nightly")
+        # A called run sees its caller's schedule; the caller's input must win.
+        _, out = self._run_step(plan, {"MODEL": "gemma4", "SCHEDULE": "0 1 * * *"})
+        self.assertEqual(out["model"], "gemma4")
         rc, _ = self._run_step(plan, {"MODEL": "", "SCHEDULE": "0 3 * * *"})
         self.assertNotEqual(rc, 0, "an unknown schedule must not fall back to all")
 
@@ -236,23 +236,22 @@ class TestJobMapsToOneTest(CustomTestCase):
 
         names = {
             model: {g["name"] for g in discover(model)}
-            for model in ("nightly", "mmmu-kimi", "mmmu-gemma4-qwen35", "full-set")
+            for model in ("day-10am", "day-5pm", "full-set")
         }
+        # Each slot's multihost legs take the 2-host lane its 1-host legs leave idle.
         self.assertEqual(
-            names["nightly"],
+            names["day-10am"],
+            {"test_tpu_kimi_k26_mmmu_shard0", "test_tpu_kimi_k26_mmmu_shard1"},
+        )
+        self.assertEqual(
+            names["day-5pm"],
             {
                 "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
                 "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
             },
         )
-        self.assertEqual(
-            names["mmmu-kimi"],
-            {"test_tpu_kimi_k26_mmmu_shard0", "test_tpu_kimi_k26_mmmu_shard1"},
-        )
-        # The 5 PM slot's legs (Gemma4, Qwen3.5 FP8) all serve on one host now.
-        self.assertEqual(names["mmmu-gemma4-qwen35"], set())
         # Every multihost accuracy file runs in exactly one scheduled selection.
-        slots = ("nightly", "mmmu-kimi", "mmmu-gemma4-qwen35")
+        slots = ("day-10am", "day-5pm")
         scheduled = [names[m] for m in slots]
         self.assertEqual(set().union(*scheduled), names["full-set"])
         self.assertEqual(sum(map(len, scheduled)), len(names["full-set"]))
@@ -273,8 +272,11 @@ class TestJobMapsToOneTest(CustomTestCase):
             # A hosted runner has six hours, including startup and cleanup.
             runtime = 3600 + group["timeout_per_file"] + 600
             self.assertGreater(21600 - runtime - 900 - 600, 0, group["name"])
+        # The nightly no longer runs accuracy; single-host legs ride the 10 AM slot.
+        for job in workflow["jobs"].values():
+            self.assertNotIn('"nightly"', job.get("if", ""))
         gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
-        self.assertIn('"nightly"', gpt["if"])
+        self.assertIn('"day-10am"', gpt["if"])
         self.assertEqual(gpt["with"]["suite"], "nightly-tpu-accuracy-gpt-oss-20b")
 
         def suites(job_name):
@@ -282,7 +284,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             return {leg["suite"] for leg in legs}
 
         sizes = ("31b", "26b-a4b")
-        self.assertIn('"nightly"', workflow["jobs"]["accuracy-gemma4"]["if"])
+        self.assertIn('"day-10am"', workflow["jobs"]["accuracy-gemma4"]["if"])
         self.assertEqual(
             suites("accuracy-gemma4"),
             {
@@ -292,22 +294,27 @@ class TestJobMapsToOneTest(CustomTestCase):
             },
         )
         mmmu = workflow["jobs"]["accuracy-gemma4-mmmupro"]["if"]
-        self.assertNotIn('"nightly"', mmmu)
-        self.assertIn('"mmmu-gemma4-qwen35"', mmmu)
+        self.assertIn('"day-5pm"', mmmu)
         self.assertEqual(
             suites("accuracy-gemma4-mmmupro"),
             {f"nightly-tpu-accuracy-gemma4-{size}-mmmupro" for size in sizes},
         )
         qwen = workflow["jobs"]["accuracy-qwen3-5-mmmupro"]
-        self.assertNotIn('"nightly"', qwen["if"])
-        for selection in ('"mmmu-gemma4-qwen35"', '"qwen3-5-397b"'):
+        for selection in ('"day-5pm"', '"qwen3-5-397b"'):
             self.assertIn(selection, qwen["if"])
         self.assertEqual(qwen["with"]["hosts"], 1)
         self.assertEqual(
             qwen["with"]["suite"], "nightly-tpu-accuracy-qwen3-5-397b-mmmupro"
         )
+        # The long P/D gates leave `all` (the nightly) for the 5 PM slot.
+        pd = workflow["jobs"]["pd-kvoff-reshard"]
+        self.assertIn('"day-5pm"', pd["if"])
+        feature = yaml.safe_load((WORKFLOWS / "feature-validation-tpu.yml").read_text())
+        for only in pd["strategy"]["matrix"]["only"]:
+            self.assertEqual(feature["jobs"][only]["if"].count("inputs.only =="), 1)
+            self.assertNotIn('"all"', feature["jobs"][only]["if"])
         nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
-        self.assertEqual(nightly["jobs"]["accuracy"]["with"]["model"], "nightly")
+        self.assertNotIn("accuracy", nightly["jobs"])
 
     def test_static_pd_jobs_carry_exactly_one_existing_file(self):
         self.assertTrue(self.static_pd, "no static P/D jobs found; did they move?")

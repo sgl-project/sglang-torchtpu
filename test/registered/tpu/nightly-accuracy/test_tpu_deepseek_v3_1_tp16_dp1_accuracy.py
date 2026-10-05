@@ -25,7 +25,7 @@ MULTIHOST_LAUNCH = {
     "launch_script": "recipe/configs/deepseek_v3_1/accuracy.py",
     "weights_pvc": "deepseek-v3-1-rox",
     # Which accuracy-test-tpu.yml lane runs this file.
-    "schedule": "nightly",
+    "schedule": "day-5pm",
     "timeout_per_file": 10800,
 }
 

@@ -219,11 +219,13 @@ jobs:
       contents: read
       id-token: write
 
+  # Not part of `all`: accuracy-test-tpu.yml's 5 PM slot runs this and the qwen3
+  # kvoff-reshard gate, which hold both 2-host slices for over an hour each.
   pd-mh-gpt-120b-kvoff-reshard:
     needs: [build, discover-tests]
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-mh-gpt-120b-kvoff-reshard"]'), inputs.only || 'all')
+          && inputs.only == 'pd-mh-gpt-120b-kvoff-reshard'
           && contains('test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py', inputs.test_filter) }}
     name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
@@ -250,7 +252,7 @@ jobs:
     needs: [build, discover-tests]
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","pd-mh-qwen3-480b-kvoff-reshard"]'), inputs.only || 'all')
+          && inputs.only == 'pd-mh-qwen3-480b-kvoff-reshard'
           && contains('test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py', inputs.test_filter) }}
     name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard_qwen)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml

@@ -22,7 +22,7 @@ MULTIHOST_LAUNCH = {
     "launch_script": "recipe/configs/kimi_k26/mmmu.py",
     "weights_pvc": "model-weights",
     # Which accuracy-test-tpu.yml lane runs this file.
-    "schedule": "mmmu-kimi",
+    "schedule": "day-10am",
     "timeout_per_file": 14400,
 }
 CONFIG_MODULE = "recipe/configs/kimi_k26/mmmu.py"
