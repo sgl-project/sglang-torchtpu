@@ -133,7 +133,6 @@ jobs:
       # Unit suite (kernels/backends; each test self-contained, no model server) runs
       # first so a broken kernel fails before the serving suite claims the slice.
       suite: stage-a-test-tpu-unit
-      vbar_tcp: true
     permissions:
       contents: read
       id-token: write

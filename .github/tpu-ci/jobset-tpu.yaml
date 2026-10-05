@@ -14,7 +14,6 @@
 #   PARTITION_FLAGS single-host run_suite partition arguments (empty when unsharded)
 #   TEST_FILE_FLAG single-host exact-file selection (empty when running a whole suite)
 #   SERVICE_ACCOUNT  indented serviceAccountName line (empty -> namespace default KSA)
-#   VBAR_TCP_ENV   opt-in node-local TCP endpoint instead of the plugin's Unix socket
 # The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
 # literal. Gating is handled by the kind-aware _tpu-test.
 #
@@ -84,7 +83,6 @@ ${WEIGHTS_VOLUME}
                   image: ${IMAGE}
                   imagePullPolicy: IfNotPresent
                   env:
-${VBAR_TCP_ENV}
                     # HF token for gated datasets (GPQA in the gpt-oss lm-eval test).
                     # One-time: kubectl -n tpu-ci create secret generic hf-token \
                     #   --from-literal=token=hf_...   (fine-grained, read-only)

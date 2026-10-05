@@ -80,15 +80,6 @@ WEIGHTS_MOUNT_TMPL = (
 # --service-account is given, so the pod keeps using the namespace default.
 SERVICE_ACCOUNT_TMPL = "              serviceAccountName: {sa}"
 
-# Match JAX's TPU CI workaround for vbar.sock races, without a metadata-server
-# request: https://github.com/jax-ml/jax/pull/40307
-VBAR_TCP_ENV = '''                    - name: TPU_CI_NODE_IP
-                      valueFrom:
-                        fieldRef:
-                          fieldPath: status.hostIP
-                    - name: VBAR_CONTROL_SERVICE_URL
-                      value: "$(TPU_CI_NODE_IP):8353"'''
-
 
 def dns_safe(name):
     s = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
@@ -150,7 +141,6 @@ def main():
     # Plain words only -- the command is inlined into the pod script unquoted.
     ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
-    ap.add_argument("--vbar-tcp", action="store_true")
     # Which lane's pools to use. pr-gate and nightly both own 1- and 2-host slices, so a
     # host count alone no longer identifies a pool (see topology.yaml).
     ap.add_argument("--lane", default="pr-gate")
@@ -183,8 +173,6 @@ def main():
         help="Print the CI poll budget (s) for --suite and exit (no rendering).",
     )
     a = ap.parse_args()
-    if a.vbar_tcp and (a.pd_prefill_hosts or a.pd_decode_hosts):
-        ap.error("--vbar-tcp is only supported for single-slice jobs")
 
     partitioned = a.partition_id != -1 or a.partition_size != 0
     if partitioned and not (
@@ -377,7 +365,6 @@ def main():
         "ACTIVE_DEADLINE": str(active_deadline),
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
-        "VBAR_TCP_ENV": VBAR_TCP_ENV if a.vbar_tcp else "",
         "TOPOLOGY": sl["topology"],
         "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(pools)),
         "POOL_LIST": " ".join(pools),

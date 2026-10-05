@@ -39,11 +39,6 @@ on:
         required: false
         type: number
         default: 1
-      vbar_tcp:
-        description: "Connect to node-local vBAR over TCP instead of the plugin's Unix socket"
-        required: false
-        type: boolean
-        default: false
       # Which lane's pools to use (topology.yaml). Both lanes own 1- and 2-host slices, so
       # host count alone no longer picks a pool. nightly-test-tpu.yml passes `nightly`.
       lane:
@@ -151,7 +146,6 @@ jobs:
             --files '${{ inputs.files }}' \
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
-            ${{ inputs.vbar_tcp && '--vbar-tcp' || '' }} \
             --lane '${{ inputs.lane }}' \
             --pools "${pools}" \
             --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \

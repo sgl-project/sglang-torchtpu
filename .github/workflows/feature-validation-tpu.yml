@@ -489,7 +489,6 @@ jobs:
       display_name: test_node_normalization
       lane: nightly
       hosts: 2
-      vbar_tcp: true
       exec_cmd: env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_node_normalization.py -v
       files: test/registered/e2e/hardware_backend/tpu/test_node_normalization.py
       run_name: ${{ fromJSON(needs.discover-tests.outputs.node_normalization)[0].run_name }}
