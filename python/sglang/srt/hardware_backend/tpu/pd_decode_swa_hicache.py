@@ -9,6 +9,7 @@ to host RAM:
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
 - A request that reuses pages of an unfinished RAM restore waits for it.
+- With EAGLE3, the draft KV goes to RAM together with the full-attention KV.
 
 ``install()`` wraps a few upstream functions and registers a host stack
 strategy. Each behaves exactly like upstream unless the decode cache is one of
@@ -26,7 +27,7 @@ from typing import Any, Callable, Iterator, Optional
 
 import torch
 
-from sglang.srt.disaggregation import decode
+from sglang.srt.disaggregation import decode, decode_hicache_mixin
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
@@ -51,6 +52,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_memory
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,8 @@ _full_only_host_caches: weakref.WeakSet[UnifiedRadixCache] = weakref.WeakSet()
 # Owned by _build_kv_cache for the duration of one cache build. While set, the
 # tree cache factory enables HiCache and _FullOnlySwaStrategy matches.
 _is_building_full_only_host_cache = False
+# The draft HiCache plan of that build, None without speculative decoding.
+_building_draft_plan: Optional[HiCacheDraftPlan] = None
 # Device pages of each full KV load a full-only controller issued, by anchor
 # node id. An entry is in flight while the anchor is in ongoing_load_back.
 _load_device_pages: weakref.WeakKeyDictionary[Any, dict[int, torch.Tensor]] = (
@@ -74,14 +78,26 @@ def uses_full_only_host_cache(tree_cache: Any) -> bool:
 
 
 @contextlib.contextmanager
-def _full_only_host_cache_build() -> Iterator[None]:
-    global _is_building_full_only_host_cache
+def _full_only_host_cache_build(
+    draft_plan: Optional[HiCacheDraftPlan],
+) -> Iterator[None]:
+    global _is_building_full_only_host_cache, _building_draft_plan
     assert not _is_building_full_only_host_cache, "nested full-only cache build"
     _is_building_full_only_host_cache = True
+    _building_draft_plan = draft_plan
     try:
         yield
     finally:
         _is_building_full_only_host_cache = False
+        _building_draft_plan = None
+
+
+def _bigram_boundary(tree_cache: UnifiedRadixCache) -> int:
+    """Extra token a prefix match needs to cover its last page under EAGLE.
+
+    EAGLE keys the cache by token pairs, so N tokens make only N - 1 keys.
+    """
+    return 1 if tree_cache.tree_core.is_eagle else 0
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +118,10 @@ def _should_use_full_only_host_cache(
 
 
 def _validate_full_only_host_cache_config(
-    *, page_size: int, is_speculative: bool
+    *,
+    page_size: int,
+    spec_algorithm: Any,
+    hicache_draft_plan: Optional[HiCacheDraftPlan],
 ) -> None:
     """Raise for settings the full-only cache does not support."""
     memory = get_memory()
@@ -120,7 +139,21 @@ def _validate_full_only_host_cache_config(
             "--hicache-storage-backend (L3) restores are not supported",
         ),
         (page_size > 1, "--page-size must be > 1 for the page-aligned SWA tail"),
-        (not is_speculative, "speculative decoding is not supported"),
+        (
+            spec_algorithm.is_none() or spec_algorithm.is_eagle3(),
+            "Only EAGLE3 is supported for speculative decoding in this mode",
+        ),
+        # Draft KV reaches RAM only through upstream's draft sidecar pool. A
+        # packed draft lives inside the full KV pool, which this build does
+        # not lay out for.
+        (
+            spec_algorithm.is_none()
+            or (
+                hicache_draft_plan is not None
+                and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
+            ),
+            "EAGLE3 draft KV must use the HiCache draft sidecar",
+        ),
         # Upstream auto-sizes the host pool for it, and so would this build.
         (
             get_disagg().disaggregation_decode_retraction_backup != "host_pool",
@@ -147,18 +180,21 @@ def _build_kv_cache(
     tp_worker: Any,
     page_size: int,
     spec_algorithm: Any,
+    hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     **other_kwargs,
 ):
     """Wraps ``build_kv_cache``: build the decode cache with a full-only RAM pool.
 
     Upstream rejects HiCache for this setup, so the flag goes in as False and
-    ``_create_tree_cache`` turns HiCache back on. ``test_upstream_flag_uses_are_known``
-    fails if upstream starts reading the flag somewhere new.
+    ``_create_tree_cache`` turns HiCache back on, draft KV included.
+    ``test_upstream_flag_uses_are_known`` fails if upstream starts reading the
+    flag somewhere new.
     """
     kwargs = dict(
         tp_worker=tp_worker,
         page_size=page_size,
         spec_algorithm=spec_algorithm,
+        hicache_draft_plan=hicache_draft_plan,
         **other_kwargs,
     )
     if not _should_use_full_only_host_cache(
@@ -167,7 +203,9 @@ def _build_kv_cache(
     ):
         return upstream(enable_hierarchical_cache=enable_hierarchical_cache, **kwargs)
     _validate_full_only_host_cache_config(
-        page_size=page_size, is_speculative=not spec_algorithm.is_none()
+        page_size=page_size,
+        spec_algorithm=spec_algorithm,
+        hicache_draft_plan=hicache_draft_plan,
     )
     logger.info(
         "PD decode SWA HiCache: the host pool holds full-attention KV only, "
@@ -175,23 +213,29 @@ def _build_kv_cache(
     )
     # Upstream rejects decode SWA radix + HiCache before it builds the tree.
     # _create_tree_cache turns HiCache back on for this build.
-    with _full_only_host_cache_build():
+    with _full_only_host_cache_build(hicache_draft_plan):
         return upstream(enable_hierarchical_cache=False, **kwargs)
 
 
 def _create_tree_cache(upstream: Callable, ctx: TreeCacheBuildContext):
-    """Wraps ``create_tree_cache``: turn HiCache back on for the full-only build."""
+    """Wraps ``create_tree_cache``: turn HiCache back on, draft KV included."""
     if not _is_building_full_only_host_cache:
         return upstream(ctx)
-    # build_kv_cache skips auto-sizing with the flag off. Sizing against the
-    # full + SWA device bytes leaves the full-only host pool within budget.
-    with auto_size_hicache(ctx.params, None, enabled=True):
+    draft_plan = _building_draft_plan
+    # build_kv_cache skips auto-sizing and draft registration with the flag
+    # off. Sizing against the full + SWA device bytes leaves the full-only
+    # host pool within budget.
+    with auto_size_hicache(ctx.params, draft_plan, enabled=True):
         cache = upstream(dataclasses.replace(ctx, enable_hierarchical_cache=True))
-    if not uses_full_only_host_cache(cache):
-        raise ValueError(
-            "PD decode SWA HiCache needs the unified radix tree with a "
-            f"full-attention + SWA pool, got {type(cache).__name__}."
-        )
+        if not uses_full_only_host_cache(cache):
+            raise ValueError(
+                "PD decode SWA HiCache needs the unified radix tree with a "
+                f"full-attention + SWA pool, got {type(cache).__name__}."
+            )
+        if draft_plan is not None:
+            kv_cache_builder.maybe_register_hicache_draft(
+                tree_cache=cache, draft_plan=draft_plan
+            )
     return cache
 
 
@@ -212,7 +256,8 @@ def _build_full_only_host_stack(
     Like ``build_hybrid_swa_stack`` without the SWA pool, so the full pool gets the
     whole host budget.
     """
-    assert not params.mtp_draft_device_pools, "speculation is rejected at startup"
+    # EAGLE3 draft KV registers as a sidecar after this build, never packed.
+    assert not params.mtp_draft_device_pools, "packed MTP draft KV is not supported"
     full_layer_mapping, swa_layer_mapping = hybrid_pool_assembler._swa_layer_mappings(
         kvcache
     )
@@ -362,10 +407,11 @@ def _match_prefix_and_lock(
     swa_window_start = fill_len - queue._swa_tail_len(fill_len)
     # Device and host hits stop at the window start. Prefill sends the window,
     # so decode reserves and restores only the prefix before it.
+    match_end = swa_window_start + _bigram_boundary(queue.tree_cache)
     result = match_prefix_for_req(
         queue.tree_cache,
         req,
-        req.origin_input_ids[:swa_window_start],
+        req.origin_input_ids[:match_end],
         cow_mamba=False,
         include_req=True,
     )
@@ -427,6 +473,26 @@ def _alloc_for_decode_prealloc(
         prefix_indices=last_loc_source,
         **kwargs,
     )
+
+
+def _restore_rematch(
+    upstream: Callable,
+    tree_cache: Any,
+    req: Any,
+    token_ids: Optional[Any] = None,
+    **kwargs,
+):
+    """Wraps ``match_prefix_for_req`` in the restore: keep the last page under EAGLE.
+
+    Without the extra token the restore's re-match comes up one page short and
+    the restore fails.
+    """
+    boundary = (
+        _bigram_boundary(tree_cache) if uses_full_only_host_cache(tree_cache) else 0
+    )
+    if boundary and token_ids is not None:
+        token_ids = req.origin_input_ids[: len(token_ids) + boundary]
+    return upstream(tree_cache, req, token_ids, **kwargs)
 
 
 def _commit_hicache_local_restore_to_req(
@@ -557,6 +623,9 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
         # Allocate new KV after the RAM-restored range. Upstream, which has no
         # decode RAM offload for SWA models, starts at the HBM hit instead.
         (decode, "alloc_for_decode_prealloc", _alloc_for_decode_prealloc),
+        # Under EAGLE the restore's re-match comes up one page short and the
+        # restore fails, so add the token that covers the last page.
+        (decode_hicache_mixin, "match_prefix_for_req", _restore_rematch),
         # When the restore commits, also drop the SWA part of the request's
         # lock, since the SWA window comes from prefill.
         (

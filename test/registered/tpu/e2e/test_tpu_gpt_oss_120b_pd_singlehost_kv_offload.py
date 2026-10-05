@@ -15,6 +15,7 @@ a device-resident resend. GSM8K then runs through the same pair.
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -191,6 +192,7 @@ class Turn(NamedTuple):
     cached_tokens: int
     host_cached_tokens: int
     text: str
+    output_ids: tuple[int, ...] = ()
 
 
 class ConversationRecord(NamedTuple):
@@ -206,7 +208,14 @@ class ConversationRecord(NamedTuple):
 
 
 def offload_failures(records: Sequence[ConversationRecord]) -> list[str]:
-    """Gate on RAM restores on both engines that reproduce the device output."""
+    """Gate on RAM restores on both engines that reproduce the device output.
+
+    Every turn must answer with the secret, a reference no restored KV can
+    influence. The restored turn is not compared token by token with the turn
+    before the eviction: greedy decoding drifts after the answer when prefill
+    computes a different number of new tokens (13 and 27 shared tokens of 32
+    in measurements), so that comparison is only logged.
+    """
     failures = []
     for i, r in enumerate(records):
         tag = f"conversation {i}"
@@ -227,21 +236,36 @@ def offload_failures(records: Sequence[ConversationRecord]) -> list[str]:
             failures.append(f"{tag}: decode did not restore the prefix from RAM")
         if r.restored.host_cached_tokens <= 0:
             failures.append(f"{tag}: prefill did not restore the prefix from RAM")
-        # Restored KV must reproduce what a device-resident hit generates.
-        if r.restored.text != r.resend.text:
+        for label, turn in (
+            ("device turn 2", r.device),
+            ("restored turn 2", r.restored),
+            ("resent turn 2", r.resend),
+        ):
+            answer = _answer(turn.text)
+            if answer != str(r.secret):
+                failures.append(
+                    f"{tag}: {label} answered {answer!r}, the secret is {r.secret}"
+                )
+        # The same restored KV must decode the same way twice.
+        if r.restored.output_ids != r.resend.output_ids:
             failures.append(f"{tag}: RAM-restored turn 2 differs from the resend")
-    # Non-deterministic TPU drift can derail one answer, a lost secret in
-    # most turns means the reused KV is wrong.
-    answers = [
-        str(r.secret) in turn.text
-        for r in records
-        for turn in (r.device, r.restored, r.resend)
-    ]
-    if answers.count(False) > len(answers) // 2:
-        failures.append(
-            f"secret number lost in {answers.count(False)}/{len(answers)} turns"
-        )
     return failures
+
+
+def _answer(text: str) -> str | None:
+    """The first five-digit number in the reply. Secrets are five digits, the
+    ledger filler numbers never are."""
+    match = re.search(r"\b\d{5}\b", text)
+    return match.group(0) if match else None
+
+
+def _common_prefix_len(a: Sequence[int], b: Sequence[int]) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
 
 
 def conversation(index: int) -> tuple[int, str, str]:
@@ -294,6 +318,7 @@ def _generate(
         cached_tokens=int(meta["cached_tokens"]),
         host_cached_tokens=int(details.get("host") or 0),
         text=reply["text"],
+        output_ids=tuple(reply["output_ids"]),
     )
     return turn, list(reply["output_ids"])
 
@@ -365,6 +390,11 @@ def offload_runner(*, tokenize_url: str, decode_url: str):
                         "answers": [
                             str(secret) in t.text for t in (device, restored, resend)
                         ],
+                        "parsed": [_answer(t.text) for t in (device, restored, resend)],
+                        "device_restored_shared_tokens": _common_prefix_len(
+                            device.output_ids, restored.output_ids
+                        ),
+                        "texts": [t.text[:60] for t in (device, restored, resend)],
                     }
                 ),
                 flush=True,
@@ -477,8 +507,10 @@ def render_jobset_yaml(
     return subprocess.check_output(cmd, text=True)
 
 
-def _turn(*, prompt=2300, cached=2240, host=0, text=""):
-    return Turn(prompt, cached, host, text)
+def _turn(
+    *, prompt=2300, cached=2240, host=0, text="50021", ids=(11, 12, 13, 14, 15, 16)
+):
+    return Turn(prompt, cached, host, text, tuple(ids))
 
 
 def _record(**overrides) -> ConversationRecord:
@@ -587,8 +619,17 @@ class TestPdSingleHostKvOffloadGptOss120bConfiguration(unittest.TestCase):
                 self.assertTrue(any(reason in f for f in failures), failures)
 
     def test_offload_gate_requires_the_same_output(self) -> None:
-        diverged = _record(resend=_turn(text="50021 and more"))
+        diverged = _record(resend=_turn(ids=(11, 12, 13, 14, 15, 99)))
         self.assertTrue(any("differs" in f for f in offload_failures([diverged])))
+
+    def test_offload_gate_checks_restored_output_against_the_device_turn(self):
+        # The answer must match the secret on every turn.
+        wrong = _record(restored=_turn(host=2176, text="50022"))
+        self.assertTrue(any("answered '50022'" in f for f in offload_failures([wrong])))
+        # Drift from the device turn is tolerated, the resend must match.
+        drift = (11, 12, 13, 77, 88, 99)
+        drifted = _record(restored=_turn(host=2176, ids=drift), resend=_turn(ids=drift))
+        self.assertEqual(offload_failures([drifted]), [])
 
     def test_offload_gate_requires_cold_first_turns_and_answers(self) -> None:
         warm = _record(turn1=_turn(prompt=1900, cached=1856))

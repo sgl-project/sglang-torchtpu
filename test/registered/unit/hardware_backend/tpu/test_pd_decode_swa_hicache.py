@@ -14,6 +14,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import contextlib
 import inspect
+import itertools
 import re
 import unittest
 from array import array
@@ -55,9 +56,11 @@ from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.test.test_utils import CustomTestCase
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
+BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
 TPU = "sglang.srt.hardware_backend.tpu.pd_decode_swa_hicache"
 
 
@@ -123,8 +126,9 @@ def make_match(device_len=64, host_len=256):
     )
 
 
-def full_only_cache():
+def full_only_cache(*, is_eagle=False):
     cache = MagicMock()
+    cache.tree_core.is_eagle = is_eagle
     cache.swa_reprefill_tail_tokens.return_value = 0
     # No L3 storage backend in this mode.
     cache.query_storage_hit_length.return_value = 0
@@ -169,7 +173,11 @@ def make_ctx():
     )
 
 
-def real_swa_cache():
+def spec(*, eagle3=False, none=False):
+    return SimpleNamespace(is_none=lambda: none, is_eagle3=lambda: eagle3)
+
+
+def real_swa_cache(*, is_eagle=False):
     """A real FULL + SWA unified tree over mocked pools, without HiCache."""
     allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
     allocator.device = torch.device("cpu")
@@ -185,6 +193,7 @@ def real_swa_cache():
         token_to_kv_pool_allocator=allocator,
         page_size=64,
         sliding_window_size=128,
+        is_eagle=is_eagle,
         tree_components=(ComponentType.FULL, ComponentType.SWA),
     )
     with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
@@ -197,7 +206,8 @@ def build_kwargs(**overrides):
         enable_hierarchical_cache=True,
         tp_worker=SimpleNamespace(is_hybrid_swa=True),
         page_size=64,
-        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        spec_algorithm=spec(none=True),
+        hicache_draft_plan=None,
     )
     kwargs.update(overrides)
     return kwargs
@@ -260,14 +270,44 @@ class TestCacheConstruction(CustomTestCase):
             patch(TPU + ".get_disagg", return_value=disagg()),
             patch(TPU + ".get_memory", return_value=memory()),
             patch(TPU + ".auto_size_hicache") as auto_size,
+            patch(BUILDER + ".maybe_register_hicache_draft") as register_draft,
         ):
             self.assertIs(tpu._build_kv_cache(upstream_build, **build_kwargs()), cache)
             auto_size.assert_called_once_with(ctx.params, None, enabled=True)
+            register_draft.assert_not_called()
             # Outside that build the factory is untouched.
             upstream = MagicMock()
             tpu._create_tree_cache(upstream, ctx)
             upstream.assert_called_once_with(ctx)
             auto_size.assert_called_once()
+
+    def test_eagle3_draft_plan_is_sized_and_registered_as_a_sidecar(self):
+        # Upstream registers the draft sidecar only with the flag on, which
+        # this build turns off to pass the SWA guard.
+        ctx = make_ctx()
+        cache = MagicMock()
+        draft_plan = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
+
+        def upstream_build(**kwargs):
+            self.assertIs(kwargs["hicache_draft_plan"], draft_plan)
+            mark_full_only(cache)
+            return tpu._create_tree_cache(lambda ctx: cache, ctx)
+
+        with (
+            patch(TPU + ".get_disagg", return_value=disagg()),
+            patch(TPU + ".get_memory", return_value=memory()),
+            patch(TPU + ".auto_size_hicache") as auto_size,
+            patch(BUILDER + ".maybe_register_hicache_draft") as register_draft,
+        ):
+            tpu._build_kv_cache(
+                upstream_build,
+                **build_kwargs(
+                    spec_algorithm=spec(eagle3=True), hicache_draft_plan=draft_plan
+                ),
+            )
+        auto_size.assert_called_once_with(ctx.params, draft_plan, enabled=True)
+        register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
+        self.assertIsNone(tpu._building_draft_plan)
 
     def test_full_only_build_requires_the_full_only_stack(self):
         # E.g. a cache type the SWA host strategy does not build.
@@ -284,10 +324,22 @@ class TestCacheConstruction(CustomTestCase):
         self.assertFalse(tpu._is_building_full_only_host_cache)
 
     def test_unsupported_configs_are_rejected(self):
-        speculative = SimpleNamespace(is_none=lambda: False)
         for overrides, mem, dis, tree_core, reason in (
             ({"page_size": 1}, {}, {}, "python", "page-size"),
-            ({"spec_algorithm": speculative}, {}, {}, "python", "speculative"),
+            # DFlash and the other drafts are not validated in this mode.
+            ({"spec_algorithm": spec()}, {}, {}, "python", "Only EAGLE3"),
+            # EAGLE3 draft KV reaches RAM only as upstream's draft sidecar.
+            ({"spec_algorithm": spec(eagle3=True)}, {}, {}, "python", "sidecar"),
+            (
+                {
+                    "spec_algorithm": spec(eagle3=True),
+                    "hicache_draft_plan": SimpleNamespace(mode=HiCacheDraftMode.PACKED),
+                },
+                {},
+                {},
+                "python",
+                "sidecar",
+            ),
             ({}, {"hicache_io_backend": "direct"}, {}, "python", "raiden"),
             (
                 {},
@@ -397,7 +449,7 @@ class TestFullOnlyStrategy(CustomTestCase):
                 hybrid_pool_assembler._select_strategy(kvcache, components),
                 tpu._FULL_ONLY_SWA_STRATEGY,
             )
-            with tpu._full_only_host_cache_build():
+            with tpu._full_only_host_cache_build(None):
                 hybrid_pool_assembler.attach_hybrid_pool_to_unified_cache(
                     cache,
                     params,
@@ -437,6 +489,28 @@ class TestAdmissionAndAllocation(CustomTestCase):
         self.assertEqual(len(cache.match_prefix.call_args.args[0].key), 320)
         self.assertEqual(result.decode_prefix_len, 320)
         self.assertEqual(swa_uuid(req.lock_receipt), 19)
+
+    def test_eagle_match_still_reaches_the_swa_window(self):
+        # Bigram keys need one token past the window start to match its page.
+        cache = full_only_cache(is_eagle=True)
+        cache.match_prefix.return_value = make_match(device_len=64, host_len=256)
+        cache.inc_lock_ref.return_value = IncLockRefResult(node_id=2)
+        tpu._match_prefix_and_lock(MagicMock(), self.queue(cache), make_req())
+        self.assertEqual(len(cache.match_prefix.call_args.args[0].key), 321)
+
+    def test_restore_rematch_adds_the_bigram_boundary_token(self):
+        req = make_req()
+        for cache, expected in (
+            (full_only_cache(is_eagle=True), 321),
+            (full_only_cache(is_eagle=False), 320),
+            (MagicMock(), 320),
+        ):
+            upstream = MagicMock()
+            tpu._restore_rematch(
+                upstream, cache, req, req.origin_input_ids[:320], include_req=True
+            )
+            args, kwargs = upstream.call_args
+            self.assertEqual((len(args[2]), kwargs), (expected, {"include_req": True}))
 
     def test_other_caches_keep_upstream_match(self):
         upstream = MagicMock()
@@ -678,8 +752,8 @@ class TestRealLockAccounting(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="scheduler")
 
-    def make_cache(self):
-        cache, _ = real_swa_cache()
+    def make_cache(self, *, is_eagle=False):
+        cache, _ = real_swa_cache(is_eagle=is_eagle)
         mark_full_only(cache)
         return cache
 
@@ -695,18 +769,23 @@ class TestRealLockAccounting(CustomTestCase):
             nodes.extend(node.children.values())
 
     def test_commit_finish_and_abort_balance_full_and_swa_locks(self):
-        for commit in (False, True):
-            with self.subTest(commit=commit):
-                cache = self.make_cache()
+        # EAGLE trees key bigrams, and the restore must still cover its last page.
+        for is_eagle, commit in itertools.product((False, True), (False, True)):
+            with self.subTest(is_eagle=is_eagle, commit=commit):
+                cache = self.make_cache(is_eagle=is_eagle)
+
+                def key(num_tokens):
+                    # How insert_req keys num_tokens tokens of KV.
+                    token_ids = array("q", range(num_tokens + is_eagle))
+                    return RadixKey(token_ids, is_bigram=is_eagle)
+
                 prefix = cache.insert(
-                    InsertParams(
-                        key=RadixKey(array("q", range(64))), value=torch.arange(64)
-                    )
+                    InsertParams(key=key(64), value=torch.arange(64))
                 ).last_device_node
                 # Full KV for 320 tokens whose SWA window was tombstoned.
                 cache.insert(
                     InsertParams(
-                        key=RadixKey(array("q", range(320))),
+                        key=key(320),
                         value=torch.arange(320),
                         component_evicted_seqlens={ComponentType.SWA: 320},
                     )

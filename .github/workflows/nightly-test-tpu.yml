@@ -54,6 +54,7 @@ on:
           - pd-sh-gpt-120b-spec
           - pd-sh-gpt-120b-decode-radix
           - pd-sh-gpt-120b-offload
+          - pd-sh-gpt-120b-offload-spec
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
