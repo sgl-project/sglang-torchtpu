@@ -60,11 +60,13 @@ def build_model_config():
                 "label": "aime25",
                 "report_only": True,
                 "thinking": True,
-                "repeat": 1,
+                # Mean pass@1 over four passes: one pass of 30 problems swings by 2-3 problems.
+                "repeat": 4,
                 "num_threads": 128,
                 "temperature": 0.6,
                 "top_p": 0.95,
-                "max_tokens": 32768,
+                # 32k truncated 3-7 of 30 answers per run (each scored 0); 64k truncates none.
+                "max_tokens": 65536,
             },
             {
                 "dataset": "mmlu",

@@ -65,7 +65,8 @@ def build_model_config():
                 "num_threads": 128,
                 "temperature": 0.6,
                 "top_p": 0.95,
-                "max_tokens": 32768,
+                # 32k truncated 3-7 of 30 answers per run (each scored 0); 64k truncates none.
+                "max_tokens": 65536,
             },
             {
                 "dataset": "mmlu",
