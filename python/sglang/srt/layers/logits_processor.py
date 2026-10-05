@@ -1094,25 +1094,16 @@ class LogitsProcessor(nn.Module):
         # Eager on TPU, each row count compiles its own program (40-100 s on a
         # 262k vocab): bucket rows to a power of two, sliced back at the return.
         rows = hidden_states.shape[0]
-        pad_rows = (
+        bucket_rows = (
             _is_tpu
             and not torch.compiler.is_compiling()
             and not self.do_tensor_parallel_all_gather_dp_attn
             and hidden_states.ndim == 2
         )
-        if pad_rows:
-            from sglang.srt.hardware_backend.tpu.sampling_mask import row_bucket
+        if bucket_rows:
+            from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
 
-            bucket = row_bucket(rows)
-            if bucket != rows:
-                hidden_states = torch.cat(
-                    [
-                        hidden_states,
-                        hidden_states.new_zeros(
-                            (bucket - rows, hidden_states.shape[1])
-                        ),
-                    ]
-                )
+            hidden_states = pad_rows(hidden_states, row_bucket(rows))
         lora_batch_layout = (
             LoRABatchLayout.TP_GLOBAL
             if self.do_tensor_parallel_all_gather_dp_attn
@@ -1192,7 +1183,7 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
-        if pad_rows and logits.shape[0] != rows:
+        if bucket_rows and logits.shape[0] != rows:
             logits = logits[:rows]
         return logits
 
@@ -1203,20 +1194,13 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if _is_tpu and hidden_states.ndim == 2 and not torch.compiler.is_compiling():
-            from sglang.srt.hardware_backend.tpu.sampling_mask import row_bucket
+            from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
 
             # Eager on TPU, each row count compiles its own program; bucket rows.
             rows = hidden_states.shape[0]
             bucket = row_bucket(rows)
             if bucket != rows:
-                padded = torch.cat(
-                    [
-                        hidden_states,
-                        hidden_states.new_zeros(
-                            (bucket - rows, hidden_states.shape[1])
-                        ),
-                    ]
-                )
+                padded = pad_rows(hidden_states, bucket)
                 return self._compute_lm_head_rows(padded, lm_head, embedding_bias)[
                     :rows
                 ]

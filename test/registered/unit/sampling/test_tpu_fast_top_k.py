@@ -15,6 +15,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import sampler as tpu_sampler_module
 from sglang.srt.hardware_backend.tpu import top_k as tpu_top_k_module
+from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
 from sglang.srt.hardware_backend.tpu.sampler import (
     TpuSampler,
     distributed_top_k_candidate_width,
@@ -1176,6 +1177,30 @@ class TestTpuLmHeadRowBuckets(CustomTestCase):
         self.assertEqual(tuple(logits.shape), (5, 32))
         expected = 30.0 * torch.tanh((hidden @ lm_head.weight.T).float() / 30.0)
         torch.testing.assert_close(logits, expected)
+
+
+class TestRowPad(CustomTestCase):
+    """Eager TPU ops compile per shape; rows round up to a power of two so a
+    batch draining one request at a time compiles log2(bs) times, not bs."""
+
+    def test_rounds_up_to_the_next_power_of_two(self):
+        self.assertEqual(
+            [row_bucket(n) for n in (0, 1, 2, 3, 5, 8, 9, 63, 64, 65)],
+            [1, 1, 2, 4, 8, 8, 16, 64, 64, 128],
+        )
+
+    def test_pads_the_leading_dim_with_the_fill_value(self):
+        x = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+        padded = pad_rows(x, 4, fill=1.0)
+        self.assertEqual(tuple(padded.shape), (4, 2))
+        torch.testing.assert_close(padded[:3], x)
+        self.assertTrue(bool((padded[3] == 1.0).all()))
+        # Already at the bucket: the same tensor, no copy.
+        self.assertIs(pad_rows(x, 3), x)
+        ks = pad_rows(torch.ones(3, dtype=torch.int32), 8)
+        self.assertEqual(tuple(ks.shape), (8,))
+        self.assertEqual(ks.dtype, torch.int32)
+        self.assertEqual(ks[3:].tolist(), [0] * 5)
 
 
 if __name__ == "__main__":

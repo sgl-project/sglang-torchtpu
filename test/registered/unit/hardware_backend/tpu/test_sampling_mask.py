@@ -304,18 +304,5 @@ class TestEagleVerifyRenorm(CustomTestCase):
         torch.testing.assert_close(actual.cpu(), probs)
 
 
-class TestRowBucket(CustomTestCase):
-    """The filter op compiles per shape; rows round up to a power of two so a
-    batch draining one request at a time compiles log2(bs) times, not bs."""
-
-    def test_rounds_up_to_the_next_power_of_two(self):
-        from sglang.srt.hardware_backend.tpu.sampling_mask import row_bucket
-
-        self.assertEqual(
-            [row_bucket(n) for n in (0, 1, 2, 3, 5, 8, 9, 63, 64, 65)],
-            [1, 1, 2, 4, 8, 8, 16, 64, 64, 128],
-        )
-
-
 if __name__ == "__main__":
     unittest.main()
