@@ -729,9 +729,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # call site can hand layer.w13_weight / layer.w2_weight straight
         # to fused_moe_call with no per-step transpose.
         if _is_tpu:
-            # gmm_v2 tiles the intermediate dim in 128-lane blocks: zero-pad it
-            # (gate/up halves separately), e.g. Gemma4-26B's 704 -> 768. Exact,
-            # since act(0) * 0 = 0 and the padded w2 rows are 0.
+            # gmm_v2 tiles the intermediate dim in 128 lanes: zero-pad gate, up and w2
+            # (e.g. 704 -> 768). Exact without bias: act(0) * 0 = 0 and the w2 pad is 0.
             inter = layer.w2_weight.shape[-1]
             pad = (-inter) % 128
             if pad and getattr(layer, "w13_weight_bias", None) is None:

@@ -531,9 +531,8 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
             batch.extend_seq_lens_cpu = [tokens_per_req] * bs
             batch.extend_prefix_lens_cpu = [0] * bs
-            # The live draft batch (dflash_worker_v2) sets the local
-            # num_token_non_padded directly and never the global tensor;
-            # direct_compile pins each input's type at trace time.
+            # The live draft batch sets only the local field; direct_compile pins
+            # each input's type at trace time.
             batch.global_num_token_non_padded = None
         return batch
 

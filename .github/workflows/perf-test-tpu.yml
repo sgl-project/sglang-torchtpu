@@ -45,10 +45,7 @@ on:
 
 concurrency:
   # Only governs standalone dispatches (a called workflow rides the caller's
-  # group). Keyed on ref and model so different branches, and different models
-  # on one branch, proceed in parallel; the nightly lane has 3 single-host slices
-  # to absorb them. The same model on the same ref still serializes, so a
-  # re-dispatch cannot race the previous run's numbers into the same window.
+  # group). Keyed on ref and model: one group per selection.
   group: tpu-perf-${{ inputs.ref || github.ref }}-${{ inputs.model || 'all' }}
   cancel-in-progress: false
 

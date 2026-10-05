@@ -169,8 +169,7 @@ class TestGmmV2W4A16(CustomTestCase):
         self._run(jnp.float32)
 
     def test_kimi_gate_up_width(self):
-        # Same tile dimensions and 32-element quantization groups as Kimi
-        # prefill; the former packed-only VMEM estimate fails to compile it.
+        # Kimi prefill's tile and 32-wide groups; a packed-only VMEM estimate fails.
         self.G, self.M, self.K, self.N = 2, 128, 7168, 4096
         self._run(jnp.bfloat16)
 

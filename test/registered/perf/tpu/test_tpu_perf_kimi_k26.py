@@ -29,7 +29,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
-# Anchored on run 37162012638: 1734 s to healthy, then 160 requests at ~13.6 s.
+# Measured in CI: 1734 s to healthy, then 160 requests at ~13.6 s.
 register_tpu_ci(
     est_time=7200,
     suite="nightly-tpu-perf-kimi-k26",
@@ -39,8 +39,7 @@ register_tpu_ci(
 
 LAUNCH_CONFIG_MODULE = "recipe/configs/kimi_k26/perf.py"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
-# 555 GB of int4 experts streamed in 630 to 1160 s on the shared Filestore, then
-# the tp8 decoder precompile; the JobSet itself allows 3600 s plus est_time.
+# 555 GB of int4 experts stream from Filestore in 630-1160 s, then the precompile.
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 
 # 8192 in + 1024 out, the same shape the other models on this lane are measured

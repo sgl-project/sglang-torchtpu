@@ -168,8 +168,7 @@ class Gemma4VisionTpuCompilePolicy(VisionTpuCompilePolicy):
             real_pooled_len = ctx.padding.real_seq_len // ctx.padding.merge_sq
             pooled = pooled[:, :real_pooled_len]
             pooler_mask = pooler_mask[:, :real_pooled_len]
-        # Stays on device: the projector runs next with device weights, and the
-        # model lands the projected rows on the host.
+        # Stays on device: the projector runs next with device weights.
         return pooled, pooler_mask
 
     def run(

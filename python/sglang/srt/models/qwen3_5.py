@@ -1594,8 +1594,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             if not _is_npu and not _is_tpu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
-                # NPU / TPU have no Triton fused_sigmoid_mul: NPU has its own
-                # kernel, TPU applies the sigmoid output gate in pure torch.
+                # NPU has its own fused_sigmoid_mul; TPU applies the gate in plain torch.
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 if _is_npu:
                     attn_output = npu_fused_sigmoid_mul(

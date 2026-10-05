@@ -313,9 +313,8 @@ jobs:
           # The stream below can outlive the token it starts with; start it fresh.
           refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
 
-          # Stream logs from every host, re-attaching if the stream drops while the
-          # JobSet is live: the pod log is the ONLY egress from a JobSet (results
-          # included; the next step lifts them out). A re-attach takes only newer lines.
+          # Stream logs from every host, re-attaching on a drop while the JobSet is
+          # live: the pod log is the only egress from a JobSet, results included.
           rm -f "$RUNNER_TEMP/tpu-pod-logs.txt"
           since=""
           while kubectl -n tpu-ci get "$name" >/dev/null 2>&1; do

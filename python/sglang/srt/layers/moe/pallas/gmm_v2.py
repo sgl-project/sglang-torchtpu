@@ -1017,10 +1017,8 @@ def calculate_tiling(
         dims.size_k * dims.size_n * rhs_bits // 8 * base_rhs_bytes_multiplier
     )
     if lhs_cfgs.quant_dtype is None and rhs_cfgs.quant_dtype is not None:
-        # Weight-only kernels reconstruct one RHS tile in the LHS dtype before
-        # the dot. The packed DMA buffers alone undercount VMEM (e.g. INT4
-        # weights expand 4x for BF16 compute). Charge that live temporary across
-        # the RHS buffer budget, plus the scales carried by each DMA buffer.
+        # Weight-only kernels unpack one RHS tile to the LHS dtype before the dot;
+        # charge that temporary and the per-buffer scales, not just the packed bytes.
         unpacked_rhs_bytes = (
             dims.size_k * dims.size_n * lhs_bits // 8 * base_rhs_bytes_multiplier
         )

@@ -286,8 +286,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         self.assertEqual([step["duration_seconds"] for step in steps], [1, 2, 3])
 
     def test_warmup_syncs_every_tensor_of_a_tuple_result(self):
-        # A boundary that returns (features, mask) hands warmup a tuple; the
-        # sync must receive the tensors, not the tuple as one tensor.
+        # A (features, mask) boundary hands warmup a tuple; sync each tensor in it.
         policy = _FakeVisionPolicy()
         policy.owner = SimpleNamespace()
         pooled, mask = torch.zeros(2), torch.ones(2)

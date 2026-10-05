@@ -120,8 +120,7 @@ class TestCalculateTilingFuseAct(CustomTestCase):
         self.assertGreater(tiles.tile_n, 0)
 
     def test_weight_only_reconstruction_fits_vmem(self):
-        # Kimi's gate/up prefill previously chose the whole INT4 matrix as a
-        # tile. Packed weights fit, but their BF16 reconstruction did not.
+        # Kimi's gate/up prefill: the packed INT4 tile fit, its BF16 unpack did not.
         dims = self._dims(size_m=32768, size_k=7168, size_n=4096)
         lhs, _ = self._bf16_cfgs(size_k=dims.size_k)
         rhs = gmm_v2.InputConfigs(

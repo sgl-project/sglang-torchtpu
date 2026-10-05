@@ -67,9 +67,8 @@ on:
 
 concurrency:
   # Only governs standalone runs (a called workflow rides the caller's group).
-  # Keyed on ref and model so different branches, and different models on one
-  # branch, proceed in parallel; the same model on the same ref still
-  # serializes, so a re-dispatch cannot race the previous run's scores.
+  # Keyed on ref and model: one group per selection, so a re-dispatch of the
+  # same selection waits for the previous run.
   # Each schedule slot gets its own group: a late Kimi run must not hold 5 PM back.
   group: tpu-accuracy-${{ github.event.schedule || inputs.ref || github.ref }}-${{ inputs.model || 'all' }}
   cancel-in-progress: false
@@ -184,9 +183,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One suite per benchmark and checkpoint, each with a two-hour budget:
-        # ~21 min of bring-up (16 of them decoder precompile), then 31B GPQA
-        # measured ~77 min of eval at 64 threads and 26B AIME ~70 min.
+        # One suite per benchmark and checkpoint; 2 h covers ~21 min of bring-up
+        # plus the ~77 min of eval measured in CI.
         include:
           - suite: nightly-tpu-accuracy-gemma4-31b-aime
             run_name: accuracy-gemma4-31b-aime
@@ -212,11 +210,8 @@ jobs:
       contents: read
       id-token: write
 
-  # The 5 PM slot, not the nightly. 26B measured 8915 s in CI including
-  # bring-up. The single-host JobSet deadline is 1.5 x est_time, and the
-  # admission budget is what the 6 h runner cap leaves after it, so est_time
-  # 9000 keeps 100 min of queue wait; 14400 left none and the leg failed
-  # before its pod existed.
+  # The 5 PM slot, not the nightly. 26B measured 8915 s in CI with bring-up; the
+  # JobSet deadline is 1.5 x est_time and the admission wait is the 6 h cap's rest.
   accuracy-gemma4-mmmupro:
     needs: [build, plan]
     if: >-

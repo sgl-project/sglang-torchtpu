@@ -293,9 +293,8 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
         from sglang.srt.layers.quantization import unquant
 
         torch.manual_seed(0)
-        # SGLang storage layout, intermediate already a multiple of 128 so no
-        # padding is involved. w13: (g, 2*intermediate, hidden); w2: (g, hidden,
-        # intermediate).
+        # SGLang layout, w13 (g, 2*inter, hidden) and w2 (g, hidden, inter);
+        # inter = 128 is already lane-aligned, so no padding.
         sglang_w13 = torch.randn(4, 256, 32, dtype=torch.bfloat16)
         sglang_w2 = torch.randn(4, 32, 128, dtype=torch.bfloat16)
 

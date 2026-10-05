@@ -53,6 +53,5 @@ CONFIG["server_args"].update(
         "weight_loader_drop_cache_after_load": True,
     }
 )
-# Empty disables the MoonViT patch-count ladder: 57 warmups took ~14 min of the
-# health budget for a sweep that never sends an image.
+# Empty skips the MoonViT patch ladder (57 warmups, ~14 min); the sweep sends no images.
 CONFIG["runtime_env"].update({"SGLANG_TPU_VIT_PRECOMPILE_SIZES": ""})
