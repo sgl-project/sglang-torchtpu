@@ -717,6 +717,11 @@ class Envs:
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
     # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
     SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
+    # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
+    # instead of fixed max-length slots; asymmetric attention TP needs it.
+    SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(
+        True, deprecated_name="TPU_RAIDEN_DYNAMIC_HOST_STAGING"
+    )
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )

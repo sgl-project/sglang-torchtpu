@@ -174,7 +174,7 @@ class RaidenReceiverMixin:
                     "Raiden asymmetric attention TP (got "
                     f"{len(bootstrap_infos)} prefill sources for one decode "
                     "rank) needs per-transfer host staging; do not set "
-                    "TPU_RAIDEN_DYNAMIC_HOST_STAGING=0."
+                    "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0."
                 )
             if not local_blocks:
                 # Full prefix-cache hit: decode already holds every page,
