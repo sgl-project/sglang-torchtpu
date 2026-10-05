@@ -249,7 +249,8 @@ class TestJobMapsToOneTest(CustomTestCase):
             names["mmmu-kimi"],
             {"test_tpu_kimi_k26_mmmu_shard0", "test_tpu_kimi_k26_mmmu_shard1"},
         )
-        self.assertEqual(names["mmmu-gemma4-qwen35"], {"test_tpu_qwen3_5_397b_mmmupro"})
+        # The 5 PM slot's legs (Gemma4, Qwen3.5 FP8) all serve on one host now.
+        self.assertEqual(names["mmmu-gemma4-qwen35"], set())
         # Every multihost accuracy file runs in exactly one scheduled selection.
         slots = ("nightly", "mmmu-kimi", "mmmu-gemma4-qwen35")
         scheduled = [names[m] for m in slots]
@@ -266,7 +267,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             recipes.count("recipe/configs/deepseek_r1_0528/accuracy.py"), 1
         )
         self.assertEqual(recipes.count("recipe/configs/kimi_k26/mmmu.py"), 2)
-        self.assertEqual(recipes.count("recipe/configs/qwen3_5_397b/server.py"), 1)
+        self.assertNotIn("recipe/configs/qwen3_5_397b/server.py", recipes)
         for group in groups:
             self.assertTrue((REPO / "benchmark/tpu" / group["launch_script"]).is_file())
             # A hosted runner has six hours, including startup and cleanup.
@@ -296,6 +297,14 @@ class TestJobMapsToOneTest(CustomTestCase):
         self.assertEqual(
             suites("accuracy-gemma4-mmmupro"),
             {f"nightly-tpu-accuracy-gemma4-{size}-mmmupro" for size in sizes},
+        )
+        qwen = workflow["jobs"]["accuracy-qwen3-5-mmmupro"]
+        self.assertNotIn('"nightly"', qwen["if"])
+        for selection in ('"mmmu-gemma4-qwen35"', '"qwen3-5-397b"'):
+            self.assertIn(selection, qwen["if"])
+        self.assertEqual(qwen["with"]["hosts"], 1)
+        self.assertEqual(
+            qwen["with"]["suite"], "nightly-tpu-accuracy-qwen3-5-397b-mmmupro"
         )
         nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
         self.assertEqual(nightly["jobs"]["accuracy"]["with"]["model"], "nightly")
