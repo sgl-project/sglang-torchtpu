@@ -269,6 +269,8 @@ class InputConfigs:
     # dtype of the per-block scale tensor (fp32/bf16/fp8); drives the scale's
     # share of the cost-model byte estimate. None when the rhs is unscaled.
     scale_dtype: jnp.dtype | None = None
+    dequantize_in_vmem: bool = False
+    requantize_in_vmem: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -476,6 +478,41 @@ def inner_kernel(
         # axis. This expands the K dimension back to tile_k.
         tiled_rhs = tiled_rhs_ref.get_weight(cfgs.rhs_cfgs.quant_dtype)
 
+        if cfgs.rhs_cfgs.dequantize_in_vmem or cfgs.rhs_cfgs.requantize_in_vmem:
+            # Zero-stride load broadcasts each group scale over its K rows.
+            group_k = cfgs.rhs_cfgs.quant_block_size
+
+            def load_group_scales(ref):
+                # Mosaic strided loads need 32-bit elements; bf16 scales fall back.
+                if ref.dtype == jnp.float32:
+                    return ref[:, pl.ds(0, group_k, 0), :]
+                return jnp.broadcast_to(
+                    ref[...], (ref.shape[0], group_k, ref.shape[-1])
+                )
+
+            if isinstance(tiled_rhs_ref, FusedWeightsRef):
+                scales = jnp.concatenate(
+                    [
+                        load_group_scales(tiled_rhs_ref.gate.scale),
+                        load_group_scales(tiled_rhs_ref.up.scale),
+                    ],
+                    axis=-1,
+                )
+            else:
+                scales = load_group_scales(tiled_rhs_ref.scale)
+            rhs_shape = tiled_rhs.shape
+            tiled_rhs = (
+                tiled_rhs.astype(tiled_lhs.dtype).reshape(
+                    num_quant_blocks_per_tile_k, group_k, rhs_shape[-1]
+                )
+                * scales.astype(tiled_lhs.dtype)
+            ).reshape(rhs_shape)
+            if cfgs.rhs_cfgs.requantize_in_vmem:
+                # Group scales are pre-divided by the channel scale; fp8 lives only in VMEM.
+                tiled_rhs = jnp.clip(tiled_rhs, -448, 448).astype(jnp.float8_e4m3fn)
+            else:
+                num_quant_blocks_per_tile_k = 1
+
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
         if is_last_k_step and valid_k != 0:
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
@@ -488,7 +525,11 @@ def inner_kernel(
                 tiled_rhs = tiled_rhs.astype(tiled_lhs.dtype)
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
-            rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+            rhs_qbs = (
+                cfgs.tiles.tile_k
+                if cfgs.rhs_cfgs.dequantize_in_vmem
+                else cfgs.rhs_cfgs.quant_block_size
+            )
             rhs_cols = tiled_rhs.shape[1]
             for start_n in range(0, rhs_cols, mxu_size):
                 end_n = min(rhs_cols, start_n + mxu_size)
@@ -503,7 +544,7 @@ def inner_kernel(
                         tiled_rhs[k_start:k_end, start_n:end_n],
                         preferred_element_type=jnp.float32,
                     )
-                    if cfgs.rhs_cfgs.has_scale:
+                    if cfgs.rhs_cfgs.has_scale and not cfgs.rhs_cfgs.dequantize_in_vmem:
                         tiled_rhs_scale = tiled_rhs_ref.get_scale(
                             b_id, cfgs.rhs_cfgs.scale_block_n
                         )
@@ -566,7 +607,7 @@ def inner_kernel(
 
                     rhs_scale = None
                     # Apply rhs subchannel scale per quant block.
-                    if cfgs.rhs_cfgs.has_scale:
+                    if cfgs.rhs_cfgs.has_scale and not cfgs.rhs_cfgs.requantize_in_vmem:
                         b_id = start_k // cfgs.rhs_cfgs.quant_block_size
                         rhs_scale_slice = tiled_rhs_ref.get_scale(
                             b_id, cfgs.rhs_cfgs.scale_block_n
@@ -590,7 +631,11 @@ def inner_kernel(
         if is_last_k_step:
             if cfgs.rhs_cfgs.has_bias:
                 tiled_rhs_bias = tiled_rhs_ref.get_bias()
-                acc += tiled_rhs_bias.astype(acc.dtype)
+                if cfgs.rhs_cfgs.requantize_in_vmem:
+                    # FP8 mode: this buffer is rhs_channel_scale, applied per column.
+                    acc *= tiled_rhs_bias.astype(acc.dtype)
+                else:
+                    acc += tiled_rhs_bias.astype(acc.dtype)
 
             gm_id = pl.program_id(1)
 
@@ -999,6 +1044,11 @@ def calculate_tiling(
     rhs_dtype = rhs_cfgs.dtype
     lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
+    if rhs_cfgs.requantize_in_vmem:
+        rhs_bits = max(rhs_bits, 8)
+    if rhs_cfgs.dequantize_in_vmem:
+        # Reserve room for the unpacked compute tile as well as packed DMA.
+        rhs_bits = max(rhs_bits, jax.dtypes.itemsize_bits(lhs_cfgs.dtype))
     base_rhs_bytes_multiplier = 2 if fuse_act else 1
 
     # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
@@ -1250,6 +1300,8 @@ def make_gmm_configs(
     fuse_act: str | None = None,
     packed_fp4: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
+    dequantize_rhs: bool = False,
+    requantize_rhs: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1310,7 +1362,36 @@ def make_gmm_configs(
         scale_size_n=scale_size_n,
         scale_block_n=scale_block_n,
         scale_dtype=rhs_scale.dtype if has_scale else None,
+        dequantize_in_vmem=dequantize_rhs,
+        requantize_in_vmem=requantize_rhs,
     )
+
+    if requantize_rhs:
+        if dequantize_rhs or packed_fp4:
+            raise ValueError(
+                "INT4-to-FP8 cannot be combined with BF16 dequantization or FP4"
+            )
+        if (
+            rhs_quant_dtype != jnp.int4.dtype
+            or rhs.dtype not in (jnp.int32, jnp.uint32)
+            or not has_scale
+            or block_size != 32
+            or scale_block_n != 1
+            or rhs_scale.dtype != jnp.float32
+            or lhs.dtype != jnp.bfloat16
+            or not maybe_quantize_lhs
+        ):
+            raise ValueError(
+                "INT4-to-FP8 requires packed INT4, FP32 normalized group-32 scales, "
+                "BF16 activations and activation quantization"
+            )
+
+    if dequantize_rhs:
+        if rhs_quant_dtype != jnp.int4.dtype or not has_scale or scale_block_n != 1:
+            raise ValueError(
+                "VMEM dequantization requires per-channel group-scaled INT4 weights"
+            )
+        maybe_quantize_lhs = False
 
     lhs_quant_block_size = 512
     if packed_fp4 and block_size != lhs_quant_block_size:
@@ -1331,12 +1412,17 @@ def make_gmm_configs(
             if tpu_info.int8_ops_per_second > 0:
                 lhs_q_dtype = jnp.int8.dtype
 
+    if requantize_rhs:
+        if pltpu.get_tpu_info().fp8_ops_per_second <= 0:
+            raise NotImplementedError("INT4-to-FP8 requires TPU FP8 compute support")
+        lhs_q_dtype = jnp.float8_e4m3fn.dtype
+
     if packed_fp4 and lhs_q_dtype != jnp.float8_e4m3fn.dtype:
         raise NotImplementedError(
             "Packed FP4 GMM requires TPU FP8 activation quantization support."
         )
 
-    if lhs_q_dtype is not None and num_blocks > 1:
+    if lhs_q_dtype is not None and num_blocks > 1 and not requantize_rhs:
         lhs_quant_block_size = min(lhs_quant_block_size, block_size)
 
     lhs_cfgs = InputConfigs(
@@ -1351,7 +1437,7 @@ def make_gmm_configs(
     # For block quantization (num_blocks > 1), rhs block size must be a
     # multiple of lhs block size. Per-channel quantization (num_blocks == 1)
     # is always safe because a single scale covers the full contracting dim.
-    if lhs_q_dtype is not None and num_blocks > 1:
+    if lhs_q_dtype is not None and num_blocks > 1 and not requantize_rhs:
         assert rhs_cfgs.quant_block_size % lhs_cfgs.quant_block_size == 0, (
             "Unsupported quantization configuration: rhs_quant_block_size must "
             "be a multiple of lhs_quant_block_size for block quantization. Got "
@@ -1401,6 +1487,16 @@ def make_gmm_configs(
         if compact_tile_n != tiles.tile_n:
             tiles = dataclasses.replace(tiles, tile_n=compact_tile_n)
 
+    if (dequantize_rhs or requantize_rhs) and tiles.tile_k % block_size != 0:
+        raise ValueError(
+            "VMEM dequantization requires tile_k to be a multiple of the INT4 group size"
+        )
+
+    if requantize_rhs and tiles.tile_k % min(lhs_quant_block_size, dims.size_k):
+        raise ValueError(
+            "INT4-to-FP8 tile_k must preserve activation quantization groups"
+        )
+
     return GmmConfigs(
         dims=dims,
         tiles=tiles,
@@ -1445,6 +1541,7 @@ def get_metadata(cfgs: GmmConfigs):
         "fuse_act",
         "packed_fp4",
         "rhs_quant_dtype",
+        "dequantize_rhs",
     ]
 )
 def gmm_v2(
@@ -1465,6 +1562,8 @@ def gmm_v2(
     fuse_act: str | None = None,
     packed_fp4: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,  # set when rhs is pre-packed
+    dequantize_rhs: bool = False,
+    rhs_channel_scale: jax.Array | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1478,6 +1577,10 @@ def gmm_v2(
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
         rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
+        rhs_channel_scale: Opt-in INT4-to-FP8 compute. Per-channel multipliers
+            [size_group, 1, out_size]; rhs_scale must contain FP32 group-32 scales
+            divided by these multipliers. Additive rhs_bias is unsupported in
+            this mode. Weights stay packed INT4 in HBM.
         group_offset: Optional. The group offset of shape [1,].
         tile_info: The tile sizes or tile function to use.
         vmem_limit_bytes: Optional vmem limit in bytes.
@@ -1485,6 +1588,8 @@ def gmm_v2(
         preferred_element_type: Optional jnp.dtype for the output matrix.
         acc_dtype: Optional jnp.dtype for the accumulator.
         maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
+        dequantize_rhs: Dequantize INT4 groups in VMEM before BF16 matmul;
+            keeps activations unquantized and avoids short-K group products.
         zero_initialize: Whether to initialize unvisited output elements to zero.
         fuse_act: Activation function to fuse with GMM, None if no fusion.
 
@@ -1493,6 +1598,13 @@ def gmm_v2(
     """
 
     del precision
+
+    requantize_rhs = rhs_channel_scale is not None
+    if requantize_rhs:
+        if rhs_bias is not None:
+            raise ValueError("rhs_bias and rhs_channel_scale are mutually exclusive")
+        # Channel scale rides the bias buffer; requantize_in_vmem says which it is.
+        rhs_bias = rhs_channel_scale
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1519,6 +1631,8 @@ def gmm_v2(
         fuse_act=fuse_act,
         packed_fp4=packed_fp4,
         rhs_quant_dtype=rhs_quant_dtype,
+        dequantize_rhs=dequantize_rhs,
+        requantize_rhs=requantize_rhs,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
