@@ -15,9 +15,8 @@ name: Nightly Test (TPU - Remote Wheel)
 run-name: "Nightly Test (TPU - Remote Wheel)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
 on:
-  schedule:
-    - cron: "0 5 * * *"
-      timezone: "America/Los_Angeles"
+  # Dispatch-only: run it against a candidate wheel before bumping the torch_tpu pin.
+  # A daily run replayed the whole nightly on the nightly slices it shares.
   workflow_dispatch:
     inputs:
       ref:
