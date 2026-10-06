@@ -249,7 +249,9 @@ def assert_not_forward_write_target(allocator: BaseTokenToKVPoolAllocator) -> No
     )
 
 
-def _page_pools(allocator: BaseTokenToKVPoolAllocator) -> list:
+def _page_pools(
+    allocator: BaseTokenToKVPoolAllocator,
+) -> List[BaseTokenToKVPoolAllocator]:
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
     if type(allocator) is SWATokenToKVPoolAllocator:
@@ -263,9 +265,8 @@ def kv_free_fence_unsupported_reason(
     spec_algorithm: SpeculativeAlgorithm | CustomSpecAlgo,
     copies_draft_tail: bool,
 ) -> Optional[str]:
-    """Why a fence on ``allocator`` would miss KV writes, or None. Every pool
-    must be a TPU paged allocator, whose frees and allocations it hooks, and
-    every KV write of a forward must precede a tensor its result copies to host."""
+    """Why a fence on ``allocator`` would miss KV writes, or None: it hooks only
+    TPU paged pools, and needs every KV write to precede a copied result tensor."""
     from sglang.srt.hardware_backend.tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )

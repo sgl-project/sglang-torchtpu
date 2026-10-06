@@ -1771,9 +1771,8 @@ class Scheduler(
         )
 
     def _needs_kv_free_fence(self) -> bool:
-        """Whether DMAs not ordered against device compute can write KV pages
-        an in-flight forward still writes: raiden HiCache loads, and on a PD
-        decode server, KV arriving from prefill and retraction restores."""
+        """Whether unordered DMAs can write pages an in-flight forward writes:
+        raiden HiCache loads, or KV arriving on a PD decode server."""
         return (
             self.device == "tpu"
             and self.enable_overlap
@@ -1800,8 +1799,12 @@ class Scheduler(
         reason = kv_free_fence_unsupported_reason(
             self.token_to_kv_pool_allocator, **fence_kwargs
         )
-        if reason is not None and not self._uses_raiden_hicache():
-            # raiden HiCache requires the fence; a PD decode server serves without it.
+        if reason is not None:
+            if self._uses_raiden_hicache():
+                raise ValueError(
+                    f"The raiden HiCache backend needs the KV free fence: {reason}"
+                )
+            # Unlike raiden HiCache, a PD decode server can serve unfenced.
             logger.warning(
                 "KV arriving on this PD decode server is not fenced against "
                 "in-flight forwards: %s",

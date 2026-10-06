@@ -2,13 +2,12 @@
 preallocated pages by a DMA that is not ordered against the in-flight forward,
 so preallocation must not hand out pages that forward may still write."""
 
-import types
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode import alloc_for_decode_prealloc
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hardware_backend.tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
@@ -28,6 +27,17 @@ PAGE = 4
 def _tpu_allocator(num_pages=4):
     return TpuPagedTokenToKVPoolAllocator(
         size=num_pages * PAGE,
+        page_size=PAGE,
+        dtype=torch.bfloat16,
+        device="cpu",
+        kvcache=None,
+        need_sort=False,
+    )
+
+
+def _generic_allocator():
+    return PagedTokenToKVPoolAllocator(
+        size=4 * PAGE,
         page_size=PAGE,
         dtype=torch.bfloat16,
         device="cpu",
@@ -56,8 +66,7 @@ class TestPreallocUnderFence(CustomTestCase):
         self.fence.on_forward_launched(SimpleNamespace(copy_done=None))
 
     def _prealloc(self, num_pages):
-        return DecodePreallocQueue._alloc_for_decode_prealloc(
-            SimpleNamespace(),
+        return alloc_for_decode_prealloc(
             self.allocator,
             req=SimpleNamespace(kv=SimpleNamespace()),
             fill_len=num_pages * PAGE,
@@ -72,13 +81,17 @@ class TestPreallocUnderFence(CustomTestCase):
     def test_prealloc_waits_for_the_in_flight_forward_before_taking_its_pages(self):
         """A request that finished at N-1 is freed while forward N still writes
         its last slot; prefill's KV pulled into that page could be overwritten."""
-        busy = self.allocator.alloc(4 * PAGE)
+        busy = self.allocator.alloc(2 * PAGE)
         self._launch()
         self.allocator.free(busy)
 
-        kv_loc = self._prealloc(2)
+        free_first = self._prealloc(2)
+        self.assertEqual(self.log, [])
+        self.assertFalse(_pages(free_first) & _pages(busy))
+
+        after_wait = self._prealloc(1)
         self.assertEqual(self.log, ["device"])
-        self.assertLessEqual(_pages(kv_loc), _pages(busy))
+        self.assertLessEqual(_pages(after_wait), _pages(busy))
 
 
 def _scheduler(**overrides):
@@ -100,7 +113,7 @@ def _scheduler(**overrides):
         "_needs_kv_free_fence",
         "maybe_init_kv_free_fence",
     ):
-        setattr(scheduler, name, types.MethodType(getattr(Scheduler, name), scheduler))
+        setattr(scheduler, name, MethodType(getattr(Scheduler, name), scheduler))
     return scheduler
 
 
@@ -112,6 +125,16 @@ class TestPdDecodeFenceInstall(CustomTestCase):
         self.assertIs(
             scheduler.token_to_kv_pool_allocator.kv_free_fence, scheduler.kv_free_fence
         )
+
+    def test_pd_decode_with_eagle_installs_the_fence_when_the_draft_tail_is_copied(
+        self,
+    ):
+        scheduler = _scheduler(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            tpu_async_copy_worker=SimpleNamespace(copy_draft_tail=True),
+        )
+        scheduler.maybe_init_kv_free_fence()
+        self.assertIsNotNone(scheduler.kv_free_fence)
 
     def test_no_fence_without_overlap_or_off_decode(self):
         for overrides in (
@@ -127,14 +150,7 @@ class TestPdDecodeFenceInstall(CustomTestCase):
 
     def test_unfenceable_pd_decode_warns_instead_of_failing_startup(self):
         """A PD decode server the fence cannot cover keeps serving, unfenced."""
-        generic = PagedTokenToKVPoolAllocator(
-            size=4 * PAGE,
-            page_size=PAGE,
-            dtype=torch.bfloat16,
-            device="cpu",
-            kvcache=None,
-            need_sort=False,
-        )
+        generic = _generic_allocator()
         for overrides, expected in (
             (dict(token_to_kv_pool_allocator=generic), "PagedTokenToKVPoolAllocator"),
             (dict(spec_algorithm=SpeculativeAlgorithm.DFLASH), "DFLASH"),
@@ -147,6 +163,30 @@ class TestPdDecodeFenceInstall(CustomTestCase):
                     scheduler.maybe_init_kv_free_fence()
                 self.assertIsNone(scheduler.kv_free_fence)
                 self.assertIn(expected, logs.output[0])
+
+    def test_unfenceable_raiden_hicache_still_fails_startup(self):
+        """raiden HiCache must not fall back to unfenced serving as PD decode does."""
+        generic = _generic_allocator()
+        for overrides, mode in (
+            (dict(token_to_kv_pool_allocator=generic), DisaggregationMode.NULL),
+            (dict(spec_algorithm=SpeculativeAlgorithm.DFLASH), DisaggregationMode.NULL),
+            (dict(token_to_kv_pool_allocator=generic), DisaggregationMode.DECODE),
+            (
+                dict(
+                    spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                    tpu_async_copy_worker=None,
+                ),
+                DisaggregationMode.DECODE,
+            ),
+        ):
+            with self.subTest(
+                mode=str(mode), **{k: str(v) for k, v in overrides.items()}
+            ):
+                scheduler = _scheduler(disaggregation_mode=mode, **overrides)
+                scheduler._uses_raiden_hicache = lambda: True
+                with self.assertRaisesRegex(ValueError, "raiden HiCache"):
+                    scheduler.maybe_init_kv_free_fence()
+                self.assertIsNone(scheduler.kv_free_fence)
 
 
 if __name__ == "__main__":
