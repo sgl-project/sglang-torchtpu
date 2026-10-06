@@ -83,8 +83,8 @@ dependencies = [
   # Published to PyPI as nightly .dev pre-releases (see [tool.uv.sources]).
   "tpu-sync-torch==0.0.1.dev20261002213151",
   "libtpu==0.0.47",
-  "torch==2.11.0",
-  "torchvision==0.26.0",
+  "torch==2.13.0",
+  "torchvision==0.28.0",
   "jax==0.10.2",
   "jaxlib==0.10.2",
 ]
