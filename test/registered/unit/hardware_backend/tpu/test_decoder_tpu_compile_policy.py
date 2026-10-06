@@ -323,6 +323,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
                 "object_state.value",
                 "object_state.weight_alias",
             )
+            prune_unused_direct_compile_inputs = False
 
         model = SimpleNamespace(forward=MagicMock())
         support_torch_compile(model, policy=CustomPolicy)
@@ -371,6 +372,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             CustomPolicy.model_extra_tensor_attrs,
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
+        self.assertIs(kwargs["prune_unused_inputs"], False)
         self.assertEqual(
             kwargs["specialization_key"], policy._direct_compile_specialization_key
         )

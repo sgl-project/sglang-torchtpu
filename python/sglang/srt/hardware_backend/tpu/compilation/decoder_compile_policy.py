@@ -325,6 +325,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     fullgraph = True
     dynamic = False
     model_extra_tensor_attrs: ClassVar[tuple[str, ...]] = ()
+    # Passed to direct_compile as prune_unused_inputs. Set False to keep every
+    # model tensor as an executable argument.
+    prune_unused_direct_compile_inputs: ClassVar[bool] = True
 
     def get_dp_padded_token_counts(
         self,
@@ -678,6 +681,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
+            prune_unused_inputs=self.prune_unused_direct_compile_inputs,
         )
 
         @functools.wraps(fn)
