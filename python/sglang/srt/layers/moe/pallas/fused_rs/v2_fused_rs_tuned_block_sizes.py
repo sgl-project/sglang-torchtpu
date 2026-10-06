@@ -114,6 +114,14 @@ _H3072_I3072_FP8_XLARGE = (
 )  # M >= 131072 (tile_m=256 wins at very large M) — autotuned 48.6ms
 _H4096_I4096_BF16 = (128, 2048, 2048, 2048, 2048, 2, 2)
 _H3072_I3072_BF16 = (128, 1024, 1024, 1024, 1024, 2, 2)
+# H4096-I4096 bf16 at TP16/EP16 (g=16).
+# Full K and unchanged N/K step order keep every output's accumulation chain
+# identical to the heuristic default, so the prefill entry only changes tile_m.
+# Decode/verify M (<= 4096 routed rows) keep the heuristic default explicitly;
+# prefill M streams the 96 MiB/expert bf16 weights once per gm tile, so
+# doubling tile_m halves the weight re-reads.
+_H4096_I4096_BF16_EP16_DEFAULT = (128, 4096, 512, 4096, 512, 2, 2)
+_H4096_I4096_BF16_EP16_PREFILL = (256, 4096, 512, 4096, 512, 2, 2)
 
 # FP4 (rhs_quant_block_size=16): weights are half FP8 → enough VMEM for
 # num_w1_bufs=2, enabling full W1 caching that FP8 couldn't afford.
@@ -244,6 +252,27 @@ def _h4096_i4096_fp4_q512_ep16_size_dependent():
     out = _h4096_i4096_fp4_q512_size_dependent()
     for m_val in (16384, 32768, 65536):
         out[f"{m_val}_silu"] = _H4096_I4096_FP4_Q512_W4A8_SMALL
+    return out
+
+
+def _h4096_i4096_bf16_ep16_size_dependent():
+    """H4096-I4096 bf16 at EP16 (g=16): a larger full-K tile_m for prefill only.
+
+    TPU7x, serving custom op, device ms per call, uniform / skewed routing.
+    M=131072 (16K tokens): default 6.03 / 7.25, tile_m=256 4.90 / 5.85,
+    tile_m=512 with tile_n=256 4.74 / 6.00 (loses on skew, more VMEM).
+    M=65536 (8K): default 2.57, tile_m=256 2.09, tile_m=512 2.71.
+    M<=32768 loses with either larger tile (padded rows), so it keeps the
+    default.
+    """
+    out = {}
+    for m_key in _ALL_M_KEYS:
+        m_val = int(m_key.split("_")[0])
+        out[m_key] = (
+            _H4096_I4096_BF16_EP16_PREFILL
+            if m_val >= 65536
+            else _H4096_I4096_BF16_EP16_DEFAULT
+        )
     return out
 
 
@@ -500,6 +529,10 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
             # Validated: tile_n2=2048 with num_w2_bufs=2 to eliminate W2 stall.
             # Caching disabled (num_bufs(2) < total_steps(4)).
             "k-4096_n-8192_g-32+k-4096_n-4096_g-32": _all_m(_H4096_I4096_BF16),
+            # H4096-I4096: EP16 -> g=16.
+            "k-4096_n-8192_g-16+k-4096_n-4096_g-16": (
+                _h4096_i4096_bf16_ep16_size_dependent()
+            ),
             # H3072-I3072: H=3072, I=3072, E=256, EP=8 → g=32
             # Smaller tiles for VMEM fit (bf16 uses 2× weight bytes vs fp8).
             "k-3072_n-6144_g-32+k-3072_n-3072_g-32": _all_m(_H3072_I3072_BF16),

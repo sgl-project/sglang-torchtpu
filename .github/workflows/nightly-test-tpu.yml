@@ -1,8 +1,10 @@
-# Nightly TPU e2e. Builds the image ONCE, then fans out the three stages of the
+# Nightly TPU e2e. Builds the image ONCE, then fans out two stages of the
 # redesign (.github/tpu-ci/README.md, § Pipelines and § Dashboard) IN PARALLEL:
 #
-#   [1] feature validation | [2] accuracy | [3] perf
+#   feature validation | perf
 #
+# The accuracy stage runs on accuracy-test-tpu.yml's 10 AM / 5 PM schedule:
+# with it, the nightly needed more slice time than the 6 h runner cap leaves.
 # Each stage is a reusable workflow that is ALSO its own dispatchable trigger
 # (feature-validation-tpu.yml / accuracy-test-tpu.yml / perf-test-tpu.yml), so a
 # single stage or single test can run without a full nightly. The stages need
@@ -21,7 +23,7 @@ run-name: "Nightly Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }
 on:
   schedule:
     - cron: "0 1 * * *"
-      timezone: "America/Los_Angeles"  # Quality evals run inside this run (stage [2]).
+      timezone: "America/Los_Angeles"
   workflow_dispatch:
     inputs:
       ref:
@@ -39,7 +41,6 @@ on:
         options:
           - all
           - feature-validation
-          - accuracy
           - perf
           - mh
           - pd-mh-gpt-120b
@@ -53,6 +54,8 @@ on:
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - pd-sh-gpt-120b-decode-radix
+          - pd-sh-gpt-120b-offload
+          - pd-sh-gpt-120b-offload-spec
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
@@ -78,12 +81,12 @@ jobs:
       contents: read
       id-token: write
 
-  # Stage [1]: feature validation -- single-host suite, multi-host launch
+  # Feature validation: single-host suite, multi-host launch
   # groups, and the static P/D disaggregation gates. Everything except `all`
   # and `feature-validation` in the sh/mh/pd-* family narrows it to one job.
   feature-validation:
     needs: build
-    if: ${{ !contains(fromJSON('["accuracy","perf"]'), inputs.only || 'all') }}
+    if: ${{ (inputs.only || 'all') != 'perf' }}
     uses: ./.github/workflows/feature-validation-tpu.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -97,22 +100,7 @@ jobs:
       contents: read
       id-token: write
 
-  # Stage [2]: accuracy evals, one job per benchmark. `model: nightly` is every
-  # single-host accuracy suite but not the ondemand multihost models parked out
-  # of the nightly lane.
-  accuracy:
-    needs: build
-    if: ${{ contains(fromJSON('["all","accuracy"]'), inputs.only || 'all') }}
-    uses: ./.github/workflows/accuracy-test-tpu.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      model: nightly
-    permissions:
-      contents: read
-      id-token: write
-
-  # Stage [3]: throughput sweeps, one job per model.
+  # Perf: throughput sweeps, one job per model.
   perf:
     needs: build
     if: ${{ contains(fromJSON('["all","perf"]'), inputs.only || 'all') }}

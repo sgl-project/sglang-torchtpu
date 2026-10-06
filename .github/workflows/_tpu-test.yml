@@ -313,12 +313,27 @@ jobs:
           # The stream below can outlive the token it starts with; start it fresh.
           refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
 
-          # Stream logs from every host (best effort; may restart while pods come up).
-          # Tee'd because the pod log is the ONLY egress from a JobSet: a benchmark
-          # test emits its results JSON into it, and the next step lifts that out.
-          kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
-            --max-log-requests=10 --pod-running-timeout=15m --tail=-1 \
-            2>&1 | tee "$RUNNER_TEMP/tpu-pod-logs.txt" || true
+          # Stream logs from every host, re-attaching on a drop while the JobSet is
+          # live: the pod log is the only egress from a JobSet, results included.
+          rm -f "$RUNNER_TEMP/tpu-pod-logs.txt"
+          since=""
+          while kubectl -n tpu-ci get "$name" >/dev/null 2>&1; do
+            jok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
+            jbad="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            { [ "$jok" = "True" ] || [ "$jbad" = "True" ]; } && break
+            if [ -n "$since" ]; then
+              echo "--- [$(date +%T)] log stream ended while ${label} is still running; re-attaching ---"
+              refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
+              range=(--since-time="$since")
+            else
+              range=(--tail=-1)
+            fi
+            kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
+              --max-log-requests=10 --pod-running-timeout=15m "${range[@]}" \
+              2>&1 | tee -a "$RUNNER_TEMP/tpu-pod-logs.txt" || true
+            since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            sleep 10
+          done
 
           # Runtime clock starts now: queue time is not charged to the test.
           deadline=$(( $(date +%s) + wait_s ))

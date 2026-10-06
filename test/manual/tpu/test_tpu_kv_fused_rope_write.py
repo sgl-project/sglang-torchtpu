@@ -146,7 +146,7 @@ def _compare(
         kv_bufs=got,
         max_span_len=max_span_len,
     )
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     bad = []
     for layer in range(LAYERS):
@@ -429,7 +429,7 @@ def test_matches_real_apply_k_rope() -> None:
 
 if __name__ == "__main__":
     test_matches_real_apply_k_rope()
-    print(f"TPU chips: {torch.tpu.device_count()}")
+    print(f"TPU chips: {torch.accelerator.device_count()}")
     # A device allocation brings the pjrt client up; .to(DEVICE) alone does not.
     torch.zeros(1, device=DEVICE)
     test_extend_spans_reconstruct_slots()

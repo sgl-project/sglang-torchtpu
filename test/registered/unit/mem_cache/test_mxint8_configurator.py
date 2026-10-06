@@ -54,6 +54,7 @@ def _load_configurator(**dependencies):
         "get_spec": get_spec,
         "mambaish_config": lambda _: None,
         "hybrid_gdn_config": lambda _: None,
+        "hybrid_kda_config": lambda _: None,
         **dependencies,
     }
     module = ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[]))
@@ -87,7 +88,8 @@ class TestMXINT8Configurator(CustomTestCase):
         kwargs = dict(
             device="tpu",
             gpu_id=0,
-            ps=None,
+            attn_dp_size=1,
+            pp_size=1,
             pp_group=None,
             model=None,
             model_config=SimpleNamespace(

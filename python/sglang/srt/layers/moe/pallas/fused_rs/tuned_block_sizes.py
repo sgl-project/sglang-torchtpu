@@ -88,6 +88,14 @@ def get_fused_rs_tuned_block_sizes(
 
     try:
         result = FUSED_RS_TUNED_BLOCK_SIZES[device_name][dtype_key][joint_key][m_key]
+        logger.info(
+            "[GMM v2 fused_rs] tuned block sizes for %s %s %s %s: %s",
+            device_name,
+            dtype_key,
+            joint_key,
+            m_key,
+            result,
+        )
     except KeyError:
         logger.warning(
             "[GMM v2 fused_rs] using default block sizes for %s %s %s %s: %s",

@@ -86,8 +86,9 @@ def scheduler(rank, receivers, size=3):
     # The per-stage poll and the failure union are the TPU wave's path; its
     # consensus travels on the pipeline group's tagged channel.
     result._pp_wave = object()
-    result.ps = SimpleNamespace(pp_rank=rank, pp_size=size)
     result.pp_group = SimpleNamespace(
+        rank_in_group=rank,
+        world_size=size,
         is_first_rank=rank == 0,
         is_last_rank=rank == size - 1,
         send_object=Mock(return_value=[]),

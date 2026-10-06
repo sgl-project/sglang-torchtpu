@@ -243,3 +243,27 @@ environment (e.g. `SGLANG_BEARER_TOKEN`, `SGLANG_S3_SECRET_ACCESS_KEY`) or an
 Any field whose name reads as a credential (`*_token`, `*secret*`, `*password*`,
 `*_access_key`, `api_key`, …) has its value replaced with `***redacted***`
 before the record is written.
+
+## Kimi INT4-resident FP8 MoE
+
+For a group-32 INT4 Kimi checkpoint, set the mode before launching the server:
+
+```bash
+export SGLANG_TPU_INT4_MOE_MODE=vmem-fp8
+```
+
+This mode keeps packed INT4 expert weights in HBM. At load time it prepares
+normalized group scales and output-channel scales. The existing
+`sglang/srt/layers/moe/pallas/gmm_v2.py` unpacks and scales each weight tile in
+VMEM, converts it to FP8, and multiplies it by activations quantized in K=512
+groups. It restores output-channel scales before the optional fused activation.
+This is W4A8 compute with BF16 partial accumulation; no second GMM implementation
+or full FP8 copy of the expert weights is required.
+
+Routing, padding and tiling are the same as in the other modes; measured at one
+token the general path matched the earlier Kimi-specific fast path, so there is
+none.
+
+The other modes retain their behavior: unset uses W4A16 group products;
+`vmem-bf16` dequantizes each INT4 group in VMEM to BF16 and leaves activations
+in BF16.

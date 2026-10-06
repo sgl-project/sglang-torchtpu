@@ -116,3 +116,19 @@ def make_dflash_verify_bookkeeping_args(
             device=context.device,
         ),
     )
+
+
+def make_dflash_verify_cache_locs_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor | int, ...]:
+    block_size = context.num_verify_tokens
+    return (
+        torch.zeros(
+            (context.physical_bs, 2 * block_size),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
+        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
+        block_size,
+    )

@@ -68,6 +68,7 @@ from sglang.srt.disaggregation.raiden.serde import (
 )
 from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -101,6 +102,10 @@ class RaidenKVManager(
     instead of reimplementing the coordination.
     """
 
+    # The legacy transport unless set_kv_caches builds a pipeline transfer.
+    _pipeline = None
+    _pipeline_enabled = False
+
     def __init__(
         self,
         args: KVArgs,
@@ -127,6 +132,15 @@ class RaidenKVManager(
         self._swa_kv_caches: Optional[list] = None
         self.raiden_endpoint: Optional[str] = None
         self.swa_raiden_endpoint: Optional[str] = None
+        self._pipeline = None
+        # Pipeline stages always transfer by named layer pools; a DP or TP
+        # decode opts in to consume from a pipeline prefill.
+        self._pipeline_enabled = self.pp_size > 1 or (
+            disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+        )
+        self._pipeline_init_lock = threading.Lock()
+        self._pipeline_messages = []
         # Each rank reserves control+data ports for full KV and SWA KV. The
         # rank counts every worker on the node -- attention-TP ranks of every
         # context-parallel, attention-DP, and system-DP replica -- so
@@ -140,17 +154,20 @@ class RaidenKVManager(
             self.system_dp_rank,
             self.attn_cp_rank,
             self.attn_cp_size,
+            self.pp_rank,
+            self.pp_size,
         )
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
-        # Raiden's own switch, read when the engine is built in this process:
-        # host staging is allocated per transfer (and per reshard plan) from
-        # the pool instead of in fixed slots. On unless the operator sets it
-        # to 0; asymmetric attention TP (push-resharding) requires it.
-        os.environ.setdefault("TPU_RAIDEN_DYNAMIC_HOST_STAGING", "1")
-        self._dynamic_host_staging = (
-            os.environ["TPU_RAIDEN_DYNAMIC_HOST_STAGING"] == "1"
+        # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
+        # built in this process. Store the resolved value back so later reads
+        # do not mistake the variable set here for the deprecated alias.
+        dynamic_host_staging = envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.get()
+        envs.SGLANG_RAIDEN_DYNAMIC_HOST_STAGING.set(dynamic_host_staging)
+        os.environ["TPU_RAIDEN_DYNAMIC_HOST_STAGING"] = (
+            "1" if dynamic_host_staging else "0"
         )
+        self._dynamic_host_staging = dynamic_host_staging
         # Whether KV moves chunk by chunk as the prefill commits it, or in one
         # transfer after the whole prefill; decided from the KV layout when the
         # pool tensors are handed over.
@@ -160,6 +177,8 @@ class RaidenKVManager(
         # until clear() so repeated poll() calls before the framework advances
         # keep reporting the same terminal state.
         self._completed_send: Set[str] = set()
+        # Raiden's finish time (perf_counter seconds) per sent id, if reported.
+        self._send_done_at: Dict[str, float] = {}
         self._completed_recv: Set[str] = set()
         self._failed: Set[str] = set()
         # Transfer ids the engine reported failed. Only these mean raiden has
@@ -171,10 +190,17 @@ class RaidenKVManager(
         # publish time. This is populated only by prefill managers, but the
         # shared engine-drain path settles it for both manager roles. A lease
         # is the room's claim on its pages: it starts before the (possibly
-        # blocking) registration, settles when the engine reports the read
-        # served or failed, and ages out after the transfer deadline for a
-        # read the decode never comes for.
+        # blocking) registration and settles when the engine reports the read
+        # served or failed (raiden expires a read nobody pulls at its
+        # deadline). Exception: once the room's closing read has settled, its
+        # unread chunk leases are dropped early -- see
+        # _settle_sender_reads_locked.
         self._send_reads: Dict[int, Set[str]] = {}
+        # Chunk read ids dropped early by that exception. Raiden cannot cancel
+        # a read, so each still expires natively at its deadline; when
+        # poll_stats reports that expiry, the id is removed from here instead
+        # of failing the room.
+        self._superseded_sender_reads: Set[str] = set()
         # Reads issued and not yet settled, with the host staging pages each
         # holds. Raiden seats a read in pages of the pool it allocated at
         # startup and rejects a read it cannot seat, so the decode side admits
@@ -293,6 +319,19 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        if self._pipeline_enabled:
+            from sglang.srt.disaggregation.raiden.pipeline import PipelineTransfer
+
+            pipeline = PipelineTransfer(self, kv_caches)
+            self._engine = pipeline.engine
+            self.raiden_endpoint = pipeline.controller
+            self.chunked_transfer = False
+            with self._pipeline_init_lock:
+                self._pipeline = pipeline
+                for message in self._pipeline_messages:
+                    pipeline.on_message(message)
+                self._pipeline_messages.clear()
+            return
         # Full-attention KV moves piece by piece during the prefill. A hybrid
         # model's sliding-window pool holds only the last window, which is
         # settled when the prefill ends, so it rides on the closing read.
@@ -429,6 +468,7 @@ class RaidenKVManager(
             self.system_dp_size,
             self.server_args.nnodes,
             self.attn_cp_size,
+            self.pp_size,
         )
         budget /= local_ranks * max(1, engines)
         slot_bytes = slot_host_bytes(kv_caches, max_blocks)
@@ -482,6 +522,14 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        if self._pipeline is not None:
+            sent, received, failed = self._pipeline.poll()
+            with self._state_lock:
+                self._completed_send.update(sent)
+                self._completed_recv.update(received)
+                self._native_failed.update(failed)
+                self._failed.update(failed)
+            return
         if self._engine is None and self._swa_engine is None:
             return
         for name, engine in (("full", self._engine), ("swa", self._swa_engine)):
@@ -493,19 +541,30 @@ class RaidenKVManager(
             done_send, done_recv, failed = status
             if done_send or done_recv or failed:
                 with self._state_lock:
-                    self._completed_send.update(self._norm_req_id(r) for r in done_send)
-                    self._completed_recv.update(self._norm_req_id(r) for r in done_recv)
-                    norm_failed = {self._norm_req_id(r) for r in failed}
-                    self._native_failed.update(norm_failed)
-                    self._failed.update(norm_failed)
+                    for t in done_send:
+                        rid = self._norm_req_id(t.req_id)
+                        self._completed_send.add(rid)
+                        if t.completed_ns is not None:
+                            self._send_done_at[rid] = t.completed_ns / 1e9
+                    self._completed_recv.update(
+                        self._norm_req_id(t.req_id) for t in done_recv
+                    )
+                    norm_failed = {self._norm_req_id(t.req_id) for t in failed}
+                    superseded = self._superseded_sender_reads
+                    real_failed = norm_failed - superseded
+                    superseded -= norm_failed
+                    self._native_failed.update(real_failed)
+                    self._failed.update(real_failed)
                     self._release_pull_slots_locked()
                     self._settle_sender_reads_locked()
                     settled_plans = self._settled_cleared_plans_locked()
                 for uuid in settled_plans:
                     self._unregister_plan(uuid)
-                if failed:
+                if real_failed:
                     logger.error(
-                        "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
+                        "RaidenKVManager rank%d failed=%s",
+                        self.attn_tp_rank,
+                        real_failed,
                     )
         with self._state_lock:
             settled_stale = [e for e in self._stale_plans if e[2].is_ready()]
@@ -516,19 +575,20 @@ class RaidenKVManager(
 
     def _poll_engine_status(
         self, *, name: str, engine: Any
-    ) -> Tuple[List[str], List[str], List[str]] | None:
-        """One engine's completions, or None when its poll raised.
+    ) -> Tuple[List[Any], List[Any], List[Any]] | None:
+        """One engine's sent, received and failed transfers, or None if the
+        poll raised.
 
         Runs inside the scheduler's poll, so an escaping exception would take
-        down every request on this worker. Raiden raises from ``poll_stats``
-        only before it takes any completion, so a failed poll loses nothing
-        and the next one reports it. Raiden's transfer deadlines are reported
-        through ``poll_stats`` too: once polls have failed for longer than one
-        deadline no transfer can settle, and that is raised rather than left
-        to hang every request with its pages held.
+        down every request on this worker. Raiden raises from
+        ``poll_stats_with_details`` only before it takes any completion, so a
+        failed poll loses nothing and the next one reports it. Raiden's
+        transfer deadlines are reported through it too: once polls have failed
+        for longer than one deadline no transfer can settle, and that is raised
+        rather than left to hang every request with its pages held.
         """
         try:
-            status = engine.poll_stats()
+            stats = engine.poll_stats_with_details()
         except Exception as e:
             now = self._monotonic()
             since = self._engine_poll_failing_since.setdefault(name, now)
@@ -553,7 +613,15 @@ class RaidenKVManager(
                 self.attn_tp_rank,
                 name,
             )
-        return status
+        return stats.sent, stats.received, stats.failed
+
+    def send_done_time(self, room: int) -> Optional[float]:
+        """Raiden's finish time for the room's send, or None if not reported."""
+        rids = [str(room)]
+        if self._swa_engine is not None:
+            rids.append(self._swa_req_id(room))
+        times = [self._send_done_at.get(rid) for rid in rids]
+        return None if None in times else max(times)
 
     def _unregister_plan(self, uuid: int) -> None:
         """Drops a receiver plan whose push has settled.
@@ -746,11 +814,48 @@ class RaidenKVManager(
         if tag == MessageTag.ABORT:
             self._on_abort(msg)
             return
+        if tag in (
+            MessageTag.PIPELINE_REQ,
+            MessageTag.PIPELINE_READY,
+            MessageTag.PIPELINE_RELEASE,
+        ):
+            self._on_pipeline_message(msg)
+            return
         handler = self._message_handlers.get(tag)
         if handler is None:
             logger.error("RaidenKVManager unknown message tag: %s", tag)
             return
         handler(msg)
+
+    def _on_pipeline_message(self, msg: List[bytes]) -> None:
+        """Hand a frame to the pipeline transfer, or hold it until the pools
+        register; a frame the pipeline rejects fails its room."""
+        room = int(msg[1])
+        try:
+            if not self._pipeline_enabled:
+                raise ValueError(
+                    "Raiden pipeline transfer requires a pipeline-parallel prefill"
+                )
+            with self._pipeline_init_lock:
+                if self._pipeline is None:
+                    self._pipeline_messages.append(msg)
+                    return
+                pipeline = self._pipeline
+            pipeline.on_message(msg)
+        except Exception as error:
+            with self._state_lock:
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(room, f"Raiden pipeline transfer: {error}")
+                self.update_status(room, KVPoll.Failed)
+            raise
+
+    @staticmethod
+    def _require_frames(msg: List[bytes], tag: MessageTag, n: int) -> None:
+        """Validate the frame count of a positional pipeline message."""
+        if len(msg) != n:
+            raise ValueError(
+                f"malformed {tag.name} message: expected {n} frames, got {len(msg)}"
+            )
 
     # ----- prefill side ------------------------------------------------------
 
@@ -820,6 +925,8 @@ class RaidenKVManager(
         transfer would write them under their next owner. Raiden's own
         transfer deadline bounds how long this can stay true.
         """
+        if self._pipeline is not None:
+            return self._pipeline.active(room)
         rid, swa_rid, chunk_prefix = str(room), self._swa_req_id(room), f"{room}#"
 
         def belongs(key: str) -> bool:
@@ -844,6 +951,8 @@ class RaidenKVManager(
         An abort tombstone survives the room: frames for it can still arrive
         and must stay rejected. Tombstones age out on their own.
         """
+        if self._pipeline is not None:
+            self._pipeline.clear(room)
         self._drop_room_state(room, clear_failure_record=True)
 
     def _drop_room_state(
@@ -888,6 +997,8 @@ class RaidenKVManager(
             self._completed_send.difference_update(
                 [k for k in self._completed_send if belongs(k)]
             )
+            for key in [k for k in self._send_done_at if belongs(k)]:
+                del self._send_done_at[key]
             for ids in (self._completed_recv, self._failed, self._native_failed):
                 ids.difference_update([k for k in ids if belongs(k) and k not in held])
             announced = self._decode.announced_at if self._decode is not None else None

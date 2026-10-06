@@ -10,6 +10,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import inspect
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
@@ -31,13 +33,14 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dfla
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
+from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import collect_warmups
 from sglang.srt.model_executor.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 DECODER_POLICY_PRECOMPILE = (
     "sglang.srt.hardware_backend.tpu.compilation."
@@ -116,7 +119,10 @@ class TestTpuGraphRunner(CustomTestCase):
         direct_patcher = patch(
             "sglang.srt.hardware_backend.tpu.compilation."
             "decoder_compile_policy.DecoderTpuCompilePolicy._direct_compile",
-            return_value=MagicMock(name="direct_compiled"),
+            return_value=(
+                MagicMock(name="direct_compiled"),
+                MagicMock(name="direct_warmup_async"),
+            ),
         )
         self.mock_direct_compile = direct_patcher.start()
         self.addCleanup(direct_patcher.stop)
@@ -126,6 +132,13 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         self.mock_register = register_patcher.start()
         self.addCleanup(register_patcher.stop)
+        self.mock_cache_key = enter_scope(
+            self,
+            patch(
+                "sglang.srt.model_executor.tpu_graph_runner."
+                "add_tpu_rank_assignment_to_compile_cache_key"
+            ),
+        )
         # Stub the in-process precompile so the test doesn't need a real
         # attn_backend / model_runner.device. Decoder policy warmup behavior
         # is covered separately in test_decoder_tpu_compile_policy.py.
@@ -238,6 +251,100 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertEqual(self.mock_compile.call_count, 1)
         self.assertIs(model.forward_split_prefill, original_split)
 
+    def test_queues_all_modules_before_waiting_for_warmups(self):
+        events = []
+        modules = [self._annotate(_model_with(forward=MagicMock())) for _ in range(2)]
+        model = _model_with(modules=lambda: modules)
+
+        def precompile():
+            index = len(events)
+            events.append(("submit", index))
+            return [PendingCall(lambda: events.append(("wait", index)))]
+
+        self.mock_precompile.side_effect = precompile
+        TpuGraphRunner(self._runner_for(model, tpu_compile_tracer="direct"))
+        self.assertEqual(
+            events, [("submit", 0), ("submit", 1), ("wait", 0), ("wait", 1)]
+        )
+
+    def test_global_queue_submits_all_runners_before_waiting(self):
+        events = []
+
+        def precompile():
+            index = len(events)
+            events.append(("submit", index))
+            return [PendingCall(lambda: events.append(("wait", index)))]
+
+        self.mock_precompile.side_effect = precompile
+        with collect_warmups() as queue:
+            for _ in range(3):
+                module = self._annotate(_model_with(forward=MagicMock()))
+                TpuGraphRunner(self._runner_for(_model_with(modules=lambda: [module])))
+            self.assertEqual(events, [("submit", i) for i in range(3)])
+        self.assertEqual(
+            events, [("submit", i) for i in range(3)] + [("wait", i) for i in range(3)]
+        )
+        self.assertEqual(queue.calls, [])
+        self.assertEqual(queue.completions, [])
+
+    def test_global_queue_defers_recompilation_checker_install(self):
+        events = []
+        self.mock_precompile.side_effect = lambda: [
+            PendingCall(lambda: events.append("wait"))
+        ]
+        checker = MagicMock()
+        checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
+        model = self._annotate(_model_with(forward=MagicMock()))
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "_shared_recompilation_checker",
+                return_value=checker,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "decoder_compile_policy.DecoderTpuCompilePolicy."
+                "set_recompilation_checker",
+                side_effect=lambda *a, **k: events.append("install"),
+            ),
+        ):
+            with collect_warmups():
+                TpuGraphRunner(self._runner_for(model))
+                self.assertEqual(events, [])
+        self.assertEqual(events, ["wait", "snapshot", "install"])
+
+    def test_precompile_done_marker_follows_warmup_completion(self):
+        for global_queue in (False, True):
+            for async_compile in (False, True):
+                with self.subTest(
+                    global_queue=global_queue, async_compile=async_compile
+                ):
+                    events = []
+
+                    def precompile():
+                        if async_compile:
+                            return [PendingCall(lambda: events.append("execute"))]
+                        events.append("execute")
+                        return []
+
+                    def record_log(message, *args):
+                        if "precompile done" in message:
+                            events.append("done")
+
+                    self.mock_precompile.side_effect = precompile
+                    model = self._annotate(_model_with(forward=MagicMock()))
+                    scope = collect_warmups() if global_queue else nullcontext()
+                    with patch(
+                        "sglang.srt.model_executor.tpu_graph_runner.logger.info",
+                        side_effect=record_log,
+                    ):
+                        with scope:
+                            TpuGraphRunner(self._runner_for(model))
+                            if global_queue:
+                                self.assertNotIn("done", events)
+                    self.assertEqual(events, ["execute", "done"])
+
     def test_prepare_forward_batch_composes_model_and_policy_hooks(self):
         model_prepare = MagicMock()
         model = self._annotate(
@@ -270,6 +377,7 @@ class TestTpuGraphRunner(CustomTestCase):
             self.assertIs(model.forward, original)
             self.mock_compile.assert_not_called()
             self.mock_register.assert_not_called()
+            self.mock_cache_key.assert_called_once_with()
             # The skip is reflected into the capture flag for downstream warmup.
             self.assertFalse(get_flags().capture.enable_torch_compile)
 
@@ -418,6 +526,9 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_precompile.assert_called_once()
 
     def test_discovers_annotated_module(self):
+        events = []
+        self.mock_cache_key.side_effect = lambda: events.append("cache-key")
+
         class _VisionPolicy(CompilePolicy):
             platform = "tpu"
 
@@ -425,10 +536,12 @@ class TestTpuGraphRunner(CustomTestCase):
                 super().__init__(**kwargs)
 
             def install(self) -> bool:
+                events.append("install")
                 self.owner.installed = True
                 return True
 
             def precompile(self) -> None:
+                events.append("precompile")
                 self.owner.precompiled = True
 
         class _VisionModule:
@@ -439,15 +552,26 @@ class TestTpuGraphRunner(CustomTestCase):
             _VisionModule,
             policy=_VisionPolicy,
         )
-        vision_module = _VisionModule()
-        model = _model_with()
-        model.modules = lambda: (model, vision_module)
-
-        TpuGraphRunner(self._runner_for(model))
-
-        self.assertTrue(vision_module.installed)
-        self.assertTrue(vision_module.precompiled)
+        for is_draft_worker in (False, True):
+            vision_module = _VisionModule()
+            model = _model_with()
+            model.modules = lambda: (model, vision_module)
+            runner = self._runner_for(model)
+            runner.is_draft_worker = is_draft_worker
+            TpuGraphRunner(runner)
+            self.assertTrue(vision_module.installed)
+            self.assertTrue(vision_module.precompiled)
+        self.assertEqual(events, ["cache-key", "install", "precompile"] * 2)
         self.mock_compile.assert_not_called()
+
+    def test_invalid_assignment_prevents_compilation(self):
+        self.mock_cache_key.side_effect = RuntimeError("Invalid TPU rank assignment")
+        model = self._annotate(_model_with(forward=MagicMock()))
+        with self.assertRaisesRegex(RuntimeError, "Invalid TPU rank assignment"):
+            TpuGraphRunner(self._runner_for(model))
+        self.mock_compile.assert_not_called()
+        self.mock_direct_compile.assert_not_called()
+        self.mock_precompile.assert_not_called()
 
     def test_ignores_policy_for_another_platform(self):
         class _CudaPolicy(CompilePolicy):
@@ -627,7 +751,8 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         worker = object.__new__(EagleDraftWorker)
         worker.speculative_num_steps = 3
         worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
-        worker.draft_tp_context = lambda _group: contextlib.nullcontext()
+        worker.draft_tp_context = lambda _group, **_kwargs: contextlib.nullcontext()
+        worker.draft_owns_attention = False
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
             canary_manager=None,
@@ -667,6 +792,10 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             patch(
                 "sglang.srt.speculative.eagle_worker_v2._is_tpu",
                 True,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.draft_pp_context",
+                side_effect=contextlib.nullcontext,
             ),
         ):
             worker.init_cuda_graphs()

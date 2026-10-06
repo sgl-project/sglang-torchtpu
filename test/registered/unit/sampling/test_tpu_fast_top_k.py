@@ -15,6 +15,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import sampler as tpu_sampler_module
 from sglang.srt.hardware_backend.tpu import top_k as tpu_top_k_module
+from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
 from sglang.srt.hardware_backend.tpu.sampler import (
     TpuSampler,
     distributed_top_k_candidate_width,
@@ -23,13 +24,11 @@ from sglang.srt.hardware_backend.tpu.sampler import (
     select_logits_output_mode,
 )
 from sglang.srt.hardware_backend.tpu.top_k import (
-    DISTRIBUTED_TOP_K_RANK_BUFFER,
     PallasDistributedTopKConfig,
     PallasDistributedTopKNegotiation,
     TpuVocabShard,
     distributed_tpu_top_k,
     negotiate_pallas_distributed_top_k_config,
-    register_distributed_top_k_rank,
     supports_distributed_tpu_top_k,
     tpu_top_k,
 )
@@ -38,7 +37,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
-from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, LogitsOutputMode
 from sglang.srt.model_executor.runner import eager_runner as eager_runner_module
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -131,50 +130,6 @@ def _distributed_top_k_model(shard_width=202_048 // 16):
     return SimpleNamespace(logits_processor=processor, lm_head=lm_head)
 
 
-class TestDistributedTopKRankOperand(CustomTestCase):
-    """The kernel's rank operand has to reach the graph as a model buffer.
-
-    direct_compile lifts parameters, buffers, explicit arguments and KV-pool
-    state into graph inputs, and TraverseAndCompile rejects any other device
-    tensor reachable from the outputs. Building the operand inside the traced
-    region instead aborted all eight schedulers during extend precompile with
-    "identified an argument that was not provided: ... int32[1]", which is what
-    reddened test_tpu_gpt_oss_120b_singlehost_prefix_cache_kv_offload from
-    2026-09-06 (nightly run 34105159302).
-    """
-
-    def test_registration_publishes_the_rank_as_a_named_buffer(self):
-        lm_head = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
-        register_distributed_top_k_rank(lm_head, group=SimpleNamespace(rank_in_group=3))
-
-        buffers = dict(lm_head.named_buffers())
-        self.assertIn(DISTRIBUTED_TOP_K_RANK_BUFFER, buffers)
-        rank = buffers[DISTRIBUTED_TOP_K_RANK_BUFFER]
-        self.assertEqual(rank.dtype, torch.int32)
-        self.assertEqual(rank.tolist(), [3])
-        # Non-persistent: a new entry in the checkpoint would break weight
-        # loading for every model that takes this path.
-        self.assertNotIn(DISTRIBUTED_TOP_K_RANK_BUFFER, lm_head.state_dict())
-
-    def test_registration_is_idempotent(self):
-        # Negotiation runs per logits processor, and a model can reach it more
-        # than once; re-registering would rebind the buffer and invalidate the
-        # placeholder direct_compile already captured for it.
-        lm_head = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
-        group = SimpleNamespace(rank_in_group=2)
-        register_distributed_top_k_rank(lm_head, group=group)
-        first = getattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER)
-        register_distributed_top_k_rank(lm_head, group=group)
-        self.assertIs(getattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER), first)
-
-    def test_a_non_module_head_is_skipped(self):
-        # Negotiation test doubles are plain namespaces; only an nn.Module can
-        # hold a buffer, and only an nn.Module can be part of a captured model.
-        lm_head = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
-        register_distributed_top_k_rank(lm_head, group=SimpleNamespace(rank_in_group=1))
-        self.assertFalse(hasattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER))
-
-
 class TestDistributedTopKEligibility(CustomTestCase):
     def test_eager_runner_selects_logits_output_mode_only_on_tpu(self):
         model = _distributed_top_k_model()
@@ -256,7 +211,8 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.srt.distributed.get_tp_group", return_value=group
+                "sglang.srt.hardware_backend.tpu.sampler.get_parallel",
+                return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
             ) as get_group,
             patch.object(
                 tpu_top_k_module,
@@ -320,7 +276,10 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 "sglang.srt.distributed.model_parallel_is_initialized",
                 return_value=True,
             ),
-            patch("sglang.srt.distributed.get_tp_group", return_value=group),
+            patch(
+                "sglang.srt.hardware_backend.tpu.sampler.get_parallel",
+                return_value=SimpleNamespace(tp_group=group, attn_tp_group=group),
+            ),
             patch.object(
                 tpu_top_k_module,
                 "negotiate_pallas_distributed_top_k_config",
@@ -485,6 +444,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
             enable_tp_lm_head_all_to_all=False,
             tp_size=8,
             attn_dp_size=1,
+            tp_group=SimpleNamespace(cpu_group=None),
         )
         config = SimpleNamespace(vocab_size=128)
 
@@ -1110,6 +1070,137 @@ class TestTpuTopKLayout(CustomTestCase):
         self.assertEqual(values.dtype, torch.float32)
         self.assertEqual(ids.shape, (0, 64))
         self.assertEqual(ids.dtype, torch.int32)
+
+
+class TestTpuLmHeadRowBuckets(CustomTestCase):
+    """The LM head runs eagerly on TPU for the multimodal wrappers, and each new
+    row count compiles a fresh program (Gemma4 and Qwen3.5 stalled 40-100 s at
+    every batch size of a draining batch). Rows pad to a power of two for the
+    matmul and the caller still gets its own row count back."""
+
+    def test_rows_pad_to_a_power_of_two_for_the_matmul(self):
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        processor.use_fp32_lm_head = False
+        processor.rl_on_policy_target = None
+        torch.manual_seed(0)
+        hidden = torch.randn(5, 16)
+        lm_head = SimpleNamespace(weight=torch.randn(32, 16))
+        seen = []
+        original = LogitsProcessor._compute_lm_head_rows
+
+        def record(self_, hidden_states, head, bias=None):
+            seen.append(tuple(hidden_states.shape))
+            return original(self_, hidden_states, head, bias)
+
+        with (
+            patch.object(logits_processor_module, "_is_tpu", True),
+            patch.object(LogitsProcessor, "_compute_lm_head_rows", record),
+        ):
+            logits = processor._compute_lm_head(hidden, lm_head)
+
+        self.assertEqual(seen, [(8, 16)])
+        self.assertEqual(tuple(logits.shape), (5, 32))
+        torch.testing.assert_close(logits, hidden @ lm_head.weight.T)
+
+        with patch.object(logits_processor_module, "_is_tpu", False):
+            direct = processor._compute_lm_head(hidden, lm_head)
+        torch.testing.assert_close(direct, logits)
+
+    def test_a_traced_graph_keeps_its_own_row_count(self):
+        # Shapes are static inside a compiled graph; padding there would only
+        # change the HLO of every compiled model.
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        processor.use_fp32_lm_head = False
+        processor.rl_on_policy_target = None
+        hidden = torch.randn(5, 16)
+        lm_head = SimpleNamespace(weight=torch.randn(32, 16))
+        seen = []
+        original = LogitsProcessor._compute_lm_head_rows
+
+        def record(self_, hidden_states, head, bias=None):
+            seen.append(tuple(hidden_states.shape))
+            return original(self_, hidden_states, head, bias)
+
+        with (
+            patch.object(logits_processor_module, "_is_tpu", True),
+            patch.object(torch.compiler, "is_compiling", return_value=True),
+            patch.object(LogitsProcessor, "_compute_lm_head_rows", record),
+        ):
+            logits = processor._compute_lm_head(hidden, lm_head)
+
+        self.assertEqual(seen, [(5, 16)])
+        self.assertEqual(tuple(logits.shape), (5, 32))
+
+    def test_get_logits_pads_through_the_softcap_and_slices_back(self):
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        processor.use_fp32_lm_head = False
+        processor.rl_on_policy_target = None
+        processor.do_tensor_parallel_all_gather_dp_attn = False
+        processor.do_tensor_parallel_all_gather = False
+        processor.logit_scale = None
+        processor.final_logit_softcapping = 30.0
+        processor.vocab_size = 32
+        torch.manual_seed(1)
+        hidden = torch.randn(5, 16)
+        lm_head = SimpleNamespace(weight=torch.randn(32, 16))
+        metadata = SimpleNamespace(
+            next_token_logits_buffer=None, forward_mode=ForwardMode.DECODE
+        )
+        seen = []
+        original = LogitsProcessor._compute_lm_head_rows
+
+        def record(self_, hidden_states, head, bias=None):
+            seen.append(tuple(hidden_states.shape))
+            return original(self_, hidden_states, head, bias)
+
+        scoped = MagicMock()
+        scoped.scoped.return_value.__enter__ = lambda *a: None
+        scoped.scoped.return_value.__exit__ = lambda *a: None
+        with (
+            patch.object(logits_processor_module, "_is_tpu", True),
+            patch.object(logits_processor_module, "get_forward", return_value=scoped),
+            patch.object(
+                logits_processor_module,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_size=1, attn_dp_size=1),
+            ),
+            patch.object(
+                LogitsProcessor,
+                "_gather_dp_attn_hidden_states",
+                lambda self_, h, m: (h, h),
+            ),
+            patch.object(LogitsProcessor, "_compute_lm_head_rows", record),
+        ):
+            logits = processor._get_logits(hidden, lm_head, metadata)
+
+        self.assertEqual(seen, [(8, 16)])
+        self.assertEqual(tuple(logits.shape), (5, 32))
+        expected = 30.0 * torch.tanh((hidden @ lm_head.weight.T).float() / 30.0)
+        torch.testing.assert_close(logits, expected)
+
+
+class TestRowPad(CustomTestCase):
+    """Eager TPU ops compile per shape; rows round up to a power of two so a
+    batch draining one request at a time compiles log2(bs) times, not bs."""
+
+    def test_rounds_up_to_the_next_power_of_two(self):
+        self.assertEqual(
+            [row_bucket(n) for n in (0, 1, 2, 3, 5, 8, 9, 63, 64, 65)],
+            [1, 1, 2, 4, 8, 8, 16, 64, 64, 128],
+        )
+
+    def test_pads_the_leading_dim_with_the_fill_value(self):
+        x = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+        padded = pad_rows(x, 4, fill=1.0)
+        self.assertEqual(tuple(padded.shape), (4, 2))
+        torch.testing.assert_close(padded[:3], x)
+        self.assertTrue(bool((padded[3] == 1.0).all()))
+        # Already at the bucket: the same tensor, no copy.
+        self.assertIs(pad_rows(x, 3), x)
+        ks = pad_rows(torch.ones(3, dtype=torch.int32), 8)
+        self.assertEqual(tuple(ks.shape), (8,))
+        self.assertEqual(ks.dtype, torch.int32)
+        self.assertEqual(ks[3:].tolist(), [0] * 5)
 
 
 if __name__ == "__main__":

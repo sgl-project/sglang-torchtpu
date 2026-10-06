@@ -470,9 +470,14 @@ def test_dflash_prepare_for_decode_uses_torch_native_allocator():
         req_pool_indices_cpu=req_pool_indices_cpu,
         device=torch.device("cpu"),
         maybe_evict_swa=Mock(),
+        # Device accept routing is a separate concern; keep this case on the
+        # synchronizing path so the allocator assertions below stay the subject.
+        enable_overlap=False,
     )
     out = torch.arange(5)
-    spec_mock = SimpleNamespace(speculative_num_draft_tokens=4)
+    spec_mock = SimpleNamespace(
+        speculative_num_draft_tokens=4, speculative_draft_window_size=None
+    )
 
     info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
 
@@ -799,7 +804,7 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
             overlap_utils_tpu.device_accept_resolved_tpu,
             create=True,
         ),
-        patch.object(overlap_utils, "gather_spec_extras_func", side_effect=gather),
+        patch.object(kernels, "gather_spec_extras_func", side_effect=gather),
         patch.object(overlap_utils, "_DEBUG_ASSERT", True),
         patch.object(
             overlap_utils, "_assert_nonneg_and_invalidate", side_effect=invalidate

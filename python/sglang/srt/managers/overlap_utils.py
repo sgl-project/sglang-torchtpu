@@ -11,7 +11,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
 )
-from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
@@ -464,6 +463,10 @@ class FutureMap:
         if not _is_tpu:
             indices.record_stream(torch.get_device_module(self.device).current_stream())
         if self.need_topk:
+            # Function-local: spec_utils imports schedule_batch, which imports
+            # this module.
+            from sglang.srt.speculative.spec_utils import gather_spec_extras_func
+
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
             )
@@ -596,6 +599,16 @@ class FutureMap:
         if _is_tpu and resolve_device_accept_seq_lens_tpu(self, batch):
             return
         batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if (
+            _is_tpu
+            and self.spec_algo.is_dflash_family()
+            and draft_input.tpu_host_seq_lens_is_committed
+        ):
+            # DFLASH pre-gathered its verify window from the committed base, so
+            # the host mirror prepare_for_decode seeded must survive: reading the
+            # published length back would reintroduce the sync this avoids.
+            return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);

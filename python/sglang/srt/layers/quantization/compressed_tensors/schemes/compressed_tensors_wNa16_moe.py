@@ -758,9 +758,9 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        cfg = self.moe_runner_config
         from sglang.srt.hardware_backend.tpu.w4a16_moe import apply_tpu_w4a16_moe
 
-        cfg = self.moe_runner_config
         return apply_tpu_w4a16_moe(
             layer=layer,
             dispatch_output=dispatch_output,

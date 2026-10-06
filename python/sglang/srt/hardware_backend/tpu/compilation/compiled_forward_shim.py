@@ -24,9 +24,11 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
@@ -309,9 +311,7 @@ def _dp_attn_compute_padding(
             f"{forward_batch.dp_padding_mode}."
         )
 
-    from sglang.srt.layers.dp_attention import get_attention_dp_rank
-
-    dp_rank = get_attention_dp_rank()
+    dp_rank = get_parallel().attn_dp_rank
     # This rank's real live token count (used below for decode/idle real_q/b).
     # global_num_tokens_cpu is padded.
     # original_global_num_tokens_cpu is the pre-padding counts.
@@ -474,6 +474,7 @@ def _attach_input_logprobs(
     logits_output.input_top_logprobs_idx = eager.input_top_logprobs_idx
     logits_output.input_token_ids_logprobs_val = eager.input_token_ids_logprobs_val
     logits_output.input_token_ids_logprobs_idx = eager.input_token_ids_logprobs_idx
+    logits_output.input_logprobs_copy_done = eager.input_logprobs_copy_done
 
 
 def _pad_tensor_on_host(
@@ -746,8 +747,10 @@ class CompiledForwardShim:
         self,
         compiled_fn: Callable[..., Any],
         policy: DecoderCompilePolicy,
+        warmup_async_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.fn = compiled_fn
+        self.warmup_async_fn = warmup_async_fn
         self.policy = policy
         self._recompilation_checker = None
         self._model_label = ""
@@ -755,6 +758,11 @@ class CompiledForwardShim:
         # it is frozen for this shim's lifetime. Caching it also keeps the
         # disabled path at a single attribute read per forward.
         self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        runner = policy.model_runner
+        # Draft models read the multimodal embeds inside their forward.
+        self._draft_worker = bool(
+            runner is not None and getattr(runner, "is_draft_worker", False)
+        )
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -826,6 +834,21 @@ class CompiledForwardShim:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        return self._call(self.fn, input_ids, positions, forward_batch, *args, **kwargs)
+
+    def warmup_async(self, *args: Any, **kwargs: Any) -> Any:
+        """Queue direct compilation and defer execution until ``wait``."""
+        return self._call(self.warmup_async_fn, *args, **kwargs)
+
+    def _call(
+        self,
+        fn: Callable[..., Any],
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         # HiCache reload no-stale gate: block until the reload's host->device
         # scatters have landed. A compiled caller must invoke the eager gate
         # before entering its graph; tracing the mutable counter would guard on
@@ -849,16 +872,22 @@ class CompiledForwardShim:
         # attaching it later would recompile the graph this very tool exists to
         # protect. Compiles from inside it surface on the next eager forward.
         if torch.compiler.is_compiling():
-            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+            return self._forward(
+                fn, input_ids, positions, forward_batch, *args, **kwargs
+            )
 
         checker = self._recompilation_checker
         if checker is None:
-            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+            return self._forward(
+                fn, input_ids, positions, forward_batch, *args, **kwargs
+            )
         # Read at entry: the padded shapes are what the graph compiled for.
         pad_q = int(forward_batch.input_ids.shape[0])
         pad_b = int(forward_batch.seq_lens.shape[0])
         try:
-            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+            return self._forward(
+                fn, input_ids, positions, forward_batch, *args, **kwargs
+            )
         finally:
             checker.check(
                 context_fn=lambda: self._describe_forward(
@@ -876,6 +905,7 @@ class CompiledForwardShim:
 
     def _forward(
         self,
+        fn: Callable[..., Any],
         input_ids: torch.Tensor | None,
         positions: torch.Tensor | None,
         forward_batch: Any,
@@ -950,15 +980,71 @@ class CompiledForwardShim:
                 forward_batch.seq_lens.shape[0]
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
+        if not self._prompt_logprob_enabled and hasattr(
+            forward_batch, "extend_logprob_start_lens_cpu"
+        ):
+            # Only the eager input-logprob gather reads these; keep them out of the guards.
+            saved.update(
+                _pin_fields(forward_batch, {"extend_logprob_start_lens_cpu": None})
+            )
+        # Keep the multimodal embeds out of a target graph's guards; re-attached below.
+        mm_embeds = (
+            None
+            if self._draft_worker
+            else getattr(forward_batch, "mm_input_embeds", None)
+        )
+        if mm_embeds is not None:
+            saved["mm_input_embeds"] = mm_embeds
+            forward_batch.mm_input_embeds = None
         try:
-            out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
-            spec_info = forward_batch.spec_info
-            if spec_info is None or not spec_info.keep_outputs_padded:
-                out = self.policy.finalize_forward_batch(out, forward_batch)
+            out = fn(input_ids, positions, forward_batch, *args, **kwargs)
+            if isinstance(out, PendingCall):
+                finalize_fields = {key: getattr(forward_batch, key) for key in saved}
+                finalize_fields["is_prefill_only"] = forward_batch.is_prefill_only
+
+                def finalize_pending(result: Any) -> Any:
+                    previous = _pin_fields(forward_batch, finalize_fields)
+                    try:
+                        return self._finalize_forward(result, forward_batch)
+                    finally:
+                        _restore_fields(forward_batch, previous)
+
+                out = out.then(finalize_pending)
+            else:
+                out = self._finalize_forward(out, forward_batch)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
+        if mm_embeds is not None:
+            real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+            if real_q is not None and mm_embeds.shape[0] > real_q:
+                mm_embeds = mm_embeds[:real_q]
+            forward_batch.mm_input_embeds = mm_embeds
 
+        def finish(result: Any) -> Any:
+            # Re-attach the embeds the graph did not see; a hidden-state boundary
+            # leaves them on the batch for the wrapper's eager tail.
+            if (
+                mm_embeds is not None
+                and isinstance(result, LogitsProcessorOutput)
+                and result.mm_input_embeds is None
+            ):
+                result.mm_input_embeds = mm_embeds
+            return self._finish_forward(result, forward_batch, wants_input_logprob)
+
+        if isinstance(out, PendingCall):
+            return out.then(finish)
+        return finish(out)
+
+    def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
+        spec_info = forward_batch.spec_info
+        if spec_info is None or not spec_info.keep_outputs_padded:
+            out = self.policy.finalize_forward_batch(out, forward_batch)
+        return out
+
+    def _finish_forward(
+        self, out: Any, forward_batch: Any, wants_input_logprob: bool = False
+    ) -> Any:
         # After the restore: LogitsMetadata.from_forward_batch branches on
         # capture_hidden_mode, so the gather must see the caller's value.
         if wants_input_logprob:

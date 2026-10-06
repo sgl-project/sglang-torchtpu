@@ -151,6 +151,8 @@ class TestPallasMoeCallContract(CustomTestCase):
             1,  # use_sc_gather (int(True))
             0,  # w_quant_bits (0 => not weight-only quantized)
             128,  # permute_dense_threshold
+            None,  # w1_channel_scale (vmem-fp8 only)
+            None,  # w2_channel_scale (vmem-fp8 only)
         )
 
 

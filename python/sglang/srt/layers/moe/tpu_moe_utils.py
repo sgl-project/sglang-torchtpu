@@ -2,7 +2,33 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
+
+# SGLANG_TPU_INT4_MOE_MODE values; None = default W4A16 group products.
+INT4_MOE_MODE_VMEM_BF16 = "vmem-bf16"
+INT4_MOE_MODE_VMEM_FP8 = "vmem-fp8"
+
+
+def resolve_int4_moe_mode() -> Optional[str]:
+    """The INT4 MoE mode from the environment, validated.
+
+    Returns:
+        ``None`` for the default W4A16 path, else one of
+        ``INT4_MOE_MODE_VMEM_BF16`` / ``INT4_MOE_MODE_VMEM_FP8``.
+
+    Raises:
+        ValueError: The environment names a mode that does not exist.
+    """
+    from sglang.srt.environ import envs
+
+    mode = envs.SGLANG_TPU_INT4_MOE_MODE.get()
+    if mode in (None, ""):
+        return None
+    if mode not in (INT4_MOE_MODE_VMEM_BF16, INT4_MOE_MODE_VMEM_FP8):
+        raise ValueError(f"Unsupported TPU INT4 MoE mode: {mode!r}")
+    return mode
 
 
 def mask_tpu_moe_non_local_experts(

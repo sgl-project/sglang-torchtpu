@@ -61,7 +61,7 @@ def precompile_spec_v2_ops(
                 args = registered_op.make_warmup_args(context)
                 registered_op.op(*args)
     if device.type == "tpu":
-        torch.get_device_module(device).synchronize()
+        torch.accelerator.synchronize()
     logger.info(
         "[spec op precompile] precompiled %d ops for shapes %s in %.1fs",
         len(registered_ops),

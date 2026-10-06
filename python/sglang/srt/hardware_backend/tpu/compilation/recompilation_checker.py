@@ -235,7 +235,7 @@ def _shared_recompilation_checker() -> RecompilationChecker | None:
     try:
         read_misses = torch.tpu._get_cache_misses
         read_stats = torch.tpu._get_cache_stats
-        sync_device = torch.tpu.synchronize
+        sync_device = torch.accelerator.synchronize
     except AttributeError:
         return None
     return RecompilationChecker(

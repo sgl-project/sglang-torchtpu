@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Invalidate torch.compile caches when TPU Pallas sources change.
+"""Invalidate torch.compile caches when TPU sources or device assignments change.
 
 torch.compile cannot detect changes to Pallas kernel implementations because
 they are hidden in torch.library custom ops. During TPU backend initialization,
@@ -10,8 +10,51 @@ compile cache key.
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
+import os
 from collections.abc import Iterable
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def add_tpu_rank_assignment_to_compile_cache_key() -> None:
+    """Scope opaque collective executables to the live WORLD device assignment.
+
+    Call after distributed initialization, before creating compile wrappers.
+    Repeated calls from target and draft runners preserve the process-wide tag.
+    Standalone compilation must call this explicitly if it bypasses TpuGraphRunner.
+    Querying the native assignment avoids another WORLD collective.
+    """
+    import torch.compiler.config as compiler_config
+    import torch.distributed as dist
+    from torch_tpu._internal.distributed.device_mesh import get_device_assignment
+
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return
+    rank_to_device = get_device_assignment()
+    if (
+        len(rank_to_device) != world_size
+        or any(type(device) is not int or device < 0 for device in rank_to_device)
+        or len(set(rank_to_device)) != world_size
+    ):
+        raise RuntimeError(f"Invalid TPU rank assignment: {rank_to_device}")
+
+    # FX only sees the custom op/group name, not its compiled device ordering.
+    assignment = {
+        "rank": dist.get_rank(),
+        "rank_to_device": rank_to_device,
+        "topology": os.environ.get("TORCH_TPU_TOPOLOGY", ""),
+    }
+    digest = hashlib.sha256(json.dumps(assignment, sort_keys=True).encode()).hexdigest()
+    tag = f"tpu-rank-assignment-v1:{digest}"
+    existing_tag = str(compiler_config.cache_key_tag or "")
+    if tag in existing_tag.split("|"):
+        return
+    compiler_config.cache_key_tag = f"{existing_tag}|{tag}" if existing_tag else tag
+    logger.info("TPU compile cache rank assignment: %s, tag=%s", assignment, tag)
 
 
 def get_pallas_kernel_sources() -> tuple[str, ...]:

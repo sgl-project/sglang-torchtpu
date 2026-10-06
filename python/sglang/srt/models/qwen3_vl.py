@@ -16,6 +16,7 @@
 
 import logging
 import re
+from array import array
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -28,7 +29,6 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.compilation.support_torch_compile import support_torch_compile
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
@@ -374,7 +374,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -1390,12 +1390,12 @@ if current_platform.supports_torch_compile():
 
 class Qwen3VLForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
-    # Whether decode hands the language model raw ``input_ids`` rather than the
-    # ``input_embeds`` that ``general_mm_embed_routine`` precomputes. Subclasses
-    # that override ``forward`` to skip that routine in decode set this True.
+    # Whether decode / verify hands the language model raw ``input_ids`` rather than the
+    # ``input_embeds`` that ``general_mm_embed_routine`` precomputes. Enabled
+    # on TPU, where the language model is the compiled boundary.
     # The TPU decoder compile policy reads it so warmup traces the same call
     # shape serving uses; getting the two out of step is a serve-time recompile.
-    decode_embeds_in_language_model: bool = False
+    decode_embeds_in_language_model: bool = _is_tpu
 
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
@@ -1420,7 +1420,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
@@ -1534,7 +1534,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         if mm_inputs and mm_inputs.mm_items:
             _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -1744,8 +1744,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         shard mask, index_select, zeroing multiply, cross-TP all-reduce -- in
         front of the graph on every step.
 
-        Decode has one query token per sequence and can never splice image
-        embeddings into it, so the routine's purpose is inert there and the model
+        Decode / target verify carry text tokens and can never splice image
+        embeddings into them, so the routine's purpose is inert there and the model
         can embed inside the graph instead. Prefill still goes through the
         routine, which is where image embeddings actually get spliced.
 
@@ -1753,9 +1753,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         ``forward_batch.input_embeds`` when that pre-allocated buffer exists (for
         CUDA-graph address stability), which this path skips.
         """
-        return (
-            self.decode_embeds_in_language_model
-            and forward_batch.forward_mode.is_decode()
+        return self.decode_embeds_in_language_model and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
         )
 
     def forward(

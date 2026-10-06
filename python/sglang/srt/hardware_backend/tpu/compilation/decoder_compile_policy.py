@@ -11,11 +11,16 @@ from typing import Any, ClassVar, Literal
 import msgspec
 import torch
 import tqdm
+from torch.utils._pytree import tree_leaves
 
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
+    get_attention_rank_tensors,
+    use_attention_rank_tensors,
+)
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
@@ -26,6 +31,10 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _restore_forward_batch_inputs,
     build_bucketers,
 )
+from sglang.srt.hardware_backend.tpu.compilation.frame_stack import (
+    call_with_reserved_frame_stack,
+)
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -35,6 +44,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     LogitsOutputMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -83,17 +93,19 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
     KV pool is held by the attention backend / model_runner), so warmup reads them
     from the runner rather than the batch.
     """
-    tensors: list[torch.Tensor] = []
-
-    for field in (
-        "next_token_logits",
-        "next_token_global_top_k_logits",
-        "next_token_global_top_k_token_ids",
-        "next_draft_tokens",
-    ):
-        value = getattr(out, field, None)
-        if isinstance(value, torch.Tensor):
-            tensors.append(value)
+    # Inner decoder boundaries can return raw hidden states or tensor pytrees.
+    # Each queued warmup must finish before launching the next collective graph.
+    tensors = [leaf for leaf in tree_leaves(out) if isinstance(leaf, torch.Tensor)]
+    if not tensors:
+        for field in (
+            "next_token_logits",
+            "next_token_global_top_k_logits",
+            "next_token_global_top_k_token_ids",
+            "next_draft_tokens",
+        ):
+            value = getattr(out, field, None)
+            if isinstance(value, torch.Tensor):
+                tensors.append(value)
 
     if isinstance(out, PPProxyTensors):
         # A non-final pipeline stage returns its hidden states and residual.
@@ -134,6 +146,18 @@ def _hbm_delta_str(
         return " HBM: N/A"
     delta = after[0] - before[0]
     return f" HBM: +{delta:.0f} MB ({after[0]:.0f}/{after[1]:.0f} MB)"
+
+
+def _warmup_progress(
+    warmup: PendingCall | None,
+    start: float,
+    hbm_before: tuple[float, float] | None,
+) -> tuple[str, float, str]:
+    """Return accurate progress details for synchronous or queued warmups."""
+    elapsed = time.perf_counter() - start
+    if warmup is not None:
+        return "Queued", elapsed, ""
+    return "Compiled", elapsed, _hbm_delta_str(hbm_before, _get_hbm_usage_mb())
 
 
 def _unpad_decoder_outputs(
@@ -368,6 +392,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         *,
         phase: str,
         duration_seconds: float,
+        pending_call: PendingCall | None = None,
         batch_size: int | None = None,
         num_tokens: int | None = None,
         num_draft_tokens: int | None = None,
@@ -376,15 +401,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         logits_output_mode: str | None = None,
         capture_hidden_mode: str | None = None,
         has_spec_info: bool | None = None,
-    ) -> None:
+    ) -> PendingCall | None:
         if self.compile_timing_recorder is None:
-            return
+            return pending_call
         assert self.model_runner is not None
-        self.compile_timing_recorder.record(
+        record = functools.partial(
+            self.compile_timing_recorder.record,
             component="draft" if self.model_runner.is_draft_worker else "target",
             phase=phase,
             policy=type(self).__name__,
-            duration_seconds=duration_seconds,
             batch_size=batch_size,
             num_tokens=num_tokens,
             num_draft_tokens=num_draft_tokens,
@@ -395,6 +420,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             capture_hidden_mode=capture_hidden_mode,
             has_spec_info=has_spec_info,
         )
+        if pending_call is None:
+            record(duration_seconds=duration_seconds)
+            return None
+
+        def wait_and_record():
+            start = time.perf_counter()
+            result = pending_call.wait()
+            # Count submission plus blocking wait/execution, excluding time
+            # spent submitting other shapes while native compilation overlaps.
+            record(duration_seconds=duration_seconds + time.perf_counter() - start)
+            return result
+
+        return PendingCall(wait_and_record)
 
     def _extend_compile_cap(self) -> int:
         assert self.t_bucketer is not None
@@ -461,8 +499,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         server_args = self.model_runner.server_args
         is_draft_worker = self.model_runner.is_draft_worker
+        split_draft = self._uses_eager_draft_coordinator()
         compile_owner = (
-            getattr(self.owner, "model", self.owner) if is_draft_worker else self.owner
+            getattr(self.owner, "model", self.owner)
+            if is_draft_worker and (split_draft or not self._supports_async_warmup())
+            else self.owner
         )
         compile_fn = compile_owner.forward if is_draft_worker else fn
 
@@ -474,14 +515,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 # TPUs don't support returning input logprobs -- this errors elsewhere.
                 logits_processor.compute_input_logprobs = False
 
-        compiled = self._compile(compile_fn)
+        if self.tracer == "direct":
+            compiled, warmup_async = self._direct_compile(compile_fn)
+        else:
+            compiled = self._compile(compile_fn)
+            warmup_async = None
         compiled.__signature__ = inspect.signature(compile_fn)
         setattr(
             compile_owner,
             "forward" if is_draft_worker else self.method_name,
             compiled,
         )
-        if is_draft_worker and hasattr(self.owner, "logits_processor"):
+        if split_draft:
             logits_fn = self.owner.logits_processor.forward
             compiled_logits = torch.compile(
                 torch.no_grad()(logits_fn),
@@ -519,7 +564,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.prepare_forward_batch(forward_batch)
 
         outer_model.prepare_forward_batch = _prepare
-        self._install_forward_shim(fn=fn, compiled=compiled)
+        self._install_forward_shim(
+            fn=fn,
+            compiled=compiled,
+            warmup_async=warmup_async,
+        )
         self.model_runner.compile_policy = self
 
         if is_dp_attention_enabled():
@@ -536,8 +585,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         return True
 
+    def _uses_eager_draft_coordinator(self) -> bool:
+        return self.model_runner.is_draft_worker and hasattr(
+            self.owner, "logits_processor"
+        )
+
+    def _supports_async_warmup(self) -> bool:
+        return not self.model_runner.is_draft_worker
+
     def _install_forward_shim(
-        self, fn: Callable[..., Any], compiled: Callable[..., Any]
+        self,
+        fn: Callable[..., Any],
+        compiled: Callable[..., Any],
+        warmup_async: Callable[..., PendingCall] | None = None,
     ) -> None:
         """Wrap and install the compiled forward shim on owner.
 
@@ -549,9 +609,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
           fn: Original uncompiled forward function.
           compiled: Compiled forward function.
         """
-        is_eagle3_draft = self.model_runner.is_draft_worker and hasattr(
-            self.owner, "logits_processor"
-        )
+        is_eagle3_draft = self._uses_eager_draft_coordinator()
         shim_target = fn if is_eagle3_draft else compiled
         logger.info(
             "[decoder compile policy] _install_forward_shim for %s (is_draft=%s, is_eagle3_draft=%s, shim_target=%s)",
@@ -560,13 +618,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             is_eagle3_draft,
             getattr(shim_target, "__name__", type(shim_target).__name__),
         )
-        self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
+        # EAGLE3's async callable covers only the backbone, not the outer
+        # forward coordinated by the shim. Other direct-compiled targets can
+        # safely use the queued warmup path.
+        shim_warmup = None if is_eagle3_draft else warmup_async
+        self.compiled_forward_shim = CompiledForwardShim(
+            shim_target, policy=self, warmup_async_fn=shim_warmup
+        )
         setattr(self.owner, self.method_name, self.compiled_forward_shim)
 
     def _compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
-        if self.tracer == "direct":
-            return self._direct_compile(fn)
-
         server_args = self.model_runner.server_args
         use_bundle = (
             server_args.unsafe_save_torch_compile_bundle is not None
@@ -580,7 +641,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             dynamic=self.dynamic,
         )
 
-    def _direct_compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+    def _direct_compile(
+        self, fn: Callable[..., Any]
+    ) -> tuple[Callable[..., Any], Callable[..., PendingCall]]:
         """Compile directly through TorchTPU without Dynamo or AOTAutograd."""
         from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
             direct_compile,
@@ -595,6 +658,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             positions: torch.Tensor,
             forward_batch: Any,
             *args: Any,
+            attention_rank_tensors: tuple[torch.Tensor, ...],
             **kwargs: Any,
         ) -> Any:
             backend = get_forward_context().attn_backend
@@ -602,7 +666,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Attention reads metadata through the backend during tracing.
             backend.forward_metadata = attention_metadata
             try:
-                return fn(input_ids, positions, forward_batch, *args, **kwargs)
+                with use_attention_rank_tensors(attention_rank_tensors):
+                    return fn(input_ids, positions, forward_batch, *args, **kwargs)
             finally:
                 backend.forward_metadata = previous_metadata
 
@@ -621,10 +686,24 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return compiled(
                 backend.forward_metadata,
                 *args,
+                attention_rank_tensors=get_attention_rank_tensors(
+                    torch.device(self.model_runner.device)
+                ),
                 **kwargs,
             )
 
-        return call
+        def warmup_async(*args: Any, **kwargs: Any) -> PendingCall:
+            backend = get_forward_context().attn_backend
+            return compiled.warmup_async(
+                backend.forward_metadata,
+                *args,
+                attention_rank_tensors=get_attention_rank_tensors(
+                    torch.device(self.model_runner.device)
+                ),
+                **kwargs,
+            )
+
+        return call, warmup_async
 
     def get_direct_compile_kv_pool(self):
         return self.model_runner.token_to_kv_pool
@@ -688,7 +767,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if pp_group is not None and not pp_group.is_last_rank:
             # Only the final pipeline stage runs the logits processor.
             return False
-        return self.owner is self.model_runner.model and not bool(
+        runner_model = self.model_runner.model
+        # A wrapper may compile its language model with the logits processor
+        # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
+        owns_logits = self.owner is runner_model or (
+            self.owner is getattr(runner_model, "language_model", None)
+            and getattr(self.owner, "logits_processor", None) is not None
+        )
+        return owns_logits and not bool(
             getattr(self.model_runner, "is_draft_worker", False)
         )
 
@@ -809,6 +895,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         forward_batch.forward_mode = ForwardMode.DECODE
+        # Scheduler idle locations are int64; active decode and warmup use
+        # the allocator dtype. Normalize before padding materializes KV slots.
+        forward_batch.out_cache_loc = forward_batch.out_cache_loc.to(
+            dtype=self._dummy_out_cache_loc_dtype(ForwardMode.DECODE)
+        )
 
     def materialize_dp_idle_extend(
         self, forward_batch: ForwardBatch, num_tokens: int
@@ -830,7 +921,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             [num_tokens], dtype=torch.int32, device=device
         )
         forward_batch.extend_prefix_lens = torch.zeros(
-            1, dtype=seq_dtype, device=device
+            1, dtype=torch.int32, device=device
         )
         forward_batch.extend_start_loc = torch.zeros(
             1, dtype=torch.int32, device=device
@@ -854,7 +945,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if isinstance(forward_batch.out_cache_loc, torch.Tensor):
             forward_batch.out_cache_loc = torch.zeros(
                 num_tokens,
-                dtype=forward_batch.out_cache_loc.dtype,
+                # Scheduler idle batches carry empty int64 locations even when
+                # the live allocator and precompiled extend graph use int32.
+                dtype=self._dummy_out_cache_loc_dtype(forward_batch.forward_mode),
                 device=device,
             )
         if isinstance(forward_batch.req_pool_indices, torch.Tensor):
@@ -872,24 +965,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             checker, model_label=model_label
         )
 
-    def precompile(self) -> None:
-        """Warm decoder graphs for this policy's bucket grid."""
+    def precompile(self) -> list[PendingCall]:
+        """Schedule decoder warmups for this policy's bucket grid."""
         overall = time.perf_counter()
         disagg_mode = get_disagg().disaggregation_mode
+        pending = []
         if disagg_mode != "decode":
-            self._precompile_extend()
+            pending += self._precompile_extend()
         if disagg_mode != "prefill":
-            self._precompile_decode()
+            pending += self._precompile_decode()
         logger.info(
-            "[decoder compile policy] precompile done in %.1fs.",
+            "[decoder compile policy] queued precompile in %.1fs.",
             time.perf_counter() - overall,
         )
+        return pending
 
     def _extend_input_variants(self) -> tuple[str, ...]:
         """Input signatures an extend graph must be compiled for."""
         return ("plain",)
 
-    def _precompile_extend(self) -> None:
+    def _precompile_extend(self) -> list[PendingCall]:
         """Compile extend at each token bucket and the fixed batch cap."""
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
@@ -933,10 +1028,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if get_parallel().tp_rank == 0
             else compile_items
         )
+        pending = []
         for num_tokens, bs, mode, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=mode,
@@ -944,7 +1040,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 capture_hidden_mode=extend_capture_hidden_mode,
             )
             elapsed = time.perf_counter() - start
-            self._record_compile_step(
+            warmup = self._record_compile_step(
+                pending_call=warmup,
                 phase=mode.name.lower(),
                 duration_seconds=elapsed,
                 batch_size=bs,
@@ -952,15 +1049,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 logits_output_mode=logits_output_mode.name.lower(),
                 capture_hidden_mode=extend_capture_hidden_mode.name.lower(),
             )
+            if warmup is not None:
+                pending.append(warmup)
             if get_parallel().tp_rank == 0:
-                hbm_after = _get_hbm_usage_mb()
-                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
-                    f"Compiled {mode.name} (tokens={num_tokens}, bs={bs}, "
+                    f"{status} {mode.name} (tokens={num_tokens}, bs={bs}, "
                     f"logits={logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
                 )
+        return pending
 
-    def _precompile_decode(self) -> None:
+    def _precompile_decode(self) -> list[PendingCall]:
         """Compile decode mode: vary batch size (tokens == batch size)."""
         assert self.b_bucketer is not None
 
@@ -984,30 +1083,34 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if get_parallel().tp_rank == 0
             else compile_items
         )
+        pending = []
         for bs, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=bs,
                 bs=bs,
                 mode=ForwardMode.DECODE,
                 logits_output_mode=logits_output_mode,
             )
             elapsed = time.perf_counter() - start
-            self._record_compile_step(
+            warmup = self._record_compile_step(
+                pending_call=warmup,
                 phase="decode",
                 duration_seconds=elapsed,
                 batch_size=bs,
                 num_tokens=bs,
                 logits_output_mode=logits_output_mode.name.lower(),
             )
+            if warmup is not None:
+                pending.append(warmup)
             if get_parallel().tp_rank == 0:
-                hbm_after = _get_hbm_usage_mb()
-                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
-                    f"Compiled DECODE (bs={bs}, logits={logits_output_mode.name}) "
+                    f"{status} DECODE (bs={bs}, logits={logits_output_mode.name}) "
                     f"in {elapsed:.1f}s{hbm_str}"
                 )
+        return pending
 
     def _make_warmup_inputs(
         self,
@@ -1044,8 +1147,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
-    ) -> float | None:
-        """Build and execute one dummy forward pass for compilation."""
+    ) -> PendingCall | float | None:
+        """Run one warmup, defer async execution, or time synchronous profiling."""
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
             bs=bs,
@@ -1114,8 +1217,27 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             torch.no_grad(),
         ):
             started = time.perf_counter()
-            out = entry.forward(*args, **kwargs)
-            # Materialize lazy outputs and backend-marked side effects.
+            async_warmup = getattr(self.owner.forward, "warmup_async_fn", None)
+            if (
+                profile_prefix is None
+                and self.tracer == "direct"
+                and envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
+                and self._supports_async_warmup()
+                and async_warmup is not None
+            ):
+                out = call_with_reserved_frame_stack(
+                    self.owner.forward.warmup_async, *args, **kwargs
+                )
+            else:
+                out = call_with_reserved_frame_stack(entry.forward, *args, **kwargs)
+            if isinstance(out, PendingCall):
+                return out.then(
+                    lambda result: _materialize_out(
+                        result,
+                        forward_attn_backend,
+                        self.model_runner.token_to_kv_pool,
+                    )
+                )
             _materialize_out(
                 out,
                 forward_attn_backend,
@@ -1217,7 +1339,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self._make_top_k_warmup_sampling_info(bs) if spec_info is None else None
         )
 
-        return ForwardBatch(
+        batch = ForwardBatch(
             forward_mode=mode,
             batch_size=bs,
             input_ids=layout.input_ids,
@@ -1248,6 +1370,24 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
+        if enable_num_token_non_padded():
+            # Serving sets these in init_new and ModelRunner.forward; the MoE
+            # path guards on the field being present, so warmup must carry it.
+            from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+            from sglang.srt.layers.cp.utils import is_mla_cp_enabled
+
+            batch.global_num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, device=layout.input_ids.device
+            )
+            batch.global_num_token_non_padded_cpu = num_tokens
+            batch.set_local_num_token_non_padded(
+                sharded=(
+                    batch.attn_tp_sequence_sharded
+                    and not is_dsa_enable_prefill_cp()
+                    and not is_mla_cp_enabled()
+                ),
+            )
+        return batch
 
     def _make_top_k_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
         """Mirror an eligible serving batch for the common static TopK width.
@@ -1334,15 +1474,14 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
 
     def install(self) -> bool:
-        # This policy is attached to the shared backbone (`Qwen3_5ForCausalLM`),
-        # not to a wrapper, so the TEXT-ONLY entry (`Qwen3_5TextForCausalLM`)
-        # gets it too. It only diverges from the plain decoder policy on the VL
-        # input_embeds path, so the DP restriction -- which is a property of that
-        # path -- must be gated the same way. Raising unconditionally blocked DP
-        # attention for text-only serving, where none of the VL machinery runs.
         outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        if is_multimodal and is_dp_attention_enabled():
+        if (
+            hasattr(outer, "get_image_feature")
+            and is_dp_attention_enabled()
+            # A wrapper that routes every rank through one input_embeds program
+            # on image steps and compiles its logits processor (Kimi).
+            and not getattr(outer, "serves_dp_attention", False)
+        ):
             raise NotImplementedError(
                 "Qwen3-VL TPU decoder compilation does not support DP attention; "
                 "disable --enable-torch-compile for this configuration."
@@ -1395,10 +1534,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         return key
 
     def _decode_uses_input_ids(self) -> bool:
-        """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
+        """Whether the wrapper hands decode / verify raw ``input_ids``, skipping embed.
 
         Wrappers that set ``decode_embeds_in_language_model`` bypass
-        ``general_mm_embed_routine`` in decode so the embedding lands inside the
+        ``general_mm_embed_routine`` in decode / verify so the embedding lands inside the
         compiled graph instead of running as eager device programs in front of
         it.
         """
@@ -1453,7 +1592,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             return hidden_states, aux_hidden_states
         return out
 
-    def _precompile_extend(self) -> None:
+    def _precompile_extend(self) -> list[PendingCall]:
         if not self._uses_input_embeds(self.owner):
             return super()._precompile_extend()
 
@@ -1495,10 +1634,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if get_parallel().tp_rank == 0
             else compile_items
         )
+        pending = []
         for num_tokens, bs, mode, variant, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=mode,
@@ -1506,7 +1646,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 logits_output_mode=logits_output_mode,
             )
             elapsed = time.perf_counter() - start
-            self._record_compile_step(
+            warmup = self._record_compile_step(
+                pending_call=warmup,
                 phase=mode.name.lower(),
                 duration_seconds=elapsed,
                 batch_size=bs,
@@ -1514,16 +1655,17 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 input_variant=variant,
                 logits_output_mode=logits_output_mode.name.lower(),
             )
+            if warmup is not None:
+                pending.append(warmup)
             if get_parallel().tp_rank == 0:
-                hbm_after = _get_hbm_usage_mb()
-                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
-                    f"Compiled VL {mode.name} (tokens={num_tokens}, bs={bs}, "
+                    f"{status} VL {mode.name} (tokens={num_tokens}, bs={bs}, "
                     f"variant={variant}, logits={logits_output_mode.name}) "
                     f"in {elapsed:.1f}s{hbm_str}"
                 )
-
         self._precompile_mm_embed_placement()
+        return pending
 
     def _precompile_mm_embed_placement(self) -> None:
         """Warm the device select that merges host-placed multimodal rows.
@@ -1564,7 +1706,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_variant="host_placement",
         )
 
-    def _precompile_decode(self) -> None:
+    def _precompile_decode(self) -> list[PendingCall]:
         if not self._uses_input_embeds(self.owner):
             return super()._precompile_decode()
 
@@ -1574,10 +1716,17 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         # (bs, variant, logits_output_mode): warm the embeds convention VL
         # requests use and the positional one text-only serving actually
         # takes (mirrors the base policy).
+        # In-graph embedding uses "text_only" (input_ids + mrope positions);
+        # "text_ids" would warm unused 1-D positions.
+        variants = (
+            ("text_only",)
+            if self._decode_uses_input_ids()
+            else ("text_only", "text_ids")
+        )
         compile_items = [
             (bs, variant, logits_output_mode)
             for bs in bs_buckets
-            for variant in ("text_only", "text_ids")
+            for variant in variants
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
         logger.info(
@@ -1594,10 +1743,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if get_parallel().tp_rank == 0
             else compile_items
         )
+        pending = []
         for bs, variant, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=bs,
                 bs=bs,
                 mode=ForwardMode.DECODE,
@@ -1605,7 +1755,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 logits_output_mode=logits_output_mode,
             )
             elapsed = time.perf_counter() - start
-            self._record_compile_step(
+            warmup = self._record_compile_step(
+                pending_call=warmup,
                 phase="decode",
                 duration_seconds=elapsed,
                 batch_size=bs,
@@ -1613,13 +1764,15 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 input_variant=variant,
                 logits_output_mode=logits_output_mode.name.lower(),
             )
+            if warmup is not None:
+                pending.append(warmup)
             if get_parallel().tp_rank == 0:
-                hbm_after = _get_hbm_usage_mb()
-                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
-                    f"Compiled VL DECODE (bs={bs}, variant={variant}, "
+                    f"{status} VL DECODE (bs={bs}, variant={variant}, "
                     f"logits={logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
                 )
+        return pending
 
     def _make_warmup_inputs(
         self,
@@ -1655,7 +1808,9 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             else forward_batch.positions
         )
 
-        if mode.is_decode() and self._decode_uses_input_ids():
+        if (
+            mode.is_decode() or mode.is_target_verify()
+        ) and self._decode_uses_input_ids():
             # Positions stay mrope-shaped; only the embedding moves into the graph.
             return (
                 (forward_batch.input_ids, positions, forward_batch),
