@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compiled_op import compiled_op
-from sglang.srt.distributed import get_tp_group, model_parallel_is_initialized
+from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
@@ -28,6 +28,7 @@ from sglang.srt.hardware_backend.tpu.top_k import (
     distributed_tpu_top_k,
     supports_distributed_tpu_top_k,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -256,15 +257,18 @@ def argmax_draft_tokens_tpu(
         hs_1d if hs_1d.dtype == lm_head.weight.dtype else hs_1d.to(lm_head.weight.dtype)
     )
 
-    tp_size = int(get_tp_group().world_size) if model_parallel_is_initialized() else 1
+    tp_size = (
+        int(get_parallel().tp_group.world_size)
+        if model_parallel_is_initialized()
+        else 1
+    )
     if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
         local_logits = torch.matmul(hs, lm_head.weight.T)
         _, global_token_ids = distributed_tpu_top_k(
             local_logits,
             TpuVocabShard.from_lm_head(lm_head),
             k=1,
-            group=get_tp_group(),
-            lm_head=lm_head,
+            group=get_parallel().tp_group,
         )
         tokens = global_token_ids.squeeze(-1).to(torch.long)
         return tokens.view(bs, block_size - 1)

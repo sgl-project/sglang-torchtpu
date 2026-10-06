@@ -293,10 +293,10 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
         from sglang.srt.layers.quantization import unquant
 
         torch.manual_seed(0)
-        # SGLang storage layout.
-        # w13: (g, 2*intermediate, hidden); w2: (g, hidden, intermediate).
-        sglang_w13 = torch.randn(4, 128, 32, dtype=torch.bfloat16)
-        sglang_w2 = torch.randn(4, 32, 64, dtype=torch.bfloat16)
+        # SGLang layout, w13 (g, 2*inter, hidden) and w2 (g, hidden, inter);
+        # inter = 128 is already lane-aligned, so no padding.
+        sglang_w13 = torch.randn(4, 256, 32, dtype=torch.bfloat16)
+        sglang_w2 = torch.randn(4, 32, 128, dtype=torch.bfloat16)
 
         layer = SimpleNamespace()
         layer.w13_weight = torch.nn.Parameter(sglang_w13.clone(), requires_grad=False)
@@ -325,6 +325,41 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
         # Inference weights -- the hook must preserve no-grad.
         self.assertFalse(layer.w13_weight.requires_grad)
         self.assertFalse(layer.w2_weight.requires_grad)
+
+    def test_tpu_branch_zero_pads_the_intermediate_to_128_lanes(self):
+        """gmm_v2 tiles the intermediate dim in 128-lane blocks, so an
+        intermediate that is not a multiple of 128 (Gemma4-26B's 704) is
+        zero-padded at load: gate and up halves of w13 separately, w2 along
+        its intermediate axis. Zero rows contribute act(0) * 0 = 0, so the
+        result is exact; a pad applied to the wrong axis or half is not.
+        """
+        from sglang.srt.layers.quantization import unquant
+
+        torch.manual_seed(0)
+        inter, hidden, g = 64, 32, 4
+        sglang_w13 = torch.randn(g, 2 * inter, hidden, dtype=torch.bfloat16)
+        sglang_w2 = torch.randn(g, hidden, inter, dtype=torch.bfloat16)
+
+        layer = SimpleNamespace()
+        layer.w13_weight = torch.nn.Parameter(sglang_w13.clone(), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(sglang_w2.clone(), requires_grad=False)
+
+        with patch.object(unquant, "_is_tpu", True):
+            UnquantizedFusedMoEMethod().process_weights_after_loading(layer)
+
+        padded = 128
+        w13, w2 = layer.w13_weight.data, layer.w2_weight.data
+        self.assertEqual(tuple(w13.shape), (g, hidden, 2 * padded))
+        self.assertEqual(tuple(w2.shape), (g, padded, hidden))
+        gate_t = sglang_w13[:, :inter, :].transpose(1, 2)
+        up_t = sglang_w13[:, inter:, :].transpose(1, 2)
+        torch.testing.assert_close(w13[:, :, :inter], gate_t)
+        self.assertEqual(w13[:, :, inter:padded].abs().sum().item(), 0.0)
+        torch.testing.assert_close(w13[:, :, padded : padded + inter], up_t)
+        self.assertEqual(w13[:, :, padded + inter :].abs().sum().item(), 0.0)
+        torch.testing.assert_close(w2[:, :inter, :], sglang_w2.transpose(1, 2))
+        self.assertEqual(w2[:, inter:, :].abs().sum().item(), 0.0)
+        self.assertTrue(w13.is_contiguous() and w2.is_contiguous())
 
     def test_no_swap_when_not_on_tpu(self):
         """The layout swap is platform-specific. With ``_is_tpu=False``

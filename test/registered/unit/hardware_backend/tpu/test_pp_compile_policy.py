@@ -122,11 +122,12 @@ class TestResolvedExtendCeiling(CustomTestCase):
 class TestWarmupProxy(CustomTestCase):
     def setUp(self):
         super().setUp()
-        dp = patch.object(
-            decoder_compile_policy, "is_dp_attention_enabled", return_value=False
-        )
-        dp.start()
-        self.addCleanup(dp.stop)
+        # Both predicates read the published parallel config, which these
+        # tests do not publish.
+        for name in ("is_dp_attention_enabled", "enable_num_token_non_padded"):
+            predicate = patch.object(decoder_compile_policy, name, return_value=False)
+            predicate.start()
+            self.addCleanup(predicate.stop)
 
     def test_non_first_stage_warms_up_with_a_zero_proxy_at_the_bucket(self):
         policy = _policy(_model_runner(_pp_group(first=False, last=False)))
@@ -188,6 +189,21 @@ class TestLogitsProcessorGating(CustomTestCase):
             )._compiles_logits_processor()
         )
         self.assertTrue(_policy(_model_runner())._compiles_logits_processor())
+
+    def test_a_language_model_owner_needs_its_own_logits_processor(self):
+        # Kimi compiles language_model with the logits processor inside; Gemma4
+        # compiles a bare text model and runs its logits eagerly afterwards.
+        runner = _model_runner()
+        runner.model = SimpleNamespace(
+            language_model=SimpleNamespace(logits_processor=object())
+        )
+        policy = _policy(runner)
+        policy.owner = runner.model.language_model
+        self.assertTrue(policy._compiles_logits_processor())
+
+        runner.model.language_model = SimpleNamespace()
+        policy.owner = runner.model.language_model
+        self.assertFalse(policy._compiles_logits_processor())
 
     def test_non_last_stage_key_ignores_the_logits_mode(self):
         policy = _policy(_model_runner(_pp_group(first=False, last=False)))

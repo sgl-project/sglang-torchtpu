@@ -41,10 +41,12 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_tpu,
 )
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = _is_cpu and cpu_has_amx_support()
+_is_tpu = is_tpu()
 
 # ---------------------------------------------------------------------------
 # 2-D Multidimensional RoPE (matches HF Gemma4RotaryEmbedding for vision)
@@ -434,7 +436,8 @@ class Gemma4VisionPatchEmbedder(nn.Module):
     def _position_embeddings(
         self, patch_positions: torch.Tensor, padding_positions: torch.Tensor
     ) -> torch.Tensor:
-        clamped_positions = patch_positions.clamp(min=0)
+        # one_hot takes int64 only; the compile runner's warmup ids are int32.
+        clamped_positions = patch_positions.clamp(min=0).long()
         one_hot = F.one_hot(clamped_positions, num_classes=self.position_embedding_size)
         one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
         position_embeddings = one_hot @ self.position_embedding_table
@@ -481,10 +484,11 @@ class Gemma4VisionPatchEmbedder(nn.Module):
 
 
 class Gemma4VisionPooler(nn.Module):
-    def __init__(self, config: Gemma4VisionConfig):
+    def __init__(self, config: Gemma4VisionConfig, mask_pad_before_pool: bool = False):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.root_hidden_size = self.hidden_size**0.5
+        self.mask_pad_before_pool = mask_pad_before_pool
 
     def _avg_pool_by_positions(
         self, x: torch.Tensor, patch_positions: torch.Tensor, length: int
@@ -530,6 +534,10 @@ class Gemma4VisionPooler(nn.Module):
         if hidden_states.shape[1] == length:
             mask = padding_positions
         else:
+            if self.mask_pad_before_pool:
+                hidden_states = hidden_states.masked_fill(
+                    padding_positions.unsqueeze(-1), 0.0
+                )
             hidden_states, mask = self._avg_pool_by_positions(
                 hidden_states, patch_positions, length
             )
@@ -550,6 +558,7 @@ class Gemma4VisionEncoder(nn.Module):
         config: Gemma4VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mask_pad_before_pool: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -562,7 +571,19 @@ class Gemma4VisionEncoder(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
         )
-        self.pooler = Gemma4VisionPooler(config)
+        self.pooler = Gemma4VisionPooler(
+            config, mask_pad_before_pool=mask_pad_before_pool
+        )
+
+        # TPU: the encoder becomes a torch.compile boundary, entered through the
+        # runner so the patch axis is padded to a precompiled bucket first.
+        self.graph_runners = None
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.graph_runner.gemma4_vision_tpu_compile_runner import (
+                Gemma4VisionTpuCompileRunner,
+            )
+
+            self.graph_runners = Gemma4VisionTpuCompileRunner(self)
 
         # Post-pooling standardization (normalizes vision tokens before projection)
         self.standardize = getattr(config, "standardize", False)
@@ -617,3 +638,14 @@ class Gemma4VisionEncoder(nn.Module):
             pooled = (pooled - self.std_bias) * self.std_scale
 
         return pooled, pooler_mask
+
+
+if _is_tpu:
+    # Register the encoder as a torch.compile boundary for the TPU graph runner
+    # to discover (inert unless --enable-torch-compile).
+    from sglang.srt.compilation.support_torch_compile import support_torch_compile
+    from sglang.srt.hardware_backend.tpu.graph_runner.gemma4_vision_tpu_compile_runner import (
+        Gemma4VisionTpuCompilePolicy,
+    )
+
+    support_torch_compile(Gemma4VisionEncoder, policy=Gemma4VisionTpuCompilePolicy)

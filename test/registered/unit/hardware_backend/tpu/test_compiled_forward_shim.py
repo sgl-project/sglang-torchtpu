@@ -587,6 +587,67 @@ class TestCompiledForwardShim(CustomTestCase):
         defaults.update(kwargs)
         return SimpleNamespace(**defaults)
 
+    def test_hidden_state_boundary_keeps_mm_embeds_on_the_batch(self):
+        """A boundary that returns hidden states (Gemma4, Qwen3.5 wrappers) has
+        nowhere to re-attach the multimodal embeds; they stay on the batch for
+        the wrapper's eager tail instead of raising on the tensor."""
+        hidden = torch.zeros(8, 4)
+        seen_by_graph = []
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            seen_by_graph.append(forward_batch.mm_input_embeds)
+            return hidden
+
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        embeds = torch.ones(3, 4)
+        fb = self._forward_batch(
+            input_ids=torch.arange(8, dtype=torch.int32), mm_input_embeds=embeds
+        )
+        out = shim(None, None, fb)
+        self.assertIs(out, hidden)
+        self.assertIs(fb.mm_input_embeds, embeds)
+        # The graph itself never saw them.
+        self.assertEqual(seen_by_graph, [None])
+
+    def test_logits_boundary_gets_mm_embeds_re_attached(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        result = LogitsProcessorOutput(next_token_logits=torch.zeros(8, 4))
+        compiled = MagicMock(return_value=result)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        embeds = torch.ones(3, 4)
+        fb = self._forward_batch(
+            input_ids=torch.arange(8, dtype=torch.int32), mm_input_embeds=embeds
+        )
+        out = shim(None, None, fb)
+        self.assertIs(out.mm_input_embeds, embeds)
+        self.assertIs(fb.mm_input_embeds, embeds)
+
+    def test_draft_worker_graph_keeps_the_mm_embeds(self):
+        # Draft models read forward_batch.mm_input_embeds inside their forward.
+        seen_by_graph = []
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            seen_by_graph.append(forward_batch.mm_input_embeds)
+            return torch.zeros(8, 4)
+
+        policy = DecoderTpuCompilePolicy()
+        policy.model_runner = SimpleNamespace(
+            model=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            is_draft_worker=True,
+        )
+        shim = CompiledForwardShim(compiled, policy=policy)
+        embeds = torch.ones(3, 4)
+        fb = self._forward_batch(
+            input_ids=torch.arange(8, dtype=torch.int32), mm_input_embeds=embeds
+        )
+        shim(None, None, fb)
+        self.assertEqual(len(seen_by_graph), 1)
+        torch.testing.assert_close(seen_by_graph[0][:3], embeds)
+        torch.testing.assert_close(fb.mm_input_embeds[:3], embeds)
+
     def test_recompilation_check_runs_when_forward_raises(self):
         """A compile that raises mid-forward must still be reported."""
         error = torch._dynamo.exc.RecompileError("fail_on_recompile")

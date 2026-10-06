@@ -14,7 +14,11 @@ from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
 )
 from sglang.srt.hardware_backend.tpu.pp_chunks import StepCostModel
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    MAX_PREFIX_MATCHED_WAITING_REQS,
+    AddReqResult,
+    PrefillAdder,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefResult,
@@ -23,6 +27,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.test.test_utils import published_topology
+
+
+@pytest.fixture(autouse=True)
+def pipeline_topology():
+    # The scheduler reads its stage count from the published parallel config.
+    with published_topology(pp_size=8):
+        yield
 
 
 def cost():
@@ -41,9 +53,29 @@ def req(tokens, prefix=0, rid="r"):
         origin_input_ids=[0] * tokens,
         output_ids=[],
         prefix_indices=[0] * prefix,
+        num_matched_prefix_tokens=0,
         full_untruncated_fill_ids=[0] * tokens,
         needs_host_load_back=lambda: False,
+        extra_key=None,
+        cache_salt=None,
+        _compute_max_prefix_len=lambda length: max(length - 1, 0),
     )
+
+
+class Cache:
+    """Radix cache stand-in: every prompt hits ``matched`` device tokens and
+    ``host`` host tokens; records each match's key limit."""
+
+    def __init__(self, matched=0, host=0, tail=0):
+        self.matched, self.host, self.tail = matched, host, tail
+        self.limits = []
+
+    def swa_reprefill_tail_tokens(self):
+        return self.tail
+
+    def match_prefix(self, params):
+        self.limits.append(params.key.limit)
+        return NS(device_indices=[0] * self.matched, host_hit_length=self.host)
 
 
 def adder(model=None):
@@ -61,14 +93,15 @@ def adder(model=None):
     return obj
 
 
-def scheduler(waiting, chunked=None, mbs=(), last_mbs=()):
+def scheduler(waiting, chunked=None, mbs=(), last_mbs=(), matched=0, host=0, tail=0):
     return NS(
         _tpu_pp_chunk_cost=cost(),
-        ps=NS(pp_size=8),
         waiting_queue=waiting,
         chunked_req=chunked,
         mbs=list(mbs),
         last_mbs=list(last_mbs),
+        tree_cache=Cache(matched, host, tail),
+        _tpu_pp_cached_prefix={},
     )
 
 
@@ -81,6 +114,56 @@ def test_pending_work_splits_lone_prompt_and_preserves_busy_steps():
     assert pending_step_limit(sched) == 4096
     sched.waiting_queue = [req(32768, rid=str(i)) for i in range(8)]
     assert pending_step_limit(sched) == 16384
+
+
+def test_cached_prefix_of_a_waiting_request_is_not_pending_work():
+    """A waiting request's cached prefix is not pending work;
+    a 64K-cached + 4K prompt still splits one chunk per stage."""
+    assert pending_step_limit(scheduler([req(65536)], matched=61440)) == 2048
+    assert pending_step_limit(scheduler([req(65536)], matched=0)) == 8192
+
+
+def test_pending_match_counts_the_cache_as_admission_does():
+    """The estimate uses admission's match: a host-cache hit is cached work,
+    and the SWA re-prefill tail limits the match."""
+    sched = scheduler([req(65536)], matched=32768, host=28672, tail=4096)
+    assert pending_step_limit(sched) == 2048
+    assert sched.tree_cache.limits == [65536 - 4096]
+
+
+def test_waiting_request_matches_are_capped_per_step():
+    """Short questions behind a long cached prefix add little pending work
+    each, so matching every queued request would walk the prefix hundreds of
+    times per step; past the cap they count at full length."""
+    waiting = [req(65536 + 256, rid=str(i)) for i in range(600)]
+    sched = scheduler(waiting, matched=65536)
+    assert pending_step_limit(sched) == 16384
+    assert len(sched.tree_cache.limits) == MAX_PREFIX_MATCHED_WAITING_REQS
+
+
+def test_a_waiting_request_is_matched_once():
+    """A match walks the whole cached prefix, so a waiting request keeps its
+    first match on later steps; the entry goes when it leaves the queue."""
+    sched = scheduler([req(65536 + 256)], matched=65536)
+    assert pending_step_limit(sched) == 2048
+    assert pending_step_limit(sched) == 2048
+    assert len(sched.tree_cache.limits) == 1
+    sched.waiting_queue = []
+    pending_step_limit(sched)
+    assert sched._tpu_pp_cached_prefix == {}
+
+
+def test_policy_match_counts_host_hits_without_rematching():
+    """A request the policy matched counts its host hits as cached without a
+    second match; a partial request counts the chunks computed past that match."""
+    waiting = req(65536, prefix=32768)
+    waiting.num_matched_prefix_tokens = 61440
+    sched = scheduler([waiting])
+    assert pending_step_limit(sched) == 2048
+    assert sched.tree_cache.limits == []
+    partial = req(32768, prefix=24576)
+    partial.num_matched_prefix_tokens = 4096
+    assert pending_step_limit(scheduler([], chunked=partial)) == 2048
 
 
 def test_pending_continuation_counts_only_unscheduled_tokens_once():
@@ -122,11 +205,11 @@ def test_decode_rows_are_not_pending_prefill():
 
 
 def test_finished_request_leaves_budget_for_next_request(monkeypatch):
-    def admit(self, request, *_):
-        tokens = len(request.full_untruncated_fill_ids)
+    def admit(self, *, req, **_):
+        tokens = len(req.full_untruncated_fill_ids)
         assert tokens <= self.rem_chunk_tokens
-        request.extend_range = NS(length=tokens)
-        self.can_run_list.append(request)
+        req.extend_range = NS(length=tokens)
+        self.can_run_list.append(req)
         self.rem_chunk_tokens -= tokens
         return self.budget_state()
 
@@ -141,7 +224,7 @@ def test_finished_request_leaves_budget_for_next_request(monkeypatch):
 
 def test_rejected_request_does_not_charge_time_or_tokens(monkeypatch):
     monkeypatch.setattr(
-        PrefillAdder, "add_one_req", lambda *args: AddReqResult.NO_TOKEN
+        PrefillAdder, "add_one_req", lambda *args, **kwargs: AddReqResult.NO_TOKEN
     )
     obj = adder()
     assert obj.add_one_req(req(4096), False, None) == AddReqResult.NO_TOKEN
@@ -170,10 +253,10 @@ def test_host_prefix_is_included_before_chunk_is_sized():
 
 
 def test_new_partial_request_stops_admission(monkeypatch):
-    def admit(self, request, *_):
-        request.extend_range = NS(length=self.rem_chunk_tokens)
-        self.can_run_list.append(request)
-        self.new_chunked_req = request
+    def admit(self, *, req, **_):
+        req.extend_range = NS(length=self.rem_chunk_tokens)
+        self.can_run_list.append(req)
+        self.new_chunked_req = req
         self.rem_chunk_tokens = 0
         return AddReqResult.OTHER
 
@@ -186,7 +269,7 @@ def test_new_partial_request_stops_admission(monkeypatch):
 
 
 def test_existing_partial_request_cannot_be_replaced(monkeypatch):
-    def unexpected(*args):
+    def unexpected(*args, **kwargs):
         raise AssertionError("A second partial request was admitted")
 
     monkeypatch.setattr(PrefillAdder, "add_one_req", unexpected)
@@ -247,7 +330,16 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     request.set_extend_range.side_effect = lambda start, end: setattr(
         request, "extend_range", NS(length=end - start)
     )
-    assert obj.add_one_req(request, has_chunked_req, None) == AddReqResult.CONTINUE
+    # Called the way the scheduler calls every prefill adder.
+    assert (
+        obj.add_one_req(
+            request,
+            has_chunked_req=has_chunked_req,
+            truncation_align_size=None,
+            chunk_tokens_cap=None,
+        )
+        == AddReqResult.CONTINUE
+    )
     assert obj.can_run_list == [request]
     assert obj.new_chunked_req is None
     assert request.extend_range.length == tokens
@@ -256,7 +348,7 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
 
 
 def test_page_reservation_cannot_overrun_remaining_budget(monkeypatch):
-    def unexpected(*args):
+    def unexpected(*args, **kwargs):
         raise AssertionError("A second partial request was admitted")
 
     monkeypatch.setattr(PrefillAdder, "add_one_req", unexpected)

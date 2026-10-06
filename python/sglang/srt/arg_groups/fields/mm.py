@@ -1,14 +1,8 @@
-"""Config fields of the ``mm`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``mm`` bag, which is what ``get_mm()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``mm`` namespace."""
 
 from __future__ import annotations
 
+import argparse
 import json
 from typing import (
     Any,
@@ -33,7 +27,12 @@ class Mm(msgspec.Struct):
     _NS_PATH = "mm"
     enable_multimodal: A[
         Optional[bool],
-        "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        Arg(
+            help="Enable the multimodal functionality for the served model. If "
+            "the model being served is not multimodal, nothing will happen. "
+            "--no-enable-multimodal serves a multimodal checkpoint text-only.",
+            action=argparse.BooleanOptionalAction,
+        ),
     ] = None
     mm_attention_backend: A[
         Optional[str],
@@ -157,8 +156,3 @@ class Mm(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
-    keep_mm_feature_on_device: A[
-        bool,
-        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
-        "multimodal feature transport.",
-    ] = False

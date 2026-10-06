@@ -8,7 +8,7 @@ that turns a device pool into the per-namespace tensor lists raiden registers.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from sglang.srt.utils.network import NetworkAddress
@@ -57,6 +57,8 @@ class RaidenKVCacheGroups:
 
     full: List[Any]
     swa: List[Any]
+    full_layer_ids: List[int] = field(default_factory=list)
+    swa_layer_ids: List[int] = field(default_factory=list)
 
 
 def get_raiden_kv_caches(
@@ -73,35 +75,53 @@ def get_raiden_kv_caches(
     """
 
     def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
+        layers_mapping = getattr(current_pool, "layers_mapping", None)
+        start = current_pool.start_layer
         if hasattr(current_pool, "get_fused_kv_buffer"):
-            start = current_pool.start_layer
+            layer_ids = (
+                sorted(layers_mapping)
+                if layers_mapping
+                else list(range(start, start + current_pool.layer_num))
+            )
             buffers = [
-                current_pool.get_fused_kv_buffer(start + i)
-                for i in range(current_pool.layer_num)
+                current_pool.get_fused_kv_buffer(layer_id) for layer_id in layer_ids
             ]
         elif hasattr(current_pool, "kv_buffer"):
             buffers = list(current_pool.kv_buffer)
+            layer_ids = (
+                sorted(layers_mapping)
+                if layers_mapping
+                else list(range(start, start + len(buffers)))
+            )
         else:
             raise RuntimeError(
                 "Raiden backend requires a fused KV pool exposing kv_buffer; got "
                 f"{type(current_pool).__name__}"
             )
-        layers_mapping = getattr(current_pool, "layers_mapping", None)
         if layers_mapping:
             full = []
             swa = []
-            for offset, buf in enumerate(buffers):
-                layer_id = current_pool.start_layer + offset
+            full_ids = []
+            swa_ids = []
+            for layer_id, buf in zip(layer_ids, buffers, strict=True):
                 (swa if layers_mapping[layer_id][1] else full).append(buf)
-            return RaidenKVCacheGroups(full=full, swa=swa)
-        return RaidenKVCacheGroups(full=buffers, swa=[])
+                (swa_ids if layers_mapping[layer_id][1] else full_ids).append(layer_id)
+            return RaidenKVCacheGroups(
+                full=full, swa=swa, full_layer_ids=full_ids, swa_layer_ids=swa_ids
+            )
+        return RaidenKVCacheGroups(
+            full=buffers, swa=[], full_layer_ids=layer_ids, swa_layer_ids=[]
+        )
 
     groups = group_one(pool)
     full, swa = list(groups.full), list(groups.swa)
+    full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
         full.extend(draft_groups.full)
         swa.extend(draft_groups.swa)
+        full_ids.extend(draft_groups.full_layer_ids)
+        swa_ids.extend(draft_groups.swa_layer_ids)
 
     for name, group in (("full", full), ("SWA", swa)):
         block_counts = {int(buf.shape[0]) for buf in group}
@@ -110,4 +130,6 @@ def get_raiden_kv_caches(
                 f"Raiden requires uniform {name} KV block counts; got "
                 f"{sorted(block_counts)}"
             )
-    return RaidenKVCacheGroups(full=full, swa=swa)
+    return RaidenKVCacheGroups(
+        full=full, swa=swa, full_layer_ids=full_ids, swa_layer_ids=swa_ids
+    )

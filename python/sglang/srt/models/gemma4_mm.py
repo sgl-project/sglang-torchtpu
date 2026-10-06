@@ -15,6 +15,7 @@
 
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
@@ -28,7 +29,6 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
@@ -65,13 +65,31 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_tpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
+
+
+def _encode(vision_tower, pixel_values, position_ids):
+    """Run the vision tower, through its TPU compile runner when it has one."""
+    runner = getattr(vision_tower, "graph_runners", None)
+    if runner is not None:
+        return runner.run(pixel_values, position_ids)
+    return vision_tower(pixel_values, position_ids)
+
+
+def _features_out(features: torch.Tensor) -> torch.Tensor:
+    # The TPU embed path places multimodal rows on the host unless told otherwise.
+    if _is_tpu and not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
+        return features.to("cpu")
+    return features
+
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -179,6 +197,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     embedding_modules = {}
     embedding_padding_modules = []
     supports_lora = True
+    # Read by the TPU VL compile policy: decode feeds input_embeds, not input_ids.
+    decode_embeds_in_language_model = False
 
     def __init__(
         self,
@@ -187,7 +207,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
 
@@ -244,6 +264,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             prefix=add_prefix("language_model", prefix),
         )
 
+        if _is_tpu:
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                Qwen3VLDecoderTpuCompilePolicy,
+            )
+
+            support_torch_compile(
+                self.language_model, policy=Qwen3VLDecoderTpuCompilePolicy
+            )
+
         # Tied embeddings: under PP the embed_tokens lives on the first rank
         # while logits run on the last rank, so we can't reuse the embedding
         # module directly.  For PP=1 keep the original tying; for PP>1
@@ -296,9 +328,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def pad_input_ids(
         self,
-        input_ids: List[int],
+        input_ids: array,
         mm_inputs: MultimodalInputs,
-    ) -> List[int]:
+    ) -> array:
         """Pad input IDs with image and audio tokens."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -453,7 +485,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 pv = pv.to(device=vt.device, dtype=self.language_model.dtype())
                 pp = pp.to(device=vt.device)
 
-                pooled, pooler_mask = vt(pv, pp)
+                pooled, pooler_mask = _encode(vt, pv, pp)
 
                 for hs, mask in zip(pooled, pooler_mask):
                     real_tokens = hs[mask]
@@ -464,7 +496,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
@@ -527,7 +559,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
@@ -573,7 +605,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 all_embeds.append(enc[~mask])
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,

@@ -24,9 +24,12 @@ all patches.  It is safe to import multiple times -- patches are idempotent.
 
 import functools
 import inspect
+import logging
 import os
 
-from sglang.srt.utils import logger
+# Plain logger: importing sglang.srt.utils here pulls torch/transformers/triton
+# into every `import sglang` (this module runs from sglang/__init__.py).
+logger = logging.getLogger(__name__)
 
 _applied = False
 

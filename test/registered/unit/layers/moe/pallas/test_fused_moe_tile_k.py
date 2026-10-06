@@ -43,6 +43,7 @@ if _HAS_GMM:
         _gmm2_tile_source,
         _largest_compatible_tile_k,
         _quant_block_compatible,
+        _vmem_safe_packed_tile_n,
     )
 
 _SKIP_REASON = "Requires JAX"
@@ -94,6 +95,20 @@ class TestDividingTileK(CustomTestCase):
             self._rhs_cfgs(size_k, quant_block_size),
             vmem_limit_bytes=128 * 1024 * 1024,
         )
+
+    def test_int4_to_fp8_preserves_activation_quantization_groups(self):
+        import dataclasses
+
+        rhs = dataclasses.replace(self._rhs_cfgs(7168, 32), requantize_in_vmem=True)
+        for requested_k in (256, 1280, 1792):
+            tiles = _dividing_tile_k(gmm_v2.TileSizes(16, requested_k, 128))(
+                self._dims(7168),
+                SimpleNamespace(quant_block_size=512),
+                rhs,
+                128 * 1024 * 1024,
+            )
+            self.assertEqual(tiles.tile_k % 512, 0)
+            self.assertEqual(7168 % tiles.tile_k, 0)
 
     # ---- the predicate itself -------------------------------------------
 
@@ -251,6 +266,104 @@ class TestGmm2TileSource(CustomTestCase):
             w2_scale=jnp.ones((16, 8, 8192), dtype=jnp.float32),
         )
         self.assertIsInstance(tiles, gmm_v2.TileSizes)
+
+
+@unittest.skipUnless(_HAS_GMM, _SKIP_REASON)
+class TestVmemSafePackedTileN(CustomTestCase):
+    """``_vmem_safe_packed_tile_n`` keeps room for the unpack staging tile.
+
+    ``calculate_tiling`` sizes the rhs tile from the stored bit width and budgets
+    three pipelined buffers, but a W4A16 rhs is also unpacked into a staging tile
+    before the matmul. On Kimi-K2.6's GMM1 that gap put the kernel 5.17 MB over
+    its own 57.60 MB limit (measured on v7x), which Mosaic reports as
+    ``CompileTimeScopedVmemOom``.
+    """
+
+    # v7x: 0.9 * 64 MiB, the default gmm_v2 passes to calculate_tiling.
+    _VMEM = int(64 * 1024 * 1024 * 0.9)
+
+    @staticmethod
+    def _dims(size_k, size_n):
+        return gmm_v2.Dimensions(
+            size_m=512,
+            size_k=size_k,
+            size_n=size_n,
+            size_group=24,
+            size_lhs_group=24,
+            size_lhs_sublane=16,
+        )
+
+    @staticmethod
+    def _packed_int4_cfgs(size_k):
+        """Kimi's compressed-tensors rhs: int4 packed 8-per-int32, 32-wide blocks."""
+        return gmm_v2.InputConfigs(
+            quant_dtype=jnp.int4.dtype,
+            quant_block_size=32,
+            dtype=jnp.int4,
+            has_scale=True,
+            packing=8,
+            num_quant_blocks=size_k // 32,
+            scale_dtype=jnp.bfloat16,
+        )
+
+    def _resolve(self, size_k, size_n, tile_n, rhs_cfgs):
+        pinned = gmm_v2.TileSizes(tile_m=64, tile_k=size_k, tile_n=tile_n)
+        wrapped = _vmem_safe_packed_tile_n(pinned)
+        return wrapped(
+            self._dims(size_k, size_n),
+            SimpleNamespace(quant_block_size=512, has_scale=False),
+            rhs_cfgs,
+            vmem_limit_bytes=self._VMEM,
+        )
+
+    def test_kimi_gmm1_tile_n_is_halved(self):
+        # The shape that OOMs: full-n leaves no room for the staging tile.
+        tiles = self._resolve(7168, 4096, 4096, self._packed_int4_cfgs(7168))
+        self.assertEqual(tiles.tile_n, 2048)
+        self.assertEqual(tiles.tile_k, 7168)
+        self.assertEqual(tiles.tile_m, 64)
+
+    def test_kimi_gmm2_tile_is_left_alone(self):
+        # Already fits, so it must keep the tile it compiles with today.
+        tiles = self._resolve(2048, 7168, 7168, self._packed_int4_cfgs(2048))
+        self.assertEqual(tiles.tile_n, 7168)
+
+    def test_bf16_weights_are_untouched(self):
+        cfgs = gmm_v2.InputConfigs(
+            quant_dtype=None,
+            quant_block_size=7168,
+            dtype=jnp.bfloat16,
+            has_scale=False,
+        )
+        tiles = self._resolve(7168, 4096, 4096, cfgs)
+        self.assertEqual(tiles.tile_n, 4096)
+
+    def test_fp8_weights_are_untouched(self):
+        # As make_gmm_configs builds them (fp8, four codes per word); fp8 has no
+        # unpack tile, so the DeepSeek GMM1 tile keeps the kernel's choice.
+        cfgs = gmm_v2.InputConfigs(
+            quant_dtype=jnp.float8_e4m3fn.dtype,
+            quant_block_size=128,
+            dtype=jnp.float8_e4m3fn,
+            has_scale=True,
+            packing=4,
+            num_quant_blocks=7168 // 128,
+            scale_dtype=jnp.float32,
+        )
+        tiles = self._resolve(7168, 4096, 4096, cfgs)
+        self.assertEqual(tiles.tile_n, 4096)
+
+    def test_result_is_a_fixed_point(self):
+        # Re-wrapping an already-safe tile must not shrink it again.
+        cfgs = self._packed_int4_cfgs(7168)
+        once = self._resolve(7168, 4096, 4096, cfgs)
+        twice = self._resolve(7168, 4096, once.tile_n, cfgs)
+        self.assertEqual(twice.tile_n, once.tile_n)
+
+    def test_chosen_tile_fits_the_staging_budget(self):
+        tiles = self._resolve(7168, 4096, 4096, self._packed_int4_cfgs(7168))
+        tile_bytes = tiles.tile_k * tiles.tile_n * 4 // 8  # int4 rhs
+        self.assertLessEqual(tile_bytes, self._VMEM // 5)
 
 
 if __name__ == "__main__":

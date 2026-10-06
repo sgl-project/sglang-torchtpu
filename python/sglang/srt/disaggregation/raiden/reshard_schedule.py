@@ -17,11 +17,10 @@ Both are captured by ``head_slice_params`` (the same math as sglang's
 module stays free of torch/triton and the byte-math is unit-testable anywhere.
 
 The fused KV pool stores one ``[num_blocks, page_size, kv_heads_packed,
-kv_packing, padded_head_dim]`` tensor per layer. One kv-head's K and V are a
-single contiguous run (``kv_packing`` is outer to ``padded_head_dim``), so a
-per-token head slice is a contiguous ``num_heads * head_pair_bytes`` granule that
-lands strided (period ``dst_heads_per_rank * head_pair_bytes``) in the decode
-token. These builders turn that geometry into
+kv_packing, padded_head_dim]`` tensor per layer. Native host copies retain
+32-bit packing: BF16 packs one head's K/V into each word, while FP8 packs two
+heads. Only complete head packs are contiguous, so a head slice must cover
+whole packs. These builders turn that geometry into
 ``raiden_service_pb2.StartTransferRequest`` push schedules.
 """
 
@@ -41,12 +40,13 @@ class FusedKVLayerTensor(Protocol):
 
 
 def reshard_ratio(src_tp: int, dst_tp: int) -> int:
-    """Prefill ranks feeding one decode rank. Requires src_tp a multiple of dst_tp."""
-    if src_tp % dst_tp != 0:
+    """Prefill ranks feeding one decode rank; 1 when the decode is sharded
+    finer. Requires one attention TP to be a multiple of the other."""
+    if src_tp % dst_tp != 0 and dst_tp % src_tp != 0:
         raise ValueError(
-            f"src attn TP ({src_tp}) must be a multiple of dst attn TP ({dst_tp})"
+            f"src attn TP ({src_tp}) and dst attn TP ({dst_tp}) must be multiples"
         )
-    return src_tp // dst_tp
+    return max(1, src_tp // dst_tp)
 
 
 def decode_rank_for(prefill_rank: int, ratio: int) -> int:
@@ -73,6 +73,13 @@ def head_pair_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
     """
     shape = fused_layer_tensor.shape
     return int(shape[3]) * int(shape[4]) * fused_layer_tensor.element_size()
+
+
+def head_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
+    """Bytes of one kv-head's K+V values, padding lanes excluded; the per-head
+    granule of a ReshardGeometry built with the tensor's kv_packing."""
+    shape = fused_layer_tensor.shape
+    return 2 * int(shape[4]) * fused_layer_tensor.element_size()
 
 
 def per_rank_head_count(fused_layer_tensor: FusedKVLayerTensor) -> int:
@@ -117,8 +124,10 @@ def head_slice_params(
     else:
         # Equal / fan-out: the prefill rank holds a superset of this decode rank's
         # heads, so the decode takes a contiguous sub-slice of the source and
-        # fills its own block from slot 0.
-        tp_head_start = tp_dst_rank * dst_heads_per_rank
+        # fills its own block from slot 0. Consecutive decode ranks share a
+        # kv-head when the model has fewer kv-heads than decode ranks.
+        dst_replication = max(1, dst_tp // total_kv_heads)
+        tp_head_start = tp_dst_rank // dst_replication * dst_heads_per_rank
         src_head_start = tp_head_start % src_heads_per_rank
         num_heads = dst_heads_per_rank
         dst_head_start = 0
@@ -134,12 +143,26 @@ def head_slice_params(
 class ReshardGeometry:
     """Byte geometry for one (src_tp -> dst_tp) reshard over ``total_kv_heads``."""
 
-    def __init__(self, src_tp: int, dst_tp: int, hp_bytes: int, total_kv_heads: int):
+    def __init__(
+        self,
+        src_tp: int,
+        dst_tp: int,
+        hp_bytes: int,
+        total_kv_heads: int,
+        kv_packing: int = 2,
+        element_size: int = 2,
+    ):
         self.src_tp = src_tp
         self.dst_tp = dst_tp
         self.ratio = reshard_ratio(src_tp, dst_tp)
         self.hp_bytes = hp_bytes
         self.total_kv_heads = total_kv_heads
+        if kv_packing not in (1, 2, 4) or kv_packing * element_size != 4:
+            raise ValueError("Raiden fused KV requires native 32-bit dtype packing")
+        if hp_bytes <= 0 or hp_bytes % (2 * element_size):
+            raise ValueError("Raiden head-pair bytes must contain whole K/V elements")
+        self.kv_packing = kv_packing
+        self.element_size = element_size
 
     def entry_bytes(self, prefill_rank: int, decode_rank: int):
         """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
@@ -147,6 +170,13 @@ class ReshardGeometry:
         sh_start, num_heads, dh_start, src_hpr, dst_hpr = head_slice_params(
             self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
         )
+        # A 32-bit pack holds kv_packing // 2 heads, and a rank's padded last
+        # pack still spans its per-token width.
+        heads_per_pack = max(1, self.kv_packing // 2)
+        if any(n % heads_per_pack for n in (sh_start, dh_start, num_heads)):
+            raise ValueError("Partial FP8 head packs are unsupported")
+        src_hpr = -(-src_hpr // heads_per_pack) * heads_per_pack
+        dst_hpr = -(-dst_hpr // heads_per_pack) * heads_per_pack
         return (
             sh_start * self.hp_bytes,  # src_offset
             num_heads * self.hp_bytes,  # size

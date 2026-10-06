@@ -17,9 +17,14 @@ from sglang.srt.hardware_backend.tpu.pp_chunks import (
     profile_points,
     uses_dynamic_chunks,
 )
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    MAX_PREFIX_MATCHED_WAITING_REQS,
+    AddReqResult,
+    PrefillAdder,
+    matched_prefix_len,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -37,21 +42,39 @@ def pending_step_limit(scheduler):
     requests = list(scheduler.waiting_queue)
     if scheduler.chunked_req is not None:
         requests.append(scheduler.chunked_req)
+    cached_prefix = scheduler._tpu_pp_cached_prefix
+    waiting = {req.rid for req in scheduler.waiting_queue}
+    for rid in [rid for rid in cached_prefix if rid not in waiting]:
+        del cached_prefix[rid]
     seen = set()
     pending = 0
+    matches_left = MAX_PREFIX_MATCHED_WAITING_REQS
     for req in requests:
         if req.rid in seen:
             continue
         seen.add(req.rid)
-        tokens = len(req.origin_input_ids) + len(req.output_ids)
-        pending += max(tokens - len(req.prefix_indices), 0)
+        # The policy's match counts host hits; a partial request's computed
+        # chunks extend prefix_indices past that match.
+        cached = max(len(req.prefix_indices), req.num_matched_prefix_tokens)
+        if cached == 0 and req.rid in cached_prefix:
+            cached = cached_prefix[req.rid]
+        elif cached == 0 and matches_left > 0:
+            # Matched once per waiting request; its cached prefix is not pending work,
+            # and the match refreshes that prefix's recency ahead of admission.
+            matches_left -= 1
+            cached = matched_prefix_len(scheduler.tree_cache, req)
+            cached_prefix[req.rid] = cached
+        pending += max(len(req.origin_input_ids) + len(req.output_ids) - cached, 0)
+        if pending >= get_parallel().pp_size * cost.buckets[-1]:
+            # The limit saturates at a full step; the rest need no match.
+            break
     # A micro-batch slot holds its batch until the result is processed, when
     # the same batch is recorded as the slot's last batch.
     for batch, done in zip(scheduler.mbs, scheduler.last_mbs):
         if batch is not None and batch is not done:
             pending += _prefill_tokens(batch)
     granule = cost.granularity
-    share = -(-pending // scheduler.ps.pp_size)
+    share = -(-pending // get_parallel().pp_size)
     return min(cost.buckets[-1], max(granule, -(-share // granule) * granule))
 
 
@@ -138,7 +161,9 @@ class TpuPipelinePrefillAdder(PrefillAdder):
                 return req
             return super().add_chunked_req(req)
 
-    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+    def add_one_req(
+        self, req, has_chunked_req, truncation_align_size, chunk_tokens_cap=None
+    ):
         before = len(self.can_run_list)
         with self._request_budget(req) as cap:
             if cap <= 0:
@@ -148,7 +173,12 @@ class TpuPipelinePrefillAdder(PrefillAdder):
                 remaining -= req.host_hit_length
             if has_chunked_req and cap < remaining:
                 return AddReqResult.OTHER
-            result = super().add_one_req(req, has_chunked_req, truncation_align_size)
+            result = super().add_one_req(
+                req=req,
+                has_chunked_req=has_chunked_req,
+                truncation_align_size=truncation_align_size,
+                chunk_tokens_cap=chunk_tokens_cap,
+            )
         if self.new_chunked_req is not None:
             return AddReqResult.OTHER
         return self.budget_state() if len(self.can_run_list) > before else result
@@ -193,7 +223,7 @@ def profile_and_install_cost_model(scheduler):
             policy._run_one(**kwargs)
             elapsed = min(policy._run_one(**kwargs) for _ in range(2))
             samples.append((tokens, prefix, elapsed))
-    reports = [None] * scheduler.ps.pp_size
+    reports = [None] * get_parallel().pp_size
     torch.distributed.all_gather_object(
         reports, (samples, schedule), group=scheduler.pp_group.cpu_group
     )
@@ -216,4 +246,6 @@ def profile_and_install_cost_model(scheduler):
                 f"lower --context-length from {context_len} to {longest}."
             )
     scheduler._tpu_pp_chunk_cost = cost
+    # Cached prefix tokens of each waiting request, matched once.
+    scheduler._tpu_pp_cached_prefix = {}
     logger.info("TPU pipeline chunks: %s; stage samples %s", cost.describe(), samples)

@@ -658,7 +658,7 @@ class TpuSRTPlatform(SRTPlatform):
         return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:
-        torch.tpu.set_device(device)
+        torch.accelerator.set_device_index(device)
 
     def get_device_name(self, device_id: int = 0) -> str:
         try:

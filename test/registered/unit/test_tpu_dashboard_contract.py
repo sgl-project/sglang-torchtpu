@@ -28,12 +28,22 @@ from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tpu import model_config
+from sglang.test.tpu.evals import model_config
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 TPU_TESTS = REPO / "test" / "registered" / "tpu"
+# The taxonomy ratchet (scripts/lint/check_registered_tests.py) only admits NEW
+# registered tests under test/registered/<kind>/<subsystem>/, so a new TPU
+# accuracy or perf file lands outside the grandfathered tree above. Both are in
+# scope here: watching only one of them would let the contract lapse silently
+# for every test written from now on, which is the failure mode this file exists
+# to prevent.
+TAXONOMY_TPU_TESTS = {
+    "nightly-accuracy": REPO / "test" / "registered" / "accuracy" / "tpu",
+    "nightly-perf": REPO / "test" / "registered" / "perf" / "tpu",
+}
 TPU_CI = REPO / ".github" / "tpu-ci"
 WORKFLOWS = REPO / ".github" / "workflows"
 ALIASES_FILE = TPU_CI / "dashboard_aliases.json"
@@ -65,7 +75,8 @@ def _nightly_registered() -> dict:
 
     files = [
         str(p)
-        for p in TPU_TESTS.rglob("*.py")
+        for root in (TPU_TESTS, *TAXONOMY_TPU_TESTS.values())
+        for p in root.rglob("*.py")
         if "__pycache__" not in p.parts and p.name not in ("conftest.py", "__init__.py")
     ]
     registered: dict = {}
@@ -82,8 +93,9 @@ def _nightly_registered() -> dict:
 
 
 def _config_modules(subdir: str):
-    """Load every MODEL_CONFIG module under test/registered/tpu/<subdir>."""
-    for path in sorted((TPU_TESTS / subdir).glob("test_*.py")):
+    """Load every MODEL_CONFIG module of a category, old tree and new."""
+    roots = (TPU_TESTS / subdir, TAXONOMY_TPU_TESTS[subdir])
+    for path in sorted(p for root in roots for p in root.glob("test_*.py")):
         spec = importlib.util.spec_from_file_location(f"dc_{path.stem}", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -149,6 +161,9 @@ class TestJobMapsToOneTest(CustomTestCase):
         cls.multihost = _discover(
             "discover_multihost.py", "--suite", "nightly-tpu-multihost"
         )
+        cls.multihost_accuracy = _discover(
+            "discover_multihost.py", "--suite", "nightly-tpu-multihost-accuracy"
+        )
         cls.ondemand = _discover(
             "discover_multihost.py", "--suite", "nightly-tpu-multihost-ondemand"
         )
@@ -158,10 +173,147 @@ class TestJobMapsToOneTest(CustomTestCase):
     def test_multihost_groups_carry_exactly_one_file(self):
         # `files` is space-separated by contract; a group bundling two files
         # would make a red JobSet ambiguous about which test failed.
-        for row in self.multihost + self.ondemand:
+        for row in self.multihost + self.multihost_accuracy + self.ondemand:
             self.assertEqual(
                 len(row["files"].split()), 1, f"group {row['name']} bundles files"
             )
+
+    @staticmethod
+    def _run_step(step, env):
+        """Run one workflow step's bash; return what it wrote to GITHUB_OUTPUT."""
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile() as output:
+            done = subprocess.run(
+                ["bash", "-c", step["run"]],
+                cwd=REPO,
+                env={**os.environ, **env, "GITHUB_OUTPUT": output.name},
+                capture_output=True,
+                text=True,
+            )
+            written = Path(output.name).read_text()
+        return done.returncode, dict(
+            line.split("=", 1) for line in written.splitlines() if line
+        )
+
+    def test_each_schedule_slot_selects_its_tests(self):
+        # A cron edited without its `plan` case would run nothing, or everything.
+        import yaml
+
+        workflow = yaml.safe_load((WORKFLOWS / "accuracy-test-tpu.yml").read_text())
+        plan = workflow["jobs"]["plan"]["steps"][0]
+        crons = [entry["cron"] for entry in workflow[True]["schedule"]]
+        selected = {}
+        for cron in crons:
+            rc, out = self._run_step(plan, {"MODEL": "", "SCHEDULE": cron})
+            self.assertEqual(rc, 0, cron)
+            selected[cron] = out["model"]
+        self.assertEqual(
+            selected,
+            {"0 10 * * *": "day-10am", "0 17 * * *": "day-5pm"},
+        )
+        # A called run sees its caller's schedule; the caller's input must win.
+        _, out = self._run_step(plan, {"MODEL": "gemma4", "SCHEDULE": "0 1 * * *"})
+        self.assertEqual(out["model"], "gemma4")
+        rc, _ = self._run_step(plan, {"MODEL": "", "SCHEDULE": "0 3 * * *"})
+        self.assertNotEqual(rc, 0, "an unknown schedule must not fall back to all")
+
+    def test_scheduled_accuracy_discovers_every_model(self):
+        import yaml
+
+        workflow = yaml.safe_load((WORKFLOWS / "accuracy-test-tpu.yml").read_text())
+        job = workflow["jobs"]["discover-multihost"]
+        step = next(s for s in job["steps"] if s.get("id") == "d")
+
+        def discover(model):
+            self.assertIn(f'"{model}"', job["if"])
+            rc, out = self._run_step(
+                step, {"MODEL": model, "TEST_FILTER": "", "UPDATE_DASHBOARD": "false"}
+            )
+            self.assertEqual(rc, 0, model)
+            return json.loads(out["groups"])
+
+        names = {
+            model: {g["name"] for g in discover(model)}
+            for model in ("day-10am", "day-5pm", "full-set")
+        }
+        # Each slot's multihost legs take the 2-host lane its 1-host legs leave idle.
+        self.assertEqual(
+            names["day-10am"],
+            {"test_tpu_kimi_k26_mmmu_shard0", "test_tpu_kimi_k26_mmmu_shard1"},
+        )
+        self.assertEqual(
+            names["day-5pm"],
+            {
+                "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
+                "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
+            },
+        )
+        # Every multihost accuracy file runs in exactly one scheduled selection.
+        slots = ("day-10am", "day-5pm")
+        scheduled = [names[m] for m in slots]
+        self.assertEqual(set().union(*scheduled), names["full-set"])
+        self.assertEqual(sum(map(len, scheduled)), len(names["full-set"]))
+        # Test authors only write "nightly"; the workflow picks the slot.
+        for row in discover("full-set"):
+            self.assertEqual(row["schedule"], "nightly", row["name"])
+
+        groups = discover("full-set")
+        recipes = [g["launch_script"] for g in groups]
+        self.assertEqual(
+            recipes.count("recipe/configs/deepseek_r1_0528/accuracy.py"), 1
+        )
+        self.assertEqual(recipes.count("recipe/configs/kimi_k26/mmmu.py"), 2)
+        self.assertNotIn("recipe/configs/qwen3_5_397b/server.py", recipes)
+        for group in groups:
+            self.assertTrue((REPO / "benchmark/tpu" / group["launch_script"]).is_file())
+            # A hosted runner has six hours, including startup and cleanup.
+            runtime = 3600 + group["timeout_per_file"] + 600
+            self.assertGreater(21600 - runtime - 900 - 600, 0, group["name"])
+        # The nightly no longer runs accuracy; single-host legs ride the 10 AM slot.
+        for job in workflow["jobs"].values():
+            self.assertNotIn('"nightly"', job.get("if", ""))
+        gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
+        self.assertIn('"day-10am"', gpt["if"])
+        self.assertEqual(gpt["with"]["suite"], "nightly-tpu-accuracy-gpt-oss-20b")
+
+        def suites(job_name):
+            legs = workflow["jobs"][job_name]["strategy"]["matrix"]["include"]
+            return {leg["suite"] for leg in legs}
+
+        sizes = ("31b", "26b-a4b")
+        self.assertIn('"day-10am"', workflow["jobs"]["accuracy-gemma4"]["if"])
+        self.assertEqual(
+            suites("accuracy-gemma4"),
+            {
+                f"nightly-tpu-accuracy-gemma4-{size}-{bench}"
+                for size in sizes
+                for bench in ("aime", "gpqa")
+            },
+        )
+        mmmu = workflow["jobs"]["accuracy-gemma4-mmmupro"]["if"]
+        self.assertIn('"day-5pm"', mmmu)
+        self.assertEqual(
+            suites("accuracy-gemma4-mmmupro"),
+            {f"nightly-tpu-accuracy-gemma4-{size}-mmmupro" for size in sizes},
+        )
+        qwen = workflow["jobs"]["accuracy-qwen3-5-mmmupro"]
+        for selection in ('"day-5pm"', '"qwen3-5-397b"'):
+            self.assertIn(selection, qwen["if"])
+        self.assertEqual(qwen["with"]["hosts"], 1)
+        self.assertEqual(
+            qwen["with"]["suite"], "nightly-tpu-accuracy-qwen3-5-397b-mmmupro"
+        )
+        # The long P/D gates leave `all` (the nightly) for the 5 PM slot.
+        pd = workflow["jobs"]["pd-kvoff-reshard"]
+        self.assertIn('"day-5pm"', pd["if"])
+        feature = yaml.safe_load((WORKFLOWS / "feature-validation-tpu.yml").read_text())
+        for only in pd["strategy"]["matrix"]["only"]:
+            self.assertEqual(feature["jobs"][only]["if"].count("inputs.only =="), 1)
+            self.assertNotIn('"all"', feature["jobs"][only]["if"])
+        nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
+        self.assertNotIn("accuracy", nightly["jobs"])
 
     def test_static_pd_jobs_carry_exactly_one_existing_file(self):
         self.assertTrue(self.static_pd, "no static P/D jobs found; did they move?")
@@ -176,6 +328,7 @@ class TestJobMapsToOneTest(CustomTestCase):
         job_files = (
             [row["file"] for row in self.single_host]
             + [row["files"] for row in self.multihost]
+            + [row["files"] for row in self.multihost_accuracy]
             + list(self.static_pd)
             + list(self.external)
         )
@@ -240,7 +393,11 @@ class TestNightlyConfigLabelLint(CustomTestCase):
 
     def test_required_fields_present(self):
         for path, mod, _kind in self._all_configs():
-            config = mod.MODEL_CONFIG
+            config = (
+                mod.build_model_config()
+                if hasattr(mod, "build_model_config")
+                else mod.MODEL_CONFIG
+            )
             for field in ("id", "display_name", "model"):
                 self.assertTrue(config.get(field), f"{path.name} misses {field!r}")
             self.assertRegex(
@@ -254,7 +411,11 @@ class TestNightlyConfigLabelLint(CustomTestCase):
         # Two tests claiming one id would merge unrelated trends into one plot.
         seen = {}
         for path, mod, _kind in self._all_configs():
-            series_id = mod.MODEL_CONFIG["id"]
+            series_id = (
+                mod.build_model_config()
+                if hasattr(mod, "build_model_config")
+                else mod.MODEL_CONFIG
+            )["id"]
             self.assertNotIn(
                 series_id, seen, f"{path.name} reuses id of {seen.get(series_id)}"
             )
@@ -262,26 +423,64 @@ class TestNightlyConfigLabelLint(CustomTestCase):
 
     def test_accuracy_gate_labels_carry_identity(self):
         for path, mod in self.accuracy:
-            for params in model_config.build_gates(mod.MODEL_CONFIG):
+            for params in model_config.build_gates(
+                (
+                    mod.build_model_config()
+                    if hasattr(mod, "build_model_config")
+                    else mod.MODEL_CONFIG
+                )
+            ):
                 labels = params.metric_labels or {}
                 self.assertEqual(labels.get("kind"), "accuracy", path.name)
-                self.assertEqual(labels.get("id"), mod.MODEL_CONFIG["id"], path.name)
+                self.assertEqual(
+                    labels.get("id"),
+                    (
+                        mod.build_model_config()
+                        if hasattr(mod, "build_model_config")
+                        else mod.MODEL_CONFIG
+                    )["id"],
+                    path.name,
+                )
                 self.assertEqual(
                     labels.get("display_name"),
-                    mod.MODEL_CONFIG["display_name"],
+                    (
+                        mod.build_model_config()
+                        if hasattr(mod, "build_model_config")
+                        else mod.MODEL_CONFIG
+                    )["display_name"],
                     path.name,
                 )
 
+    @staticmethod
+    def _fixture_config_module(mod) -> str:
+        """The recipe a TPULauncherTestCase subclass in this module serves."""
+        return next(
+            (
+                obj.config_module
+                for obj in vars(mod).values()
+                if isinstance(obj, type) and getattr(obj, "config_module", "")
+            ),
+            "",
+        )
+
     def test_perf_measures_through_recipe_and_bench_serving_only(self):
-        # RecipeLauncher + bench_serving.sh is what puts the server/bench config
-        # panels on the dashboard; a hand-booted server or hand-rolled bench
-        # produces a chart nobody can reproduce from.
+        # A recipe launch plus bench_serving.sh is what puts the server/bench
+        # config panels on the dashboard; a hand-booted server or hand-rolled
+        # bench produces a chart nobody can reproduce from. Two launch forms
+        # qualify: MODEL_CONFIG's own `launch.recipe`, and the unified launcher,
+        # where a TPULauncherTestCase subclass serves a Python recipe module and
+        # the config carries gates only.
         for path, mod in self.perf:
-            config = mod.MODEL_CONFIG
+            config = (
+                mod.build_model_config()
+                if hasattr(mod, "build_model_config")
+                else mod.MODEL_CONFIG
+            )
             launch = config.get("launch") or {}
             self.assertTrue(
-                launch.get("recipe"),
-                f"{path.name}: perf must launch through a recipe (RecipeLauncher)",
+                launch.get("recipe") or self._fixture_config_module(mod),
+                f"{path.name}: perf must serve through a recipe -- launch.recipe, "
+                "or a TPULauncherTestCase subclass with config_module",
             )
             self.assertFalse(launch.get("external"), path.name)
             for gate in config["gates"]:
@@ -302,7 +501,11 @@ class TestAliasRegistry(CustomTestCase):
     def setUpClass(cls):
         cls.aliases = json.loads(ALIASES_FILE.read_text(encoding="utf-8"))["aliases"]
         cls.live_ids = {
-            mod.MODEL_CONFIG["id"]
+            (
+                mod.build_model_config()
+                if hasattr(mod, "build_model_config")
+                else mod.MODEL_CONFIG
+            )["id"]
             for subdir in ("nightly-accuracy", "nightly-perf")
             for _path, mod in _config_modules(subdir)
         }
@@ -346,6 +549,7 @@ class TestReservedKindValues(CustomTestCase):
 
     SCAN_ROOTS = (
         TPU_TESTS,
+        *TAXONOMY_TPU_TESTS.values(),
         REPO / "python" / "sglang" / "test" / "tpu",
     )
 

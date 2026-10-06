@@ -28,6 +28,7 @@ from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
@@ -310,9 +311,7 @@ def _dp_attn_compute_padding(
             f"{forward_batch.dp_padding_mode}."
         )
 
-    from sglang.srt.layers.dp_attention import get_attention_dp_rank
-
-    dp_rank = get_attention_dp_rank()
+    dp_rank = get_parallel().attn_dp_rank
     # This rank's real live token count (used below for decode/idle real_q/b).
     # global_num_tokens_cpu is padded.
     # original_global_num_tokens_cpu is the pre-padding counts.
@@ -475,6 +474,7 @@ def _attach_input_logprobs(
     logits_output.input_top_logprobs_idx = eager.input_top_logprobs_idx
     logits_output.input_token_ids_logprobs_val = eager.input_token_ids_logprobs_val
     logits_output.input_token_ids_logprobs_idx = eager.input_token_ids_logprobs_idx
+    logits_output.input_logprobs_copy_done = eager.input_logprobs_copy_done
 
 
 def _pad_tensor_on_host(
@@ -758,6 +758,11 @@ class CompiledForwardShim:
         # it is frozen for this shim's lifetime. Caching it also keeps the
         # disabled path at a single attribute read per forward.
         self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        runner = policy.model_runner
+        # Draft models read the multimodal embeds inside their forward.
+        self._draft_worker = bool(
+            runner is not None and getattr(runner, "is_draft_worker", False)
+        )
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -975,6 +980,22 @@ class CompiledForwardShim:
                 forward_batch.seq_lens.shape[0]
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
+        if not self._prompt_logprob_enabled and hasattr(
+            forward_batch, "extend_logprob_start_lens_cpu"
+        ):
+            # Only the eager input-logprob gather reads these; keep them out of the guards.
+            saved.update(
+                _pin_fields(forward_batch, {"extend_logprob_start_lens_cpu": None})
+            )
+        # Keep the multimodal embeds out of a target graph's guards; re-attached below.
+        mm_embeds = (
+            None
+            if self._draft_worker
+            else getattr(forward_batch, "mm_input_embeds", None)
+        )
+        if mm_embeds is not None:
+            saved["mm_input_embeds"] = mm_embeds
+            forward_batch.mm_input_embeds = None
         try:
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)
             if isinstance(out, PendingCall):
@@ -994,13 +1015,26 @@ class CompiledForwardShim:
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
+        if mm_embeds is not None:
+            real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+            if real_q is not None and mm_embeds.shape[0] > real_q:
+                mm_embeds = mm_embeds[:real_q]
+            forward_batch.mm_input_embeds = mm_embeds
+
+        def finish(result: Any) -> Any:
+            # Re-attach the embeds the graph did not see; a hidden-state boundary
+            # leaves them on the batch for the wrapper's eager tail.
+            if (
+                mm_embeds is not None
+                and isinstance(result, LogitsProcessorOutput)
+                and result.mm_input_embeds is None
+            ):
+                result.mm_input_embeds = mm_embeds
+            return self._finish_forward(result, forward_batch, wants_input_logprob)
+
         if isinstance(out, PendingCall):
-            return out.then(
-                lambda result: self._finish_forward(
-                    result, forward_batch, wants_input_logprob
-                )
-            )
-        return self._finish_forward(out, forward_batch, wants_input_logprob)
+            return out.then(finish)
+        return finish(out)
 
     def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
         spec_info = forward_batch.spec_info

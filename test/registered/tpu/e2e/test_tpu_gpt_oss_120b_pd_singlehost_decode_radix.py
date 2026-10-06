@@ -25,7 +25,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, NamedTuple
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.pd_singlehost_base import PDSingleHostTestCase
+from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
 
 # Expected runtime: the single-host P/D GSM8K gate plus a few minutes of probe.
 register_tpu_ci(

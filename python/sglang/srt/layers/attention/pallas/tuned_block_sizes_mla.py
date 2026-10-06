@@ -189,6 +189,8 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 64, 64): (32, 1, 16),
         # Kimi tp=8 bs=1, long-context
         ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 1): (64, 1, 1),
+        ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 16): (32, 1, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 8192): (16, 256),
         ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 64, 8192): (64, 256),
         # DP attention dp=16 (64 heads per core, page 128)
         ("decode", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 1): (

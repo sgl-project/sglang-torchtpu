@@ -17,7 +17,6 @@ from unittest.mock import MagicMock, patch  # noqa: E402
 
 import torch  # noqa: E402
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
 from sglang.srt.hardware_backend.tpu import pp_scheduler  # noqa: E402
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (  # noqa: E402
     Bucketer,
@@ -35,8 +34,9 @@ from sglang.test.test_utils import CustomTestCase  # noqa: E402
 def _single_queue_scheduler(is_last_rank=False) -> SchedulerPPMixin:
     """A scheduler on a backend without forward/copy/schedule streams."""
     scheduler = SchedulerPPMixin()
-    scheduler.ps = ParallelState.trivial(pp_size=2, pp_rank=1)
     scheduler.use_overlap_streams = False
+    scheduler.pp_send_done_event = None
+    scheduler.pp_proxy_recv_event = None
     scheduler.forward_stream_ctx = nullcontext()
     scheduler.copy_stream_ctx = nullcontext()
     scheduler.device_module = MagicMock()
@@ -89,7 +89,9 @@ class TestStreamFences(CustomTestCase):
             forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
         )
         received = {"next_token_ids": torch.zeros(2, dtype=torch.int64)}
-        scheduler._pp_recv_dict_from_prev_stage = MagicMock(return_value=received)
+        scheduler._pp_recv_dict_from_prev_stage = MagicMock(
+            return_value=(received, None)
+        )
         self.batch_result = SimpleNamespace(logits_output=None)
         scheduler._pp_prep_batch_result = MagicMock(return_value=self.batch_result)
         scheduler._pp_send_output_to_next_stage = MagicMock(return_value=[])
@@ -133,7 +135,7 @@ class TestProxyReceive(CustomTestCase):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace(is_first_rank=False)
         scheduler.attn_tp_group = object()
-        scheduler._pp_recv_typed_dict = MagicMock(return_value=received)
+        scheduler._pp_recv_typed_dict = MagicMock(return_value=(received, None))
         return scheduler
 
     def test_first_stage_receives_nothing(self):

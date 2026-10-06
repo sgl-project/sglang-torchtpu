@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit")
 
 import unittest
 
@@ -119,7 +119,7 @@ class TestGmmV2W4A16(CustomTestCase):
             out.append((packed, scale))
         return out
 
-    def _run(self, dtype):
+    def _run(self, dtype, dequantize_rhs=False, scale_dtype=None):
         from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
 
         klhs, k13, k2 = jax.random.split(jax.random.key(0), 3)
@@ -136,9 +136,10 @@ class TestGmmV2W4A16(CustomTestCase):
                 lhs=lhs,
                 rhs=packed,
                 group_sizes=group_sizes,
-                rhs_scale=prepped_scale,  # already [G, blocks, 1, N] from prep
+                rhs_scale=prepped_scale.astype(scale_dtype or prepped_scale.dtype),
                 rhs_quant_dtype=jnp.int4,
                 maybe_quantize_lhs=False,
+                dequantize_rhs=dequantize_rhs,
                 preferred_element_type=dtype,
             )
 
@@ -165,8 +166,34 @@ class TestGmmV2W4A16(CustomTestCase):
     def test_bfloat16(self):
         self._run(jnp.bfloat16)
 
+    def test_bfloat16_vmem_dequantization(self):
+        self._run(jnp.bfloat16, dequantize_rhs=True)
+
+    def test_bfloat16_vmem_float32_scales(self):
+        # The production loader stores FP32 scales for zero-stride VMEM loads.
+        self._run(jnp.bfloat16, dequantize_rhs=True, scale_dtype=jnp.float32)
+
+    def test_vmem_rejects_partial_scale_group(self):
+        from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+
+        with self.assertRaisesRegex(ValueError, "multiple of the INT4 group size"):
+            gmm_v2(
+                lhs=jnp.ones((16, 512), jnp.bfloat16),
+                rhs=jnp.zeros((1, 64, 128), jnp.int32),
+                group_sizes=jnp.array([16], jnp.int32),
+                rhs_scale=jnp.ones((1, 1, 1, 128), jnp.float32),
+                rhs_quant_dtype=jnp.int4,
+                dequantize_rhs=True,
+                tile_info=TileSizes(16, 128, 128),
+            )
+
     def test_float32(self):
         self._run(jnp.float32)
+
+    def test_kimi_gate_up_width(self):
+        # Kimi prefill's tile and 32-wide groups; a packed-only VMEM estimate fails.
+        self.G, self.M, self.K, self.N = 2, 128, 7168, 4096
+        self._run(jnp.bfloat16)
 
 
 if __name__ == "__main__":

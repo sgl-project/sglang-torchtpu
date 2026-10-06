@@ -175,7 +175,7 @@ def prepare_fused_moe_sequence_parallel_input(
     parallel = get_parallel()
     group = parallel.attn_tp_group
     tp_group = getattr(parallel, "tp_group", None)
-    fused_rs_world_size = int(layer._tpu_fused_rs_tp_rank_to_device_id.numel())
+    fused_rs_world_size = layer.moe_ep_size
     if group.world_size != fused_rs_world_size:
         raise RuntimeError(
             "TPU fused-RS sequence parallelism requires matching attention-TP "

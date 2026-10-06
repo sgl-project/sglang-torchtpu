@@ -387,9 +387,9 @@ class TestSharedChecker(CustomTestCase):
             with (
                 patch.object(spec_op_precompile, "get_compiled_ops", return_value=[op]),
                 patch.object(
-                    spec_op_precompile.torch,
-                    "get_device_module",
-                    return_value=SimpleNamespace(synchronize=cache.sync),
+                    spec_op_precompile.torch.accelerator,
+                    "synchronize",
+                    cache.sync,
                 ),
             ):
                 spec_op_precompile.precompile_spec_v2_ops(

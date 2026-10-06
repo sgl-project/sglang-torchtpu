@@ -50,6 +50,9 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dfla
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
+from sglang.srt.hardware_backend.tpu.compile_cache import (
+    add_tpu_rank_assignment_to_compile_cache_key,
+)
 from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -139,6 +142,10 @@ class TpuGraphRunner:
         assert model_runner.server_args.enable_torch_compile, (
             "TpuGraphRunner should only be initialized when enable_torch_compile=True."
         )
+
+        # WORLD is initialized; set the tag before any policy creates a compile
+        # wrapper, since cache lookup can happen before its first warmup call.
+        add_tpu_rank_assignment_to_compile_cache_key()
 
         # Side-effectful import: registers the "tpu" dynamo backend so that
         # torch.compile(backend="tpu", ...) resolves. apply_tpu_patches does

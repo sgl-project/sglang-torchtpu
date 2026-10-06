@@ -1,7 +1,7 @@
 """Raiden wire messages and auxiliary-buffer serialization.
 
 Each typed Raiden message uses the shared ``[TAG, JSON payload]`` framing.
-``ABORT`` retains the common receiver's legacy positional layout.
+Pipeline messages and ``ABORT`` retain their positional layouts.
 """
 
 from __future__ import annotations
@@ -27,6 +27,10 @@ class MessageTag(bytes, enum.Enum):
     PULL_REQ = b"RAIDEN_PULL_REQ"  # decode -> prefill: "send me room R's blocks"
     BLOCKS = b"RAIDEN_BLOCKS"  # prefill -> decode: block-ids + endpoint + aux
     CHUNK = b"RAIDEN_CHUNK"  # prefill -> decode: one chunk's pages, mid-prefill
+
+    PIPELINE_REQ = b"RAIDEN_PIPELINE_REQ"
+    PIPELINE_READY = b"RAIDEN_PIPELINE_READY"
+    PIPELINE_RELEASE = b"RAIDEN_PIPELINE_RELEASE"
 
     # Asymmetric-TP push-resharding path (decode TP < prefill TP).
     RESHARD_REQ = b"RAIDEN_RESHARD_REQ"  # decode -> prefill: endpoint + blocks + tp

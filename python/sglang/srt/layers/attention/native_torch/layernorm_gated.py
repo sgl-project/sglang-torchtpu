@@ -12,13 +12,13 @@ class RMSNormGated(nn.Module):
 
     def __init__(self, hidden_size, eps=1e-6, activation="silu", dtype=None):
         super().__init__()
-        # Qwen3.5 GDN gates with silu(z) (matches FLA's RMSNormGated default).
+        # Qwen3.8 calls the same SiLU gate "swish", as accepted by FLA.
         # Guard other activations rather than silently applying no gate — that
         # would be a subtle correctness bug.
-        if activation != "silu":
+        if activation not in ("silu", "swish"):
             raise NotImplementedError(
                 f"RMSNormGated gate activation {activation!r} not supported "
-                "(only 'silu')"
+                "(only 'silu' or 'swish')"
             )
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.eps = eps

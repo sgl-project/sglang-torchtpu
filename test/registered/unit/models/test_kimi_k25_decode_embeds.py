@@ -12,16 +12,29 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _forward(*, decode_in_graph: bool, is_decode: bool):
+def _forward(
+    *,
+    decode_in_graph: bool,
+    is_decode: bool,
+    is_target_verify: bool = False,
+    has_mm_inputs: bool = False,
+    mm_extend_in_batch: bool = False,
+):
     """Call the wrapper's forward on a stand-in self with a mocked LM."""
     language_model = MagicMock(return_value="lm-out")
     fake_self = SimpleNamespace(
         decode_embeds_in_language_model=decode_in_graph,
+        text_prefill_in_language_model=decode_in_graph,
         language_model=language_model,
         get_image_feature=MagicMock(),
     )
     forward_batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode=lambda: is_decode)
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: is_decode,
+            is_target_verify=lambda: is_target_verify,
+        ),
+        contains_mm_inputs=lambda: has_mm_inputs,
+        is_tpu_mm_extend_in_batch=mm_extend_in_batch,
     )
     input_ids = torch.tensor([1, 2, 3])
     positions = torch.tensor([0, 1, 2])
@@ -39,12 +52,38 @@ class TestKimiDecodeEmbedsInGraph(CustomTestCase):
         out, lm, routine, ids, pos, fb = _forward(decode_in_graph=True, is_decode=True)
         self.assertEqual(out, "lm-out")
         routine.assert_not_called()
-        lm.assert_called_once_with(
-            input_ids=ids, positions=pos, forward_batch=fb, pp_proxy_tensors=None
-        )
+        # Positional: the compiled text variants are warmed with this call shape.
+        lm.assert_called_once_with(ids, pos, fb, pp_proxy_tensors=None)
 
-    def test_prefill_still_uses_the_embed_routine(self):
-        out, lm, routine, *_ = _forward(decode_in_graph=True, is_decode=False)
+    def test_target_verify_hands_raw_input_ids_to_the_language_model(self):
+        # The shared VL decoder policy warms verify with input_ids whenever the
+        # wrapper embeds in the language model; the routine here would be a
+        # serve-time recompile.
+        out, lm, routine, ids, pos, fb = _forward(
+            decode_in_graph=True, is_decode=False, is_target_verify=True
+        )
+        self.assertEqual(out, "lm-out")
+        routine.assert_not_called()
+        lm.assert_called_once_with(ids, pos, fb, pp_proxy_tensors=None)
+
+    def test_text_only_prefill_also_embeds_in_the_language_model(self):
+        out, lm, routine, ids, pos, fb = _forward(decode_in_graph=True, is_decode=False)
+        self.assertEqual(out, "lm-out")
+        routine.assert_not_called()
+        lm.assert_called_once_with(ids, pos, fb, pp_proxy_tensors=None)
+
+    def test_image_prefill_still_uses_the_embed_routine(self):
+        out, lm, routine, *_ = _forward(
+            decode_in_graph=True, is_decode=False, has_mm_inputs=True
+        )
+        self.assertEqual(out, "routine-out")
+        routine.assert_called_once()
+        lm.assert_not_called()
+
+    def test_text_prefill_takes_the_routine_when_a_dp_peer_has_an_image(self):
+        out, lm, routine, *_ = _forward(
+            decode_in_graph=True, is_decode=False, mm_extend_in_batch=True
+        )
         self.assertEqual(out, "routine-out")
         routine.assert_called_once()
         lm.assert_not_called()

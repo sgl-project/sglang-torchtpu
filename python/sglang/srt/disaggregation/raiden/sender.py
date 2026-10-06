@@ -232,6 +232,8 @@ class RaidenSenderMixin:
         finalized room and fails it terminally, or wins and this returns
         False without touching the status.
         """
+        if self._pipeline is not None:
+            return self._pipeline.finalize_send(room, aux_index)
         self._ensure_engine()
         with self._state_lock:
             if room in self._aborted:
@@ -254,6 +256,15 @@ class RaidenSenderMixin:
             self._maybe_reply(room)
         return True
 
+    def _decode_asked_locked(self, room: int) -> bool:
+        """Whether the decode asked to pull the room, cleared it to push, or
+        requested its pipeline transfer."""
+        return (
+            room in self._prefill.decode_addr
+            or room in self._prefill.reshard_ready
+            or (self._pipeline is not None and room in self._pipeline.replies)
+        )
+
     def awaiting_decode_since(self, room: int, since: float) -> Optional[float]:
         """When the prefill started waiting on the decode for ``room``.
 
@@ -266,7 +277,7 @@ class RaidenSenderMixin:
         decode's court, the window is timed from that latest progress.
         """
         with self._state_lock:
-            if room in self._prefill.decode_addr or room in self._prefill.reshard_ready:
+            if self._decode_asked_locked(room):
                 return None
             if room in self._prefill.reshard_req:
                 return self._prefill.reshard_replied_at.get(room)
@@ -281,7 +292,7 @@ class RaidenSenderMixin:
         decode can never be told to pull KV whose room just failed.
         """
         with self._state_lock:
-            if room in self._prefill.decode_addr or room in self._prefill.reshard_ready:
+            if self._decode_asked_locked(room):
                 return False
             if room in self._prefill.reshard_req:
                 started = self._prefill.reshard_replied_at.get(room)
@@ -305,9 +316,11 @@ class RaidenSenderMixin:
 
         ``register_read`` publishes physical device block ids to raiden. The
         consumer may not pull them until later, so the lease starts before
-        the potentially blocking registration and ends only when poll_stats
+        the potentially blocking registration and ends when poll_stats
         reports the request id settled: raiden expires a read nobody pulls at
-        its own deadline and reports it, so no second timer runs here. A
+        its own deadline and reports it, so no second timer runs here. The
+        one exception is an unread chunk lease of a room whose closing read
+        has settled, which ends early (see _settle_sender_reads_locked). A
         false return means raiden accepted no work, so no lease is left
         behind; a registration failure fails the room.
         """
@@ -342,6 +355,22 @@ class RaidenSenderMixin:
     def _settle_sender_reads_locked(self) -> None:
         settled = self._completed_send | self._native_failed
         for room, reads in list(self._send_reads.items()):
+            closing_done = str(room) in self._completed_send and (
+                self._swa_engine is None
+                or self._swa_req_id(room) in self._completed_send
+            )
+            if closing_done:
+                # The closing read covers every page the decode asked for
+                # (whole_pull_registration), and the decode issues it only
+                # after its earlier chunk reads settled and drops any CHUNK
+                # that arrives after BLOCKS (final_seen). So an unread chunk
+                # lease here will never be pulled, and the room's pages can be
+                # released now rather than held to the native deadline.
+                # Raiden cannot cancel the read; record it so _drain_engine
+                # ignores its eventual expiry instead of failing the room.
+                self._superseded_sender_reads.update(reads - settled)
+                self._send_reads.pop(room, None)
+                continue
             reads -= settled
             if not reads:
                 self._send_reads.pop(room, None)
@@ -354,8 +383,12 @@ class RaidenSenderMixin:
         While any holds, the pages must not be handed back -- the transfer
         would read them under their next owner. A read the decode never
         comes for is expired by raiden at its own deadline and settles
-        through poll_stats like any other.
+        through poll_stats like any other, except an unread chunk read of a
+        room whose closing read has settled: the decode will never pull it,
+        so it stops counting then (see _settle_sender_reads_locked).
         """
+        if self._pipeline is not None:
+            return self._pipeline.active(room)
         with self._state_lock:
             if self._send_reads.get(room):
                 return True
@@ -959,6 +992,8 @@ class RaidenKVSender(CommonKVSender):
         self._last_chunk = False
         self._started = False
         self._transfer_start_time: Optional[float] = None
+        # Raiden's finish time for this room (perf_counter seconds), set on Success.
+        self.transfer_finish_time: Optional[float] = None
         self.init_time = time.time()
         # Raiden is consumer-pull: the prefill need not wait for any decode
         # handshake before computing (decode pulls once prefill registers its
@@ -1012,12 +1047,16 @@ class RaidenKVSender(CommonKVSender):
             self.kv_mgr.finalize_send(self.bootstrap_room, self.aux_index)
 
     def _finalize_transfer_latency(self) -> None:
-        if (
-            self._transfer_start_time is not None
-            and self._transfer_metric.transfer_latency_s is None
-        ):
+        if self._transfer_metric.transfer_latency_s is not None:
+            return
+        # Save it now: clear() runs before the scheduler stamps the stage.
+        self.transfer_finish_time = self.kv_mgr.send_done_time(self.bootstrap_room)
+        if self._transfer_start_time is not None:
+            finish = self.transfer_finish_time
+            if finish is None:
+                finish = time.perf_counter()
             self._transfer_metric.transfer_latency_s = (
-                time.perf_counter() - self._transfer_start_time
+                finish - self._transfer_start_time
             )
 
     def poll(self) -> KVPoll:

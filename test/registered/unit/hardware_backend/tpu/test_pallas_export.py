@@ -21,42 +21,79 @@ register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
 
 
 class TestPallasExportEnvironment(CustomTestCase):
-    def test_export_devices_follow_runtime_assignment(self):
-        for device_ids in ([0, 1, 4, 5, 6, 7, 2, 3], [6, 7, 2, 3, 0, 1, 4, 5]):
-            with (
-                self.subTest(device_ids=device_ids),
-                patch("torch.distributed.is_initialized", return_value=True),
-                patch.dict(
-                    sys.modules,
-                    {
-                        "torch_tpu._internal.distributed.device_mesh": SimpleNamespace(
-                            get_device_assignment=lambda: device_ids
-                        )
-                    },
-                ),
-                patch.object(
-                    pallas_export, "get_pallas_tpu_device_kind", return_value="TPU7x"
-                ),
-            ):
-                devices = pallas_export.get_torchtpu_export_devices(len(device_ids))
-                self.assertEqual([device.id for device in devices], device_ids)
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_pipeline_wave_uses_logical_ranks_and_native_assignment(self):
+        import torch
+        from jax.sharding import PartitionSpec as P
 
-    def test_export_rejects_missing_or_duplicate_runtime_assignment(self):
-        for device_ids in ([], [0, 0], [0]):
+        from sglang.srt.hardware_backend.tpu import pp_wave
+        from sglang.test.cpu_test_utils import get_cpu_export_mesh
+
+        mesh = get_cpu_export_mesh(("pp",), (4,), (3, 1, 0, 2))
+        group = SimpleNamespace(
+            rank_in_group=0, world_size=4, ranks=(2, 0, 3, 1), cpu_group=object()
+        )
+
+        def gather_verdicts(values, verdict, group):
+            values[:] = [verdict] * 4
+
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "4"}),
+            patch.object(pp_wave, "_OPS", {}),
+            patch.object(pp_wave.PPWave, "probe", return_value=True),
+            patch.object(
+                torch.distributed, "all_gather_object", side_effect=gather_verdicts
+            ),
+            patch("torch_tpu._internal.pallas.get_pallas_mesh", return_value=mesh),
+            patch("torch_tpu._internal.pallas.jax_op") as register,
+        ):
+            pp_wave.build_pp_wave(
+                group, rows=8, hidden=16, dtype=torch.float32, device="cpu"
+            )
+            self.assertEqual(list(pp_wave._OPS), [(2, 0, 0, 3, 3, 1, 1, 2)])
+            register.assert_called_once()
+            self.assertIs(register.call_args.kwargs["mesh"], mesh)
+            self.assertEqual(register.call_args.kwargs["input_partition_specs"], (P(),))
+            self.assertEqual(
+                register.call_args.kwargs["output_partition_specs"], (P(),)
+            )
+
+    @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires TorchTPU")
+    def test_mesh_builders_use_native_mesh_unchanged(self):
+        from sglang.srt.hardware_backend.tpu import distributed_topk_pallas
+        from sglang.srt.layers.moe.pallas import fused_moe_rs_op
+
+        for builder, args, axes, shape in (
+            (distributed_topk_pallas._get_mesh, (8,), ("model",), (8,)),
+            (fused_moe_rs_op._get_mesh, (), ("data", "model"), (1, 8)),
+        ):
+            mesh = object()
+            get_mesh = MagicMock(return_value=mesh)
             with (
-                self.subTest(device_ids=device_ids),
-                patch("torch.distributed.is_initialized", return_value=True),
+                self.subTest(axes=axes),
+                patch.dict(os.environ, {"WORLD_SIZE": "8"}),
                 patch.dict(
                     sys.modules,
                     {
-                        "torch_tpu._internal.distributed.device_mesh": SimpleNamespace(
-                            get_device_assignment=lambda: device_ids
+                        "torch_tpu._internal.pallas": SimpleNamespace(
+                            get_pallas_mesh=get_mesh
                         )
                     },
                 ),
-                self.assertRaisesRegex(RuntimeError, "distinct world devices"),
             ):
-                pallas_export.get_torchtpu_export_devices(2)
+                builder.cache_clear()
+                try:
+                    self.assertIs(builder(*args), mesh)
+                    get_mesh.assert_called_once_with(axes, shape)
+                    builder.cache_clear()
+                    get_mesh.side_effect = ValueError("mesh shape")
+                    with self.assertRaisesRegex(ValueError, "mesh shape"):
+                        builder(*args)
+                finally:
+                    builder.cache_clear()
 
     def setUp(self):
         env_patcher = patch.dict(os.environ, {}, clear=False)
@@ -130,9 +167,13 @@ class TestPallasExportEnvironment(CustomTestCase):
         import jax
         import torch
         from jax.experimental import pallas as pl
+        from jax.sharding import PartitionSpec as P
 
         from sglang.srt.hardware_backend.tpu import pallas_jax_op
+        from sglang.test.cpu_test_utils import get_cpu_export_mesh
 
+        device_ids = (3, 1, 0, 2)
+        mesh = get_cpu_export_mesh(("model",), (4,), device_ids)
         registered = set()
         fingerprints = []
         native_keys = []
@@ -174,8 +215,18 @@ class TestPallasExportEnvironment(CustomTestCase):
 
                 wrapped = pallas_jax_op._CpuExportJaxCallable(
                     name="sglang_tpu_test::body_identity",
-                    jit_fn=jax.jit(add),
+                    jit_fn=jax.jit(
+                        jax.shard_map(
+                            add,
+                            mesh=mesh,
+                            in_specs=(P(),),
+                            out_specs=P(),
+                            check_vma=False,
+                        )
+                    ),
                     trace_key=trace_key,
+                    mesh=mesh,
+                    input_partition_specs=(P(),),
                 )
                 wrapped.sglang_output_shardings = ()
                 with patch.object(
@@ -189,9 +240,15 @@ class TestPallasExportEnvironment(CustomTestCase):
                     native_key = f"{kernel_key};mlir={fingerprint}"
                     self.assertEqual(register.call_args.args[1], native_key)
                     self.assertEqual(call.call_args.args[1], native_key)
+                    self.assertEqual(
+                        call.call_args.kwargs["device_assignment"], list(device_ids)
+                    )
                     wrapped(value)
                     lookup.assert_called_with(wrapped.name, native_key)
                     self.assertEqual(call.call_args.args[1], native_key)
+                    self.assertEqual(
+                        call.call_args.kwargs["device_assignment"], list(device_ids)
+                    )
                     export.assert_called_once()
                 fingerprints.append(fingerprint)
                 native_keys.append(native_key)
@@ -230,18 +287,20 @@ class TestPallasExportEnvironment(CustomTestCase):
         self.assertIs(tpu_info.get_device_kind, original_device_kind)
         self.assertIs(tpu_info.is_tpu_device, original_is_tpu_device)
 
-    @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
     def test_distinct_mesh_exports_collective_with_world_size_partitions(self):
         script = textwrap.dedent("""
             import base64
             import inspect
             import json
-            import numpy as np
             from unittest.mock import patch
 
             from sglang.srt.hardware_backend.tpu import pallas_export
 
-            devices = pallas_export.get_torchtpu_export_devices(4)
+            from sglang.test.cpu_test_utils import get_cpu_export_mesh
 
             import jax
             import jax.numpy as jnp
@@ -249,12 +308,12 @@ class TestPallasExportEnvironment(CustomTestCase):
             from jax._src.interpreters import mlir as jax_mlir
             from jax.experimental import pallas as pl
             from jax.experimental.pallas import tpu as pltpu
-            from jax.sharding import Mesh, PartitionSpec as P
+            from jax.sharding import PartitionSpec as P
             from jaxlib.mlir import ir
             from jaxlib.mlir.dialects import sdy, stablehlo
             from jaxlib.mosaic.python import tpu as mosaic_tpu
 
-            mesh = Mesh(np.asarray(devices).reshape(1, 4), ("data", "model"))
+            mesh = get_cpu_export_mesh(("data", "model"), (1, 4))
             if hasattr(jax, "shard_map"):
                 shard_map = jax.shard_map
             else:
@@ -380,7 +439,7 @@ class TestPallasExportEnvironment(CustomTestCase):
             print(
                 json.dumps(
                     {
-                        "device_ids": [device.id for device in devices],
+                        "device_ids": [device.id for device in mesh.devices.flat],
                         "mesh_shape": dict(mesh.shape),
                         "nr_devices": exported.nr_devices,
                         "has_all_reduce": (
@@ -399,7 +458,7 @@ class TestPallasExportEnvironment(CustomTestCase):
             )
             """)
         env = os.environ.copy()
-        env.pop("JAX_PLATFORMS", None)
+        env["JAX_PLATFORMS"] = "cpu"
         env.pop("XLA_FLAGS", None)
         completed = subprocess.run(
             [sys.executable, "-c", script],

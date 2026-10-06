@@ -60,7 +60,7 @@ _SKIP_REASON_JAX_TPU = (
 
 def _has_torch_tpu() -> bool:
     try:
-        return bool(torch.tpu.is_available())
+        return bool(torch.accelerator.is_available())
     except Exception:  # pragma: no cover
         return False
 

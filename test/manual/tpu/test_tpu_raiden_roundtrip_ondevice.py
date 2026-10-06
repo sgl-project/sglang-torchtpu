@@ -124,7 +124,7 @@ def test_host_pool_wiring():
 
 
 if __name__ == "__main__":
-    print(f"TPU chips: {torch.tpu.device_count()}")
+    print(f"TPU chips: {torch.accelerator.device_count()}")
     test_raiden_dma_roundtrip()
     test_host_pool_wiring()
     print("\nALL ON-DEVICE RAIDEN TESTS PASSED")

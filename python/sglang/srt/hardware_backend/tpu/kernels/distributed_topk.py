@@ -392,7 +392,6 @@ def _start_and_wait(copies) -> None:
 
 
 def _distributed_topk_kernel(
-    rank_ref,
     logits_ref,
     candidate_values_ref,
     candidate_indices_ref,
@@ -417,21 +416,18 @@ def _distributed_topk_kernel(
     from jax.experimental.pallas import tpu as pltpu
 
     token_start = pl.program_id(0) * _TOKEN_BLOCK
-    # Address the ring in mesh order: physical TPU IDs need not follow
-    # torch.distributed rank order. Keep the independent vocabulary rank for
-    # padding masks and token-ID offsets.
+    # The native mesh follows logical ranks for both routing and vocabulary shards.
     mesh_rank = lax.axis_index("model").astype(jnp.int32)
-    vocab_rank = rank_ref[0].astype(jnp.int32)
     aligned_width = logits_ref.shape[-1]
     added_width = local_width - org_vocab_padded_count
 
     positions = lax.broadcasted_iota(jnp.int32, logits_ref.shape, 1)
     org_count = jnp.clip(
-        org_vocab_size - vocab_rank * org_vocab_padded_count,
+        org_vocab_size - mesh_rank * org_vocab_padded_count,
         0,
         org_vocab_padded_count,
     )
-    added_start = org_vocab_size + vocab_rank * added_width
+    added_start = org_vocab_size + mesh_rank * added_width
     added_count = jnp.clip(global_vocab_size - added_start, 0, added_width)
     added_positions = positions - org_vocab_padded_count
     valid = (positions < org_count) | (
@@ -448,7 +444,7 @@ def _distributed_topk_kernel(
         constant_values=-jnp.inf,
     )
     local_indices = jnp.pad(
-        local_indices + vocab_rank * aligned_width,
+        local_indices + mesh_rank * aligned_width,
         ((0, 0), (0, _DMA_WIDTH - MAX_DISTRIBUTED_TOP_K)),
     )
 
@@ -579,7 +575,6 @@ def _distributed_topk_kernel(
 
 def _ring_candidates(
     local_logits,
-    rank_input,
     *,
     world_size: int,
     org_vocab_size: int,
@@ -629,12 +624,12 @@ def _ring_candidates(
             jax.ShapeDtypeStruct(candidate_shape, jnp.int32),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=0,
             grid=(padded_tokens // _TOKEN_BLOCK,),
             in_specs=(
                 pl.BlockSpec(
                     (_TOKEN_BLOCK, aligned_width),
-                    lambda tile, *_: (tile, 0),
+                    lambda tile: (tile, 0),
                     memory_space=pltpu.VMEM,
                 ),
             ),
@@ -642,12 +637,11 @@ def _ring_candidates(
             scratch_shapes=scratch_shapes,
         ),
         name=f"distributed_topk_ring_tp{world_size}",
-    )(rank_input, local_logits)
+    )(local_logits)
 
 
 def distributed_top_k(
     local_logits,
-    rank_input,
     *,
     world_size: int,
     org_vocab_size: int,
@@ -664,7 +658,6 @@ def distributed_top_k(
     aligned_width = _ceil_multiple(local_width, _VOCAB_ALIGNMENT)
     candidate_values, candidate_indices = _ring_candidates(
         local_logits,
-        rank_input,
         world_size=world_size,
         org_vocab_size=org_vocab_size,
         global_vocab_size=global_vocab_size,

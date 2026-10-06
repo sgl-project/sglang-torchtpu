@@ -21,48 +21,11 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
     return ((num_tokens + token_alignment - 1) // token_alignment) * token_alignment
 
 
-def _get_global_device_id() -> int:
-    """Return the physical TPU device ID, defaulting to 0 if unavailable."""
-    try:
-        from torch_tpu._internal.distributed import tpu_distributed
-
-        return int(tpu_distributed.global_device_id())
-    except Exception:
-        return 0
-
-
-@functools.cache
-def _get_tp_rank_to_device_id_mapping() -> tuple[int, tuple[int, ...]]:
-    """Return (global_device_id, tp_rank_to_device_id) for the active TP communication group."""
-    import torch.distributed as dist
-
-    global_device_id = _get_global_device_id()
-    if not dist.is_initialized():
-        return global_device_id, (global_device_id,)
-
-    try:
-        from sglang.srt.distributed import get_tp_group
-
-        tp_group = get_tp_group()
-        group, world_size = tp_group.cpu_group, tp_group.world_size
-    except (AssertionError, RuntimeError):
-        # Fallback for standalone unit tests running raw torch.distributed without SGLang parallel_state
-        group, world_size = None, dist.get_world_size()
-
-    physical_ids = [None] * world_size
-    dist.all_gather_object(physical_ids, global_device_id, group=group)
-    if sorted(physical_ids) != list(range(world_size)):
-        raise RuntimeError(f"Unexpected TPU physical device IDs: {physical_ids}")
-
-    return global_device_id, tuple(int(x) for x in physical_ids)
-
-
 def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
-    """Prepare physical-rank metadata before Dynamo captures the MoE layer."""
+    """Prepare logical expert ownership before Dynamo captures the MoE layer."""
     from sglang.srt.runtime_context import get_parallel
 
     moe_ep_rank = get_parallel().moe_ep_rank
-    _, tp_rank_to_device_id = _get_tp_rank_to_device_id_mapping()
     group_offset = torch.tensor(
         [
             moe_ep_rank * layer.num_local_experts,
@@ -73,31 +36,15 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     )
     layer.register_buffer("_tpu_fused_rs_group_offset", group_offset, persistent=False)
 
-    tp_rank_to_device_id_tensor = torch.tensor(
-        tp_rank_to_device_id,
-        dtype=torch.int32,
-        device=layer.w13_weight.device,
-    )
-    layer.register_buffer(
-        "_tpu_fused_rs_tp_rank_to_device_id",
-        tp_rank_to_device_id_tensor,
-        persistent=False,
-    )
     _build_fused_moe_rs_op()
 
 
 @functools.cache
 def _get_mesh():
-    import numpy as np
-    from jax.sharding import Mesh
-
-    from sglang.srt.hardware_backend.tpu.pallas_export import (
-        get_torchtpu_export_devices,
-    )
+    from torch_tpu._internal.pallas import get_pallas_mesh
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    export_devices = np.asarray(get_torchtpu_export_devices(world_size)).reshape(1, -1)
-    return Mesh(export_devices, ("data", "model"))
+    return get_pallas_mesh(("data", "model"), (1, world_size))
 
 
 def _build_fused_moe_rs_op():
@@ -107,6 +54,7 @@ def _build_fused_moe_rs_op():
 
     import jax
     import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
     from torch_tpu._internal.pallas import jax_op
 
     from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
@@ -127,7 +75,6 @@ def _build_fused_moe_rs_op():
         activation: str,
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
-        tp_rank_to_device_id: jax.Array,
     ) -> jax.Array:
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
@@ -162,14 +109,21 @@ def _build_fused_moe_rs_op():
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
             fp8_direct_write=fp8_direct_write,
-            tp_rank_to_device_id=tp_rank_to_device_id,
         )
         if not has_post_expert_norm:
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
         return result
 
-    # Bridge the JAX kernel into Torch as clean non-sharded custom op.
-    custom_op = jax_op(_FUSED_MOE_RS_OP_NAME, _wrapped)
+    # Forward the mesh's device assignment while preserving the Torch-local
+    # shapes: the kernel already consumes local expert weights and returns a
+    # local token shard.
+    custom_op = jax_op(
+        _FUSED_MOE_RS_OP_NAME,
+        _wrapped,
+        mesh=mesh,
+        input_partition_specs=(P(),) * 9 + (None,) * 4,
+        output_partition_specs=(P(),),
+    )
 
     def _fake_impl(
         hidden_states: torch.Tensor,
@@ -185,9 +139,8 @@ def _build_fused_moe_rs_op():
         activation: str,
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
-        tp_rank_to_device_id: torch.Tensor,
     ) -> torch.Tensor:
-        ep_size = int(tp_rank_to_device_id.shape[0])
+        ep_size = mesh.shape["model"]
         padded_tokens = fused_moe_rs_padded_tokens(
             hidden_states.shape[0], topk, ep_size
         )
@@ -214,7 +167,6 @@ def fused_moe_rs_call(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
-    tp_rank_to_device_id: torch.Tensor,
 ) -> torch.Tensor:
     return _build_fused_moe_rs_op()(
         hidden_states,
@@ -230,7 +182,6 @@ def fused_moe_rs_call(
         activation,
         has_post_expert_norm,
         fp8_direct_write,
-        tp_rank_to_device_id,
     )
 
 
@@ -249,12 +200,11 @@ def fused_moe_rs_gather(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
-    tp_rank_to_device_id: torch.Tensor,
+    world_size: int,
     keep_token_shard: bool = False,
 ) -> torch.Tensor:
     import torch.distributed as dist
 
-    world_size = int(tp_rank_to_device_id.numel())
     if keep_token_shard and hidden_states.shape[0] % world_size:
         raise RuntimeError(
             "TPU fused-RS sharded output requires input rows divisible by "
@@ -300,7 +250,6 @@ def fused_moe_rs_gather(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
-        tp_rank_to_device_id=tp_rank_to_device_id,
     )
     if token_shard.ndim != 2 or token_shard.shape != (
         padded_shard_rows,
@@ -315,9 +264,9 @@ def fused_moe_rs_gather(
         return token_shard[:logical_shard_rows].contiguous()
 
     try:
-        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if tp_group is not None:
             return tp_group.all_gather(token_shard, dim=0)
     except (AssertionError, RuntimeError):

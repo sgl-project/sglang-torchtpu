@@ -112,6 +112,7 @@ def ranks_per_node(
     system_dp_size: int,
     nnodes: int,
     attn_cp_size: int = 1,
+    pp_size: int = 1,
 ) -> int:
     """Attention ranks resident on one host.
 
@@ -125,6 +126,7 @@ def ranks_per_node(
         * max(1, attn_dp_size)
         * max(1, system_dp_size)
         * max(1, attn_cp_size)
+        * max(1, pp_size)
     )
     return max(1, total // max(1, nnodes))
 
@@ -137,6 +139,8 @@ def node_worker_rank(
     system_dp_rank: int,
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
+    pp_rank: int = 0,
+    pp_size: int = 1,
 ) -> int:
     """Distinct rank of one worker among every worker on its node.
 
@@ -145,6 +149,7 @@ def node_worker_rank(
     raiden engine id, or uuid namespace derived from it.
     """
     replica = system_dp_rank * max(1, attn_dp_size) + attn_dp_rank
+    replica = replica * max(1, pp_size) + pp_rank
     replica = replica * max(1, attn_cp_size) + attn_cp_rank
     return replica * max(1, attn_tp_size) + attn_tp_rank
 

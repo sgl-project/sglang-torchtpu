@@ -40,7 +40,7 @@ from sglang.srt.model_executor.tpu_graph_runner import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 DECODER_POLICY_PRECOMPILE = (
     "sglang.srt.hardware_backend.tpu.compilation."
@@ -132,6 +132,13 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         self.mock_register = register_patcher.start()
         self.addCleanup(register_patcher.stop)
+        self.mock_cache_key = enter_scope(
+            self,
+            patch(
+                "sglang.srt.model_executor.tpu_graph_runner."
+                "add_tpu_rank_assignment_to_compile_cache_key"
+            ),
+        )
         # Stub the in-process precompile so the test doesn't need a real
         # attn_backend / model_runner.device. Decoder policy warmup behavior
         # is covered separately in test_decoder_tpu_compile_policy.py.
@@ -370,6 +377,7 @@ class TestTpuGraphRunner(CustomTestCase):
             self.assertIs(model.forward, original)
             self.mock_compile.assert_not_called()
             self.mock_register.assert_not_called()
+            self.mock_cache_key.assert_called_once_with()
             # The skip is reflected into the capture flag for downstream warmup.
             self.assertFalse(get_flags().capture.enable_torch_compile)
 
@@ -518,6 +526,9 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_precompile.assert_called_once()
 
     def test_discovers_annotated_module(self):
+        events = []
+        self.mock_cache_key.side_effect = lambda: events.append("cache-key")
+
         class _VisionPolicy(CompilePolicy):
             platform = "tpu"
 
@@ -525,10 +536,12 @@ class TestTpuGraphRunner(CustomTestCase):
                 super().__init__(**kwargs)
 
             def install(self) -> bool:
+                events.append("install")
                 self.owner.installed = True
                 return True
 
             def precompile(self) -> None:
+                events.append("precompile")
                 self.owner.precompiled = True
 
         class _VisionModule:
@@ -539,15 +552,26 @@ class TestTpuGraphRunner(CustomTestCase):
             _VisionModule,
             policy=_VisionPolicy,
         )
-        vision_module = _VisionModule()
-        model = _model_with()
-        model.modules = lambda: (model, vision_module)
-
-        TpuGraphRunner(self._runner_for(model))
-
-        self.assertTrue(vision_module.installed)
-        self.assertTrue(vision_module.precompiled)
+        for is_draft_worker in (False, True):
+            vision_module = _VisionModule()
+            model = _model_with()
+            model.modules = lambda: (model, vision_module)
+            runner = self._runner_for(model)
+            runner.is_draft_worker = is_draft_worker
+            TpuGraphRunner(runner)
+            self.assertTrue(vision_module.installed)
+            self.assertTrue(vision_module.precompiled)
+        self.assertEqual(events, ["cache-key", "install", "precompile"] * 2)
         self.mock_compile.assert_not_called()
+
+    def test_invalid_assignment_prevents_compilation(self):
+        self.mock_cache_key.side_effect = RuntimeError("Invalid TPU rank assignment")
+        model = self._annotate(_model_with(forward=MagicMock()))
+        with self.assertRaisesRegex(RuntimeError, "Invalid TPU rank assignment"):
+            TpuGraphRunner(self._runner_for(model))
+        self.mock_compile.assert_not_called()
+        self.mock_direct_compile.assert_not_called()
+        self.mock_precompile.assert_not_called()
 
     def test_ignores_policy_for_another_platform(self):
         class _CudaPolicy(CompilePolicy):
@@ -727,7 +751,8 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         worker = object.__new__(EagleDraftWorker)
         worker.speculative_num_steps = 3
         worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
-        worker.draft_tp_context = lambda _group: contextlib.nullcontext()
+        worker.draft_tp_context = lambda _group, **_kwargs: contextlib.nullcontext()
+        worker.draft_owns_attention = False
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
             canary_manager=None,
@@ -767,6 +792,10 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             patch(
                 "sglang.srt.speculative.eagle_worker_v2._is_tpu",
                 True,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.draft_pp_context",
+                side_effect=contextlib.nullcontext,
             ),
         ):
             worker.init_cuda_graphs()

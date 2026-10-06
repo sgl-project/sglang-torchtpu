@@ -25,14 +25,13 @@ from transformers import (
 )
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
-    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
-    gemma_routing_post_topk,
 )
-from sglang.srt.distributed import (
-    get_pp_group,
+from sglang.kernels.ops.moe.gemma4_routing import (
+    gemma4_fused_routing,
+    gemma_routing_post_topk,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -219,6 +218,7 @@ class Gemma4MoE(nn.Module):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        activation: str = "gelu",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -277,7 +277,7 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            activation="gelu",
+            activation=activation,
             reduce_results=True,
         )
 
@@ -782,7 +782,7 @@ class Gemma4TextModel(PreTrainedModel):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
         self.padding_idx = getattr(config, "pad_token_id", None)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Token / per-layer embedding tables and the per-layer projection only
         # produce activations consumed at the model entry, so they live on the
@@ -825,6 +825,9 @@ class Gemma4TextModel(PreTrainedModel):
                 self.padding_idx,
                 embed_scale=self.config.hidden_size**0.5,  # embedded normalizer
             )
+            # Plain nn.Embedding requires grad by default; compile guards on the
+            # input_embeds it produces, so freeze it to match no_grad serving.
+            self.embed_tokens.weight.requires_grad_(False)
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -1090,7 +1093,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
 

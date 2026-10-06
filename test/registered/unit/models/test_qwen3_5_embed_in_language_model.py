@@ -1,4 +1,4 @@
-"""Unit tests for letting the language model embed on decode steps.
+"""Unit tests for letting the language model embed on decode and verify steps.
 
 `Qwen3VLForConditionalGeneration.forward` picks between two ways of reaching the
 language model: `general_mm_embed_routine`, which embeds first and passes
@@ -7,8 +7,9 @@ inside its own (compiled) graph. `_embeds_in_language_model` decides, gated on t
 per-wrapper `decode_embeds_in_language_model` flag.
 
 What these guard: the routine is what splices image embeddings, so taking the
-direct path anywhere other than decode would silently drop them; and the flag
-defaulting on would change every Qwen3-VL subclass at once.
+direct path anywhere other than decode / target verify would silently drop them;
+and the flag must stay off on backends where the language model is not a compiled
+boundary.
 """
 
 import unittest
@@ -17,6 +18,10 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    Qwen3VLDecoderTpuCompilePolicy,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5MoeForConditionalGeneration,
@@ -43,11 +48,11 @@ class _RecordingLM:
         return lambda ids: torch.zeros(ids.shape[0], HIDDEN)
 
 
-def _forward_batch(is_decode=True):
+def _forward_batch(is_decode=True, is_target_verify=False):
     return SimpleNamespace(
         forward_mode=SimpleNamespace(
             is_decode=lambda: is_decode,
-            is_target_verify=lambda: False,
+            is_target_verify=lambda: is_target_verify,
         ),
         mrope_positions=torch.full((3, BS), 7, dtype=torch.int64),
         input_embeds=None,
@@ -124,6 +129,31 @@ class TestEmbedsInLanguageModel(CustomTestCase):
         self.assertIsNone(call["input_ids"])
         self.assertIsNotNone(call["input_embeds"])
 
+    def test_target_verify_passes_input_ids_when_enabled(self):
+        # Verify rows are drafted text tokens; the routine has nothing to splice.
+        lm = _RecordingLM()
+
+        _run(
+            _make(lm, embeds_in_lm=True),
+            _forward_batch(is_decode=False, is_target_verify=True),
+        )
+
+        call = lm.calls[0]
+        self.assertTrue(torch.equal(call["input_ids"], torch.arange(BS)))
+        self.assertNotIn("input_embeds", call)
+
+    def test_target_verify_uses_the_routine_when_disabled(self):
+        lm = _RecordingLM()
+
+        _run(
+            _make(lm, embeds_in_lm=False),
+            _forward_batch(is_decode=False, is_target_verify=True),
+        )
+
+        call = lm.calls[0]
+        self.assertIsNone(call["input_ids"])
+        self.assertIsNotNone(call["input_embeds"])
+
     def test_prefill_always_uses_the_routine(self):
         # Prefill is where image embeddings get spliced -- taking the direct path
         # there would drop them.
@@ -191,13 +221,63 @@ class TestWrapperOptIn(CustomTestCase):
             Qwen3_5MoeForConditionalGeneration.decode_embeds_in_language_model, expected
         )
 
-    def test_base_wrapper_stays_opted_out(self):
-        # Flipping this default would change every Qwen3-VL subclass at once,
-        # including backends where the language model is not a compiled boundary
-        # and the routine's input_embeds buffer copy still matters.
-        self.assertFalse(
-            Qwen3VLForConditionalGeneration.decode_embeds_in_language_model
+    def test_base_wrapper_opts_in_only_on_tpu(self):
+        # Off wherever the language model is not a compiled boundary and the
+        # routine's input_embeds buffer copy still matters.
+        self.assertEqual(
+            Qwen3VLForConditionalGeneration.decode_embeds_in_language_model,
+            current_platform.is_tpu(),
         )
+
+
+class TestWarmupMatchesServingCall(CustomTestCase):
+    """The VL policy must warm the same call shape the forward takes.
+
+    With the flag on, decode and target verify reach the language model as
+    ``(input_ids, positions, forward_batch)``; warming them through the
+    input_embeds convention instead would recompile on the first serving step.
+    """
+
+    def _warmup(self, mode, *, embeds_in_lm):
+        embed = lambda ids: torch.zeros(ids.shape[0], HIDDEN)
+        owner = SimpleNamespace(get_input_embeddings=lambda: embed)
+        policy = object.__new__(Qwen3VLDecoderTpuCompilePolicy)
+        policy.owner = owner
+        policy.model_runner = SimpleNamespace(
+            model=SimpleNamespace(
+                get_image_feature=None,
+                decode_embeds_in_language_model=embeds_in_lm,
+                num_deepstack_embeddings=0,
+            ),
+            model_config=SimpleNamespace(model_is_mrope=True),
+            pp_group=None,
+        )
+        policy._logged_vl_warmup_variants = set()
+        fb = SimpleNamespace(
+            input_ids=torch.arange(8),
+            mrope_positions=torch.zeros(3, 8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+        )
+        with patch.object(
+            Qwen3VLDecoderTpuCompilePolicy,
+            "_make_dummy_forward_batch",
+            return_value=fb,
+        ):
+            args, kwargs = policy._make_warmup_inputs(num_tokens=8, bs=2, mode=mode)
+        return fb, args, kwargs
+
+    def test_decode_and_verify_warm_input_ids_when_enabled(self):
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                fb, args, kwargs = self._warmup(mode, embeds_in_lm=True)
+                self.assertEqual(args, (fb.input_ids, fb.mrope_positions, fb))
+                self.assertEqual(kwargs, {})
+
+    def test_verify_warms_input_embeds_when_disabled(self):
+        _, args, kwargs = self._warmup(ForwardMode.TARGET_VERIFY, embeds_in_lm=False)
+        self.assertEqual(args, ())
+        self.assertIsNone(kwargs["input_ids"])
+        self.assertIsNotNone(kwargs["input_embeds"])
 
 
 if __name__ == "__main__":

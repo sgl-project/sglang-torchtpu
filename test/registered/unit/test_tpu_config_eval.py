@@ -8,11 +8,12 @@ from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
+from benchmark.tpu.launch_server import load_recipe, plan_launch
 from benchmark.tpu.recipe.configs import config_eval
 from benchmark.tpu.recipe.configs.base import CONFIG as BASE_CONFIG
 from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
@@ -79,6 +80,121 @@ class TestTpuConfigEval(unittest.TestCase):
         self.assertEqual(args[:2], ["--quantization", "modelopt_fp8"])
         self.assertEqual(args[2], "--lora-paths")
         self.assertEqual(json.loads(args[3]), {"adapter": "/tmp/adapter"})
+
+
+class TestAccuracyRecipes(unittest.TestCase):
+    MULTIHOST = (
+        "recipe/configs/deepseek_r1_0528/accuracy.py",
+        "recipe/configs/deepseek_v3_1/accuracy.py",
+        "recipe/configs/kimi_k26/mmmu.py",
+    )
+    SINGLE_HOST = (
+        "recipe/configs/qwen3_5_397b/server.py",
+        "recipe/configs/gpt_oss_20b/accuracy.py",
+        "recipe/configs/gemma4_31b/accuracy.py",
+        "recipe/configs/gemma4_26b_a4b/accuracy.py",
+        "recipe/configs/gpt_oss_120b/accuracy_aime.py",
+        "recipe/configs/gpt_oss_120b/accuracy_gpqa.py",
+        "recipe/configs/gpt_oss_120b/accuracy_gsm8k.py",
+        "recipe/configs/gpt_oss_120b/accuracy_mmlupro.py",
+    )
+
+    def test_multihost_rank_resolves_from_jobset_topology(self):
+        topology = {"TPU_WORKER_ID": "1", "TPU_WORKER_HOSTNAMES": "rank0,rank1"}
+        for recipe in self.MULTIHOST:
+            with self.subTest(recipe=recipe):
+                plan = plan_launch(load_recipe(recipe), inherited=topology)
+                args = plan.config.server_args
+                self.assertEqual((args["nnodes"], args["node_rank"]), (2, 1))
+                self.assertEqual(args["dist_init_addr"], "rank0:10011")
+                self.assertEqual((args["tp_size"], args["ep_size"]), (16, 16))
+                # DP attention is all-or-nothing: --dp-size without
+                # --enable-dp-attention silently serves one attention group.
+                dp_size = args.get("dp_size", 1)
+                if dp_size > 1:
+                    self.assertTrue(args.get("enable_dp_attention"), recipe)
+                    self.assertEqual(args["tp_size"] % dp_size, 0, recipe)
+                    # attention TP > 1 needs the LM head split the same way.
+                    self.assertTrue(args.get("enable_dp_lm_head"), recipe)
+                    self.assertIn("--dp-size", plan.command)
+                else:
+                    self.assertNotIn("--dp-size", plan.command)
+                    self.assertNotIn("--enable-dp-attention", plan.command)
+
+    def test_derived_recipe_does_not_mutate_its_base(self):
+        from benchmark.tpu.recipe.configs.deepseek_r1_0528.accuracy import CONFIG as R1
+        from benchmark.tpu.recipe.configs.deepseek_v3_1.accuracy import CONFIG as V31
+
+        self.assertEqual(R1["server_args"]["model_path"], "/weights/DeepSeek-R1-0528")
+        self.assertEqual(R1["server_args"]["reasoning_parser"], "deepseek-r1")
+        self.assertEqual(V31["server_args"]["reasoning_parser"], "deepseek-v3")
+        self.assertEqual(
+            {
+                k: v
+                for k, v in V31["server_args"].items()
+                if k not in ("model_path", "reasoning_parser")
+            },
+            {
+                k: v
+                for k, v in R1["server_args"].items()
+                if k not in ("model_path", "reasoning_parser")
+            },
+        )
+
+    def test_recipes_include_shell_runtime_defaults(self):
+        for recipe in self.MULTIHOST + self.SINGLE_HOST:
+            with self.subTest(recipe=recipe):
+                plan = plan_launch(load_recipe(recipe), inherited={})
+                self.assertEqual(plan.env["TORCH_LOGS"], "+recompiles")
+                self.assertEqual(plan.env["SGLANG_TPU_PRELOAD_TELEMETRY_STUB"], "1")
+                self.assertIn("--enable-torch-compile", plan.command)
+
+    def test_every_recipe_still_parses_as_server_args(self):
+        """Every flag a recipe emits must exist on ServerArgs at this revision.
+
+        An upstream rename leaves the recipe emitting a flag the server no
+        longer takes, and the job dies in bring-up on the slice: the sync that
+        split --cuda-graph-bs into -decode/-prefill made the bare flag an
+        ambiguous prefix, which argparse rejects.
+        """
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        topology = {"TPU_WORKER_ID": "0", "TPU_WORKER_HOSTNAMES": "h0,h1"}
+        for recipe in self.MULTIHOST + self.SINGLE_HOST:
+            with self.subTest(recipe=recipe):
+                plan = plan_launch(load_recipe(recipe), inherited=topology)
+                argv = plan.command[plan.command.index("sglang.launch_server") + 1 :]
+                parser = argparse.ArgumentParser()
+                ServerArgs.add_cli_args(parser)
+                try:
+                    parser.parse_args(argv)
+                except SystemExit as exit_code:
+                    self.fail(f"{recipe}: server rejects its own flags ({exit_code})")
+
+    def test_every_multihost_accuracy_test_launches_one_of_these_recipes(self):
+        """The JobSet runs MULTIHOST_LAUNCH["launch_script"] on every host.
+
+        A .py value is handed to the Python launcher by jobset-tpu.yaml; a typo
+        would only surface as a JobSet that never serves.
+        """
+        import ast
+
+        declared = set()
+        for path in sorted(
+            (ROOT / "test/registered/tpu/nightly-accuracy").glob("test_*.py")
+        ):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", "") == "MULTIHOST_LAUNCH" for t in node.targets
+                ):
+                    script = ast.literal_eval(node.value)["launch_script"]
+                    self.assertTrue(
+                        (ROOT / "benchmark/tpu" / script).is_file(), f"{path}: {script}"
+                    )
+                    declared.add(script)
+        self.assertEqual(declared, set(self.MULTIHOST))
 
 
 if __name__ == "__main__":

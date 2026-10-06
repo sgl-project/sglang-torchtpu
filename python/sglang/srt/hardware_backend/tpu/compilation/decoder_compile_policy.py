@@ -31,6 +31,9 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _restore_forward_batch_inputs,
     build_bucketers,
 )
+from sglang.srt.hardware_backend.tpu.compilation.frame_stack import (
+    call_with_reserved_frame_stack,
+)
 from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -41,6 +44,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     LogitsOutputMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -693,6 +697,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return compiled.warmup_async(
                 backend.forward_metadata,
                 *args,
+                attention_rank_tensors=get_attention_rank_tensors(
+                    torch.device(self.model_runner.device)
+                ),
                 **kwargs,
             )
 
@@ -760,7 +767,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if pp_group is not None and not pp_group.is_last_rank:
             # Only the final pipeline stage runs the logits processor.
             return False
-        return self.owner is self.model_runner.model and not bool(
+        runner_model = self.model_runner.model
+        # A wrapper may compile its language model with the logits processor
+        # inside (Kimi); one that keeps the logits eager (Gemma4) does not.
+        owns_logits = self.owner is runner_model or (
+            self.owner is getattr(runner_model, "language_model", None)
+            and getattr(self.owner, "logits_processor", None) is not None
+        )
+        return owns_logits and not bool(
             getattr(self.model_runner, "is_draft_worker", False)
         )
 
@@ -1211,9 +1225,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 and self._supports_async_warmup()
                 and async_warmup is not None
             ):
-                out = self.owner.forward.warmup_async(*args, **kwargs)
+                out = call_with_reserved_frame_stack(
+                    self.owner.forward.warmup_async, *args, **kwargs
+                )
             else:
-                out = entry.forward(*args, **kwargs)
+                out = call_with_reserved_frame_stack(entry.forward, *args, **kwargs)
             if isinstance(out, PendingCall):
                 return out.then(
                     lambda result: _materialize_out(
@@ -1323,7 +1339,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self._make_top_k_warmup_sampling_info(bs) if spec_info is None else None
         )
 
-        return ForwardBatch(
+        batch = ForwardBatch(
             forward_mode=mode,
             batch_size=bs,
             input_ids=layout.input_ids,
@@ -1354,6 +1370,24 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
+        if enable_num_token_non_padded():
+            # Serving sets these in init_new and ModelRunner.forward; the MoE
+            # path guards on the field being present, so warmup must carry it.
+            from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+            from sglang.srt.layers.cp.utils import is_mla_cp_enabled
+
+            batch.global_num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, device=layout.input_ids.device
+            )
+            batch.global_num_token_non_padded_cpu = num_tokens
+            batch.set_local_num_token_non_padded(
+                sharded=(
+                    batch.attn_tp_sequence_sharded
+                    and not is_dsa_enable_prefill_cp()
+                    and not is_mla_cp_enabled()
+                ),
+            )
+        return batch
 
     def _make_top_k_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
         """Mirror an eligible serving batch for the common static TopK width.
@@ -1440,15 +1474,14 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
 
     def install(self) -> bool:
-        # This policy is attached to the shared backbone (`Qwen3_5ForCausalLM`),
-        # not to a wrapper, so the TEXT-ONLY entry (`Qwen3_5TextForCausalLM`)
-        # gets it too. It only diverges from the plain decoder policy on the VL
-        # input_embeds path, so the DP restriction -- which is a property of that
-        # path -- must be gated the same way. Raising unconditionally blocked DP
-        # attention for text-only serving, where none of the VL machinery runs.
         outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        if is_multimodal and is_dp_attention_enabled():
+        if (
+            hasattr(outer, "get_image_feature")
+            and is_dp_attention_enabled()
+            # A wrapper that routes every rank through one input_embeds program
+            # on image steps and compiles its logits processor (Kimi).
+            and not getattr(outer, "serves_dp_attention", False)
+        ):
             raise NotImplementedError(
                 "Qwen3-VL TPU decoder compilation does not support DP attention; "
                 "disable --enable-torch-compile for this configuration."
@@ -1501,10 +1534,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         return key
 
     def _decode_uses_input_ids(self) -> bool:
-        """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
+        """Whether the wrapper hands decode / verify raw ``input_ids``, skipping embed.
 
         Wrappers that set ``decode_embeds_in_language_model`` bypass
-        ``general_mm_embed_routine`` in decode so the embedding lands inside the
+        ``general_mm_embed_routine`` in decode / verify so the embedding lands inside the
         compiled graph instead of running as eager device programs in front of
         it.
         """
@@ -1683,10 +1716,17 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         # (bs, variant, logits_output_mode): warm the embeds convention VL
         # requests use and the positional one text-only serving actually
         # takes (mirrors the base policy).
+        # In-graph embedding uses "text_only" (input_ids + mrope positions);
+        # "text_ids" would warm unused 1-D positions.
+        variants = (
+            ("text_only",)
+            if self._decode_uses_input_ids()
+            else ("text_only", "text_ids")
+        )
         compile_items = [
             (bs, variant, logits_output_mode)
             for bs in bs_buckets
-            for variant in ("text_only", "text_ids")
+            for variant in variants
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
         logger.info(
@@ -1768,7 +1808,9 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             else forward_batch.positions
         )
 
-        if mode.is_decode() and self._decode_uses_input_ids():
+        if (
+            mode.is_decode() or mode.is_target_verify()
+        ) and self._decode_uses_input_ids():
             # Positions stay mrope-shaped; only the embedding moves into the graph.
             return (
                 (forward_batch.input_ids, positions, forward_batch),

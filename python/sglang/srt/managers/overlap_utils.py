@@ -11,7 +11,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
 )
-from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
@@ -464,6 +463,10 @@ class FutureMap:
         if not _is_tpu:
             indices.record_stream(torch.get_device_module(self.device).current_stream())
         if self.need_topk:
+            # Function-local: spec_utils imports schedule_batch, which imports
+            # this module.
+            from sglang.srt.speculative.spec_utils import gather_spec_extras_func
+
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
             )

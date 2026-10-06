@@ -940,6 +940,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             # The live draft path has consumed this seed before entering the
             # fused loop. Match its state so Dynamo reuses the warmup graph.
             forward_batch.input_ids = None
+            # The live fused loop bypasses ModelRunner.forward, so its batch carries
+            # None here; direct_compile pins each input's type at trace time.
+            forward_batch.num_token_non_padded = None
             with torch.no_grad():
                 out = fused_draft_forward(forward_batch)
                 _materialize_out(

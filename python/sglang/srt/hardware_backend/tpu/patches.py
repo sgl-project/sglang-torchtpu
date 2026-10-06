@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from collections.abc import Sequence
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -108,6 +109,14 @@ def _unwrap_dynamic_compile_fns() -> None:
             )
 
 
+def build_slicebuilder_addresses(
+    hosts: Sequence[str], base_port: int, devices_per_host: int
+) -> str:
+    return ",".join(
+        f"{host}:{base_port + i}" for host in hosts for i in range(devices_per_host)
+    )
+
+
 def _set_torch_tpu_topology_env_multihost(
     hosts: list[str],
     base_port: int,
@@ -119,8 +128,8 @@ def _set_torch_tpu_topology_env_multihost(
     One slicebuilder endpoint per device across ALL hosts; topology is the
     ``TPU_TOPOLOGY`` chip grid with an extra dim appended on v7x (>1 core/chip).
     """
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-        f"{host}:{base_port + i}" for host in hosts for i in range(devices_per_host)
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = build_slicebuilder_addresses(
+        hosts, base_port, devices_per_host
     )
 
     if not tpu_topology:
@@ -803,6 +812,66 @@ def _patch_raiden_is_load_back_event_done() -> None:
     UnifiedRadixCache.is_load_back_event_done = is_load_back_event_done
 
 
+_prefill_transfer_finish_from_raiden_patched = False
+
+
+def _patch_prefill_transfer_finish_from_raiden() -> None:
+    """End the ``prefill_transfer_kv_cache`` stage at raiden's transfer finish
+    time instead of the (later) scheduler poll time.
+
+    Other backends, and raiden sends without a finish time, keep the poll time.
+    """
+    global _prefill_transfer_finish_from_raiden_patched
+    if _prefill_transfer_finish_from_raiden_patched:
+        return
+    _prefill_transfer_finish_from_raiden_patched = True
+
+    from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+    from sglang.srt.disaggregation.raiden.sender import RaidenKVSender
+    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+
+    # Each polled request's time stats -> its sender, during the poll only.
+    polled_senders = {}
+    orig_poll = (
+        SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue
+    )
+    orig_set_finish = SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time
+
+    def process_disagg_prefill_inflight_queue(self, *args, **kwargs):
+        for req in self.disagg_prefill_inflight_queue:
+            polled_senders[id(req.time_stats)] = req.disagg_kv_sender
+        try:
+            return orig_poll(self, *args, **kwargs)
+        finally:
+            polled_senders.clear()
+
+    def set_prefill_kv_transfer_finish_time(self, ts=None):
+        sender = polled_senders.get(id(self))
+        if ts is None and isinstance(sender, RaidenKVSender):
+            finish = sender.transfer_finish_time
+            if finish is not None:
+                # Never before the stage start: a fast transfer can finish first.
+                ts = max(finish, self.prefill_transfer_queue_entry_time)
+        orig_set_finish(self, ts)
+
+    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue = (
+        process_disagg_prefill_inflight_queue
+    )
+    SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time = (
+        set_prefill_kv_transfer_finish_time
+    )
+
+
+def _patch_pd_decode_swa_hicache() -> None:
+    """Allow PD decode prefix cache + RAM offload on sliding-window models.
+
+    Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
+    """
+    from sglang.srt.hardware_backend.tpu import pd_decode_swa_hicache
+
+    pd_decode_swa_hicache.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -821,3 +890,5 @@ def apply_tpu_patches() -> None:
     _patch_tpu_torch_pallas_register_positional()
     _patch_future_map_direct_handoff()
     _patch_raiden_is_load_back_event_done()
+    _patch_prefill_transfer_finish_from_raiden()
+    _patch_pd_decode_swa_hicache()

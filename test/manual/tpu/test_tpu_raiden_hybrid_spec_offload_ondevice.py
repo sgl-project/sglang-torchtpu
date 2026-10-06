@@ -214,6 +214,6 @@ def test_hybrid_round_piggybacks_draft():
 
 
 if __name__ == "__main__":
-    print(f"TPU chips: {torch.tpu.device_count()}")
+    print(f"TPU chips: {torch.accelerator.device_count()}")
     test_hybrid_round_piggybacks_draft()
     print("\nON-DEVICE HYBRID RAIDEN SPEC-DRAFT OFFLOAD TEST PASSED")
