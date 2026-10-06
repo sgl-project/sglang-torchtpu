@@ -20,6 +20,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import sys
 import time
@@ -1325,6 +1326,24 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
     return None
 
 
+# Chat-template control-token markup: <|channel|>, <|im_end|>, <|eot_id|>, ...
+_CONTROL_TOKEN_RE = re.compile(r"<\|([A-Za-z0-9_]*)\|>")
+
+
+def _replayable_assistant_text(text: Optional[str]) -> str:
+    """The model's output as the next round's assistant message.
+
+    With ignore_eos a model generates past the end of its turn, and the raw
+    control-token markup it then emits (GPT-OSS: ``<|start|>assistant
+    <|channel|>commentary ...``) is detokenized as plain text, since those
+    tokens are not flagged special. A real client never sends that back, and
+    servers reject it (GPT-OSS's chat parser returns a 400) or misparse a turn
+    boundary, failing every later round of the session. Keep the text (so the
+    history grows about as much); drop only the ``<|``/``|>`` delimiters.
+    """
+    return _CONTROL_TOKEN_RE.sub(r"\1", text or "")
+
+
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
     assert backend in MULTI_TURN_BACKENDS, (
         f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
@@ -1366,7 +1385,10 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             outputs.append(output)
 
             prev_messages.append(
-                {"role": "assistant", "content": output.generated_text}
+                {
+                    "role": "assistant",
+                    "content": _replayable_assistant_text(output.generated_text),
+                }
             )
 
         return outputs
