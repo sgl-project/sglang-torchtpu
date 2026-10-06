@@ -63,6 +63,7 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 
 # block size is always 32 for MXFP4
@@ -367,7 +368,9 @@ _MAX_DEQUANT_ELEMENTS = 2**30
 _EXPERTS_PER_CHUNK = 16
 
 
-def _process_mxfp4_moe_weights_in_chunks(layer: torch.nn.Module, w13_interleaved: bool):
+def _process_mxfp4_moe_weights_in_chunks(
+    layer: torch.nn.Module, w13_interleaved: bool, *, align_to: int = 128
+):
     """``process_mxfp4_moe_weights_bf16`` over expert chunks, concatenated one
     output at a time so the chunks of a finished output are freed before the
     next one is assembled."""
@@ -382,6 +385,7 @@ def _process_mxfp4_moe_weights_in_chunks(layer: torch.nn.Module, w13_interleaved
             layer.w2_weight_scale.data[i : i + _EXPERTS_PER_CHUNK],
             layer.w2_weight_bias.data[i : i + _EXPERTS_PER_CHUNK],
             w13_interleaved=w13_interleaved,
+            align_to=align_to,
         )
         for parts, part in zip(outputs, chunk):
             parts.append(part)
@@ -409,12 +413,17 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
     # non-interleaved MXFP4 MoE checkpoint would not. Mirrors tpu-inference's
     # ``w13_interleave = layer.activation == MoEActivation.SWIGLUOAI`` — sglang
     # carries the activation as a string on the MoE runner config.
+    alignment = envs.SGLANG_TPU_MXFP4_MOE_INTERMEDIATE_ALIGNMENT.get()
+    if alignment <= 0 or alignment % 128:
+        raise ValueError(
+            "TPU MXFP4 intermediate alignment must be a positive multiple of 128"
+        )
     w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
     if 2 * layer.w13_weight.data.numel() > _MAX_DEQUANT_ELEMENTS:
         # All 128 experts of gpt-oss-120b on one device (a pipeline stage:
         # 2.1e9 values before padding) are processed a few at a time.
         w13, w13_bias, w2, w2_bias = _process_mxfp4_moe_weights_in_chunks(
-            layer, w13_interleaved
+            layer, w13_interleaved, align_to=alignment
         )
     else:
         w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
@@ -425,6 +434,7 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
             layer.w2_weight_scale.data,
             layer.w2_weight_bias.data,
             w13_interleaved=w13_interleaved,
+            align_to=alignment,
         )
     layer.w13_weight = Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = None
