@@ -223,9 +223,13 @@ def profile_and_install_cost_model(scheduler):
             policy._run_one(**kwargs)
             elapsed = min(policy._run_one(**kwargs) for _ in range(2))
             samples.append((tokens, prefix, elapsed))
-    reports = [None] * get_parallel().pp_size
+    # Every rank fits the model from every rank's timings: the TP ranks of a
+    # stage must cut the same chunks, or their forwards differ in shape and
+    # the stage's TP collectives never match.
+    world = get_parallel().world_group
+    reports = [None] * world.world_size
     torch.distributed.all_gather_object(
-        reports, (samples, schedule), group=scheduler.pp_group.cpu_group
+        reports, (samples, schedule), group=world.cpu_group
     )
     schedules = [report[1] for report in reports if report[1] is not None]
     cost = StepCostModel.fit(
