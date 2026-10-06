@@ -17,6 +17,11 @@ unlocked before the oldest running forward's batch formed. Allocations inside
 launch order and the later forward's write lands last. Every other allocation
 uses free pages first and, when short, waits for the in-flight forwards before
 taking held ones, so a missed scope costs a device sync, not corrupted KV.
+
+DMA reads have the mirror hazard: a device-to-host backup issued while a forward
+is in flight can copy a slot that forward has not written yet, such as the last
+slot of a request that finished at N-1 and was inserted into the tree.
+``after_in_flight`` runs a DMA read once the forwards formed so far are done.
 """
 
 from __future__ import annotations
@@ -77,6 +82,8 @@ class KVFreeFence:
         self._device_done = 0
         self._forward_write_target = False
         self._free_write_horizon: Optional[float] = None
+        # (latest formed seq at registration, callback) awaiting those forwards.
+        self._after: Deque[Tuple[int, Callable[[], None]]] = deque()
         self._allocators: List[TpuPagedTokenToKVPoolAllocator] = []
         self.stats = KVFreeFenceStats()
         self._stats_since = time.monotonic()
@@ -154,9 +161,22 @@ class KVFreeFence:
         self._device_done = launched
         self._release(launched)
 
+    def after_in_flight(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` once every forward formed so far has finished: now
+        if none is running, else when that forward's result is processed or a
+        device sync covers it. Callbacks run in registration order."""
+        if not self._after and all(
+            seq <= self._device_done for seq, _, _ in self._in_flight
+        ):
+            callback()
+            return
+        self._after.append((self._formed, callback))
+
     def _release(self, completed: int) -> None:
         for allocator in self._allocators:
             allocator.release_held_pages(completed)
+        while self._after and self._after[0][0] <= completed:
+            self._after.popleft()[1]()
 
     def _maybe_log_stats(self) -> None:
         now = time.monotonic()
@@ -201,6 +221,79 @@ class KVFreeFence:
             yield
         finally:
             self._forward_write_target = prev
+
+
+class _DeferredDmaEvent:
+    """Completion of a DMA read whose issue waits on ``after_in_flight``.
+
+    ``query`` reports not ready until the DMA is issued and done.
+    ``synchronize`` (a blocking caller) waits for the in-flight forwards first.
+    """
+
+    _warned = False
+
+    def __init__(self, fence: KVFreeFence, issue: Callable[[], object]) -> None:
+        self._fence = fence
+        self._issue_dma = issue
+        self._event = None
+
+    def issue(self) -> None:
+        if self._event is None:
+            self._event = self._issue_dma()
+
+    def query(self) -> bool:
+        return self._event is not None and self._event.query()
+
+    def synchronize(self) -> None:
+        if self._event is None:
+            self._fence.wait_for_in_flight()
+        if self._event is None:
+            # Registered against a batch formed but not launched, which a
+            # device sync cannot cover. Only a blocking write-back eviction
+            # reaches this, and it takes the least recently used nodes, not
+            # the tail just inserted; issue unfenced rather than stall.
+            if not _DeferredDmaEvent._warned:
+                _DeferredDmaEvent._warned = True
+                logger.warning(
+                    "Blocking on a KV backup before the formed batch launches; "
+                    "issuing it unfenced."
+                )
+            self.issue()
+        self._event.synchronize()
+
+    def record(self, *args, **kwargs) -> None:
+        return None
+
+    def wait(self, *args, **kwargs) -> None:
+        return None
+
+
+def fence_hicache_backups(controller, fence: KVFreeFence) -> None:
+    """Defer the tree's raiden HiCache backups behind in-flight forwards. Only
+    the tree's controller backs up pages a running forward can still write;
+    other controllers (e.g. the decode offload manager's) read finished KV and
+    stay unfenced. ``controller`` is None when the tree has no HiCache
+    controller (external linker)."""
+    from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
+        TpuRaidenHybridCacheController,
+    )
+
+    if controller is None:
+        return
+    assert isinstance(controller, TpuRaidenHybridCacheController), type(
+        controller
+    ).__name__
+    controller.kv_free_fence = fence
+
+
+def deferred_dma_read(fence: Optional[KVFreeFence], issue: Callable[[], object]):
+    """Issue a DMA that reads KV pages once no in-flight forward may still write
+    them; returns its completion event. Without a fence, issues at once."""
+    if fence is None:
+        return issue()
+    event = _DeferredDmaEvent(fence, issue)
+    fence.after_in_flight(event.issue)
+    return event
 
 
 class HeldPages:

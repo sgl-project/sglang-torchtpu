@@ -229,6 +229,38 @@ class TestKVFreeFence(CustomTestCase):
         self.fence.on_forward_done(nxt)
         self.assertEqual(self.allocator.held_pages.num_pages, 0)
 
+    def test_after_in_flight_runs_once_the_forwards_formed_so_far_finish(self):
+        """A DMA read registered while forward N runs must not run before N
+        finishes, and reads registered later never overtake earlier ones."""
+        self._setup()
+        ran = []
+        first = self._launch()
+        self.fence.after_in_flight(lambda: ran.append("a"))
+        second = self._launch()
+        self.fence.after_in_flight(lambda: ran.append("b"))
+        self.assertEqual(ran, [])
+        self.fence.on_forward_done(first)
+        self.assertEqual(ran, ["a"])
+        self.fence.on_forward_done(second)
+        self.assertEqual(ran, ["a", "b"])
+        self.fence.after_in_flight(lambda: ran.append("c"))
+        self.assertEqual(ran, ["a", "b", "c"])
+
+    def test_after_in_flight_waits_for_a_formed_batch_not_yet_launched(self):
+        """With overlap off for a batch, the previous result is processed after
+        the batch forms; a read registered then must wait for that batch."""
+        self._setup()
+        ran = []
+        previous = self._launch()
+        self.fence.on_batch_formed()
+        self.fence.after_in_flight(lambda: ran.append("read"))
+        self.fence.on_forward_done(previous)
+        self.assertEqual(ran, [])
+        current = SimpleNamespace(copy_done=None)
+        self.fence.on_forward_launched(current)
+        self.fence.on_forward_done(current)
+        self.assertEqual(ran, ["read"])
+
     def test_install_covers_swa_sub_pools_and_rejects_other_allocators(self):
         full, swa = (
             TpuPagedTokenToKVPoolAllocator(

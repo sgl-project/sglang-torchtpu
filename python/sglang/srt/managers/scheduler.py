@@ -1776,6 +1776,7 @@ class Scheduler(
         if not self._needs_kv_free_fence():
             return
         from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+            fence_hicache_backups,
             install_kv_free_fence,
             kv_free_fence_unsupported_reason,
         )
@@ -1807,6 +1808,8 @@ class Scheduler(
             synchronize_device=self.device_module.synchronize,
             **fence_kwargs,
         )
+        if self._uses_raiden_hicache():
+            fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (

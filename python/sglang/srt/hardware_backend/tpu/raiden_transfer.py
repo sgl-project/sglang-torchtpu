@@ -161,14 +161,11 @@ class RaidenKVTransfer:
     ) -> RaidenFutureEvent:
         """Device->host (D2H): stage device pages into raiden's host pool.
 
-        No device sync precedes the DMA. raiden's D2H reads HBM on a separate
-        hardware path that can overlap TC compute, but the caller already
-        guarantees the source KV has landed: write-back only ever targets a
-        committed radix node, and the scheduler reads that batch's sampled
-        tokens (``next_token_ids.tolist()``, fed by the whole forward graph)
-        before triggering write-back, so the node's in-place KV writes are in
-        HBM by the time this runs. Write-back never runs concurrently with the
-        forward, so no explicit wait-ready on the DMA source is needed.
+        No device sync precedes the DMA: raiden's D2H reads HBM on a separate
+        hardware path that is not ordered against TC compute. Under overlap
+        the caller must not issue it while a forward that may write the source
+        pages is in flight; the hybrid controller defers write-through behind
+        the KV free fence for that.
         """
         n = len(device_page_ids)
         assert n == len(host_page_ids)
