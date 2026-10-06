@@ -1909,6 +1909,10 @@ class Envs:
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
     # xprof python tracer. Off by default: it dominates host busy time.
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
+    # Capture each stage once at launch, without /start_profile. Keep the step
+    # count small: each chip's trace is hundreds of MB.
+    SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
+    SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.

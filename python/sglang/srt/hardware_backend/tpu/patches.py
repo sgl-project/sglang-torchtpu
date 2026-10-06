@@ -872,6 +872,16 @@ def _patch_pd_decode_swa_hicache() -> None:
     pd_decode_swa_hicache.install()
 
 
+def _patch_profile_auto() -> None:
+    """Arm a staged xprof capture at launch under SGLANG_TPU_ENABLE_PROFILE_AUTO.
+
+    See ``profile_auto``.
+    """
+    from sglang.srt.hardware_backend.tpu import profile_auto
+
+    profile_auto.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -892,3 +902,4 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _patch_profile_auto()
