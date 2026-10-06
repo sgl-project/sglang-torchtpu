@@ -252,7 +252,9 @@ def _update_gather_batch(
         )
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
-        batch.is_tpu_mm_extend_in_batch = mlp_sync_info.is_tpu_mm_extend_in_batch
+        batch.is_tpu_mm_extend_in_batch = getattr(
+            mlp_sync_info, "is_tpu_mm_extend_in_batch", False
+        )
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 

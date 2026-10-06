@@ -1000,7 +1000,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
-            is_tpu_mm_extend_in_batch=batch.is_tpu_mm_extend_in_batch,
+            # TPU-only; batches built outside the scheduler may not carry it.
+            is_tpu_mm_extend_in_batch=getattr(
+                batch, "is_tpu_mm_extend_in_batch", False
+            ),
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
