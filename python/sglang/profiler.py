@@ -133,7 +133,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         type=bool,
         default=False,
-        help="Whether to use the TPU xprof collector.",
+        help="Whether to capture TPU device activity (ProfilerActivity.TPU).",
     )
     parser.add_argument(
         "--merge-profiles",

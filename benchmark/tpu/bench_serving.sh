@@ -61,8 +61,11 @@
 #                                   # InferenceX harness (and torchtpu-vllm)
 #   PROFILE=0                       # 1 → torch profiler /start_profile capture
 #   PROFILE_NUM_STEPS=5
-#   PROFILE_ACTIVITIES="CPU TPU"      # xprof device activity; CPU GPU is CUDA-only
-#   PROFILE_OUTPUT_DIR=             # auto-generated when PROFILE=1
+#   PROFILE_ACTIVITIES="CPU TPU"      # TPU device activity; CPU GPU is CUDA-only
+#   PROFILE_OUTPUT_DIR=             # auto-generated when PROFILE=1. Gets the
+#                                   # Kineto traces; the TPU xplane goes to
+#                                   # ${TMPDIR:-/tmp}/plugins/profile/ on the
+#                                   # server host (path logged by the server)
 #   OUTPUT_DIR=./results/<model-slug>-tpu/<ts>
 #                                   # JSONL summaries (one per sweep config) land here
 #   SWEEP=                          # space-separated "c:isl:osl[:workload]" tuples
@@ -114,9 +117,9 @@ SEED=${SEED:-1}
 RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.8}
 PROFILE=${PROFILE:-0}
 PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS:-5}
-# Device activity on TPU is xprof ("TPU"), not CUDA. The server only
-# substitutes TPU when activities is unset, so passing CPU GPU here
-# silently skipped xprof and captured host activity only.
+# Device activity on TPU is "TPU" (ProfilerActivity.TPU), not CUDA. The
+# server only substitutes TPU when activities is unset, so passing CPU GPU
+# here silently skipped the TPU capture and recorded host activity only.
 PROFILE_ACTIVITIES=${PROFILE_ACTIVITIES:-"CPU TPU"}
 PROFILE_OUTPUT_DIR=${PROFILE_OUTPUT_DIR:-}
 SWEEP=${SWEEP:-}

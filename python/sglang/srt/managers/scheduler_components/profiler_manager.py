@@ -128,7 +128,7 @@ class SchedulerProfilerManager:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
         if activities is None:
             activities = ["CPU", "GPU"]
-            # On TPU the device activity is xprof ("TPU"), not CUDA.
+            # On TPU the device activity is ProfilerActivity.TPU, not CUDA.
             if _is_tpu:
                 activities = ["CPU", "TPU"]
 
@@ -211,8 +211,9 @@ class SchedulerProfilerManager:
         ]
 
         if "TPU" in activities:
-            # TorchTPU xprof: capture TPU device activity (and host CPU only if
-            # "CPU" was also requested).
+            # TorchTPU: one torch.profiler capturing TPU device activity (and
+            # CPU only if "CPU" was also requested) through torch_tpu's Kineto
+            # plugin. The generic torch.profiler branch below must not also run.
             if _is_tpu:
                 from sglang.srt.hardware_backend.tpu.profiler import start_tpu_profile
 
@@ -221,14 +222,17 @@ class SchedulerProfilerManager:
                     subdir_parts.append(str(self.profile_id))
                 if stage is not None:
                     subdir_parts.append(stage.name)
-                # xprof names the trace file after the host, so ranks sharing a
-                # host need separate directories or they overwrite each other.
+                # One directory per rank keeps each rank's Kineto trace apart.
                 subdir_parts.extend(self._rank_parts())
                 # "TPU" -> TPU-only. "TPU"+"CPU" -> CPU and TPU.
-                self.tpu_profiler = start_tpu_profile(
-                    output_dir=self.torch_profiler_output_dir / "-".join(subdir_parts),
-                    with_cpu="CPU" in activities,
-                )
+                try:
+                    self.tpu_profiler = start_tpu_profile(
+                        output_dir=self.torch_profiler_output_dir
+                        / "-".join(subdir_parts),
+                        with_cpu="CPU" in activities,
+                    )
+                except RuntimeError as e:
+                    return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
         elif "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl

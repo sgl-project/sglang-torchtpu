@@ -1896,9 +1896,11 @@ class Envs:
     # and tune from there.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
+    # TODO: not read by the TPU profiler; wire up in the custom-options PR.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
-    # xprof python tracer. Off by default: it dominates host busy time.
+    # TPU profiler python tracer (torch.profiler with_stack=True). Off by
+    # default: it dominates host busy time.
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
