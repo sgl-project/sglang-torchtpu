@@ -104,6 +104,8 @@ class TestKVFreeFence(CustomTestCase):
                 self.assertEqual(self.allocator.available_size(), 3 * PAGE)
                 loaded = self._alloc_pages(3)
                 self.assertEqual(self.log, ["device"])
+                self.assertEqual(self.fence.stats.pages_held, 3)
+                self.assertEqual(self.fence.stats.device_syncs, 1)
                 self.assertEqual(
                     self._pages(loaded), self._pages(busy) | self._pages(spare[:PAGE])
                 )
@@ -149,6 +151,7 @@ class TestKVFreeFence(CustomTestCase):
         )
         self.assertEqual(self.log, [])
         self.assertEqual(self.allocator.available_size(), 0)
+        self.assertEqual(self.fence.stats.pages_borrowed, 4)
 
     def test_pages_release_once_every_forward_in_flight_at_free_is_processed(self):
         self._setup()
@@ -364,6 +367,7 @@ class TestRadixEvictionUnderFence(CustomTestCase):
         )
         self._evict_all()
         self.assertEqual(self.allocator.held_pages.num_pages, 0)
+        self.assertEqual(self.fence.stats.pages_freed_past_write_horizon, 2)
 
     def test_node_inserted_or_unlocked_after_batch_formed_is_held(self):
         """A request in a running forward's batch can insert or unlock its
