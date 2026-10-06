@@ -12,6 +12,7 @@ from array import array
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Tuple
+from unittest.mock import Mock
 
 import torch
 
@@ -20,6 +21,7 @@ from sglang.srt.hardware_backend.tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
 from sglang.srt.hardware_backend.tpu.kv_free_fence import install_kv_free_fence
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation import (
     alloc_paged_token_slots_decode,
     alloc_paged_token_slots_extend,
@@ -297,6 +299,94 @@ class TestKVFreeFence(CustomTestCase):
                 else:
                     with self.assertRaises(ValueError):
                         install()
+
+
+class _StopLoop(Exception):
+    pass
+
+
+class TestOverlapLoopWiring(CustomTestCase):
+    """Each overlap loop must form the next batch before processing the last
+    result, and release a result's held pages only once it is processed."""
+
+    def _run(self, loop, *, disable_overlap: bool):
+        """Run batches A, B, then none; processing A frees two pages that a
+        request still in B writes."""
+        log = []
+        allocator = TpuPagedTokenToKVPoolAllocator(
+            size=4 * PAGE,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        finished = allocator.alloc(2 * PAGE)
+        held_at_processing = []
+
+        def process_result(batch, result):
+            held_at_processing.append(allocator.held_pages.num_pages)
+            if batch is batch_a:
+                allocator.free(finished)
+
+        batch_a, batch_b = Mock(reqs=[]), Mock(reqs=[])
+        for batch in (batch_a, batch_b):
+            batch.copy.return_value = batch
+            batch.forward_mode.is_decode.return_value = True
+        plans = [
+            SimpleNamespace(running_batch=None, batch_to_run=b)
+            for b in (batch_a, batch_b, None)
+        ]
+        scheduler = Mock(
+            gracefully_exit=False,
+            _engine_paused=False,
+            enable_unified_memory=False,
+            is_generation=True,
+            running_batch=None,
+            last_batch=None,
+            kv_free_fence=_install(allocator, synchronize_device=lambda: None),
+        )
+        scheduler.ngram_embedding_manager.prepare_for_forward.side_effect = (
+            lambda batch, **kwargs: batch
+        )
+        for name in (
+            "get_next_batch_to_run",
+            "get_next_disagg_prefill_batch_to_run",
+            "get_next_disagg_decode_batch_to_run",
+        ):
+            getattr(scheduler, name).side_effect = list(plans)
+        scheduler.is_disable_overlap_for_batch.side_effect = [
+            False,
+            disable_overlap,
+            False,
+        ]
+        scheduler.run_batch.side_effect = lambda batch: SimpleNamespace(
+            copy_done=_CopyDone(log)
+        )
+        scheduler.batch_result_processor.process_batch_result_decode.side_effect = (
+            process_result
+        )
+        scheduler.process_batch_result = functools.partial(
+            Scheduler.process_batch_result, scheduler
+        )
+        scheduler.launch_batch_sample_if_needed.side_effect = [None, None, _StopLoop]
+        with self.assertRaises(_StopLoop):
+            loop(scheduler)
+        self.assertEqual(held_at_processing, [0, 2])
+        self.assertEqual(allocator.held_pages.num_pages, 0)
+        self.assertEqual(log, ["copy_done", "copy_done"])
+
+    def test_pages_freed_by_a_result_wait_for_the_next_forward(self):
+        loops = [
+            (Scheduler.event_loop_overlap, False),
+            (Scheduler.event_loop_overlap, True),
+            (Scheduler.event_loop_overlap_disagg_prefill, False),
+            (Scheduler.event_loop_overlap_disagg_decode, False),
+            (Scheduler.event_loop_overlap_disagg_decode, True),
+        ]
+        for loop, disable_overlap in loops:
+            with self.subTest(loop=loop.__name__, disable_overlap=disable_overlap):
+                self._run(loop, disable_overlap=disable_overlap)
 
 
 class TestRadixEvictionUnderFence(CustomTestCase):
