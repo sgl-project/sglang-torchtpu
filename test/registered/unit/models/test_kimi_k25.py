@@ -489,6 +489,7 @@ def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
     model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
     nn.Module.__init__(model)
     model.use_data_parallel = True
+    model.replicate_vision_tower = False
     model.vision_tower = _MoonViT3dTower()
     model.mm_projector = _Projector()
     items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
