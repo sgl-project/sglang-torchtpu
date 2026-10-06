@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.raiden.common import (
     get_raiden_kv_caches,
     logger,
 )
+from sglang.srt.disaggregation.raiden.engine import RaidenEngine
 from sglang.srt.disaggregation.raiden.host_pool import (
     StagingAdmission,
     node_worker_rank,
@@ -126,8 +127,8 @@ class RaidenKVManager(
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
         }
 
-        self._engine: Optional[Any] = None  # raiden KVCacheManager
-        self._swa_engine: Optional[Any] = None
+        self._engine: Optional[RaidenEngine] = None
+        self._swa_engine: Optional[RaidenEngine] = None
         self._kv_caches: Optional[list] = None
         self._swa_kv_caches: Optional[list] = None
         self.raiden_endpoint: Optional[str] = None
@@ -357,13 +358,15 @@ class RaidenKVManager(
         self.raiden_endpoint = NetworkAddress(
             host=self.local_ip, port=self._control_port
         ).to_host_port_str()
-        self._engine = KVCacheManager(
-            kv_caches=self._kv_caches,
-            node_id=self._local_rank,
-            local_control_port=self._control_port,
-            max_blocks=max_blocks,
-            num_slots=num_slots,
-            timeout_s=self._timeout_s,
+        self._engine = RaidenEngine(
+            KVCacheManager(
+                kv_caches=self._kv_caches,
+                node_id=self._local_rank,
+                local_control_port=self._control_port,
+                max_blocks=max_blocks,
+                num_slots=num_slots,
+                timeout_s=self._timeout_s,
+            )
         )
         self._full_engine_max_blocks = max_blocks
         pool_pages = num_slots * max_blocks
@@ -384,13 +387,15 @@ class RaidenKVManager(
             ).to_host_port_str()
             swa_max_blocks = self._swa_max_request_blocks()
             swa_num_slots = self._num_slots(self._swa_kv_caches, swa_max_blocks, 2)
-            self._swa_engine = KVCacheManager(
-                kv_caches=self._swa_kv_caches,
-                node_id=self._local_rank,
-                local_control_port=self._control_port + 2,
-                max_blocks=swa_max_blocks,
-                num_slots=swa_num_slots,
-                timeout_s=self._timeout_s,
+            self._swa_engine = RaidenEngine(
+                KVCacheManager(
+                    kv_caches=self._swa_kv_caches,
+                    node_id=self._local_rank,
+                    local_control_port=self._control_port + 2,
+                    max_blocks=swa_max_blocks,
+                    num_slots=swa_num_slots,
+                    timeout_s=self._timeout_s,
+                )
             )
             self._swa_engine_max_blocks = swa_max_blocks
             swa_pool_pages = swa_num_slots * swa_max_blocks
@@ -484,7 +489,7 @@ class RaidenKVManager(
         )
         return slots
 
-    def _ensure_engine(self) -> Any:
+    def _ensure_engine(self) -> RaidenEngine:
         if self._engine is None:
             with self._engine_lock:
                 self._build_engine()
