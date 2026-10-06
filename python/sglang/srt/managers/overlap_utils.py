@@ -97,7 +97,10 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
+    batch.mm_input_ids_cpu = None
     if batch.prefill_input_ids_cpu is not None:
+        if _is_tpu and any(batch.multimodal_inputs or ()):
+            batch.mm_input_ids_cpu = batch.prefill_input_ids_cpu
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
             if batch.enable_overlap and not batch.spec_algorithm.is_none():

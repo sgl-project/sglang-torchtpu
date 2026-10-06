@@ -130,6 +130,47 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
         batch = _make_decode_capture_batch(num_tokens=8)
         self.assertEqual(self._children_counts(batch), [2, 6])
 
+    def test_children_drop_parent_multimodal_cpu_snapshot(self):
+        cpu_ids = torch.tensor([1, 1_000_123, 1_000_123, 2, 3, 4, 5, 6])
+        parent = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            input_ids=cpu_ids.clone(),
+            mm_input_ids_cpu=cpu_ids,
+            mm_inputs=[SimpleNamespace(), None],
+            positions=torch.arange(8),
+            out_cache_loc=torch.arange(8),
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([4, 4]),
+            seq_lens_cpu=torch.tensor([4, 4]),
+            seq_lens_sum=8,
+            extend_num_tokens=8,
+            extend_seq_lens_cpu=[4, 4],
+            extend_prefix_lens_cpu=[0, 0],
+        )
+        with (
+            get_context().override_server_args(
+                attention_backend="fa3", moe_dense_tp_size=None
+            ),
+            get_parallel().override(attn_tp_size=1),
+        ):
+            for start in (0, 4):
+                child = TboForwardBatchPreparer.filter_batch(
+                    parent,
+                    start_token_index=start,
+                    end_token_index=start + 4,
+                    start_seq_index=start // 4,
+                    end_seq_index=start // 4 + 1,
+                    out_num_token_non_padded=torch.tensor(4),
+                    out_num_token_non_padded_cpu=4,
+                )
+                self.assertIsNone(child.mm_inputs)
+                self.assertIsNone(child.mm_input_ids_cpu)
+                self.assertTrue(
+                    torch.equal(child.input_ids, cpu_ids[start : start + 4])
+                )
+        self.assertIs(parent.mm_input_ids_cpu, cpu_ids)
+
     def test_prepare_falls_back_to_physical_rows_for_missing_cpu_count(self):
         batch = _make_decode_capture_batch(num_tokens=8)
 

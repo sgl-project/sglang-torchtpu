@@ -1,24 +1,93 @@
-"""TPU-specific placement of multimodal embeddings into the token embedding grid.
-
-The vision tower already returns host tensors, so the rows are placed at their
-final positions on the host. The device then only selects between two aligned
-matrices, instead of running masked_scatter_'s cumsum over num_tokens x hidden
-to rediscover that mapping.
-"""
+"""TPU multimodal row placement using host-built indices and masks."""
 
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.mm_embedding import (
+    MultimodalEmbedding,
+    PaddedEmbedding,
+)
+
+
+def scatter_mm_on_device(
+    dest: torch.Tensor, mask: torch.Tensor, src: MultimodalEmbedding
+) -> None:
+    """Merge device embeddings using the scheduler's host row mask."""
+    if mask.device.type != "cpu":
+        raise ValueError("TPU multimodal placement requires a host mask")
+    num_rows = int(mask.sum())
+    if num_rows != src.shape[0]:
+        raise RuntimeError(
+            "Multimodal placement expects one embedding row per masked "
+            f"position, got {src.shape[0]} rows for {num_rows} positions."
+        )
+    if num_rows == 0:
+        return
+    if isinstance(src, PaddedEmbedding):
+        _scatter_padded_embedding(dest, mask, src)
+        return
+
+    # Keep indices at the padded token count; only their values depend on
+    # image lengths. The elementwise fallback scans tokens * hidden instead.
+    indices = (torch.cumsum(mask.reshape(-1), dim=0, dtype=torch.int32) - 1).clamp_(
+        min=0
+    )
+    _scatter_mm_rows(dest, src, indices, mask)
+
+
+def _scatter_mm_rows(
+    dest: torch.Tensor,
+    src: torch.Tensor,
+    indices: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    src = src.to(device=dest.device, dtype=dest.dtype)
+    if src.shape[0] < dest.shape[0]:
+        # Gather compilation must depend on the text bucket, not image length.
+        src = F.pad(src, (0, 0, 0, dest.shape[0] - src.shape[0]))
+    rows = src.index_select(0, indices.to(dest.device))
+    dest.copy_(torch.where(mask.to(dest.device), rows, dest))
+
+
+def _scatter_padded_embedding(
+    dest: torch.Tensor, mask: torch.Tensor, src: PaddedEmbedding
+) -> None:
+    positions = mask.reshape(-1).nonzero(as_tuple=True)[0]
+    # One merge per distinct physical buffer, even when several requests reuse
+    # different spans of the same cached image.
+    placements: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    offset = 0
+    for span in src.spans:
+        if span.length == 0:
+            continue
+        key = id(span.buffer)
+        if key not in placements:
+            placements[key] = (
+                span.buffer,
+                torch.zeros(dest.shape[0], dtype=torch.int32),
+                torch.zeros(dest.shape[0], 1, dtype=torch.bool),
+            )
+        _buffer, indices, active = placements[key]
+        target_rows = positions[offset : offset + span.length]
+        indices[target_rows] = torch.arange(
+            span.start, span.start + span.length, dtype=torch.int32
+        )
+        active[target_rows] = True
+        offset += span.length
+
+    for buffer, indices, active in placements.values():
+        _scatter_mm_rows(dest, buffer, indices, active)
 
 
 def _place_mm_rows(
     *,
     masks: List[Optional[torch.Tensor]],
-    embeddings: List[Optional[torch.Tensor]],
+    embeddings: List[Optional[MultimodalEmbedding]],
     rows: int,
     hidden: int,
     dtype: torch.dtype,
@@ -45,6 +114,8 @@ def _place_mm_rows(
     for mask, embedding in zip(masks, embeddings):
         if embedding is None or mask is None:
             continue
+        if isinstance(embedding, PaddedEmbedding):
+            embedding = embedding.to_host()
         indices = mask.reshape(-1).nonzero(as_tuple=True)[0]
         if indices.numel() != embedding.shape[0]:
             raise ValueError(
@@ -82,9 +153,9 @@ def embed_mm_on_host(
     input_embeds: torch.Tensor,
     deepstack_shape: Optional[torch.Size],
     modalities: List[Modality],
-    embeddings: List[Optional[torch.Tensor]],
+    embeddings: List[Optional[MultimodalEmbedding]],
     masks: List[Optional[torch.Tensor]],
-    deepstack_embeddings: List[Optional[torch.Tensor]],
+    deepstack_embeddings: List[Optional[MultimodalEmbedding]],
     use_deepstack: Dict[Modality, bool],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Place multimodal rows on the host, then move them to the device.

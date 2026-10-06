@@ -378,6 +378,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             "forward_batch.extend_input_logprob_token_ids_gpu",
             kwargs["ignored_argnames"],
         )
+        self.assertIn("forward_batch.mm_input_ids_cpu", kwargs["ignored_argnames"])
 
 
 class TestEagle3DirectCompile(_SpecPolicyTestCase):

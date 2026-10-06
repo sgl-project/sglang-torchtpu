@@ -6,6 +6,10 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.multimodal.mm_embedding import (
+    MultimodalEmbedding,
+    PaddedEmbedding,
+)
 
 
 class MultimodalCache(abc.ABC):
@@ -64,13 +68,15 @@ class MultimodalCache(abc.ABC):
         raise NotImplementedError()
 
 
-def _get_tensor_size(embedding: torch.Tensor):
+def _get_tensor_size(embedding: MultimodalEmbedding):
+    if isinstance(embedding, PaddedEmbedding):
+        return embedding.storage_nbytes()
     return embedding.untyped_storage().nbytes()
 
 
 @dataclass(kw_only=True)
 class EmbeddingResult:
-    embedding: torch.Tensor
+    embedding: MultimodalEmbedding
 
 
 class MultiModalStaticCache(MultimodalCache):
@@ -111,7 +117,11 @@ class MultiModalStaticCache(MultimodalCache):
             return True
         tensor = embedding.embedding
         storage_size = _get_tensor_size(tensor)
-        data_size = min(storage_size, tensor.element_size() * tensor.numel())
+        data_size = (
+            storage_size
+            if isinstance(tensor, PaddedEmbedding)
+            else min(storage_size, tensor.element_size() * tensor.numel())
+        )
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False
