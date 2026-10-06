@@ -2,7 +2,7 @@
 # JOB PER MODEL so they take separate slices and run in parallel.
 # A model that fails costs the others nothing, and each gets its own
 # --timeout-per-file rather than sharing one with every other model.
-# Stage [3] of the nightly (nightly-test-tpu.yml calls this workflow with a
+# The nightly's perf stage (nightly-test-tpu.yml calls this workflow with a
 # prebuilt image); this action is also the isolated trigger, for collecting a
 # datapoint on demand without waiting for a nightly:
 #   gh workflow run perf-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]

@@ -128,13 +128,13 @@ single feature-validation leg) and an `update-dashboard` publish opt-in (see
 
 ```
 build (once)
-  ├─▶ [1] feature validation   feature-validation-tpu.yml
-  └─▶ [3] perf                 perf-test-tpu.yml
+  ├─▶ feature validation   feature-validation-tpu.yml
+  └─▶ perf                 perf-test-tpu.yml
       both in parallel: slice contention is Kueue's job (the nightly
       lane's quota queues the jobs), and a red stage costs the others nothing
 ```
 
-Stage [2], accuracy (`accuracy-test-tpu.yml`), runs on its own 10 AM / 5 PM PT schedule
+The accuracy stage (`accuracy-test-tpu.yml`) runs on its own 10 AM / 5 PM PT schedule
 instead: with it the nightly needed about twice the slice time the 6 h runner cap allows.
 Each slot fills the lane its MMMU-Pro legs leave idle:
 
@@ -143,9 +143,9 @@ Each slot fills the lane its MMMU-Pro legs leave idle:
 | `day-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
 | `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy, kv-offload-resharding P/D gates |
 
-Each stage is a reusable workflow the nightly calls with the shared image, and ALSO its
-own `workflow_dispatch` trigger (with its own build) for running one stage — or one
-test — without a full nightly. Inside stage [1]:
+Each stage is a reusable workflow (the nightly calls feature validation and perf with the
+shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one
+test — without a full nightly. Inside feature validation:
 
 ```
   ├─▶ single-host           (hosts=1)  one job per nightly-tpu-4-v7 test
@@ -268,10 +268,10 @@ _TODO._
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
 | `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated); decide → build → single-host test |
-| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build once → stages [1] feature validation, [3] perf in parallel |
-| `.github/workflows/feature-validation-tpu.yml` | Stage [1], also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
-| `.github/workflows/accuracy-test-tpu.yml` | Stage [2], on its own 10 AM / 5 PM schedule and dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |
-| `.github/workflows/perf-test-tpu.yml` | Stage [3], also dispatchable alone: one job per model via run_suite |
+| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build once → feature validation and perf stages in parallel |
+| `.github/workflows/feature-validation-tpu.yml` | Feature-validation stage, also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
+| `.github/workflows/accuracy-test-tpu.yml` | Accuracy stage, on its own 10 AM / 5 PM schedule and dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |
+| `.github/workflows/perf-test-tpu.yml` | Perf stage, also dispatchable alone: one job per model via run_suite |
 | `.github/tpu-ci/dashboard_aliases.json` | Series-id rename registry: old-id → new-id, applied by keel at render time (pr-gate lint) |
 
 ## Cluster infra

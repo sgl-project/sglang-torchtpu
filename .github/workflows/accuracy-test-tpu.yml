@@ -2,9 +2,9 @@
 # JOB PER BENCHMARK so each eval takes its own slice, runs in parallel, and gets
 # its own runtime budget (a slow AIME cannot cost GPQA its score). Scores are
 # emitted for longitudinal tracking without quality thresholds (report_only).
-# Stage [2] of the nightly (nightly-test-tpu.yml calls this workflow with a
-# prebuilt image); this action is also the isolated trigger, for collecting a
-# datapoint on demand without waiting for a nightly:
+# The accuracy stage: it runs on its own 10 AM / 5 PM schedule below rather
+# than inside the nightly, and is also the isolated trigger, for collecting a
+# datapoint on demand without waiting for a slot:
 #   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
 #
 # Single-host models go through run_suite; multihost accuracy uses JobSets.

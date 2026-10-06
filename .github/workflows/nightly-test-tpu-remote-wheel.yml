@@ -8,7 +8,7 @@
 #    torch-tpu registry (or user-specified wheel), logs the exact wheel version, and
 #    pushes the new image.
 # 3. Runs the test suites in parallel on GKE Cloud TPU hardware against the mutated container:
-#      [1] feature validation | [3] perf  (accuracy runs on its own daytime schedule)
+#      feature validation | perf  (accuracy runs on its own daytime schedule)
 # 4. Compares current run results against the nightly main baseline, printing a
 #    job-level pass/fail diff table with regressions and fixes to the GitHub Summary.
 name: Nightly Test (TPU - Remote Wheel)

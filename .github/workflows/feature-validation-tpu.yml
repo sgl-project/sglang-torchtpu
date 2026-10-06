@@ -1,4 +1,4 @@
-# TPU feature validation -- stage [1] of the nightly (nightly-test-tpu.yml calls
+# TPU feature validation -- the nightly's feature stage (nightly-test-tpu.yml calls
 # this workflow with a prebuilt image), and its own dispatchable trigger for
 # running the stage, or a single test, without a full nightly:
 #   gh workflow run feature-validation-tpu.yml [-f only=<job>] [-f ref=<branch>]

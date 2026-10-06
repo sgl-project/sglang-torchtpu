@@ -1,9 +1,9 @@
 # Nightly TPU e2e. Builds the image ONCE, then fans out two stages of the
 # redesign (.github/tpu-ci/README.md, § Pipelines and § Dashboard) IN PARALLEL:
 #
-#   [1] feature validation | [3] perf
+#   feature validation | perf
 #
-# Stage [2], accuracy, runs on accuracy-test-tpu.yml's 10 AM / 5 PM schedule:
+# The accuracy stage runs on accuracy-test-tpu.yml's 10 AM / 5 PM schedule:
 # with it, the nightly needed more slice time than the 6 h runner cap leaves.
 # Each stage is a reusable workflow that is ALSO its own dispatchable trigger
 # (feature-validation-tpu.yml / accuracy-test-tpu.yml / perf-test-tpu.yml), so a
@@ -79,7 +79,7 @@ jobs:
       contents: read
       id-token: write
 
-  # Stage [1]: feature validation -- single-host suite, multi-host launch
+  # Feature validation: single-host suite, multi-host launch
   # groups, and the static P/D disaggregation gates. Everything except `all`
   # and `feature-validation` in the sh/mh/pd-* family narrows it to one job.
   feature-validation:
@@ -98,7 +98,7 @@ jobs:
       contents: read
       id-token: write
 
-  # Stage [3]: throughput sweeps, one job per model.
+  # Perf: throughput sweeps, one job per model.
   perf:
     needs: build
     if: ${{ contains(fromJSON('["all","perf"]'), inputs.only || 'all') }}
