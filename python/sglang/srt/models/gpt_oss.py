@@ -699,10 +699,16 @@ class GptOssModel(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.layers_to_capture: list[int] = []
+        self.capture_final_eagle_hidden_state = False
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]) -> None:
         self.layers_to_capture = layers_to_capture
+        # Capture IDs name block boundaries. The boundary after the final
+        # decoder layer has no next layer whose input norm can capture it.
+        self.capture_final_eagle_hidden_state = len(self.layers) in layers_to_capture
         for layer_id in self.layers_to_capture:
+            if layer_id == len(self.layers):
+                continue
             self.layers[layer_id]._is_layer_to_capture = True
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]) -> None:
@@ -770,6 +776,11 @@ class GptOssModel(nn.Module):
                 }
             )
         else:
+            if self.capture_final_eagle_hidden_state:
+                # Capture the final block output before the model's final norm.
+                aux_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
