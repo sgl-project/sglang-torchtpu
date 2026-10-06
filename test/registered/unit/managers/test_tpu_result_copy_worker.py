@@ -151,12 +151,16 @@ def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail):
     under the KV free fence copy_done must also wait for one of its outputs;
     otherwise the extra copy would only delay result processing."""
     device_module = SimpleNamespace(
-        current_device=lambda: 0,
         Stream=Mock(),
-        device=lambda value: contextmanager(lambda: (yield))(),
         stream=lambda value: contextmanager(lambda: (yield))(),
     )
     monkeypatch.setattr(torch, "get_device_module", Mock(return_value=device_module))
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "device_index",
+        lambda value: contextmanager(lambda: (yield))(),
+    )
     issued = []
     draft_tail = object()
     topk_index = Mock()
