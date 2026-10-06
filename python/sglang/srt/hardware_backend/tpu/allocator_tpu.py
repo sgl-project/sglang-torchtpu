@@ -147,15 +147,16 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return True
         if short > self.held_pages.num_pages:
             return False
-        if self.kv_free_fence.in_dma_write_target:
-            # A DMA is not ordered after the forward that may still write these.
-            self.kv_free_fence.wait_for_in_flight()
-            self.merge_and_sort_free()
-        else:
+        if self.kv_free_fence.in_forward_write_target:
             # Device compute runs in launch order, so this forward writes last.
             self.free_pages = torch.cat(
                 (self.held_pages.borrow(short), self.free_pages)
             )
+        else:
+            # Other allocations may be DMA targets, which are not ordered after
+            # the forward that may still write these.
+            self.kv_free_fence.wait_for_in_flight()
+            self.merge_and_sort_free()
         return num_pages <= len(self.free_pages)
 
     def alloc(self, need_size: int):

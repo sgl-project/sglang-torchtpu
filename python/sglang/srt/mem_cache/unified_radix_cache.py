@@ -3390,15 +3390,6 @@ class UnifiedRadixCache(BasePrefixCache):
         """Prepare KV cache loading from host to device.
         Returns (device_indices, last_node), or None when buffer-mode
         admission must retry without committing a load."""
-        # Pages allocated here are DMA targets, so an in-flight forward must
-        # not still write them.
-        with self.token_to_kv_pool_allocator.dma_write_target():
-            return self._init_load_back(params)
-
-    def _init_load_back(
-        self,
-        params: InitLoadBackParams,
-    ) -> Optional[tuple[torch.Tensor, NodeId]]:
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node

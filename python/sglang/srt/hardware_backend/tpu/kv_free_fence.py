@@ -1,21 +1,21 @@
-"""Hold freed KV pages back from raiden DMAs until in-flight forwards finish.
+"""Hold freed KV pages back from DMAs until in-flight forwards finish.
 
 Under overlap scheduling, the scheduler processes result N-1 while forward N
 still runs. A request that finished at N-1 is still in forward N's batch, so
-its last pages are freed while forward N is still writing them. raiden's H2D
-DMAs are not ordered against device compute, so a HiCache load allocated one of
-those pages can land before forward N's write and be overwritten.
+its last pages are freed while forward N is still writing them. DMAs such as
+raiden's H2D loads are not ordered against device compute, so a DMA into one
+of those pages can land before forward N's write and be overwritten.
 
 ``KVFreeFence`` holds every page freed while a queued forward result is
 unprocessed, tagged with the latest formed forward, and releases it once that
 result is processed. Which pages a forward writes is never modeled: eviction
 frees are held too, since a finished request's tree insert can cover the slot
 the in-flight forward writes, unless every evicted node was last inserted or
-unlocked before the oldest running forward's batch formed. Forward allocations may
-take held pages, because device compute runs in launch order and the later
-forward's write lands last. Allocations inside ``dma_write_target()`` use free
-pages first and, when short, wait for the in-flight forwards before taking held
-ones.
+unlocked before the oldest running forward's batch formed. Allocations inside
+``forward_write_target()`` may take held pages, because device compute runs in
+launch order and the later forward's write lands last. Every other allocation
+uses free pages first and, when short, waits for the in-flight forwards before
+taking held ones, so a missed scope costs a device sync, not corrupted KV.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class KVFreeFence:
         self._in_flight: Deque[Tuple[int, float, object]] = deque()
         # Latest seq a device sync has covered.
         self._device_done = 0
-        self._dma_write_target = False
+        self._forward_write_target = False
         self._free_release_time: Optional[float] = None
         self._allocators: List[TpuPagedTokenToKVPoolAllocator] = []
 
@@ -60,8 +60,8 @@ class KVFreeFence:
         self._allocators.append(allocator)
 
     @property
-    def in_dma_write_target(self) -> bool:
-        return self._dma_write_target
+    def in_forward_write_target(self) -> bool:
+        return self._forward_write_target
 
     def hold_tag(self) -> Optional[int]:
         """Forward a page freed now must wait for, or None to free it at once."""
@@ -135,14 +135,14 @@ class KVFreeFence:
             self._free_release_time = prev
 
     @contextmanager
-    def dma_write_target(self) -> Iterator[None]:
-        """Allocations here are written by DMAs that are not ordered against
-        device compute, so they only get pages no in-flight forward may write."""
-        prev, self._dma_write_target = self._dma_write_target, True
+    def forward_write_target(self) -> Iterator[None]:
+        """Allocations here are written only by forwards, which run after the
+        in-flight ones, so they may take pages those forwards still write."""
+        prev, self._forward_write_target = self._forward_write_target, True
         try:
             yield
         finally:
-            self._dma_write_target = prev
+            self._forward_write_target = prev
 
 
 class HeldPages:

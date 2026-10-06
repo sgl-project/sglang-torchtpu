@@ -1,4 +1,4 @@
-"""KV pages freed under overlap stay out of DMA-written allocations until the
+"""KV pages freed under overlap stay out of non-forward allocations until the
 forwards in flight at free time are processed."""
 
 import ast
@@ -20,6 +20,11 @@ from sglang.srt.hardware_backend.tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
 from sglang.srt.hardware_backend.tpu.kv_free_fence import install_kv_free_fence
+from sglang.srt.mem_cache.allocation import (
+    alloc_paged_token_slots_decode,
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -72,11 +77,10 @@ class TestKVFreeFence(CustomTestCase):
     def _pages(self, locs):
         return set((locs[::PAGE] // PAGE).tolist())
 
-    def _alloc_dma(self, num_pages):
-        with self.allocator.dma_write_target():
-            return self.allocator.alloc(num_pages * PAGE)
+    def _alloc_pages(self, num_pages):
+        return self.allocator.alloc(num_pages * PAGE)
 
-    def test_dma_target_never_gets_a_page_an_in_flight_forward_may_write(self):
+    def test_unscoped_allocation_never_gets_a_page_in_flight_forwards_write(self):
         """A page freed while forward N runs can be overwritten by forward N, so
         a host-to-device load into it must not be issued before N finishes."""
         for need_sort in (False, True):
@@ -90,25 +94,25 @@ class TestKVFreeFence(CustomTestCase):
 
                 # Free pages exist only on the held side, so the DMA waits.
                 self.assertEqual(self.allocator.available_size(), 3 * PAGE)
-                loaded = self._alloc_dma(3)
+                loaded = self._alloc_pages(3)
                 self.assertEqual(self.log, ["device"])
                 self.assertEqual(
                     self._pages(loaded), self._pages(busy) | self._pages(spare[:PAGE])
                 )
 
-    def test_dma_target_uses_free_pages_without_waiting(self):
+    def test_unscoped_allocation_uses_free_pages_without_waiting(self):
         self._setup()
         busy = self.allocator.alloc(2 * PAGE)
         self._launch()
         self.allocator.free(busy)
 
-        loaded = self._alloc_dma(2)
+        loaded = self._alloc_pages(2)
         self.assertEqual(self.log, [])
         self.assertTrue(self._pages(loaded).isdisjoint(self._pages(busy)))
-        self.assertIsNone(self._alloc_dma(3))
+        self.assertIsNone(self._alloc_pages(3))
         self.assertEqual(self.log, [])
 
-    def test_forward_allocation_borrows_held_pages_without_waiting(self):
+    def test_forward_allocations_borrow_held_pages_without_waiting(self):
         """Device compute runs in launch order, so a later forward's write to a
         held page lands after the in-flight forward's write."""
         self._setup()
@@ -116,7 +120,12 @@ class TestKVFreeFence(CustomTestCase):
         self._launch()
         self.allocator.free(busy)
 
-        out = self.allocator.alloc_extend(
+        tree_cache = SimpleNamespace(
+            token_to_kv_pool_allocator=self.allocator, is_chunk_cache=lambda: True
+        )
+        alloc_token_slots(tree_cache, num_tokens=PAGE)
+        alloc_paged_token_slots_extend(
+            tree_cache,
             prefix_lens=torch.tensor([0]),
             prefix_lens_cpu=torch.tensor([0]),
             seq_lens=torch.tensor([PAGE + 1]),
@@ -124,9 +133,14 @@ class TestKVFreeFence(CustomTestCase):
             last_loc=torch.tensor([-1]),
             extend_num_tokens=PAGE + 1,
         )
-        self.assertIsNotNone(out)
+        alloc_paged_token_slots_decode(
+            tree_cache,
+            seq_lens=torch.tensor([1]),
+            seq_lens_cpu=torch.tensor([1]),
+            last_loc=torch.tensor([-1]),
+        )
         self.assertEqual(self.log, [])
-        self.assertEqual(self.allocator.available_size(), 2 * PAGE)
+        self.assertEqual(self.allocator.available_size(), 0)
 
     def test_pages_release_once_every_forward_in_flight_at_free_is_processed(self):
         self._setup()
@@ -191,7 +205,7 @@ class TestKVFreeFence(CustomTestCase):
         self.allocator.free(busy[:PAGE])
         self.fence.on_forward_done(prev)
         # A sync before launch does not cover the formed batch's writes.
-        self.assertIsNone(self._alloc_dma(3))
+        self.assertIsNone(self._alloc_pages(3))
         self.assertEqual(self.log, ["copy_done", "device"])
         self.assertEqual(self.allocator.held_pages.num_pages, 1)
 
