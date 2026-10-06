@@ -1842,6 +1842,9 @@ class Envs:
     # per-length XLA compilations.
     SGLANG_TPU_HOST_PADDING = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+    # Reject tier-1 XLA cache misses after the scheduler's warmup boundary,
+    # including eager ops and programs that could otherwise load from disk.
+    SGLANG_TPU_XLA_CACHE_ONLY = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

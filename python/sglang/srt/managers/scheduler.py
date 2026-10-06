@@ -5122,11 +5122,20 @@ class Scheduler(
         return ClearHiCacheReqOutput(success=if_success)
 
     def _maybe_arm_fail_on_recompile(self) -> None:
-        """TPU-only: freeze torch.compile so serving-time recompiles raise."""
+        """TPU-only: freeze graph specialization and optionally the XLA cache."""
         model_runner = self.tp_worker.model_runner
         if model_runner.device != "tpu":
             # Only enable this for tpu
             return
+        if envs.SGLANG_TPU_XLA_CACHE_ONLY.get():
+            # Drain warmup work once; the native cache rejects subsequent misses
+            # before compilation, including eager ops outside torch.compile.
+            torch.accelerator.synchronize()
+            torch.tpu._set_cache_only(True)
+            logger.info(
+                "[tpu] Warmup complete; enabled SGLANG_TPU_XLA_CACHE_ONLY. "
+                "New XLA programs and persistent-cache loads now raise."
+            )
         if not get_exec().graph.enable_torch_compile:
             return
         if (
