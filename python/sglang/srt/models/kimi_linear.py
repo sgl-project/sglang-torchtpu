@@ -48,8 +48,10 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_xpu, make_layers
+from sglang.srt.utils import is_tpu, is_xpu, make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+
+_is_tpu = is_tpu()
 
 
 def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
@@ -522,8 +524,8 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            if not forward_batch.forward_mode.is_target_verify():
-                # Only chunk_kda (extend) wants pre-activated beta; the verify
+            if not _is_tpu:
+                # Only chunk_kda (extend) wants pre-activated beta; the TPU fused
                 # kernel sigmoids it in-kernel like decode.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
