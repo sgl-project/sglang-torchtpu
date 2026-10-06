@@ -202,7 +202,7 @@ def test_hybrid_round_piggybacks_draft():
     assert producer_id >= 0
     (load_ack,) = controller.ack_load_queue
     _poll(load_ack.finish_event, "load-back (full+swa+draft)")
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     _verify_moved(full_dev, expected_full, SRC_PAGES, DST_PAGES, "full pool (2 layers)")
     _verify_moved(
@@ -214,6 +214,6 @@ def test_hybrid_round_piggybacks_draft():
 
 
 if __name__ == "__main__":
-    print(f"TPU chips: {torch.tpu.device_count()}")
+    print(f"TPU chips: {torch.accelerator.device_count()}")
     test_hybrid_round_piggybacks_draft()
     print("\nON-DEVICE HYBRID RAIDEN SPEC-DRAFT OFFLOAD TEST PASSED")

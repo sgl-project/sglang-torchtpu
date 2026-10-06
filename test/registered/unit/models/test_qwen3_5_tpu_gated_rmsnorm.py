@@ -15,6 +15,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -58,10 +60,46 @@ class TestTpuGatedRMSNorm(CustomTestCase):
         exp = _ref(x, norm.weight, None, self.EPS)
         torch.testing.assert_close(out, exp, rtol=1e-5, atol=1e-5)
 
+    def test_qwen38_swish_gate_matches_reference(self):
+        """The original Qwen3.8-27B config names its SiLU gate 'swish'."""
+        torch.manual_seed(0)
+        norm = self._norm("swish").to(torch.bfloat16)
+        x = torch.randn(4, self.H, dtype=torch.bfloat16)
+        z = torch.randn_like(x)
+        expected = _ref(x, norm.weight, z, self.EPS)
+        torch.testing.assert_close(norm(x, z), expected)
+
     def test_unsupported_activation_raises(self):
         # A non-silu gate must fail loudly, not silently drop the gate.
         with self.assertRaises(NotImplementedError):
             RMSNormGated(self.H, activation="gelu")
+
+    def test_tpu_attention_gate_without_npu_kernel(self):
+        """TPU full attention must not call the NPU-only sigmoid kernel."""
+        from sglang.srt.models import qwen3_5
+
+        x = torch.tensor([[2.0, -3.0, 4.0, 1.0]], dtype=torch.bfloat16)
+        for gate_shape in ((1, 4), (1, 2, 2)):
+            with self.subTest(gate_shape=gate_shape):
+                gate = torch.tensor([-2.0, 0.0, 1.0, 3.0]).to(x.dtype)
+                gate = gate.reshape(gate_shape)
+                layer = SimpleNamespace(
+                    attn_output_gate=True,
+                    _prepare_qkv_gate=lambda **kwargs: (None, None, None, gate),
+                    attn=lambda *args: x,
+                    o_proj=lambda value: (value, None),
+                )
+                with (
+                    patch.object(qwen3_5, "_is_tpu", True),
+                    patch.object(qwen3_5, "_is_npu", False),
+                ):
+                    out = qwen3_5.Qwen3_5AttentionDecoderLayer.self_attention(
+                        layer,
+                        positions=torch.tensor([0]),
+                        hidden_states=x,
+                        forward_batch=None,
+                    )
+                torch.testing.assert_close(out, x * torch.sigmoid(gate.reshape_as(x)))
 
     def test_bf16_dtype_preserved(self):
         norm = RMSNormGated(self.H, eps=self.EPS, dtype=torch.bfloat16)

@@ -119,6 +119,29 @@ class TestCalculateTilingFuseAct(CustomTestCase):
         self.assertGreater(tiles.tile_k, 0)
         self.assertGreater(tiles.tile_n, 0)
 
+    def test_weight_only_reconstruction_fits_vmem(self):
+        # Kimi's gate/up prefill: the packed INT4 tile fit, its BF16 unpack did not.
+        dims = self._dims(size_m=32768, size_k=7168, size_n=4096)
+        lhs, _ = self._bf16_cfgs(size_k=dims.size_k)
+        rhs = gmm_v2.InputConfigs(
+            quant_dtype=jnp.int4,
+            quant_block_size=32,
+            dtype=jnp.int4,
+            has_scale=True,
+            packing=8,
+            num_quant_blocks=224,
+            scale_size_n=4096,
+            scale_dtype=jnp.bfloat16,
+        )
+        budget = int(64 * _MiB * 0.9)
+        tiles = gmm_v2.calculate_tiling(dims, lhs, rhs, budget)
+        elements = tiles.tile_k * tiles.tile_n
+        dma_bytes = 3 * (elements // 2 + tiles.tile_k // 32 * tiles.tile_n * 2)
+        reconstructed_bytes = elements * 2
+        self.assertLessEqual(dma_bytes + reconstructed_bytes, budget)
+        # N tiling can resolve this without changing K accumulation order.
+        self.assertEqual(tiles.tile_k, dims.size_k)
+
 
 if __name__ == "__main__":
     unittest.main()

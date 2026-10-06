@@ -38,7 +38,7 @@ class TPUAsyncCopyWorker:
 
     def __init__(self) -> None:
         self.device_module = torch.get_device_module("tpu")
-        self.device_index = self.device_module.current_device()
+        self.device_index = torch.accelerator.current_device_index()
         # TPU events track work by stream. Keep copy events from capturing
         # unrelated work submitted by the scheduler.
         self.stream = self.device_module.Stream(device=self.device_index)
@@ -74,7 +74,7 @@ class TPUAsyncCopyWorker:
         return_hidden_states: bool,
     ) -> None:
         with (
-            self.device_module.device(self.device_index),
+            torch.accelerator.device_index(self.device_index),
             self.device_module.stream(self.stream),
         ):
             # copy_to_cpu calls result.copy_done.record() after issuing the copies.

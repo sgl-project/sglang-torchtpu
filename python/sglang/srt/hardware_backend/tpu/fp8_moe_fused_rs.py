@@ -132,7 +132,6 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
 
 
 def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> bool:
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -143,7 +142,7 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     unsupported_reason = fp8_fused_rs_unsupported_reason(
         num_experts=layer.num_experts,
         ep_size=ep_size,
-        tp_size=get_tp_group().world_size,
+        tp_size=get_parallel().tp_group.world_size,
         pp_size=parallel.pp_size,
         world_size=world_size,
         reduction_compatible=layer.allow_backend_reduction,
@@ -235,7 +234,7 @@ def _apply_fp8_fused_rs(
         # sequence-parallel local-shard paths. A direct FP8 write would add row
         # quantization and scale DMAs before a BF16 consumer.
         fp8_direct_write=False,
-        tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
+        world_size=layer.moe_ep_size,
         keep_token_shard=keep_output_shard,
     )
     return StandardCombineInput(

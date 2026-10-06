@@ -39,6 +39,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+
 _TPU_FILTER_PROBS_OP: Optional[Callable] = None
 
 
@@ -147,12 +149,17 @@ def tpu_filter_probs(
         raise ValueError(f"tpu_filter_probs requires a TPU tensor, got {probs.device}")
     if probs.ndim != 2:
         raise ValueError(f"tpu_filter_probs expects a 2D tensor, got {probs.shape}")
-    return _get_tpu_filter_probs_op()(
-        probs.float(),
-        top_ks.to(torch.int32),
-        top_ps.float(),
-        min_ps.float(),
+    # The exported op compiles once per argument shape: bucket rows to a power
+    # of two. Ghost rows: zero probs, k=0 (clipped to 1), top_p=1, min_p=0.
+    rows = probs.shape[0]
+    bucket = row_bucket(rows)
+    filtered = _get_tpu_filter_probs_op()(
+        pad_rows(probs.float(), bucket),
+        pad_rows(top_ks.to(torch.int32), bucket),
+        pad_rows(top_ps.float(), bucket, fill=1.0),
+        pad_rows(min_ps.float(), bucket),
         int(need_top_k),
         int(need_top_p),
         int(need_min_p),
     )
+    return filtered if bucket == rows else filtered[:rows]

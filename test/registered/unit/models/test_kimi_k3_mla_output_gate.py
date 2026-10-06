@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.kimi_k3 import mla_output_gate
+import sglang.kernels.ops.attention.mla_output_gate as mla_output_gate
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

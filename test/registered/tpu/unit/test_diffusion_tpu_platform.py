@@ -30,7 +30,7 @@ class TestWorkerBootstrap(CustomTestCase):
 
         x = torch.ones((8, 128), device="tpu", dtype=torch.bfloat16)
         y = (x + x).sum()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         self.assertEqual(y.item(), 2 * 8 * 128)
 
         self.assertGreater(TpuPlatform.get_device_total_memory(), 0)

@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tpu import eval_support, model_config
+from sglang.test.tpu.evals import eval_support, model_config
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -54,6 +54,73 @@ class _FakeSampler:
     @staticmethod
     def _pack_message(role, content):
         return {"role": role, "content": content}
+
+
+class TestThinkingGate(CustomTestCase):
+    def test_thinking_and_effort_reach_eval_runner_together(self):
+        gates = model_config.build_gates(
+            {
+                "model": "deepseek-ai/DeepSeek-V3.1",
+                "test_name": "thinking-test",
+                "gates": [
+                    {
+                        "dataset": "gpqa",
+                        "report_only": True,
+                        "thinking": True,
+                        "reasoning_effort": "high",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            gates[0].extra_eval_args,
+            {"sgl_eval_thinking": True, "reasoning_effort": "high"},
+        )
+
+
+class TestSglEvalRunner(CustomTestCase):
+    def test_template_kwargs_reach_sgl_eval_and_metrics_are_read_back(self):
+        from pathlib import Path
+
+        def fake_run(cmd, check):
+            out = Path(cmd[cmd.index("--out-dir") + 1]) / "sgl_eval_aime26_1"
+            out.mkdir(parents=True)
+            (out / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "aggregate": {"score": 0.875},
+                        "num_examples": 30,
+                        "latency_seconds": 12.0,
+                        "output_throughput_tps": 3.5,
+                    }
+                )
+            )
+
+        runner = eval_support.sgl_eval_runner(
+            "aime26",
+            model="gemma4-31b",
+            max_tokens=32768,
+            num_threads=64,
+            temperature=1.0,
+            top_p=0.95,
+            n_repeats=4,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        with (
+            patch.object(eval_support.subprocess, "run", side_effect=fake_run) as run,
+            patch.object(eval_support, "dump_metric"),
+        ):
+            result = runner("http://127.0.0.1:30000/")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], ["sgl-eval", "run", "aime26"])
+        self.assertEqual(cmd[cmd.index("--base-url") + 1], "http://127.0.0.1:30000/v1")
+        self.assertEqual(
+            cmd[cmd.index("--chat-template-kwarg") + 1], "enable_thinking=true"
+        )
+        self.assertEqual(cmd[cmd.index("--n-repeats") + 1], "4")
+        self.assertNotIn("--thinking", cmd)
+        self.assertEqual(result["score"], 0.875)
+        self.assertEqual(result["latency"], 12.0)
 
 
 class TestBoundedGptOssSampler(CustomTestCase):
@@ -548,7 +615,7 @@ class TestPerfConfigsAreValid(CustomTestCase):
     def test_every_config_builds(self):
         names, suites = set(), set()
         for path, mod in self._perf_modules():
-            config = mod.MODEL_CONFIG
+            config = _model_config(mod)
             model_config.build_model(config)  # rejects unknown launch keys
             self.assertTrue(model_config.build_gates(config))
             case = model_config.build_test_case(config)
@@ -566,7 +633,7 @@ class TestPerfConfigsAreValid(CustomTestCase):
         # The dashboard groups by workload name; an unnamed point would fall back to
         # its raw shape and sit in a separate dropdown entry from its siblings.
         for _path, mod in self._perf_modules():
-            for gate in mod.MODEL_CONFIG["gates"]:
+            for gate in _model_config(mod)["gates"]:
                 for point in gate.get("sweep") or []:
                     self.assertTrue(point["workload"])
 
@@ -595,11 +662,39 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
         self.assertTrue(found, "no accuracy test files found; did they move?")
         yield from found
 
+    def _assert_fixture_owns_the_server(self, path, mod):
+        # Without a launch entry, the file's TPULauncherTestCase boots the recipe.
+        from pathlib import Path
+
+        from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase
+        from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
+
+        # The imported bases are in the module namespace too; only the concrete
+        # subclass this file defines counts.
+        bases = (TPULauncherTestCase, AccuracyTestCase)
+        fixtures = [
+            value
+            for value in vars(mod).values()
+            if isinstance(value, type)
+            and issubclass(value, TPULauncherTestCase)
+            and value not in bases
+        ]
+        self.assertEqual(len(fixtures), 1, f"{path.name} needs one launcher fixture")
+        recipe = (
+            Path(__file__).resolve().parents[3]
+            / "benchmark/tpu"
+            / fixtures[0].config_module
+        )
+        self.assertTrue(recipe.is_file(), f"{path.name}: no {recipe}")
+
     def test_every_config_builds(self):
         names, suites = set(), set()
         for path, mod in self._accuracy_modules():
-            config = mod.MODEL_CONFIG
-            model_config.build_model(config)  # rejects unknown launch keys
+            config = _model_config(mod)
+            if "launch" in config:
+                model_config.build_model(config)  # rejects unknown launch keys
+            else:
+                self._assert_fixture_owns_the_server(path, mod)
             self.assertTrue(model_config.build_gates(config))
             case = model_config.build_test_case(config)
             self.assertNotIn(case.__name__, names, f"{path.name} duplicates a case")
@@ -609,22 +704,37 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
             # files sharing one would quietly serialise onto the same slice.
             suite = _registered_suite(path)
             self.assertTrue(suite, f"{path.name} registers no suite")
-            self.assertNotIn(suite, suites, f"{path.name} shares a suite")
-            suites.add(suite)
+            # Multi-host discovery creates one job per file, even when files
+            # share a suite. Single-host discovery creates one job per suite.
+            if not hasattr(mod, "MULTIHOST_LAUNCH"):
+                self.assertNotIn(suite, suites, f"{path.name} shares a suite")
+                suites.add(suite)
 
-    def test_every_gate_is_report_only(self):
+    # R1-0528 keeps the two regression floors it was relocated with; its MMLU
+    # subset has no measured baseline, like every other model's.
+    R1_GATED = {
+        ("accuracy-deepseek-r1-0528", "gpqa"),
+        ("accuracy-deepseek-r1-0528", "aime25"),
+    }
+
+    def test_every_gate_declares_its_accuracy_policy(self):
         for path, mod in self._accuracy_modules():
-            for gate in mod.MODEL_CONFIG["gates"]:
-                self.assertTrue(gate.get("report_only"), path.name)
-                self.assertNotIn("baseline", gate, path.name)
-                self.assertNotIn("atol", gate, path.name)
+            for gate in _model_config(mod)["gates"]:
+                if (_model_config(mod)["id"], gate["dataset"]) in self.R1_GATED:
+                    self.assertFalse(gate.get("report_only"), path.name)
+                    self.assertIn("baseline", gate, path.name)
+                    self.assertIn("atol", gate, path.name)
+                else:
+                    self.assertTrue(gate.get("report_only"), path.name)
+                    self.assertNotIn("baseline", gate, path.name)
+                    self.assertNotIn("atol", gate, path.name)
 
     def test_every_gate_reaches_the_dashboard(self):
         # "accuracy" is the literal the dashboard's metric_kind() matches on; a
         # renamed key or value empties the tab without failing anything here.
         for path, mod in self._accuracy_modules():
-            self.assertEqual(mod.MODEL_CONFIG.get("dashboard"), "accuracy", path.name)
-            for params in model_config.build_gates(mod.MODEL_CONFIG):
+            self.assertEqual(_model_config(mod).get("dashboard"), "accuracy", path.name)
+            for params in model_config.build_gates(_model_config(mod)):
                 self.assertEqual(
                     (params.metric_labels or {}).get("kind"),
                     "accuracy",
@@ -632,7 +742,7 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                 )
                 self.assertEqual(
                     (params.metric_labels or {}).get("model"),
-                    "gpt-oss-120b",
+                    _model_config(mod)["dashboard_model"],
                     f"{path.name}: gate {params.name} has the wrong model series",
                 )
 
@@ -662,6 +772,17 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
         for path, _mod in self._accuracy_modules():
             suite = _registered_suite(path)
             self.assertIn(f'"{suite}"', runner, f"{suite} missing from run_suite.py")
+
+
+def _model_config(mod):
+    """The file's MODEL_CONFIG, however it declares it.
+
+    #836's shape builds it in a function so the gates can close over values the
+    fixture resolves; older files still assign the dict at import.
+    """
+    if hasattr(mod, "build_model_config"):
+        return mod.build_model_config()
+    return mod.MODEL_CONFIG
 
 
 def _config_modules(subdir, pattern):

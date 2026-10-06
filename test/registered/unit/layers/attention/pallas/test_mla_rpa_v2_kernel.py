@@ -442,6 +442,24 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         """
         self._run("extend", self.EXTEND_LENS, page_size=64, num_heads=3)
 
+    def test_extend_six_q_heads(self):
+        """6 bf16 heads (Kimi-K3 at TP16) must compile in Mosaic.
+
+        3 packed head rows do not fit the sublane tile; without q/o scratch
+        padding the MIXED kernel fails Mosaic lowering.
+        """
+        self._run("extend", self.EXTEND_LENS, page_size=128, num_heads=6)
+
+    def test_decode_six_q_heads(self):
+        """6 bf16 heads through both the batched and the tail decode passes."""
+        self._run(
+            "decode",
+            [(1, 64), (1, 130), (1, 257), (1, 300), (1, 511)],
+            page_size=128,
+            num_heads=6,
+            decode_batch_size=4,
+        )
+
     def test_decode_page_size_8(self):
         self._run("decode", self.DECODE_LENS, page_size=8)
 

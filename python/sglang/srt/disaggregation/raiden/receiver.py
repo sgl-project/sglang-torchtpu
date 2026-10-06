@@ -64,7 +64,11 @@ class RaidenReceiverMixin:
         blocks = req.blocks
         endpoint = req.endpoint
         with self._state_lock:
-            if room in self._aborted:
+            if (
+                room in self._aborted
+                or room in self._decode.final_seen
+                or req_id in self._decode.announced_at
+            ):
                 return
             self._decode.announced_at[req_id] = self._monotonic()
             self._decode.remote_total[room] = total_pages
@@ -92,7 +96,7 @@ class RaidenReceiverMixin:
 
         aux_index = None
         with self._state_lock:
-            if room in self._aborted:
+            if room in self._aborted or room in self._decode.final_seen:
                 return
             self._decode.remote_blocks[room] = remote_blocks
             self._decode.remote_endpoint[room] = endpoint
@@ -154,6 +158,11 @@ class RaidenReceiverMixin:
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
     ) -> None:
+        if self._pipeline is not None:
+            self._pipeline.register_decode(
+                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+            )
+            return
         if len(bootstrap_infos) != 1:
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
@@ -165,7 +174,7 @@ class RaidenReceiverMixin:
                     "Raiden asymmetric attention TP (got "
                     f"{len(bootstrap_infos)} prefill sources for one decode "
                     "rank) needs per-transfer host staging; do not set "
-                    "TPU_RAIDEN_DYNAMIC_HOST_STAGING=0."
+                    "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0."
                 )
             if not local_blocks:
                 # Full prefix-cache hit: decode already holds every page,
@@ -354,6 +363,8 @@ class RaidenReceiverMixin:
         Returns True once at least one read is in flight for the room. A False
         return is a retry: the caller polls again on the next scheduler pass.
         """
+        if self._pipeline is not None:
+            return self._pipeline.maybe_start_pull(room)
         if self.chunked_transfer:
             return self._start_chunked_pull(room)
         return self._start_whole_pull(room)
@@ -646,7 +657,12 @@ class RaidenReceiverMixin:
         blocks = req.blocks
         src_rank = req.src_rank
         with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
+            if (
+                room not in self._decode.reshard_meta
+                or room in self._aborted
+                or room in self._decode.final_seen
+                or room in self._decode.reshard_registered
+            ):
                 return
             per_source = self._decode.reshard_chunk_sources.setdefault(
                 room, {}
@@ -763,7 +779,12 @@ class RaidenReceiverMixin:
         ready = False
         aux_index = None
         with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
+            if (
+                room not in self._decode.reshard_meta
+                or room in self._aborted
+                or room in self._decode.final_seen
+                or room in self._decode.reshard_registered
+            ):
                 return
             self._decode.reshard_sources[room][src_rank] = prefill_blocks
             self._decode.reshard_swa_sources.setdefault(room, {})[src_rank] = (

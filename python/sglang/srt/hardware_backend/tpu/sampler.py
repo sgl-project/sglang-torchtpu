@@ -19,6 +19,7 @@ from sglang.srt.layers.sampler import (
     top_k_top_p_min_p_sampling_from_probs_torch,
 )
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
@@ -73,19 +74,15 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
             )
         return None if state.config is None else state.config.candidate_width
 
-    from sglang.srt.distributed import (
-        get_attn_tp_group,
-        get_tp_group,
-        model_parallel_is_initialized,
-    )
+    from sglang.srt.distributed import model_parallel_is_initialized
 
     if not model_parallel_is_initialized():
         return None
 
     group = (
-        get_attn_tp_group()
+        get_parallel().attn_tp_group
         if getattr(logits_processor, "use_attn_tp_group", False)
-        else get_tp_group()
+        else get_parallel().tp_group
     )
     expected_dtype = _distributed_top_k_output_dtype(logits_processor, lm_head)
     local_fallback_reason = None
@@ -111,15 +108,8 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
         from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
             register_pallas_distributed_top_k_op,
         )
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            register_distributed_top_k_rank,
-        )
 
         register_pallas_distributed_top_k_op(config.world_size)
-        # Must happen here, not on the first forward: direct_compile lifts the
-        # model's buffers into graph inputs when it traces, and the kernel's
-        # rank operand has to be one of them.
-        register_distributed_top_k_rank(lm_head, group=group)
 
     # Publish only after consensus and registration both succeed. A transport
     # or export failure must remain fatal instead of becoming a local fallback.

@@ -62,7 +62,7 @@ dependencies = [
   "transformers==5.8.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.2.0",
+  "xgrammar==0.2.7",
   "smg-grpc-servicer>=0.5.0",
 
   # The pins below form one TPU stack and must be upgraded and validated
@@ -76,12 +76,12 @@ dependencies = [
   # torch-tpu wheels come from a private package server (see the
   # [[tool.uv.index]] block below); installing them requires registry
   # credentials (workload identity on CI, gcloud ADC on dev machines).
-  "torch-tpu==0.1.1.dev20260924085621",
+  "torch-tpu==0.1.1+release.2026.9.22.20260927223741",
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
   # Published to PyPI as nightly .dev pre-releases (see [tool.uv.sources]).
-  "tpu-sync-torch==0.0.1.dev20260923040928",
+  "tpu-sync-torch==0.0.1.dev20261002213151",
   "libtpu==0.0.47",
   "torch==2.11.0",
   "torchvision==0.26.0",

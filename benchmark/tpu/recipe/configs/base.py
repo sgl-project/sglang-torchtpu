@@ -67,7 +67,6 @@ _FP8_BASE_CONFIG["runtime_env"].update(
                 "--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative",
                 "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
                 "--xla_tpu_offload_gather_to_sparsecore=false",
-                "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
                 "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
             ]
         ),

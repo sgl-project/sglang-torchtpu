@@ -40,7 +40,9 @@ def _disable_cpu_fallback():
         execution_mode.enable_cpu_fallback = original
 
 
-@unittest.skipUnless(hasattr(torch, "tpu") and torch.tpu.is_available(), "requires TPU")
+@unittest.skipUnless(
+    hasattr(torch, "accelerator") and torch.accelerator.is_available(), "requires TPU"
+)
 class TestDeviceEncoderScatter(unittest.TestCase):
     def setUp(self):
         _register_aten_fallbacks()

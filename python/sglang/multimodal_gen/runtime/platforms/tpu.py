@@ -135,6 +135,10 @@ class TpuPlatform(Platform):
         # tpu_dist implements collectives only; send/recv raise.
         return False
 
+    def supports_distributed_device_id(self) -> bool:
+        # PJRT owns the chiplet binding.
+        return False
+
     @classmethod
     def supports_device_tensor_pickle(cls) -> bool:
         # Reducing a PrivateUse1 storage aborts in tensor_to_buffer.cc.
@@ -153,7 +157,7 @@ class TpuPlatform(Platform):
         if not cls._worker_initialized:
             cls._init_worker_process()
             cls._worker_initialized = True
-        torch.tpu.set_device(device)
+        torch.accelerator.set_device_index(device)
 
     @classmethod
     def _init_worker_process(cls) -> None:

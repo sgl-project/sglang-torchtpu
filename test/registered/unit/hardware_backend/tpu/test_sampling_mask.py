@@ -71,7 +71,7 @@ def _filter_on_tpu(probs, top_ks, top_ps, min_ps, need_top_k, need_top_p, need_m
     return filtered.cpu().numpy()
 
 
-@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+@unittest.skipUnless(torch.accelerator.is_available(), "requires TPU")
 class TestFilterProbsOpMatchesSortReference(CustomTestCase):
     def _assert_matches_reference(
         self, probs, top_ks, top_ps, min_ps, need_top_k, need_top_p, need_min_p
@@ -83,6 +83,20 @@ class TestFilterProbsOpMatchesSortReference(CustomTestCase):
             probs, top_ks, top_ps, min_ps, need_top_k, need_top_p, need_min_p
         )
         np.testing.assert_array_equal(actual, expected)
+
+    def test_rows_off_the_power_of_two_bucket_match_reference(self):
+        """Row counts between buckets are padded with ghost rows for the op and
+        sliced back, so the caller sees its own shape and unchanged values."""
+        rng = np.random.default_rng(23)
+        for batch_size in (1, 3, 5, 13):
+            probs = _random_rows(rng, batch_size=batch_size, vocab_size=256)
+            top_ks = rng.integers(1, 200, size=batch_size).astype(np.int32)
+            top_ps = rng.uniform(0.1, 0.99, size=batch_size).astype(np.float32)
+            min_ps = rng.uniform(0.0, 0.3, size=batch_size).astype(np.float32)
+            with self.subTest(batch_size=batch_size):
+                actual = _filter_on_tpu(probs, top_ks, top_ps, min_ps, 1, 1, 1)
+                self.assertEqual(actual.shape, probs.shape)
+                self._assert_matches_reference(probs, top_ks, top_ps, min_ps, 1, 1, 1)
 
     def test_randomized_mixed_filters_match_sort_reference(self):
         rng = np.random.default_rng(17)
@@ -158,7 +172,7 @@ class TestFilterProbsOpMatchesSortReference(CustomTestCase):
         )
 
 
-@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+@unittest.skipUnless(torch.accelerator.is_available(), "requires TPU")
 class TestGatheredBlockFilterEquivalence(CustomTestCase):
     """Validates the widened fast path: top-p/min-p evaluated inside the
     `tpu_top_k`-gathered descending [bs, k] block (need_top_k=False) keeps
@@ -210,8 +224,23 @@ class TestGatheredBlockFilterEquivalence(CustomTestCase):
                 ):
                     np.testing.assert_array_equal(row_full, row_block)
 
+    def test_top_k_rows_off_the_power_of_two_bucket_match_torch(self):
+        """Row counts between buckets are padded for the exported TopK op and
+        sliced back, so the caller sees its own shape, values and indices."""
+        from sglang.srt.hardware_backend.tpu.top_k import tpu_top_k
 
-@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+        rng = np.random.default_rng(29)
+        for batch_size in (1, 3, 5, 13):
+            probs = _random_rows(rng, batch_size=batch_size, vocab_size=512)
+            with self.subTest(batch_size=batch_size):
+                values, ids = tpu_top_k(torch.from_numpy(probs).to("tpu"), 7)
+                expected = torch.topk(torch.from_numpy(probs), 7, dim=-1)
+                self.assertEqual(tuple(values.shape), (batch_size, 7))
+                torch.testing.assert_close(values.cpu(), expected.values)
+                self.assertEqual(ids.cpu().tolist(), expected.indices.tolist())
+
+
+@unittest.skipUnless(torch.accelerator.is_available(), "requires TPU")
 class TestEagleVerifyRenorm(CustomTestCase):
     """EAGLE verify renormalizes top-k, then top-p on the top-k-renormalized
     distribution. Each stage must keep the sort reference's support."""

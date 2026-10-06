@@ -5,12 +5,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 import msgspec
 from torch import nn
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
-
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class AttentionAndMoeLayers(NamedTuple):
@@ -146,7 +142,6 @@ def resolve_layer_indices(
     model: Any,
     model_config: ModelConfig,
     is_draft_worker: bool,
-    spec_algorithm: SpeculativeAlgorithm,
     draft_model_idx: Optional[int] = None,
 ) -> ModelLayerInfo:
     # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
@@ -155,8 +150,6 @@ def resolve_layer_indices(
     model_num_layers = _compute_model_num_layers(
         model=model, model_config=model_config, is_draft_worker=is_draft_worker
     )
-    _nnpl = model_config.num_nextn_predict_layers
-    model_has_mtp_layers = _nnpl is not None and _nnpl > 0
     pp_range = _resolve_pp_layer_range(model=model, model_num_layers=model_num_layers)
     num_effective_layers = pp_range.end_layer - pp_range.start_layer
 
@@ -165,13 +158,22 @@ def resolve_layer_indices(
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
-    if not is_npu():
-        _assert_pp_mtp_compat(
-            model_has_mtp_layers=model_has_mtp_layers,
-            spec_algorithm=spec_algorithm,
-            num_effective_layers=num_effective_layers,
-            model_num_layers=model_num_layers,
+    is_hybrid_swa_mtp_draft = (
+        is_draft_worker
+        and draft_model_idx is not None
+        and model_config.is_hybrid_swa
+        and getattr(model, "mtp_layer_id_is_depth", False)
+    )
+    owned_layers = (
+        range(draft_model_idx, draft_model_idx + 1)
+        if is_hybrid_swa_mtp_draft
+        else range(pp_range.start_layer, pp_range.end_layer)
+    )
+    swa_attention_layer_ids, full_attention_layer_ids = (
+        _resolve_local_hybrid_swa_layer_ids(
+            model_config=model_config, owned_layers=owned_layers
         )
+    )
 
     is_hybrid_swa_mtp_draft = (
         is_draft_worker
@@ -250,22 +252,3 @@ def _resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> _PPLayerRan
         start_layer=getattr(model, "start_layer", 0),
         end_layer=getattr(model, "end_layer", model_num_layers),
     )
-
-
-def _assert_pp_mtp_compat(
-    *,
-    model_has_mtp_layers: bool,
-    spec_algorithm: SpeculativeAlgorithm,
-    num_effective_layers: int,
-    model_num_layers: int,
-) -> None:
-    if envs.SGLANG_ENABLE_PP_SPEC.get():
-        return
-    assert (
-        (not model_has_mtp_layers)
-        or (spec_algorithm.is_none())
-        or (
-            (not spec_algorithm.is_none())
-            and (num_effective_layers == model_num_layers)
-        )
-    ), "PP is not compatible with MTP models."

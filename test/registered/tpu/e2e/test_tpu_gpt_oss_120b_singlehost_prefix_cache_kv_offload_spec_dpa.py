@@ -4,7 +4,7 @@ import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
-from sglang.test.tpu.kv_offload_probe import kv_offload_runner
+from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 
 register_tpu_ci(
     est_time=5400,

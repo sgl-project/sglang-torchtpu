@@ -1,0 +1,70 @@
+"""Unit tests for global TPU warmup collection."""
+
+import contextvars
+import sys
+
+import pytest
+
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
+from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+    collect_warmups,
+    current_warmup_queue,
+)
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_forward_context,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def test_collect_warmups_nests_and_preserves_context():
+    value = contextvars.ContextVar("value", default="outside")
+    events = []
+    with collect_warmups() as queue:
+        value.set("captured")
+        with collect_warmups() as nested:
+            assert nested is queue
+            nested.calls.append(PendingCall(lambda: events.append(value.get())))
+        value.set("changed")
+        queue.completions.append(lambda: events.append("complete"))
+        assert current_warmup_queue() is queue
+
+    assert events == ["captured", "complete"]
+    assert current_warmup_queue() is None
+    assert queue.calls == []
+    assert queue.completions == []
+
+
+def test_collect_warmups_clears_after_failure():
+    completed = []
+
+    def fail():
+        raise RuntimeError("warmup failed")
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        with collect_warmups() as queue:
+            queue.calls.append(PendingCall(fail))
+            queue.completions.append(lambda: completed.append(True))
+
+    assert current_warmup_queue() is None
+    assert completed == []
+    assert queue.calls == []
+    assert queue.completions == []
+
+
+def test_pending_call_restores_forward_context():
+    first_backend = object()
+    second_backend = object()
+    with forward_context(ForwardContext(attn_backend=first_backend)):
+        pending = PendingCall(lambda: get_forward_context().attn_backend)
+
+    with forward_context(ForwardContext(attn_backend=second_backend)):
+        assert pending.wait() is first_backend
+        assert get_forward_context().attn_backend is second_backend
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

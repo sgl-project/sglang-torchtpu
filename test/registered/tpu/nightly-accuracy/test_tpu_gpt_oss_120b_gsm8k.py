@@ -1,11 +1,15 @@
 """GPT-OSS 120B TPU full-dataset GSM8K nightly score."""
 
+import unittest
+
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
-from sglang.test.tpu.gpt_oss_120b_eval_common import (
-    BASE_URL,
-    make_launch_env,
+from sglang.test.tpu import (
+    GPT_OSS_120B,
     make_model_config,
+)
+from sglang.test.tpu.utils.accuracy_base import (
+    AccuracyTestCase,
+    gate_server_failures,
 )
 
 register_tpu_ci(
@@ -13,14 +17,6 @@ register_tpu_ci(
     suite="nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "accuracy"],
-)
-
-LAUNCH_ENV = make_launch_env(
-    MAX_TOTAL_TOKENS="262144",
-    OSL="4096",
-    CONCUR="32",
-    CONTEXT_LEN="8192",
-    TPU_COMPILE_BS="8 16 32",
 )
 
 GATE = {
@@ -34,13 +30,40 @@ GATE = {
     "reasoning_effort": "low",
 }
 
-MODEL_CONFIG = make_model_config(
-    test_name="gpt-oss-120b-gsm8k",
-    series_id="accuracy-gpt-oss-120b-gsm8k",
-    tag="gsm8k-e2e",
-    launch_env=LAUNCH_ENV,
-    gate=GATE,
-)
+CONFIG_MODULE = "recipe/configs/gpt_oss_120b/accuracy_gsm8k.py"
+
+
+def build_model_config():
+    """Assemble this benchmark's gate against the model's shared identity."""
+    return make_model_config(
+        GPT_OSS_120B,
+        test_name="gpt-oss-120b-gsm8k",
+        series_id="accuracy-gpt-oss-120b-gsm8k",
+        gate=GATE,
+    )
+
+
+class TestGptOss120bGSM8K(AccuracyTestCase):
+    """Score GPT-OSS-120B gsm8k on the server its recipe starts."""
+
+    config_module = CONFIG_MODULE
+    model_path = "/weights/gpt-oss-120b"
+    tag = "gpt-oss-120b-gsm8k-e2e"
+
+    @classmethod
+    def build_model_config(cls):
+        return build_model_config()
+
+    def test_accuracy(self):
+        self.run_evaluations()
+
+
+class TestGptOss120bGSM8KConfiguration(unittest.TestCase):
+    """Host-side configuration tests, runnable without TPU hardware."""
+
+    def test_gate_fits_the_server_its_recipe_starts(self):
+        self.assertEqual(gate_server_failures(CONFIG_MODULE, GATE), [])
+
 
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    unittest.main()

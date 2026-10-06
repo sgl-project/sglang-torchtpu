@@ -23,6 +23,7 @@ policy or driver. It should not know decoder- or ViT-specific padding rules.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -48,6 +49,9 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dfla
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
+)
+from sglang.srt.hardware_backend.tpu.compile_cache import (
+    add_tpu_rank_assignment_to_compile_cache_key,
 )
 from sglang.srt.platforms import current_platform
 
@@ -139,6 +143,10 @@ class TpuGraphRunner:
             "TpuGraphRunner should only be initialized when enable_torch_compile=True."
         )
 
+        # WORLD is initialized; set the tag before any policy creates a compile
+        # wrapper, since cache lookup can happen before its first warmup call.
+        add_tpu_rank_assignment_to_compile_cache_key()
+
         # Side-effectful import: registers the "tpu" dynamo backend so that
         # torch.compile(backend="tpu", ...) resolves. apply_tpu_patches does
         # this in init_backend; redo it defensively in case the runner is
@@ -208,9 +216,11 @@ class TpuGraphRunner:
             if callable(getattr(self.model, "modules", None))
             else (self.model,)
         )
+        warmup_start = time.perf_counter()
         installed_any = False
         installed_policies: list[CompilePolicy] = []
         compile_timing_recorder = getattr(model_runner, "compile_timing", None)
+        pending_warmups = []
         for module in modules:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:
@@ -259,7 +269,7 @@ class TpuGraphRunner:
             if installed:
                 installed_any = True
                 installed_policies.append(policy)
-                policy.precompile()
+                pending_warmups.extend(policy.precompile() or ())
 
         if not installed_any:
             server_args = model_runner.server_args
@@ -282,21 +292,50 @@ class TpuGraphRunner:
             if fallback_policy.install():
                 installed_any = True
                 installed_policies.append(fallback_policy)
-                fallback_policy.precompile()
+                pending_warmups.extend(fallback_policy.precompile() or ())
 
         if not installed_any:
             return
 
+        warmup_submitted = time.perf_counter()
+        from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+            current_warmup_queue,
+        )
+
+        queue = current_warmup_queue()
+        if queue is not None:
+            queue.calls.extend(pending_warmups)
+            queue.completions.append(lambda: self._finish_warmup(installed_policies))
+            logger.info("TpuGraphRunner queued %d global warmups", len(pending_warmups))
+            return
+        if pending_warmups:
+            logger.info("[direct_compile] waiting for %d warmups", len(pending_warmups))
+            for warmup in pending_warmups:
+                warmup.wait()
+        warmup_finished = time.perf_counter()
+        logger.info(
+            "TpuGraphRunner warmup grid: pending=%d submit=%.3fs wait=%.3fs total=%.3fs",
+            len(pending_warmups),
+            warmup_submitted - warmup_start,
+            warmup_finished - warmup_submitted,
+            warmup_finished - warmup_start,
+        )
+
+        self._finish_warmup(installed_policies)
+
+    def _finish_warmup(self, installed_policies: list[CompilePolicy]) -> None:
         # Baseline after model warmup. Later TPU speculative-op and KV-offload
         # warmup refresh the shared baseline in their own completion paths.
         if envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
             # A draft model precompiles later, from precompile_draft, and installs
             # the checker itself once that is done.
-            if not model_runner.is_draft_worker:
+            if not self.model_runner.is_draft_worker:
                 install_recompilation_checker(
                     policies=installed_policies,
                     model_label=type(self.model).__name__,
                 )
+        # PD harnesses wait for this marker before issuing requests.
+        logger.info("TpuGraphRunner precompile done")
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.

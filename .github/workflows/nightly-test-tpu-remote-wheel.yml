@@ -8,16 +8,15 @@
 #    torch-tpu registry (or user-specified wheel), logs the exact wheel version, and
 #    pushes the new image.
 # 3. Runs the test suites in parallel on GKE Cloud TPU hardware against the mutated container:
-#      [1] feature validation | [2] accuracy | [3] perf
+#      feature validation | perf  (accuracy runs on its own daytime schedule)
 # 4. Compares current run results against the nightly main baseline, printing a
 #    job-level pass/fail diff table with regressions and fixes to the GitHub Summary.
 name: Nightly Test (TPU - Remote Wheel)
 run-name: "Nightly Test (TPU - Remote Wheel)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
 on:
-  schedule:
-    - cron: "0 5 * * *"
-      timezone: "America/Los_Angeles"
+  # Dispatch-only: run it against a candidate wheel before bumping the torch_tpu pin.
+  # A daily run replayed the whole nightly on the nightly slices it shares.
   workflow_dispatch:
     inputs:
       ref:
@@ -52,7 +51,6 @@ on:
         options:
           - all
           - feature-validation
-          - accuracy
           - perf
           - mh
           - pd-mh-gpt-120b
@@ -220,7 +218,7 @@ jobs:
   # Step 3: Run test suites against the overridden container
   feature-validation:
     needs: override-wheel
-    if: ${{ !cancelled() && needs.override-wheel.result == 'success' && !contains(fromJSON('["accuracy","perf"]'), inputs.only || 'all') }}
+    if: ${{ !cancelled() && needs.override-wheel.result == 'success' && (inputs.only || 'all') != 'perf' }}
     uses: ./.github/workflows/feature-validation-tpu.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -228,18 +226,6 @@ jobs:
       only: ${{ contains(fromJSON('["all","feature-validation"]'), inputs.only || 'all') && 'all' || inputs.only }}
       test_filter: ${{ inputs.test_filter || '' }}
       update-dashboard: ${{ inputs.update-dashboard || false }}
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy:
-    needs: override-wheel
-    if: ${{ !cancelled() && needs.override-wheel.result == 'success' && contains(fromJSON('["all","accuracy"]'), inputs.only || 'all') }}
-    uses: ./.github/workflows/accuracy-test-tpu.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.override-wheel.outputs.digest }}
-      model: nightly
     permissions:
       contents: read
       id-token: write
@@ -258,7 +244,7 @@ jobs:
 
   # Step 4: Compare current run results against the nightly main baseline
   report-baseline-diff:
-    needs: [resolve-baseline, override-wheel, feature-validation, accuracy, perf]
+    needs: [resolve-baseline, override-wheel, feature-validation, perf]
     if: ${{ always() && !cancelled() && needs.resolve-baseline.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:

@@ -97,6 +97,10 @@ def test_worker_preserves_context_and_serializes_copies(monkeypatch):
 
     get_device_module = Mock(return_value=device_module)
     monkeypatch.setattr(torch, "get_device_module", get_device_module)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
+    monkeypatch.setattr(
+        torch.accelerator, "device_index", lambda value: context("device", value)
+    )
 
     def make_result(first):
         event = DelayedCopyEvent()

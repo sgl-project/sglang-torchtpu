@@ -340,7 +340,6 @@ def kernel_main_fused_rs(
     w1_gs_gate_ref,  # (E,) GMM1 gate global_scale
     w1_gs_up_ref,  # (E,) GMM1 up global_scale
     w2_gs_ref,  # (E,) GMM2 global_scale
-    tp_rank_to_device_id_ref,
     # In (7)
     hidden_states_ref,
     w1_ref,
@@ -1009,7 +1008,7 @@ def kernel_main_fused_rs(
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
-                if step == 0:
+                if step == 0 and can_cache_w1:
 
                     @pl.when(gm_id + 1 < local_num_gm)
                     def _():
@@ -1033,7 +1032,10 @@ def kernel_main_fused_rs(
 
                 @pl.when(jnp.logical_not(next_same))
                 def _():
-                    for _i in range(1, min(num_w1_bufs, total_w1_steps)):
+                    # Rotating W1 tiles still need buffer zero until GMM1 finishes.
+                    for _i in range(
+                        1 if can_cache_w1 else 0, min(num_w1_bufs, total_w1_steps)
+                    ):
                         start_w1_dma(_i, next_e, _i // num_k1, _i % num_k1)
 
             with jax.named_scope("interlude"):
@@ -1154,7 +1156,7 @@ def kernel_main_fused_rs(
 
                         @pl.when(~is_local)
                         def _():
-                            target_device_id = tp_rank_to_device_id_ref[dest_chip]
+                            target_device_id = dest_chip
                             pltpu.make_async_remote_copy(
                                 src_ref=scatter_fp8_staging_3x_ref.at[
                                     stg_id, pl.ds(row_idx, 1), :, :
@@ -1199,7 +1201,7 @@ def kernel_main_fused_rs(
 
                         @pl.when(~is_local)
                         def _():
-                            target_device_id = tp_rank_to_device_id_ref[dest_chip]
+                            target_device_id = dest_chip
                             pltpu.make_async_remote_copy(
                                 src_ref=scatter_staging_3x_ref.at[
                                     stg_id, pl.ds(row_idx, 1), :, :
@@ -1276,7 +1278,6 @@ def kernel_main_fused_rs_fp8(
     w1_gs_gate_ref,
     w1_gs_up_ref,
     w2_gs_ref,
-    tp_rank_to_device_id_ref,
     hidden_states_ref,
     w1_ref,
     w2_ref,
@@ -1347,7 +1348,6 @@ def kernel_main_fused_rs_fp8(
         w1_gs_gate_ref,
         w1_gs_up_ref,
         w2_gs_ref,
-        tp_rank_to_device_id_ref,
         hidden_states_ref,
         w1_ref,
         w2_ref,
@@ -1452,7 +1452,6 @@ def gmm_v2_fused_rs(
     caller_tile_m: int | None = None,
     top_k: int,
     fp8_direct_write: bool = False,
-    tp_rank_to_device_id: jax.Array | None,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -1898,10 +1897,6 @@ def gmm_v2_fused_rs(
         primary_idx_ref = lhs_indices
         secondary_idx_ref = topk_indices
 
-    assert tp_rank_to_device_id is not None, (
-        "tp_rank_to_device_id mapping is required for gmm_v2_fused_rs"
-    )
-
     pallas_inputs = (
         group_sizes,
         group_offset,
@@ -1912,7 +1907,6 @@ def gmm_v2_fused_rs(
         _w1_gs_gate,
         _w1_gs_up,
         _w2_gs,
-        tp_rank_to_device_id,
         hidden_3d,
         w1,
         w2,
@@ -1968,7 +1962,7 @@ def gmm_v2_fused_rs(
             functools.partial(kernel_main_fused_rs_fp8, **kernel_kwargs),
             out_shape=(out_buf_init, out_scale_init),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=10,
+                num_scalar_prefetch=9,
                 in_specs=in_specs,
                 out_specs=[
                     pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1986,7 +1980,7 @@ def gmm_v2_fused_rs(
         functools.partial(kernel_main_fused_rs, **kernel_kwargs),
         out_shape=out_buf_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=10,
+            num_scalar_prefetch=9,
             in_specs=in_specs,
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,

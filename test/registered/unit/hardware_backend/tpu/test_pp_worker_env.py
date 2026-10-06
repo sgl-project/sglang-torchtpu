@@ -18,7 +18,7 @@ from sglang.srt.utils.patch_torch import (
     initialize_torch_tpu_worker,
     monkey_patch_torch_tpu_env,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 _ENV_VARS = (
     "RANK",
@@ -156,6 +156,8 @@ class TestPipelineGroupCommunicators(CustomTestCase):
         world.device_group = Mock()
         world.local_rank = 0
         with (
+            # initialize_model_parallel reads the widths from the published config.
+            published_topology(tp_size=1, pp_size=8),
             patch.object(parallel_state, "_is_tpu", True),
             patch.object(parallel_state, "_WORLD", None),
             patch.object(parallel_state, "_TP", None),
@@ -173,10 +175,7 @@ class TestPipelineGroupCommunicators(CustomTestCase):
             ),
             patch.object(parallel_state, "get_world_group", return_value=world),
         ):
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=8,
-            )
+            parallel_state.initialize_model_parallel()
             parallel_state.destroy_model_parallel()
         return captured["pp"]
 

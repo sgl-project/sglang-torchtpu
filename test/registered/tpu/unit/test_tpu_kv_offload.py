@@ -34,7 +34,7 @@ def _has_tpu_via_jax() -> bool:
 
 
 def _has_tpu_via_torch() -> bool:
-    return hasattr(torch, "tpu") and torch.tpu.is_available()
+    return hasattr(torch, "accelerator") and torch.accelerator.is_available()
 
 
 _SKIP_REASON = "Requires torch_tpu + JAX with a TPU backend visible to jax.devices()"
