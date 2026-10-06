@@ -31,6 +31,8 @@ if TYPE_CHECKING:
         TpuPagedTokenToKVPoolAllocator,
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
 
 class KVFreeFence:
@@ -187,15 +189,31 @@ class HeldPages:
 
 
 def install_kv_free_fence(
-    allocator: BaseTokenToKVPoolAllocator, synchronize_device: Callable[[], None]
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    synchronize_device: Callable[[], None],
+    spec_algorithm: SpeculativeAlgorithm | CustomSpecAlgo,
+    copies_draft_tail: bool,
 ) -> KVFreeFence:
     """Attach a fence to ``allocator`` and its page pools. Raises unless every
-    pool is a TPU paged allocator, whose frees and allocations it hooks."""
+    pool is a TPU paged allocator, whose frees and allocations it hooks, and
+    every KV write of a forward precedes a tensor its result copies to host."""
     from sglang.srt.hardware_backend.tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
+    if not spec_algorithm.supports_kv_free_fence(copies_draft_tail=copies_draft_tail):
+        # copy_done would complete before the KV writes that follow every copy.
+        hint = (
+            " unless SGLANG_TPU_ASYNC_COPY_WORKER is on"
+            if spec_algorithm.supports_kv_free_fence(copies_draft_tail=True)
+            else ""
+        )
+        raise ValueError(
+            f"{spec_algorithm.name} speculative decoding is not supported with "
+            f"the raiden HiCache backend under overlap scheduling on TPU{hint}."
+        )
     if type(allocator) is SWATokenToKVPoolAllocator:
         pools = [allocator.full_attn_allocator, allocator.swa_attn_allocator]
     else:

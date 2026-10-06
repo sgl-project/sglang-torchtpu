@@ -174,6 +174,24 @@ class SpeculativeAlgorithm(Enum):
         """Whether this algorithm supports TPU direct compilation."""
         return self.is_eagle3() or self.is_dflash()
 
+    def supports_kv_free_fence(self, *, copies_draft_tail: bool) -> bool:
+        """Whether some tensor a forward's result copies to host is computed
+        after the forward's last KV write, as the TPU KV free fence requires.
+        ``copies_draft_tail``: the copy includes the EAGLE draft input's topk."""
+        # Their next tokens are computed after their last KV write.
+        if self in (
+            SpeculativeAlgorithm.NONE,
+            SpeculativeAlgorithm.FROZEN_KV_MTP,
+            SpeculativeAlgorithm.UNO,
+        ):
+            return True
+        # EAGLE's draft extend writes KV after verify and computes the topk.
+        return copies_draft_tail and self in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.STANDALONE,
+        )
+
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no

@@ -37,12 +37,20 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 PAGE = 4
+
+_install = functools.partial(
+    install_kv_free_fence,
+    spec_algorithm=SpeculativeAlgorithm.NONE,
+    copies_draft_tail=False,
+)
 
 
 class _CopyDone:
@@ -64,7 +72,7 @@ class TestKVFreeFence(CustomTestCase):
             kvcache=None,
             need_sort=need_sort,
         )
-        self.fence = install_kv_free_fence(
+        self.fence = _install(
             self.allocator, synchronize_device=lambda: self.log.append("device")
         )
 
@@ -230,7 +238,7 @@ class TestKVFreeFence(CustomTestCase):
         wrapper = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
         wrapper.full_attn_allocator = full
         wrapper.swa_attn_allocator = swa
-        fence = install_kv_free_fence(wrapper, synchronize_device=lambda: None)
+        fence = _install(wrapper, synchronize_device=lambda: None)
         self.assertIs(full.kv_free_fence, fence)
         self.assertIs(swa.kv_free_fence, fence)
 
@@ -243,7 +251,49 @@ class TestKVFreeFence(CustomTestCase):
             need_sort=False,
         )
         with self.assertRaises(ValueError):
-            install_kv_free_fence(generic, synchronize_device=lambda: None)
+            _install(generic, synchronize_device=lambda: None)
+
+    def test_install_allows_only_spec_algorithms_whose_result_copy_follows_kv(self):
+        """copy_done covers a KV write only if a copied tensor is computed after
+        it; EAGLE's draft extend writes KV after every result tensor but topk,
+        and DFLASH, DSPARK and NGRAM write KV after all of them."""
+        allowed = [
+            (SpeculativeAlgorithm.NONE, False),
+            (SpeculativeAlgorithm.FROZEN_KV_MTP, False),
+            (SpeculativeAlgorithm.UNO, False),
+            (SpeculativeAlgorithm.EAGLE, True),
+            (SpeculativeAlgorithm.EAGLE3, True),
+            (SpeculativeAlgorithm.STANDALONE, True),
+        ]
+        rejected = [
+            (SpeculativeAlgorithm.EAGLE, False),
+            (SpeculativeAlgorithm.DFLASH, True),
+            (SpeculativeAlgorithm.DSPARK, True),
+            (SpeculativeAlgorithm.NGRAM, True),
+            (CustomSpecAlgo("PLUGIN", factory=lambda server_args: None), True),
+        ]
+        for spec_algorithm, copies_draft_tail in allowed + rejected:
+            with self.subTest(spec=spec_algorithm, copies_draft_tail=copies_draft_tail):
+                allocator = TpuPagedTokenToKVPoolAllocator(
+                    size=4 * PAGE,
+                    page_size=PAGE,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=None,
+                    need_sort=False,
+                )
+                install = functools.partial(
+                    install_kv_free_fence,
+                    allocator,
+                    synchronize_device=lambda: None,
+                    spec_algorithm=spec_algorithm,
+                    copies_draft_tail=copies_draft_tail,
+                )
+                if (spec_algorithm, copies_draft_tail) in allowed:
+                    install()
+                else:
+                    with self.assertRaises(ValueError):
+                        install()
 
 
 class TestRadixEvictionUnderFence(CustomTestCase):
@@ -270,9 +320,7 @@ class TestRadixEvictionUnderFence(CustomTestCase):
             kvcache=kv_pool,
             need_sort=False,
         )
-        self.fence = install_kv_free_fence(
-            self.allocator, synchronize_device=lambda: None
-        )
+        self.fence = _install(self.allocator, synchronize_device=lambda: None)
         self.cache = UnifiedRadixCache(
             CacheInitParams(
                 disable=False,
