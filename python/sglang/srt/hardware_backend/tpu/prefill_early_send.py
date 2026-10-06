@@ -64,9 +64,13 @@ def tpu_hicache_load_page_ids(
     size, the same unit the early-send clips use for prefix slots.
     """
     page_size = scheduler.token_to_kv_pool_allocator.page_size
-    page_ids = torch.cat(list(load_indices)).cpu().to(torch.int64) // page_size
-    # Each request scans this batch-wide set, so compact it once here.
-    return torch.unique(page_ids)
+    # A page's slots are adjacent within a load, so collapse each run first;
+    # the final sort then sees about one entry per page.
+    page_ids = [
+        torch.unique_consecutive(indices.cpu() // page_size).to(torch.int64)
+        for indices in load_indices
+    ]
+    return torch.unique(torch.cat(page_ids))
 
 
 def tpu_clip_hicache_load_send_end(

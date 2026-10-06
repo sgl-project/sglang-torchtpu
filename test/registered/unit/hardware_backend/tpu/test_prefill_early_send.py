@@ -428,6 +428,11 @@ class TestHiCacheLoadPageIds(CustomTestCase):
         # Every slot of a page maps to the same page ID, so each ID repeats 64 times;
         # each physical page needs only one entry.
         self.assertEqual(sorted(page_ids.tolist()), [1, 2, 3])
+        # The IDs stay unique even if a page's slots are not adjacent in a load.
+        page_ids = tpu_hicache_load_page_ids(
+            scheduler=scheduler, load_indices=[torch.tensor([0, 130, 1])]
+        )
+        self.assertEqual(sorted(page_ids.tolist()), [0, 2])
 
 
 class TestUpdateInflightKvWritePages(CustomTestCase):
