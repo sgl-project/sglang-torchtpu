@@ -203,13 +203,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return nullcontext()
         return self.kv_free_fence.forward_write_target()
 
-    def freeing_released_values(self, release_time: float | None) -> ContextManager:
+    def freeing_values_written_before(
+        self, write_horizon: float | None
+    ) -> ContextManager:
         """Scope frees of cached values no forward formed after
-        ``release_time`` (the radix tree's time counter) can write; None when
+        ``write_horizon`` (the radix tree's time counter) can write; None when
         unknown."""
         if self.kv_free_fence is None:
             return nullcontext()
-        return self.kv_free_fence.freeing_released_values(release_time)
+        return self.kv_free_fence.freeing_values_written_before(write_horizon)
 
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"

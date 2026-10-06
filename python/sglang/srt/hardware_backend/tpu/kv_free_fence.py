@@ -54,7 +54,7 @@ class KVFreeFence:
         # Latest seq a device sync has covered.
         self._device_done = 0
         self._forward_write_target = False
-        self._free_release_time: Optional[float] = None
+        self._free_write_horizon: Optional[float] = None
         self._allocators: List[TpuPagedTokenToKVPoolAllocator] = []
 
     def attach(self, allocator: TpuPagedTokenToKVPoolAllocator) -> None:
@@ -73,8 +73,8 @@ class KVFreeFence:
         if oldest_running is None:
             return None
         if (
-            self._free_release_time is not None
-            and self._free_release_time < oldest_running
+            self._free_write_horizon is not None
+            and self._free_write_horizon < oldest_running
         ):
             return None
         return self._formed
@@ -127,14 +127,16 @@ class KVFreeFence:
             allocator.release_held_pages(completed)
 
     @contextmanager
-    def freeing_released_values(self, release_time: Optional[float]) -> Iterator[None]:
-        """Frees here are of values no forward formed after ``release_time``
+    def freeing_values_written_before(
+        self, write_horizon: Optional[float]
+    ) -> Iterator[None]:
+        """Frees here are of values no forward formed after ``write_horizon``
         writes; they skip the hold if every running forward formed later."""
-        prev, self._free_release_time = self._free_release_time, release_time
+        prev, self._free_write_horizon = self._free_write_horizon, write_horizon
         try:
             yield
         finally:
-            self._free_release_time = prev
+            self._free_write_horizon = prev
 
     @contextmanager
     def forward_write_target(self) -> Iterator[None]:
@@ -182,10 +184,6 @@ class HeldPages:
             remaining -= ids.numel()
         self.num_pages -= num_pages
         return torch.cat(taken)
-
-    def clear(self) -> None:
-        self._entries.clear()
-        self.num_pages = 0
 
 
 def install_kv_free_fence(

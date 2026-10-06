@@ -427,7 +427,7 @@ class TestRadixEvictionUnderFence(CustomTestCase):
             for call in _attribute_calls(func):
                 lines.setdefault(call.func.attr, []).append(call.lineno)
             release_lines = [n for name in releases for n in lines.get(name, ())]
-            stamp_lines = lines.get("_stamp_release", [])
+            stamp_lines = lines.get("_stamp_write_horizon", [])
             if release_lines and min(stamp_lines, default=float("inf")) > min(
                 release_lines
             ):
@@ -441,7 +441,7 @@ def _srt_functions() -> List[Tuple[Path, ast.FunctionDef | ast.AsyncFunctionDef]
     srt = Path(sglang.__file__).parent / "srt"
     functions = []
     for path in srt.rglob("*.py"):
-        # The Rust core reports no release time, so all its frees are held.
+        # The Rust core reports no write horizon, so all its frees are held.
         if "rust_tree_core" in path.parts:
             continue
         with warnings.catch_warnings():

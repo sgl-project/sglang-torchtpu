@@ -1334,9 +1334,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def _drain_device_frees(
         self, device_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
-        release_time = self.tree_core.take_device_frees_release_time()
+        write_horizon = self.tree_core.take_device_frees_write_horizon()
         # Free per component device slots, consuming each entry as it frees.
-        with self.token_to_kv_pool_allocator.freeing_released_values(release_time):
+        with self.token_to_kv_pool_allocator.freeing_values_written_before(
+            write_horizon
+        ):
             for ct in list(device_frees):
                 self._apply_cache_action(
                     FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)

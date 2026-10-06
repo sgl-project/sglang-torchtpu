@@ -50,7 +50,7 @@ class _FakeTreeCore:
         # write-through drop counter; this fake never tracks a walk.
         self._is_tracking_unbacked_tokens = False
         self._tracked_unbacked_tokens = 0
-        self._device_frees_release_time = None
+        self._device_frees_write_horizon = None
 
     def _evict_component_and_detach_lru(self, node, component, *args, **kwargs):
         self.evicted.append(node)
