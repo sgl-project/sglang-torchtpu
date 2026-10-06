@@ -162,10 +162,12 @@ def direct_compile(
     the caller supplies this key because computing a generic key can be
     expensive. Use `torch.compile` if you want automatic specialization.
 
-    Caveat: like `jax.jit`, `direct_compile` does not normalize inputs. Calling
-    `fn` with an equivalent but differently structured `(args, kwargs)` creates
-    a different specialization. Model warmup, where compilation occurs, must
-    therefore call `fn` exactly as model serving does.
+    Caveat: like `jax.jit`, `direct_compile` does not normalize input structure.
+    Calling `fn` with an equivalent but differently structured `(args, kwargs)`
+    creates a different specialization. Model warmup, where compilation occurs,
+    must therefore call `fn` exactly as model serving does. Explicit scalar
+    Tensor views are materialized into owned storage because TorchTPU's physical
+    executable input shape otherwise depends on the view's storage offset.
 
     `ignored_argnames` names arguments that are not captured as graph inputs.
     This is useful for unused Tensors whose shapes would otherwise cause
@@ -377,7 +379,10 @@ class CompiledFunction:
         kv_pool_input_start = model_input_count
         kv_pool_input_stop = kv_pool_input_start + len(kv_pool_inputs)
         flat_inputs = [*model_inputs, *kv_pool_inputs]
-        flat_inputs.extend(path_leaves[index][1] for index in tensor_leaf_indices)
+        flat_inputs.extend(
+            _normalize_explicit_tensor_input(path_leaves[index][1])
+            for index in tensor_leaf_indices
+        )
 
         # Step 2: We've figured out all of our args. Now, we can create
         # placeholders for them. These will all be inputs to the MLIR graph.
@@ -599,7 +604,7 @@ class _CompiledArtifact:
                     f"is now {tuple(value.shape)} ({value.dtype}). The "
                     "specialization key does not cover whatever varies here."
                 )
-            inputs.append(value)
+            inputs.append(_normalize_explicit_tensor_input(value))
 
         outputs = tpu_torch_compile.execute(self.executable, inputs)
 
@@ -699,6 +704,20 @@ def _get_path(value: Any, path: tree_util.KeyPath) -> Any:
             value = getattr(value, key.name)
         else:
             raise TypeError(f"Unsupported JAX key type: {type(key).__name__}")
+    return value
+
+
+def _normalize_explicit_tensor_input(value: torch.Tensor) -> torch.Tensor:
+    """Give scalar views a stable physical input representation.
+
+    TorchTPU reconstructs a view from the minimum contiguous base containing
+    its storage offset. Two scalar views can therefore both have shape ``()``
+    while requiring different executable parameter shapes. Explicit inputs are
+    read-only in direct_compile, so materializing such a scalar is safe and
+    avoids making every caller clone value-like metadata individually.
+    """
+    if value.ndim == 0 and (value._base is not None or value.storage_offset() != 0):
+        return value.clone()
     return value
 
 

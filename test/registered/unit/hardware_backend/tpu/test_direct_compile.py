@@ -392,6 +392,92 @@ class TestDirectCompile(CustomTestCase):
                         )
                 self.assertEqual(len(compiled.cache), 1)
 
+    def test_scalar_view_inputs_are_materialized_for_compile_and_execute(self):
+        compile_base = torch.arange(129, dtype=torch.int32)
+        compile_value = compile_base[0]
+        runtime_base = torch.arange(126, dtype=torch.int32)
+        runtime_value = runtime_base[125]
+        placeholder_inputs = []
+
+        compiled = direct_compile.direct_compile(
+            lambda value: value + value,
+            specialization_key=lambda _value: None,
+        )
+        compiler = direct_compile.tpu_torch_compile
+        with (
+            patch.object(direct_compile, "_is_tpu_tensor", return_value=True),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler,
+                "placeholder_like",
+                side_effect=lambda tensor: placeholder_inputs.append(tensor)
+                or tensor.clone(),
+            ),
+            patch.object(
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ),
+            patch.object(
+                compiler,
+                "execute",
+                side_effect=([torch.tensor(0)], [torch.tensor(250)]),
+            ) as execute,
+        ):
+            compiled(compile_value)
+            output = compiled(runtime_value)
+
+        self.assertEqual(output.item(), 250)
+        self.assertEqual(len(placeholder_inputs), 1)
+        self.assertEqual(placeholder_inputs[0].storage_offset(), 0)
+        self.assertIsNone(placeholder_inputs[0]._base)
+        self.assertEqual(placeholder_inputs[0].item(), 0)
+
+        runtime_input = execute.call_args_list[1].args[1][0]
+        self.assertEqual(runtime_input.storage_offset(), 0)
+        self.assertIsNone(runtime_input._base)
+        self.assertEqual(runtime_input.item(), 125)
+        self.assertIsNot(runtime_input, runtime_value)
+        runtime_base[125] = -1
+        self.assertEqual(runtime_input.item(), 125)
+
+    def test_scalar_view_normalization_preserves_other_explicit_inputs(self):
+        owned_scalar = torch.tensor(1)
+        vector_view = torch.arange(4)[1:]
+        detached_scalar_view = torch.arange(4)[2].detach()
+
+        self.assertIs(
+            direct_compile._normalize_explicit_tensor_input(owned_scalar),
+            owned_scalar,
+        )
+        self.assertIs(
+            direct_compile._normalize_explicit_tensor_input(vector_view),
+            vector_view,
+        )
+
+        normalized = direct_compile._normalize_explicit_tensor_input(
+            detached_scalar_view
+        )
+        self.assertIsNot(normalized, detached_scalar_view)
+        self.assertEqual(normalized.storage_offset(), 0)
+        self.assertIsNone(normalized._base)
+        self.assertEqual(normalized.item(), 2)
+
+    @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+    def test_scalar_view_storage_offsets_share_compiled_artifact(self):
+        compiled = direct_compile.direct_compile(
+            lambda value: value + value,
+            specialization_key=lambda _value: None,
+        )
+        compile_base = torch.arange(129, dtype=torch.int32, device="tpu")
+        runtime_base = torch.arange(126, dtype=torch.int32, device="tpu")
+
+        self.assertEqual(compiled(compile_base[128]).cpu().item(), 256)
+        self.assertEqual(compiled(runtime_base[125]).cpu().item(), 250)
+        self.assertEqual(len(compiled.cache), 1)
+
     def test_model_extra_tensor_attrs_trace_user_object_state_and_aliases(self):
         model = _ModelWithObjectTensorState()
         original_value = model.object_state.value
