@@ -1496,22 +1496,12 @@ class KVCacheConfigurator:
             pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
         elif current_platform.is_tpu():
-            num_swa_only = sum(1 for r in compression_ratios if r == 0)
-            num_c4 = sum(1 for r in compression_ratios if r == 4)
-            num_c128 = sum(1 for r in compression_ratios if r == 128)
-            logger.info(
-                f"[DSV4-TPU Stage 1 Verified] Model & weights loaded, "
-                f"layers={len(compression_ratios)} (swa_only={num_swa_only}, c4={num_c4}, c128={num_c128}, "
-                f"kv_sources={len(kv_source_layers)}), "
-                f"pool_sizes=(full={full_max_total_num_tokens}, swa={swa_max_total_num_tokens}, "
-                f"c4={c4_max_total_num_tokens}, c128={c128_max_total_num_tokens}, "
-                f"c4_state={c4_state_pool_size}, c128_state={c128_state_pool_size}, "
-                f"max_reqs={max_running_requests}, page_size={swa_page_size})"
+            from sglang.srt.hardware_backend.tpu.dsv4.dsv4_memory_pool import (
+                DSV4TPUTokenToKVPool,
             )
-            raise NotImplementedError(
-                "[DSV4-TPU Stage 1 Verified] Model config, weight loading, and DSV4PoolConfigurator "
-                "succeeded. Next step (Iteration 2): implement DSV4TPUTokenToKVPool."
-            )
+
+            pool_cls = DSV4TPUTokenToKVPool
+            kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
@@ -1557,7 +1547,9 @@ class KVCacheConfigurator:
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
             **kv_layout_kwargs,
         )
-        if not self.is_draft_worker and token_to_kv_pool._unified_kv:
+        if not self.is_draft_worker and (
+            token_to_kv_pool._unified_kv or current_platform.is_tpu()
+        ):
             # The draft pool has no C4 layers and shares this req pool, so only
             # the target registers the per-slot C4 reset.
             req_to_token_pool.register_on_alloc_rows(
