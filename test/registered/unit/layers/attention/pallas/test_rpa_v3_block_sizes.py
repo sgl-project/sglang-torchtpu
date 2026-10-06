@@ -84,6 +84,75 @@ class TestTpu7xPrefillBlocks(CustomTestCase):
         self.assertEqual((blocks["bq_sz"], blocks["bkv_sz"]), (64, 2048))
 
 
+def _as_tuple(blocks):
+    return (blocks["bq_sz"], blocks["bkv_sz"], blocks["bq_csz"], blocks["bkv_csz"])
+
+
+class TestTpu7xPrefillBlocksKeepQueryRows(CustomTestCase):
+    """PREFILL/MIXED blocks over the VMEM budget give up KV depth, down to the
+    KV compute chunk, before query rows below the query compute block."""
+
+    def test_gpt_oss_pp_stage_fp8_keeps_128_query_rows(self):
+        """gpt-oss-120b's 64 query / 8 KV heads on one core (a pipeline stage
+        at TP1) with fp8 KV: 128 query rows are over the budget with 2048- and
+        1024-row KV blocks and within it with 512, so the KV block shrinks
+        instead of the query block. Measured on tpu7x, 16K-token prefill: full
+        attention runs 5% faster than at the (64, 2048) the generic loop
+        picked, with identical output."""
+        blocks = _block_sizes(
+            num_q_heads=64,
+            num_kv_heads=8,
+            head_dim=64,
+            kv_dtype=jnp.float8_e4m3fn,
+            vmem_limit=TPU7X_VMEM,
+        )
+        self.assertEqual(_as_tuple(blocks), (128, 512, 128, 512))
+
+    def test_mha_keeps_64_query_rows(self):
+        """32 query over 32 KV heads (MHA), head_dim 128, on one core: the
+        generic loop took the query block down to 16 rows with fp8 KV and 8
+        with bf16. Measured on tpu7x, 16K-token prefills: these blocks run
+        full attention 3.1 to 3.4x (fp8) and 4.2 to 4.3x (bf16) faster."""
+        for kv_dtype, expected in (
+            (jnp.float8_e4m3fn, (64, 1024, 64, 512)),
+            (jnp.bfloat16, (64, 512, 64, 512)),
+        ):
+            with self.subTest(kv=kv_dtype):
+                blocks = _block_sizes(
+                    num_q_heads=32,
+                    num_kv_heads=32,
+                    head_dim=128,
+                    kv_dtype=kv_dtype,
+                    vmem_limit=TPU7X_VMEM,
+                )
+                self.assertEqual(_as_tuple(blocks), expected)
+
+    def test_query_rows_go_below_the_compute_block_only_when_no_kv_block_fits(
+        self,
+    ):
+        """With 128 rows over budget at every KV depth, the query block halves
+        and its KV block restarts from the deepest candidate."""
+
+        def fits(bq, bkv, bkv_c):
+            return bq <= 64
+
+        self.assertEqual(
+            rpa._fit_prefill_blocks_keeping_query_rows(256, 2048, 128, 512, fits),
+            (64, 2048, 64, 512),
+        )
+
+    def test_returns_none_when_one_kv_chunk_does_not_fit(self):
+        """Nothing at or above the KV compute chunk fits: the caller's generic
+        loop takes over and may shrink the chunk itself."""
+
+        def fits(bq, bkv, bkv_c):
+            return bkv < 512
+
+        self.assertIsNone(
+            rpa._fit_prefill_blocks_keeping_query_rows(256, 2048, 128, 512, fits)
+        )
+
+
 def _decode_block_sizes(*, num_q_heads, num_kv_heads, head_dim, kv_dtype, vmem_limit):
     """Decode-case blocks for a 32k-context batch at page 128."""
     with mock.patch.object(rpa, "get_tpu_version", return_value=7):

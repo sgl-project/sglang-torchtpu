@@ -1537,6 +1537,41 @@ def dynamic_validate_inputs(
                 )
 
 
+def _fit_prefill_blocks_keeping_query_rows(bq_sz, bkv_sz, bq_csz, bkv_csz, fits):
+    """Shrink PREFILL/MIXED blocks into the VMEM budget, KV depth first.
+
+    ``fits(bq_sz, bkv_sz, bkv_csz)`` says whether blocks are within budget.
+    The query block halves down to its compute block ``bq_csz``; then, for
+    each query block from there down, the deepest KV block that is a multiple
+    of the KV compute chunk ``bkv_csz`` and fits wins. Returns
+    ``(bq_sz, bkv_sz, bq_csz, bkv_csz)``, or None when not even one KV compute
+    chunk fits beside a 1-row query block, leaving the caller's generic loop
+    to shrink the chunk as well.
+
+    The generic loop halves the query block while ``bkv_sz <= bq_sz *
+    bkv_alignment``, e.g. down to 16 rows at page 64 before a 2048-row KV
+    block shrinks. Every query block re-reads the keys it attends to, so query
+    rows are worth more than KV depth: for gpt-oss-120b's 64 query / 8 KV heads
+    with fp8 KV (one pipeline stage at TP1), 16K-token prefill on tpu7x, full
+    attention runs 5% faster at (128, 512, 128, 512) than at the generic
+    loop's (64, 2048, 64, 512), while a 2048-row KV block gains only 0.3% over
+    a 512-row one at 128 query rows.
+    """
+    if bkv_csz <= 0 or bkv_sz % bkv_csz:
+        return None
+    while bq_sz > bq_csz and not fits(bq_sz, bkv_sz, bkv_csz):
+        bq_sz //= 2
+    while True:
+        num_chunks = bkv_sz // bkv_csz
+        while num_chunks >= 1:
+            if fits(bq_sz, num_chunks * bkv_csz, bkv_csz):
+                return bq_sz, num_chunks * bkv_csz, min(bq_csz, bq_sz), bkv_csz
+            num_chunks //= 2
+        if bq_sz <= 1:
+            return None
+        bq_sz //= 2
+
+
 def get_default_block_sizes(
     q_dtype,
     kv_dtype,
@@ -1631,21 +1666,31 @@ def get_default_block_sizes(
         # block measured slower per token.
         _budget_frac = 0.15 if case == RpaCase.DECODE else 0.60
         vmem_budget = int(vmem_limit_bytes * _budget_frac)
-        # The DECODE query tile never shrinks below the static row count.
-        min_bq_sz = decode_query_size if case == RpaCase.DECODE else 1
-        while bq_sz > min_bq_sz or bkv_sz > bkv_alignment:
+
+        def fits(bq, bkv, bkv_c):
             vmem_est = get_vmem_estimate_bytes(
                 actual_num_kv_heads,
                 actual_num_q_heads_per_kv_head,
                 head_dim,
-                bq_sz,
-                bkv_sz,
+                bq,
+                bkv,
                 q_dtype,
                 kv_dtype,
                 use_custom_mask=use_custom_mask,
-                bkv_csz=bkv_csz,
+                bkv_csz=bkv_c,
             )
-            if vmem_est <= vmem_budget:
+            return vmem_est <= vmem_budget
+
+        if case != RpaCase.DECODE:
+            fitted = _fit_prefill_blocks_keeping_query_rows(
+                bq_sz, bkv_sz, bq_csz, bkv_csz, fits
+            )
+            if fitted is not None:
+                bq_sz, bkv_sz, bq_csz, bkv_csz = fitted
+        # The DECODE query tile never shrinks below the static row count.
+        min_bq_sz = decode_query_size if case == RpaCase.DECODE else 1
+        while bq_sz > min_bq_sz or bkv_sz > bkv_alignment:
+            if fits(bq_sz, bkv_sz, bkv_csz):
                 break
             if bkv_sz > bq_sz * bkv_alignment:
                 bkv_sz = max(bkv_sz // 2, bkv_alignment)
