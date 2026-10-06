@@ -1,4 +1,5 @@
 import unittest
+from array import array
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -8,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeRequest,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
@@ -19,9 +21,13 @@ from sglang.srt.disaggregation.fake.conn import (
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVReceiver as DisaggFakeKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
@@ -85,10 +91,12 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
             enable_decode_hicache=True,
             server_args=object(),
         )
+        queue.enable_early_handoff_token_streaming = True
+        queue.process_handoff_progress = MagicMock()
 
         with patch(
             "sglang.srt.disaggregation.decode.poll_and_all_reduce",
-            return_value=[KVPoll.Transferring],
+            return_value=([KVPoll.Transferring], [1]),
         ) as reduce:
             queue._poll_with_metadata_gate()
 
@@ -97,6 +105,8 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
         self.assertIs(pollers[0].decode_req, decode_req)
         self.assertIs(reduce.call_args.args[1], tp_group)
         self.assertEqual(reduce.call_args.kwargs["additional_groups"], [cp_group])
+        self.assertTrue(reduce.call_args.kwargs["return_metadata_ready"])
+        queue.process_handoff_progress.assert_called_once_with([KVPoll.Transferring])
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
@@ -105,6 +115,171 @@ class TestDecodeQueueCleanup(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _make_handoff_case(
+        self,
+        *,
+        max_new_tokens=4,
+        stream=True,
+        early_stream=True,
+        **req_options,
+    ):
+        req = Req(
+            rid="early-handoff",
+            origin_input_text="prompt",
+            origin_input_ids=array("q", [1, 2, 3]),
+            sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+            stream=stream,
+            bootstrap_host="127.0.0.1",
+            bootstrap_room=7,
+            disagg_mode=DisaggregationMode.DECODE,
+            vocab_size=128,
+            **req_options,
+        )
+        req.sampling_params.stop_strs = []
+        req.sampling_params.stop_regex_strs = []
+        receiver = FakeReceiver()
+        decode_req = DecodeRequest(
+            req=req,
+            kv_receiver=receiver,
+            metadata_buffer_index=0,
+        )
+        metadata = SimpleNamespace(
+            get_buf=MagicMock(
+                return_value=(
+                    torch.tensor([23]),
+                    torch.tensor([0, 0, 0, 0, 0, 0, 0]),
+                    torch.tensor([0.0]),
+                    torch.tensor([23]),
+                    torch.empty(0),
+                    torch.empty(0, dtype=torch.int64),
+                    None,
+                    None,
+                    None,
+                    torch.empty(0),
+                    torch.empty(0, dtype=torch.int64),
+                    torch.empty(0),
+                    None,
+                    torch.tensor([7], dtype=torch.int64),
+                )
+            ),
+            bootstrap_room=torch.tensor([[7]], dtype=torch.int64),
+        )
+        output_streamer = MagicMock()
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.pp_size = 1
+        queue.enable_early_handoff_token_streaming = early_stream
+        queue.metadata_buffers = metadata
+        queue.spec_algorithm = MagicMock()
+        queue.spec_algorithm.is_none.return_value = True
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            batch_result_processor=SimpleNamespace(
+                _maybe_update_reasoning_tokens=MagicMock()
+            ),
+            output_streamer=output_streamer,
+        )
+        return queue, decode_req, output_streamer
+
+    @staticmethod
+    def _process_handoff(queue, *decode_reqs):
+        queue.queue = list(decode_reqs)
+        queue._metadata_ready = [1] * len(decode_reqs)
+        queue.process_handoff_progress([KVPoll.Transferring] * len(decode_reqs))
+
+    def test_handoff_token_streams_once_before_kv_completion(self):
+        queue, decode_req, output_streamer = self._make_handoff_case()
+        req = decode_req.req
+
+        self._process_handoff(queue, decode_req)
+        self._process_handoff(queue, decode_req)
+
+        self.assertEqual(list(req.output_ids), [23])
+        self.assertTrue(req.disagg_handoff_token_streamed)
+        output_streamer.stream_output.assert_called_once_with([req], False)
+
+        processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
+        object.__setattr__(processor, "disaggregation_mode", DisaggregationMode.DECODE)
+        object.__setattr__(processor, "output_streamer", output_streamer)
+        batch = SimpleNamespace(reqs=[req], return_logprob=False)
+        processor.process_batch_result_prebuilt(batch)
+
+        self.assertEqual(list(req.output_ids), [23])
+        self.assertFalse(req.disagg_handoff_token_streamed)
+        output_streamer.stream_output.assert_called_once_with([req], False)
+
+    def test_terminal_handoff_finishes_before_kv_completion(self):
+        for name, options in (
+            ("length", {"max_new_tokens": 1}),
+            ("eos", {"eos_token_ids": {23}}),
+        ):
+            with self.subTest(name=name):
+                queue, decode_req, output_streamer = self._make_handoff_case(**options)
+
+                self._process_handoff(queue, decode_req)
+
+                self.assertTrue(decode_req.req.finished())
+                self.assertEqual(list(decode_req.req.output_ids), [23])
+                output_streamer.stream_output.assert_called_once_with(
+                    [decode_req.req], False
+                )
+
+    def test_handoff_advances_grammar_once(self):
+        queue, decode_req, _ = self._make_handoff_case()
+        grammar = SimpleNamespace(current_token=None, finished=False)
+
+        def accept_token(token):
+            grammar.current_token = token
+
+        grammar.accept_token = MagicMock(side_effect=accept_token)
+        grammar.is_terminated = MagicMock(return_value=False)
+        decode_req.req.grammar = grammar
+
+        self._process_handoff(queue, decode_req)
+        self._process_handoff(queue, decode_req)
+
+        grammar.accept_token.assert_called_once_with(23)
+        self.assertFalse(grammar.finished)
+
+    def test_ineligible_handoff_waits_for_kv_completion(self):
+        for name, options in (
+            ("non-streaming", {"stream": False}),
+            ("logprobs", {"return_logprob": True}),
+            ("feature-disabled", {"early_stream": False}),
+        ):
+            with self.subTest(name=name):
+                queue, decode_req, output_streamer = self._make_handoff_case(**options)
+
+                self._process_handoff(queue, decode_req)
+
+                self.assertFalse(decode_req.metadata_committed)
+                self.assertEqual(list(decode_req.req.output_ids), [])
+                output_streamer.stream_output.assert_not_called()
+
+    def test_transfer_failure_after_early_handoff_releases_request(self):
+        queue, decode_req, output_streamer = self._make_handoff_case()
+        self._process_handoff(queue, decode_req)
+        queue.queue = [decode_req]
+        queue._poll_with_metadata_gate = MagicMock(return_value=[KVPoll.Failed])
+        queue._metadata_ready = [1]
+        queue.enable_staging = False
+        queue.enable_host_receive = False
+        queue.enable_deferred_kv_release = False
+        queue.tp_rank = 0
+        queue._release_request = MagicMock()
+        queue._clean_hicache_prefetch_resources = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.scheduler.enable_decode_hicache = False
+        queue.scheduler.enable_hisparse = False
+        queue.scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+
+        self.assertEqual(queue.pop_transferred(), [])
+
+        self.assertEqual(queue.queue, [])
+        self.assertIsInstance(decode_req.req.finished_reason, FINISH_ABORT)
+        queue._release_request.assert_called_once_with(decode_req)
+        self.assertTrue(decode_req.kv_receiver is None)
+        self.assertEqual(output_streamer.stream_output.call_count, 2)
 
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_prealloc_waiting_row_still_enters_tp_cp_vote(self, reduce):
@@ -756,6 +931,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
         queue.enable_staging = False
+        queue.enable_early_handoff_token_streaming = False
         queue.enable_deferred_kv_release = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()

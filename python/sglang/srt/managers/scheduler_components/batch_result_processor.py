@@ -118,9 +118,14 @@ class SchedulerBatchResultProcessor:
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
+        reqs_to_stream = []
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
-            req.update_finish_state()
+            if req.disagg_handoff_token_streamed:
+                req.disagg_handoff_token_streamed = False
+            else:
+                req.update_finish_state()
+                reqs_to_stream.append(req)
             if req.finished():
                 req.time_stats.set_quick_finish_time()
                 if get_memory().enable_hisparse:
@@ -128,7 +133,10 @@ class SchedulerBatchResultProcessor:
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        if reqs_to_stream:
+            self.output_streamer.stream_output(
+                reqs_to_stream, any(req.return_logprob for req in reqs_to_stream)
+            )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 

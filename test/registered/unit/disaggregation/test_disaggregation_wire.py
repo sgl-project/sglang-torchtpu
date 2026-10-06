@@ -270,6 +270,38 @@ class TestPollCollectives(CustomTestCase):
         self.assertEqual(result, [KVPoll.Transferring, KVPoll.Success])
         all_reduce.assert_not_called()
 
+    def test_metadata_readiness_shares_the_transfer_status_collective(self):
+        pollers = [Mock(poll=Mock(return_value=KVPoll.Success)) for _ in range(2)]
+        requests = [
+            SimpleNamespace(
+                req=SimpleNamespace(bootstrap_host="127.0.0.1", bootstrap_room=room),
+                metadata_buffer_index=index,
+            )
+            for index, room in enumerate((42, 43))
+        ]
+        metadata = SimpleNamespace(bootstrap_room=torch.tensor([[42], [43]]))
+
+        def reduce(values, **_):
+            self.assertEqual(values.numel(), 2)
+            values[1] = (1 << (KVPoll.Transferring + 1)) - 1
+
+        with (
+            patch.object(dist, "get_world_size", return_value=2),
+            patch.object(dist, "all_reduce", side_effect=reduce) as all_reduce,
+        ):
+            polls, ready = poll_and_all_reduce(
+                pollers,
+                object(),
+                requests,
+                metadata,
+                return_metadata_ready=True,
+            )
+
+        self.assertEqual(polls, [KVPoll.Success, KVPoll.Transferring])
+        self.assertEqual(ready, [1, 0])
+        all_reduce.assert_called_once()
+        self.assertIs(all_reduce.call_args.kwargs["op"], dist.ReduceOp.BAND)
+
     def test_singleton_still_advances_and_waits_for_staging(self):
         request = SimpleNamespace(
             kv_receiver=Mock(

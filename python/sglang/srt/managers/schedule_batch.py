@@ -1352,6 +1352,10 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        # Decode may stream the prefill-sampled handoff token before KV transfer
+        # completion. PREBUILT consumes this marker instead of processing that
+        # same token a second time.
+        self.disagg_handoff_token_streamed: bool = False
         # Decode-local: the already-emitted boundary token to replay when a
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.

@@ -625,6 +625,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # decode node, get by time.perf_counter()
     decode_prealloc_queue_entry_time: float = 0.0
     decode_transfer_queue_entry_time: float = 0.0
+    decode_metadata_ready_time: float = 0.0
+    decode_kv_transfer_finish_time: float = 0.0
+    decode_handoff_stream_time: float = 0.0
     decode_prebuilt_finish_time: float = 0.0
 
     # bootstrap sub-phase tracking (PD disagg)
@@ -1028,6 +1031,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 alloc_ms=alloc_ms,
             )
 
+    def set_decode_metadata_ready_time(self, ts=None):
+        if self.decode_metadata_ready_time == 0.0:
+            self.decode_metadata_ready_time = ts or time.perf_counter()
+
+    def set_decode_kv_transfer_finish_time(self, ts=None):
+        if self.decode_kv_transfer_finish_time == 0.0:
+            self.decode_kv_transfer_finish_time = ts or time.perf_counter()
+
+    def set_decode_handoff_stream_time(self, ts=None):
+        if self.decode_handoff_stream_time == 0.0:
+            self.decode_handoff_stream_time = ts or time.perf_counter()
+
     def set_bootstrap_done_time(self, ts=None):
         ts = ts or time.perf_counter()
         if self.bootstrap_done_time == 0.0:
@@ -1112,6 +1127,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 self.decode_transfer_queue_entry_time,
                 self.wait_queue_entry_time,
             )
+            metadata_wait_duration = self.duration_between(
+                self.decode_transfer_queue_entry_time,
+                self.decode_metadata_ready_time,
+            )
+            metadata_to_kv_duration = self.duration_between(
+                self.decode_metadata_ready_time,
+                self.decode_kv_transfer_finish_time,
+            )
+            metadata_to_stream_duration = self.duration_between(
+                self.decode_metadata_ready_time,
+                self.decode_handoff_stream_time,
+            )
             queue_duration = self.get_queueing_time()
             forward_duration = self.duration_between(
                 self.forward_entry_time,
@@ -1151,6 +1178,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             return (
                 f"{prealloc_fields}"
                 f"transfer_duration={self.format_duration(transfer_duration)}, "
+                f"metadata_wait_duration={self.format_duration(metadata_wait_duration)}, "
+                f"metadata_to_kv_duration={self.format_duration(metadata_to_kv_duration)}, "
+                f"metadata_to_stream_duration={self.format_duration(metadata_to_stream_duration)}, "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.decode_prealloc_queue_entry_time)}"

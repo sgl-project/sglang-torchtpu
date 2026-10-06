@@ -2104,25 +2104,17 @@ class SchedulerPPMixin:
                     else self._pp_recv_pyobj_from_prev_stage()
                 ),
             )
-        # get the current stage transfer success
+        queue = self.disagg_decode_transfer_queue
+        polls = queue.poll_transfer_progress()
+        curr_transferred_rids = [
+            item.req.rid
+            for item, poll in zip(queue.queue, polls)
+            if poll in (KVPoll.Success, KVPoll.Failed)
+        ]
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-        # if other ranks, do intersection with the previous rank's transferred rids
+            transferred_rids = curr_transferred_rids
         else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
             )

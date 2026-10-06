@@ -47,11 +47,7 @@ def decode_transfer_status(
     """This stage's transfer poll folded into the previous stages' status:
     terminals are shared by every stage and a failure seen by any stage is a
     failure."""
-    polls = (
-        queue._poll_with_staging()
-        if queue.enable_staging
-        else queue._poll_with_metadata_gate()
-    )
+    polls = queue.poll_transfer_progress()
     terminal_rids = [
         item.req.rid
         for item, poll in zip(queue.queue, polls)

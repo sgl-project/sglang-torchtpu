@@ -226,16 +226,49 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
     return polls
 
 
-def _reduce_status_and_gate_group_failure(polls, pollers, groups):
-    """Reduce transfer status before applying the group-wide drain gate."""
+def _reduce_status_and_gate_group_failure(polls, pollers, groups, metadata_ready=None):
+    """Reduce transfer status and optional metadata readiness together."""
     # A single-rank group has nothing to reduce.
     groups = [group for group in groups if dist.get_world_size(group) != 1]
     if groups:
-        tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+        if metadata_ready is None:
+            values = polls
+            op = dist.ReduceOp.MIN
+        else:
+            # Unary status bits preserve MIN under bitwise AND. The next bit
+            # carries metadata readiness, so the collective stays one byte per
+            # request instead of doubling its payload.
+            values = [
+                (1 << (poll + 1)) - 1 | (ready << 5)
+                for poll, ready in zip(polls, metadata_ready)
+            ]
+            op = dist.ReduceOp.BAND
+        tensor_to_reduce = torch.tensor(values, dtype=torch.uint8, device="cpu")
         for group in groups:
-            dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-        polls = tensor_to_reduce.tolist()
-    return _gate_group_failure_on_drain(polls, pollers, groups)
+            dist.all_reduce(tensor_to_reduce, op=op, group=group)
+        values = tensor_to_reduce.tolist()
+        if metadata_ready is not None:
+            polls = [(value & 0x1F).bit_length() - 1 for value in values]
+            metadata_ready = [value >> 5 for value in values]
+        else:
+            polls = values
+    polls = _gate_group_failure_on_drain(polls, pollers, groups)
+    return polls if metadata_ready is None else (polls, metadata_ready)
+
+
+def _metadata_ready_bits(decode_reqs, metadata_buffers) -> List[int]:
+    """Return whether each request's complete metadata record is present."""
+    ready = []
+    for decode_req in decode_reqs:
+        if _is_fake_transfer(decode_req.req):
+            ready.append(0)
+            continue
+        expected_room = decode_req.req.bootstrap_room or 0
+        actual_room = metadata_buffers.bootstrap_room[
+            decode_req.metadata_buffer_index, 0
+        ].item()
+        ready.append(int(actual_room == expected_room))
+    return ready
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
@@ -254,6 +287,7 @@ def poll_and_all_reduce(
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
     additional_groups: Optional[Iterable[dist.ProcessGroup]] = None,
+    return_metadata_ready: bool = False,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
@@ -261,8 +295,15 @@ def poll_and_all_reduce(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
+    metadata_ready = (
+        _metadata_ready_bits(decode_reqs, metadata_buffers)
+        if return_metadata_ready
+        else None
+    )
     groups = [gloo_group, *(additional_groups or [])]
-    return _reduce_status_and_gate_group_failure(polls, pollers, groups)
+    return _reduce_status_and_gate_group_failure(
+        polls, pollers, groups, metadata_ready=metadata_ready
+    )
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -289,6 +330,7 @@ def poll_and_all_reduce_with_staging(
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
     additional_groups: Optional[Iterable[dist.ProcessGroup]] = None,
+    return_metadata_ready: bool = False,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -316,8 +358,15 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
+    metadata_ready = (
+        _metadata_ready_bits(decode_reqs, metadata_buffers)
+        if return_metadata_ready
+        else None
+    )
     groups = [gloo_group, *(additional_groups or [])]
-    return _reduce_status_and_gate_group_failure(raw_polls, receivers, groups)
+    return _reduce_status_and_gate_group_failure(
+        raw_polls, receivers, groups, metadata_ready=metadata_ready
+    )
 
 
 #########################

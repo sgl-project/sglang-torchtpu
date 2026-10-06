@@ -68,6 +68,13 @@ class TransferQueue:
             for item in self.queue
         ]
 
+    def poll_transfer_progress(self):
+        return (
+            self._poll_with_staging()
+            if self.enable_staging
+            else self._poll_with_metadata_gate()
+        )
+
     def pop_transferred(self, rids):
         released, remaining = [], []
         for item, status in zip(self.queue, self._poll_with_metadata_gate()):

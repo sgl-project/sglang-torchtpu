@@ -362,6 +362,7 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
     host_staged: bool = False
+    metadata_committed: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -2471,6 +2472,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.attn_cp_cpu_group = attn_cp_cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = get_parallel().tp_rank
+        self.pp_size = get_parallel().pp_size
+        self.enable_early_handoff_token_streaming = (
+            self.pp_size == 1
+            and envs.SGLANG_DISAGG_DECODE_EARLY_STREAM_HANDOFF_TOKEN.get()
+        )
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.enable_host_receive = (
@@ -2489,6 +2495,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
+        self._metadata_ready: List[int] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2500,14 +2507,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest):
-        # Preserve the checksum before the metadata slot is freed so it can be
-        # re-verified when the request enters a batch, including after retraction.
+    def _commit_handoff_metadata(self, decode_req: DecodeRequest) -> bool:
+        if decode_req.metadata_committed:
+            return True
+
         idx = decode_req.metadata_buffer_index
-        if self.scheduler.kv_checksum_computer is not None:
-            decode_req.req.expected_kv_checksum = self.metadata_buffers.get_kv_checksum(
-                idx
-            )
         (
             output_id,
             cached_tokens,
@@ -2552,7 +2556,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
-            return
+            return False
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
             # Abort the request and remove from the queue
@@ -2571,11 +2575,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
-            return
+            return False
 
-        self._commit_hicache_local_restore_to_req(decode_req)
-
-        # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when
         # there is a remembered boundary token we are *replaying* an
@@ -2668,6 +2669,70 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 output_token_sampling_logprobs[:num_logprobs].cpu().numpy(),
             )
 
+        decode_req.metadata_committed = True
+        return True
+
+    def _can_stream_handoff_early(self, decode_req: DecodeRequest) -> bool:
+        req = decode_req.req
+        # Keep the normal handoff path for responses that need more than the
+        # token and state carried in the prefill-to-decode metadata record.
+        return (
+            self.enable_early_handoff_token_streaming
+            and not decode_req.metadata_committed
+            and not decode_req.is_rebootstrap
+            and not _is_fake_transfer(req)
+            and req.stream
+            and not req.return_logprob
+            and req.beam_group is None
+            and not isinstance(req.grammar, Future)
+            and not req.return_hidden_states
+            and not req.return_routed_experts
+            and not req.return_indexer_topk
+            and req.customized_info is None
+            and not req.finished()
+        )
+
+    def _prepare_handoff_for_early_stream(
+        self, decode_req: DecodeRequest
+    ) -> Optional[Req]:
+        if not self._can_stream_handoff_early(decode_req):
+            return None
+        if not self._commit_handoff_metadata(decode_req):
+            return None
+
+        req = decode_req.req
+        if req.grammar is not None and req.grammar.current_token is None:
+            try:
+                req.grammar.accept_token(req.output_ids[-1])
+            except ValueError as error:
+                req.to_finish = FINISH_ABORT(
+                    f"Grammar accept_token failed for req {req.rid} with token "
+                    f"{req.output_ids[-1]}: {error}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+        req.update_finish_state()
+        if req.grammar is not None:
+            req.grammar.finished = req.finished()
+
+        req.disagg_handoff_token_streamed = True
+        req.time_stats.set_decode_handoff_stream_time()
+        return req
+
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        # Preserve the checksum before the metadata slot is freed so it can be
+        # re-verified when the request enters a batch, including after retraction.
+        idx = decode_req.metadata_buffer_index
+        if self.scheduler.kv_checksum_computer is not None:
+            decode_req.req.expected_kv_checksum = self.metadata_buffers.get_kv_checksum(
+                idx
+            )
+        if not self._commit_handoff_metadata(decode_req):
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+
+        self._commit_hicache_local_restore_to_req(decode_req)
+
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
@@ -2680,7 +2745,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             else [dr.kv_receiver for dr in self.queue]
         )
         attn_cp_cpu_group = getattr(self, "attn_cp_cpu_group", None)
-        return poll_and_all_reduce(
+        result = poll_and_all_reduce(
             pollers,
             self.gloo_group,
             decode_reqs=self.queue,
@@ -2688,11 +2753,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             additional_groups=(
                 [attn_cp_cpu_group] if attn_cp_cpu_group is not None else None
             ),
+            return_metadata_ready=self.enable_early_handoff_token_streaming,
         )
+        if not self.enable_early_handoff_token_streaming:
+            return result
+        polls, self._metadata_ready = result
+        self.process_handoff_progress(polls)
+        return polls
 
     def _poll_with_staging(self) -> list:
         attn_cp_cpu_group = getattr(self, "attn_cp_cpu_group", None)
-        return poll_and_all_reduce_with_staging(
+        result = poll_and_all_reduce_with_staging(
             self.queue,
             self.staging_handler,
             self.gloo_group,
@@ -2700,7 +2771,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             additional_groups=(
                 [attn_cp_cpu_group] if attn_cp_cpu_group is not None else None
             ),
+            return_metadata_ready=self.enable_early_handoff_token_streaming,
         )
+        if not self.enable_early_handoff_token_streaming:
+            return result
+        polls, self._metadata_ready = result
+        self.process_handoff_progress(polls)
+        return polls
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
@@ -2713,6 +2790,43 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    def process_handoff_progress(
+        self,
+        polls: List[int],
+        rids_to_check: Optional[List[str]] = None,
+    ) -> None:
+        """Commit streamable handoff metadata without waiting for KV."""
+        metadata_ready = self._metadata_ready
+        if len(metadata_ready) != len(self.queue):
+            return
+
+        ready_to_stream = []
+        for decode_req, poll, ready in zip(self.queue, polls, metadata_ready):
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+            if ready:
+                decode_req.req.time_stats.set_decode_metadata_ready_time()
+            if poll == KVPoll.Success:
+                decode_req.req.time_stats.set_decode_kv_transfer_finish_time()
+            if ready and poll != KVPoll.Failed:
+                if req := self._prepare_handoff_for_early_stream(decode_req):
+                    ready_to_stream.append(req)
+        if ready_to_stream:
+            self.scheduler.output_streamer.stream_output(ready_to_stream, False)
+
+    def poll_transfer_progress(self) -> List[int]:
+        """Poll transfers and expose handoff metadata that arrived before KV."""
+        if not self.queue:
+            return []
+        if self.scheduler.enable_decode_hicache:
+            self._process_hicache_local_restores(self.queue)
+        polls = (
+            self._poll_with_staging()
+            if self.enable_staging
+            else self._poll_with_metadata_gate()
+        )
+        return polls
+
     def _release_request(self, decode_req: DecodeRequest) -> None:
         if self.enable_host_receive:
             discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
@@ -2724,19 +2838,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self.queue:
             return []
 
-        if self.scheduler.enable_decode_hicache:
-            self._process_hicache_local_restores(
-                [
-                    decode_req
-                    for decode_req in self.queue
-                    if rids_to_check is None or decode_req.req.rid in rids_to_check
-                ]
-            )
-
-        if self.enable_staging:
-            polls = self._poll_with_staging()
-        else:
-            polls = self._poll_with_metadata_gate()
+        polls = self.poll_transfer_progress()
 
         transferred_reqs = []
         indices_to_remove = set()
