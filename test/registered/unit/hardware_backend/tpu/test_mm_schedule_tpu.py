@@ -1,4 +1,4 @@
-"""Unit tests for TPU patch-budget batching of the multimodal encoder call.
+"""Unit tests for TPU handling of the multimodal encoder call.
 
 Every image in a prefill batch is concatenated into one vision-encoder call,
 and TPU precompiles that call for a bounded set of patch counts, so a batch
@@ -8,6 +8,10 @@ fail_on_recompile.
 The budget is injected here; resolving it against the live policy is covered in
 test_vit_tpu_compile_runner.py, which needs torch_tpu. No server / TPU / weights
 involved.
+
+Host placement also needs every encoder output on the host, whichever device
+the encoder finished on (#741). A mock stands in for the TPU tensor here;
+test_mm_device_scatter.py runs the same path with real TPU tensors.
 """
 
 import unittest
@@ -15,9 +19,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import mm_schedule_tpu
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +40,13 @@ def _image(patches: int) -> MultimodalDataItem:
         offsets=[(0, patches)],
         model_specific_data={"image_grid_thw": torch.tensor([1, 1, patches])},
     )
+
+
+def _tpu_output(rows: int) -> Mock:
+    """An encoder output left on the TPU; .to("cpu") returns its host copy."""
+    output = Mock(spec=torch.Tensor)
+    output.to.return_value = torch.full((rows, 3), float(rows))
+    return output
 
 
 class _RecordingEmbedder:
@@ -139,6 +153,57 @@ class TestEncodeVisionItems(CustomTestCase):
                 embedder.assert_called_once_with(items)
 
 
+class TestEncoderOutputToHost(CustomTestCase):
+    def test_device_outputs_are_copied_to_the_host(self):
+        tensor = _tpu_output(2)
+        per_item = [_tpu_output(1), _tpu_output(3)]
+        evs = EVSEmbeddingResult(embedding=_tpu_output(4), num_tokens_per_frame=[3, 1])
+        with envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(False):
+            landed_tensor = mm_schedule_tpu.encoder_output_to_host(tensor)
+            landed_list = mm_schedule_tpu.encoder_output_to_host(per_item)
+            landed_evs = mm_schedule_tpu.encoder_output_to_host(evs)
+
+        self.assertIs(landed_tensor, tensor.to.return_value)
+        self.assertEqual(len(landed_list), len(per_item))
+        for landed, output in zip(landed_list, per_item):
+            self.assertIs(landed, output.to.return_value)
+        # EVS keeps its per-frame token counts; only the tensor moves.
+        self.assertIsInstance(landed_evs, EVSEmbeddingResult)
+        self.assertEqual(landed_evs.num_tokens_per_frame, [3, 1])
+        self.assertIs(landed_evs.embedding, evs.embedding.to.return_value)
+        for output in (tensor, *per_item, evs.embedding):
+            output.to.assert_called_once_with("cpu")
+
+    def test_host_outputs_pass_through_without_a_copy(self):
+        # Qwen3-VL already landed on the host at its bucketed shape.
+        output = torch.ones(2, 3)
+        with envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(False):
+            self.assertIs(mm_schedule_tpu.encoder_output_to_host(output), output)
+
+    def test_device_placement_leaves_outputs_on_the_device(self):
+        output = _tpu_output(2)
+        with envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(True):
+            self.assertIs(mm_schedule_tpu.encoder_output_to_host(output), output)
+        output.to.assert_not_called()
+
+    def test_split_batch_outputs_land_before_concatenation(self):
+        # A mock cannot be concatenated, so this also pins the order: landing
+        # after the concat would run a variable-length cat on the TPU.
+        outputs = [_tpu_output(2), _tpu_output(3)]
+        embedder = Mock(side_effect=outputs)
+        with (
+            envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(False),
+            patch.object(mm_schedule_tpu, "_patch_budget", return_value=4900),
+        ):
+            out = mm_schedule_tpu.encode_vision_items(
+                embedder, [_image(4752), _image(4836)]
+            )
+
+        self.assertEqual(embedder.call_count, 2)
+        expected = torch.cat([output.to.return_value for output in outputs])
+        self.assertTrue(torch.equal(out, expected))
+
+
 class TestSharedDispatch(CustomTestCase):
     def test_non_tpu_backends_keep_the_single_batched_call(self):
         embedder = _RecordingEmbedder()
@@ -146,6 +211,33 @@ class TestSharedDispatch(CustomTestCase):
         with patch.object(mm_schedule, "_is_tpu", False):
             mm_schedule._encode_vision_items(embedder, items)
         self.assertEqual(embedder.calls, [14372])
+
+    def test_tpu_full_path_caches_the_host_copy(self):
+        # An item with several placeholder spans takes the full path, which
+        # calls the encoder directly rather than through _encode_vision_items.
+        output = _tpu_output(4)
+        item = MultimodalDataItem(
+            modality=Modality.VIDEO, hash=7, offsets=[(0, 1), (3, 4)]
+        )
+        cache = MultiModalStaticCache(1 << 20)
+        with (
+            patch.object(mm_schedule, "_is_tpu", True),
+            patch.object(mm_schedule, "embedding_cache", cache),
+            envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(False),
+        ):
+            chunk, _ = mm_schedule._get_chunked_embedding_full(
+                Mock(return_value=output),
+                [item],
+                item.offsets,
+                0,
+                5,
+                torch.zeros(5, dtype=torch.long),
+                torch.device("cpu"),
+            )
+
+        output.to.assert_called_once_with("cpu")
+        self.assertIs(cache.get([item.hash]).embedding, output.to.return_value)
+        self.assertTrue(torch.equal(chunk, output.to.return_value))
 
 
 if __name__ == "__main__":

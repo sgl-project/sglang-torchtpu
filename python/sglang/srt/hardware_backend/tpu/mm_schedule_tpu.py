@@ -1,14 +1,17 @@
-"""TPU-specific batching of the multimodal encoder call made by mm_schedule."""
+"""TPU-specific handling of the multimodal encoder call made by mm_schedule."""
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import List
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import DataEmbeddingFunc
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 
 logger = logging.getLogger(__name__)
@@ -57,6 +60,28 @@ def _split_items_by_patch_budget(
     return groups
 
 
+def encoder_output_to_host(
+    embedding: torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult,
+) -> torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult:
+    """Land an encoder result on the host unless MM embeds stay on the device.
+
+    Host placement (the default, see mm_embed_tpu) splits, caches, chunks and
+    scatters encoder outputs on the host, but an encoder returns whatever device
+    it finished on. Qwen3-VL lands on the host itself while its output still has
+    the bucketed shape, so this is a no-op there. Other encoders finish on the
+    TPU; copying their output once here keeps those variable-length consumers
+    off the device, where each new length would recompile.
+    """
+    if envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
+        return embedding
+    if isinstance(embedding, list):
+        return [item_embedding.to("cpu") for item_embedding in embedding]
+    if isinstance(embedding, EmbeddingResult):
+        # replace() keeps subclass metadata such as EVS per-frame token counts.
+        return dataclasses.replace(embedding, embedding=embedding.embedding.to("cpu"))
+    return embedding.to("cpu")
+
+
 def encode_vision_items(
     data_embedding_func: DataEmbeddingFunc,
     items: List[MultimodalDataItem],
@@ -65,18 +90,19 @@ def encode_vision_items(
 
     A batch is concatenated into one encoder call, and TPU precompiles that call
     for a bounded set of patch counts, so a batch above the largest one falls off
-    the set and recompiles.
+    the set and recompiles. Each call's output goes through
+    encoder_output_to_host before anything concatenates it.
     """
     # Some external processors derive patch geometry from feature tensors and
     # own their batching. Apply this generic split only when every item exposes
     # the grid metadata it requires.
     if any(_item_patch_grid(item) is None for item in items):
-        return data_embedding_func(items)
+        return encoder_output_to_host(data_embedding_func(items))
 
     budget = _patch_budget()
     groups = _split_items_by_patch_budget(items, budget)
     if len(groups) == 1:
-        return data_embedding_func(items)
+        return encoder_output_to_host(data_embedding_func(items))
 
     logger.info(
         "Splitting the vision batch: %d items / %d patches exceed the encoder "
@@ -87,7 +113,7 @@ def encode_vision_items(
         len(groups),
         [sum(_item_patch_count(item) for item in group) for group in groups],
     )
-    outputs = [data_embedding_func(group) for group in groups]
+    outputs = [encoder_output_to_host(data_embedding_func(group)) for group in groups]
     if isinstance(outputs[0], list):
         return [embedding for output in outputs for embedding in output]
     return torch.concat(

@@ -1,6 +1,7 @@
 """TPU-specific placement of multimodal embeddings into the token embedding grid.
 
-The vision tower already returns host tensors, so the rows are placed at their
+The scheduler lands every encoder output on the host
+(mm_schedule_tpu.encoder_output_to_host), so the rows are placed at their
 final positions on the host. The device then only selects between two aligned
 matrices, instead of running masked_scatter_'s cumsum over num_tokens x hidden
 to rediscover that mapping.

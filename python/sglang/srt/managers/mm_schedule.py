@@ -293,6 +293,14 @@ def _get_chunked_embedding_full(
     if embedding_per_req is None:
         _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
         embedding = data_embedding_func(embedding_items_per_req)
+        if _is_tpu:
+            # This path skips _encode_vision_items, so it lands the output on
+            # the host itself; imported here for the same cycle as over there.
+            from sglang.srt.hardware_backend.tpu.mm_schedule_tpu import (
+                encoder_output_to_host,
+            )
+
+            embedding = encoder_output_to_host(embedding)
         if isinstance(embedding, list):
             # This path caches the combined per-request embedding, so the
             # per-item form is flattened here.

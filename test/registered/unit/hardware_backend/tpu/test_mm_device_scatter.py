@@ -48,19 +48,25 @@ class TestDeviceEncoderScatter(unittest.TestCase):
         _register_aten_fallbacks()
         self.enterContext(_disable_cpu_fallback())
 
+    # (SGLANG_TPU_MM_EMBED_ON_DEVICE, encoder output device). Host placement
+    # must also take encoders that finish on the TPU, not just Qwen3-VL's host
+    # outputs (#741).
+    _PLACEMENTS = ((None, "cpu"), (None, "tpu"), (False, "cpu"), (True, "tpu"))
+
     def test_non_chunked_embed(self):
-        for on_device in (None, False, True):
-            with self.subTest(on_device=on_device):
-                self._check_embed(on_device, chunk_size=20)
+        for on_device, encoder_device in self._PLACEMENTS:
+            with self.subTest(on_device=on_device, encoder_device=encoder_device):
+                self._check_embed(on_device, encoder_device, chunk_size=20)
 
     def test_chunked_embed(self):
-        for on_device in (None, False, True):
-            with self.subTest(on_device=on_device):
-                self._check_embed(on_device, chunk_size=4)
+        for on_device, encoder_device in self._PLACEMENTS:
+            with self.subTest(on_device=on_device, encoder_device=encoder_device):
+                self._check_embed(on_device, encoder_device, chunk_size=4)
 
     @torch.no_grad()
-    def _check_embed(self, on_device, chunk_size):
-        encoder_device = "tpu" if on_device else "cpu"
+    def _check_embed(self, on_device, encoder_device, chunk_size):
+        # Host placement caches host copies whatever device the encoder used.
+        cache_device = "tpu" if on_device else "cpu"
         # Both modalities cross chunk boundaries; the second image arrives later.
         specs = [
             (Modality.IMAGE, 2, 6),
@@ -151,7 +157,7 @@ class TestDeviceEncoderScatter(unittest.TestCase):
                 for item in items:
                     cached = cache.get_single(item.hash)
                     self.assertIsNotNone(cached)
-                    self.assertEqual(cached.embedding.device.type, encoder_device)
+                    self.assertEqual(cached.embedding.device.type, cache_device)
                     self.assertEqual(cached.embedding.dtype, sources[item.hash].dtype)
                     self.assertTrue(
                         torch.equal(cached.embedding.cpu(), sources[item.hash])
