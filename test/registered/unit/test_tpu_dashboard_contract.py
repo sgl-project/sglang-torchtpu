@@ -255,10 +255,9 @@ class TestJobMapsToOneTest(CustomTestCase):
         scheduled = [names[m] for m in slots]
         self.assertEqual(set().union(*scheduled), names["full-set"])
         self.assertEqual(sum(map(len, scheduled)), len(names["full-set"]))
-        # The lane comes from MULTIHOST_LAUNCH["schedule"], not from the filename:
-        # a file whose name says nothing about its benchmark still runs somewhere.
+        # Test authors only write "nightly"; the workflow picks the slot.
         for row in discover("full-set"):
-            self.assertIn(row["schedule"], slots, row["name"])
+            self.assertEqual(row["schedule"], "nightly", row["name"])
 
         groups = discover("full-set")
         recipes = [g["launch_script"] for g in groups]

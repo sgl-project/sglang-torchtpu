@@ -291,11 +291,14 @@ jobs:
           fi
           groups="$(python3 .github/tpu-ci/discover_multihost.py \
                       --suite nightly-tpu-multihost-accuracy)"
-          # Each file declares its lane in MULTIHOST_LAUNCH["schedule"]; a model
-          # name still selects by file name, for a one-off dispatch.
+          # Test files only say "nightly"; the slot is decided here. The 10 AM slot
+          # takes the Kimi MMMU shards, the 5 PM slot every other file, so a new
+          # file runs without picking a slot. A model name selects by file name.
+          kimi='test("^test_tpu_kimi_k26_mmmu_")'
           case "$MODEL" in
             all|full-set) keep='.' ;;
-            day-10am|day-5pm) keep='map(select(.schedule == $m))' ;;
+            day-10am) keep="map(select(.name | $kimi))" ;;
+            day-5pm) keep="map(select(.name | $kimi | not))" ;;
             *) keep='map(select(.name | contains($m | gsub("-"; "_"))))' ;;
           esac
           groups="$(jq -c --arg m "$MODEL" "$keep" <<< "$groups")"
