@@ -110,7 +110,14 @@ def _content_token_pool(tokenizer) -> List[int]:
             f"(sglang.benchmark.datasets.common); run it with the sglang "
             f"interpreter. ({exc})"
         )
+    # all_special_ids is not enough: GPT-OSS flags only 3 of its 21 added
+    # tokens as special, and content containing one of the others (the harmony
+    # <|channel|>, <|message|>, ...) is rejected by the server's chat parser
+    # with a 400. Every added token is a control token, never content.
     specials = set(tokenizer.all_special_ids or [])
+    get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
+    if get_added_vocab is not None:
+        specials.update(get_added_vocab().values())
     pool = sorted(t for t in get_available_tokens(tokenizer) if t not in specials)
     if not pool:
         raise SystemExit("tokenizer vocabulary is empty after removing special ids")

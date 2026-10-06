@@ -122,6 +122,9 @@ env | grep -E '^TPU_' | sed 's/^/[serve_group]   /' || true
 # validate. (A 2-host tp=16-per-engine variant on a subdivided slice also
 # brings up with a consistently re-scoped libtpu env, but its KV-transfer
 # path is unvalidated; revisit if tp=16 engines are wanted.)
+# The mini-LB keeps the recipe's front port (:30000); capture it before PORT
+# is re-pointed at this pod's engine port below.
+LB_PORT=${LB_PORT:-$PORT}
 if (( WORKER_ID < 2 )); then
     ROLE=prefill
     export PORT=$PD_PREFILL_PORT
@@ -173,7 +176,6 @@ if [[ "$WORKER_ID" == "0" ]]; then
     # --prefill hostnames are injected into requests as the KV bootstrap
     # addresses the decode engines dial, so they must be the cluster-reachable
     # names, never 127.0.0.1.
-    LB_PORT=${LB_PORT:-$PORT}   # the health-gated/benched port
     wait_url "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "prefill engine 0" "$HEALTH_TIMEOUT" "$ENGINE_PID" || exit 1
     wait_url "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "prefill engine 1" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" "decode engine 0" "$HEALTH_TIMEOUT" || exit 1
