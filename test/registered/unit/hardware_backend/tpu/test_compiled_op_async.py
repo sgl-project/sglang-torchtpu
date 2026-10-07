@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.compilation.compiled_op import compiled_op
+from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import spec_op_precompile
 from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
@@ -127,8 +127,10 @@ def test_cold_call_and_synchronous_mode_return_real_results(backend, monkeypatch
         ):
             op = compiled_op()(lambda x: x * 3)
             x = torch.arange(3)
-            assert torch.equal(op(x), x * 3)
-            assert op.warmup_async(x) is None
+            with collect_warmups() as queue:
+                assert torch.equal(op(x), x * 3)
+                assert queue.calls == []
+            assert warmup_compiled_op(op, x) is None
             assert torch.equal(op(x), x * 3)
 
 
@@ -147,7 +149,7 @@ def test_pending_compile_failure_prevents_completion(backend, monkeypatch):
         pytest.raises(RuntimeError, match="native compile failed"),
     ):
         with collect_warmups() as queue:
-            queue.calls.append(op.warmup_async(torch.ones(2)))
+            warmup_compiled_op(op, torch.ones(2))
             queue.completions.append(lambda: backend.events.append("completed"))
     assert "completed" not in backend.events
 
@@ -164,7 +166,7 @@ def test_disabled_compilation_uses_original_helper(backend, monkeypatch):
 
         assert torch.equal(op(torch.ones(2)), torch.full((2,), 5.0))
         (registered,) = registry.get_compiled_ops()
-        assert registered.op.warmup_async(torch.ones(2)) is None
+        assert warmup_compiled_op(registered.op, torch.ones(2)) is None
         assert backend.wrappers == []
 
 
@@ -188,20 +190,18 @@ def test_owner_warmups_share_serving_callable_without_global_registration(
         envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
     ):
         with collect_warmups() as queue:
-            first.warmup(torch.zeros(2))
-            second.warmup(torch.zeros(3))
+            warmup_compiled_op(first, torch.zeros(2))
+            warmup_compiled_op(second, torch.zeros(3))
             assert len(queue.calls) == 2
             assert not any(event[0] == "execute" for event in backend.events)
         assert torch.equal(first(torch.ones(2)), torch.full((2,), 2.0))
         assert torch.equal(second(torch.ones(3)), torch.full((3,), 3.0))
-        first.warmup(torch.zeros(4))
+        warmup_compiled_op(first, torch.zeros(4))
     assert len(backend.wrappers) == 2
     assert registry.get_compiled_ops() == ()
 
 
 def test_compiled_helper_inlines_inside_outer_dynamo_graph():
-    from sglang.srt.compilation.compiled_op import compiled_op
-
     @compiled_op()
     def add_one(x):
         return x + 1

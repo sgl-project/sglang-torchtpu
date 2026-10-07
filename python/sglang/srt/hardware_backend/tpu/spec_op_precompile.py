@@ -8,7 +8,7 @@ from collections.abc import Sequence
 
 import torch
 
-from sglang.srt.compilation.compiled_op import get_compiled_ops
+from sglang.srt.compilation.compiled_op import get_compiled_ops, warmup_compiled_op
 from sglang.srt.hardware_backend.tpu import (  # noqa: F401
     eagle_utils_tpu as _eagle_utils_tpu,
 )
@@ -66,7 +66,7 @@ def precompile_spec_v2_ops(
                 if queue is None:
                     registered_op.op(*args)
                 else:
-                    registered_op.op.warmup(*args)
+                    warmup_compiled_op(registered_op.op, *args)
 
     def finish():
         if device.type == "tpu":
