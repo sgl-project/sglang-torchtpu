@@ -1,5 +1,7 @@
 """CPU coverage for TPU merge indexing and embedding preparation."""
 
+import sys
+
 import pytest
 import torch
 
@@ -137,3 +139,7 @@ def test_padded_and_unpadded_chunks_merge_in_order():
     expected = dest.clone().masked_scatter_(mask.expand_as(dest), src.to_host())
     scatter_mm_on_device(dest, mask, src)
     assert torch.equal(dest, expected)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

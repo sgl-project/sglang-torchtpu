@@ -1,5 +1,7 @@
 """CPU coverage for padded TPU embedding scheduling and cache ownership."""
 
+import sys
+
 import pytest
 import torch
 
@@ -78,3 +80,7 @@ def test_tensor_cache_compacts_views_and_preserves_admission_and_eviction(entry_
     assert not cache.set(3, entry_type(embedding=torch.zeros(3, 4)))
     assert cache.current_size == 0
     assert cache.get_single(3) is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
