@@ -7,11 +7,19 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.multimodal.mm_embedding import (
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.mm_embedding import (
     MultimodalEmbedding,
     PaddedEmbedding,
 )
+from sglang.srt.hardware_backend.tpu.mm_schedule_tpu import (
+    DataEmbeddingFunc,
+    get_embedding_and_mask,
+)
+from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_disagg, get_server_args
+from sglang.srt.utils import flatten_nested_list
 
 
 def scatter_mm_on_device(
@@ -199,3 +207,283 @@ def embed_mm_on_host(
             deepstack_shape, device=input_embeds.device, dtype=dtype
         )
     return input_embeds, placed_deepstack[0].to(input_embeds.device, dtype)
+
+
+def _embed_mm_inputs(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+    input_ids: torch.Tensor,
+    input_embedding: torch.nn.Embedding,
+    multimodal_model: torch.nn.Module = None,
+    data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
+    placeholder_tokens: dict[Modality, List[int]] = None,
+    use_deepstack: Optional[Dict[Modality, bool]] = None,
+    input_ids_cpu: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, dict]:
+    use_deepstack = use_deepstack or {}
+    other_info = {}
+
+    item_flatten_list = []
+    for mm_inputs in mm_inputs_list:
+        item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
+
+    # deepstack_embeddings: per-modality
+    modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
+
+    for modality in Modality.all():
+        items = [
+            item for item in item_flatten_list if item.is_modality(modality=modality)
+        ]
+        embedder = (
+            None
+            if data_embedding_func_mapping is None
+            else data_embedding_func_mapping.get(modality, None)
+        )
+        if embedder is None:
+            # "image", "video", etc
+            modality_id = modality.name.lower()
+            embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
+        if len(items) != 0:
+            assert embedder is not None, f"no embedding method found for {modality}"
+            pad_values = [item.pad_value for item in items]
+            placeholder_tensor = torch.as_tensor(pad_values, device="cpu")
+            # calculate per request items length offset
+            items_size = [0]
+            items_offsets = []
+            for mm_inputs in mm_inputs_list:
+                mm_items = [
+                    item
+                    for item in mm_inputs.mm_items
+                    if item.is_modality(modality=modality)
+                ]
+                items_size.append(items_size[-1] + len(mm_items))
+                items_offsets.append(
+                    flatten_nested_list([item.offsets for item in mm_items])
+                )
+
+            original_input_ids = input_ids
+            embedding, mask, input_ids = get_embedding_and_mask(
+                data_embedding_func=embedder,
+                embedding_items=items,
+                placeholder_tensor=placeholder_tensor,
+                input_ids=input_ids,
+                items_size=items_size,
+                prefix_length=extend_prefix_lens,
+                extend_length=extend_seq_lens,
+                items_offset_list=items_offsets,
+                input_ids_cpu=input_ids_cpu,
+            )
+            if input_ids is not original_input_ids:
+                # EVS rewrites token positions for all subsequent modalities too.
+                input_ids_cpu = None
+
+            if use_deepstack.get(modality, None) and embedding is not None:
+                embedding, deepstack_embedding = (
+                    multimodal_model.separate_deepstack_embeds(embedding)
+                )
+                deepstack_embeddings += [deepstack_embedding]
+            else:
+                deepstack_embeddings += [None]
+            modalities += [modality]
+            embeddings += [embedding]
+            masks += [mask]
+
+    # 3. Get input embeddings
+    vocab_size = input_embedding.num_embeddings
+    # Build masks before replacing image hash placeholders with vocabulary IDs.
+    input_ids.clamp_(min=0, max=vocab_size - 1)
+    input_embeds = input_embedding(input_ids)
+
+    # deepstack embedding
+    if use_deepstack:
+        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
+
+        deepstack_embedding_shape = input_embeds.shape[:-1] + (
+            input_embeds.shape[-1] * num_deepstack_embeddings,
+        )
+
+    # 4. scatter embeddings into input embedding
+    if not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
+        input_embeds, input_deepstack_embeds = embed_mm_on_host(
+            input_embeds=input_embeds,
+            deepstack_shape=deepstack_embedding_shape if use_deepstack else None,
+            modalities=modalities,
+            embeddings=embeddings,
+            masks=masks,
+            deepstack_embeddings=deepstack_embeddings,
+            use_deepstack=use_deepstack,
+        )
+        if use_deepstack:
+            other_info["input_deepstack_embeds"] = input_deepstack_embeds
+        return input_embeds, other_info
+
+    if use_deepstack:
+        input_deepstack_embeds = torch.zeros(
+            deepstack_embedding_shape,
+            device=input_embeds.device,
+            dtype=input_embeds.dtype,
+        )
+
+        other_info["input_deepstack_embeds"] = input_deepstack_embeds
+
+    for i, modality, embedding, mask in zip(
+        range(len(embeddings)), modalities, embeddings, masks
+    ):
+        if embedding is None or mask is None:
+            continue
+        scatter_mm_on_device(dest=input_embeds, mask=mask, src=embedding)
+        if use_deepstack.get(modality, None):
+            scatter_mm_on_device(
+                dest=input_deepstack_embeds, mask=mask, src=deepstack_embeddings[i]
+            )
+
+    return input_embeds, other_info
+
+
+def _embed_mm_inputs_with_split(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+    input_ids: torch.Tensor,
+    forward_batch: ForwardBatch,
+    input_embedding: torch.nn.Embedding,
+    multimodal_model: torch.nn.Module = None,
+    data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
+    placeholder_tokens: dict[Modality, List[int]] = None,
+    use_deepstack: Optional[Dict[Modality, bool]] = None,
+    input_ids_cpu: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, dict]:
+    use_deepstack = use_deepstack or {}
+    precomputed_req_indices = []
+    non_precomputed_req_indices = []
+    for idx, mm_input in enumerate(mm_inputs_list):
+        items = [item for item in mm_input.mm_items if item is not None]
+        if items and all(item.precomputed_embeddings is not None for item in items):
+            precomputed_req_indices.append(idx)
+        else:
+            non_precomputed_req_indices.append(idx)
+
+    embed_kwargs = dict(
+        multimodal_model=multimodal_model,
+        input_embedding=input_embedding,
+        data_embedding_func_mapping=data_embedding_func_mapping,
+        placeholder_tokens=placeholder_tokens,
+        use_deepstack=use_deepstack,
+    )
+
+    if not precomputed_req_indices or not non_precomputed_req_indices:
+        return _embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=input_ids,
+            input_ids_cpu=input_ids_cpu,
+            **embed_kwargs,
+        )
+
+    all_seq_lens = forward_batch.extend_seq_lens_cpu
+    mm_batch_indices = [
+        i for i, mm in enumerate(forward_batch.mm_inputs) if mm is not None
+    ]
+    token_starts = []
+    cumulative = 0
+    for sl in all_seq_lens:
+        token_starts.append(cumulative)
+        cumulative += sl
+
+    vocab_size = input_embedding.num_embeddings
+    input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1))
+    other_info = {}
+
+    input_deepstack_embeds = None
+    if use_deepstack and multimodal_model is not None:
+        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
+        input_deepstack_embeds = torch.zeros(
+            input_ids.shape[0],
+            input_embedding.embedding_dim * num_deepstack_embeddings,
+            device=input_ids.device,
+            dtype=input_embedding.weight.dtype,
+        )
+        other_info["input_deepstack_embeds"] = input_deepstack_embeds
+
+    for group_req_indices in [precomputed_req_indices, non_precomputed_req_indices]:
+        sub_mm_inputs = [mm_inputs_list[i] for i in group_req_indices]
+        sub_prefix_lens = [extend_prefix_lens[i] for i in group_req_indices]
+        sub_seq_lens = [extend_seq_lens[i] for i in group_req_indices]
+        group_batch_indices = [mm_batch_indices[i] for i in group_req_indices]
+        sub_slices = [
+            input_ids[token_starts[bi] : token_starts[bi] + all_seq_lens[bi]]
+            for bi in group_batch_indices
+        ]
+        sub_input_ids = torch.cat(sub_slices)
+        sub_input_ids_cpu = (
+            torch.cat(
+                [
+                    input_ids_cpu[
+                        token_starts[bi] : token_starts[bi] + all_seq_lens[bi]
+                    ]
+                    for bi in group_batch_indices
+                ]
+            )
+            if input_ids_cpu is not None
+            else None
+        )
+
+        sub_embeds, sub_info = _embed_mm_inputs(
+            mm_inputs_list=sub_mm_inputs,
+            extend_prefix_lens=sub_prefix_lens,
+            extend_seq_lens=sub_seq_lens,
+            input_ids=sub_input_ids,
+            input_ids_cpu=sub_input_ids_cpu,
+            **embed_kwargs,
+        )
+
+        offset = 0
+        for bi in group_batch_indices:
+            req_len = all_seq_lens[bi]
+            start = token_starts[bi]
+            input_embeds[start : start + req_len] = sub_embeds[
+                offset : offset + req_len
+            ]
+            if (
+                input_deepstack_embeds is not None
+                and "input_deepstack_embeds" in sub_info
+            ):
+                input_deepstack_embeds[start : start + req_len] = sub_info[
+                    "input_deepstack_embeds"
+                ][offset : offset + req_len]
+            offset += req_len
+
+    return input_embeds, other_info
+
+
+def embed_mm_inputs_tpu(
+    *,
+    forward_batch: ForwardBatch,
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+    input_ids: torch.Tensor,
+    input_embedding: torch.nn.Embedding,
+    multimodal_model: Optional[torch.nn.Module] = None,
+    data_embedding_func_mapping: Optional[Dict[Modality, DataEmbeddingFunc]] = None,
+    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
+    use_deepstack: Optional[Dict[Modality, bool]] = None,
+) -> Tuple[torch.Tensor, dict]:
+    """Prepare TPU multimodal rows; padded embeddings never escape this boundary."""
+    kwargs = dict(
+        mm_inputs_list=mm_inputs_list,
+        extend_prefix_lens=extend_prefix_lens,
+        extend_seq_lens=extend_seq_lens,
+        input_ids=input_ids,
+        input_ids_cpu=forward_batch.mm_input_ids_cpu,
+        input_embedding=input_embedding,
+        multimodal_model=multimodal_model,
+        data_embedding_func_mapping=data_embedding_func_mapping,
+        placeholder_tokens=placeholder_tokens,
+        use_deepstack=use_deepstack or {},
+    )
+    if get_server_args() and get_disagg().enable_adaptive_dispatch_to_encoder:
+        return _embed_mm_inputs_with_split(forward_batch=forward_batch, **kwargs)
+    return _embed_mm_inputs(**kwargs)

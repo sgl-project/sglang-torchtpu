@@ -16,9 +16,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.hardware_backend.tpu import mm_schedule_tpu
+from sglang.srt.hardware_backend.tpu.mm_embedding import PaddedEmbedding
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.multimodal.mm_embedding import PaddedEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

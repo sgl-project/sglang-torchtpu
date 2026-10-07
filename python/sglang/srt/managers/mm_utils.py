@@ -42,7 +42,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.multimodal.mm_embedding import MultimodalEmbedding
 from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
@@ -393,15 +392,13 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 # an int64 prefix-sum over it (~9 B per num_tokens x hidden element); the
 # cumsum-derived row indices keep the transients O(num_tokens) and sync-free.
 def _scatter_mm_embedding(
-    dest: torch.Tensor, mask: torch.Tensor, src: MultimodalEmbedding
+    dest: torch.Tensor, mask: torch.Tensor, src: torch.Tensor
 ) -> None:
     # mask: [num_tokens, 1] bool; src: [num_mm_tokens, width] in sequence order.
-    if dest.device.type == "tpu":
-        from sglang.srt.hardware_backend.tpu.mm_embed_tpu import scatter_mm_on_device
-
-        scatter_mm_on_device(dest, mask, src)
-        return
     src = src.to(dest.device, dest.dtype)
+    if dest.device.type == "tpu":
+        dest.masked_scatter_(mask.to(dest.device).expand_as(dest), src)
+        return
     num_src_rows = src.size(0)
     flat_mask = mask.view(-1)
     ranks = torch.cumsum(flat_mask, dim=0) - 1
@@ -425,7 +422,6 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
-    input_ids_cpu: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -482,7 +478,7 @@ def embed_mm_inputs(
                 )
             else:
                 placeholder_tensor = torch.as_tensor(
-                    pad_values, device="cpu" if _is_tpu else input_ids.device
+                    pad_values, device=input_ids.device
                 )
             # calculate per request items length offset
             items_size = [0]
@@ -498,7 +494,6 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
-            original_input_ids = input_ids
             embedding, mask, input_ids = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
@@ -508,11 +503,7 @@ def embed_mm_inputs(
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
-                input_ids_cpu=input_ids_cpu,
             )
-            if input_ids is not original_input_ids:
-                # EVS rewrites token positions for all subsequent modalities too.
-                input_ids_cpu = None
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
@@ -594,7 +585,6 @@ def _embed_mm_inputs_with_split(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
-    input_ids_cpu: Optional[torch.Tensor] = None,
 ):
     """Split batch into precomputed vs non-precomputed, embed each group, merge back."""
     precomputed_req_indices = []
@@ -622,7 +612,6 @@ def _embed_mm_inputs_with_split(
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
-            input_ids_cpu=input_ids_cpu,
             **embed_kwargs,
         )
 
@@ -661,25 +650,12 @@ def _embed_mm_inputs_with_split(
             for bi in group_batch_indices
         ]
         sub_input_ids = torch.cat(sub_slices)
-        sub_input_ids_cpu = (
-            torch.cat(
-                [
-                    input_ids_cpu[
-                        token_starts[bi] : token_starts[bi] + all_seq_lens[bi]
-                    ]
-                    for bi in group_batch_indices
-                ]
-            )
-            if input_ids_cpu is not None
-            else None
-        )
 
         sub_embeds, sub_info = embed_mm_inputs(
             mm_inputs_list=sub_mm_inputs,
             extend_prefix_lens=sub_prefix_lens,
             extend_seq_lens=sub_seq_lens,
             input_ids=sub_input_ids,
-            input_ids_cpu=sub_input_ids_cpu,
             **embed_kwargs,
         )
 
@@ -711,6 +687,7 @@ def general_mm_embed_routine(
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Dict[Modality, bool] = {},
     feature_dtypes: Optional[Dict[Modality, torch.dtype]] = None,
+    mm_embedder: Optional[Callable] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -724,6 +701,8 @@ def general_mm_embed_routine(
         placeholder_tokens: Token IDs for multimodal placeholders
         use_deepstack: Whether to use deepstack embeddings for each modality, default False
         feature_dtypes: Optional per-modality dtypes for preparing CUDA features before cache lookup.
+        mm_embedder: Optional backend preparation callback returning merged embeddings
+            and extra model inputs. Owns cache/chunk preparation when supplied.
         **kwargs: Additional arguments passed to language model
 
     Returns:
@@ -772,14 +751,26 @@ def general_mm_embed_routine(
             # encoder/ViT execution and multimodal feature placement, while
             # the language model range below excludes both.
             with torch.profiler.record_function("sglang.vlm.mm_embedding"):
-                if server_args and get_disagg().enable_adaptive_dispatch_to_encoder:
+                if mm_embedder is not None:
+                    input_embeds, other_info = mm_embedder(
+                        forward_batch=forward_batch,
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
+                elif server_args and get_disagg().enable_adaptive_dispatch_to_encoder:
                     # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
                     input_embeds, other_info = _embed_mm_inputs_with_split(
                         mm_inputs_list=mm_inputs_list,
                         extend_prefix_lens=extend_prefix_lens,
                         extend_seq_lens=extend_seq_lens,
                         input_ids=input_ids,
-                        input_ids_cpu=forward_batch.mm_input_ids_cpu,
                         forward_batch=forward_batch,
                         input_embedding=embed_tokens,
                         multimodal_model=multimodal_model,
@@ -793,7 +784,6 @@ def general_mm_embed_routine(
                         extend_prefix_lens=extend_prefix_lens,
                         extend_seq_lens=extend_seq_lens,
                         input_ids=input_ids,
-                        input_ids_cpu=forward_batch.mm_input_ids_cpu,
                         input_embedding=embed_tokens,
                         multimodal_model=multimodal_model,
                         data_embedding_func_mapping=data_embedding_funcs,

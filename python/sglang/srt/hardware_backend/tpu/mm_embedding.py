@@ -7,6 +7,8 @@ from typing import Sequence
 
 import torch
 
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
+
 
 @dataclass(frozen=True)
 class EmbeddingSpan:
@@ -127,3 +129,18 @@ def split_embedding(
         parts.append(embedding.slice(offset, offset + count))
         offset += count
     return parts
+
+
+@dataclass(kw_only=True)
+class TpuEmbeddingResult(EmbeddingResult):
+    embedding: MultimodalEmbedding
+
+    def storage_size(self) -> int:
+        if isinstance(self.embedding, PaddedEmbedding):
+            return self.embedding.storage_nbytes()
+        return super().storage_size()
+
+    def cache_size(self) -> int:
+        if isinstance(self.embedding, PaddedEmbedding):
+            return self.storage_size()
+        return super().cache_size()
