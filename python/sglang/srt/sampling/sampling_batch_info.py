@@ -122,14 +122,16 @@ class SamplingBatchInfo:
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
+        # Match the [B, 1] device allocation produced by merging/filtering.
+        # A device-side view of [B] gives TorchTPU a different compiled input.
         temperatures = (
             torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
                 dtype=torch.float,
                 pin_memory=_pin,
             )
-            .to(device, non_blocking=True)
             .view(-1, 1)
+            .to(device, non_blocking=True)
         )
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs],
