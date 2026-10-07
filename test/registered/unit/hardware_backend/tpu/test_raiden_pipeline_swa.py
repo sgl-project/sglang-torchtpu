@@ -193,6 +193,7 @@ def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
     mgr = harness.Manager(mode, rank if producer else 0, pp_size, world.bus, name)
     mgr.attn_tp_size, mgr.attn_tp_rank = (1, 0) if producer else (tp_size, rank)
     mgr.kv_args.total_kv_head_num = HEADS
+    mgr.kv_args.total_swa_kv_head_num = HEADS
     if producer:
         heads, full_ids, swa_ids = HEADS, [2 * rank + 1], [2 * rank]
         blocks = PRODUCER_BLOCKS
@@ -1000,7 +1001,9 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
         _local_rank=0,
         _timeout_s=120,
         server_args=SimpleNamespace(nnodes=1),
-        kv_args=SimpleNamespace(page_size=256, total_kv_head_num=HEADS),
+        kv_args=SimpleNamespace(
+            page_size=256, total_kv_head_num=HEADS, total_swa_kv_head_num=HEADS
+        ),
         _max_request_blocks=lambda: 64,
         _swa_max_request_blocks=lambda: 3,
         _slot_ceiling=lambda: 64,

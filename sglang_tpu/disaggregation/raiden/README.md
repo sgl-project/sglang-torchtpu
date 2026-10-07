@@ -85,8 +85,9 @@ Push-resharding runs the same two-engine split. `RESHARD_REQ` carries the
 decode's SWA pages and its SWA transfer address alongside the full ones, and
 `RESHARD_BLOCKS` carries the prefill's; each side then builds a second plan
 over the SWA sub-pool with `_make_geometry(..., swa=True)`, which takes the
-head-pair granule from the SWA tensor so the two pools may differ in dtype or
-head_dim. The window is **never chunked** — it is settled only when the prefill
+head-pair granule from the SWA tensor and the kv-head count from
+`total_swa_kv_head_num`, so the two pools may differ in dtype, head_dim or
+kv-head count. The window is **never chunked** — it is settled only when the prefill
 ends — so it always travels on the closing push, even when chunks already cover
 every full-attention page. Completion is unchanged: `is_send_done` /
 `is_recv_done` already require `swa:<room>` whenever a second engine exists.

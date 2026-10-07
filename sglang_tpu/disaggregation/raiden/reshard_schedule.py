@@ -87,6 +87,42 @@ def per_rank_head_count(fused_layer_tensor: FusedKVLayerTensor) -> int:
     return int(fused_layer_tensor.shape[2])
 
 
+def swa_geometry_kv_heads(
+    full_kv_heads: int,
+    swa_kv_heads: int,
+    kv_packing: int,
+    src_tp: int,
+    dst_tp: int,
+) -> int:
+    """kv-head count for a sliding-window ReshardGeometry whose granule is
+    ``head_pair_bytes`` (the push path), or ValueError when no count yields
+    byte-correct placement.
+
+    The granule is one kv-head only at kv_packing 2. At fp8 (kv_packing 4) it
+    is a 32-bit pack of two heads, so the schedule is right only where it runs
+    in pack units: every rank holds one head (a whole padded pack), or the
+    count is ``swa_kv_heads // 2`` packs and every rank holds whole packs. The
+    full-attention count is exactly that on MiMo-V2-like models (8 SWA / 4
+    full heads), which is why they work today.
+    TODO(#829): remove when head_pair_bytes uses per-head units (B1).
+    """
+    if swa_kv_heads == full_kv_heads or kv_packing == 2:
+        return swa_kv_heads
+    if kv_packing == 4:
+        if swa_kv_heads <= min(src_tp, dst_tp):
+            return swa_kv_heads
+        if (
+            swa_kv_heads == 2 * full_kv_heads
+            and swa_kv_heads % (2 * max(src_tp, dst_tp)) == 0
+        ):
+            return full_kv_heads
+    raise ValueError(
+        f"Raiden reshard of sliding-window KV with {swa_kv_heads} kv-heads "
+        f"(full attention: {full_kv_heads}) at attention TP {src_tp}->{dst_tp} "
+        f"is unsupported at kv_packing {kv_packing}"
+    )
+
+
 def head_slice_params(
     src_tp: int,
     dst_tp: int,
