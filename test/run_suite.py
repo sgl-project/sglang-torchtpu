@@ -225,7 +225,6 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gemma4-31b",
         "nightly-tpu-perf-gemma4-26b-a4b",
         "nightly-tpu-perf-qwen3-5-397b",
-        "nightly-perf-tpu",
         # One suite per quality eval so each gets an independent TPU slice.
         "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gemma4-31b-aime",
@@ -239,6 +238,9 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
         "nightly-tpu-accuracy-gpt-oss-120b-mmlupro",
+        # Bench matrix on the external tpu7x cluster (nightly-test-external-tpu.yml).
+        "external-nightly-2x2x2",
+        "external-nightly-2x2x4",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",
@@ -250,6 +252,11 @@ NIGHTLY_SUITES = {
 
 
 OTHER_SUITES = {
+    # Hand-wired jobs (`files:`) in feature-validation-tpu.yml: P/D gates and
+    # exec-mode probes that no generic suite runner can launch.
+    HWBackend.TPU: [
+        "tpu-integration",
+    ],
     HWBackend.CPU: [
         "default",
         # `stage="weekly"`, dispatched by weekly-test-cpu.yml.
@@ -276,6 +283,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.TPU,
 }
 
 
