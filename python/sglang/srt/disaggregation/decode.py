@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    get_kv_layout,
     get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
     is_mla_backend,
@@ -711,6 +712,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.kv_layout = get_kv_layout(self.token_to_kv_pool)
         kv_args.sliding_window_size = self.scheduler.sliding_window_size
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num

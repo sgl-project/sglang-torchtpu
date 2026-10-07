@@ -21,7 +21,11 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
-from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.common import (
+    _tcp_endpoint,
+    kv_layout_mismatch_reason,
+    logger,
+)
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -1377,6 +1381,12 @@ class RaidenReceiverMixin:
         )
 
 
+def _kv_layout_refusal(receiver: RaidenKVReceiver) -> Optional[str]:
+    return kv_layout_mismatch_reason(
+        receiver.kv_mgr.kv_args.kv_layout, receiver.prefill_info.kv_layout
+    )
+
+
 def _attn_tp_refusal(receiver: RaidenKVReceiver) -> Optional[str]:
     src, dst = receiver.prefill_info.attn_tp_size, receiver.kv_mgr.attn_tp_size
     if src < dst:
@@ -1432,10 +1442,14 @@ def _push_reshard_refusal(receiver: RaidenKVReceiver) -> Optional[str]:
 class RaidenKVReceiver(CommonKVReceiver):
     # See RaidenKVSender: a group Failed waits for every rank's transfers.
     group_failure_requires_drain = True
-    # Ordered checks run by init() on the legacy (non-pipeline) transport,
-    # after the rank mapping is known and before any frame reaches the
-    # prefill. Each returns why the room cannot be served, or None; the first
-    # reason fails the room. Append new refusals here.
+    # Ordered checks run by init() after the rank mapping is known and before
+    # any frame reaches the prefill. Each returns why the room cannot be
+    # served, or None; the first reason fails the room. Append new refusals
+    # to the tuple whose transports they apply to.
+    # Every transport, the pipeline included: sglang hands the pipeline's
+    # layout_fingerprint to native code and never compares it itself.
+    pre_pipeline_checks = (_kv_layout_refusal,)
+    # The legacy (non-pipeline) transport only.
     init_checks = (_attn_tp_refusal, _source_count_refusal, _push_reshard_refusal)
 
     def __init__(
@@ -1452,15 +1466,17 @@ class RaidenKVReceiver(CommonKVReceiver):
 
     def init(self, prefill_dp_rank: int):
         super().init(prefill_dp_rank)
-        if self.conclude_state is not None or self.kv_mgr._pipeline is not None:
+        if self.conclude_state is not None:
             return
-        if self.prefill_info.attn_tp_size <= 0:
-            return
-        for check in self.init_checks:
+        checks = self.pre_pipeline_checks
+        if self.kv_mgr._pipeline is None and self.prefill_info.attn_tp_size > 0:
+            checks += self.init_checks
+        for check in checks:
             reason = check(self)
             if reason is not None:
-                key = (check.__name__, self.prefill_info.attn_tp_size)
-                self.kv_mgr.log_reshard_refusal(key, reason)
+                self.kv_mgr.log_reshard_refusal((check.__name__, reason), reason)
+                # Failed plus ABORT to the prefill; send_metadata then sends
+                # nothing.
                 self._conclude_failed(reason=reason)
                 return
 

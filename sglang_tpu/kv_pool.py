@@ -624,6 +624,9 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     # torch_tpu's host pool reads its page shape from get_fused_kv_buffer, so it
     # mirrors this layout too.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu"})
+    # Advertised to P/D peers as KVArgs.kv_layout; pools without it are
+    # token-major. Not ``kv_layout``: DSV4 pools use that for a KVLayout enum.
+    disagg_kv_layout: str = "seq_along_lane"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
