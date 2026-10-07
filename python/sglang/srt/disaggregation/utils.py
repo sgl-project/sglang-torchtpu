@@ -1838,6 +1838,13 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+def get_kv_layout(token_to_kv_pool) -> Optional[str]:
+    """The pool's P/D layout name, or None for the token-major default."""
+    # SWAKVPool builds both sub-pools from the same class.
+    pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
+    return getattr(pool, "disagg_kv_layout", None)
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

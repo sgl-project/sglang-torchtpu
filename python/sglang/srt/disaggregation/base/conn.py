@@ -111,6 +111,9 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    # KV pool layout name (pool ``disagg_kv_layout``); None is token-major.
+    # Published to the bootstrap server and compared by the decode.
+    kv_layout: Optional[str] = None
 
 
 class KVPoll:
