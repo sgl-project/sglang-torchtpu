@@ -1,5 +1,8 @@
 # Ported from tpu-inference (https://github.com/vllm-project/tpu-inference)
 #   tpu_inference/kernels/sparse_core/ragged_gather_reduce_v2.py @ 4367dcff1 (2026-07-19).
+# Local changes: a group continuing into the next row block is written only
+# there (the race vllm-torchtpu #453 fixed by masking the earlier block's last
+# sub-chunk; tpu-inference still has it); one garbage row per subcore.
 
 import dataclasses
 import functools
@@ -420,17 +423,42 @@ def main_kernel(
                 global_idx % num_simd_lanes
             ]
 
+        # Whether the group of this block's last row continues into the next
+        # block. Its partial sum must not be written here: the block holding
+        # the group's last row writes the full sum, and two DMA writes to one
+        # HBM row are not ordered, so the partial could land last.
+        next_block_start = (row_block_id + 1) * row_chunk_size
+        next_block_first_dst = (
+            scratch.sorted_by_validity_vmem[
+                pl.ds(
+                    jnp.minimum(
+                        next_block_start, row_partition_size_padded - num_simd_lanes
+                    ),
+                    num_simd_lanes,
+                )
+            ][0]
+            // cfg.reduce_group_size
+        )
+        group_continues = jnp.logical_and(
+            next_block_start < num_rows_current_row_partition,
+            get_dst_idx(row_chunk_size - 1) == next_block_first_dst,
+        ).astype(jnp.int32)
+
         # For each source row, find the VMEM row that will hold its group's fully
         # reduced value -- the last row of the group within this block. Scanning
         # backwards, a row inherits its successor's merge target when they share
-        # a destination, otherwise it is its own target.
+        # a destination, otherwise it is its own target. A group continuing into
+        # the next block gets target ``row_chunk_size``, so it is not written.
         src_row_idx_in_vmem = []
         row_valid_vec = []
         for row_vmem_idx in reversed(range(row_chunk_size)):
             global_row_idx = row_block_id * row_chunk_size + row_vmem_idx
             row_valid_vec.append(global_row_idx < num_rows_current_row_partition)
             if row_vmem_idx == row_chunk_size - 1:
-                src_row_idx_in_vmem.append(row_vmem_idx)
+                src_row_idx_in_vmem.append(
+                    group_continues * row_chunk_size
+                    + (1 - group_continues) * row_vmem_idx
+                )
             else:
                 same_group_as_next = jnp.logical_and(
                     row_valid_vec[-2],
@@ -445,8 +473,10 @@ def main_kernel(
 
         # Per source row, the (VMEM source row, HBM destination row) of its
         # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
-        # and padding rows, are routed to a throwaway row.
-        garbage_dst = out_hbm_ref.shape[0] - 1
+        # and padding rows, are routed to a throwaway row. Each subcore has its
+        # own: DMA writes to a row shared by all subcores serialize.
+        num_cores = cfg.num_row_partitions * cfg.num_column_partitions
+        garbage_dst = out_hbm_ref.shape[0] - num_cores + core_id
         dma_src_rows = []
         dma_dst_rows = []
         for s in range(num_row_subchunks):
@@ -553,9 +583,10 @@ def main_kernel(
 
             plsc.parallel_loop(0, col_chunk_size, step=num_simd_lanes)(col_loop)
 
-            # Scatter every source row's reduced value to its output row. Rows
-            # that share a group write the same value (idempotent); rows routed to
-            # the garbage destination are harmless.
+            # Scatter the reduced values. An output row is written only by the
+            # sub-chunk holding its group's last row, and every row of the group
+            # in that sub-chunk writes the same value; all other rows go to the
+            # garbage row.
             dma_src_row_slice = dma_src_row_vmem_sc[row_slice]
             dma_dst_row_slice = dma_dst_row_vmem_sc[row_slice]
             copies = []
@@ -638,6 +669,9 @@ def ragged_gather_reduce(
         hidden_size, input_size, num_cores, num_lanes, num_simd_lanes
     )
     num_row_partitions = num_cores // num_column_partitions
+    # The output's last num_cores rows are the subcores' garbage rows, which the
+    # kernel indexes by core id over this grid.
+    assert num_row_partitions * num_column_partitions == num_cores
     assert num_row_partitions <= num_simd_lanes, (
         f"{num_row_partitions=} must be <= {num_simd_lanes=}"
     )
@@ -698,11 +732,11 @@ def ragged_gather_reduce(
         subcore_axis_name=vector_mesh.subcore_axis_name,
     )
 
-    # The output gets one extra row: the kernel's garbage scatter destination.
+    # The output gets one extra row per subcore: the garbage scatter destinations.
     out = core_map_helper.kernel(
         functools.partial(main_kernel, cfg=cfg),
         out_type=jax.ShapeDtypeStruct(
-            (padded_input_size // reduce_group_size + 1, aligned_hidden_size),
+            (padded_input_size // reduce_group_size + num_cores, aligned_hidden_size),
             jnp.float32,
         ),
         compiler_params=pltpu.CompilerParams(
