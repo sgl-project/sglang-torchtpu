@@ -190,7 +190,7 @@ class TestLeaderForwarding(unittest.TestCase):
                         ) as dummy,
                     ):
                         try:
-                            with engine.Engine._worker_health_server(object()):
+                            with engine.Engine._worker_serving_listener(object()):
                                 if fail:
                                     raise RuntimeError("scheduler failed")
                         except RuntimeError as error:

@@ -1206,7 +1206,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
                 signal.signal(signal.SIGTERM, sigterm_handler)
 
-            with cls._worker_health_server(server_args):
+            with cls._worker_serving_listener(server_args):
                 scheduler_init_result.block_until_scheduler_exits()
             return (
                 None,
@@ -1298,7 +1298,15 @@ class Engine(EngineScoreMixin, EngineBase):
 
     @classmethod
     @contextmanager
-    def _worker_health_server(cls, server_args):
+    def _worker_serving_listener(cls, server_args):
+        """Keep the worker's serving endpoint available while schedulers run.
+
+        If TPU normalization displaces input rank zero, forward its HTTP and
+        applicable PD bootstrap ports to normalized rank zero instead of binding
+        a dummy health listener. The forwarder closes its listeners and active
+        connections when this context exits. Existing Rust listeners retain
+        ownership; other workers use the dummy health server.
+        """
         with ExitStack() as stack:
             owns_base_port = envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
             if not owns_base_port and get_device().device == "tpu":
