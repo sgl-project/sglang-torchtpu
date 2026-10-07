@@ -213,8 +213,8 @@ class TestJobMapsToOneTest(CustomTestCase):
             selected,
             {
                 "0 1 * * *": "all",
-                "0 10 * * *": "accuracy-day-10am",
-                "0 17 * * *": "accuracy-day-5pm",
+                "0 10 * * *": "nightly-10am",
+                "0 17 * * *": "nightly-5pm",
             },
         )
         # A dispatch input wins over the schedule.
@@ -228,14 +228,19 @@ class TestJobMapsToOneTest(CustomTestCase):
         self.assertNotIn("schedule", accuracy[True])
         # The daytime slots run accuracy alone; the 1 AM slot never runs it.
         jobs = nightly["jobs"]
-        is_accuracy = "startsWith(needs.plan.outputs.only, 'accuracy-')"
-        self.assertIn(f"!{is_accuracy}", jobs["feature-validation"]["if"])
+        daytime = """fromJSON('["nightly-10am","nightly-5pm"]')"""
+        self.assertIn(
+            """!contains(fromJSON('["perf","nightly-10am","nightly-5pm"]')""",
+            jobs["feature-validation"]["if"],
+        )
         self.assertIn("""fromJSON('["all","perf"]')""", jobs["perf"]["if"])
         stage = jobs["accuracy"]
-        self.assertEqual(stage["if"], f"${{{{ {is_accuracy} }}}}")
+        self.assertIn(f"contains({daytime}", stage["if"])
         self.assertEqual(stage["uses"], "./.github/workflows/accuracy-test-tpu.yml")
-        for slot in ("day-10am", "day-5pm"):
-            self.assertIn(f"'accuracy-{slot}' && '{slot}'", stage["with"]["model"])
+        self.assertEqual(
+            stage["with"]["model"],
+            "${{ needs.plan.outputs.only == 'nightly-10am' && 'day-10am' || 'day-5pm' }}",
+        )
         # A called job cannot get a permission its caller withholds; a missing
         # grant fails the whole nightly at startup.
         self.assertEqual(stage["permissions"].get("actions"), "read")
