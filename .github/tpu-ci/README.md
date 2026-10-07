@@ -132,17 +132,23 @@ single feature-validation leg) and an `update-dashboard` publish opt-in (see
                    └─▶ perf                 perf-test-tpu.yml
                        both in parallel: slice contention is Kueue's job (the nightly
                        lane's quota queues the jobs), and a red stage costs the others nothing
-10 AM / 5 PM PT: build (once) ─▶ accuracy   accuracy-test-tpu.yml
+10 AM PT:        build (once) ─▶ accuracy (day-10am)       accuracy-test-tpu.yml
+5 PM PT:         build (once)
+                   ├─▶ accuracy (day-5pm)                accuracy-test-tpu.yml
+                   └─▶ the two kv-offload-resharding P/D gates   feature-validation-tpu.yml
 ```
+
+Every slot calls each stage directly (nightly -> stage -> `_tpu-test.yml`); a stage
+holds only its own kind of test, so no stage calls another.
 
 The nightly owns all three crons; its `plan` job maps each to its stages. Accuracy has
 its own daytime slots because with it the 1 AM run needed about twice the slice time the
 6 h runner cap allows. Each slot fills the lane its MMMU-Pro legs leave idle:
 
-| Slot | 1-host lane | 2-host lane |
+| Slot (dispatch `only`) | 1-host lane | 2-host lane |
 |---|---|---|
-| `day-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
-| `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy, kv-offload-resharding P/D gates |
+| `nightly-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
+| `nightly-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy, kv-offload-resharding P/D gates |
 
 Each stage is a reusable workflow (the nightly calls each with its slot's shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one
 test — without a full nightly. Inside feature validation:

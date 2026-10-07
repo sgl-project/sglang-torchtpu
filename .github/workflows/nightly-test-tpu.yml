@@ -2,8 +2,8 @@
 # stages of the redesign (.github/tpu-ci/README.md, § Pipelines and § Dashboard):
 #
 #   1 AM:  feature validation | perf   (in parallel)
-#   10 AM: accuracy stage, day-10am selection
-#   5 PM:  accuracy stage, day-5pm selection (includes the long kv-offload P/D gates)
+#   10 AM: accuracy, day-10am selection
+#   5 PM:  accuracy, day-5pm selection | the two kv-offload-resharding P/D gates
 #
 # Accuracy has its own daytime slots because, with it, the 1 AM run needed more
 # slice time than the 6 h runner cap leaves. `plan` maps each cron to its stages.
@@ -150,8 +150,8 @@ jobs:
       contents: read
       id-token: write
 
-  # The daytime slots: accuracy, one job per benchmark, plus the long P/D gates
-  # the 5 PM selection carries; the selection picks the slot's tests.
+  # The daytime slots: accuracy, one job per benchmark; the selection picks the
+  # slot's tests.
   accuracy:
     needs: [build, plan]
     if: ${{ contains(fromJSON('["nightly-10am","nightly-5pm"]'), needs.plan.outputs.only) }}
@@ -166,3 +166,21 @@ jobs:
       id-token: write
       # collect-full-evaluations reads this run's job logs.
       actions: read
+
+  # The 5 PM slot also takes the two kv-offload-resharding P/D gates: each holds
+  # both 2-host slices for over an hour, more than the 1 AM lane can spare.
+  pd-kvoff-reshard:
+    needs: [build, plan]
+    if: ${{ needs.plan.outputs.only == 'nightly-5pm' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        only: [pd-mh-gpt-120b-kvoff-reshard, pd-mh-qwen3-480b-kvoff-reshard]
+    uses: ./.github/workflows/feature-validation-tpu.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      only: ${{ matrix.only }}
+    permissions:
+      contents: read
+      id-token: write

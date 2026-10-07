@@ -331,13 +331,18 @@ class TestJobMapsToOneTest(CustomTestCase):
         self.assertEqual(
             qwen["with"]["suite"], "nightly-tpu-accuracy-qwen3-5-397b-mmmupro"
         )
-        # The long P/D gates leave `all` (the nightly) for the 5 PM slot.
-        pd = workflow["jobs"]["pd-kvoff-reshard"]
-        self.assertIn('"day-5pm"', pd["if"])
+        # The long P/D gates leave the 1 AM `all` for the nightly's 5 PM slot,
+        # which calls feature validation directly: each stage holds only its own tests.
+        nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
+        pd = nightly["jobs"]["pd-kvoff-reshard"]
+        self.assertEqual(pd["if"], "${{ needs.plan.outputs.only == 'nightly-5pm' }}")
+        self.assertEqual(pd["uses"], "./.github/workflows/feature-validation-tpu.yml")
         feature = yaml.safe_load((WORKFLOWS / "feature-validation-tpu.yml").read_text())
         for only in pd["strategy"]["matrix"]["only"]:
             self.assertEqual(feature["jobs"][only]["if"].count("inputs.only =="), 1)
             self.assertNotIn('"all"', feature["jobs"][only]["if"])
+        for job in workflow["jobs"].values():
+            self.assertNotIn("feature-validation-tpu.yml", job.get("uses", ""))
 
     def test_static_pd_jobs_carry_exactly_one_existing_file(self):
         self.assertTrue(self.static_pd, "no static P/D jobs found; did they move?")
