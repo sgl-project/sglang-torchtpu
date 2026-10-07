@@ -947,6 +947,8 @@ class RaidenReceiverMixin:
             accepted_end = self._register_reshard_chunk(
                 room, index, total_pages, sources_map
             )
+        except Exception as error:
+            self._fail_reshard_room(room, error)
         finally:
             with self._state_lock:
                 registering = self._decode.reshard_chunk_registering.get(room)
@@ -1047,6 +1049,7 @@ class RaidenReceiverMixin:
         prefill_swa_blocks = req.prefill_swa_blocks
         ready = False
         aux_index = None
+        aux_error = None
         with self._state_lock:
             if (
                 room not in self._decode.reshard_meta
@@ -1069,12 +1072,19 @@ class RaidenReceiverMixin:
             ready = have >= need
             # Written under the lock, for the same reason as the pull path.
             if aux_index is not None and aux_blob:
-                write_aux_blob(
-                    self.kv_args.aux_data_ptrs,
-                    self.kv_args.aux_item_lens,
-                    aux_index,
-                    aux_blob,
-                )
+                try:
+                    write_aux_blob(
+                        self.kv_args.aux_data_ptrs,
+                        self.kv_args.aux_item_lens,
+                        aux_index,
+                        aux_blob,
+                    )
+                except Exception as error:
+                    aux_error = error
+        if aux_error is not None:
+            # Failed outside the block: _fail_reshard_room takes _state_lock.
+            self._fail_reshard_room(room, aux_error)
+            return
         if ready:
             self._maybe_register_reshard_final(room)
 
@@ -1110,14 +1120,41 @@ class RaidenReceiverMixin:
                     room,
                     sorted(partial),
                 )
-        self._register_receiver_and_signal(room)
+        try:
+            self._register_receiver_and_signal(room)
+        except Exception as error:
+            # reshard_registered stays set, so a late frame cannot retry.
+            self._fail_reshard_room(room, error)
+
+    def _fail_reshard_room(self, room: int, error: BaseException) -> None:
+        """Fail a resharded room whose decode-side handler raised.
+
+        The exception is consumed here: the listener has nothing to do with
+        it beyond logging, and its log would not carry the room. A room
+        already cleared or aborted is left as it is.
+        """
+        reason = f"Raiden reshard receive failed: {error}"
+        logger.error(
+            "RaidenKVManager rank%d room %s: %s",
+            self.attn_tp_rank,
+            room,
+            reason,
+            exc_info=error,
+        )
+        with self._state_lock:
+            if room not in self._decode.reshard_meta or room in self._aborted:
+                return
+            self._mark_aborted_locked(room)
+            self._fail_room_locked(room, reason, preserve_reason=True)
+            self.update_status(room, KVPoll.Failed)
 
     def _fail_reshard_plan_build(self, room: int, req_id: str, exc: Exception) -> None:
-        reason = f"Raiden receive failed: cannot build plan {req_id}: {exc}"
-        logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-        with self._state_lock:
-            if room in self._decode.reshard_meta:
-                self._fail_room_locked(room, reason)
+        """Fail a room whose receive plan could not be built, on the same
+        path as a raising handler: tombstoned, status Failed, first reason
+        kept."""
+        error = RuntimeError(f"cannot build plan {req_id}: {exc}")
+        error.__cause__ = exc
+        self._fail_reshard_room(room, error)
 
     def _publish_reshard_plan(
         self,
@@ -1241,11 +1278,9 @@ class RaidenReceiverMixin:
             )
             self._swa_engine.register_active_plan(room, req, is_sender=False)
         except Exception as e:
-            reason = f"Raiden reshard SWA receive: cannot stage plan {room}: {e}"
-            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-            with self._state_lock:
-                if room in self._decode.reshard_meta:
-                    self._fail_room_locked(room, reason)
+            error = RuntimeError(f"SWA: cannot stage plan {room}: {e}")
+            error.__cause__ = e
+            self._fail_reshard_room(room, error)
             return False
         with self._state_lock:
             if room not in self._decode.reshard_meta or room in self._aborted:
