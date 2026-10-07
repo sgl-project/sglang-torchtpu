@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.mm_compile import merge_mm_rows
 from sglang.srt.hardware_backend.tpu.mm_embedding import (
     MultimodalEmbedding,
     PaddedEmbedding,
@@ -23,7 +23,11 @@ from sglang.srt.utils import flatten_nested_list
 
 
 def scatter_mm_on_device(
-    dest: torch.Tensor, mask: torch.Tensor, src: MultimodalEmbedding
+    dest: torch.Tensor,
+    mask: torch.Tensor,
+    src: MultimodalEmbedding,
+    *,
+    merge_rows: Callable = merge_mm_rows,
 ) -> None:
     """Merge device embeddings using the scheduler's host row mask."""
     if mask.device.type != "cpu":
@@ -37,7 +41,7 @@ def scatter_mm_on_device(
     if num_rows == 0:
         return
     if isinstance(src, PaddedEmbedding):
-        _scatter_padded_embedding(dest, mask, src)
+        _scatter_padded_embedding(dest, mask, src, merge_rows=merge_rows)
         return
 
     # Keep indices at the padded token count; only their values depend on
@@ -45,7 +49,7 @@ def scatter_mm_on_device(
     indices = (torch.cumsum(mask.reshape(-1), dim=0, dtype=torch.int32) - 1).clamp_(
         min=0
     )
-    _scatter_mm_rows(dest, src, indices, mask)
+    _scatter_mm_rows(dest, src, indices, mask, merge_rows=merge_rows)
 
 
 def _scatter_mm_rows(
@@ -53,17 +57,25 @@ def _scatter_mm_rows(
     src: torch.Tensor,
     indices: torch.Tensor,
     mask: torch.Tensor,
+    *,
+    merge_rows: Callable = merge_mm_rows,
 ) -> None:
-    src = src.to(device=dest.device, dtype=dest.dtype)
-    if src.shape[0] < dest.shape[0]:
-        # Gather compilation must depend on the text bucket, not image length.
-        src = F.pad(src, (0, 0, 0, dest.shape[0] - src.shape[0]))
-    rows = src.index_select(0, indices.to(dest.device))
-    dest.copy_(torch.where(mask.to(dest.device), rows, dest))
+    dest.copy_(
+        merge_rows(
+            dest,
+            src.to(device=dest.device, dtype=dest.dtype),
+            indices.to(dest.device),
+            mask.to(dest.device),
+        )
+    )
 
 
 def _scatter_padded_embedding(
-    dest: torch.Tensor, mask: torch.Tensor, src: PaddedEmbedding
+    dest: torch.Tensor,
+    mask: torch.Tensor,
+    src: PaddedEmbedding,
+    *,
+    merge_rows: Callable = merge_mm_rows,
 ) -> None:
     positions = mask.reshape(-1).nonzero(as_tuple=True)[0]
     # One merge per distinct physical buffer, even when several requests reuse
@@ -89,7 +101,7 @@ def _scatter_padded_embedding(
         offset += span.length
 
     for buffer, indices, active in placements.values():
-        _scatter_mm_rows(dest, buffer, indices, active)
+        _scatter_mm_rows(dest, buffer, indices, active, merge_rows=merge_rows)
 
 
 def _place_mm_rows(
@@ -220,6 +232,7 @@ def _embed_mm_inputs(
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Optional[Dict[Modality, bool]] = None,
     input_ids_cpu: Optional[torch.Tensor] = None,
+    merge_rows: Callable = merge_mm_rows,
 ) -> Tuple[torch.Tensor, dict]:
     use_deepstack = use_deepstack or {}
     other_info = {}
@@ -332,10 +345,15 @@ def _embed_mm_inputs(
     ):
         if embedding is None or mask is None:
             continue
-        scatter_mm_on_device(dest=input_embeds, mask=mask, src=embedding)
+        scatter_mm_on_device(
+            dest=input_embeds, mask=mask, src=embedding, merge_rows=merge_rows
+        )
         if use_deepstack.get(modality, None):
             scatter_mm_on_device(
-                dest=input_deepstack_embeds, mask=mask, src=deepstack_embeddings[i]
+                dest=input_deepstack_embeds,
+                mask=mask,
+                src=deepstack_embeddings[i],
+                merge_rows=merge_rows,
             )
 
     return input_embeds, other_info
@@ -353,6 +371,7 @@ def _embed_mm_inputs_with_split(
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Optional[Dict[Modality, bool]] = None,
     input_ids_cpu: Optional[torch.Tensor] = None,
+    merge_rows: Callable = merge_mm_rows,
 ) -> Tuple[torch.Tensor, dict]:
     use_deepstack = use_deepstack or {}
     precomputed_req_indices = []
@@ -370,6 +389,7 @@ def _embed_mm_inputs_with_split(
         data_embedding_func_mapping=data_embedding_func_mapping,
         placeholder_tokens=placeholder_tokens,
         use_deepstack=use_deepstack,
+        merge_rows=merge_rows,
     )
 
     if not precomputed_req_indices or not non_precomputed_req_indices:
@@ -470,6 +490,7 @@ def embed_mm_inputs_tpu(
     data_embedding_func_mapping: Optional[Dict[Modality, DataEmbeddingFunc]] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Optional[Dict[Modality, bool]] = None,
+    merge_rows: Callable = merge_mm_rows,
 ) -> Tuple[torch.Tensor, dict]:
     """Prepare TPU multimodal rows; padded embeddings never escape this boundary."""
     kwargs = dict(
@@ -483,6 +504,7 @@ def embed_mm_inputs_tpu(
         data_embedding_func_mapping=data_embedding_func_mapping,
         placeholder_tokens=placeholder_tokens,
         use_deepstack=use_deepstack or {},
+        merge_rows=merge_rows,
     )
     if get_server_args() and get_disagg().enable_adaptive_dispatch_to_encoder:
         return _embed_mm_inputs_with_split(forward_batch=forward_batch, **kwargs)

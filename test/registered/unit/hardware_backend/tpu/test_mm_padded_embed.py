@@ -26,7 +26,10 @@ register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
 NUM_TOKENS = 64
 
 
-def test_embed_preserves_cpu_placeholders_and_merges_multiple_images():
+@pytest.mark.parametrize("compiled_callbacks", [False, True])
+def test_embed_preserves_cpu_placeholders_and_merges_multiple_images(
+    compiled_callbacks,
+):
     cpu_ids = torch.tensor([1, 99, 99, 2, 100, 100, 3])
     device_ids = torch.cat([cpu_ids, torch.zeros(1, dtype=torch.long)])
     text_embedding = torch.nn.Embedding.from_pretrained(
@@ -50,7 +53,12 @@ def test_embed_preserves_cpu_placeholders_and_merges_multiple_images():
         envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(True),
         patch.object(mm_embed_tpu, "get_server_args", return_value=None),
     ):
+        from sglang.srt.hardware_backend.tpu.mm_compile import merge_mm_rows
+
+        merge_rows = Mock(wraps=merge_mm_rows)
+        callbacks = dict(merge_rows=merge_rows) if compiled_callbacks else {}
         result, _ = mm_embed_tpu.embed_mm_inputs_tpu(
+            **callbacks,
             forward_batch=SimpleNamespace(mm_input_ids_cpu=cpu_ids),
             mm_inputs_list=[mm_inputs],
             extend_prefix_lens=[0],
@@ -60,6 +68,8 @@ def test_embed_preserves_cpu_placeholders_and_merges_multiple_images():
             data_embedding_func_mapping={Modality.IMAGE: Mock()},
         )
     assert torch.equal(result, expected)
+    if compiled_callbacks:
+        assert merge_rows.call_count == 1
     assert cpu_ids.tolist() == [1, 99, 99, 2, 100, 100, 3]
     assert device_ids.tolist() == [1, 7, 7, 2, 7, 7, 3, 0]
 
