@@ -23,11 +23,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_tpu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 logger = logging.getLogger(__name__)
 
@@ -165,9 +166,7 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    from sglang.srt.platforms import current_platform
-
-    if current_platform.is_tpu():
+    if _is_tpu:
         pool = runner.token_to_kv_pool
         alloc = runner.token_to_kv_pool_allocator
         kv_bytes = pool.get_kv_size_bytes()
