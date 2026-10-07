@@ -1895,13 +1895,19 @@ class Envs:
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
     # and tune from there.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
-    # xprof scope per task. Values <= 0 trace all chips or SparseCores.
-    # TODO: not read by the TPU profiler; wire up in the custom-options PR.
+    # TPU profiler defaults for every capture; a /start_profile profile_prefix
+    # of the form "key:value;key:value" overrides them per capture (see
+    # hardware_backend/tpu/profiler.py).
+    # Chips / SparseCores traced per task. Values <= 0 trace all of them.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
-    # TPU profiler python tracer (torch.profiler with_stack=True). Off by
-    # default: it dominates host busy time.
+    # TPU profiler python tracer (python_tracer_level=1, and torch.profiler
+    # with_stack=True). Off by default: it dominates host busy time.
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
+    # More options, as "key:value;key:value": tracer levels (e.g.
+    # "host_tracer_level:3") and libtpu experimental options (e.g.
+    # "tpu_trace_mode:TRACE_COMPUTE;tpu_perf_counters:true").
+    SGLANG_TPU_PROFILE_OPTIONS = EnvStr("")
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.

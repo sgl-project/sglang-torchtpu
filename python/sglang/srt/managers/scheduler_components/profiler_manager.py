@@ -85,6 +85,7 @@ class SchedulerProfilerManager:
 
         # For TPU
         self.tpu_profiler = None
+        self.tpu_profile_options = None
 
     def _init_profile(
         self,
@@ -137,6 +138,22 @@ class SchedulerProfilerManager:
                 success=False,
                 message="merge_profiles is not supported for TPU profiling.",
             )
+
+        self.tpu_profile_options = None
+        if _is_tpu and "TPU" in activities:
+            from sglang.srt.hardware_backend.tpu.profiler import (
+                resolve_tpu_profile_options,
+            )
+
+            # A "key:value;..." profile_prefix carries TPU profiler options
+            # rather than a name. Parse here so bad options fail /start_profile
+            # even when the capture starts later (start_step, profile_by_stage).
+            try:
+                profile_prefix, self.tpu_profile_options = resolve_tpu_profile_options(
+                    profile_prefix
+                )
+            except ValueError as e:
+                return ProfileReqOutput(success=False, message=str(e))
 
         self.profile_by_stage = profile_by_stage
         self.merge_profiles = merge_profiles
@@ -222,16 +239,21 @@ class SchedulerProfilerManager:
                     subdir_parts.append(str(self.profile_id))
                 if stage is not None:
                     subdir_parts.append(stage.name)
-                # One directory per rank keeps each rank's Kineto trace apart.
-                subdir_parts.extend(self._rank_parts())
+                # One directory per capture, stage and rank. It gets both the
+                # Kineto trace and the xplane, so ranks and stages don't
+                # overwrite each other.
+                rank_parts = self._rank_parts()
+                subdir_parts.extend(rank_parts)
                 # "TPU" -> TPU-only. "TPU"+"CPU" -> CPU and TPU.
                 try:
                     self.tpu_profiler = start_tpu_profile(
                         output_dir=self.torch_profiler_output_dir
                         / "-".join(subdir_parts),
                         with_cpu="CPU" in activities,
+                        options=self.tpu_profile_options,
+                        worker_rank="-".join(rank_parts),
                     )
-                except RuntimeError as e:
+                except (RuntimeError, ValueError) as e:
                     return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
         elif "RPD" in activities:  # for ROCM

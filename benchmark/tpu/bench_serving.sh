@@ -62,10 +62,12 @@
 #   PROFILE=0                       # 1 → torch profiler /start_profile capture
 #   PROFILE_NUM_STEPS=5
 #   PROFILE_ACTIVITIES="CPU TPU"      # TPU device activity; CPU GPU is CUDA-only
-#   PROFILE_OUTPUT_DIR=             # auto-generated when PROFILE=1. Gets the
-#                                   # Kineto traces; the TPU xplane goes to
-#                                   # ${TMPDIR:-/tmp}/plugins/profile/ on the
-#                                   # server host (path logged by the server)
+#   PROFILE_OUTPUT_DIR=             # auto-generated when PROFILE=1. On the
+#                                   # server host, each rank (and stage) gets
+#                                   # a subdirectory with its Kineto trace and
+#                                   # plugins/profile/<ts>/*.xplane.pb. TPU
+#                                   # profiler options: set
+#                                   # SGLANG_TPU_PROFILE_OPTIONS on the server
 #   OUTPUT_DIR=./results/<model-slug>-tpu/<ts>
 #                                   # JSONL summaries (one per sweep config) land here
 #   SWEEP=                          # space-separated "c:isl:osl[:workload]" tuples
