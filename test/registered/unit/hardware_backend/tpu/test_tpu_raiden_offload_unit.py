@@ -1968,6 +1968,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._transfer_parallelism = 4
         mgr._push_executor = _InlineExecutor()
         mgr._make_geometry = self._geometry
+        # Placeholder tensors: the geometry checks have nothing to inspect.
+        mgr.reshard_refusal = lambda src_tp, dst_tp: None
+        mgr._check_reshard_bounds = lambda *args, **kwargs: None
         mgr._read_leases = {}
         mgr._uuid_seq = 0
         mgr._prefill.announce_pages = 16
@@ -2131,6 +2134,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._local_rank = 0
         mgr._uuid_seq = 0
         mgr._make_geometry = self._geometry
+        # Placeholder tensors: the geometry checks have nothing to inspect.
+        mgr.reshard_refusal = lambda src_tp, dst_tp: None
+        mgr._check_reshard_bounds = lambda *args, **kwargs: None
         mgr._decode.reshard_meta = {
             self.ROOM: dict(
                 local_blocks=list(self.DECODE_BLOCKS),

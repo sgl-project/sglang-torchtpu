@@ -4,9 +4,12 @@ import itertools
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     ReshardGeometry,
@@ -246,6 +249,314 @@ class TestTpuReshardLayout(unittest.TestCase):
         # Full-attention geometry ignores the SWA count.
         mgr = _manager(fp8, 4, 8, 4)
         self.assertEqual(mgr._make_geometry(8, 4).total_kv_heads, 4)
+
+
+# ---- push-reshard refusal --------------------------------------------------
+
+_FP8 = torch.float8_e4m3fn
+_SUBLANES = 8
+
+
+class _Tensor:
+    def __init__(self, shape, itemsize):
+        self.shape = tuple(shape)
+        self._itemsize = itemsize
+
+    def element_size(self):
+        return self._itemsize
+
+
+def _cdiv(a, b):
+    return -(-a // b)
+
+
+def _shape(layout, itemsize, heads, head_dim, page):
+    pk = 4 // itemsize
+    if layout == "NHD":
+        return (2, page, _cdiv(2 * heads, pk), pk, _cdiv(head_dim, 128) * 128)
+    lanes = _cdiv(head_dim, _SUBLANES * pk) * _SUBLANES * pk
+    return (2, 2 * heads, lanes // pk, pk, page)
+
+
+def _refusal_manager(
+    tensors, heads, own_tp, *, total_heads, page_size=64, side="decode"
+):
+    mgr = object.__new__(RaidenKVManager)
+    mgr.attn_tp_size = own_tp
+    mgr.kv_args = SimpleNamespace(total_kv_head_num=total_heads, page_size=page_size)
+    mgr.disaggregation_mode = (
+        DisaggregationMode.DECODE if side == "decode" else DisaggregationMode.PREFILL
+    )
+    mgr._kv_caches = list(tensors)
+    mgr._kv_head_nums = tuple(heads)
+    mgr._swa_kv_caches = []
+    mgr._seq_along_lane = False
+    return mgr
+
+
+def _allowed(layout, itemsize, src_tp, dst_tp, held, geom_heads, head_dim, page):
+    """Both sides' verdict for one KV layer holding ``held`` global heads, pushed
+    with a geometry built for ``geom_heads`` (they differ for draft and, before
+    #1076, sliding-window layers)."""
+    for own_tp, side in ((dst_tp, "decode"), (src_tp, "prefill")):
+        heads = max(1, held // own_tp)
+        mgr = _refusal_manager(
+            [_Tensor(_shape(layout, itemsize, heads, head_dim, page), itemsize)],
+            [heads],
+            own_tp,
+            total_heads=geom_heads,
+            page_size=page,
+            side=side,
+        )
+        mgr._seq_along_lane = layout == "HND"
+        if mgr.reshard_refusal(src_tp, dst_tp) is not None:
+            return False
+    return True
+
+
+def _global_heads(rank, tp, total):
+    if total >= tp:
+        return [rank * (total // tp) + i for i in range(total // tp)]
+    return [rank // (tp // total)]
+
+
+def _labels(layout, itemsize, heads, ghead, head_dim, page):
+    """Byte labels of one block in the CPU (logical) layout; 0 marks padding."""
+    shape = _shape(layout, itemsize, heads, head_dim, page)
+    pk = shape[3]
+    if layout == "NHD":
+        t, row, r, c = np.meshgrid(*(np.arange(n) for n in shape[1:]), indexing="ij")
+        slot = row * pk + r
+    else:
+        slot, w, r, t = np.meshgrid(*(np.arange(n) for n in shape[1:]), indexing="ij")
+        c = w * pk + r
+    valid = (slot < 2 * heads) & (c < head_dim)
+    g = np.take(np.array(ghead + [0]), np.minimum(slot // 2, heads))
+    elem = np.arange(valid.size).reshape(valid.shape)
+    out = np.zeros(valid.size * itemsize, dtype=np.int64)
+    for b in range(itemsize):
+        label = (((g * 2 + slot % 2) * 512 + c) * 2048 + t) * 4 + b + 1
+        out[(elem * itemsize + b)[valid]] = label[valid]
+    return out
+
+
+def _chunks(offset, size, stride, count):
+    return (offset + stride * np.arange(count)[:, None] + np.arange(size)).ravel()
+
+
+def _push_correct(layout, itemsize, src_tp, dst_tp, held, geom_heads, head_dim, page):
+    """Replay the legacy push byte for byte: the sender sends at most its block
+    of the entry's chunks, the receiver writes exactly what was sent."""
+    ratio = rs.reshard_ratio(src_tp, dst_tp)
+    s_h, d_h = max(1, held // src_tp), max(1, held // dst_tp)
+    src_t = _Tensor(_shape(layout, itemsize, s_h, head_dim, page), itemsize)
+    dst_t = _Tensor(_shape(layout, itemsize, d_h, head_dim, page), itemsize)
+    gsrc = rs.ReshardGeometry(src_tp, dst_tp, rs.head_pair_bytes(src_t), geom_heads)
+    gdst = rs.ReshardGeometry(src_tp, dst_tp, rs.head_pair_bytes(dst_t), geom_heads)
+    src_block = int(np.prod(src_t.shape[1:])) * itemsize
+    for d in range(dst_tp):
+        expect = _labels(
+            layout, itemsize, d_h, _global_heads(d, dst_tp, held), head_dim, page
+        )
+        got = np.zeros(expect.size * 8, dtype=np.int64)
+        srcs = rs.source_ranks_for(d, ratio)
+        rreq = rs.build_receiver_request(
+            _Pb2, uuid=1, req_id="x", peer="d", decode_rank=d, geom=gdst,
+            sources=[(p, [0]) for p in srcs], dst_block_ids=[0], live_tokens=[page],
+        )  # fmt: skip
+        for p in srcs:
+            sent = _labels(
+                layout, itemsize, s_h, _global_heads(p, src_tp, held), head_dim, page
+            )
+            sent = np.concatenate([sent, np.full(sent.size * 8, -1, np.int64)])
+            sreq = rs.build_sender_request(
+                _Pb2, uuid=1, req_id="x", peer="d", prefill_rank=p, decode_rank=d,
+                geom=gsrc, src_block_ids=[0], dst_block_ids=[0], live_tokens=[page],
+            )  # fmt: skip
+            sidx = np.concatenate(
+                [
+                    _chunks(
+                        e.src_offset_bytes, e.size_bytes, e.src_stride_bytes, e.count
+                    )
+                    for e in sreq.shard_push_schedules[0].entries
+                ]
+            )[:src_block]
+            didx = np.concatenate(
+                [
+                    _chunks(
+                        e.dst_offset_bytes, e.size_bytes, e.dst_stride_bytes, e.count
+                    )
+                    for e in rreq.shard_push_schedules[p].entries
+                ]
+            )
+            if didx.size < sidx.size:
+                return False
+            got[didx[: sidx.size]] = sent[sidx]
+        if got[expect.size :].any():
+            return False
+        mask = expect != 0
+        if not np.array_equal(got[: expect.size][mask], expect[mask]):
+            return False
+    return True
+
+
+class _Entries(list):
+    def add(self):
+        entry = SimpleNamespace()
+        self.append(entry)
+        return entry
+
+
+class _Schedules(dict):
+    def __missing__(self, key):
+        self[key] = SimpleNamespace(entries=_Entries())
+        return self[key]
+
+
+class _Pb2:
+    MEMORY_TYPE_DRAM = 1
+    MEMORY_TYPE_HBM = 2
+
+    @staticmethod
+    def StartTransferRequest():
+        return SimpleNamespace(shard_push_schedules=_Schedules())
+
+
+class TestPushReshardRefusal(unittest.TestCase):
+    def _decode(self, tensors, heads, *, total_heads, src_tp=8, dst_tp=4, page=64):
+        mgr = _refusal_manager(
+            tensors, heads, dst_tp, total_heads=total_heads, page_size=page
+        )
+        return mgr.reshard_refusal(src_tp, dst_tp)
+
+    def test_real_pool_matrix(self):
+        bf16_2 = _layer(torch.bfloat16, 2)
+        fp8_1, fp8_2 = _layer(_FP8, 1), _layer(_FP8, 2)
+        # A fp8 tensor's shape cannot tell one head from two.
+        self.assertEqual(fp8_1.shape, fp8_2.shape)
+        self.assertIsNone(self._decode([bf16_2], [2], total_heads=8))
+        self.assertIsNone(self._decode([fp8_1], [1], total_heads=4))
+        self.assertIn("fp8", self._decode([fp8_2], [2], total_heads=8))
+        fp8_4 = _layer(_FP8, 4)
+        self.assertIsNotNone(self._decode([fp8_4], [4], total_heads=16))
+
+    def test_layout_and_limits(self):
+        mla = torch.zeros(4, 64, 576, dtype=torch.bfloat16)
+        self.assertIn("5-D", self._decode([mla], [1], total_heads=1))
+        bf16 = _layer(torch.bfloat16, 2)
+        self.assertIn("page_size", self._decode([bf16], [2], total_heads=8, page=2048))
+        self.assertIn("multiple", self._decode([bf16], [2], total_heads=8, src_tp=6))
+        self.assertIsNotNone(self._decode([bf16], [2], total_heads=8, src_tp=2))
+
+    def test_draft_layers_with_other_head_dim_refused(self):
+        target = _layer(torch.bfloat16, 2)
+        draft = TpuFusedMHATokenToKVPool(
+            size=128,
+            page_size=64,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=256,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        ).get_fused_kv_buffer(0)
+        reason = self._decode([target, draft], [2, 2], total_heads=8)
+        self.assertIn("head_dim or dtype", reason)
+
+    def test_prefill_side_and_memo(self):
+        mgr = _refusal_manager(
+            [_layer(_FP8, 1)], [1], 8, total_heads=8, side="prefill"
+        )  # fmt: skip
+        reason = mgr.reshard_refusal(8, 4)
+        self.assertIsNotNone(reason)
+        self.assertIs(mgr.reshard_refusal(8, 4), reason)
+
+    def test_bounds_check_fires_for_fp8_one_to_two(self):
+        geom = rs.ReshardGeometry(8, 4, 4 * 128, 8)
+        # Each decode rank holds two fp8 heads in one 32-bit row; the default
+        # unit schedule places the second source one row further.
+        mgr = _refusal_manager([_layer(_FP8, 2)], [2], 4, total_heads=8)
+        req = rs.build_receiver_request(
+            _Pb2, uuid=1, req_id="x", peer="d", decode_rank=0, geom=geom,
+            sources=[(0, [0]), (1, [0])], dst_block_ids=[0], live_tokens=[64],
+        )  # fmt: skip
+        with self.assertRaisesRegex(ValueError, "exceeds the block"):
+            mgr._check_reshard_bounds(req, 8, 4)
+
+
+class TestPushReshardBytes(unittest.TestCase):
+    """Byte-level pins: the predicate allows a cell iff the push is exact."""
+
+    # (layout, itemsize, src_tp, dst_tp, held heads, geometry heads, head_dim,
+    #  page, exact)
+    CASES = [
+        ("NHD", 2, 8, 4, 8, 8, 128, 64, True),
+        ("NHD", 2, 4, 1, 8, 8, 64, 64, True),
+        ("NHD", 1, 8, 4, 4, 4, 128, 64, True),
+        ("NHD", 1, 8, 4, 8, 8, 128, 64, False),
+        ("NHD", 1, 4, 2, 8, 8, 128, 64, False),
+        # TODO(#829) coincidence: fp8 layers holding twice the geometry's heads
+        # with even heads per rank (sliding-window before #1076, draft).
+        ("NHD", 1, 4, 2, 8, 4, 128, 64, True),
+        ("NHD", 1, 8, 2, 16, 8, 128, 64, True),
+        # Spec §3.2 counterexample: shape-only heads would allow it.
+        ("NHD", 1, 8, 4, 8, 4, 128, 64, False),
+        ("NHD", 2, 8, 4, 16, 8, 128, 64, False),
+        # TODO(#829) coincidence: SEQ_ALONG_LANE at one head per rank.
+        ("HND", 2, 8, 4, 4, 4, 128, 128, True),
+        ("HND", 1, 8, 4, 4, 4, 128, 256, True),
+        ("HND", 2, 8, 4, 4, 4, 256, 128, False),
+        ("HND", 2, 8, 4, 8, 8, 128, 128, False),
+        ("HND", 2, 8, 4, 2, 2, 128, 128, True),
+    ]
+
+    def test_verdict_matches_bytes(self):
+        for case in self.CASES:
+            *args, exact = case
+            with self.subTest(case=case):
+                self.assertEqual(_push_correct(*args), exact)
+                self.assertEqual(_allowed(*args), exact)
+
+
+class TestRefusalWithSlidingWindow(unittest.TestCase):
+    def test_refusal_matches_both_groups_bytes(self):
+        """reshard_refusal checks the full and the sliding-window group. Over
+        real pools it allows a cell iff both groups land byte for byte, with
+        the SWA group sized by _make_geometry (#1076), including the fp8
+        cells where that keeps the full count."""
+
+        def manager(dtype, full_heads, swa_heads, tp, mode):
+            mgr = _manager(dtype, full_heads, swa_heads, tp)
+            mgr.attn_tp_size = tp
+            mgr.kv_args.page_size = PAGE
+            mgr.disaggregation_mode = mode
+            mgr._kv_head_nums = (max(1, full_heads // tp),)
+            mgr._swa_kv_head_nums = (max(1, swa_heads // tp),)
+            return mgr
+
+        topologies = ((2, 1), (4, 2), (4, 1), (8, 4), (8, 2), (16, 8), (16, 4))
+        for dtype in (torch.bfloat16, _FP8):
+            for full_heads, swa_heads in itertools.product((2, 4, 8, 16), repeat=2):
+                for src_tp, dst_tp in topologies:
+                    cell = (dtype, full_heads, swa_heads, src_tp, dst_tp)
+                    with self.subTest(cell=cell):
+                        heads = (full_heads, swa_heads, src_tp, dst_tp)
+                        exact = _replay(*heads, dtype=dtype, swa=False)
+                        try:
+                            exact = exact and _replay(*heads, dtype=dtype, swa=True)
+                        except ValueError:
+                            exact = False
+                        allowed = all(
+                            manager(
+                                dtype, full_heads, swa_heads, tp, mode
+                            ).reshard_refusal(src_tp, dst_tp)
+                            is None
+                            for tp, mode in (
+                                (dst_tp, DisaggregationMode.DECODE),
+                                (src_tp, DisaggregationMode.PREFILL),
+                            )
+                        )
+                        self.assertEqual(allowed, exact)
 
 
 if __name__ == "__main__":

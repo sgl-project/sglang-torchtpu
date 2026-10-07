@@ -156,6 +156,10 @@ class RaidenKVManager(
     _read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     _write_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     state_raiden_endpoint: Optional[str] = None
+    # Recorded by set_kv_caches from RaidenKVCacheGroups.
+    _kv_head_nums: Tuple[int, ...] = ()
+    _swa_kv_head_nums: Tuple[int, ...] = ()
+    _seq_along_lane = False
 
     def __init__(
         self,
@@ -378,6 +382,120 @@ class RaidenKVManager(
             )
         return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
 
+    def _reshard_layers(self, swa: bool) -> List[Tuple[tuple, int, int]]:
+        """Distinct (shape, element_size, per-rank kv heads) of a KV group."""
+        tensors = (self._swa_kv_caches if swa else self._kv_caches) or []
+        head_nums = self._swa_kv_head_nums if swa else self._kv_head_nums
+        total = int(
+            self.kv_args.total_swa_kv_head_num
+            if swa
+            else self.kv_args.total_kv_head_num
+        )
+        fallback = max(1, total // max(1, self.attn_tp_size))
+        layers = {}
+        for i, tensor in enumerate(tensors):
+            heads = head_nums[i] if i < len(head_nums) else 0
+            key = (tuple(tensor.shape), int(tensor.element_size()), heads or fallback)
+            layers.setdefault(key, None)
+        return list(layers)
+
+    def reshard_refusal(self, src_attn_tp: int, dst_attn_tp: int) -> Optional[str]:
+        """Why this side's KV cannot be push-resharded from prefill attention
+        TP ``src_attn_tp`` to decode ``dst_attn_tp``, or None. Never raises."""
+        cache = self.__dict__.setdefault("_reshard_refusals", {})
+        key = (src_attn_tp, dst_attn_tp)
+        if key not in cache:
+            try:
+                cache[key] = self._reshard_refusal(src_attn_tp, dst_attn_tp)
+            except Exception as e:  # a refusal must not crash the caller
+                cache[key] = (
+                    f"Raiden push-reshard ({src_attn_tp} -> {dst_attn_tp}) "
+                    f"geometry check failed: {e!r}"
+                )
+        return cache[key]
+
+    def _reshard_refusal(self, src_attn_tp: int, dst_attn_tp: int) -> Optional[str]:
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            candidate_total_heads,
+            fused_layout_refusal,
+            push_reshard_refusal,
+            push_reshard_where,
+        )
+
+        if src_attn_tp <= dst_attn_tp or src_attn_tp % dst_attn_tp:
+            return (
+                f"{push_reshard_where(src_attn_tp, dst_attn_tp)} needs the "
+                "prefill attention TP to be a multiple of the decode's"
+            )
+        own_tp = self.attn_tp_size
+        peer_tp = dst_attn_tp if own_tp == src_attn_tp else src_attn_tp
+        page_size = int(self.kv_args.page_size)
+        for swa in (False, True) if self._swa_kv_caches else (False,):
+            layers = self._reshard_layers(swa)
+            for shape, _, _ in layers:
+                reason = fused_layout_refusal(src_attn_tp, dst_attn_tp, len(shape))
+                if reason is not None:
+                    return reason
+            try:
+                geom = self._make_geometry(src_attn_tp, dst_attn_tp, swa=swa)
+            except (ValueError, RuntimeError) as e:
+                return f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
+            for shape, element_size, heads in layers:
+                reasons = []
+                for total in candidate_total_heads(heads, own_tp, peer_tp):
+                    try:
+                        reason = push_reshard_refusal(
+                            geom,
+                            shape,
+                            element_size,
+                            total_heads=total,
+                            own_tp=own_tp,
+                            page_size=page_size,
+                            seq_along_lane=self._seq_along_lane,
+                        )
+                    except ValueError as e:
+                        reason = f"{push_reshard_where(src_attn_tp, dst_attn_tp)}: {e}"
+                    if reason is None:
+                        break
+                    reasons.append(reason)
+                else:
+                    return reasons[0]
+        return None
+
+    def _check_reshard_bounds(
+        self, req: Any, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False
+    ) -> None:
+        """Raise ValueError if a push plan would move bytes outside a block of
+        any of the group's KV layers. The decode estimates the prefill block
+        from its own tensor: only the head rows differ between the sides."""
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            check_request_bounds,
+        )
+
+        prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        pairs = []
+        for shape, element_size, heads in self._reshard_layers(swa):
+            if len(shape) != 5:
+                continue
+            block = math.prod(shape[1:]) * element_size
+            if prefill:
+                pairs.append((block, None))
+                continue
+            src_heads = max(1, heads * dst_attn_tp // src_attn_tp)
+            if self._seq_along_lane:
+                own_rows, src_rows = shape[1], 2 * src_heads
+            else:
+                own_rows, src_rows = shape[2], -(-2 * src_heads // shape[3])
+            pairs.append((block // own_rows * src_rows, block))
+        check_request_bounds(req, pairs)
+
+    def log_reshard_refusal(self, key: Any, reason: str) -> None:
+        """Log a refusal at ERROR once per ``key``."""
+        logged = self.__dict__.setdefault("_logged_reshard_refusals", set())
+        if key not in logged:
+            logged.add(key)
+            logger.error("%s", reason)
+
     # ----- engine lifecycle -------------------------------------------------
 
     def set_kv_caches(self, kv_caches: RaidenKVCacheGroups) -> None:
@@ -402,6 +520,9 @@ class RaidenKVManager(
             and self._committed_state_row is None
         ):
             raise RuntimeError("Raiden GDN state tensors need a committed-row mapping")
+        self._kv_head_nums = tuple(kv_caches.full_head_nums)
+        self._swa_kv_head_nums = tuple(kv_caches.swa_head_nums)
+        self._seq_along_lane = kv_caches.seq_along_lane
         if self._pipeline_enabled:
             if self._state_kv_caches:
                 raise NotImplementedError(

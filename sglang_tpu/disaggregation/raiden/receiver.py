@@ -1131,6 +1131,9 @@ class RaidenReceiverMixin:
         """
         engine = self._ensure_engine()
         try:
+            with self._state_lock:
+                src_attn_tp = self._decode.reshard_meta[room]["src_attn_tp"]
+            self._check_reshard_bounds(req, src_attn_tp, self.attn_tp_size)
             engine.register_active_plan(uuid, req, is_sender=False)
         except Exception as e:
             reason = f"Raiden receive failed: cannot stage plan {req_id}: {e}"
@@ -1229,6 +1232,7 @@ class RaidenReceiverMixin:
             live_tokens=[self.kv_args.page_size] * n,
         )
         try:
+            self._check_reshard_bounds(req, src_attn_tp, self.attn_tp_size, swa=True)
             self._swa_engine.register_active_plan(room, req, is_sender=False)
         except Exception as e:
             reason = f"Raiden reshard SWA receive: cannot stage plan {room}: {e}"
@@ -1371,9 +1375,66 @@ class RaidenReceiverMixin:
         )
 
 
+def _attn_tp_refusal(receiver: RaidenKVReceiver) -> Optional[str]:
+    src, dst = receiver.prefill_info.attn_tp_size, receiver.kv_mgr.attn_tp_size
+    if src < dst:
+        return (
+            f"Raiden cannot serve a decode with a larger attention TP ({dst}) "
+            f"than the prefill ({src}) without the pipeline transfer: the "
+            "prefill answers one decode rank per room. Set "
+            "SGLANG_RAIDEN_PIPELINE_TRANSFER=1 on the decode (TP=1 pipeline "
+            "prefill) or use attention TP prefill >= decode"
+        )
+    if src % dst:
+        return (
+            f"Raiden push-reshard needs the prefill attention TP ({src}) to be "
+            f"a multiple of the decode's ({dst})"
+        )
+    return None
+
+
+def _source_count_refusal(receiver: RaidenKVReceiver) -> Optional[str]:
+    if len(receiver.target_pp_ranks) != 1:
+        return (
+            f"Raiden: the prefill runs {len(receiver.target_pp_ranks)} pipeline "
+            "stages; set SGLANG_RAIDEN_PIPELINE_TRANSFER=1 on the decode"
+        )
+    if len(receiver.target_cp_ranks) != 1:
+        return (
+            "Raiden does not pull from several context-parallel prefill ranks "
+            f"({len(receiver.target_cp_ranks)}) without the pipeline transfer"
+        )
+    src, dst = receiver.prefill_info.attn_tp_size, receiver.kv_mgr.attn_tp_size
+    expected = max(1, src // dst)
+    if len(receiver.bootstrap_infos) != expected:
+        return (
+            f"Raiden expected {expected} prefill sources per decode rank for "
+            f"attention TP {src} -> {dst}, got {len(receiver.bootstrap_infos)}"
+        )
+    return None
+
+
+def _push_reshard_refusal(receiver: RaidenKVReceiver) -> Optional[str]:
+    src, dst = receiver.prefill_info.attn_tp_size, receiver.kv_mgr.attn_tp_size
+    if src <= dst:
+        return None
+    if not receiver.kv_mgr._dynamic_host_staging:
+        return (
+            f"Raiden asymmetric attention TP ({src} -> {dst}) needs "
+            "per-transfer host staging; do not set "
+            "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0"
+        )
+    return receiver.kv_mgr.reshard_refusal(src, dst)
+
+
 class RaidenKVReceiver(CommonKVReceiver):
     # See RaidenKVSender: a group Failed waits for every rank's transfers.
     group_failure_requires_drain = True
+    # Ordered checks run by init() on the legacy (non-pipeline) transport,
+    # after the rank mapping is known and before any frame reaches the
+    # prefill. Each returns why the room cannot be served, or None; the first
+    # reason fails the room. Append new refusals here.
+    init_checks = (_attn_tp_refusal, _source_count_refusal, _push_reshard_refusal)
 
     def __init__(
         self,
@@ -1386,6 +1447,20 @@ class RaidenKVReceiver(CommonKVReceiver):
         # Bounds the wait before send_metadata, see _check_handshake_timeout.
         self._handshake_start = time.time()
         self._handshake_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+
+    def init(self, prefill_dp_rank: int):
+        super().init(prefill_dp_rank)
+        if self.conclude_state is not None or self.kv_mgr._pipeline is not None:
+            return
+        if self.prefill_info.attn_tp_size <= 0:
+            return
+        for check in self.init_checks:
+            reason = check(self)
+            if reason is not None:
+                key = (check.__name__, self.prefill_info.attn_tp_size)
+                self.kv_mgr.log_reshard_refusal(key, reason)
+                self._conclude_failed(reason=reason)
+                return
 
     def send_metadata(
         self,

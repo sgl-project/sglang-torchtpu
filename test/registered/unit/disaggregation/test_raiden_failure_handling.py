@@ -1126,9 +1126,13 @@ class TestSenderBootstrapGate(unittest.TestCase):
         # A resharding decode sends RESHARD_READY only after the prefill has
         # announced its blocks, so the request itself must open the gate.
         sender, mgr = self._sender()
+        # A servable 4 -> 2 geometry; refusals are covered by the reshard tests.
+        mgr.attn_tp_size = 4
+        mgr.reshard_refusal = Mock(return_value=None)
         mgr._dispatch(
             ReshardReq(ROOM, "10.0.0.2", 5555, "push", [1, 2], 2, [], "").to_frames()
         )
+        mgr.reshard_refusal.assert_called_once_with(4, 2)
         self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
 
     def test_pipeline_request_ends_bootstrapping(self):
@@ -1254,6 +1258,172 @@ class TestReshardHandshakeWindow(unittest.TestCase):
         mgr = _prefill_manager()
         mgr._prefill.decode_addr[ROOM] = ("10.0.0.2", 5555)
         self.assertIsNone(mgr.awaiting_decode_since(ROOM, 1000.0))
+
+
+class TestReceiverInitRefusals(unittest.TestCase):
+    """init() fails a room the legacy transport would corrupt or hang, before
+    send_metadata can reach the prefill."""
+
+    def _init(self, src_tp, dst_tp, *, infos=None, pp=1, cp=1, **mgr_overrides):
+        fields = dict(
+            attn_tp_size=dst_tp,
+            _pipeline=None,
+            _dynamic_host_staging=True,
+            reshard_refusal=Mock(return_value=None),
+            log_reshard_refusal=Mock(),
+            register_decode_request=Mock(),
+        )
+        fields.update(mgr_overrides)
+        mgr = _decode_manager_stub(**fields)
+        recv = _receiver(mgr)
+        n = max(1, src_tp // dst_tp) if infos is None else infos
+
+        def common_init(self, prefill_dp_rank):
+            self.prefill_info = SimpleNamespace(attn_tp_size=src_tp)
+            self.target_pp_ranks = list(range(pp))
+            self.target_cp_ranks = list(range(cp))
+            self.bootstrap_infos = [{"rank_ip": "10.0.0.1", "rank_port": 4444}] * n
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.CommonKVReceiver.init",
+                common_init,
+            ),
+            patch.object(RaidenKVReceiver, "_send_abort_notification") as abort,
+        ):
+            recv.init(0)
+        return recv, mgr, abort
+
+    def _assert_refused(self, recv, mgr, abort, text):
+        self.assertEqual(recv.poll(), KVPoll.Failed)
+        abort.assert_called_once()
+        mgr.log_reshard_refusal.assert_called_once()
+        recv.send_metadata(np.asarray([1], dtype=np.int32))
+        mgr.register_decode_request.assert_not_called()
+        with self.assertRaises(Exception) as cm:
+            recv.failure_exception()
+        self.assertIn(text, str(cm.exception))
+
+    def test_larger_decode_tp_refused_without_pipeline(self):
+        self._assert_refused(
+            *self._init(2, 4), "SGLANG_RAIDEN_PIPELINE_TRANSFER=1"
+        )  # fmt: skip
+
+    def test_larger_decode_tp_allowed_on_pipeline(self):
+        recv, mgr, abort = self._init(1, 4, _pipeline=object())
+        self.assertIsNone(recv.conclude_state)
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.WaitingForInput)
+        abort.assert_not_called()
+
+    def test_equal_tp_allowed(self):
+        recv, mgr, _ = self._init(4, 4)
+        self.assertIsNone(recv.conclude_state)
+        mgr.reshard_refusal.assert_not_called()
+
+    def test_pipeline_prefill_refused(self):
+        self._assert_refused(*self._init(4, 4, pp=2), "pipeline stages")
+
+    def test_source_count_mismatch_refused(self):
+        self._assert_refused(*self._init(8, 4, infos=1), "expected 2 prefill")
+
+    def test_non_multiple_tp_refused(self):
+        self._assert_refused(*self._init(6, 4, infos=1), "multiple")
+
+    def test_push_refusal_surfaces_as_failed_poll(self):
+        reason = "Raiden push-reshard (prefill attention TP 8 -> decode 4) no"
+        recv, mgr, abort = self._init(8, 4, reshard_refusal=Mock(return_value=reason))
+        mgr.reshard_refusal.assert_called_once_with(8, 4)
+        self._assert_refused(recv, mgr, abort, reason)
+
+    def test_push_allowed_geometry_passes(self):
+        recv, mgr, _ = self._init(8, 4)
+        mgr.reshard_refusal.assert_called_once_with(8, 4)
+        self.assertIsNone(recv.conclude_state)
+
+    def test_static_host_staging_refused(self):
+        recv, mgr, abort = self._init(8, 4, _dynamic_host_staging=False)
+        self._assert_refused(recv, mgr, abort, "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING")
+
+
+class TestPrefillReshardRefusal(unittest.TestCase):
+    def _mgr(self, reason):
+        mgr = _prefill_manager()
+        mgr.attn_tp_size = 8
+        mgr.request_status = {ROOM: KVPoll.WaitingForInput}
+        mgr.reshard_refusal = Mock(return_value=reason)
+        mgr._maybe_reshard_reply = Mock()
+        mgr._message_handlers[ReshardReq.TAG] = mgr._on_reshard_req
+        return mgr
+
+    def _req(self):
+        return ReshardReq(
+            ROOM, "10.0.0.2", 5555, "10.0.0.2:31000", [1], 4, [], ""
+        ).to_frames()
+
+    def test_refused_geometry_fails_the_room(self):
+        mgr = self._mgr("refused")
+        with patch("sglang_tpu.disaggregation.raiden.conn.logger.error"):
+            mgr._dispatch(self._req())
+        mgr.reshard_refusal.assert_called_once_with(8, 4)
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertEqual(mgr.failure_records[ROOM], "refused")
+        self.assertTrue(mgr.is_aborted(ROOM))
+        self.assertNotIn(ROOM, mgr._prefill.reshard_req)
+        mgr._maybe_reshard_reply.assert_not_called()
+
+    def test_allowed_geometry_records_the_request(self):
+        mgr = self._mgr(None)
+        mgr._dispatch(self._req())
+        self.assertIn(ROOM, mgr._prefill.reshard_req)
+        mgr._maybe_reshard_reply.assert_called_once_with(ROOM)
+
+
+class TestDecodeBoundsViolationFailsTheRoom(unittest.TestCase):
+    """A decode plan that would write past a KV block is a staging failure:
+    the room fails with the reason and nothing is registered (#1079)."""
+
+    REASON = "Raiden reshard entry exceeds the block: dst bytes [0, 9) of 8"
+
+    def _assert_failed(self, mgr, engine):
+        engine.register_active_plan.assert_not_called()
+        self.assertTrue(mgr.is_failed(ROOM))
+        self.assertIn(self.REASON, mgr.failure_records[ROOM])
+        with patch.object(RaidenKVReceiver, "_send_abort_notification") as abort:
+            self.assertEqual(_receiver(mgr).poll(), KVPoll.Failed)
+        abort.assert_called_once()
+        self.assertFalse(mgr.is_failed(OTHER_ROOM))
+
+    def test_full_attention_plan(self):
+        mgr = _reshard_decode_manager()
+        mgr._check_reshard_bounds = Mock(side_effect=ValueError(self.REASON))
+        published = mgr._publish_reshard_plan(
+            ROOM, f"{ROOM}#0", 7, object(), [b"ready"], ["tcp://10.0.0.10:1"]
+        )
+        self.assertFalse(published)
+        mgr._check_reshard_bounds.assert_called_once()
+        self.assertEqual(mgr._check_reshard_bounds.call_args.args[1:], (8, 4))
+        mgr._send_multipart_locked.assert_not_called()
+        self._assert_failed(mgr, mgr._engine)
+
+    def test_sliding_window_plan(self):
+        mgr = _reshard_decode_manager(chunked=False, swa=True)
+        mgr._check_reshard_bounds = Mock(side_effect=ValueError(self.REASON))
+        mgr._make_geometry = Mock()
+        with (
+            patch.dict(sys.modules, _pb2_stub_modules()),
+            patch(
+                "sglang_tpu.disaggregation.raiden.reshard_schedule."
+                "build_receiver_request"
+            ),
+        ):
+            armed = mgr._register_reshard_swa_receiver(
+                ROOM, 8, [300, 301], {0: [1, 2], 1: [1, 2]}
+            )
+        self.assertFalse(armed)
+        mgr._check_reshard_bounds.assert_called_once()
+        self.assertEqual(mgr._check_reshard_bounds.call_args.args[1:], (8, 4))
+        self.assertEqual(mgr._check_reshard_bounds.call_args.kwargs, {"swa": True})
+        self._assert_failed(mgr, mgr._swa_engine)
 
 
 class TestAbortIsTerminal(unittest.TestCase):

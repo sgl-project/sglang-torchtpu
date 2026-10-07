@@ -112,9 +112,20 @@ symmetric TP), decode in
 chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
 push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
-as this fork (tpu-sync `build.sh`). Not covered: MLA,
-NSA, Mamba/GDN under push-resharding or pipeline transfer, speculative draft
-KV, decode prefix-cache reuse, `dst_tp > src_tp`.
+as this fork (tpu-sync `build.sh`). Not covered: NSA, Mamba/GDN under
+push-resharding or pipeline transfer, decode prefix-cache reuse.
+
+Without the pipeline transfer, the decode fails a request at `init()` (before
+any frame reaches the prefill) when the topology would corrupt KV or hang:
+`dst_tp > src_tp` (set `SGLANG_RAIDEN_PIPELINE_TRANSFER=1` for a TP=1 pipeline
+prefill), `src_tp % dst_tp != 0`, a PP or multi-CP prefill, a source count
+other than `src_tp / dst_tp`, and push-resharding of KV the schedule cannot
+place: non-5-D pools (MLA, MXINT8), `page_size > 1024`, layers whose head_dim
+or dtype differ from the first layer's (e.g. a draft model's), fp8 with more
+than one kv head per decode rank, and SEQ_ALONG_LANE pools unless both sides
+hold one kv head per rank. The prefill re-checks the push geometry on
+`RESHARD_REQ`, and every push plan is bounds-checked per block before
+registration.
 
 ## Tunables (env)
 
