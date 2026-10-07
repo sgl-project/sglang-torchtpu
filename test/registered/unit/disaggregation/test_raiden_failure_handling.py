@@ -1,6 +1,7 @@
 """Unit tests for the raiden transport's failure handling between prefill and decode."""
 
 import errno
+import sys
 import threading
 import time
 import types
@@ -27,6 +28,8 @@ from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 from sglang_tpu.disaggregation.raiden.serde import (
     MessageTag,
     PullReq,
+    ReshardBlocks,
+    ReshardChunk,
     ReshardReq,
     RoomFailed,
 )
@@ -547,6 +550,241 @@ class TestReceiverFailurePaths(unittest.TestCase):
             self.assertEqual(recv.poll(), KVPoll.Failed)
         self.assertEqual(recv.conclude_state, KVPoll.Failed)
         send_abort.assert_not_called()
+
+
+def _reshard_decode_manager(chunked=True, swa=False):
+    """A decode manager with ROOM and OTHER_ROOM awaiting two reshard sources."""
+    mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr._prefill = None
+    mgr._decode = DecodeState()
+    mgr.disaggregation_mode = DisaggregationMode.DECODE
+    mgr.request_status = {}
+    mgr.failure_records = {}
+    mgr.failure_lock = threading.Lock()
+    mgr._state_lock = threading.Lock()
+    mgr._status_lock = threading.Lock()
+    mgr._aborted = {}
+    mgr._failed = set()
+    mgr._native_failed = set()
+    mgr._completed_recv = set()
+    mgr._reshard_plans = {}
+    mgr.chunked_transfer = chunked
+    mgr.attn_tp_rank = 0
+    mgr.attn_tp_size = 4
+    mgr.kv_args = SimpleNamespace(page_size=128)
+    mgr._engine = Mock(transfer_address="10.0.0.2:31000")
+    mgr._swa_engine = Mock(transfer_address="10.0.0.2:31001") if swa else None
+    mgr._swa_kv_caches = [object()] if swa else None
+    mgr._ensure_engine = lambda: mgr._engine
+    mgr._send_multipart_locked = Mock()
+    mgr._drain_engine = lambda: None
+    mgr.room_has_active_io = lambda room: False
+    for room in (ROOM, OTHER_ROOM):
+        mgr.request_status[room] = KVPoll.WaitingForInput
+        mgr._decode.reshard_meta[room] = dict(
+            local_blocks=list(range(200, 208)),
+            local_swa_blocks=[300, 301] if swa else [],
+            source_ranks=[0, 1],
+            src_attn_tp=8,
+            aux_index=None,
+            ready_endpoints=["tcp://10.0.0.10:1", "tcp://10.0.0.11:1"],
+        )
+        mgr._decode.reshard_sources[room] = {}
+        mgr._decode.reshard_swa_sources[room] = {}
+    mgr._message_handlers = {
+        ReshardChunk.TAG: mgr._on_reshard_chunk,
+        ReshardBlocks.TAG: mgr._on_reshard_blocks,
+    }
+    return mgr
+
+
+def _chunk_frames(room, src_rank):
+    return ReshardChunk(room, 0, 0, 16, list(range(100, 108)), src_rank).to_frames()
+
+
+def _blocks_frames(room, src_rank, swa_blocks=()):
+    return ReshardBlocks(
+        room, list(range(100, 108)), src_rank, b"", list(swa_blocks)
+    ).to_frames()
+
+
+def _pb2_stub_modules():
+    """Lets the closing path import raiden's protobuf module without raiden."""
+    pb2 = types.ModuleType("tpu_sync.rpc.raiden_service_pb2")
+    rpc = types.ModuleType("tpu_sync.rpc")
+    rpc.raiden_service_pb2 = pb2
+    pkg = types.ModuleType("tpu_sync")
+    pkg.rpc = rpc
+    return {
+        "tpu_sync": pkg,
+        "tpu_sync.rpc": rpc,
+        "tpu_sync.rpc.raiden_service_pb2": pb2,
+    }
+
+
+class _StopListener(BaseException):
+    """Ends _listen's loop, which catches only Exception."""
+
+
+def _fail_room_registration(registered):
+    def register(room, index, total_pages, sources_map):
+        registered.append(room)
+        if room == ROOM:
+            raise RuntimeError("chunk plan broke")
+        return None
+
+    return register
+
+
+class TestReshardHandlerErrorsFailTheRoom(unittest.TestCase):
+    """A decode reshard handler that raises fails its room at once instead of
+    leaving it to the waiting timeout (#1078)."""
+
+    def test_chunk_registration_error_fails_only_its_room(self):
+        mgr = _reshard_decode_manager()
+        registered = []
+        mgr._register_reshard_chunk = _fail_room_registration(registered)
+        for room in (ROOM, OTHER_ROOM):
+            for rank in (0, 1):
+                mgr._dispatch(_chunk_frames(room, rank))
+
+        self.assertEqual(registered, [ROOM, OTHER_ROOM])
+        self.assertTrue(mgr.is_failed(ROOM))
+        self.assertTrue(mgr.is_aborted(ROOM))
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertIn("chunk plan broke", mgr.failure_records[ROOM])
+        self.assertNotIn(ROOM, mgr._decode.reshard_chunk_registering)
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            self.assertEqual(_receiver(mgr).poll(), KVPoll.Failed)
+
+        self.assertFalse(mgr.is_failed(OTHER_ROOM))
+        self.assertFalse(mgr.is_aborted(OTHER_ROOM))
+        self.assertEqual(mgr.check_status(OTHER_ROOM), KVPoll.WaitingForInput)
+        self.assertNotIn(OTHER_ROOM, mgr.failure_records)
+
+    def test_closing_path_error_fails_the_room_and_sends_no_ready(self):
+        def make_geometry(src_tp, dst_tp, *, swa=False):
+            raise IndexError("tuple index out of range")
+
+        for swa in (False, True):
+            with self.subTest(swa=swa):
+                mgr = _reshard_decode_manager(chunked=False, swa=swa)
+                mgr._make_geometry = make_geometry
+                swa_blocks = [1, 2] if swa else []
+                with patch.dict(sys.modules, _pb2_stub_modules()):
+                    for rank in (0, 1):
+                        mgr._dispatch(_blocks_frames(ROOM, rank, swa_blocks))
+                    # The tombstone holds: a repeated closing frame is dropped.
+                    mgr._dispatch(_blocks_frames(ROOM, 0, swa_blocks))
+
+                self.assertTrue(mgr.is_failed(ROOM))
+                self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+                self.assertIn("tuple index out of range", mgr.failure_records[ROOM])
+                self.assertIn(ROOM, mgr._decode.reshard_registered)
+                mgr._send_multipart_locked.assert_not_called()
+                mgr._engine.register_active_plan.assert_not_called()
+                if swa:
+                    mgr._swa_engine.register_active_plan.assert_not_called()
+                self.assertEqual(mgr.check_status(OTHER_ROOM), KVPoll.WaitingForInput)
+
+    def test_aux_write_error_fails_the_room_without_deadlock(self):
+        mgr = _reshard_decode_manager()
+        mgr._decode.reshard_meta[ROOM]["aux_index"] = 3
+        mgr._decode.reshard_meta[OTHER_ROOM]["aux_index"] = 4
+        mgr.kv_args = SimpleNamespace(
+            page_size=128, aux_data_ptrs=[0], aux_item_lens=[8]
+        )
+        mgr._maybe_register_reshard_final = Mock()
+        written = []
+
+        def write_aux_blob(ptrs, lens, aux_index, blob):
+            if aux_index == 3:
+                raise ValueError("aux blob too long")
+            written.append(aux_index)
+
+        def deliver():
+            for frames in (
+                ReshardBlocks(ROOM, [100], 0, b"aux", []).to_frames(),
+                ReshardBlocks(ROOM, [100], 1, b"aux", []).to_frames(),
+                ReshardBlocks(OTHER_ROOM, [100], 0, b"aux", []).to_frames(),
+            ):
+                mgr._dispatch(frames)
+
+        with patch(
+            "sglang_tpu.disaggregation.raiden.receiver.write_aux_blob",
+            side_effect=write_aux_blob,
+        ):
+            worker = threading.Thread(target=deliver, daemon=True)
+            worker.start()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "handler deadlocked on _state_lock")
+
+        self.assertTrue(mgr.is_failed(ROOM))
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertIn("aux blob too long", mgr.failure_records[ROOM])
+        # The second source's frame hits the tombstone; nothing registers.
+        self.assertEqual(set(mgr._decode.reshard_sources[ROOM]), {0})
+        mgr._maybe_register_reshard_final.assert_not_called()
+        self.assertEqual(written, [4])
+        self.assertFalse(mgr.is_failed(OTHER_ROOM))
+        self.assertEqual(mgr.check_status(OTHER_ROOM), KVPoll.WaitingForInput)
+
+    def test_cleared_room_is_not_failed(self):
+        mgr = _reshard_decode_manager()
+
+        def register(room, index, total_pages, sources_map):
+            mgr._decode.reshard_meta.pop(ROOM)
+            raise KeyError(room)
+
+        mgr._register_reshard_chunk = register
+        for rank in (0, 1):
+            mgr._dispatch(_chunk_frames(ROOM, rank))
+
+        self.assertEqual(mgr.failure_records, {})
+        self.assertEqual(mgr._failed, set())
+        self.assertFalse(mgr.is_aborted(ROOM))
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.WaitingForInput)
+
+    def test_aborted_room_keeps_its_first_failure(self):
+        mgr = _reshard_decode_manager()
+
+        def register(room, index, total_pages, sources_map):
+            with mgr._state_lock:
+                mgr._mark_aborted_locked(ROOM)
+                mgr._fail_room_locked(ROOM, "Aborted by AbortReq.")
+            raise RuntimeError("chunk plan broke")
+
+        mgr._register_reshard_chunk = register
+        for rank in (0, 1):
+            mgr._dispatch(_chunk_frames(ROOM, rank))
+
+        self.assertEqual(mgr.failure_records, {ROOM: "Aborted by AbortReq."})
+
+    def test_listener_keeps_serving_after_a_handler_error(self):
+        mgr = _reshard_decode_manager()
+        registered = []
+        mgr._register_reshard_chunk = _fail_room_registration(registered)
+        mgr.server_socket = Mock()
+        mgr.server_socket.recv_multipart.side_effect = [
+            # Undecodable: there is no room to fail, so _listen logs it.
+            [ReshardChunk.TAG, b"not json"],
+            _chunk_frames(ROOM, 0),
+            _chunk_frames(ROOM, 1),
+            _chunk_frames(OTHER_ROOM, 0),
+            _chunk_frames(OTHER_ROOM, 1),
+            _StopListener(),
+        ]
+
+        with patch(
+            "sglang_tpu.disaggregation.raiden.conn.logger.exception"
+        ) as log_exception:
+            with self.assertRaises(_StopListener):
+                mgr._listen()
+
+        log_exception.assert_called_once()
+        self.assertEqual(registered, [ROOM, OTHER_ROOM])
+        self.assertTrue(mgr.is_failed(ROOM))
+        self.assertFalse(mgr.is_failed(OTHER_ROOM))
 
 
 class TestSenderBootstrapTimeout(unittest.TestCase):
