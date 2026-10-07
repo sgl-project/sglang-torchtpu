@@ -8,8 +8,8 @@ and registers to a suite via register_tpu_ci(suite=..., nightly=...). This scans
 test/registered/**.py (AST only -- no imports/TPU), keeps files registered to --suite
 (and nightly when --nightly), then emits each file as its own matrix row so GitHub reports its status directly.
 
-`schedule` is "nightly" for every nightly file; accuracy-test-tpu.yml decides which of its
-daily slots runs each accuracy file.
+`schedule` is "nightly" for every nightly file; accuracy-test-tpu.yml decides which of the
+nightly's daytime slots runs each accuracy file.
 
 Prints a JSON array for the CI matrix:
     [{"name","launch_script","weights_pvc","hosts","files","schedule"}]  (files = space-separated)

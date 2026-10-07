@@ -21,10 +21,11 @@ python3 -m pytest test/registered/unit/test_tpu_dashboard_contract.py -q
 | **Accuracy** | `test/registered/tpu/nightly-accuracy/` | Model backbone only: basic serving config, **no feature flags**. One file and one suite per **benchmark**, sharing the model's `*_eval_common.py` config module; scores are `report_only` (the trend detects regressions). |
 | **Perf** | `test/registered/tpu/nightly-perf/` | Specific model + serving config, through `RecipeLauncher` + `bench_serving.sh` **only** (that is what puts the server/bench config panels on the dashboard). Egress order: digest lines → `dump_metric` per number (clean legs only) → the framed `emit_result_payload` summary. |
 
-The nightly (`nightly-test-tpu.yml`) builds once, then fans out the feature-validation
-and perf stage workflows **in parallel** — slice contention is Kueue's job, and a red
-stage costs the others nothing. Accuracy runs on `accuracy-test-tpu.yml`'s own 10 AM /
-5 PM schedule; that workflow picks the slot, so a new accuracy test just registers as
+The nightly (`nightly-test-tpu.yml`) owns every TPU cron. At 1 AM PT it builds once,
+then fans out the feature-validation and perf stage workflows **in parallel** — slice
+contention is Kueue's job, and a red stage costs the others nothing. Its 10 AM and 5 PM
+PT slots call `accuracy-test-tpu.yml` with the `day-10am` / `day-5pm` selection; that
+workflow maps each selection to its tests, so a new accuracy test just registers as
 nightly. Each stage workflow is also dispatchable alone.
 
 ## Required MODEL_CONFIG fields and labels (label lint fails the PR otherwise)

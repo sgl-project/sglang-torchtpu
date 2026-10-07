@@ -201,23 +201,44 @@ class TestJobMapsToOneTest(CustomTestCase):
         # A cron edited without its `plan` case would run nothing, or everything.
         import yaml
 
-        workflow = yaml.safe_load((WORKFLOWS / "accuracy-test-tpu.yml").read_text())
-        plan = workflow["jobs"]["plan"]["steps"][0]
-        crons = [entry["cron"] for entry in workflow[True]["schedule"]]
+        nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
+        plan = nightly["jobs"]["plan"]["steps"][0]
+        crons = [entry["cron"] for entry in nightly[True]["schedule"]]
         selected = {}
         for cron in crons:
-            rc, out = self._run_step(plan, {"MODEL": "", "SCHEDULE": cron})
+            rc, out = self._run_step(plan, {"ONLY": "", "SCHEDULE": cron})
             self.assertEqual(rc, 0, cron)
-            selected[cron] = out["model"]
+            selected[cron] = out["only"]
         self.assertEqual(
             selected,
-            {"0 10 * * *": "day-10am", "0 17 * * *": "day-5pm"},
+            {
+                "0 1 * * *": "all",
+                "0 10 * * *": "accuracy-day-10am",
+                "0 17 * * *": "accuracy-day-5pm",
+            },
         )
-        # A called run sees its caller's schedule; the caller's input must win.
-        _, out = self._run_step(plan, {"MODEL": "gemma4", "SCHEDULE": "0 1 * * *"})
-        self.assertEqual(out["model"], "gemma4")
-        rc, _ = self._run_step(plan, {"MODEL": "", "SCHEDULE": "0 3 * * *"})
+        # A dispatch input wins over the schedule.
+        _, out = self._run_step(plan, {"ONLY": "perf", "SCHEDULE": "0 10 * * *"})
+        self.assertEqual(out["only"], "perf")
+        rc, _ = self._run_step(plan, {"ONLY": "", "SCHEDULE": "0 3 * * *"})
         self.assertNotEqual(rc, 0, "an unknown schedule must not fall back to all")
+
+        # The nightly owns every TPU schedule; the stage workflows only run when called.
+        accuracy = yaml.safe_load((WORKFLOWS / "accuracy-test-tpu.yml").read_text())
+        self.assertNotIn("schedule", accuracy[True])
+        # The daytime slots run accuracy alone; the 1 AM slot never runs it.
+        jobs = nightly["jobs"]
+        is_accuracy = "startsWith(needs.plan.outputs.only, 'accuracy-')"
+        self.assertIn(f"!{is_accuracy}", jobs["feature-validation"]["if"])
+        self.assertIn("""fromJSON('["all","perf"]')""", jobs["perf"]["if"])
+        stage = jobs["accuracy"]
+        self.assertEqual(stage["if"], f"${{{{ {is_accuracy} }}}}")
+        self.assertEqual(stage["uses"], "./.github/workflows/accuracy-test-tpu.yml")
+        for slot in ("day-10am", "day-5pm"):
+            self.assertIn(f"'accuracy-{slot}' && '{slot}'", stage["with"]["model"])
+        # A called job cannot get a permission its caller withholds; a missing
+        # grant fails the whole nightly at startup.
+        self.assertEqual(stage["permissions"].get("actions"), "read")
 
     def test_scheduled_accuracy_discovers_every_model(self):
         import yaml
@@ -271,7 +292,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             # A hosted runner has six hours, including startup and cleanup.
             runtime = 3600 + group["timeout_per_file"] + 600
             self.assertGreater(21600 - runtime - 900 - 600, 0, group["name"])
-        # The nightly no longer runs accuracy; single-host legs ride the 10 AM slot.
+        # Accuracy has no 1 AM selection; single-host legs ride the 10 AM slot.
         for job in workflow["jobs"].values():
             self.assertNotIn('"nightly"', job.get("if", ""))
         gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
@@ -312,8 +333,6 @@ class TestJobMapsToOneTest(CustomTestCase):
         for only in pd["strategy"]["matrix"]["only"]:
             self.assertEqual(feature["jobs"][only]["if"].count("inputs.only =="), 1)
             self.assertNotIn('"all"', feature["jobs"][only]["if"])
-        nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
-        self.assertNotIn("accuracy", nightly["jobs"])
 
     def test_static_pd_jobs_carry_exactly_one_existing_file(self):
         self.assertTrue(self.static_pd, "no static P/D jobs found; did they move?")
