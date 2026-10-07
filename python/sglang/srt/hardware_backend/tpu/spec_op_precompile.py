@@ -15,6 +15,9 @@ from sglang.srt.hardware_backend.tpu import (  # noqa: F401
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+    current_warmup_queue,
+)
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import SpecOpWarmupContext
 from sglang.srt.speculative import dflash_utils as _dflash_utils  # noqa: F401
 from sglang.srt.speculative import eagle_utils as _eagle_utils  # noqa: F401
@@ -55,18 +58,30 @@ def precompile_spec_v2_ops(
     registered_ops = get_compiled_ops()
 
     start = time.perf_counter()
+    queue = current_warmup_queue() if device.type == "tpu" else None
     with torch.no_grad():
         for context in warmup_contexts:
             for registered_op in registered_ops:
                 args = registered_op.make_warmup_args(context)
-                registered_op.op(*args)
-    if device.type == "tpu":
-        torch.accelerator.synchronize()
-    logger.info(
-        "[spec op precompile] precompiled %d ops for shapes %s in %.1fs",
-        len(registered_ops),
-        shapes,
-        time.perf_counter() - start,
-    )
-    if device.type == "tpu":
-        snapshot_recompilation_baseline()
+                if queue is None:
+                    registered_op.op(*args)
+                else:
+                    pending = registered_op.warmup_async(*args)
+                    if pending is not None:
+                        queue.calls.append(pending)
+
+    def finish():
+        if device.type == "tpu":
+            torch.accelerator.synchronize()
+            snapshot_recompilation_baseline()
+        logger.info(
+            "[spec op precompile] precompiled %d ops for shapes %s in %.1fs",
+            len(registered_ops),
+            shapes,
+            time.perf_counter() - start,
+        )
+
+    if queue is None:
+        finish()
+    else:
+        queue.completions.append(finish)

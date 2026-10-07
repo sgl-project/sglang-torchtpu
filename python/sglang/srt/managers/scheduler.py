@@ -678,8 +678,6 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
         self.maybe_init_kv_free_fence()
-        if current_platform.is_tpu() and self.draft_worker is not None:
-            self.precompile_tpu_spec_ops()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1119,6 +1117,8 @@ class Scheduler(
             self.tp_worker.init_cuda_graphs()
             if self.draft_worker is not None:
                 self.draft_worker.init_cuda_graphs()
+                if current_platform.is_tpu():
+                    self.precompile_tpu_spec_ops()
 
         # Independent DP groups repeat distributed ranks but run identical model
         # replicas. DP0 writes their shared bundles; DP-attention ranks are unique.
@@ -1822,7 +1822,7 @@ class Scheduler(
         )
 
         precompile_spec_v2_ops(
-            device=torch.device(self.device),
+            device=torch.device(self.tp_worker.model_runner.device),
             physical_batch_buckets=compile_policy.b_bucketer.buckets,
             num_verify_tokens=compile_policy.draft_token_num,
             vocab_size=self.model_config.vocab_size,
