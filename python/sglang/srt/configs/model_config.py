@@ -212,6 +212,8 @@ def is_deepseek_dsa(config) -> bool:
             _hf_arch(config) == "GlmMoeDsaForCausalLM"
             and _hf_attr(config, "tpu_dense_dsa_max_context") is not None
         )
+        # The TPU Flash model (glm5_next_tpu) evaluates DSA densely.
+        and not (_hf_arch(config) == "Glm5NextForConditionalGeneration" and is_tpu())
     )
 
 
@@ -1220,8 +1222,16 @@ class ModelConfig:
         if self.swa_v_head_dim is None:
             self.swa_v_head_dim = self.swa_head_dim
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
+        # The TPU Flash model (glm5_next_tpu) runs its full-attention layers as
+        # unabsorbed MHA, so it needs the MHA KV pool and backend.
+        tpu_glm5_next_mha = (
+            is_tpu()
+            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        )
         # FIXME: temporary special judge for MLA architecture
-        if (
+        if tpu_glm5_next_mha:
+            self.attention_arch = AttentionArch.MHA
+        elif (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
