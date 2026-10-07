@@ -96,16 +96,19 @@ def head_slice_spans(
     swa: list[int],
     dst_attn_tp: int,
     total_kv_heads: int,
+    total_swa_kv_heads: int,
     *,
     draft_total_kv_heads: int | None = None,
     draft_swa_total_kv_heads: int | None = None,
 ) -> list[Any]:
     """Describe each destination rank's kv-head slice of every locally owned
-    page: one strided span per page and rank, routed to that rank only."""
+    page: one strided span per page and rank, routed to that rank only.
+    Sliding-window pools are sliced over ``total_swa_kv_heads``."""
     result = []
     for pool, tensor in zip(pools, tensors):
         tag = pool["tag"]
-        blocks = swa if is_swa_pool(tag) else full
+        is_swa = is_swa_pool(tag)
+        blocks = swa if is_swa else full
         if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
             raise ValueError(
                 "A block-major KV bundle moves whole page rows; a "
@@ -117,7 +120,7 @@ def head_slice_spans(
         if is_draft_pool(tag):
             draft_heads = (
                 draft_swa_total_kv_heads
-                if is_swa_pool(tag) and draft_swa_total_kv_heads is not None
+                if is_swa and draft_swa_total_kv_heads is not None
                 else draft_total_kv_heads
             )
             pool_kv_heads = (
@@ -126,7 +129,7 @@ def head_slice_spans(
                 else _producer_tensor_kv_heads(tensor)
             )
         else:
-            pool_kv_heads = total_kv_heads
+            pool_kv_heads = total_swa_kv_heads if is_swa else total_kv_heads
         if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             result.append(
                 _head_major_slice_spans(
@@ -276,6 +279,7 @@ def part_spans(
     swa: list[int],
     dst_attn_tp: int,
     total_kv_heads: int,
+    total_swa_kv_heads: int,
     *,
     draft_total_kv_heads: int | None = None,
     draft_swa_total_kv_heads: int | None = None,
@@ -299,6 +303,7 @@ def part_spans(
         swa,
         dst_attn_tp,
         total_kv_heads,
+        total_swa_kv_heads,
         draft_total_kv_heads=draft_total_kv_heads,
         draft_swa_total_kv_heads=draft_swa_total_kv_heads,
     )
