@@ -192,6 +192,9 @@ class RaidenKVManager(
     _last_scheduler_drain = float("-inf")
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
+    # RaidenKVReceiver.init() fails the room on a KVArgs.kv_layout mismatch;
+    # CommonKVManager would compare the frame tag above and raise.
+    fails_room_on_kv_layout_mismatch = True
     # Shared-buffer Full+SWA pool when --enable-unified-memory is active.
     _unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
     _seq_along_lane: bool = False

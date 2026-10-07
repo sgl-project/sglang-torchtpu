@@ -2124,7 +2124,10 @@ def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
 
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
         return token_to_kv_pool.pd_kv_layout()
-    return None
+    # Other pools name a non-default layout in ``disagg_kv_layout``; SWAKVPool
+    # builds both sub-pools from the same class.
+    pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
+    return getattr(pool, "disagg_kv_layout", None)
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

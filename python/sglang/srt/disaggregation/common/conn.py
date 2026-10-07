@@ -329,6 +329,9 @@ class CommonKVManager(BaseKVManager):
     reports_transfer_latency: bool = False
 
     kv_layout: Optional[str] = None
+    # Set by a backend whose decode fails the room on a kv_layout mismatch;
+    # try_ensure_parallel_info then leaves the mismatch to it instead of raising.
+    fails_room_on_kv_layout_mismatch: bool = False
     dsv41_spec_layout: Optional[dict] = None
     spec_kv_layout: Optional[dict] = None
 
@@ -1485,7 +1488,8 @@ class CommonKVManager(BaseKVManager):
             )
 
         if (
-            info.kv_layout is not None
+            not self.fails_room_on_kv_layout_mismatch
+            and info.kv_layout is not None
             and self.kv_layout is not None
             and info.kv_layout != self.kv_layout
         ):
