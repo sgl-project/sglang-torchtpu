@@ -48,6 +48,37 @@ HEALTH_CHECK_TIMEOUT_SECS = 30
 # would mark a server unhealthy before its own 20 s check answers.
 HEALTH_PROBE_PATH = "/health_generate"
 
+# How long a completed stream waits, in the background, for the prefill to end
+# its own response before the connection to it is closed anyway.
+PREFILL_DRAIN_TIMEOUT_SECS = 60
+
+# Strong references to fire-and-forget tasks (asyncio keeps only weak ones).
+_background_tasks: set = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _read_to_eof(response) -> None:
+    async for _ in response.content.iter_chunked(AIOHTTP_STREAM_READ_CHUNK_SIZE):
+        pass
+
+
+def _stream_error_event(message: str) -> bytes:
+    """An SSE error event in the shape sglang's /generate stream uses. A
+    broken upstream is transient (a retry is routed to a random, possibly
+    healthy, decode), so it is marked retryable."""
+    error = {
+        "message": message,
+        "type": "upstream_error",
+        "code": HTTPStatus.BAD_GATEWAY.value,
+        "retryable": True,
+    }
+    return b"data: " + orjson.dumps({"error": error}) + b"\n\n"
+
 
 def maybe_wrap_ipv6_address(address: str) -> str:
     try:
@@ -522,7 +553,29 @@ class MiniLoadBalancer:
                 response.close()
             await session.close()
 
+        async def drain_prefill_then_close():
+            # The decode has answered in full, but the prefill may not have
+            # wrapped up its side yet (it ends its stream once its own request,
+            # KV transfer included, is done). Closing its connection now looks
+            # like a client disconnect to it: it aborts the request and counts
+            # it as aborted, or as a failed transfer. Read its stream to the end
+            # first, bounded so a stuck prefill cannot hold the session forever.
+            try:
+                await asyncio.wait_for(
+                    _read_to_eof(prefill_response),
+                    timeout=min(PREFILL_DRAIN_TIMEOUT_SECS, self.timeout),
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.debug(
+                    f"[MiniLB] prefill {prefill_server} did not finish after a "
+                    f"completed stream: {type(e).__name__}: {e}"
+                )
+            finally:
+                await close_upstreams()
+
         async def stream_results():
+            completed = False
+            upstream = prefill_server
             try:
                 if modified_request.get("return_logprob", False):
                     prefill_chunks = []
@@ -533,6 +586,7 @@ class MiniLoadBalancer:
                     )
                     first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
 
+                    upstream = decode_server
                     async for chunk in decode_response.content:
                         # Note: This is inefficient
                         # merge prefill input_token_logprobs, output_token_logprobs to decode
@@ -553,12 +607,27 @@ class MiniLoadBalancer:
                         else:
                             yield chunk
                 else:
+                    upstream = decode_server
                     async for chunk in decode_response.content.iter_chunked(
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
                         yield chunk
+                completed = True
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # The upstream broke after the 200 status went out (e.g. the
+                # decode died mid-stream). Without this the stream would just
+                # stop, and a cut-off answer would look complete. Tell the
+                # client explicitly, in the same shape sglang's own /generate
+                # stream reports errors.
+                message = f"upstream {upstream} stream broke: {type(e).__name__}: {e}"
+                logger.error(f"[MiniLB] {message}")
+                yield _stream_error_event(message)
+                yield b"data: [DONE]\n\n"
             finally:
-                await close_upstreams()
+                if completed and responses:
+                    _spawn_background(drain_prefill_then_close())
+                else:
+                    await close_upstreams()
 
         # The session and both upstream responses stay open only for an
         # accepted request, whose stream_results() closes them when the
