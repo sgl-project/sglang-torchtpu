@@ -717,6 +717,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
+            kv_args.total_swa_kv_head_num = (
+                self.scheduler.model_config.get_total_swa_num_kv_heads()
+            )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()

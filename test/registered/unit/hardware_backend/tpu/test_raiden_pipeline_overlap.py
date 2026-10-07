@@ -114,7 +114,9 @@ class Manager:
         self._state_lock = threading.RLock()
         self._aborted = {}
         self._prefill = SimpleNamespace(send_blocks={}, send_swa_blocks={})
-        self.kv_args = SimpleNamespace(total_kv_head_num=4, page_size=4)
+        self.kv_args = SimpleNamespace(
+            total_kv_head_num=4, total_swa_kv_head_num=4, page_size=4
+        )
         self._timeout_s = 60
         self.local_ip, self.rank_port = "10.0.0.1", 1000 + len(bus)
         self._completed_send, self._completed_recv = set(), set()
