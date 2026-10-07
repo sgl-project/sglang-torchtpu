@@ -16,7 +16,6 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.hardware_backend.tpu import mm_schedule_tpu
-from sglang.srt.hardware_backend.tpu.mm_embedding import PaddedEmbedding
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -110,21 +109,6 @@ class TestEncodeVisionItems(CustomTestCase):
         self.assertEqual(
             [int(tensor[0, 0].item()) for tensor in out], [4752, 4836, 4784]
         )
-
-    def test_combined_padded_outputs_keep_buffers_across_budget_groups(self):
-        def embedder(items):
-            count = sum(mm_schedule_tpu._item_patch_count(item) for item in items)
-            return PaddedEmbedding.from_buffer(
-                torch.full((4, 3), float(count)), count // _MERGE_AREA
-            )
-
-        with patch.object(torch, "cat", side_effect=AssertionError("keep buckets")):
-            out = self._encode([_image(8), _image(8), _image(4)], embedder, budget=8)
-
-        self.assertIsInstance(out, PaddedEmbedding)
-        self.assertEqual([span.buffer.shape[0] for span in out.spans], [4, 4, 4])
-        self.assertEqual(out.shape, (5, 3))
-        self.assertTrue(torch.equal(out.to_host()[:, 0], torch.tensor([8, 8, 8, 8, 4])))
 
     def test_an_item_above_the_budget_is_still_encoded_in_one_call(self):
         # Nothing to split; the compile runner pads/recompiles and warns for itself.

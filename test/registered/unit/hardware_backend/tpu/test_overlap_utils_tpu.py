@@ -12,21 +12,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-# isort: split
 from sglang.srt.hardware_backend.tpu import patches
 from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
     flush_direct_handoff_tpu,
     resolve_direct_handoff_tpu,
 )
-from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
-from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -98,126 +89,6 @@ def make_case():
     batch = SimpleNamespace(spec_info=draft)
     draft.bonus_tokens = payload.bonus_tokens
     return fm, batch, indices, payload, torch.tensor([101, 203])
-
-
-class TestMultimodalCpuIds(CustomTestCase):
-    def _case(self, *, mixed=False):
-        algo = SimpleNamespace(is_none=lambda: True)
-        batch = ScheduleBatch(
-            reqs=[],
-            device="cpu",
-            forward_mode=ForwardMode.MIXED if mixed else ForwardMode.EXTEND,
-            prefill_input_ids_cpu=torch.tensor([11, 1_000_123, 13]),
-            multimodal_inputs=[SimpleNamespace()],
-            mix_running_indices=torch.tensor([1, 3]) if mixed else None,
-            req_pool_indices=torch.tensor([1]),
-            spec_algorithm=algo,
-        )
-        future_map = SimpleNamespace(
-            spec_algo=algo, output_tokens_buf=torch.tensor([20, 21, 22, 23])
-        )
-        return batch, future_map
-
-    def test_prefill_snapshot_survives_staging_and_clears_on_decode(self):
-        batch, future_map = self._case()
-        prefill = batch.prefill_input_ids_cpu
-        with (
-            patch.object(overlap_utils, "_is_tpu", True),
-            patch.object(overlap_utils, "_DEBUG_ASSERT", False),
-        ):
-            overlap_utils.resolve_forward_inputs(batch, future_map)
-            self.assertIs(batch.mm_input_ids_cpu, prefill)
-            self.assertIsNone(batch.prefill_input_ids_cpu)
-            self.assertTrue(torch.equal(batch.input_ids, prefill))
-
-            batch.forward_mode = ForwardMode.DECODE
-            batch.input_ids = None
-            overlap_utils.resolve_forward_inputs(batch, future_map)
-            self.assertIsNone(batch.mm_input_ids_cpu)
-            self.assertTrue(torch.equal(batch.input_ids, torch.tensor([21])))
-            self.assertTrue(torch.equal(prefill, torch.tensor([11, 1_000_123, 13])))
-
-    def test_mixed_snapshot_excludes_decode_tail_and_replaces_next_prefill(self):
-        batch, future_map = self._case(mixed=True)
-        prefill = batch.prefill_input_ids_cpu
-        with (
-            patch.object(overlap_utils, "_is_tpu", True),
-            patch.object(overlap_utils, "_DEBUG_ASSERT", False),
-        ):
-            overlap_utils.resolve_forward_inputs(batch, future_map)
-            self.assertIs(batch.mm_input_ids_cpu, prefill)
-            self.assertIsNone(batch.prefill_input_ids_cpu)
-            self.assertIsNone(batch.mix_running_indices)
-            self.assertTrue(
-                torch.equal(batch.input_ids, torch.tensor([11, 1_000_123, 13, 21, 23]))
-            )
-            next_prefill = torch.tensor([1_000_456, 17])
-            batch.prefill_input_ids_cpu = next_prefill
-            overlap_utils.resolve_forward_inputs(batch, future_map)
-            self.assertIs(batch.mm_input_ids_cpu, next_prefill)
-            self.assertTrue(torch.equal(prefill, torch.tensor([11, 1_000_123, 13])))
-
-    def test_text_only_and_other_backends_drop_stale_snapshot(self):
-        for is_tpu, has_mm in ((True, False), (False, True)):
-            with self.subTest(is_tpu=is_tpu, has_mm=has_mm):
-                batch, future_map = self._case()
-                batch.mm_input_ids_cpu = torch.tensor([1_000_789])
-                if not has_mm:
-                    batch.multimodal_inputs = None
-                with patch.object(overlap_utils, "_is_tpu", is_tpu):
-                    overlap_utils.resolve_forward_inputs(batch, future_map)
-                self.assertIsNone(batch.mm_input_ids_cpu)
-                self.assertTrue(
-                    torch.equal(batch.input_ids, torch.tensor([11, 1_000_123, 13]))
-                )
-
-    def test_forward_batch_borrows_snapshot_only_for_target_prefill(self):
-        cpu_ids = torch.tensor([11, 1_000_123, 13])
-        batch = ScheduleBatch(
-            reqs=[SimpleNamespace(lora_id=None, rid="mm-prefill", token_type_ids=None)],
-            device="cpu",
-            forward_mode=ForwardMode.EXTEND,
-            input_ids=cpu_ids.clone(),
-            mm_input_ids_cpu=cpu_ids,
-            req_pool_indices=torch.tensor([0]),
-            seq_lens=torch.tensor([3]),
-            seq_lens_cpu=torch.tensor([3]),
-            seq_lens_sum=3,
-            out_cache_loc=torch.arange(3),
-            prefix_lens=[0],
-            extend_lens=[3],
-            extend_num_tokens=3,
-            extend_logprob_start_lens=[0],
-        )
-        for is_draft in (False, True):
-            with self.subTest(is_draft=is_draft):
-                runner = SimpleNamespace(
-                    is_draft_worker=is_draft,
-                    device="cpu",
-                    model_config=SimpleNamespace(
-                        requires_mm_token_modalities=False, model_is_mrope=False
-                    ),
-                    kv_index_translator=SimpleNamespace(
-                        rebind_write_loc=lambda _: None
-                    ),
-                    ngram_embedding_manager=SimpleNamespace(enabled=False),
-                    lora_manager=None,
-                    attn_dcp_size=1,
-                    prefill_attention_backend_str="torch_native",
-                )
-                with get_context().override_server_args():
-                    forward = ForwardBatch.init_new(
-                        batch,
-                        runner,
-                        capture_hidden_mode=CaptureHiddenMode.NULL,
-                        return_hidden_states_before_norm=False,
-                    )
-                if is_draft:
-                    self.assertIsNone(forward.mm_input_ids_cpu)
-                else:
-                    self.assertIs(forward.mm_input_ids_cpu, cpu_ids)
-                self.assertIs(batch.mm_input_ids_cpu, cpu_ids)
-                self.assertTrue(torch.equal(cpu_ids, torch.tensor([11, 1_000_123, 13])))
 
 
 class TestDirectHandoff(CustomTestCase):

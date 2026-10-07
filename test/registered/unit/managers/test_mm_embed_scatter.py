@@ -29,7 +29,7 @@ def _make_mask(pattern: str) -> torch.Tensor:
 def test_scatter_matches_masked_scatter_bitwise(width, src_dtype, mask_pattern):
     """The row-index mm embedding merge must stay bitwise identical to
     masked_scatter_ semantics, whose internal transients it avoids."""
-    torch.default_generator.manual_seed(0)
+    torch.manual_seed(0)
     mask = _make_mask(mask_pattern)
     dest = torch.randn(NUM_TOKENS, width).to(torch.bfloat16)
     src = torch.randn(int(mask.sum()), width, dtype=src_dtype)

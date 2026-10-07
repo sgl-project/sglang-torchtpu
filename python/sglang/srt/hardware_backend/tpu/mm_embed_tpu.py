@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.mm_compile import merge_mm_rows
 from sglang.srt.hardware_backend.tpu.mm_embedding import (
     MultimodalEmbedding,
     PaddedEmbedding,
@@ -20,6 +20,18 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_disagg, get_server_args
 from sglang.srt.utils import flatten_nested_list
+
+
+def merge_mm_rows(
+    dest: torch.Tensor,
+    src: torch.Tensor,
+    indices: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    src = src.to(dtype=dest.dtype)
+    if src.shape[0] < dest.shape[0]:
+        src = F.pad(src, (0, 0, 0, dest.shape[0] - src.shape[0]))
+    return torch.where(mask, src.index_select(0, indices), dest)
 
 
 def scatter_mm_on_device(
