@@ -262,6 +262,10 @@ class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
             dec = self._unified(
                 self._decode(attn_tp_rank=0, attn_tp_size=2), d_pool, chunked=chunked
             )
+            # The pools hold one kv head per rank at TP4 and two at TP2, a
+            # 4-head model; the harness declares 8.
+            for m in (*ps, dec):
+                m.kv_args.total_kv_head_num = 4
             return ps, dec
 
         with patch.dict(sys.modules, _fake_pb2_modules()):

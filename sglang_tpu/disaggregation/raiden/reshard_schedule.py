@@ -26,7 +26,8 @@ whole packs. These builders turn that geometry into
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Protocol, Sequence, Tuple
+import math
+from typing import Any, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 
 class FusedKVLayerTensor(Protocol):
@@ -83,7 +84,9 @@ def head_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
 
 
 def per_rank_head_count(fused_layer_tensor: FusedKVLayerTensor) -> int:
-    """kv_heads_packed (this rank's kv-head count) of a fused KV layer tensor."""
+    """kv_heads_packed of a fused KV layer tensor: 32-bit rows per token, each
+    holding ``kv_packing // 2`` heads' K+V. Equals this rank's kv-head count
+    only at kv_packing 2; at fp8 it is ``ceil(2 * heads / 4)``."""
     return int(fused_layer_tensor.shape[2])
 
 
@@ -220,6 +223,189 @@ class ReshardGeometry:
             dh_start * self.hp_bytes,  # dst_offset
             dst_hpr * self.hp_bytes,  # dst_stride (dst per-token width)
         )
+
+
+# tpu-sync accepts at most IOV_MAX iovecs per (layer, block, sender)
+# (transport/lib/socket/util.cc); a push entry spends one per token.
+IOV_MAX = 1024
+
+
+def _moved_extent(offset: int, size: int, stride: int, count: int, moved: int) -> int:
+    """One past the last byte touched by the first ``moved`` bytes of
+    ``count`` chunks of ``size`` bytes placed every ``stride`` bytes."""
+    if size <= 0 or moved <= 0:
+        return offset
+    full, rest = divmod(min(moved, count * size), size)
+    end = offset + (full - 1) * stride + size if full else offset
+    if rest:
+        end = max(end, offset + full * stride + rest)
+    return end
+
+
+def check_entry_bounds(
+    entry: Any, src_block_bytes: int, dst_block_bytes: Optional[int]
+) -> None:
+    """Raise ValueError if ``entry`` moves bytes outside one block.
+
+    Models tpu-sync's legacy push: the sender sends at most its block's bytes
+    of the entry's chunks, and the receiver writes exactly what the sender
+    sent. Native code validates offsets only against the whole host block
+    array, so an entry that leaves its block silently writes a neighbouring
+    block (another request's staging). ``dst_block_bytes=None`` checks the
+    source side only.
+    """
+    size, count = entry.size_bytes, entry.count
+    moved = min(count * size, src_block_bytes)
+    src_end = _moved_extent(
+        entry.src_offset_bytes, size, entry.src_stride_bytes, count, moved
+    )
+    dst_end = _moved_extent(
+        entry.dst_offset_bytes, size, entry.dst_stride_bytes, count, moved
+    )
+    if src_end > src_block_bytes or (
+        dst_block_bytes is not None and dst_end > dst_block_bytes
+    ):
+        raise ValueError(
+            "Raiden reshard entry exceeds the block: src bytes "
+            f"[{entry.src_offset_bytes}, {src_end}) of {src_block_bytes}, dst "
+            f"bytes [{entry.dst_offset_bytes}, {dst_end}) of {dst_block_bytes}"
+        )
+
+
+def check_request_bounds(
+    req: Any, block_bytes: Iterable[Tuple[int, Optional[int]]]
+) -> None:
+    """check_entry_bounds on every entry of a StartTransferRequest, for each
+    ``(src_block_bytes, dst_block_bytes)`` it is pushed with: one plan serves
+    every layer of its group, and draft layers can have other block sizes."""
+    pairs = list(block_bytes)
+    for schedule in req.shard_push_schedules.values():
+        for entry in schedule.entries:
+            for src_bytes, dst_bytes in pairs:
+                check_entry_bounds(entry, src_bytes, dst_bytes)
+
+
+def candidate_total_heads(own_heads: int, own_tp: int, peer_tp: int) -> List[int]:
+    """Global kv-head counts consistent with ``own_heads`` per rank at
+    attention TP ``own_tp``, for a peer at ``peer_tp``.
+
+    Exact unless one head per rank. On the smaller (decode) side every count
+    up to ``own_tp`` then gives the same push schedule, so ``own_tp`` stands in
+    for all of them; on the larger side the peer's per-rank count stays open.
+    """
+    if own_heads > 1:
+        return [own_heads * own_tp]
+    if own_tp <= peer_tp:
+        return [own_tp]
+    return [
+        n
+        for n in range(1, own_tp + 1)
+        if own_tp % n == 0 and (peer_tp % n == 0 or n % peer_tp == 0)
+    ]
+
+
+def push_reshard_where(src_tp: int, dst_tp: int) -> str:
+    return f"Raiden push-reshard (prefill attention TP {src_tp} -> decode {dst_tp})"
+
+
+def fused_layout_refusal(src_tp: int, dst_tp: int, ndim: int) -> Optional[str]:
+    """The push schedule addresses the 5-D fused MHA layout only; MLA pools
+    are 4-D and quantized (MXINT8) pools 3-D."""
+    if ndim == 5:
+        return None
+    return (
+        f"{push_reshard_where(src_tp, dst_tp)} needs the 5-D fused MHA KV "
+        f"layout; this KV tensor is {ndim}-D (MLA or a quantized pool)"
+    )
+
+
+def _schedule(geom: ReshardGeometry) -> List[Tuple[int, int, int, int, int]]:
+    return [geom.entry_bytes(p, p // geom.ratio) for p in range(geom.src_tp)]
+
+
+def push_reshard_refusal(
+    geom: ReshardGeometry,
+    shape: Sequence[int],
+    element_size: int,
+    *,
+    total_heads: int,
+    own_tp: int,
+    page_size: int,
+    seq_along_lane: bool,
+) -> Optional[str]:
+    """Why pushing one KV layer tensor with ``geom``'s schedule would misplace
+    bytes, or None when the copy is byte-exact.
+
+    ``shape``/``element_size`` are this side's tensor (attention TP
+    ``own_tp``) and ``total_heads`` the global kv-head count it really holds,
+    which differs from ``geom.total_kv_heads`` for draft layers and, before
+    #1076, sliding-window layers. The push path builds ``geom`` with the
+    default unit, so ``head_pair_bytes`` is one 32-bit row (one bf16 head, two
+    fp8 heads) and the schedule is exact iff it equals the schedule over the
+    tensor's real rows.
+    """
+    src_tp, dst_tp = geom.src_tp, geom.dst_tp
+    where = push_reshard_where(src_tp, dst_tp)
+    reason = fused_layout_refusal(src_tp, dst_tp, len(shape))
+    if reason is not None:
+        return reason
+    if page_size > IOV_MAX:
+        return f"{where} supports page_size <= {IOV_MAX}, got {page_size}"
+    pk = int(shape[3])
+    hp = pk * int(shape[4]) * element_size
+    if pk * element_size != 4 or hp != geom.hp_bytes:
+        return (
+            f"{where} moves every layer with one geometry, but its KV layers "
+            "differ in head_dim or dtype (e.g. a draft model's KV)"
+        )
+    src_heads = max(1, total_heads // src_tp)
+    dst_heads = max(1, total_heads // dst_tp)
+    own_heads = max(1, total_heads // own_tp)
+    rows = 2 * own_heads if seq_along_lane else -(-2 * own_heads // pk)
+    if int(shape[1 if seq_along_lane else 2]) != rows:
+        return (
+            f"{where}: a KV tensor of shape {tuple(shape)} does not hold "
+            f"{own_heads} kv heads per rank"
+        )
+    if seq_along_lane:
+        # TODO(#829): remove when the SEQ_ALONG_LANE geometry lands. The
+        # schedule treats one (kv_packing, page_size) row as a head; at one head
+        # per rank that is page_size contiguous chunks from offset 0 on both
+        # sides, which the sender's per-block cap turns into a whole-page copy
+        # once the chunks cover the page.
+        block = math.prod(int(d) for d in shape[1:]) * element_size
+        identity = all(e == (0, hp, hp, 0, hp) for e in _schedule(geom))
+        if src_heads == dst_heads == 1 and identity and page_size * hp >= block:
+            return None
+        return (
+            f"{where} supports SEQ_ALONG_LANE KV only with one kv head per rank "
+            "on both sides and page_size * kv_packing >= 2 * head_dim lanes "
+            f"(here {src_heads} -> {dst_heads} heads per rank)"
+        )
+    if pk == 2 or src_heads == dst_heads == 1:
+        # A row is one head, or each rank's single head fills its own row.
+        row_heads = total_heads
+    elif src_heads % 2 == 0 and dst_heads % 2 == 0:
+        # TODO(#829): remove with B1 (per-head units on the push path). Every
+        # rank holds whole two-head rows, so the schedule is exact when its
+        # head count is the row count -- true for draft or sliding-window
+        # layers holding twice the geometry's heads, false for the full pool.
+        row_heads = total_heads // 2
+    else:
+        row_heads = None
+    if row_heads is not None:
+        if _schedule(geom) == _schedule(ReshardGeometry(src_tp, dst_tp, hp, row_heads)):
+            return None
+        if pk == 2 or geom.total_kv_heads != total_heads:
+            return (
+                f"{where} would misplace KV: its schedule assumes "
+                f"{geom.total_kv_heads} kv heads, a KV layer holds {total_heads}"
+            )
+    return (
+        f"{where} misplaces fp8 KV unless each decode rank holds one kv head "
+        f"(here {src_heads} per prefill rank -> {dst_heads} per decode rank); "
+        "use equal attention TP or a bf16 KV cache"
+    )
 
 
 def _add_entry(
