@@ -241,6 +241,18 @@ class TestRegisterToBootstrap(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_payload_carries_kv_layout(self, mock_put, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        mock_put.return_value = MagicMock(status_code=200)
+
+        for layout in (None, "seq_along_lane"):
+            mgr = self._make_manager()
+            mgr.kv_args.kv_layout = layout
+            mgr.register_to_bootstrap()
+            self.assertEqual(mock_put.call_args[1]["json"]["kv_layout"], layout)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_url_with_dist_init_addr(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
@@ -419,10 +431,202 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
         mgr.kv_args.rust_http_port = None
+        mgr.kv_args.kv_layout = None
         # Resolved per-runner value threaded through KVArgs (the payload field).
         mgr.kv_cache_dtype_str = "auto"
 
         return mgr
+
+
+class TestBootstrapServerKVLayout(CustomTestCase):
+    """The Python bootstrap server carries kv_layout and omits it when None."""
+
+    SENTINEL = dict(
+        prefill_dp_rank="-1",
+        prefill_cp_rank="-1",
+        target_tp_rank="-1",
+        target_pp_rank="-1",
+    )
+
+    def _server(self):
+        import asyncio
+
+        from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+
+        server = CommonKVBootstrapServer.__new__(CommonKVBootstrapServer)
+        server.lock = asyncio.Lock()
+        for name in (
+            "pp_size",
+            "attn_tp_size",
+            "attn_cp_size",
+            "dp_size",
+            "page_size",
+            "kv_cache_dtype",
+            "dsv41_spec_layout",
+            "kv_layout",
+            "follow_bootstrap_room",
+            "enable_dsa_cache_layer_split",
+            "prefill_http_port",
+        ):
+            setattr(server, name, None)
+        server.prefill_port_table = {}
+        server._registered_count = 0
+        return server
+
+    @staticmethod
+    def _put_body(**overrides):
+        body = {
+            "attn_tp_size": 2,
+            "attn_tp_rank": 0,
+            "attn_cp_size": 1,
+            "attn_cp_rank": 0,
+            "attn_dp_size": 1,
+            "attn_dp_rank": 0,
+            "pp_size": 1,
+            "pp_rank": 0,
+            "system_dp_size": 1,
+            "system_dp_rank": 0,
+            "rank_ip": "10.0.0.1",
+            "rank_port": 17000,
+            "page_size": 64,
+            "kv_cache_dtype": "auto",
+            "dsv41_spec_layout": None,
+            "kv_layout": None,
+            "prefill_http_port": 30000,
+        }
+        body.update(overrides)
+        return body
+
+    @staticmethod
+    def _run(coro):
+        import asyncio
+
+        return asyncio.run(coro)
+
+    def _put(self, server, body):
+        async def json():
+            return body
+
+        return self._run(server._handle_route_put(MagicMock(json=json)))
+
+    def _get_info(self, server):
+        import json
+
+        resp = self._run(server._handle_route_get(MagicMock(query=self.SENTINEL)))
+        return resp.status, (json.loads(resp.text) if resp.status == 200 else None)
+
+    def test_kv_layout_round_trip(self):
+        server = self._server()
+        for rank in (0, 1):
+            body = self._put_body(attn_tp_rank=rank, kv_layout="seq_along_lane")
+            self.assertEqual(self._put(server, body).status, 200)
+        status, info = self._get_info(server)
+        self.assertEqual(status, 200)
+        self.assertEqual(info["kv_layout"], "seq_along_lane")
+
+    def test_token_major_omits_key_for_old_decodes(self):
+        import dataclasses
+
+        from sglang.srt.disaggregation.common.conn import PrefillServerInfo
+
+        server = self._server()
+        for rank in (0, 1):
+            self.assertEqual(
+                self._put(server, self._put_body(attn_tp_rank=rank)).status, 200
+            )
+        status, info = self._get_info(server)
+        self.assertEqual(status, 200)
+        self.assertNotIn("kv_layout", info)
+        # A decode built before kv_layout existed: same dataclass minus the field.
+        OldInfo = dataclasses.make_dataclass(
+            "OldInfo",
+            [
+                (f.name, f.type, f)
+                for f in dataclasses.fields(PrefillServerInfo)
+                if f.name != "kv_layout"
+            ],
+        )
+        OldInfo(**info)
+        self.assertIsNone(PrefillServerInfo(**info).kv_layout)
+
+    def test_non_default_layout_fails_closed_on_old_decode(self):
+        """Documented skew: an old decode rejects the key (TypeError, then the
+        15-retry abort in decode.py), so HND fleets upgrade in lock step."""
+        import dataclasses
+
+        from sglang.srt.disaggregation.common.conn import PrefillServerInfo
+
+        server = self._server()
+        for rank in (0, 1):
+            body = self._put_body(attn_tp_rank=rank, kv_layout="seq_along_lane")
+            self._put(server, body)
+        _, info = self._get_info(server)
+        OldInfo = dataclasses.make_dataclass(
+            "OldInfo",
+            [
+                (f.name, f.type, f)
+                for f in dataclasses.fields(PrefillServerInfo)
+                if f.name != "kv_layout"
+            ],
+        )
+        with self.assertRaises(TypeError):
+            OldInfo(**info)
+
+    def test_rank_layout_mismatch_is_rejected(self):
+        server = self._server()
+        body = self._put_body(kv_layout="seq_along_lane")
+        self.assertEqual(self._put(server, body).status, 200)
+        resp = self._put(server, self._put_body(attn_tp_rank=1, kv_layout=None))
+        self.assertEqual(resp.status, 400)
+        self.assertIn("KV layout differs", resp.text)
+        # The rejected rank is not registered, so the server stays not-ready.
+        self.assertEqual(server._registered_count, 1)
+        self.assertEqual(self._get_info(server)[0], 503)
+
+
+class TestGetKVLayout(CustomTestCase):
+    def test_pool_resolution(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.disaggregation.utils import get_kv_layout
+
+        seq = SimpleNamespace(disagg_kv_layout="seq_along_lane")
+        self.assertIsNone(get_kv_layout(SimpleNamespace()))
+        self.assertEqual(get_kv_layout(seq), "seq_along_lane")
+        self.assertEqual(
+            get_kv_layout(SimpleNamespace(full_kv_pool=seq)), "seq_along_lane"
+        )
+
+    def test_tpu_pool_classes(self):
+        try:
+            from sglang_tpu.kv_pool import (
+                TpuFusedMHATokenToKVPool,
+                TpuSeqAlongLaneKVPool,
+            )
+        except ImportError as e:
+            self.skipTest(f"TPU pool module unavailable: {e}")
+        self.assertEqual(TpuSeqAlongLaneKVPool.disagg_kv_layout, "seq_along_lane")
+        self.assertFalse(hasattr(TpuFusedMHATokenToKVPool, "disagg_kv_layout"))
+
+    def test_raiden_reads_the_same_layout(self):
+        """Raiden's SEQ_ALONG_LANE flag comes from the advertised layout."""
+        from types import SimpleNamespace
+
+        from sglang_tpu.disaggregation.raiden.common import _is_seq_along_lane
+
+        try:
+            from sglang_tpu.kv_pool import (
+                TpuFusedMHATokenToKVPool,
+                TpuSeqAlongLaneKVPool,
+            )
+        except ImportError as e:
+            self.skipTest(f"TPU pool module unavailable: {e}")
+        seq = object.__new__(TpuSeqAlongLaneKVPool)
+        fused = object.__new__(TpuFusedMHATokenToKVPool)
+        self.assertTrue(_is_seq_along_lane(seq))
+        self.assertTrue(_is_seq_along_lane(SimpleNamespace(full_kv_pool=seq)))
+        self.assertFalse(_is_seq_along_lane(fused))
+        self.assertFalse(_is_seq_along_lane(None))
 
 
 if __name__ == "__main__":

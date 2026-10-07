@@ -42,6 +42,10 @@ struct PrefillServerInfo {
     kv_cache_dtype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dsv41_spec_layout: Option<serde_json::Value>,
+    /// Omitted when token-major (None), as Python does: older decodes parse
+    /// the reply strictly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_layout: Option<String>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
     prefill_http_port: Option<i64>,
@@ -109,6 +113,7 @@ struct Topology {
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
     dsv41_spec_layout: Option<serde_json::Value>,
+    kv_layout: Option<String>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
     prefill_http_port: Option<i64>,
@@ -158,6 +163,8 @@ struct Route {
     kv_cache_dtype: Option<String>,
     #[serde(default)]
     dsv41_spec_layout: Option<serde_json::Value>,
+    #[serde(default)]
+    kv_layout: Option<String>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,
     #[serde(default)]
@@ -181,15 +188,23 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
 
     // Copy-on-write update. `rcu` may re-run the closure under write
     // contention, so it only reads `body` and clones what it stores.
-    let mut layout_mismatch = false;
+    let mut mismatch: Option<&'static str> = None;
     state.topology.rcu(|current| {
         let mut topo = (**current).clone();
-        layout_mismatch =
-            topo.registered_count > 0 && topo.dsv41_spec_layout != body.dsv41_spec_layout;
-        if layout_mismatch {
+        mismatch = if topo.registered_count == 0 {
+            None
+        } else if topo.dsv41_spec_layout != body.dsv41_spec_layout {
+            Some("DeepSeek-V4.1 DSpark PD layout differs across prefill ranks")
+        } else if topo.kv_layout != body.kv_layout {
+            Some("KV layout differs across prefill ranks")
+        } else {
+            None
+        };
+        if mismatch.is_some() {
             return topo;
         }
         topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
+        topo.kv_layout = body.kv_layout.clone();
         topo.attn_tp_size.get_or_insert(body.attn_tp_size);
         topo.attn_cp_size.get_or_insert(body.attn_cp_size);
         topo.dp_size.get_or_insert(dp_size);
@@ -220,11 +235,8 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         topo
     });
 
-    if layout_mismatch {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
-        );
+    if let Some(message) = mismatch {
+        return json_error(StatusCode::BAD_REQUEST, message);
     }
 
     let topo = state.topology.load();
@@ -282,6 +294,7 @@ async fn route_get(
             page_size: topo.page_size,
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
+            kv_layout: topo.kv_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             prefill_http_port: topo.prefill_http_port,
@@ -562,6 +575,45 @@ mod tests {
         let (_, body) = request(addr, "GET", SENTINEL, None);
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(info["dsv41_spec_layout"], layout);
+    }
+
+    /// `kv_layout` passes through when set and must match across ranks.
+    #[test]
+    fn kv_layout_round_trip_and_rank_mismatch() {
+        let (_rt, addr) = start_on_free_port();
+        let rank0 = put_route(serde_json::json!({
+            "system_dp_size": 2, "system_dp_rank": 0, "kv_layout": "seq_along_lane",
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&rank0)).0, 200);
+
+        let token_major = put_route(serde_json::json!({
+            "system_dp_size": 2, "system_dp_rank": 1, "kv_layout": null,
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&token_major)).0, 400);
+        // The rejected rank is not counted.
+        assert_eq!(request(addr, "GET", SENTINEL, None).0, 503);
+
+        let rank1 = put_route(serde_json::json!({
+            "system_dp_size": 2, "system_dp_rank": 1, "kv_layout": "seq_along_lane",
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&rank1)).0, 200);
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["kv_layout"], "seq_along_lane");
+    }
+
+    /// An explicit `null` (what Python sends for token-major) is omitted from
+    /// the reply, like an absent key.
+    #[test]
+    fn kv_layout_null_is_omitted() {
+        let (_rt, addr) = start_on_free_port();
+        let body = put_route(serde_json::json!({"kv_layout": null}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(info.get("kv_layout").is_none());
     }
 
     /// System-dp topology derivation: with `system_dp_size > 1` the dp axis
