@@ -298,8 +298,9 @@ def prepare_tpu_environment(server_args) -> None:
 
     Single-host TPU and other devices are unchanged. Multi-host Ray, partial
     slices, and external distributed-init overrides are unsupported. HTTP
-    serving follows normalized rank zero, which may move to another pod;
-    orchestration must route traffic there. Cache compatibility checks remain
+    serving follows normalized rank zero, which may move to another pod. The
+    input leader forwards its HTTP and PD-bootstrap ports to that host; bind
+    serving to a pod-reachable address on every host. Cache checks remain
     required even with normalized ranks.
     """
     from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
