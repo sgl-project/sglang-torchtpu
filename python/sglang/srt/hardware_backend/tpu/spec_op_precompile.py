@@ -66,9 +66,7 @@ def precompile_spec_v2_ops(
                 if queue is None:
                     registered_op.op(*args)
                 else:
-                    pending = registered_op.warmup_async(*args)
-                    if pending is not None:
-                        queue.calls.append(pending)
+                    registered_op.op.warmup(*args)
 
     def finish():
         if device.type == "tpu":

@@ -7,11 +7,9 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import spec_op_precompile
-from sglang.srt.hardware_backend.tpu.compilation.dynamo_compile import (
-    DynamoCompiledFunction,
-)
 from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import collect_warmups
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -119,22 +117,35 @@ def test_registered_ops_submit_before_join_and_reuse_serving_wrapper(
         )
 
 
-def test_cold_call_and_synchronous_mode_return_real_results(backend):
+def test_cold_call_and_synchronous_mode_return_real_results(backend, monkeypatch):
+    registry = importlib.import_module("sglang.srt.compilation.compiled_op")
+    monkeypatch.setattr(registry, "is_tpu", lambda: True)
     for asynchronous in (False, True):
-        op = DynamoCompiledFunction(lambda x: x * 3, async_compile=asynchronous)
-        x = torch.arange(3)
-        assert torch.equal(op(x), x * 3)
-        assert op.warmup_async(x) is None
-        assert torch.equal(op(x), x * 3)
+        with (
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(asynchronous),
+        ):
+            op = compiled_op()(lambda x: x * 3)
+            x = torch.arange(3)
+            assert torch.equal(op(x), x * 3)
+            assert op.warmup_async(x) is None
+            assert torch.equal(op(x), x * 3)
 
 
 def test_pending_compile_failure_prevents_completion(backend, monkeypatch):
+    registry = importlib.import_module("sglang.srt.compilation.compiled_op")
+    monkeypatch.setattr(registry, "is_tpu", lambda: True)
+
     def fail(_):
         raise RuntimeError("native compile failed")
 
     monkeypatch.setattr(backend.module, "resolve_compilations", fail)
-    op = DynamoCompiledFunction(lambda x: x + 1, async_compile=True)
-    with pytest.raises(RuntimeError, match="native compile failed"):
+    op = compiled_op()(lambda x: x + 1)
+    with (
+        envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+        pytest.raises(RuntimeError, match="native compile failed"),
+    ):
         with collect_warmups() as queue:
             queue.calls.append(op.warmup_async(torch.ones(2)))
             queue.completions.append(lambda: backend.events.append("completed"))
@@ -153,8 +164,54 @@ def test_disabled_compilation_uses_original_helper(backend, monkeypatch):
 
         assert torch.equal(op(torch.ones(2)), torch.full((2,), 5.0))
         (registered,) = registry.get_compiled_ops()
-        assert registered.warmup_async(torch.ones(2)) is None
+        assert registered.op.warmup_async(torch.ones(2)) is None
         assert backend.wrappers == []
+
+
+def test_owner_warmups_share_serving_callable_without_global_registration(
+    backend, monkeypatch
+):
+    registry = importlib.import_module("sglang.srt.compilation.compiled_op")
+    monkeypatch.setattr(registry, "_compiled_ops", {})
+    monkeypatch.setattr(registry, "is_tpu", lambda: True)
+
+    def make_op(offset):
+        @registry.compiled_op()
+        def add(x):
+            return x + offset
+
+        return add
+
+    first, second = make_op(1), make_op(2)
+    with (
+        envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+    ):
+        with collect_warmups() as queue:
+            first.warmup(torch.zeros(2))
+            second.warmup(torch.zeros(3))
+            assert len(queue.calls) == 2
+            assert not any(event[0] == "execute" for event in backend.events)
+        assert torch.equal(first(torch.ones(2)), torch.full((2,), 2.0))
+        assert torch.equal(second(torch.ones(3)), torch.full((3,), 3.0))
+        first.warmup(torch.zeros(4))
+    assert len(backend.wrappers) == 2
+    assert registry.get_compiled_ops() == ()
+
+
+def test_compiled_helper_inlines_inside_outer_dynamo_graph():
+    from sglang.srt.compilation.compiled_op import compiled_op
+
+    @compiled_op()
+    def add_one(x):
+        return x + 1
+
+    def outer(x):
+        return add_one(x) * 2
+
+    compiled = torch.compile(outer, backend="eager", fullgraph=True)
+    x = torch.arange(4)
+    assert torch.equal(compiled(x), (x + 1) * 2)
 
 
 def test_scheduler_submits_helpers_before_model_join(monkeypatch):
