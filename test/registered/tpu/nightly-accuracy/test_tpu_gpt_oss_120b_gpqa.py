@@ -33,7 +33,6 @@ GATE = {
         n_threads=16,
         num_examples=198,
     ),
-    "report_only": True,
 }
 
 CONFIG_MODULE = "recipe/configs/gpt_oss_120b/accuracy_gpqa.py"

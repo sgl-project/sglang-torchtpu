@@ -22,7 +22,6 @@ register_tpu_ci(
 GATE = {
     "dataset": "gsm8k",
     "label": "gsm8k_full",
-    "report_only": True,
     "num_examples": 1319,
     "num_threads": 32,
     "max_tokens": 4096,

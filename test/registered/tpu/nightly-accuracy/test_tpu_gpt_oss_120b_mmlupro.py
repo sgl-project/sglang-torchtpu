@@ -23,7 +23,6 @@ GATE = {
     "dataset": "mmlu_pro",
     "label": "mmlu_pro_high",
     "lm_eval_config": "test/lm_eval_configs/GPT-OSS-120B-TPU-MMLU-Pro.yaml",
-    "report_only": True,
 }
 
 CONFIG_MODULE = "recipe/configs/gpt_oss_120b/accuracy_mmlupro.py"

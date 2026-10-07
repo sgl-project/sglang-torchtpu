@@ -20,7 +20,6 @@ GATE = {
     "dataset": "aime26",
     "label": "aime26",
     "runner": make_runner(GEMMA4_26B_A4B, "aime26", n_repeats=4),
-    "report_only": True,
 }
 
 

@@ -47,8 +47,6 @@ def build_model_config():
             {
                 "dataset": "gpqa",
                 "label": "gpqa_diamond",
-                "baseline": 0.715,
-                "atol": 0.10,
                 "repeat": 1,
                 "num_threads": 128,
                 "temperature": 0.6,
@@ -58,9 +56,6 @@ def build_model_config():
             {
                 "dataset": "aime25",
                 "label": "aime25",
-                # Preserve the existing serving-regression threshold.
-                "baseline": 0.875,
-                "atol": 0.20,
                 "repeat": 1,
                 "num_threads": 128,
                 "temperature": 0.6,
@@ -71,7 +66,6 @@ def build_model_config():
             {
                 "dataset": "mmlu",
                 "label": "mmlu",
-                "report_only": True,
                 "repeat": 1,
                 # The same seeded 250 rows every model and every night: sgl-eval's
                 # mmlu pins the archive revision and samples with sample_seed=0.

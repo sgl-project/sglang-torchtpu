@@ -47,7 +47,6 @@ def build_model_config():
             {
                 "dataset": "gpqa",
                 "label": "gpqa_diamond",
-                "report_only": True,
                 "thinking": True,
                 "repeat": 1,
                 "num_threads": 128,
@@ -58,7 +57,6 @@ def build_model_config():
             {
                 "dataset": "aime25",
                 "label": "aime25",
-                "report_only": True,
                 "thinking": True,
                 # Mean pass@1 over four passes: one pass of 30 problems swings by 2-3 problems.
                 "repeat": 4,
@@ -71,7 +69,6 @@ def build_model_config():
             {
                 "dataset": "mmlu",
                 "label": "mmlu",
-                "report_only": True,
                 "thinking": True,
                 "repeat": 1,
                 # Match the non-DPA test: 250 sampled questions per repeat.

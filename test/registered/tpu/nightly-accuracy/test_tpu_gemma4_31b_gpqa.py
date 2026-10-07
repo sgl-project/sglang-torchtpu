@@ -20,7 +20,6 @@ GATE = {
     "dataset": "gpqa",
     "label": "gpqa_diamond",
     "runner": make_runner(GEMMA4_31B, "gpqa", n_repeats=4),
-    "report_only": True,
 }
 
 

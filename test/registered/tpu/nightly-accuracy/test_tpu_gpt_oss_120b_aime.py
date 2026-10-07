@@ -32,7 +32,6 @@ GATE = {
         max_tokens=MAX_TOKENS,
         n_threads=16,
     ),
-    "report_only": True,
 }
 
 CONFIG_MODULE = "recipe/configs/gpt_oss_120b/accuracy_aime.py"

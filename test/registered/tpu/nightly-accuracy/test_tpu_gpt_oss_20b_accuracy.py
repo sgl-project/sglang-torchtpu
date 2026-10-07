@@ -27,7 +27,6 @@ SAMPLING = {
     "top_p": 1.0,
     "max_tokens": 131072,
     "num_threads": 128,
-    "report_only": True,
 }
 
 GATES = [

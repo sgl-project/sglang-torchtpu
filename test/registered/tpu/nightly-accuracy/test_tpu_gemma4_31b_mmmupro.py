@@ -21,7 +21,6 @@ GATE = {
     # sgl-eval's own grader: its own series, apart from the lenient manual re-grades.
     "label": "mmmu_pro_strict",
     "runner": make_runner(GEMMA4_31B, "mmmu_pro"),
-    "report_only": True,
 }
 
 

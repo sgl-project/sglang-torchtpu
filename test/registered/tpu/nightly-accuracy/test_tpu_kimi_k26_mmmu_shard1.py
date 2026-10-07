@@ -42,7 +42,6 @@ def build_model_config():
             {
                 "dataset": "mmmu_pro",
                 "label": "mmmu_pro_shard1",
-                "report_only": True,
                 "runner": partial(
                     run_shard,
                     shard=1,
