@@ -33,6 +33,15 @@ from sglang.srt.utils.common import log_info_on_rank0
 logger = logging.getLogger(__name__)
 
 
+def local_routed_expert_range(
+    storage_rank: int, num_local_routed: int
+) -> tuple[int, int]:
+    """Global routed-expert ids [start, end) stored on EP storage rank
+    ``storage_rank``; experts are placed contiguously by storage rank."""
+    start = storage_rank * num_local_routed
+    return start, start + num_local_routed
+
+
 class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"

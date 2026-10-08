@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_deepep_v2_dispatcher_output_dtype,
     has_per_rank_fused_shared_slots,
+    local_routed_expert_range,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -1016,8 +1017,9 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        start_idx = self._expert_storage_rank * self._num_local_routed
-        end_idx = start_idx + self._num_local_routed
+        start_idx, end_idx = local_routed_expert_range(
+            self._expert_storage_rank, self._num_local_routed
+        )
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
         elif self._has_fused_shared and expert_id >= self._num_global_routed:
