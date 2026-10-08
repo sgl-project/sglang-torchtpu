@@ -52,12 +52,15 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
 
 import logging
 import math
-from typing import Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 from torch_tpu._internal.pallas import jax_op
 
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    import jax
 
 logger = logging.getLogger(__name__)
 
@@ -384,6 +387,89 @@ def _fuse_act_name(activation_name):
     return mapping[activation_name]
 
 
+# Largest routed-row count for the rank permute. Its [rows, rows] compares grow
+# quadratically (4 MiB of bools each at 2048 rows). On tpu7x under EP it beat
+# the sort route at every measured shape up to 2048 rows (Kimi-K3, Qwen3-Coder,
+# Qwen3.5) and by only ~10 us at 4096; raise the cap only with new measurements.
+_RANK_PERMUTE_MAX_ROWS = 2048
+
+
+class _DenseRoute(NamedTuple):
+    sorted_token_ids: "jax.Array"  # i32[n]: owner token of each sorted row
+    sorted_weights: "jax.Array"  # f32[n]: routing weight of each sorted row
+    group_sizes: "jax.Array"  # i32[num_local_experts]
+    num_owned: "jax.Array"  # i32[]: owned rows, a prefix of the sorted order
+
+
+def _dense_rank_route(
+    topk_ids_flat: "jax.Array",
+    topk_weights: "jax.Array",
+    num_experts: int,
+    expert_group_offset: int,
+) -> _DenseRoute:
+    """Expert-major routing over this rank's local expert ids, without a sort.
+
+    Ids outside ``[expert_group_offset, expert_group_offset + num_experts)``
+    map to one sentinel past the last local expert, so the owned rows form a
+    prefix of the sorted order and ``group_sizes`` covers only local experts.
+    The rank of each slot comes from pairwise compares (stable, ties broken by
+    slot), so the owned prefix matches a stable argsort over global ids. Exact
+    integer compares rather than vllm-torchtpu's counting-sort rank matmul,
+    which that repo keeps off the one-hot permute (it collapsed MTP acceptance)
+    and off more than 512 buckets (an XLA miscompile).
+    """
+    import jax.numpy as jnp
+
+    n = topk_ids_flat.shape[0]
+    topk = n // topk_weights.shape[0]
+    local_ids = topk_ids_flat - expert_group_offset
+    owned = (local_ids >= 0) & (local_ids < num_experts)
+    keys = jnp.where(owned, local_ids, num_experts)
+    slot = jnp.arange(n, dtype=jnp.int32)
+    before = (keys[None, :] < keys[:, None]) | (
+        (keys[None, :] == keys[:, None]) & (slot[None, :] < slot[:, None])
+    )
+    sorted_pos = jnp.sum(before, axis=1, dtype=jnp.int32)
+    # hit[p, s]: slot s lands at sorted position p.
+    hit = sorted_pos[None, :] == slot[:, None]
+    sorted_token_ids = jnp.sum(
+        jnp.where(hit, (slot // topk)[None, :], 0), axis=1, dtype=jnp.int32
+    )
+    weights = topk_weights.reshape(-1).astype(jnp.float32)
+    sorted_weights = jnp.sum(jnp.where(hit, weights[None, :], 0.0), axis=1)
+    # The sentinel one-hots to an all-zero row.
+    group_sizes = (keys[:, None] == jnp.arange(num_experts)[None, :]).sum(
+        axis=0, dtype=jnp.int32
+    )
+    num_owned = jnp.sum(owned, dtype=jnp.int32)
+    return _DenseRoute(sorted_token_ids, sorted_weights, group_sizes, num_owned)
+
+
+def _dense_route_combine(
+    gmm2_out: "jax.Array", route: _DenseRoute, num_tokens: int
+) -> "jax.Array":
+    """Weighted top-k combine of the expert-major GMM2 rows of ``route``.
+
+    Rows past ``route.num_owned`` were never written (no zero-init), so they
+    are masked before they can reach the sum as ``0 * NaN``.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    owned_rows = jnp.arange(gmm2_out.shape[0]) < route.num_owned
+    gmm2_out = jnp.where(owned_rows[:, None], gmm2_out, 0)
+    unpermute_matrix = (
+        jax.nn.one_hot(route.sorted_token_ids, num_tokens, dtype=jnp.float32)
+        * route.sorted_weights[:, None]
+    )
+    return jax.lax.dot_general(
+        unpermute_matrix,
+        gmm2_out.astype(jnp.float32),
+        (((0,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+
+
 def _fused_moe_jax(
     hidden_states,  # [m, k]
     w1,  # [g,k,2*n] bf16 | [g,k/2,2*n] uint8 (packed FP4) | [g,k/8,2*n] int32 (packed int4)
@@ -537,6 +623,29 @@ def _fused_moe_jax(
         )
     else:
         x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
+
+    # Multi-token dense decode: route on local expert ids with a sort-free rank
+    # permute. The routing above is then unused, and XLA drops it as dead code.
+    # A single token keeps the path above.
+    dense_route = None
+    if (
+        use_dense_permute
+        and use_dense_unpermute
+        and m_orig > 1
+        and m * topk <= _RANK_PERMUTE_MAX_ROWS
+    ):
+        dense_route = _dense_rank_route(
+            topk_ids_flat,
+            topk_weights,
+            num_experts,
+            expert_group_offset if use_group_offset else 0,
+        )
+        x_sorted = jax.lax.dot_general(
+            jax.nn.one_hot(dense_route.sorted_token_ids, m, dtype=hidden_states.dtype),
+            hidden_states,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=hidden_states.dtype,
+        )
     # GMM1: gate/up projection. For per-column/per-tensor scales (and MXFP4), the
     # gated activation is fused in-kernel: ``fuse_act`` makes gmm_v2 split the
     # [.., 2*n] accumulator and write only [.., n] = act(gate) * up, avoiding a
@@ -603,6 +712,10 @@ def _fused_moe_jax(
         zero_init = False
     else:
         zero_init = True
+
+    if dense_route is not None:
+        # Local groups only; the combine masks the rows past the owned prefix.
+        group_sizes, group_offset, zero_init = dense_route.group_sizes, None, False
 
     gmm1_out = gmm_v2(
         lhs=x_sorted,
@@ -672,6 +785,9 @@ def _fused_moe_jax(
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
     # slot before the weighted reduction.
     if use_dense_unpermute:
+        if dense_route is not None:
+            combined = _dense_route_combine(gmm2_out, dense_route, m)
+            return combined[:m_orig].astype(out_dtype)
         # Unpermute using dense matmul.
         w_sorted = topk_weights.reshape(-1)[argsort_idx].astype(jnp.float32)
         unpermute_matrix = (

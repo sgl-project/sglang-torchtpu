@@ -1905,7 +1905,8 @@ class Envs:
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there.
+    # and tune from there. Below it, batches of up to 2048 routed rows also
+    # take the sort-free dense rank route.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
