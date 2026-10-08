@@ -280,6 +280,10 @@ jobs:
             kill "$stream_pid" 2>/dev/null || true
             wait "$stream_pid" 2>/dev/null || true
             kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
+            # The next group needs every host of the slice free: with no gang
+            # scheduling, a pod still terminating here half-places it.
+            kubectl -n "$ns" wait --for=delete pod -l "$sel" --timeout=600s >/dev/null 2>&1 \
+              || echo "⚠️ ${label}: pods still terminating after 600s"
             CUR=""
             return "$rc"
           }
