@@ -555,6 +555,7 @@ def _fused_moe_jax(
     # ``jnp.pad`` + ``group_sizes`` scatter that XLA was offloading to the
     # SparseCore (and crashing on). Padding has zero weight.
     m_orig = m
+    topk_ids_orig, topk_weights_orig = topk_ids, topk_weights
     m_pad = _padded_token_count(m, topk, lhs_sublane_tiling(hidden_states.dtype))
     if m_pad != m:
         hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
@@ -576,30 +577,51 @@ def _fused_moe_jax(
     # Routing: build a permutation that puts rows of hidden_states in
     # expert-major order so a single grouped-matmul covers GMM1 / GMM2.
     topk_ids_flat = topk_ids.reshape(-1).astype(jnp.int32)  # [m*topk]
-    # argsort is stable enough on TPU for our usage; the gmm kernel
-    # only cares about contiguous expert runs.
-    argsort_idx = jnp.argsort(topk_ids_flat)
-    # Row-of-original-token for each sorted slot.
-    token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
-    sorted_token_ids = token_indices[argsort_idx]
-
-    # gmm_v2 only reads and writes the rows of expert groups at or after
-    # ``group_offset``, so this rank's routed-row window is all the permute has
-    # to produce. Computed here (not at the ``group_sizes`` site below) so the
-    # gather can start as soon as the sort is done.
     use_group_offset = global_num_experts > num_experts
-    row_start = row_end = None
-    if use_group_offset:
-        row_start, row_end = _shard_row_window(
-            topk_ids_flat, expert_group_offset, num_experts
-        )
 
     # Decide whether to use the dense permute/un-permute paths based on the
     # number of rows (m) and the number of routed rows (m*topk).
     use_dense_permute = m < permute_dense_threshold
     use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
+    # One real token (bs=1 decode) on the dense path (threshold > m_pad * topk,
+    # combine on): every routed row is token 0, so the permute is a broadcast
+    # and only the expert-major metadata is needed. One SMEM kernel builds it
+    # in place of the sort/one-hot glue.
+    single_token = use_dense_permute and use_dense_unpermute and m_orig == 1
 
-    if use_dense_permute:
+    row_start = row_end = None
+    if single_token:
+        from sglang.srt.layers.moe.pallas.route_meta import single_token_route_meta
+
+        # Local rows (stable, expert-major) form a prefix of the n routed rows;
+        # group_sizes is over the local experts only, so no group_offset.
+        w_sorted_f32, group_sizes = single_token_route_meta(
+            topk_ids_orig,
+            topk_weights_orig,
+            n=m * topk,
+            offset=expert_group_offset if use_group_offset else 0,
+            num_experts=num_experts,
+        )
+    else:
+        # argsort is stable enough on TPU for our usage; the gmm kernel
+        # only cares about contiguous expert runs.
+        argsort_idx = jnp.argsort(topk_ids_flat)
+        # Row-of-original-token for each sorted slot.
+        token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
+        sorted_token_ids = token_indices[argsort_idx]
+
+        # gmm_v2 only reads and writes the rows of expert groups at or after
+        # ``group_offset``, so this rank's routed-row window is all the permute
+        # has to produce. Computed here (not at the ``group_sizes`` site below)
+        # so the gather can start as soon as the sort is done.
+        if use_group_offset:
+            row_start, row_end = _shard_row_window(
+                topk_ids_flat, expert_group_offset, num_experts
+            )
+
+    if single_token:
+        x_sorted = jnp.broadcast_to(hidden_states[:1], (m * topk, hidden_size))
+    elif use_dense_permute:
         permute_matrix = jax.nn.one_hot(sorted_token_ids, m, dtype=hidden_states.dtype)
         x_sorted = jax.lax.dot_general(
             permute_matrix,
@@ -692,14 +714,19 @@ def _fused_moe_jax(
             "is unsupported: pad weights AND scales jointly at load time."
         )
 
-    route_num_experts = global_num_experts if use_group_offset else num_experts
-    # one_hot+sum is cheaper on TPU than bincount.
-    group_sizes = jax.nn.one_hot(topk_ids_flat, route_num_experts, dtype=jnp.int32).sum(
-        axis=0
-    )
-    group_offset = (
-        jnp.array([expert_group_offset], dtype=jnp.int32) if use_group_offset else None
-    )
+    if single_token:
+        group_offset = None
+    else:
+        route_num_experts = global_num_experts if use_group_offset else num_experts
+        # one_hot+sum is cheaper on TPU than bincount.
+        group_sizes = jax.nn.one_hot(
+            topk_ids_flat, route_num_experts, dtype=jnp.int32
+        ).sum(axis=0)
+        group_offset = (
+            jnp.array([expert_group_offset], dtype=jnp.int32)
+            if use_group_offset
+            else None
+        )
 
     # The TensorCore path requires zero-initializing, while the SparseCore
     # combine does not: the masked EP combine skips masked rows entirely, and
@@ -712,6 +739,9 @@ def _fused_moe_jax(
         zero_init = False
     else:
         zero_init = True
+    if single_token:
+        # The single-token combine masks rows past the local prefix itself.
+        zero_init = False
 
     if dense_route is not None:
         # Local groups only; the combine masks the rows past the owned prefix.
@@ -784,6 +814,16 @@ def _fused_moe_jax(
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
     # slot before the weighted reduction.
+    if single_token:
+        # Rows past the local prefix carry weight 0 and are uninitialized; a
+        # zero-weight row adds nothing, so the weight is an exact mask.
+        gmm2_rows = jnp.where(w_sorted_f32[:, None] != 0, gmm2_out, 0)
+        combined = jnp.sum(
+            gmm2_rows.astype(jnp.float32) * w_sorted_f32[:, None],
+            axis=0,
+            keepdims=True,
+        )
+        return combined.astype(out_dtype)
     if use_dense_unpermute:
         if dense_route is not None:
             combined = _dense_route_combine(gmm2_out, dense_route, m)
