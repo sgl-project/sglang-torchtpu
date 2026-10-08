@@ -108,6 +108,8 @@ spec:
                       # hub cache (weights/hf-hub, staged from huggingface.co).
                       [ -f /tmp/test.jsonl ] || cp /weights/datasets/gsm8k/test.jsonl /tmp/test.jsonl
                       export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1
+                      # gpt-oss's harmony encoding loads its tiktoken vocab from here.
+                      export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
                       NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
                       RANK="${TPU_WORKER_ID:-0}"
                       echo "run=${RUN_NAME} mode=${MODE} nnodes=$NNODES rank=$RANK"

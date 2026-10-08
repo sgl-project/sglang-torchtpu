@@ -116,10 +116,16 @@ spec:
                       # hub cache (weights/hf-hub, staged from huggingface.co).
                       [ -f /tmp/test.jsonl ] || cp /weights/datasets/gsm8k/test.jsonl /tmp/test.jsonl
                       export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1
+                      # gpt-oss's harmony encoding loads its tiktoken vocab from here.
+                      export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
                       # A role smaller than its slice runs one single-host engine per pod:
                       # the injected TPU_* vars describe the whole slice, and libtpu would
                       # wait for a peer that belongs to the other role.
                       if [ -n "${PREFILL_SINGLE_HOST}" ]; then
+                        # The tests name their peer from this pod's DNS name, which the
+                        # dropped TPU_WORKER_HOSTNAMES carried (one entry: this pod).
+                        PD_SELF_HOST="${TPU_WORKER_HOSTNAMES%%,*}"
+                        export PD_SELF_HOST="${PD_SELF_HOST:-$(hostname -f)}"
                         unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES \
                               TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS \
                               TPU_ACCELERATOR_TYPE
@@ -272,10 +278,16 @@ spec:
                       # hub cache (weights/hf-hub, staged from huggingface.co).
                       [ -f /tmp/test.jsonl ] || cp /weights/datasets/gsm8k/test.jsonl /tmp/test.jsonl
                       export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1
+                      # gpt-oss's harmony encoding loads its tiktoken vocab from here.
+                      export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
                       # A role smaller than its slice runs one single-host engine per pod:
                       # the injected TPU_* vars describe the whole slice, and libtpu would
                       # wait for a peer that belongs to the other role.
                       if [ -n "${DECODE_SINGLE_HOST}" ]; then
+                        # The tests name their peer from this pod's DNS name, which the
+                        # dropped TPU_WORKER_HOSTNAMES carried (one entry: this pod).
+                        PD_SELF_HOST="${TPU_WORKER_HOSTNAMES%%,*}"
+                        export PD_SELF_HOST="${PD_SELF_HOST:-$(hostname -f)}"
                         unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES \
                               TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS \
                               TPU_ACCELERATOR_TYPE

@@ -86,7 +86,8 @@ that hard-code `/weights/<model>` run unchanged once the model is staged.
 The cluster has **no internet egress**. Pods copy `weights/datasets/gsm8k/test.jsonl` to
 `/tmp/test.jsonl` (the GSM8K evals' download cache) and run HF offline against
 `weights/hf-hub`, a flat hub cache (`models--<org>--<name>/refs/main` +
-`snapshots/<rev>/`). A test that pulls a new HF repo id needs it staged there first.
+`snapshots/<rev>/`), with gpt-oss's harmony vocab read from `weights/datasets/tiktoken`.
+A test that pulls a new HF repo id or dataset needs it staged there first.
 
 | Declaration | Suite | What runs |
 |---|---|---|
