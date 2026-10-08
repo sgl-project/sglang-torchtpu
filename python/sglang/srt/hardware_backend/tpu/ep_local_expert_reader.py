@@ -16,6 +16,8 @@ from sglang.srt.utils import is_tpu, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
+_is_tpu = is_tpu()
+
 # Bound on a single readinto() call while filling a span buffer.
 _READ_CHUNK_BYTES = 64 * 1024 * 1024
 # Kept tensors at most this far apart are read with one seek + read.
@@ -57,36 +59,41 @@ def tpu_local_routed_expert_range(model: torch.nn.Module) -> Optional[Tuple[int,
     (fused shared experts, parameters that need every expert), or when
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS is true.
     """
-    if not is_tpu() or not getattr(model, "supports_tpu_ep_local_expert_reads", False):
+    if not _is_tpu or not getattr(model, "supports_tpu_ep_local_expert_reads", False):
         return None
     from sglang.srt.environ import envs
 
+    def whole_shards(reason: str) -> None:
+        # An opted-in model reading whole shards can need far more host memory.
+        log_info_on_rank0(
+            logger, f"EP-local expert reads off ({reason}); reading whole shards."
+        )
+
     if envs.SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS.get():
-        return None
+        return whole_shards("SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS")
     from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.utils import local_routed_expert_range
     from sglang.srt.runtime_context import get_exec
 
-    if (
-        get_global_expert_location_metadata() is not None
-        or get_exec().moe.ep_join_mode == "scale"
-    ):
-        return None
+    if get_global_expert_location_metadata() is not None:
+        return whole_shards("expert location metadata")
+    if get_exec().moe.ep_join_mode == "scale":
+        return whole_shards("elastic EP join")
     moes = [m for m in model.modules() if isinstance(m, FusedMoE)]
     if any(
-        getattr(m, "_has_fused_shared", False)
+        m._has_fused_shared
         or any(
             getattr(p, "_sglang_require_global_experts", False) for p in m.parameters()
         )
         for m in moes
     ):
-        return None
+        return whole_shards("a MoE layer loads experts outside its routed range")
     layouts = {
         (m.moe_ep_size, m._expert_storage_rank, m._num_local_routed) for m in moes
     }
     if len(layouts) != 1:
-        return None
+        return whole_shards("MoE layers disagree on the expert layout")
     ep_size, storage_rank, num_local_routed = layouts.pop()
     if ep_size <= 1:
         return None

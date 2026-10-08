@@ -59,6 +59,27 @@ def _write_checkpoint(folder, num_experts=4, layers=(0, 1), extra=None):
     return files, tensors
 
 
+class _CountingFile:
+    """File wrapper counting the bytes readinto() fills."""
+
+    def __init__(self, f, counter):
+        self._f, self._counter = f, counter
+
+    def readinto(self, buf):
+        n = self._f.readinto(buf)
+        self._counter.append(n or 0)
+        return n
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._f.close()
+
+
 def _expert_id(name):
     return (
         int(name.split(".experts.")[1].split(".")[0]) if ".experts." in name else None
@@ -91,6 +112,37 @@ class TestEpLocalExpertReads(CustomTestCase):
                 for name in expected:
                     self.assertEqual(loaded[name].dtype, tensors[name].dtype)
                     self.assertTrue(torch.equal(loaded[name], tensors[name]), name)
+
+    def test_span_reads_fetch_only_the_kept_bytes(self):
+        """Without gap merging every run of kept tensors is its own span, as on
+        real shards: values still match and the skipped experts' bytes are never
+        read."""
+        for iterator in _ITERATORS:
+            with (
+                self.subTest(iterator=iterator),
+                tempfile.TemporaryDirectory() as d,
+                patch(f"{_MOD}._SPAN_MERGE_GAP_BYTES", 0),
+            ):
+                files, tensors = _write_checkpoint(d)
+                read_bytes = []
+                real_open = open
+
+                def counting_open(path, mode="r", *args, **kwargs):
+                    return _CountingFile(
+                        real_open(path, mode, *args, **kwargs), read_bytes
+                    )
+
+                with patch(f"{_MOD}.open", counting_open, create=True):
+                    loaded = _read(files, iterator, (2, 4))
+                expected = {n for n in tensors if _expert_id(n) in (None, 2, 3)}
+                self.assertEqual(set(loaded), expected)
+                for name in expected:
+                    self.assertTrue(torch.equal(loaded[name], tensors[name]), name)
+                # Span payloads go through readinto; headers through read().
+                kept = sum(
+                    tensors[n].numel() * tensors[n].element_size() for n in expected
+                )
+                self.assertEqual(sum(read_bytes), kept)
 
     def test_reads_everything_without_range_mmap_off_or_index(self):
         with tempfile.TemporaryDirectory() as d:
@@ -212,6 +264,20 @@ class TestEpLocalExpertReads(CustomTestCase):
             for name, tensor in loaded.items():
                 self.assertTrue(torch.equal(tensor, tensors[name]), name)
 
+    def test_routed_expert_dtype_probe_regex_untouched(self):
+        # The reader's expert-id pattern must not replace weight_utils'
+        # `.weight`-anchored routed-expert pattern used for dtype probing.
+        self.assertIsNone(
+            weight_utils._ROUTED_EXPERT_KEY_RE.search(
+                "model.layers.0.mlp.experts.3.w1.scale"
+            )
+        )
+        self.assertIsNotNone(
+            weight_utils._ROUTED_EXPERT_KEY_RE.search(
+                "model.layers.0.mlp.experts.3.down_proj.weight"
+            )
+        )
+
 
 def _fused_moe(
     ep_size,
@@ -246,7 +312,7 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
     @staticmethod
     def _env(*, tpu=True, eplb=None, join="none"):
         stack = contextlib.ExitStack()
-        stack.enter_context(patch(f"{_MOD}.is_tpu", return_value=tpu))
+        stack.enter_context(patch(f"{_MOD}._is_tpu", tpu))
         stack.enter_context(
             patch(
                 "sglang.srt.eplb.expert_location.get_global_expert_location_metadata",
