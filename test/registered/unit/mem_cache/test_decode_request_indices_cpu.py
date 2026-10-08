@@ -82,3 +82,7 @@ def test_host_decode_allocation_uses_request_index_mirror(monkeypatch, indices):
         batch.seq_lens_cpu + 1
     ).tolist()
     batch.req_to_token_pool.alloc_aux_to_lengths.assert_called_once()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
