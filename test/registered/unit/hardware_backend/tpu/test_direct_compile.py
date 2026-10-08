@@ -363,6 +363,57 @@ class TestDirectCompile(CustomTestCase):
         finally:
             torch.tpu.set_rng_state(original_state)
 
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_registered_helpers_compile_directly_and_match_eager(self):
+        from sglang.srt.compilation.compiled_op import (
+            get_compiled_ops,
+            warmup_compiled_op,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.tpu import spec_op_precompile  # noqa: F401
+        from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+            collect_warmups,
+        )
+        from sglang.srt.hardware_backend.tpu.spec_op_warmup import SpecOpWarmupContext
+
+        cases = []
+        with (
+            torch.no_grad(),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+        ):
+            with collect_warmups():
+                for width in (1, 3):
+                    context = SpecOpWarmupContext(
+                        device=torch.device("tpu"),
+                        physical_bs=2,
+                        num_verify_tokens=width,
+                        vocab_size=16,
+                        draft_vocab_size=16,
+                        hidden_size=8,
+                        hidden_dtype=torch.float32,
+                    )
+                    for registered in get_compiled_ops():
+                        args = registered.make_warmup_args(context)
+                        warmup_compiled_op(registered.op, *args)
+                        cases.append((registered.op, args))
+            self.assertEqual(len(cases), 12)
+            with torch.compiler.set_stance("fail_on_recompile"):
+                for op, args in cases:
+                    cpu_args = tree_util.tree_map(
+                        lambda x: x.cpu() if isinstance(x, torch.Tensor) else x, args
+                    )
+                    expected = op.__wrapped__(*cpu_args)
+                    actual = op(*args)
+                    self.assertEqual(
+                        tree_util.tree_structure(actual),
+                        tree_util.tree_structure(expected),
+                    )
+                    for a, b in zip(
+                        tree_util.tree_leaves(actual), tree_util.tree_leaves(expected)
+                    ):
+                        self.assertTrue(torch.equal(a.cpu(), b), op.__name__)
+
     def test_native_async_failure_propagates_before_execution(self):
         artifact = _make_artifact(((2,),))
         artifact.pending_compile = MagicMock()
