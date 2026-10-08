@@ -54,7 +54,7 @@ class TestPadTensorOnHost(CustomTestCase):
 
 
 class TestHostPadFieldSelection(CustomTestCase):
-    """Host padding is opt-in for prefill and never used for decode or verify."""
+    """Host padding defaults on for prefill, never for decode or verify."""
 
     def setUp(self):
         super().setUp()
@@ -140,10 +140,14 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertEqual(batch.mrope_positions.shape, (3, 8))
         self.assertEqual(batch.mrope_positions[1].tolist(), [5, 6, 7, 8, 9, 0, 0, 0])
 
-    def test_extend_metadata_uses_device_pad_by_default(self):
+    def test_extend_metadata_uses_host_pad_by_default(self):
         self.assertFalse(envs.SGLANG_TPU_HOST_PADDING.is_set())
-        self.assertFalse(envs.SGLANG_TPU_HOST_PADDING.get())
-        self._assert_extend_uses_device_padding()
+        self.assertTrue(envs.SGLANG_TPU_HOST_PADDING.get())
+        batch = self._extend_batch()
+        originals = [getattr(batch, name) for name in shim._HOST_PAD_TOKEN_FIELDS]
+        _, host_padded = self._run(batch)
+        for original in originals:
+            self.assertTrue(any(value is original for value in host_padded))
 
     def test_extend_metadata_uses_device_pad_when_disabled(self):
         with envs.SGLANG_TPU_HOST_PADDING.override(False):
@@ -216,6 +220,41 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertEqual(batch.input_ids.tolist(), [0, 1])
         self.assertEqual(batch.mrope_positions.shape, (3, 2))
         self.assertEqual(batch.mrope_positions[:, 0].tolist(), [0, 8, 16])
+
+    def test_restore_reuses_metadata_without_retaining_large_embeddings(self):
+        batch = self._extend_batch()
+        batch.input_embeds = torch.randn(5, 4)
+        batch.mm_input_embeds = torch.randn(5, 4)
+        originals = {name: getattr(batch, name) for name in shim._TOKEN_FIELDS}
+        # Repeat on the same batch to catch stale snapshots from earlier calls.
+        for _ in range(2):
+            self._run(batch)
+            self.assertNotIn("input_embeds", batch._tpu_token_padding)
+            self.assertNotIn("mm_input_embeds", batch._tpu_token_padding)
+            shim._restore_forward_batch_inputs(batch, real_q=5, real_b=2)
+            for name, original in originals.items():
+                if name in shim._HOST_PAD_TOKEN_FIELDS:
+                    self.assertIs(getattr(batch, name), original, name)
+                else:
+                    torch.testing.assert_close(getattr(batch, name), original)
+            self.assertIsNone(batch._tpu_token_padding)
+
+    def test_restore_preserves_a_consumer_replacement(self):
+        batch = self._extend_batch()
+        self._run(batch)
+        # An eager embedding/position producer can replace a padded tensor.
+        batch.positions = torch.arange(100, 108)
+        shim._restore_forward_batch_inputs(batch, real_q=5, real_b=2)
+        self.assertEqual(batch.positions.tolist(), list(range(100, 105)))
+
+    def test_restore_trims_inputs_already_padded_by_dp(self):
+        batch = self._decode_batch()
+        self._run(batch)
+        # DP can pass three physical rows for only two local live requests.
+        shim._restore_forward_batch_inputs(batch, real_q=2, real_b=2)
+        self.assertEqual(batch.input_ids.tolist(), [0, 1])
+        self.assertEqual(batch.positions.tolist(), [13, 51])
+        self.assertIsNone(batch._tpu_token_padding)
 
     def test_decode_keeps_device_pad(self):
         batch = self._decode_batch()

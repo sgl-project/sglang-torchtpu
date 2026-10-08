@@ -700,6 +700,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
 
+    # TPU bucketing replaces small token metadata. Keep both references so
+    # restoration can reuse the original instead of materializing a TPU slice.
+    # The padded reference also prevents restoring over a consumer's replacement.
+    _tpu_token_padding: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None
+
     # Prefill body-CUDA-graph context limit. Attention backends that allocate
     # context-shaped metadata use this fixed maximum instead of deriving a
     # shape from the live batch. None preserves eager/default graph behavior.

@@ -160,6 +160,32 @@ def _warmup_progress(
     return "Compiled", elapsed, _hbm_delta_str(hbm_before, _get_hbm_usage_mb())
 
 
+def can_keep_padded_prefill_hidden(forward_batch: ForwardBatch) -> bool:
+    """Whether an outer logits consumer may gather from bucket-sized hidden.
+
+    Only use at inner-decoder boundaries whose outer model selects prefill
+    rows using the restored extend lengths. Slicing to each arbitrary prompt
+    length first creates a distinct eager TPU executable. FULL capture keeps
+    its real-token contract, including every extend with the prompt-logprob
+    opt-in: the shim pins capture to FULL until finalization. return_logprob
+    is pinned False here, so it cannot guard trimming. Decode/verify consume
+    every row and must still be trimmed.
+    """
+    lengths = forward_batch.extend_seq_lens_cpu
+    return (
+        forward_batch.forward_mode == ForwardMode.EXTEND
+        and forward_batch.capture_hidden_mode
+        in (CaptureHiddenMode.NULL, CaptureHiddenMode.LAST)
+        and not is_dp_attention_enabled()
+        # A zero-length request would gather -1. On padded hidden that means
+        # a ghost row rather than the last real token. Keep legacy trimming
+        # when the host mirror is absent/stale or contains an empty request.
+        and isinstance(lengths, (list, tuple))
+        and bool(lengths)
+        and all(length > 0 for length in lengths)
+    )
+
+
 def _unpad_decoder_outputs(
     out: LogitsProcessorOutput | Any,
     forward_batch: ForwardBatch,
@@ -1562,10 +1588,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         return t if t.shape[0] == real_q else t[:real_q]
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: Any) -> Any:
-        """Slice the inner VL decoder output before outer logits processing."""
+        """Restore metadata and preserve bucketed hidden for prefill gathers."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
         out = super().finalize_forward_batch(outputs, forward_batch)
-        if real_q is None:
+        if real_q is None or can_keep_padded_prefill_hidden(forward_batch):
             return out
         if isinstance(out, torch.Tensor):
             return self._trim_q(out, real_q)

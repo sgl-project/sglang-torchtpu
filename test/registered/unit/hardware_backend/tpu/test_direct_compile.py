@@ -206,6 +206,28 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_padding_restore_state_is_not_a_compile_input(self):
+        padded = torch.arange(8)
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=padded,
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([5]),
+            seq_lens_sum=5,
+            out_cache_loc=padded,
+        )
+        leaves, tree = tree_util.tree_flatten(batch)
+        original = torch.arange(5)
+        batch._tpu_token_padding = {"input_ids": (original, padded)}
+        saved_leaves, saved_tree = tree_util.tree_flatten(batch)
+        self.assertEqual(tree, saved_tree)
+        self.assertEqual(len(leaves), len(saved_leaves))
+        self.assertFalse(any(value is original for value in saved_leaves))
+        rebuilt = tree_util.tree_unflatten(saved_tree, saved_leaves)
+        self.assertIsNone(rebuilt._tpu_token_padding)
+        self.assertIs(batch._tpu_token_padding["input_ids"][0], original)
+
     def test_fail_on_recompile_stance(self):
         compiled = direct_compile.direct_compile(
             lambda value: value,

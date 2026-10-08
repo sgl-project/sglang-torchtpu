@@ -566,7 +566,7 @@ def _pad_forward_batch_inputs(
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
-    # Opt-in host padding applies only to prefill with arbitrary token counts.
+    # Host padding applies only to prefill with arbitrary token counts.
     # Decode and target verify have a small, fixed set of token counts. The
     # TPU pad compiles each of those once, and avoids a blocking copy on
     # every generation step.
@@ -576,13 +576,18 @@ def _pad_forward_batch_inputs(
         and mode.is_extend()
         and not mode.is_target_verify()
     )
+    forward_batch._tpu_token_padding = {}
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         dim = _TOKEN_FIELD_DIM.get(field, 0)
         if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
             on_host = host_pad and field in _HOST_PAD_TOKEN_FIELDS
-            val = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
-            setattr(forward_batch, field, val)
+            padded = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
+            # Retain only small metadata. Holding an unpadded embedding tensor
+            # through the decoder forward would increase peak HBM usage.
+            if field in _HOST_PAD_TOKEN_FIELDS:
+                forward_batch._tpu_token_padding[field] = (val, padded)
+            setattr(forward_batch, field, padded)
 
     if is_draft_extend_v2:
         out_cache_loc = forward_batch.out_cache_loc
@@ -650,9 +655,15 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     Restore real token and batch shapes so downstream logits and sampling do
     not observe the compiled inner decoder's padded ghost slots.
     """
+    token_padding = getattr(forward_batch, "_tpu_token_padding", None) or {}
+    forward_batch._tpu_token_padding = None
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
         dim = _TOKEN_FIELD_DIM.get(field, 0)
+        original, padded = token_padding.get(field, (None, None))
+        if value is padded and original is not None and original.shape[dim] == real_q:
+            setattr(forward_batch, field, original)
+            continue
         if isinstance(value, torch.Tensor) and value.shape[dim] > real_q:
             setattr(forward_batch, field, value.narrow(dim, 0, real_q))
 

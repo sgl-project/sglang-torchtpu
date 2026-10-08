@@ -125,7 +125,18 @@ class KVPool(Protocol):
 
 # These objects cross the compiled decoder boundary. Registering them lets JAX
 # flatten their tensor fields and reconstruct the same objects for tracing.
-tree_util.register_dataclass(ForwardBatch)
+# Padding restoration belongs to the eager caller. In particular, its original
+# unbucketed tensors must never enter the compiled signature or input tree.
+tree_util.register_dataclass(
+    ForwardBatch,
+    data_fields=tuple(
+        field.name
+        for field in fields(ForwardBatch)
+        if field.name != "_tpu_token_padding"
+    ),
+    meta_fields=(),
+    drop_fields=("_tpu_token_padding",),
+)
 tree_util.register_dataclass(PallasForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
 # Pipeline stages exchange PPProxyTensors as the compiled input and output.

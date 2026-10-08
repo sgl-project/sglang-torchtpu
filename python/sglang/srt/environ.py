@@ -1841,9 +1841,9 @@ class Envs:
     # Restore device MM scatter instead of host placement.
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
-    # Opt in to host padding for small prefill metadata tensors to avoid
+    # Host padding for small prefill metadata tensors avoids
     # per-length XLA compilations.
-    SGLANG_TPU_HOST_PADDING = EnvBool(False)
+    SGLANG_TPU_HOST_PADDING = EnvBool(True)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
@@ -1852,6 +1852,8 @@ class Envs:
     # graph's guard, so the mode is a property of the warmed variant rather than
     # of the request. Off keeps the extend graph and the serving path exactly as
     # they are today, and a request asking for prompt logprobs is rejected.
+    # FULL capture also retains per-length hidden slicing at inner-decoder
+    # boundaries, disabling the bucketed-hidden optimization for every extend.
     SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
 
     # Build the RoPE cos/sin cache at the served context length instead of the
