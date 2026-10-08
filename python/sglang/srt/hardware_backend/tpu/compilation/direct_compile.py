@@ -141,6 +141,7 @@ def direct_compile(
     kv_pool: KVPool | None = None,
     ignored_argnames: tuple[str, ...] = (),
     prune_unused_inputs: bool = False,
+    uses_rng: bool = False,
 ) -> CompiledFunction:
     """Compile and dispatch ``fn`` directly, without torch.compile's
     Dynamo or AOTAutograd.
@@ -190,9 +191,12 @@ def direct_compile(
     lowerings. This option is fixed when constructing the compiled function; explicit
     function inputs and KV-pool state are never pruned.
 
+    ``uses_rng`` lifts the default TPU generator state into an input/output pair.
+    Tracing leaves the serving generator unchanged; execution advances it.
+
     `kv_pool` exposes every KV-cache Tensor through `get_state`; all of
     them are assumed to be mutated during inference and are copied back
-    after execution. The KV pool is the only mutable input.
+    after execution. Explicit function inputs must be immutable.
 
     Common problems/assumptions:
 
@@ -226,6 +230,7 @@ def direct_compile(
         kv_pool=kv_pool,
         ignored_argnames=ignored_argnames,
         prune_unused_inputs=prune_unused_inputs,
+        uses_rng=uses_rng,
     )
     return functools.update_wrapper(compiled, fn)
 
@@ -247,6 +252,7 @@ class CompiledFunction:
         kv_pool: KVPool | None = None,
         ignored_argnames: tuple[str, ...] = (),
         prune_unused_inputs: bool = False,
+        uses_rng: bool = False,
     ) -> None:
         self.fn = fn
         self.specialization_key = specialization_key
@@ -263,6 +269,7 @@ class CompiledFunction:
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
         self._prune_unused_inputs = prune_unused_inputs
+        self._uses_rng = uses_rng
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         artifact = self._get_artifact(args, kwargs)
@@ -398,6 +405,9 @@ class CompiledFunction:
         ):
             trace_leaves[leaf_index] = trace_inputs[input_index]
 
+        rng_device = flat_inputs[0].device if self._uses_rng else None
+        rng_output = None
+
         # Step 3: Lower to MLIR via literally running the function against the
         # placeholders. The goal is to get a flat list of output Tensors.
         with (
@@ -407,6 +417,21 @@ class CompiledFunction:
             ),
             ExitStack() as stack,
         ):
+            if rng_device is not None:
+                generator = torch.tpu.default_generators[rng_device.index or 0]
+                trace_generator = tpu_torch_compile.make_export_mode_device_generator(
+                    generator
+                )
+                tpu_torch_compile.set_export_mode_default_device_generator(
+                    trace_generator
+                )
+                stack.callback(
+                    tpu_torch_compile.clear_export_mode_default_device_generators
+                )
+                graph_inputs.append(
+                    tpu_torch_compile.get_device_state_tensor(trace_generator)
+                )
+
             # Respect torch.compiler.is_compiling() during tracing by returning True.
             previous_is_compiling = torch.compiler._is_compiling_flag
             torch.compiler._is_compiling_flag = True
@@ -449,6 +474,8 @@ class CompiledFunction:
             trace_arguments = tree_util.tree_unflatten(input_treespec, trace_leaves)
             with _collect_callbacks() as inserted_callbacks:
                 outputs = self.fn(*trace_arguments[0], **trace_arguments[1])
+            if rng_device is not None:
+                rng_output = tpu_torch_compile.get_device_state_tensor(trace_generator)
 
         output_leaves, output_treespec = tree_util.tree_flatten(outputs)
         if not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
@@ -458,6 +485,8 @@ class CompiledFunction:
         # cannot serialize host callbacks. Preserve callback values as extra
         # executable outputs, then invoke their Python callbacks after execute.
         result_tensors.extend(entry.tensor for entry in inserted_callbacks)
+        if rng_output is not None:
+            result_tensors.append(rng_output)
         # A mutation-only fn (the DFlash draft KV appender) returns None and has
         # no output leaves; the KV-pool copy-back is then the graph's only effect.
         if not result_tensors:
@@ -479,7 +508,11 @@ class CompiledFunction:
             )
             model_inputs = [model_inputs[index] for index in live_model_indices]
             graph_inputs = [graph_inputs[index] for index in retained_indices]
-            flat_inputs = [flat_inputs[index] for index in retained_indices]
+            flat_inputs = [
+                flat_inputs[index]
+                for index in retained_indices
+                if index < len(flat_inputs)
+            ]
             logger.info(
                 "[direct_compile] retained %d/%d model inputs",
                 len(model_inputs),
@@ -502,6 +535,8 @@ class CompiledFunction:
             if tensor.device.type == "tpu":
                 layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
             argument_layouts.append(layout[0] if layout is not None else [])
+        if rng_device is not None:
+            argument_layouts.append([])
         pending_compile = None
         executable = None
         start = time.perf_counter()
@@ -537,6 +572,7 @@ class CompiledFunction:
             output_count=len(output_leaves),
             callbacks=tuple(entry.callback for entry in inserted_callbacks),
             pending_compile=pending_compile,
+            rng_device=rng_device,
         )
 
 
@@ -553,6 +589,7 @@ class _CompiledArtifact:
     output_count: int
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
     pending_compile: Any | None = None
+    rng_device: torch.device | None = None
 
     def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
         if self.pending_compile is not None:
@@ -601,7 +638,15 @@ class _CompiledArtifact:
                 )
             inputs.append(value)
 
-        outputs = tpu_torch_compile.execute(self.executable, inputs)
+        if self.rng_device is None:
+            outputs = tpu_torch_compile.execute(self.executable, inputs)
+        else:
+            generator = torch.tpu.default_generators[self.rng_device.index or 0]
+            with tpu_torch_compile.MultiGeneratorLocker([generator]):
+                inputs.append(tpu_torch_compile.get_device_state_tensor(generator))
+                outputs = tpu_torch_compile.execute(self.executable, inputs)
+                tpu_torch_compile.set_device_state_tensor(generator, outputs[-1])
+                outputs = outputs[:-1]
 
         # Copy updated KV state back into the live pool tensors.
         with torch.no_grad():

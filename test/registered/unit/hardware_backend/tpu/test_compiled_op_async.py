@@ -2,9 +2,6 @@
 
 import importlib
 import sys
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from threading import Barrier, local
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -20,98 +17,34 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def test_async_compile_workers_preserve_graph_mode_without_serializing(monkeypatch):
-    from sglang.srt.hardware_backend.tpu import patches
-
-    class ModeState(local):
-        mode = "eager"
-
-    state = ModeState()
-    barrier = Barrier(2)
-
-    @contextmanager
-    def set_mode(mode):
-        previous = state.mode
-        state.mode = mode
-        try:
-            yield
-        finally:
-            state.mode = previous
-
-    class StaticCompiler:
-        def _compile(self, fail=False):
-            assert state.mode == "graph"
-            barrier.wait(timeout=10)
-            if fail:
-                raise RuntimeError("compile failed")
-            return "compiled"
-
-    execution_mode = SimpleNamespace(
-        EagerMode=SimpleNamespace(INTERNAL_COMPILE_FX_GRAPH="graph"),
-        set_eager_mode=set_mode,
-    )
-    internal = ModuleType("torch_tpu._internal")
-    internal.execution_mode = execution_mode
-    compiler = ModuleType("torch_tpu._internal.compile.compiler")
-    compiler.StaticCompiler = StaticCompiler
-    monkeypatch.setitem(sys.modules, internal.__name__, internal)
-    monkeypatch.setitem(sys.modules, compiler.__name__, compiler)
-    monkeypatch.setattr(patches, "_async_compile_context_patched", False)
-    patches._patch_async_compile_context()
-    patched_compile = StaticCompiler._compile
-    patches._patch_async_compile_context()
-    assert StaticCompiler._compile is patched_compile
-
-    def run(fail):
-        state.mode = "eager"
-        try:
-            return StaticCompiler()._compile(fail=fail)
-        finally:
-            assert state.mode == "eager"
-
-    with set_mode("caller"), ThreadPoolExecutor(max_workers=2) as pool:
-        success = pool.submit(run, False)
-        failure = pool.submit(run, True)
-        assert success.result(timeout=15) == "compiled"
-        with pytest.raises(RuntimeError, match="compile failed"):
-            failure.result(timeout=15)
-        assert state.mode == "caller"
-
-
 @pytest.fixture
 def backend(monkeypatch):
     events = []
     wrappers = []
-    module = ModuleType("torch_tpu._internal.compile")
+    module = ModuleType("sglang.srt.hardware_backend.tpu.compilation.direct_compile")
 
-    class Submitted(Exception):
-        def __init__(self, artifact):
-            self.artifact = artifact
+    class Compiled:
+        def __init__(self, fn, specialization_key, **options):
+            self.fn = fn
+            self.key = specialization_key
+            self.cache = set()
+            wrappers.append(options)
 
-    def resolve(artifacts):
-        for artifact in artifacts:
-            events.append(("resolve", artifact))
-
-    def compile_fn(fn, **options):
-        shapes = set()
-        wrappers.append(options)
-
-        def call(x):
-            key = (fn.__name__, x.numel())
-            if key not in shapes:
-                shapes.add(key)
-                events.append(("submit", key))
-                if options["options"]:
-                    raise Submitted(key)
+        def __call__(self, x):
+            key = (self.fn.__name__, x.numel())
             events.append(("execute", key))
-            return fn(x)
+            return self.fn(x)
 
-        return call
+        def warmup_async(self, x):
+            key = self.key(x)
+            if key not in self.cache:
+                self.cache.add(key)
+                events.append(("submit", (self.fn.__name__, x.numel())))
+            return PendingCall(lambda: module.finish(self, x))
 
-    module.AsyncCompilationSubmitted = Submitted
-    module.resolve_compilations = resolve
+    module.direct_compile = Compiled
+    module.finish = lambda compiled, x: compiled(x)
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(torch, "compile", compile_fn)
     return SimpleNamespace(events=events, wrappers=wrappers, module=module)
 
 
@@ -167,7 +100,9 @@ def test_registered_ops_submit_before_join_and_reuse_serving_wrapper(
         assert backend.events[-2:] == ["sync", "snapshot"]
         assert len(backend.wrappers) == 2
         for op, offset in ((add_one, 1), (add_two, 2)):
-            assert torch.equal(op(torch.arange(2)), torch.arange(2) + offset)
+            assert torch.equal(
+                op(torch.arange(2, dtype=torch.float32)), torch.arange(2) + offset
+            )
         assert (
             sum(
                 event[0] == "submit"
@@ -199,10 +134,10 @@ def test_pending_compile_failure_prevents_completion(backend, monkeypatch):
     registry = importlib.import_module("sglang.srt.compilation.compiled_op")
     monkeypatch.setattr(registry, "is_tpu", lambda: True)
 
-    def fail(_):
+    def fail(*_):
         raise RuntimeError("native compile failed")
 
-    monkeypatch.setattr(backend.module, "resolve_compilations", fail)
+    monkeypatch.setattr(backend.module, "finish", fail)
     op = compiled_op()(lambda x: x + 1)
     with (
         envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
@@ -273,6 +208,40 @@ def test_compiled_helper_inlines_inside_outer_dynamo_graph():
     compiled = torch.compile(outer, backend="eager", fullgraph=True)
     x = torch.arange(4)
     assert torch.equal(compiled(x), (x + 1) * 2)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        (torch.ones(3), 2, True),
+        (torch.ones(2, dtype=torch.int32), 2, True),
+        (torch.ones(2), 3, True),
+        (torch.ones(2), 2, False),
+        (torch.ones(2), 2, None),
+    ],
+)
+def test_helper_key_covers_tensor_metadata_and_static_values(changed):
+    from sglang.srt.compilation.compiled_op import _specialization_key
+
+    key = _specialization_key(torch.zeros(2), 2, True)
+    assert key == _specialization_key(torch.ones(2), 2, True)
+    assert key != _specialization_key(*changed)
+    assert key != _specialization_key(torch.zeros(2), 2, flag=True)
+
+
+@pytest.mark.parametrize("shape", [(1, 4), (3, 4)])
+def test_helper_normalizes_views_without_copying_canonical_inputs(shape):
+    from sglang.srt.compilation.compiled_op import _canonical_tensor
+
+    canonical = torch.arange(shape[0] * shape[1]).reshape(shape)
+    assert _canonical_tensor(canonical) is canonical
+    backing = torch.arange((shape[0] + 1) * shape[1] * 2).reshape(-1, shape[1] * 2)
+    view = backing[1:, ::2]
+    normalized = _canonical_tensor(view)
+    assert torch.equal(normalized, view)
+    assert normalized.storage_offset() == 0
+    assert normalized.stride() == canonical.stride()
+    assert _canonical_tensor(normalized) is normalized
 
 
 def test_scheduler_submits_helpers_before_model_join(monkeypatch):

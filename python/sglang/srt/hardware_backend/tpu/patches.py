@@ -12,7 +12,6 @@ from __future__ import annotations
 import importlib
 import os
 from collections.abc import Sequence
-from functools import wraps
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
@@ -69,32 +68,6 @@ def _register_tpu_compile_backend() -> None:
     # torch._dynamo so that `torch.compile(backend="tpu", ...)` works. Must run
     # before any code applies that decorator (e.g. on imports of layers/models).
     import torch_tpu._internal.compile  # noqa: F401
-
-
-_async_compile_context_patched = False
-
-
-def _patch_async_compile_context() -> None:
-    global _async_compile_context_patched
-    if _async_compile_context_patched:
-        return
-
-    from torch_tpu._internal import execution_mode
-    from torch_tpu._internal.compile.compiler import StaticCompiler
-
-    original_compile = StaticCompiler._compile
-
-    @wraps(original_compile)
-    def compile_in_graph_mode(self, *args, **kwargs):
-        # Background workers do not inherit the backend's graph-building mode.
-        # Keep it through traversal so output views cannot materialize mid-compile.
-        with execution_mode.set_eager_mode(
-            execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
-        ):
-            return original_compile(self, *args, **kwargs)
-
-    StaticCompiler._compile = compile_in_graph_mode
-    _async_compile_context_patched = True
 
 
 _tpu_sampler_backend_registered = False
@@ -907,7 +880,6 @@ def apply_tpu_patches() -> None:
     """
     _configure_eager_mode()
     _register_tpu_compile_backend()
-    _patch_async_compile_context()
     _register_tpu_sampler_backend()
     _unwrap_dynamic_compile_fns()
     _patch_set_device_tolerate_mismatch()

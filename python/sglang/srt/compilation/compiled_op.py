@@ -31,12 +31,47 @@ def get_compiled_ops() -> tuple[RegisteredCompiledOp, ...]:
     return tuple(_compiled_ops.values())
 
 
-def compiled_op(*, warmup: WarmupArgsFactory | None = None):
-    """Lazily ``torch.compile`` a pure tensor helper into one fused dispatch.
+def _canonical_tensor(value):
+    if not isinstance(value, torch.Tensor):
+        return value
+    strides, step = [], 1
+    for size in reversed(value.shape):
+        strides.append(step)
+        step *= max(size, 1)
+    # placeholder_like preserves even size-1 strides and storage offsets.
+    # Warmup and serving must expose the same logical buffer to the executable.
+    if value.storage_offset() == 0 and value.stride() == tuple(reversed(strides)):
+        return value
+    return value.clone(memory_format=torch.contiguous_format)
+
+
+def _specialization_key(*args, **kwargs):
+    from jax import tree_util
+
+    leaves, structure = tree_util.tree_flatten((args, kwargs))
+    return structure, tuple(
+        (tuple(value.shape), value.dtype, value.device)
+        if isinstance(value, torch.Tensor)
+        else (type(value), value)
+        for value in leaves
+    )
+
+
+def compiled_op(
+    *,
+    warmup: WarmupArgsFactory | None = None,
+    model: torch.nn.Module | None = None,
+    uses_rng: bool = False,
+):
+    """Directly compile a tensor helper into one fused dispatch.
 
     Active only on TPU with ``--enable-torch-compile``. The caller must pass
-    TPU tensors and ``fn`` must be compile-safe. A ``warmup`` factory registers
-    the helper for the speculative-op grid. Model-specific owners can instead
+    TPU tensors and ``fn`` must be compile-safe. Tensor shapes, dtypes, devices,
+    argument structure, and non-Tensor values determine specialization; closed-over
+    Python configuration must stay fixed. Pass ``model`` for captured parameters
+    and ``uses_rng=True`` for helpers drawing from the default TPU generator.
+    A ``warmup`` factory registers the helper for the speculative-op grid.
+    Model-specific owners can instead
     call ``warmup_compiled_op(op, ...)`` with their own representative inputs.
     The internal ``_warmup_async`` keyword returns a pending call without waiting.
     """
@@ -53,39 +88,23 @@ def compiled_op(*, warmup: WarmupArgsFactory | None = None):
                 or not envs.SGLANG_ENABLE_TORCH_COMPILE.get()
             ):
                 return fn(*args, **kwargs)
+            from jax import tree_util
+
+            args, kwargs = tree_util.tree_map(_canonical_tensor, (args, kwargs))
             if compiled_fn is None:
-                compiled_fn = torch.compile(
-                    fn,
-                    backend="tpu",
-                    fullgraph=True,
-                    dynamic=False,
-                    options=(
-                        {"async_compile": True}
-                        if envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
-                        else None
-                    ),
+                from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+                    direct_compile,
                 )
 
-            from torch_tpu._internal.compile import (
-                AsyncCompilationSubmitted,
-                resolve_compilations,
-            )
-
-            from sglang.srt.hardware_backend.tpu.compilation.pending_call import (
-                PendingCall,
-            )
-
-            try:
-                return compiled_fn(*args, **kwargs)
-            except AsyncCompilationSubmitted as submitted:
-                artifact = submitted.artifact
-
-                def finish():
-                    resolve_compilations([artifact])
-                    return compiled_fn(*args, **kwargs)
-
-                pending = PendingCall(finish)
-                return pending if _warmup_async else pending.wait()
+                compiled_fn = direct_compile(
+                    fn,
+                    specialization_key=_specialization_key,
+                    model=model,
+                    uses_rng=uses_rng,
+                )
+            if _warmup_async and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
+                return compiled_fn.warmup_async(*args, **kwargs)
+            return compiled_fn(*args, **kwargs)
 
         if warmup is not None:
             op_name = f"{fn.__module__}.{fn.__qualname__}"

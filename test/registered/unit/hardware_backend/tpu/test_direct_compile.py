@@ -328,6 +328,41 @@ class TestDirectCompile(CustomTestCase):
                 )
             )
 
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_random_helper_preserves_trace_state_and_advances_on_replay(self):
+        value = torch.ones((2, 7), device="tpu")
+        original_state = torch.tpu.get_rng_state()
+        try:
+            for asynchronous in (False, True):
+
+                def draw(x):
+                    return torch.rand_like(x)
+
+                compiled = direct_compile.direct_compile(
+                    draw,
+                    specialization_key=lambda x: tuple(x.shape),
+                    uses_rng=True,
+                )
+                torch.manual_seed(113)
+                before = torch.tpu.get_rng_state()
+                if asynchronous:
+                    pending = compiled.warmup_async(value)
+                    self.assertTrue(torch.equal(before, torch.tpu.get_rng_state()))
+                    first = pending.wait().cpu()
+                else:
+                    first = compiled(value).cpu()
+                after_first = torch.tpu.get_rng_state()
+                with torch.compiler.set_stance("fail_on_recompile"):
+                    second = compiled(value).cpu()
+                after_second = torch.tpu.get_rng_state()
+                torch.tpu.set_rng_state(before)
+                self.assertTrue(torch.equal(first, draw(value).cpu()))
+                self.assertTrue(torch.equal(after_first, torch.tpu.get_rng_state()))
+                self.assertTrue(torch.equal(second, draw(value).cpu()))
+                self.assertTrue(torch.equal(after_second, torch.tpu.get_rng_state()))
+        finally:
+            torch.tpu.set_rng_state(original_state)
+
     def test_native_async_failure_propagates_before_execution(self):
         artifact = _make_artifact(((2,),))
         artifact.pending_compile = MagicMock()
