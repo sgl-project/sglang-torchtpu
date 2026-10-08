@@ -168,6 +168,23 @@ jobs:
           CUR=""
           cleanup() { [ -n "$CUR" ] && kubectl -n "$ns" delete "$CUR" --ignore-not-found --wait=false 2>/dev/null; true; }
           trap cleanup EXIT
+          # A cancel signals the step; exit through the EXIT trap rather than dying first.
+          trap 'exit 130' INT TERM
+
+          # A JobSet still pinned to this row's slices was left by a canceled run (the
+          # slice concurrency group rules out a live one). With no gang scheduling, its
+          # pods would half-place this run's JobSets, so delete it before starting.
+          for pool in "$NODEPOOL" $NODEPOOL_DECODE; do
+            stale="$(kubectl -n "$ns" get jobsets -o json 2>/dev/null | jq -r --arg p "$pool" '
+              .items[] | select(any(.spec.replicatedJobs[].template.spec.template;
+                  .metadata.labels.app == "external-tpu-ci"
+                  and .spec.nodeSelector["cloud.google.com/gke-nodepool"] == $p))
+              | .metadata.name')"
+            for js in $stale; do
+              echo "deleting stale JobSet ${js} left on this slice by an earlier run"
+              kubectl -n "$ns" delete jobset "$js" --ignore-not-found --wait=true --timeout=300s || true
+            done
+          done
 
           # Render, apply, gate, and tear down ONE group's JobSet. Returns 0 pass / 1 fail.
           # $3 = wait budget in seconds (sized from the group's per-file budgets so a
