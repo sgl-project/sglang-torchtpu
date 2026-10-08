@@ -1,124 +1,77 @@
 """Preserve the input leader's serving address after TPU rank normalization."""
 
-import asyncio
 import logging
-import threading
-from contextlib import contextmanager
+import socket
+from concurrent.futures import CancelledError
+from contextlib import AsyncExitStack, contextmanager, suppress
+from functools import partial
+
+import anyio
+from anyio.abc import SocketListener
+from anyio.from_thread import start_blocking_portal
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.utils.network import try_bind_socket
 
 logger = logging.getLogger(__name__)
 
 
-class LeaderForwarder:
-    """Own TCP listeners until the local worker schedulers exit."""
+async def _copy_stream(source, destination, cancel_scope):
+    try:
+        async for data in source:
+            await destination.send(data)
+        # Preserve half-close: the peer can still send its response after EOF.
+        await destination.send_eof()
+    except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+        cancel_scope.cancel()
 
-    def __init__(self, host: str, target_host: str, ports: list[int]):
-        self.host = host
-        self.target_host = target_host
-        self.ports = ports
-        self._ready = threading.Event()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._stop: asyncio.Event | None = None
-        self._error: BaseException | None = None
-        self._connections: set[asyncio.Task] = set()
-        self._thread = threading.Thread(
-            target=self._run, name="tpu-leader-forwarder", daemon=True
-        )
 
-    @staticmethod
-    async def _pipe(reader, writer):
-        while data := await reader.read(64 * 1024):
-            writer.write(data)
-            await writer.drain()
-        if writer.can_write_eof():
-            writer.write_eof()
-
-    async def _handle(self, reader, writer, port):
-        upstream_writer = None
-        pumps = []
+async def _forward_connection(target_host, port, client):
+    async with client:
         try:
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(self.target_host, port), timeout=10
+            with anyio.fail_after(10):
+                upstream = await anyio.connect_tcp(target_host, port)
+        except (OSError, TimeoutError) as error:
+            # Closing the client makes readiness fail until the leader listens.
+            logger.debug("TPU leader connection on port %s failed: %s", port, error)
+            return
+
+        async with upstream, anyio.create_task_group() as tasks:
+            tasks.start_soon(_copy_stream, client, upstream, tasks.cancel_scope)
+            tasks.start_soon(_copy_stream, upstream, client, tasks.cancel_scope)
+
+
+async def _serve_ports(host, target_host, ports, *, task_status):
+    async with AsyncExitStack() as stack:
+        listeners = []
+        for port in ports:
+            sock = stack.enter_context(try_bind_socket(host, port))
+            sock.listen(socket.SOMAXCONN)
+            listener = await stack.enter_async_context(
+                await SocketListener.from_socket(sock)
             )
-            pumps = [
-                asyncio.create_task(self._pipe(reader, upstream_writer)),
-                asyncio.create_task(self._pipe(upstream_reader, writer)),
-            ]
-            await asyncio.gather(*pumps)
-        except (ConnectionError, OSError) as error:
-            # During startup the normalized leader may not be listening yet.
-            # Close this connection so readiness fails and the client can retry.
-            logger.debug("TPU leader connection on port %s closed: %s", port, error)
-        finally:
-            for pump in pumps:
-                pump.cancel()
-            await asyncio.gather(*pumps, return_exceptions=True)
-            for connection in (writer, upstream_writer):
-                if connection is not None:
-                    connection.close()
-                    try:
-                        await asyncio.wait_for(connection.wait_closed(), timeout=5)
-                    except TimeoutError:
-                        connection.transport.abort()
-                    except (ConnectionError, OSError):
-                        logger.debug("TPU leader connection closed by peer")
+            listeners.append((listener, port))
 
-    async def _serve(self):
-        self._loop = asyncio.get_running_loop()
-        self._stop = asyncio.Event()
-        servers = []
-        try:
-            for port in self.ports:
-                server = await asyncio.start_server(
-                    lambda reader, writer, port=port: self._accept(
-                        reader, writer, port
-                    ),
-                    self.host,
-                    port,
+        async with anyio.create_task_group() as tasks:
+            for listener, port in listeners:
+                tasks.start_soon(
+                    listener.serve, partial(_forward_connection, target_host, port)
                 )
-                servers.append(server)
-            self._ready.set()
-            await self._stop.wait()
-        finally:
-            for server in servers:
-                server.close()
-            # Stop accepting before cancelling active streams. wait_closed()
-            # can otherwise wait forever for an idle keep-alive connection.
-            await asyncio.sleep(0)
-            connections = tuple(self._connections)
-            for connection in connections:
-                connection.cancel()
-            await asyncio.gather(*connections, return_exceptions=True)
-            for server in servers:
-                await server.wait_closed()
+            task_status.started()
+            await anyio.sleep_forever()
 
-    def _accept(self, reader, writer, port):
-        task = asyncio.create_task(self._handle(reader, writer, port))
-        self._connections.add(task)
-        task.add_done_callback(self._connections.discard)
 
-    def _run(self):
+@contextmanager
+def _forward_ports(host: str, target_host: str, ports: list[int]):
+    """Bind before yielding; cancel connections and close listeners on exit."""
+    with start_blocking_portal(name="tpu-leader-forwarder") as portal:
+        serving, _ = portal.start_task(_serve_ports, host, target_host, ports)
         try:
-            asyncio.run(self._serve())
-        except BaseException as error:
-            self._error = error
+            yield
         finally:
-            self._ready.set()
-
-    def __enter__(self):
-        self._thread.start()
-        self._ready.wait()
-        if self._error is not None:
-            self._thread.join()
-            raise self._error
-        return self
-
-    def __exit__(self, *exc):
-        self._loop.call_soon_threadsafe(self._stop.set)
-        self._thread.join()
-        if self._error is not None:
-            raise self._error
+            serving.cancel()
+            with suppress(CancelledError):
+                serving.result()
 
 
 @contextmanager
@@ -140,7 +93,7 @@ def forward_normalized_leader(server_args):
     ):
         ports.append(cfg.disaggregation_bootstrap_port)
     target_host = cfg.dist_init_addr.rpartition(":")[0]
-    with LeaderForwarder(cfg.host, target_host, ports):
+    with _forward_ports(cfg.host, target_host, ports):
         logger.info(
             "Forwarding input TPU leader ports %s to normalized leader %s "
             "(local node rank %s)",

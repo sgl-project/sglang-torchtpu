@@ -18,6 +18,7 @@ dependencies = [
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
+  "anyio>=4.13.0",
   "blobfile==3.0.0",
   "av",
   "build",

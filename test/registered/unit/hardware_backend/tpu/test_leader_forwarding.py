@@ -2,7 +2,7 @@ import socket
 import socketserver
 import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -17,22 +17,26 @@ class StreamingTarget(socketserver.BaseRequestHandler):
         request = b""
         while data := self.request.recv(4096):
             request += data
+        self.request.sendall(b"port-%d:" % self.server.server_address[1])
         for index in range(3):
             self.request.sendall(b"chunk-%d:" % index + request)
 
 
 class TestLeaderForwarding(unittest.TestCase):
     def test_streaming_half_close_and_listener_cleanup(self):
-        with socketserver.ThreadingTCPServer(
-            ("127.0.0.2", 0), StreamingTarget
-        ) as target:
-            thread = threading.Thread(target=target.serve_forever, daemon=True)
-            thread.start()
-            port = target.server_address[1]
-            try:
-                with leader_forwarding.LeaderForwarder(
-                    "127.0.0.1", "127.0.0.2", [port]
-                ):
+        with ExitStack() as stack:
+            ports = []
+            for _ in range(2):
+                target = stack.enter_context(
+                    socketserver.ThreadingTCPServer(("127.0.0.2", 0), StreamingTarget)
+                )
+                thread = threading.Thread(target=target.serve_forever, daemon=True)
+                thread.start()
+                stack.callback(thread.join)
+                stack.callback(target.shutdown)
+                ports.append(target.server_address[1])
+            with leader_forwarding._forward_ports("127.0.0.1", "127.0.0.2", ports):
+                for port in ports:
                     with socket.create_connection(
                         ("127.0.0.1", port), timeout=5
                     ) as client:
@@ -43,21 +47,27 @@ class TestLeaderForwarding(unittest.TestCase):
                             response += data
                     self.assertEqual(
                         response,
-                        b"".join(b"chunk-%d:request" % index for index in range(3)),
+                        b"port-%d:" % port
+                        + b"".join(b"chunk-%d:request" % index for index in range(3)),
                     )
+            for port in ports:
                 with self.assertRaises(ConnectionRefusedError):
                     socket.create_connection(("127.0.0.1", port), timeout=5)
-            finally:
-                target.shutdown()
-                thread.join()
 
-    def test_unready_target_does_not_pass_health(self):
+    def test_unready_target_rejects_connection_then_accepts_retry(self):
         with socket.socket() as probe:
             probe.bind(("127.0.0.2", 0))
+            probe.settimeout(5)
             port = probe.getsockname()[1]
-            with leader_forwarding.LeaderForwarder("127.0.0.1", "127.0.0.2", [port]):
+            with leader_forwarding._forward_ports("127.0.0.1", "127.0.0.2", [port]):
                 with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
                     self.assertEqual(client.recv(4096), b"")
+                probe.listen()
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+                    upstream, _ = probe.accept()
+                    with upstream:
+                        upstream.sendall(b"ready")
+                        self.assertEqual(client.recv(4096), b"ready")
 
     def test_shutdown_closes_an_active_connection(self):
         accepted = threading.Event()
@@ -73,12 +83,16 @@ class TestLeaderForwarding(unittest.TestCase):
             thread.start()
             port = target.server_address[1]
             try:
-                with leader_forwarding.LeaderForwarder(
-                    "127.0.0.1", "127.0.0.2", [port]
-                ):
-                    client = socket.create_connection(("127.0.0.1", port), timeout=5)
-                    self.addCleanup(client.close)
-                    self.assertTrue(accepted.wait(5))
+                with self.assertRaisesRegex(RuntimeError, "scheduler failed"):
+                    with leader_forwarding._forward_ports(
+                        "127.0.0.1", "127.0.0.2", [port]
+                    ):
+                        client = socket.create_connection(
+                            ("127.0.0.1", port), timeout=5
+                        )
+                        self.addCleanup(client.close)
+                        self.assertTrue(accepted.wait(5))
+                        raise RuntimeError("scheduler failed")
                 self.assertEqual(client.recv(4096), b"")
             finally:
                 target.shutdown()
@@ -91,8 +105,10 @@ class TestLeaderForwarding(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             first_port = probe.getsockname()[1]
             probe.close()
-            with self.assertRaises(OSError):
-                with leader_forwarding.LeaderForwarder(
+            with self.assertRaisesRegex(
+                OSError, f"Could not bind port {occupied.getsockname()[1]}"
+            ):
+                with leader_forwarding._forward_ports(
                     "127.0.0.1", "127.0.0.2", [first_port, occupied.getsockname()[1]]
                 ):
                     self.fail("bind failure must propagate")
@@ -127,7 +143,7 @@ class TestLeaderForwarding(unittest.TestCase):
                 )
                 with (
                     patch.object(leader_forwarding, "resolving_view", return_value=cfg),
-                    patch.object(leader_forwarding, "LeaderForwarder") as forward,
+                    patch.object(leader_forwarding, "_forward_ports") as forward,
                 ):
                     with leader_forwarding.forward_normalized_leader(args) as active:
                         self.assertEqual(active, bool(expected))
@@ -189,12 +205,18 @@ class TestLeaderForwarding(unittest.TestCase):
                             engine, "launch_dummy_health_check_server"
                         ) as dummy,
                     ):
-                        try:
-                            with engine.Engine._worker_serving_listener(object()):
-                                if fail:
-                                    raise RuntimeError("scheduler failed")
-                        except RuntimeError as error:
-                            self.assertEqual(str(error), "scheduler failed")
+                        with ExitStack() as stack:
+                            if fail:
+                                stack.enter_context(
+                                    self.assertRaisesRegex(
+                                        RuntimeError, "scheduler failed"
+                                    )
+                                )
+                            stack.enter_context(
+                                engine.Engine._worker_serving_listener(object())
+                            )
+                            if fail:
+                                raise RuntimeError("scheduler failed")
                         self.assertEqual(dummy.call_count, int(not rust and not moved))
                         self.assertEqual(
                             forward.call_count, 2 if device == "tpu" and not rust else 0
