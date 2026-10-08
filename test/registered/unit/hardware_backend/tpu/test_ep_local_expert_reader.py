@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu import ep_local_expert_reader
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.loader import DefaultModelLoader
@@ -21,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
-_MOD = "sglang.srt.model_loader.weight_utils"
+_MOD = "sglang.srt.hardware_backend.tpu.ep_local_expert_reader"
 _LOADER = "sglang.srt.model_loader.loader"
 _ITERATORS = ("single", "buffered")
 
@@ -165,7 +166,9 @@ class TestEpLocalExpertReads(CustomTestCase):
             with self.subTest(iterator=iterator), tempfile.TemporaryDirectory() as d:
                 files, _ = _write_checkpoint(d, extra=extra)
                 with patch.object(
-                    weight_utils.safetensors, "safe_open", side_effect=AssertionError
+                    ep_local_expert_reader.safetensors,
+                    "safe_open",
+                    side_effect=AssertionError,
                 ):
                     loaded = _read(files, iterator, (2, 4))
                 self.assertNotIn("model.layers.0.mlp.experts.0.fnuz", loaded)
@@ -185,12 +188,16 @@ class TestEpLocalExpertReads(CustomTestCase):
 
     def test_unviewable_dtype_is_read_by_safetensors(self):
         dtypes = {
-            k: v for k, v in weight_utils._SAFETENSORS_DTYPES.items() if k != "BF16"
+            k: v
+            for k, v in ep_local_expert_reader._SAFETENSORS_DTYPES.items()
+            if k != "BF16"
         }
         for iterator in _ITERATORS:
             with self.subTest(iterator=iterator), tempfile.TemporaryDirectory() as d:
                 files, tensors = _write_checkpoint(d)
-                with patch.object(weight_utils, "_SAFETENSORS_DTYPES", dtypes):
+                with patch.object(
+                    ep_local_expert_reader, "_SAFETENSORS_DTYPES", dtypes
+                ):
                     loaded = _read(files, iterator, (2, 4))
                 expected = {n for n in tensors if _expert_id(n) in (None, 2, 3)}
                 self.assertEqual(set(loaded), expected)
@@ -200,23 +207,10 @@ class TestEpLocalExpertReads(CustomTestCase):
     def test_chunked_span_reads(self):
         with tempfile.TemporaryDirectory() as d:
             files, tensors = _write_checkpoint(d)
-            with patch.object(weight_utils, "_READ_CHUNK_BYTES", 7):
+            with patch.object(ep_local_expert_reader, "_READ_CHUNK_BYTES", 7):
                 loaded = _read(files, "single", (0, 2))
             for name, tensor in loaded.items():
                 self.assertTrue(torch.equal(tensor, tensors[name]), name)
-
-    def test_routed_expert_key_re_matches_weight_tensors_only(self):
-        """_ROUTED_EXPERT_KEY_RE (dtype probing) matches expert weights, not scales."""
-        self.assertIsNone(
-            weight_utils._ROUTED_EXPERT_KEY_RE.search(
-                "model.layers.0.mlp.experts.3.w1.scale"
-            )
-        )
-        self.assertIsNotNone(
-            weight_utils._ROUTED_EXPERT_KEY_RE.search(
-                "model.layers.0.mlp.experts.3.down_proj.weight"
-            )
-        )
 
 
 def _fused_moe(
@@ -271,7 +265,7 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
         # 28 checkpoint experts + 4 redundant slots over EP 4: 8 slots per rank.
         layers = [_fused_moe(4, 2, 8, 32), _fused_moe(4, 2, 8, 32)]
         with self._env():
-            rng = weight_utils.tpu_local_routed_expert_range(_model(layers))
+            rng = ep_local_expert_reader.tpu_local_routed_expert_range(_model(layers))
         self.assertEqual(rng, (16, 24))
         for eid in range(32):
             local = FusedMoE._map_global_expert_id_to_local_expert_id(layers[0], eid)
@@ -304,13 +298,15 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
         for label, (env, layers, opted_in) in cases.items():
             with self.subTest(label), self._env(**env):
                 self.assertIsNone(
-                    weight_utils.tpu_local_routed_expert_range(_model(layers, opted_in))
+                    ep_local_expert_reader.tpu_local_routed_expert_range(
+                        _model(layers, opted_in)
+                    )
                 )
 
     def test_kill_switch(self):
         with self._env(), envs.SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS.override(True):
             self.assertIsNone(
-                weight_utils.tpu_local_routed_expert_range(
+                ep_local_expert_reader.tpu_local_routed_expert_range(
                     _model([_fused_moe(4, 1, 8, 32)])
                 )
             )
@@ -364,12 +360,21 @@ class TestLoaderPassesTheRange(CustomTestCase):
     def test_init_new_takes_the_range_from_the_model(self):
         model = torch.nn.Module()
         model_config = SimpleNamespace(model_path="/dummy", revision=None)
-        with patch(
-            f"{_LOADER}.tpu_local_routed_expert_range", return_value=(2, 4)
-        ) as expert_range:
-            source = DefaultModelLoader.Source.init_new(model_config, model)
-        expert_range.assert_called_once_with(model)
-        self.assertEqual(source.local_expert_range, (2, 4))
+        for tpu in (True, False):
+            with (
+                self.subTest(tpu=tpu),
+                patch(f"{_LOADER}._is_tpu", tpu),
+                patch(
+                    f"{_MOD}.tpu_local_routed_expert_range", return_value=(2, 4)
+                ) as expert_range,
+            ):
+                source = DefaultModelLoader.Source.init_new(model_config, model)
+                if tpu:
+                    expert_range.assert_called_once_with(model)
+                    self.assertEqual(source.local_expert_range, (2, 4))
+                else:
+                    expert_range.assert_not_called()
+                    self.assertIsNone(source.local_expert_range)
 
 
 if __name__ == "__main__":
