@@ -880,7 +880,7 @@ def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
                     proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
                 )
 
-            def forward(self, pixel_values, _grid_thws):
+            def forward(self, pixel_values, _grid_thws, grid_thw_list=None):
                 return pixel_values
 
         model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
@@ -948,7 +948,7 @@ def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
                 proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
             )
 
-        def forward(self, pixel_values, _grid_thws):
+        def forward(self, pixel_values, _grid_thws, grid_thw_list=None):
             return pixel_values
 
     model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)

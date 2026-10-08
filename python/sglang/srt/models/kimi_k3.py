@@ -727,6 +727,17 @@ class KimiK3MoE(nn.Module):
         ):
             self.__dict__.pop(prop, None)
 
+    def _warm_tpu_forward_properties(self) -> None:
+        """Resolve the cached properties the TPU forward reads before compilation;
+        one first evaluated inside the trace fails its own guard on the next call.
+        The others gate CUDA-only paths and stay unevaluated."""
+        for name in (
+            "_eligible_for_fused_front",
+            "_ep_front_eligible",
+            "_routed_needs_reduce",
+        ):
+            getattr(self, name)
+
     @cached_property
     def _routed_needs_reduce(self):
         return self.tp_size > 1 and get_moe_a2a_backend().is_none()
@@ -3442,6 +3453,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                     raise ValueError("Kimi-K3 MLA V projection must remain GGUF Q2_K")
                 self_attn.use_deep_gemm_bmm = False
                 continue
+            if _is_tpu:
+                # Bind before compilation: forward_prepare's lazy bind is a
+                # module setattr, which Dynamo cannot trace.
+                self_attn.attn_mha.kv_b_proj = self_attn.kv_b_proj
             kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
@@ -3481,6 +3496,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 bias = layer.mlp.gate.e_score_correction_bias
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
+                if _is_tpu:
+                    layer.mlp._warm_tpu_forward_properties()
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 if _is_tpu:
@@ -3544,6 +3561,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
         "mm_projector.",
     )
 
+    # Decode / verify embed inside the compiled decoder instead of an eager
+    # general_mm_embed_routine in front of it; neither splices images.
+    decode_embeds_in_language_model = _is_tpu
+    # Text-only prefill takes the same direct path (the policy warms the
+    # "text_ids" extend variant for it); image prefill keeps the routine.
+    text_prefill_in_language_model = _is_tpu
+
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
             "language_model.layers.": "language_model.model.layers.",
@@ -3564,9 +3588,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        # The dedicated K3 tower runs replicated (per-rank full weights);
-        # shard work across ranks image-wise via the DP runner.
-        self.use_data_parallel = True
+        # The K3 tower is replicated (full weights on every rank). Off TPU the DP
+        # runner shards images across ranks and gathers the embeddings; on TPU
+        # every rank encodes every image, so the encoder runs no cross-rank
+        # collective.
+        self.use_data_parallel = not _is_tpu
 
         self.vision_tower = KimiK3VisionTower(config.vision_config)
         self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
@@ -3589,6 +3615,21 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 prefix=language_prefix,
             )
 
+        # Compile the language model with its logits processor; the vision
+        # tower and the multimodal embed merge stay eager. The text-only entry
+        # (KimiK3LinearForCausalLM) keeps the generic decoder policy.
+        if _is_tpu and self.language_model is not None:
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                Qwen3VLDecoderTpuCompilePolicy,
+            )
+
+            support_torch_compile(
+                self.language_model, policy=Qwen3VLDecoderTpuCompilePolicy
+            )
+
     @property
     def model(self):
         return self.language_model
@@ -3602,6 +3643,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
             self.language_model.post_load_weights()
+
+    @property
+    def logits_processor(self):
+        # Looked up on model_runner.model by the TPU compile policy and sampler.
+        return getattr(self.language_model, "logits_processor", None)
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:
@@ -3842,8 +3888,15 @@ class KimiK3ForConditionalGeneration(nn.Module):
             return self.mm_projector(image_embeds)
 
         pixel_values = materialize_item_features(list(range(len(items))))
-        image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))
-        return self.mm_projector(image_embeds)
+        image_embeds = self.vision_tower(
+            pixel_values, grid_thws_host, grid_thw_list=grid_thw_list
+        )
+        image_features = self.mm_projector(image_embeds)
+        # TPU merges multimodal rows on the host unless
+        # SGLANG_TPU_MM_EMBED_ON_DEVICE is set.
+        if _is_tpu and not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
+            return image_features.to("cpu")
+        return image_features
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -3897,6 +3950,21 @@ class KimiK3ForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if self.decode_embeds_in_language_model and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or (
+                self.text_prefill_in_language_model
+                and not forward_batch.contains_mm_inputs()
+                # A DP peer's image step puts every rank on the input_embeds path.
+                and not forward_batch.is_tpu_mm_extend_in_batch
+            )
+        ):
+            # Embed in-graph: the compile policy warms decode, verify and
+            # text-only extend as input_ids calls without input_embeds.
+            return self.language_model(
+                input_ids, positions, forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
