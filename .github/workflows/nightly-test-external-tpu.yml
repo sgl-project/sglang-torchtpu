@@ -18,7 +18,7 @@ on:
         required: false
         default: main
       test_filter:
-        description: "Substring of a test file path; runs only the launch groups that match"
+        description: "Space-separated substrings of test file paths; runs only the groups that match one"
         required: false
         default: ""
         type: string
@@ -58,7 +58,9 @@ jobs:
           slices="$(python3 .github/tpu-ci/external/render_external_jobset.py --list-groups)"
           if [ -n "$TEST_FILTER" ]; then
             slices="$(jq -c --arg f "$TEST_FILTER" \
-                        '[.[] | .groups |= map(select(.files | contains($f))) | select(.groups != [])]' <<< "$slices")"
+                        '($f | split(" ") | map(select(. != ""))) as $fs
+                         | [.[] | .groups |= map(select(.files as $x | any($fs[]; . as $s | $x | contains($s))))
+                                | select(.groups != [])]' <<< "$slices")"
             if [ "$slices" = "[]" ]; then
               echo "::error::test_filter matched no external tests"
               exit 1
@@ -87,6 +89,7 @@ jobs:
       suite: ${{ matrix.slice.suite }}
       slice_name: ${{ matrix.slice.name }}
       nodepool_var: ${{ matrix.slice.nodepool_var }}
+      nodepool_var_decode: ${{ matrix.slice.nodepool_var_decode || '' }}
       groups_json: ${{ toJSON(matrix.slice.groups) }}
     secrets: inherit
     permissions:

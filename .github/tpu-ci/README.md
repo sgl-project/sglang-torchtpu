@@ -114,9 +114,11 @@ picks it up and groups it automatically; identical setup joins an existing group
 
 A test with **no server that every host must run** (a collectives probe spawning its
 own ranks) fits neither, since a launch group runs the files on rank 0 alone. That
-shape is `--exec`: register it to `tpu-integration` and hand-wire a job with `files:`
-(see `diffusion-mh-collectives` in `feature-validation-tpu.yml`). Registered to
-`nightly-tpu-multihost` instead, discovery drops it and the pr-gate lint reds the PR.
+shape is exec mode. Nightly feature validation runs on the external cluster: give the
+file an `EXEC_LAUNCH` (or, for P/D, a `PD_LAUNCH`) and register it to
+`external-nightly-2x2x2`; a single-host test registers to `external-nightly-1host`
+(see `external/README.md`). In-project, exec and P/D jobs are hand-wired in
+`feature-validation-tpu.yml` with `files:`.
 
 ## Pipelines
 
@@ -141,7 +143,7 @@ Each slot fills the lane its MMMU-Pro legs leave idle:
 | Slot | 1-host lane | 2-host lane |
 |---|---|---|
 | `day-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
-| `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy, kv-offload-resharding P/D gates |
+| `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
 
 Each stage is a reusable workflow (the nightly calls feature validation and perf with the
 shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one

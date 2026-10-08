@@ -27,9 +27,16 @@ except ModuleNotFoundError:
 # the resharding probes, and gsm8k.
 register_tpu_ci(
     est_time=10800,
-    suite="tpu-integration",
+    suite="external-nightly-2x2x2",
+    nightly=True,
     labels=["multihost", "gpt-oss-120b", "pd", "tp-reshard", "kv-offload"],
 )
+
+PD_LAUNCH = {
+    "prefill_hosts": 2,
+    "decode_hosts": 2,
+    "cmd": "env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py",
+}
 
 
 if __name__ == "__main__":

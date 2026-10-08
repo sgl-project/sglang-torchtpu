@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 # feature-validation discovers single-host rows by this suite and nightly=True.
 register_tpu_ci(
     est_time=2400,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "qwen3-0.6b", "kv-offload", "rpa-v3"],
 )

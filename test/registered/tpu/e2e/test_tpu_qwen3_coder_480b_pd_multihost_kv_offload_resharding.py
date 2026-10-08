@@ -27,9 +27,16 @@ except ModuleNotFoundError:
 # the resharding probes, and gsm8k.
 register_tpu_ci(
     est_time=10800,
-    suite="tpu-integration",
+    suite="external-nightly-2x2x2",
+    nightly=True,
     labels=["multihost", "qwen3-coder-480b", "pd", "tp-reshard", "kv-offload"],
 )
+
+PD_LAUNCH = {
+    "prefill_hosts": 2,
+    "decode_hosts": 2,
+    "cmd": "env MODEL_PROFILE=qwen3_coder_480b python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py",
+}
 
 
 if __name__ == "__main__":

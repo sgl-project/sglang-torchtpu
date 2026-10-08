@@ -305,13 +305,6 @@ class TestJobMapsToOneTest(CustomTestCase):
         self.assertEqual(
             qwen["with"]["suite"], "nightly-tpu-accuracy-qwen3-5-397b-mmmupro"
         )
-        # The long P/D gates leave `all` (the nightly) for the 5 PM slot.
-        pd = workflow["jobs"]["pd-kvoff-reshard"]
-        self.assertIn('"day-5pm"', pd["if"])
-        feature = yaml.safe_load((WORKFLOWS / "feature-validation-tpu.yml").read_text())
-        for only in pd["strategy"]["matrix"]["only"]:
-            self.assertEqual(feature["jobs"][only]["if"].count("inputs.only =="), 1)
-            self.assertNotIn('"all"', feature["jobs"][only]["if"])
         nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
         self.assertNotIn("accuracy", nightly["jobs"])
 

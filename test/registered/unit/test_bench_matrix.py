@@ -148,7 +148,7 @@ class TestBenchMatrix(CustomTestCase):
             ours = [
                 g
                 for g in sl["groups"]
-                if g["launch_script"].startswith("recipe/bench_matrix/")
+                if g.get("launch_script", "").startswith("recipe/bench_matrix/")
             ]
             self.assertLessEqual(
                 len(ours),

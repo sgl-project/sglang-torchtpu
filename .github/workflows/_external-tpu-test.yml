@@ -25,6 +25,10 @@ on:
       nodepool_var:
         required: true
         type: string            # NAME of the repo secret holding this slice's nodepool
+      nodepool_var_decode:
+        required: false
+        type: string
+        default: ""             # slice-pair rows only: the decode slice's nodepool secret
       groups_json:
         required: true
         type: string            # JSON array of this slice's groups (from --list-groups)
@@ -41,7 +45,8 @@ concurrency:
   # Serialize per SLICE across ALL runs (keyed on the nodepool, NOT the run id): without Kueue
   # gang-admission, two runs must never apply to the same nodepool at once. Different slices run
   # in parallel. Depth-1 (GitHub keeps one pending) is enough until Kueue lands.
-  group: external-slice-${{ inputs.nodepool_var }}
+  # A slice-pair row holds two slices, so its key names both.
+  group: external-slice-${{ inputs.nodepool_var }}${{ inputs.nodepool_var_decode && format('-{0}', inputs.nodepool_var_decode) || '' }}
   cancel-in-progress: false
 
 env:
@@ -87,6 +92,7 @@ jobs:
           EXTERNAL_NODEPOOL_2X2X4_0: ${{ secrets.EXTERNAL_NODEPOOL_2X2X4_0 }}
           EXTERNAL_NODEPOOL_2X2X4_1: ${{ secrets.EXTERNAL_NODEPOOL_2X2X4_1 }}
           NODEPOOL_VAR: ${{ inputs.nodepool_var }}
+          NODEPOOL_VAR_DECODE: ${{ inputs.nodepool_var_decode }}
           GROUPS_JSON: ${{ inputs.groups_json }}
         run: |
           set -uo pipefail
@@ -126,6 +132,11 @@ jobs:
           # the value in logs). Fail closed if the secret is unset.
           NODEPOOL="${!NODEPOOL_VAR:-}"
           [ -n "$NODEPOOL" ] || { echo "❌ repo secret ${NODEPOOL_VAR} is not set -- see external/README.md 'Configuration'"; exit 1; }
+          NODEPOOL_DECODE=""
+          if [ -n "$NODEPOOL_VAR_DECODE" ]; then
+            NODEPOOL_DECODE="${!NODEPOOL_VAR_DECODE:-}"
+            [ -n "$NODEPOOL_DECODE" ] || { echo "❌ repo secret ${NODEPOOL_VAR_DECODE} is not set"; exit 1; }
+          fi
 
           # Re-mint the CI SA token from a fresh GitHub OIDC token (same exchange the auth action
           # does) and swap it into the kubeconfig; a full slice of groups can outlast one hour.
@@ -261,25 +272,19 @@ jobs:
           overall=0
           for i in $(seq 0 $(( n - 1 ))); do
             g="$(jq -c ".[$i]" <<<"$GROUPS_JSON")"
-            ls="$(jq -r '.launch_script' <<<"$g")"
             files="$(jq -r '.files' <<<"$g")"
-            weights="$(jq -r '.weights' <<<"$g")"
             gname="$(jq -r '.name' <<<"$g")"
-            grun="$(jq -r '.run_name' <<<"$g")"
+            gmode="$(jq -r '.mode' <<<"$g")"
             tpf="$(jq -r '.timeout_per_file // 3600' <<<"$g")"
             nf="$(wc -w <<<"$files")"
-            echo "::group::group $(( i + 1 ))/${n}: ${gname}"
+            echo "::group::group $(( i + 1 ))/${n}: ${gname} (${gmode})"
             python3 .github/tpu-ci/external/render_external_jobset.py \
               --image '${{ inputs.image }}' \
-              --suite '${{ inputs.suite }}' \
-              --launch-script "$ls" \
-              --files "$files" \
-              --weights "$weights" \
+              --group "$g" \
               --nodepool "$NODEPOOL" \
-              --extra-args '${{ inputs.extra_args }}' \
-              --timeout-per-file "$tpf" \
-              --name "$grun" > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
-            grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|TP_SIZE|bash "benchmark' /tmp/external-job.yaml | head
+              --nodepool-decode "$NODEPOOL_DECODE" \
+              --extra-args '${{ inputs.extra_args }}' > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
+            grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|MODE|SINGLE_HOST|bash "benchmark' /tmp/external-job.yaml | head -20
             # Waiting outlasts the rendered activeDeadlineSeconds (same formula + slack).
             wait_budget=$(( WAIT_SLACK + nf * tpf )); (( wait_budget < WAIT_FLOOR )) && wait_budget=$WAIT_FLOOR
             run_group /tmp/external-job.yaml "$gname" "$wait_budget" || overall=1

@@ -24,7 +24,7 @@ from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.
 register_tpu_ci(
     est_time=4200,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "prefix-cache", "kv-offload"],
 )

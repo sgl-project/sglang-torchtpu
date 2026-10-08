@@ -40,6 +40,18 @@ suites:
       - EXTERNAL_NODEPOOL_2X2X2_1
       - EXTERNAL_NODEPOOL_2X2X2_2
       - EXTERNAL_NODEPOOL_2X2X2_3
+  # Single-host tests that launch their own server (no launch dict). There is no 1-host
+  # slice here, so a group takes a whole 2x2x2 slice: rank 0 drops the slice-wide TPU env
+  # and runs each file through run_suite on its own host; rank 1 idles.
+  external-nightly-1host:
+    hosts: 2
+    topology: 2x2x2
+    self_launch: true
+    nodepool_vars:
+      - EXTERNAL_NODEPOOL_2X2X2_0
+      - EXTERNAL_NODEPOOL_2X2X2_1
+      - EXTERNAL_NODEPOOL_2X2X2_2
+      - EXTERNAL_NODEPOOL_2X2X2_3
   external-nightly-2x2x4:
     hosts: 4                                   # tp=32 (16 chips, 4 hosts)
     topology: 2x2x4

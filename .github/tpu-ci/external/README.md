@@ -3,11 +3,11 @@
 Runs sglang-torchtpu TPU e2e tests on **the external Ironwood (tpu7x) cluster**,
 serving model weights from the in-project CI GCS bucket over **gcsfuse**.
 
-> **Status: active.** The `test_tpu_bench_*` benchmark matrix (GPT-OSS-120B and
+> **Status: active.** Runs the `test_tpu_bench_*` benchmark matrix (GPT-OSS-120B and
 > Qwen3-Coder-480B x {1-host prefix-cache, 1-host +EAGLE3+KV-offload, 4-host 2P+2D P/D} x
-> {agentic, 8k1k} — see `benchmark/tpu/recipe/bench_matrix/`) fills all six slices,
-> one launch group per slice. Add further tests as below; a shape's groups beyond its
-> slice count serialize within the slice's job.
+> {agentic, 8k1k} — see `benchmark/tpu/recipe/bench_matrix/`) and the TPU feature
+> validation tests: single-host, multi-host, P/D and exec. Groups that share a slice
+> serialize within that slice's job.
 
 ## Architecture
 
@@ -24,8 +24,9 @@ nightly-test-external-tpu.yml
             apply → stream logs → gate on JobSet Completed/Failed → tear down
 ```
 
-**No Kueue, so scheduling is done by construction:** discovery round-robins each shape's
-launch groups across its slices and emits **one matrix job per slice**. Slices run in parallel
+**No Kueue, so scheduling is done by construction:** discovery round-robins the groups across
+their slices and emits **one matrix job per slice** (keyed by nodepool: several suites share
+the 2x2x2 slices). A P/D group whose roles each fill a slice gets a job per slice PAIR. Slices run in parallel
 (full 4+2 utilization); groups that land on the same slice run **serially inside that one job**,
 so two JobSets never race for a slice (no half-placement, no drops). A slice-keyed
 `concurrency` group guards the cross-run case. When Kueue is installed on the cluster this all
@@ -76,10 +77,24 @@ launch/rank-0 run model, and the image are the same too. `tp = hosts × 8` (tpu7
    `external-nightly-2x2x4` ⇒ 4 hosts / `tp=32` (see [`external-topology.yaml`](external-topology.yaml)).
    The runner injects `MODEL`, `TP_SIZE`, `EP_SIZE`, `EXTRA_ARGS`; the recipe owns the rest.
 
+### Other launch models
+
+A test declares at most one of these next to its registration; the suite still fixes the
+slice. Every pod sees the bucket's `weights/` at `/weights`, the in-project path, so tests
+that hard-code `/weights/<model>` run unchanged once the model is staged.
+
+| Declaration | Suite | What runs |
+|---|---|---|
+| none | `external-nightly-1host` | Single-host tests that launch their own server. Rank 0 of a 2x2x2 slice drops the slice-wide TPU env and runs each file through `run_suite`; rank 1 idles. Files are dealt across the slices, one bundle per slice. |
+| `PD_LAUNCH = {"prefill_hosts": 1, "decode_hosts": 1, "cmd": "python3 <file> integration"}` | `external-nightly-2x2x2` | P/D: `prefill` and `decode` replicated jobs run `cmd` with `CI_PD_ROLE` set (`jobset-external-tpu-pd.yaml`). 1+1 shares one slice; 2+2 takes a slice pair. |
+| `EXEC_LAUNCH = {"cmd": "python3 <file>"}` | `external-nightly-2x2x2` | Every host runs `cmd`; rank 0's exit code gates. |
+
 ## Run it
 
 ```sh
 gh workflow run "Nightly Test (External TPU)" -f ref=<branch>      # build + discover + run
+gh workflow run "Nightly Test (External TPU)" --ref <branch> -f ref=<branch> \
+  -f test_filter=<path substring>                                   # only the matching groups
 
 python3 .github/tpu-ci/external/render_external_jobset.py --list-groups  # what would run
 ```

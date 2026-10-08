@@ -7,7 +7,7 @@ from sglang.test.tpu import model_config_main
 
 register_tpu_ci(
     est_time=3600,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "spec", "dpa"],
 )
