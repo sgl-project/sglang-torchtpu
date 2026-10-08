@@ -208,17 +208,13 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.enable_hicache_storage = False
         scheduler.tree_cache = MagicMock()
         scheduler.ipc_channels = MagicMock()
+        scheduler.attn_tp_cpu_group = None
+        scheduler.attn_cp_cpu_group = None
         return scheduler
 
-    @patch("sglang.srt.managers.scheduler.release_kv_cache")
-    @patch("sglang.srt.managers.scheduler.maybe_release_metadata_buffer")
-    @patch("sglang.srt.managers.scheduler.prepare_abort")
-    def test_abort_defers_page_release_while_sender_is_not_drained(
-        self, _prepare_abort, _release_metadata, release_kv
-    ):
-        sender = MagicMock(group_failure_requires_drain=True)
-        sender.drained.return_value = False
-        req = SimpleNamespace(
+    @staticmethod
+    def _aborted_chunked_req(sender):
+        return SimpleNamespace(
             rid="chunked-abort",
             disagg_kv_sender=sender,
             time_stats=SimpleNamespace(trace_ctx=MagicMock()),
@@ -229,6 +225,30 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
             output_ids=array("q"),
             cache_request_handle=object(),
         )
+
+    @staticmethod
+    def _peer_rank(scheduler, peer_drained):
+        """Join a two-rank TP group whose peer reports the given drain bits."""
+        scheduler.attn_tp_cpu_group = object()
+
+        def all_reduce(bits, op, group):
+            peer = torch.tensor(next(peer_drained), dtype=torch.uint8)
+            torch.minimum(bits, peer, out=bits)
+
+        return (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce", side_effect=all_reduce),
+        )
+
+    @patch("sglang.srt.managers.scheduler.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler.maybe_release_metadata_buffer")
+    @patch("sglang.srt.managers.scheduler.prepare_abort")
+    def test_abort_defers_page_release_while_sender_is_not_drained(
+        self, _prepare_abort, _release_metadata, release_kv
+    ):
+        sender = MagicMock(group_failure_requires_drain=True)
+        sender.drained.return_value = False
+        req = self._aborted_chunked_req(sender)
         scheduler = self._scheduler(req)
 
         # The same notice reads the live weight version off the serving bag.
@@ -238,6 +258,47 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         sender.abort.assert_called_once_with()
         release_kv.assert_not_called()
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+
+    @patch("sglang.srt.managers.scheduler.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler.maybe_release_metadata_buffer")
+    @patch("sglang.srt.managers.scheduler.prepare_abort")
+    def test_abort_defers_while_a_peer_rank_is_not_drained(
+        self, _prepare_abort, _release_metadata, release_kv
+    ):
+        # This rank drained, but a TP peer still has reads over its shard:
+        # every rank must defer, or the ranks free the pages in different steps.
+        sender = MagicMock(group_failure_requires_drain=True)
+        sender.drained.return_value = True
+        req = self._aborted_chunked_req(sender)
+        scheduler = self._scheduler(req)
+        world_size, all_reduce = self._peer_rank(scheduler, iter([[0]]))
+
+        with world_size, all_reduce, get_context().override_server_args():
+            scheduler.process_pending_chunked_abort()
+
+        release_kv.assert_not_called()
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+
+    @patch("sglang.srt.managers.scheduler.release_kv_cache")
+    def test_drain_holds_pages_until_every_rank_drains(self, release_kv):
+        sender = MagicMock()
+        sender.drained.return_value = True
+        req = SimpleNamespace(disagg_kv_sender=sender, kv=_held_kv())
+        scheduler = self._scheduler(None)
+        scheduler._deferred_chunked_sender_aborts = [req]
+        world_size, all_reduce = self._peer_rank(scheduler, iter([[0], [1]]))
+
+        with world_size, all_reduce:
+            scheduler._drain_deferred_chunked_sender_aborts()
+            sender.clear.assert_not_called()
+            release_kv.assert_not_called()
+            self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+
+            scheduler._drain_deferred_chunked_sender_aborts()
+
+        sender.clear.assert_called_once_with()
+        release_kv.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
 
     def _idle_prefill_scheduler(self):
         # is_fully_idle reads the pipeline width from the published config.
@@ -265,6 +326,8 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.enable_lmcache = False
         scheduler._engine_paused = False
         scheduler._deferred_chunked_sender_aborts = []
+        scheduler.attn_tp_cpu_group = None
+        scheduler.attn_cp_cpu_group = None
         scheduler.req_to_token_pool = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.metrics_reporter = MagicMock()
