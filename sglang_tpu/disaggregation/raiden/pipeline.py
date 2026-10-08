@@ -484,8 +484,18 @@ class PipelineTransfer:
     def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
         manager = self.manager
-        if manager.attn_cp_size != 1:
-            raise ValueError("Raiden pipeline transfer requires attention CP=1")
+        # Prefill CP writes the whole sequence into every CP rank's pool, so CP
+        # rank 0 of each stage is the stage's only source; the other CP ranks
+        # never build a transfer (RaidenKVManager.set_kv_caches).
+        if manager.attn_cp_size != 1 and not self.producer:
+            raise ValueError(
+                "Raiden pipeline transfer requires attention CP=1 on the decode"
+            )
+        if manager.attn_cp_size != 1 and manager.attn_cp_rank != 0:
+            raise ValueError(
+                "Raiden pipeline transfer sends only from prefill CP rank 0, got CP rank "
+                f"{manager.attn_cp_rank}"
+            )
         if self.producer and (manager.attn_tp_size != 1 or manager.pp_size <= 1):
             raise ValueError(
                 "Raiden pipeline transfer requires a pipeline producer with "
