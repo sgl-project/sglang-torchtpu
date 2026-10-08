@@ -17,6 +17,11 @@ on:
         description: "Git ref to test"
         required: false
         default: main
+      test_filter:
+        description: "Substring of a test file path; runs only the launch groups that match"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -45,10 +50,20 @@ jobs:
         with:
           ref: ${{ inputs.ref || 'main' }}
       - id: d
+        env:
+          TEST_FILTER: ${{ inputs.test_filter }}
         run: |
           set -euo pipefail
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           slices="$(python3 .github/tpu-ci/external/render_external_jobset.py --list-groups)"
+          if [ -n "$TEST_FILTER" ]; then
+            slices="$(jq -c --arg f "$TEST_FILTER" \
+                        '[.[] | .groups |= map(select(.files | contains($f))) | select(.groups != [])]' <<< "$slices")"
+            if [ "$slices" = "[]" ]; then
+              echo "::error::test_filter matched no external tests"
+              exit 1
+            fi
+          fi
           echo "slices=$slices" >> "$GITHUB_OUTPUT"
           echo "discovered external-nightly slices: $slices"
           # `|| true`: under set -e a bare `[ ... ] &&` as the step's last command

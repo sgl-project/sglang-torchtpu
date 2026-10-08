@@ -13,7 +13,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."  # recipe/ -> benchmark/tpu
 
 model=${MODEL:-/weights/gpt-oss-120b}
-draft_model=${DRAFT_MODEL:-lmsys/EAGLE3-gpt-oss-120b-bf16}
+# The draft sits next to the target in the external cluster's gcsfuse weight bucket.
+draft_model=${DRAFT_MODEL:-$(dirname "$model")/EAGLE3-gpt-oss-120b-bf16}
 served_model_name=${SERVED_MODEL_NAME:-gpt-oss-120b}
 
 spec_args=(
