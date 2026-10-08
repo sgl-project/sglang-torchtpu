@@ -18,7 +18,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."  # recipe/ -> benchmark/tpu
 
 model=${MODEL:-/weights/gpt-oss-120b}
-draft_model=${DRAFT_MODEL:-z-lab/gpt-oss-120b-DFlash}
+# The draft sits next to the target in the external cluster's gcsfuse weight bucket.
+draft_model=${DRAFT_MODEL:-$(dirname "$model")/gpt-oss-120b-DFlash}
 served_model_name=${SERVED_MODEL_NAME:-gpt-oss-120b}
 
 spec_args=(

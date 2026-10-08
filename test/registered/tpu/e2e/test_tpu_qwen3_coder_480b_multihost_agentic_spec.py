@@ -26,15 +26,14 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
     est_time=1800,
-    suite="nightly-tpu-multihost",
+    suite="external-nightly-2x2x2",
     nightly=True,
     labels=["multihost", "qwen3-coder-480b", "agentic", "spec"],
 )
 
 MULTIHOST_LAUNCH = {
-    "hosts": 2,
     "launch_script": "recipe/qwen3_coder_480b_agentic_spec_mh.sh",
-    "weights_pvc": "model-weights",
+    "weights": "Qwen3-Coder-480B-A35B-Instruct-FP8",
 }
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 4))
