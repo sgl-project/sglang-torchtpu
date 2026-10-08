@@ -3589,9 +3589,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
 
         # The K3 tower is replicated (full weights on every rank). Off TPU the DP
-        # runner shards images across ranks and gathers the embeddings; on TPU
-        # every rank encodes every image, so the encoder runs no cross-rank
-        # collective.
+        # runner shards images across ranks and gathers the embeddings. On TPU an
+        # image prefill through the runner hung with on-device embeds, so every
+        # rank encodes every image instead.
+        # TODO(chandrasekhard2): root-cause the hang and use the DP runner on TPU.
         self.use_data_parallel = not _is_tpu
 
         self.vision_tower = KimiK3VisionTower(config.vision_config)

@@ -148,13 +148,13 @@ class TestKimiK3CompileAnnotation(CustomTestCase):
 
 
 class TestKimiK3TpuImageFeaturePlacement(CustomTestCase):
-    @staticmethod
-    def _image_features(*, on_device: bool):
+    def _image_features(self, *, on_device: bool):
         """Run the TPU (non-DP) image path with a mocked tower and projector."""
         model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
         torch.nn.Module.__init__(model)
         model.use_data_parallel = False
-        model.vision_tower = MagicMock(device=torch.device("cpu"))
+        # A meta "device" tells host tensors apart from the ones moved to it.
+        model.vision_tower = MagicMock(device=torch.device("meta"))
         model.vision_tower.patch_embed.proj.weight.dtype = torch.float32
         model.mm_projector = MagicMock()
         item = MultimodalDataItem(
@@ -170,6 +170,12 @@ class TestKimiK3TpuImageFeaturePlacement(CustomTestCase):
         ):
             out = model.get_image_feature([item])
         model.vision_tower.assert_called_once()
+        (pixel_values, grid_thws), kwargs = model.vision_tower.call_args
+        self.assertEqual(pixel_values.device.type, "meta")
+        # The tower reads the grids on the host: no device copy to sync on.
+        self.assertEqual(grid_thws.device.type, "cpu")
+        self.assertEqual(grid_thws.tolist(), [[1, 4, 4]])
+        self.assertEqual(kwargs["grid_thw_list"], [[1, 4, 4]])
         return out, model.mm_projector.return_value
 
     def test_features_land_on_the_host(self):
