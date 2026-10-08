@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
@@ -525,6 +526,21 @@ class TestKVFreeFenceCoverage(CustomTestCase):
         with patch.object(HybridCacheController, "__init__", init_base):
             with self.assertRaises(NotImplementedError):
                 TpuRaidenHybridCacheController()
+
+    def test_load_inside_forward_write_target_is_rejected(self):
+        """A raiden load inside forward_write_target() could be given a page an
+        in-flight forward still writes, since only forward allocations may borrow."""
+        ctrl = _make_controller()
+        allocator = MagicMock()
+        allocator.full_attn_allocator.alloc.return_value = torch.arange(8)
+        allocator.kv_free_fence = KVFreeFence(synchronize_device=MagicMock())
+        ctrl.mem_pool_device_allocator = allocator
+        with allocator.kv_free_fence.forward_write_target():
+            with self.assertRaises(AssertionError):
+                ctrl.load(host_indices=torch.arange(8))
+        allocator.full_attn_allocator.alloc.assert_not_called()
+
+        self.assertIsNotNone(ctrl.load(host_indices=torch.arange(8)))
 
 
 class TestDraftSidecarPlatformHook(CustomTestCase):
