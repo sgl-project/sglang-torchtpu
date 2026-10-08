@@ -1500,16 +1500,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         is_multimodal = hasattr(outer, "get_image_feature")
         return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
-    def _embeds_on_this_rank(self) -> bool:
-        """Only the first pipeline stage embeds; later ones take the proxy."""
-        pp_group = self.model_runner.pp_group
-        return pp_group is None or pp_group.is_first_rank
-
     def _extend_input_variants(self) -> tuple[str, ...]:
         """Split text from deepstack: deepstack adds a Dynamo-guarded kwarg."""
         if not self._uses_input_embeds(self.owner):
             return super()._extend_input_variants()
-        if self._num_deepstack > 0 and self._embeds_on_this_rank():
+        if self._num_deepstack > 0:
             return ("deepstack", "text_only")
         return ("text_only",)
 
@@ -1520,7 +1515,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         positions: torch.Tensor,
         forward_batch: Any,
         *,
-        input_embeds: torch.Tensor | None = None,
+        input_embeds: torch.Tensor,
         input_deepstack_embeds: torch.Tensor | None = None,
         **_kwargs: Any,
     ) -> tuple[Any, ...]:
@@ -1529,19 +1524,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        # Embed-in-graph text steps pass input_ids alone; general_mm_embed_routine
-        # on a later pipeline stage passes neither (the proxy carries the hidden
-        # states).
-        tokens = input_embeds if input_embeds is not None else input_ids
-        if tokens is None:
-            tokens = forward_batch.input_ids
         key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
-            tokens.shape[0],
-            input_ids is None,
-            input_embeds is None,
+            input_embeds.shape[0],
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
@@ -1678,8 +1665,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     f"variant={variant}, logits={logits_output_mode.name}) "
                     f"in {elapsed:.1f}s{hbm_str}"
                 )
-        if self._embeds_on_this_rank():
-            self._precompile_mm_embed_placement()
+        self._precompile_mm_embed_placement()
         return pending
 
     def _precompile_mm_embed_placement(self) -> None:
@@ -1832,16 +1818,6 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 self._pp_warmup_kwargs(num_tokens),
             )
 
-        if not self._embeds_on_this_rank():
-            # general_mm_embed_routine on a later pipeline stage passes neither
-            # input_ids nor input_embeds: the proxy carries the hidden states.
-            return (), {
-                **self._pp_warmup_kwargs(num_tokens),
-                "input_ids": None,
-                "positions": positions,
-                "forward_batch": forward_batch,
-            }
-
         embed_tokens = self.owner.get_input_embeddings()
         input_embeds = embed_tokens(forward_batch.input_ids)
 
@@ -1879,3 +1855,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_embeds=input_embeds,
         )
         return (), call_kwargs
+
+
+# Kimi-K3's multimodal wrapper compiles its language model with the Qwen3-VL
+# policy unchanged.
+KimiK3VLDecoderTpuCompilePolicy = Qwen3VLDecoderTpuCompilePolicy

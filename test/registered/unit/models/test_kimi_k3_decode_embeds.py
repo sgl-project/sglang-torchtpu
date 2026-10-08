@@ -7,7 +7,7 @@ import torch
 from sglang.srt.compilation.support_torch_compile import get_torch_compile_policy
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    Qwen3VLDecoderTpuCompilePolicy,
+    KimiK3VLDecoderTpuCompilePolicy,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models import kimi_k3
@@ -136,7 +136,7 @@ class TestKimiK3CompileAnnotation(CustomTestCase):
         model = self._build(tpu=True)
         self.assertIs(
             get_torch_compile_policy(model.language_model),
-            Qwen3VLDecoderTpuCompilePolicy,
+            KimiK3VLDecoderTpuCompilePolicy,
         )
         self.assertIsNone(get_torch_compile_policy(type(model.language_model)))
         self.assertFalse(model.use_data_parallel)

@@ -44,7 +44,6 @@ from sglang.srt.hardware_backend.tpu.top_k import (
     TpuVocabShard,
 )
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
-from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1115,36 +1114,6 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             deepstack_key, policy._direct_compile_specialization_key(None, **kwargs)
         )
 
-    def test_direct_key_takes_text_steps_without_input_embeds(self):
-        """Embed-in-graph wrappers call decode with input_ids alone; the direct
-        tracer keys that call apart from an input_embeds call."""
-        model_runner = _model_runner()
-        model_runner.model.get_image_feature = MagicMock()
-        policy = Qwen3VLDecoderTpuCompilePolicy(
-            model_runner=model_runner, owner=model_runner.model
-        )
-        forward_batch = SimpleNamespace(
-            input_ids=torch.ones(8, dtype=torch.int64),
-            forward_mode=ForwardMode.DECODE,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            batch_size=8,
-            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
-        )
-        positions = torch.arange(8)
-
-        ids_key = policy._direct_compile_specialization_key(
-            None, forward_batch.input_ids, positions, forward_batch
-        )
-        embeds_key = policy._direct_compile_specialization_key(
-            None,
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=torch.zeros(8, 4),
-        )
-
-        self.assertNotEqual(ids_key, embeds_key)
-
     def test_text_ids_warmup_uses_the_positional_serving_convention(self):
         """A multimodal model still serves text-only requests.
 
@@ -1716,65 +1685,6 @@ class TestPrecompileLoops(_PolicyTestCase):
             [call.kwargs["input_embeds"].shape for call in warmed.call_args_list],
             [torch.Size((64, 4)), torch.Size((256, 4))],
         )
-
-    def test_qwen3_vl_later_pipeline_stage_warms_the_proxy_call(self):
-        """A later pipeline stage has no embedding layer and serves image steps
-        with neither input_ids nor input_embeds: it warms that proxy-only call
-        and skips the input_embeds variants and the host-placement select."""
-        mr = _model_runner()
-        mr.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
-        mr.model_config.hidden_size = 4
-        mr.dtype = torch.float32
-        mr.model.get_image_feature = MagicMock()
-        mr.model.get_input_embeddings = MagicMock(return_value=PPMissingLayer())
-        mr.model.num_deepstack_embeddings = 2
-        mr.model.decode_embeds_in_language_model = False
-        forward_batch = SimpleNamespace(
-            input_ids=torch.ones(64, dtype=torch.int64),
-            positions=torch.arange(64),
-            forward_mode=ForwardMode.EXTEND,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            batch_size=16,
-            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
-        )
-        policy = Qwen3VLDecoderTpuCompilePolicy(
-            model_runner=mr,
-            t_bucketer=Bucketer(name="Token", buckets=[64]),
-            b_bucketer=Bucketer(name="Bs", buckets=[16]),
-            owner=mr.model,
-        )
-        policy.extend_bs = 16
-        policy._make_dummy_forward_batch = MagicMock(return_value=forward_batch)
-        policy._run_one = MagicMock()
-
-        with (
-            patch(
-                "sglang.srt.hardware_backend.tpu.mm_embed_tpu.apply_host_mm_embeds"
-            ) as placement,
-            get_parallel().override(
-                tp_size=2,
-                tp_rank=1,
-                attn_tp_size=2,
-                attn_tp_rank=1,
-                moe_tp_size=2,
-                moe_tp_rank=1,
-            ),
-        ):
-            policy._precompile_extend()
-        args, kwargs = policy._make_warmup_inputs(
-            num_tokens=64, bs=16, mode=ForwardMode.EXTEND, variant="text_only"
-        )
-
-        placement.assert_not_called()
-        self.assertEqual(
-            {call.kwargs["variant"] for call in policy._run_one.call_args_list},
-            {"text_only", "text_ids"},
-        )
-        self.assertEqual(args, ())
-        self.assertIsNone(kwargs["input_ids"])
-        self.assertNotIn("input_embeds", kwargs)
-        self.assertIn("pp_proxy_tensors", kwargs)
-        policy._direct_compile_specialization_key(None, **kwargs)
 
     def test_extend_skips_token_bucket_below_bs(self):
         # A 4-token bucket can't hold the fixed 8-req extend cap.

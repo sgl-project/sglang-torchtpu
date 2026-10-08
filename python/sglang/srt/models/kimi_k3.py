@@ -3623,11 +3623,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 support_torch_compile,
             )
             from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-                Qwen3VLDecoderTpuCompilePolicy,
+                KimiK3VLDecoderTpuCompilePolicy,
             )
 
             support_torch_compile(
-                self.language_model, policy=Qwen3VLDecoderTpuCompilePolicy
+                self.language_model, policy=KimiK3VLDecoderTpuCompilePolicy
             )
 
     @property
