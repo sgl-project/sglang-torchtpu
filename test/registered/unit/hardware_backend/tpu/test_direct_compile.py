@@ -10,6 +10,8 @@ import torch
 from jax import tree_util
 from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
+from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
 from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
     use_attention_rank_tensors,
@@ -17,6 +19,8 @@ from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
+from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import collect_warmups
 from sglang.srt.layers import dp_attention
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -207,6 +211,46 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_cold_call_and_synchronous_mode_return_real_results(self):
+        def compile_helper(fn, **kwargs):
+            compiled = MagicMock(side_effect=fn)
+            compiled.cache = {}
+            compiled.warmup_async.side_effect = lambda *args: PendingCall(
+                lambda: compiled(*args)
+            )
+            return compiled
+
+        with (
+            patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+            patch.object(direct_compile, "direct_compile", side_effect=compile_helper),
+            get_context().override_server_args(tpu_compile_tracer="direct"),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        ):
+            for asynchronous in (False, True):
+                with (
+                    self.subTest(asynchronous=asynchronous),
+                    envs.SGLANG_DIRECT_COMPILE_ASYNC.override(asynchronous),
+                ):
+                    op = compiled_op()(lambda x: x * 3)
+                    x = torch.arange(3)
+                    with collect_warmups() as queue:
+                        self.assertTrue(torch.equal(op(x), x * 3))
+                        self.assertEqual(queue.calls, [])
+                    self.assertIsNone(warmup_compiled_op(op, x))
+                    self.assertTrue(torch.equal(op(x), x * 3))
+
+    def test_compiled_helper_inlines_inside_outer_dynamo_graph(self):
+        @compiled_op()
+        def add_one(x):
+            return x + 1
+
+        def outer(x):
+            return add_one(x) * 2
+
+        compiled = torch.compile(outer, backend="eager", fullgraph=True)
+        x = torch.arange(4)
+        self.assertTrue(torch.equal(compiled(x), (x + 1) * 2))
+
     def test_fail_on_recompile_stance(self):
         compiled = direct_compile.direct_compile(
             lambda value: value,
@@ -368,13 +412,8 @@ class TestDirectCompile(CustomTestCase):
     def test_registered_helpers_compile_directly_and_match_eager(self):
         from sglang.srt.compilation.compiled_op import (
             get_compiled_ops,
-            warmup_compiled_op,
         )
-        from sglang.srt.environ import envs
         from sglang.srt.hardware_backend.tpu import spec_op_precompile  # noqa: F401
-        from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
-            collect_warmups,
-        )
         from sglang.srt.hardware_backend.tpu.spec_op_warmup import SpecOpWarmupContext
 
         cases = []
