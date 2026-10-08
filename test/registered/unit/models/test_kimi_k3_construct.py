@@ -93,6 +93,22 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
             self.assertIsNone(kda._bfa_w)
             self.assertFalse(kda._kda_fused_decode_ready)
 
+    def test_kda_value_head_dim_follows_linear_attn_config(self):
+        """KDA's value head dim follows linear_attn_config, not MLA's v_head_dim."""
+        config = _tiny_config()
+        config.v_head_dim = 32  # MLA value head dim; KDA head_dim stays 64
+        model = KimiK3LinearForCausalLM(config=config, quant_config=None)
+        kdas = [
+            layer.self_attn
+            for layer in model.model.layers
+            if isinstance(layer.self_attn, KimiK3DeltaAttention)
+        ]
+        self.assertTrue(kdas)
+        for kda in kdas:
+            self.assertEqual(kda.head_v_dim, 64)
+            # What the KDA attention backends read.
+            self.assertEqual(kda.attn.head_v_dim, 64)
+
 
 if __name__ == "__main__":
     unittest.main()

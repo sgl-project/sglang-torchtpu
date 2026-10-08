@@ -1526,7 +1526,8 @@ class KimiK3DeltaAttention(nn.Module):
         self.num_k_heads = config.linear_attn_config["num_heads"]
         self.num_v_heads = config.linear_attn_config["num_heads"]
         self.head_k_dim = config.linear_attn_config["head_dim"]
-        self.head_v_dim = config.v_head_dim
+        # KDA value heads use the linear-attention head dim, as in kimi_linear.
+        self.head_v_dim = config.linear_attn_config["head_dim"]
         self.layer_idx = layer_idx
         self.prefix = prefix
         assert self.num_heads % self.attn_tp_size == 0
