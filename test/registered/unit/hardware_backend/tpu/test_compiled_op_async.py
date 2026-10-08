@@ -2,6 +2,9 @@
 
 import importlib
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from threading import Barrier, local
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -15,6 +18,64 @@ from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import collect_war
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def test_async_compile_workers_preserve_graph_mode_without_serializing(monkeypatch):
+    from sglang.srt.hardware_backend.tpu import patches
+
+    class ModeState(local):
+        mode = "eager"
+
+    state = ModeState()
+    barrier = Barrier(2)
+
+    @contextmanager
+    def set_mode(mode):
+        previous = state.mode
+        state.mode = mode
+        try:
+            yield
+        finally:
+            state.mode = previous
+
+    class StaticCompiler:
+        def _compile(self, fail=False):
+            assert state.mode == "graph"
+            barrier.wait(timeout=10)
+            if fail:
+                raise RuntimeError("compile failed")
+            return "compiled"
+
+    execution_mode = SimpleNamespace(
+        EagerMode=SimpleNamespace(INTERNAL_COMPILE_FX_GRAPH="graph"),
+        set_eager_mode=set_mode,
+    )
+    internal = ModuleType("torch_tpu._internal")
+    internal.execution_mode = execution_mode
+    compiler = ModuleType("torch_tpu._internal.compile.compiler")
+    compiler.StaticCompiler = StaticCompiler
+    monkeypatch.setitem(sys.modules, internal.__name__, internal)
+    monkeypatch.setitem(sys.modules, compiler.__name__, compiler)
+    monkeypatch.setattr(patches, "_async_compile_context_patched", False)
+    patches._patch_async_compile_context()
+    patched_compile = StaticCompiler._compile
+    patches._patch_async_compile_context()
+    assert StaticCompiler._compile is patched_compile
+
+    def run(fail):
+        state.mode = "eager"
+        try:
+            return StaticCompiler()._compile(fail=fail)
+        finally:
+            assert state.mode == "eager"
+
+    with set_mode("caller"), ThreadPoolExecutor(max_workers=2) as pool:
+        success = pool.submit(run, False)
+        failure = pool.submit(run, True)
+        assert success.result(timeout=15) == "compiled"
+        with pytest.raises(RuntimeError, match="compile failed"):
+            failure.result(timeout=15)
+        assert state.mode == "caller"
 
 
 @pytest.fixture
