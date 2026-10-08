@@ -83,6 +83,11 @@ A test declares at most one of these next to its registration; the suite still f
 slice. Every pod sees the bucket's `weights/` at `/weights`, the in-project path, so tests
 that hard-code `/weights/<model>` run unchanged once the model is staged.
 
+The cluster has **no internet egress**. Pods copy `weights/datasets/gsm8k/test.jsonl` to
+`/tmp/test.jsonl` (the GSM8K evals' download cache) and run HF offline against
+`weights/hf-hub`, a flat hub cache (`models--<org>--<name>/refs/main` +
+`snapshots/<rev>/`). A test that pulls a new HF repo id needs it staged there first.
+
 | Declaration | Suite | What runs |
 |---|---|---|
 | none | `external-nightly-1host` | Single-host tests that launch their own server. Rank 0 of a 2x2x2 slice drops the slice-wide TPU env and runs each file through `run_suite`; rank 1 idles. Files are dealt across the slices, one bundle per slice. |
