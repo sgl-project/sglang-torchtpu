@@ -72,7 +72,7 @@ jobs:
         if: env.IS_PR_EVENT == 'true' && inputs.require-run-ci == true
         run: |
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
-            echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
+            echo "Missing required label 'run-ci'. Comment /tag-and-rerun-ci on the PR to add it and start CI."
             exit 1
           fi
 

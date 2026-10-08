@@ -1734,7 +1734,7 @@ def main():
 
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
+    # Note: /tag-run-ci-label needs CI_PERMISSIONS.json or write access (below).
     # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
@@ -1753,6 +1753,12 @@ def main():
     # so a write-holder absent from the file must still reach its handler.
     if user_perms is None:
         user_perms = {}
+
+    # Anyone with write access may tag run-ci and rerun CI.
+    if repo.get_collaborator_permission(user_login) in ("admin", "maintain", "write"):
+        print(f"User {user_login} has write access. Granting CI tag and rerun.")
+        user_perms["can_tag_run_ci_label"] = True
+        user_perms["can_rerun_failed_ci"] = True
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
