@@ -1,3 +1,6 @@
+import errno
+import os
+import signal
 import socket
 import socketserver
 import threading
@@ -5,6 +8,8 @@ import unittest
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import anyio
 
 from sglang.srt.hardware_backend.tpu import leader_forwarding
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,6 +28,26 @@ class StreamingTarget(socketserver.BaseRequestHandler):
 
 
 class TestLeaderForwarding(unittest.TestCase):
+    def test_serving_failure_signals_worker_before_context_exit(self):
+        signalled = threading.Event()
+
+        async def fail_serve(listener, handler):
+            await anyio.sleep(0)
+            raise OSError(errno.EMFILE, "Too many open files")
+
+        with (
+            patch.object(leader_forwarding.SocketListener, "serve", fail_serve),
+            patch.object(
+                leader_forwarding.os, "kill", side_effect=lambda *_: signalled.set()
+            ) as kill,
+            self.assertLogs(leader_forwarding.logger, level="ERROR") as logs,
+            self.assertRaisesRegex(Exception, "unhandled errors in a TaskGroup"),
+        ):
+            with leader_forwarding._forward_ports("127.0.0.1", "127.0.0.2", [0]):
+                self.assertTrue(signalled.wait(5))
+                kill.assert_called_once_with(os.getpid(), signal.SIGQUIT)
+        self.assertIn("Too many open files", "\n".join(logs.output))
+
     def test_streaming_half_close_and_listener_cleanup(self):
         with ExitStack() as stack:
             ports = []
@@ -35,7 +60,10 @@ class TestLeaderForwarding(unittest.TestCase):
                 stack.callback(thread.join)
                 stack.callback(target.shutdown)
                 ports.append(target.server_address[1])
-            with leader_forwarding._forward_ports("127.0.0.1", "127.0.0.2", ports):
+            with (
+                patch.object(leader_forwarding.os, "kill") as kill,
+                leader_forwarding._forward_ports("127.0.0.1", "127.0.0.2", ports),
+            ):
                 for port in ports:
                     with socket.create_connection(
                         ("127.0.0.1", port), timeout=5
@@ -50,6 +78,7 @@ class TestLeaderForwarding(unittest.TestCase):
                         b"port-%d:" % port
                         + b"".join(b"chunk-%d:request" % index for index in range(3)),
                     )
+            kill.assert_not_called()
             for port in ports:
                 with self.assertRaises(ConnectionRefusedError):
                     socket.create_connection(("127.0.0.1", port), timeout=5)

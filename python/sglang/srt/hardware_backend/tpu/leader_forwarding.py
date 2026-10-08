@@ -1,6 +1,8 @@
 """Preserve the input leader's serving address after TPU rank normalization."""
 
 import logging
+import os
+import signal
 import socket
 from concurrent.futures import CancelledError
 from contextlib import AsyncExitStack, contextmanager, suppress
@@ -61,11 +63,23 @@ async def _serve_ports(host, target_host, ports, *, task_status):
             await anyio.sleep_forever()
 
 
+def _on_forwarder_exit(serving):
+    if serving.cancelled():
+        return
+    logger.error(
+        "TPU leader forwarder stopped unexpectedly; shutting down worker",
+        exc_info=serving.exception(),
+    )
+    # Use Engine's fatal-error handler: workers defer SIGTERM until leader drain.
+    os.kill(os.getpid(), signal.SIGQUIT)
+
+
 @contextmanager
 def _forward_ports(host: str, target_host: str, ports: list[int]):
-    """Bind before yielding; cancel connections and close listeners on exit."""
+    """Bind before yielding; supervise serving and close connections on exit."""
     with start_blocking_portal(name="tpu-leader-forwarder") as portal:
         serving, _ = portal.start_task(_serve_ports, host, target_host, ports)
+        serving.add_done_callback(_on_forwarder_exit)
         try:
             yield
         finally:
