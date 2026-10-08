@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import is_tpu
 
 WarmupArgsFactory = Callable[[Any], tuple[Any, ...]]
@@ -63,10 +64,12 @@ def compiled_op(
     model: torch.nn.Module | None = None,
     uses_rng: bool = False,
 ):
-    """Directly compile a tensor helper into one fused dispatch.
+    """Compile a tensor helper with the selected TPU tracer.
 
     Active only on TPU with ``--enable-torch-compile``. The caller must pass
-    TPU tensors and ``fn`` must be compile-safe. Tensor shapes, dtypes, devices,
+    TPU tensors and ``fn`` must be compile-safe. ``--tpu-compile-tracer`` selects
+    direct compilation or synchronous ``torch.compile``. For direct compilation,
+    tensor shapes, dtypes, devices,
     argument structure, and non-Tensor values determine specialization; closed-over
     Python configuration must stay fixed. Pass ``model`` for captured parameters
     and ``uses_rng=True`` for helpers drawing from the default TPU generator.
@@ -74,15 +77,16 @@ def compiled_op(
     Model-specific owners can instead
     call ``warmup_compiled_op(op, ...)`` with their own representative inputs.
     The internal ``_warmup_async`` keyword submits each new specialization
-    without waiting when asynchronous compilation is enabled.
+    without waiting when direct asynchronous compilation is enabled.
     """
 
     def decorator(fn):
         compiled_fn = None
+        use_direct = False
 
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
-            nonlocal compiled_fn
+            nonlocal compiled_fn, use_direct
             if (
                 torch.compiler.is_compiling()
                 or not is_tpu()
@@ -93,17 +97,23 @@ def compiled_op(
 
             args, kwargs = tree_util.tree_map(_canonical_tensor, (args, kwargs))
             if compiled_fn is None:
-                from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
-                    direct_compile,
-                )
+                use_direct = get_exec().graph.tpu_compile_tracer == "direct"
+                if use_direct:
+                    from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+                        direct_compile,
+                    )
 
-                compiled_fn = direct_compile(
-                    fn,
-                    specialization_key=_specialization_key,
-                    model=model,
-                    uses_rng=uses_rng,
-                )
-            if _warmup_async and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
+                    compiled_fn = direct_compile(
+                        fn,
+                        specialization_key=_specialization_key,
+                        model=model,
+                        uses_rng=uses_rng,
+                    )
+                else:
+                    compiled_fn = torch.compile(
+                        fn, backend="tpu", fullgraph=True, dynamic=False
+                    )
+            if use_direct and _warmup_async and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
                 # Repeated storage/layout warmups share one compiled program.
                 # Keep only its first inputs alive until the queue joins.
                 if _specialization_key(*args, **kwargs) in compiled_fn.cache:

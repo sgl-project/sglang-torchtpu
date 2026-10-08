@@ -12,6 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import spec_op_precompile
 from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import collect_warmups
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -45,7 +46,8 @@ def backend(monkeypatch):
     module.direct_compile = Compiled
     module.finish = lambda compiled, x: compiled(x)
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    return SimpleNamespace(events=events, wrappers=wrappers, module=module)
+    with get_context().override_server_args(tpu_compile_tracer="direct"):
+        yield SimpleNamespace(events=events, wrappers=wrappers, module=module)
 
 
 def test_registered_ops_submit_before_join_and_reuse_serving_wrapper(
@@ -128,6 +130,43 @@ def test_cold_call_and_synchronous_mode_return_real_results(backend, monkeypatch
                 assert queue.calls == []
             assert warmup_compiled_op(op, x) is None
             assert torch.equal(op(x), x * 3)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_default_dynamo_warmup_runs_inline_and_reuses_serving_graph(
+    backend, monkeypatch, asynchronous
+):
+    registry = importlib.import_module("sglang.srt.compilation.compiled_op")
+    monkeypatch.setattr(registry, "is_tpu", lambda: True)
+    original_compile = torch.compile
+    wrappers = []
+    graphs = []
+
+    def record_graph(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    def compile_on_cpu(fn, **options):
+        wrappers.append(options)
+        return original_compile(fn, backend=record_graph, fullgraph=True, dynamic=False)
+
+    monkeypatch.setattr(torch, "compile", compile_on_cpu)
+    op = compiled_op()(lambda x: x * 3)
+    x = torch.arange(3)
+    with (
+        get_context().override_server_args(),
+        envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        envs.SGLANG_DIRECT_COMPILE_ASYNC.override(asynchronous),
+    ):
+        with collect_warmups() as queue:
+            warmup_compiled_op(op, x)
+            assert len(graphs) == 1
+            assert queue.calls == []
+        with torch.compiler.set_stance("fail_on_recompile"):
+            assert torch.equal(op(x + 1), (x + 1) * 3)
+    assert wrappers == [dict(backend="tpu", fullgraph=True, dynamic=False)]
+    assert len(graphs) == 1
+    assert backend.wrappers == []
 
 
 def test_pending_compile_failure_prevents_completion(backend, monkeypatch):

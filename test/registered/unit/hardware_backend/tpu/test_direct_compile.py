@@ -24,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -379,6 +380,7 @@ class TestDirectCompile(CustomTestCase):
         cases = []
         with (
             torch.no_grad(),
+            get_context().override_server_args(tpu_compile_tracer="direct"),
             envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
             envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
         ):
