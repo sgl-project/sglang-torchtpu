@@ -45,6 +45,7 @@ jobs:
       contents: read
     outputs:
       slices: ${{ steps.d.outputs.slices }}
+      pairs: ${{ steps.d.outputs.pairs }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,12 +67,19 @@ jobs:
               exit 1
             fi
           fi
+          # Slice-pair rows (P/D whose roles each fill a slice) run after the single-slice
+          # rows: the cluster has no gang scheduling, so a pair overlapping a slice job
+          # gets half-placed and its pods time out waiting for peers left Pending.
+          pairs="$(jq -c '[.[] | select(.nodepool_var_decode)]' <<< "$slices")"
+          slices="$(jq -c '[.[] | select(.nodepool_var_decode | not)]' <<< "$slices")"
           echo "slices=$slices" >> "$GITHUB_OUTPUT"
+          echo "pairs=$pairs" >> "$GITHUB_OUTPUT"
           echo "discovered external-nightly slices: $slices"
+          echo "discovered external-nightly slice pairs: $pairs"
           # `|| true`: under set -e a bare `[ ... ] &&` as the step's last command
           # fails the step the moment tests ARE discovered (the scaffold-era bug
           # never fired because slices was always []).
-          [ "$slices" = "[]" ] && echo "No external-nightly-* tests registered yet; run will be skipped." || true
+          [ "$slices$pairs" = "[][]" ] && echo "No external-nightly-* tests registered yet; run will be skipped." || true
 
   # One matrix job PER SLICE (parallel across slices). Each runs its bucketed groups serially.
   run:
@@ -90,6 +98,29 @@ jobs:
       slice_name: ${{ matrix.slice.name }}
       nodepool_var: ${{ matrix.slice.nodepool_var }}
       nodepool_var_decode: ${{ matrix.slice.nodepool_var_decode || '' }}
+      groups_json: ${{ toJSON(matrix.slice.groups) }}
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+
+  # Slice-pair rows, once every single-slice row is done (see the discover step).
+  run-pairs:
+    needs: [build, discover, run]
+    if: ${{ !cancelled() && needs.discover.outputs.pairs != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(needs.discover.outputs.pairs) }}
+    name: ${{ matrix.slice.name }}
+    uses: ./.github/workflows/_external-tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: ${{ matrix.slice.suite }}
+      slice_name: ${{ matrix.slice.name }}
+      nodepool_var: ${{ matrix.slice.nodepool_var }}
+      nodepool_var_decode: ${{ matrix.slice.nodepool_var_decode }}
       groups_json: ${{ toJSON(matrix.slice.groups) }}
     secrets: inherit
     permissions:
