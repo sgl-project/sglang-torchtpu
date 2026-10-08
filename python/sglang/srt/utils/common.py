@@ -2737,8 +2737,9 @@ def broadcast_pyobj(
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
-        serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        # Unpickle directly from the contiguous buffer to avoid a full bytes copy.
+        # The NumPy view keeps the CPU tensor alive until deserialization finishes.
+        data = pickle.loads(tensor_data.cpu().numpy())
         return data
 
 
