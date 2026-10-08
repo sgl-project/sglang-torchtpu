@@ -196,7 +196,14 @@ jobs:
             echo "Created ${name} for ${label}"
 
             local running_deadline; running_deadline=$(( $(date +%s) + POD_RUNNING_DEADLINE ))
-            until kubectl -n "$ns" get pods -l "$sel" -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
+            # Wait for EVERY pod, not just the first: `kubectl logs -f -l` follows only the
+            # pods that exist when it attaches, so a role that starts later (a P/D prefill
+            # behind its decode) would never be streamed and its verdict would be lost.
+            all_started() {
+              local phases; phases="$(kubectl -n "$ns" get pods -l "$sel" -o jsonpath='{.items[*].status.phase}' 2>/dev/null)"
+              grep -q Running <<<"$phases" && ! grep -q Pending <<<"$phases"
+            }
+            until all_started; do
               # Fail fast when the JobSet's Jobs are REJECTED (e.g. an admission
               # policy denying the pod spec): no pod will ever run, the JobSet
               # never turns Failed, and waiting the full budget burns hours.
@@ -212,7 +219,7 @@ jobs:
                 return 1
               fi
               if [ "$(date +%s)" -ge "$running_deadline" ]; then
-                echo "⚠️  ${label}: no pod Running ${POD_RUNNING_DEADLINE}s after apply; continuing anyway"
+                echo "⚠️  ${label}: pods not all Running ${POD_RUNNING_DEADLINE}s after apply; continuing anyway"
                 kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
                 break
               fi
