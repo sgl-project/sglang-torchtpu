@@ -176,15 +176,12 @@ def apply_tpu_w4a16_moe(
     x = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
+    # Padded rows carry expert id -1, which the kernel drops.
     topk_ids = topk_ids.to(torch.int32)
     if layer.num_fused_shared_experts:
         raise NotImplementedError(
             "Fused shared experts are not supported on the TPU MoE path."
         )
-    # Padded rows carry expert id -1: route them to expert 0 with zero weight.
-    valid = topk_ids >= 0
-    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
-    topk_weights = topk_weights * valid.to(topk_weights.dtype)
 
     # Global expert ids + this rank's group window (as the fp8 path does), so
     # the permute and combine only touch this rank's routed rows.

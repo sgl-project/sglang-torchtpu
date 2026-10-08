@@ -40,7 +40,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
         jnp = ModuleType("jax.numpy")
         for name in ("uint8", "int32"):
             setattr(jnp, name, getattr(np, name))
-        for name in ("argsort", "repeat", "arange", "sum", "array"):
+        for name in ("argsort", "repeat", "arange", "sum", "array", "where"):
             setattr(jnp, name, getattr(np, name))
         jax.numpy = jnp
 
@@ -119,16 +119,17 @@ class TestUnquantGlobalRouting(CustomTestCase):
 
         def kernel(**kwargs):
             routed_ids = kwargs["topk_ids"]
-            self.assertTrue(torch.all(routed_ids >= 0))
+            # Router ids arrive unchanged; the kernel drops out-of-range ids.
+            torch.testing.assert_close(routed_ids, ids)
+            in_range = (routed_ids >= 0) & (routed_ids < kwargs["global_num_experts"])
             local_ids = routed_ids - kwargs["expert_group_offset"]
             local_experts = kwargs["w1"].shape[0]
-            local = (local_ids >= 0) & (local_ids < local_experts)
+            local = in_range & (local_ids >= 0) & (local_ids < local_experts)
             expert_values = kwargs["w1"][:, 0, 0][local_ids.clamp(0, local_experts - 1)]
             values = expert_values.unsqueeze(-1) * kwargs["hidden_states"].unsqueeze(1)
-            route_weights = kwargs["topk_weights"] * local
+            route_weights = torch.where(local, kwargs["topk_weights"], 0)
             if kwargs["no_combine"]:
-                # Global routing masks ownership, not weights. In particular,
-                # sanitized invalid IDs still produce expert-0 output on rank 0.
+                # Global routing masks ownership, not weights.
                 mask = (
                     local
                     if kwargs["global_num_experts"] > local_experts

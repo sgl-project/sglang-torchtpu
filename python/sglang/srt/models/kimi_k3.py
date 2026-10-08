@@ -1053,6 +1053,7 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1173,7 +1174,11 @@ class KimiK3MoE(nn.Module):
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+            )
         if not (_is_npu and self._sbo_shared_overlap):
             issue_shared()
 
@@ -1478,7 +1483,17 @@ class KimiK3MoE(nn.Module):
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_unfused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                # TopK marks padded rows -1 for the TPU fused MoE to drop. Off
+                # TPU, K3's MoE paths are not validated with -1 ids.
+                num_token_non_padded=(
+                    forward_batch.moe_num_token_non_padded()
+                    if _is_tpu and forward_batch is not None
+                    else None
+                ),
+            )
         if use_dp:
             global_out = out
             out = get_local_dp_buffer(_dp_local_buffer_group())

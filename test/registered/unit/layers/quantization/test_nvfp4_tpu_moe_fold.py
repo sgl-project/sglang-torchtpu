@@ -421,7 +421,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         torch.testing.assert_close(
             call["topk_ids"],
-            torch.tensor([[0, 0], [0, 1]], dtype=torch.int32),
+            torch.tensor([[0, -1], [-1, 1]], dtype=torch.int32),
         )
         self.assertEqual(tuple(result.hidden_states.shape), (2, 2, HIDDEN_SIZE))
 
