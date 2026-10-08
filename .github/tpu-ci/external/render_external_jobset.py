@@ -9,19 +9,18 @@ in-project CI helpers, so improvements to those land here too. What stays unique
 external path lives in this file: slice bucketing (no Kueue), gcsfuse weights, the
 nodepool-pin JobSets, and the DNS-endpoint gating (in _external-tpu-test.yml).
 
-A test registers to an external suite (the suite fixes the slice shape) and says how it runs
-with at most one module-level dict:
+Three kinds of external work, by where they are declared (the suite fixes the slice shape):
 
-    MULTIHOST_LAUNCH = {"launch_script": "recipe/x.sh", "weights": "<bucket subdir>"}
-        launch: every host runs the recipe; rank 0 runs the file against the live server.
-        Files sharing (suite, launch_script, weights) share one server.
-    PD_LAUNCH = {"prefill_hosts": 1, "decode_hosts": 1, "cmd": "python3 <file> integration"}
-        P/D: two replicated jobs (prefill, decode); every pod runs `cmd` with CI_PD_ROLE set.
-        1+1 shares one slice; N+N with N == the slice's hosts takes a PAIR of slices.
-    EXEC_LAUNCH = {"cmd": "python3 <file>"}
-        exec: every host of the slice runs `cmd`; rank 0's exit code gates.
-    (no dict, suite with `self_launch: true`)
-        self-launch: rank 0 runs the file through run_suite; the test starts its own server.
+    launch  -- a test registered to an external suite with a module-level
+               MULTIHOST_LAUNCH = {"launch_script": "recipe/x.sh", "weights": "<bucket subdir>"}:
+               every host runs the recipe; rank 0 runs the file against the live server.
+               Files sharing (suite, launch_script, weights) share one server.
+    self    -- a test registered to a suite with `self_launch: true`: rank 0 runs the file
+               through run_suite; the test starts its own server.
+    pd/exec -- a suite's `commands` in external-topology.yaml, wired there as in-project's
+               feature-validation-tpu.yml wires its static jobs: every pod runs `cmd`. A `pd`
+               entry gets prefill and decode replicated jobs with CI_PD_ROLE set; 1+1 shares
+               one slice, N+N with N == the slice's hosts takes a PAIR of slices.
 
 Every pod sees the weights bucket at /weights (as in-project), so tests that hard-code
 /weights/<model> paths run unchanged.
@@ -74,13 +73,6 @@ _SELF_TIMEOUT_PER_FILE = 3600
 # DNS-1035 label budget for the run name (children append suffixes).
 _RUN_NAME_MAX = 40
 
-# Launch dict name -> group mode.
-_LAUNCH_VARS = (
-    ("MULTIHOST_LAUNCH", "launch"),
-    ("PD_LAUNCH", "pd"),
-    ("EXEC_LAUNCH", "exec"),
-)
-
 
 def load_config(path):
     with open(path) as f:
@@ -99,16 +91,17 @@ def dns_safe(name):
 
 
 def _scan(cfg, root, nightly_only):
-    """[(path, suite, mode, spec)] for every external registration, sorted by path."""
+    """[(path, suite, mode, spec)] for every external test, sorted by path."""
     found = []
     for suite, sl in cfg["suites"].items():
         if sl.get("self_launch"):
             for path in _scan_suite(root, suite, nightly_only, launch_var=None):
                 found.append((path, suite, "self", {}))
             continue
-        for var, mode in _LAUNCH_VARS:
-            for path, spec in _scan_suite(root, suite, nightly_only, var).items():
-                found.append((path, suite, mode, spec))
+        for path, spec in _scan_suite(root, suite, nightly_only).items():
+            found.append((path, suite, "launch", spec))
+        for spec in sl.get("commands", []):
+            found.append((spec["files"], suite, "pd" if "pd" in spec else "exec", spec))
     return sorted(found)
 
 
@@ -167,7 +160,7 @@ def _cmd_groups(entries, mode, slice_hosts):
             ),
         }
         if mode == "pd":
-            p, d = int(spec["prefill_hosts"]), int(spec["decode_hosts"])
+            p, d = int(spec["pd"]["prefill_hosts"]), int(spec["pd"]["decode_hosts"])
             hosts = slice_hosts[suite]
             # A role either shares the slice as one single-host engine per pod, or fills it.
             if p + d > hosts and not p == d == hosts:

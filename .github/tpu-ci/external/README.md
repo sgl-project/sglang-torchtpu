@@ -89,11 +89,15 @@ The cluster has **no internet egress**. Pods copy `weights/datasets/gsm8k/test.j
 `snapshots/<rev>/`), with gpt-oss's harmony vocab read from `weights/datasets/tiktoken`.
 A test that pulls a new HF repo id or dataset needs it staged there first.
 
-| Declaration | Suite | What runs |
+| Declared in | Suite | What runs |
 |---|---|---|
-| none | `external-nightly-1host` | Single-host tests that launch their own server. Rank 0 of a 2x2x2 slice drops the slice-wide TPU env and runs each file through `run_suite`; rank 1 idles. Files are dealt across the slices, one bundle per slice. |
-| `PD_LAUNCH = {"prefill_hosts": 1, "decode_hosts": 1, "cmd": "python3 <file> integration"}` | `external-nightly-2x2x2` | P/D: `prefill` and `decode` replicated jobs run `cmd` with `CI_PD_ROLE` set (`jobset-external-tpu-pd.yaml`). 1+1 shares one slice; 2+2 takes a slice pair. |
-| `EXEC_LAUNCH = {"cmd": "python3 <file>"}` | `external-nightly-2x2x2` | Every host runs `cmd`; rank 0's exit code gates. |
+| the test: registration only | `external-nightly-1host` | Single-host tests that launch their own server. Rank 0 of a 2x2x2 slice drops the slice-wide TPU env and runs each file through `run_suite`; rank 1 idles. Files are dealt across the slices, one bundle per slice. |
+| `external-topology.yaml`: the suite's `commands`, entry with `pd: {prefill_hosts, decode_hosts}` | `external-nightly-2x2x2` | P/D: `prefill` and `decode` replicated jobs run `cmd` with `CI_PD_ROLE` set (`jobset-external-tpu-pd.yaml`). 1+1 shares one slice; 2+2 takes a slice pair. |
+| `external-topology.yaml`: the suite's `commands`, entry without `pd` | `external-nightly-2x2x2` | Every host runs `cmd`; rank 0's exit code gates. |
+
+`commands` entries are wired by hand, as in-project's `feature-validation-tpu.yml` wires
+its static jobs: the test file keeps its registration and serving config, and CI owns
+how it is run.
 
 ## Run it
 

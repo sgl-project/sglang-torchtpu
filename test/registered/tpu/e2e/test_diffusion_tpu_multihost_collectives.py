@@ -16,14 +16,10 @@ from sglang.test.ci.ci_register import register_tpu_ci
 # which a MULTIHOST_LAUNCH group cannot do.
 register_tpu_ci(
     est_time=600,
-    suite="external-nightly-2x2x2",
+    suite="tpu-integration",
     nightly=True,
     labels=["multihost", "diffusion", "collectives"],
 )
-
-EXEC_LAUNCH = {
-    "cmd": "python3 test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py",
-}
 
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 

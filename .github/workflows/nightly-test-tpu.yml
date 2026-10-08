@@ -43,6 +43,7 @@ on:
           - feature-validation
           - perf
           - mh
+          - pd-mh-qwen3-480b-kvoff-reshard
           - pd-mh-qwen3-vl-8b-spec
           - sh
       test_filter:

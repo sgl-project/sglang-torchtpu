@@ -1,6 +1,6 @@
 # External P/D disaggregation test workload -- TWO replicated jobs (prefill, decode),
 # each pinned to a slice by nodepool (no Kueue on this cluster). Adapted from the in-project
-# jobset-tpu-pd.yaml; rendered by render_external_jobset.py for PD_LAUNCH groups. Render vars
+# jobset-tpu-pd.yaml; rendered by render_external_jobset.py for P/D `commands` groups. Render vars
 # (do NOT write them as dollar-brace tokens in these comments -- the renderer would
 # substitute them here too):
 #   IMAGE / NAMESPACE / ACCELERATOR / TOPOLOGY   image and node labels

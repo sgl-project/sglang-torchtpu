@@ -32,7 +32,7 @@ from sglang.test.tpu.utils.pd_singlehost_base import (
 
 register_tpu_ci(
     est_time=3600,
-    suite="external-nightly-2x2x2",
+    suite="tpu-integration",
     nightly=True,
     labels=[
         "singlehost",
@@ -43,12 +43,6 @@ register_tpu_ci(
         "decode-radix",
     ],
 )
-
-PD_LAUNCH = {
-    "prefill_hosts": 1,
-    "decode_hosts": 1,
-    "cmd": "python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py integration",
-}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))

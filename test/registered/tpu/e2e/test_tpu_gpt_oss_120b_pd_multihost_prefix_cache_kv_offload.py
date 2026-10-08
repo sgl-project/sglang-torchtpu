@@ -78,16 +78,9 @@ except ModuleNotFoundError as exc:
 # cache probe with device-pool churn, and GSM8K.
 register_tpu_ci(
     est_time=10800,
-    suite="external-nightly-2x2x2",
-    nightly=True,
+    suite="tpu-integration",
     labels=["multihost", "gpt-oss-120b", "pd", "prefix-cache", "kv-offload"],
 )
-
-PD_LAUNCH = {
-    "prefill_hosts": 2,
-    "decode_hosts": 2,
-    "cmd": "python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py",
-}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))

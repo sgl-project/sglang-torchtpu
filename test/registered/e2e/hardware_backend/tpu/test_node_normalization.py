@@ -15,14 +15,10 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
     est_time=120,
-    suite="external-nightly-2x2x2",
+    suite="tpu-integration",
     nightly=True,
     labels=["multihost", "normalization"],
 )
-
-EXEC_LAUNCH = {
-    "cmd": "env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_node_normalization.py -v",
-}
 
 
 class TestNodeNormalization(unittest.TestCase):

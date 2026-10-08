@@ -114,11 +114,10 @@ picks it up and groups it automatically; identical setup joins an existing group
 
 A test with **no server that every host must run** (a collectives probe spawning its
 own ranks) fits neither, since a launch group runs the files on rank 0 alone. That
-shape is exec mode. Nightly feature validation runs on the external cluster: give the
-file an `EXEC_LAUNCH` (or, for P/D, a `PD_LAUNCH`) and register it to
-`external-nightly-2x2x2`; a single-host test registers to `external-nightly-1host`
-(see `external/README.md`). In-project, exec and P/D jobs are hand-wired in
-`feature-validation-tpu.yml` with `files:`.
+shape is exec mode. Exec and P/D jobs are hand-wired: in-project in
+`feature-validation-tpu.yml` with `files:`, and on the external cluster, where most
+nightly feature validation runs, in `external/external-topology.yaml`'s `commands`
+(a single-host test there registers to `external-nightly-1host`; see `external/README.md`).
 
 ## Pipelines
 

@@ -33,6 +33,7 @@ on:
         options:
           - all
           - mh
+          - pd-mh-qwen3-480b-kvoff-reshard
           - pd-mh-qwen3-vl-8b-spec
           - sh
       test_filter:
@@ -97,6 +98,7 @@ jobs:
       contents: read
     outputs:
       single_host: ${{ steps.tests.outputs.single_host }}
+      pd_kvoff_reshard_qwen: ${{ steps.tests.outputs.pd_kvoff_reshard_qwen }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -123,6 +125,8 @@ jobs:
             echo "test_filter=$TEST_FILTER kept: $single_host"
           fi
           echo "single_host=$single_host" >> "$GITHUB_OUTPUT"
+          discover_files='python3 .github/tpu-ci/discover_files.py'
+          echo "pd_kvoff_reshard_qwen=$($discover_files --entry test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py)" >> "$GITHUB_OUTPUT"
 
   single-host:
     needs: [build, discover-tests]
@@ -152,6 +156,34 @@ jobs:
 
   # Qwen3-VL-8B 2P+2D gate: the prefill owns the ViT, so the handoff carries
   # image-derived KV into an EAGLE3 draft/verify decode loop. Scores MMMU-Pro.
+  pd-mh-qwen3-480b-kvoff-reshard:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && inputs.only == 'pd-mh-qwen3-480b-kvoff-reshard'
+          && contains('test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard_qwen)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding
+      hosts: 2
+      lane: nightly
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=qwen3_coder_480b python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
+      # Names the dashboard row and the TIMINGS record; required in P/D mode.
+      files: test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
+      weights_pvc: model-weights
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard_qwen)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # One host per P/D engine isolates this gate from intra-engine multihost issues.
+  # Kueue queues it against other P/D jobs contending for the nightly lane.
+
   pd-mh-qwen3-vl-8b-spec:
     needs: build
     if: >-

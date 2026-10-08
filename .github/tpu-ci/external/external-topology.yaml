@@ -40,6 +40,48 @@ suites:
       - EXTERNAL_NODEPOOL_2X2X2_1
       - EXTERNAL_NODEPOOL_2X2X2_2
       - EXTERNAL_NODEPOOL_2X2X2_3
+    # Tests wired here instead of discovered, as feature-validation-tpu.yml's static jobs
+    # are in-project: every pod runs `cmd`. A `pd` entry gets prefill and decode replicated
+    # jobs (CI_PD_ROLE set); 1+1 shares one slice, and roles that each fill a slice take a
+    # slice pair. Without `pd`, every host of one slice runs `cmd` and rank 0 gates.
+    commands:
+      - files: test/registered/e2e/hardware_backend/tpu/test_node_normalization.py
+        cmd: env JAX_PLATFORMS=cpu TORCH_TPU_TOPOLOGY=2,2,2,2 python3 test/registered/e2e/hardware_backend/tpu/test_node_normalization.py -v
+      - files: test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
+        cmd: python3 test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py integration
+        pd: {prefill_hosts: 2, decode_hosts: 2}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
+        cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
+        pd: {prefill_hosts: 2, decode_hosts: 2}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
+        pd: {prefill_hosts: 2, decode_hosts: 2}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
+        pd: {prefill_hosts: 2, decode_hosts: 2}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py integration
+        pd: {prefill_hosts: 2, decode_hosts: 2}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
+        pd: {prefill_hosts: 2, decode_hosts: 2}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
   # Single-host tests that launch their own server (no launch dict). There is no 1-host
   # slice here, so a group takes a whole 2x2x2 slice: rank 0 drops the slice-wide TPU env
   # and runs each file through run_suite on its own host; rank 1 idles.
