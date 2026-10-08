@@ -187,6 +187,7 @@ def test_owner_warmups_share_serving_callable_without_global_registration(
     ):
         with collect_warmups() as queue:
             warmup_compiled_op(first, torch.zeros(2))
+            warmup_compiled_op(first, torch.ones(2))
             warmup_compiled_op(second, torch.zeros(3))
             assert len(queue.calls) == 2
             assert not any(event[0] == "execute" for event in backend.events)

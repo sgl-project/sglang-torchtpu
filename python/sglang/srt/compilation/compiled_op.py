@@ -73,7 +73,8 @@ def compiled_op(
     A ``warmup`` factory registers the helper for the speculative-op grid.
     Model-specific owners can instead
     call ``warmup_compiled_op(op, ...)`` with their own representative inputs.
-    The internal ``_warmup_async`` keyword returns a pending call without waiting.
+    The internal ``_warmup_async`` keyword submits each new specialization
+    without waiting when asynchronous compilation is enabled.
     """
 
     def decorator(fn):
@@ -103,6 +104,10 @@ def compiled_op(
                     uses_rng=uses_rng,
                 )
             if _warmup_async and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
+                # Repeated storage/layout warmups share one compiled program.
+                # Keep only its first inputs alive until the queue joins.
+                if _specialization_key(*args, **kwargs) in compiled_fn.cache:
+                    return None
                 return compiled_fn.warmup_async(*args, **kwargs)
             return compiled_fn(*args, **kwargs)
 
