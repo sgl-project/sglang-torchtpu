@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Vendored from vllm-torchtpu (https://github.com/vllm-project/vllm-torchtpu)
-#   tests/kernels/test_mla_kv_cache_scatter.py @ b94bc6d4f (2026-10-08).
-# sglang adaptations (keep when re-syncing): import paths, CI registration,
-# pytest markers dropped, unittest entry point.
+# Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: tests/kernels/test_mla_kv_cache_scatter.py
 """Correctness tests for the SparseCore Pallas sparse-MLA KV cache scatter.
 
 The Pallas writer must be byte-identical to the pure-jnp reference in

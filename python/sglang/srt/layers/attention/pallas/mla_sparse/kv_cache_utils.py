@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Vendored from vllm-torchtpu (https://github.com/vllm-project/vllm-torchtpu)
-#   src/vllm_torchtpu/kernels/mla/kv_cache_utils.py @ b94bc6d4f (2026-10-08).
-# sglang adaptations (keep when re-syncing): import paths only.
+# Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: src/vllm_torchtpu/kernels/mla/kv_cache_utils.py
 """Utilities for paged KV cache indexing and byte packing.
 
 NOTE: Currently designed for 8-bit / FP8 KV caches (1 byte per element). We use

@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Vendored from vllm-torchtpu (https://github.com/vllm-project/vllm-torchtpu)
-#   src/vllm_torchtpu/kernels/mla/sparse/native_sc_cache_layout.py @ b94bc6d4f (2026-10-08).
-# sglang adaptations (keep when re-syncing): import paths only.
+# Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: src/vllm_torchtpu/kernels/mla/sparse/native_sc_cache_layout.py
 """Host helpers for the native SparseCore GLM-5.2 cache layout.
 
 These conversions define the standalone native-SC kernel's byte contract. They

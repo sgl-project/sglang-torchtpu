@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Vendored from vllm-torchtpu (https://github.com/vllm-project/vllm-torchtpu)
-#   tests/kernels/test_mla_native_sc_attention.py @ b94bc6d4f (2026-10-08).
-# sglang adaptations (keep when re-syncing): import paths, CI registration,
-# pytest markers dropped, unittest entry point.
+# Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: tests/kernels/test_mla_native_sc_attention.py
 """Standalone sparse-attention tests for both physical cache layouts."""
 
 import os
