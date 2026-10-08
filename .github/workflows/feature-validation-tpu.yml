@@ -225,7 +225,7 @@ jobs:
       contents: read
       id-token: write
 
-  # Not part of `all`: the nightly's 5 PM slot runs this and the qwen3
+  # Not part of `all`: accuracy-test-tpu.yml's 5 PM slot runs this and the qwen3
   # kvoff-reshard gate, which hold both 2-host slices for over an hour each.
   pd-mh-gpt-120b-kvoff-reshard:
     needs: [build, discover-tests]

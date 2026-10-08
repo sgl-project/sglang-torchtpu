@@ -1,12 +1,10 @@
-# Nightly TPU e2e. Each scheduled slot builds the image ONCE, then fans out the
-# stages of the redesign (.github/tpu-ci/README.md, § Pipelines and § Dashboard):
+# Nightly TPU e2e. Builds the image ONCE, then fans out two stages of the
+# redesign (.github/tpu-ci/README.md, § Pipelines and § Dashboard) IN PARALLEL:
 #
-#   1 AM:  feature validation | perf   (in parallel)
-#   10 AM: accuracy, day-10am selection
-#   5 PM:  accuracy, day-5pm selection | the two kv-offload-resharding P/D gates
+#   feature validation | perf
 #
-# Accuracy has its own daytime slots because, with it, the 1 AM run needed more
-# slice time than the 6 h runner cap leaves. `plan` maps each cron to its stages.
+# The accuracy stage runs on accuracy-test-tpu.yml's 10 AM / 5 PM schedule:
+# with it, the nightly needed more slice time than the 6 h runner cap leaves.
 # Each stage is a reusable workflow that is ALSO its own dispatchable trigger
 # (feature-validation-tpu.yml / accuracy-test-tpu.yml / perf-test-tpu.yml), so a
 # single stage or single test can run without a full nightly. The stages need
@@ -23,14 +21,8 @@ name: Nightly Test (TPU)
 run-name: "Nightly Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
 on:
-  # Pacific time, DST-aware. `plan` maps each cron to its stages, so a changed
-  # cron must change there too.
   schedule:
-    - cron: "0 1 * * *"   # feature validation + perf
-      timezone: "America/Los_Angeles"
-    - cron: "0 10 * * *"  # accuracy day-10am: Kimi MMMU on 2-host, single-host accuracy on 1-host
-      timezone: "America/Los_Angeles"
-    - cron: "0 17 * * *"  # accuracy day-5pm: Gemma4/Qwen3.5 MMMU on 1-host, DeepSeek accuracy + long P/D gates on 2-host
+    - cron: "0 1 * * *"
       timezone: "America/Los_Angeles"
   workflow_dispatch:
     inputs:
@@ -38,10 +30,9 @@ on:
         description: "Git ref to test"
         required: false
         default: main
-      # Scheduled runs (inputs empty) run their slot's stages; `all` is the
-      # 1 AM slot. A stage name runs one stage; the sh/mh/pd-* choices pass
-      # through to feature-validation-tpu.yml for a single feature-validation
-      # job; nightly-10am / nightly-5pm run that daytime slot.
+      # Scheduled runs (inputs empty) run everything. A stage name runs one
+      # stage; the sh/mh/pd-* choices pass through to feature-validation-tpu.yml
+      # for a single feature-validation job.
       only:
         description: "Run only one stage (or one feature-validation part)"
         required: false
@@ -51,8 +42,6 @@ on:
           - all
           - feature-validation
           - perf
-          - nightly-10am
-          - nightly-5pm
           - mh
           - pd-mh-gpt-120b
           - pd-mh-gpt-120b-pc-offload
@@ -80,36 +69,10 @@ on:
         type: boolean
 
 concurrency:
-  # One group per slot: a late 10 AM accuracy run must not hold 5 PM back.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.schedule || inputs.only || 'all' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # The selection every stage below filters on: the dispatch input when given,
-  # else the schedule slot that fired.
-  plan:
-    runs-on: ubuntu-latest
-    outputs:
-      only: ${{ steps.p.outputs.only }}
-    steps:
-      - id: p
-        env:
-          ONLY: ${{ inputs.only }}
-          SCHEDULE: ${{ github.event.schedule }}
-        run: |
-          set -euo pipefail
-          if [ -z "$ONLY" ]; then
-            case "$SCHEDULE" in
-              "0 1 * * *") ONLY=all ;;
-              "0 10 * * *") ONLY=nightly-10am ;;
-              "0 17 * * *") ONLY=nightly-5pm ;;
-              # Never fall back to `all`: that would put the wrong stages on the slices.
-              *) echo "::error::no selection for schedule '$SCHEDULE'"; exit 1 ;;
-            esac
-          fi
-          echo "only=$ONLY" >> "$GITHUB_OUTPUT"
-          echo "selection: $ONLY"
-
   build:
     uses: ./.github/workflows/_tpu-build.yml
     with:
@@ -122,13 +85,13 @@ jobs:
   # groups, and the static P/D disaggregation gates. Everything except `all`
   # and `feature-validation` in the sh/mh/pd-* family narrows it to one job.
   feature-validation:
-    needs: [build, plan]
-    if: ${{ !contains(fromJSON('["perf","nightly-10am","nightly-5pm"]'), needs.plan.outputs.only) }}
+    needs: build
+    if: ${{ (inputs.only || 'all') != 'perf' }}
     uses: ./.github/workflows/feature-validation-tpu.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
-      only: ${{ contains(fromJSON('["all","feature-validation"]'), needs.plan.outputs.only) && 'all' || needs.plan.outputs.only }}
+      only: ${{ contains(fromJSON('["all","feature-validation"]'), inputs.only || 'all') && 'all' || inputs.only }}
       test_filter: ${{ inputs.test_filter || '' }}
       # Without this the test_filter/update-dashboard guard inside the called
       # workflow never sees the flag, so a filtered run could publish.
@@ -139,48 +102,13 @@ jobs:
 
   # Perf: throughput sweeps, one job per model.
   perf:
-    needs: [build, plan]
-    if: ${{ contains(fromJSON('["all","perf"]'), needs.plan.outputs.only) }}
+    needs: build
+    if: ${{ contains(fromJSON('["all","perf"]'), inputs.only || 'all') }}
     uses: ./.github/workflows/perf-test-tpu.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       model: all
-    permissions:
-      contents: read
-      id-token: write
-
-  # The daytime slots: accuracy, one job per benchmark; the selection picks the
-  # slot's tests.
-  accuracy:
-    needs: [build, plan]
-    if: ${{ contains(fromJSON('["nightly-10am","nightly-5pm"]'), needs.plan.outputs.only) }}
-    uses: ./.github/workflows/accuracy-test-tpu.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      model: ${{ needs.plan.outputs.only == 'nightly-10am' && 'day-10am' || 'day-5pm' }}
-      test_filter: ${{ inputs.test_filter || '' }}
-    permissions:
-      contents: read
-      id-token: write
-      # collect-full-evaluations reads this run's job logs.
-      actions: read
-
-  # The 5 PM slot also takes the two kv-offload-resharding P/D gates: each holds
-  # both 2-host slices for over an hour, more than the 1 AM lane can spare.
-  pd-kvoff-reshard:
-    needs: [build, plan]
-    if: ${{ needs.plan.outputs.only == 'nightly-5pm' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        only: [pd-mh-gpt-120b-kvoff-reshard, pd-mh-qwen3-480b-kvoff-reshard]
-    uses: ./.github/workflows/feature-validation-tpu.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      only: ${{ matrix.only }}
     permissions:
       contents: read
       id-token: write
