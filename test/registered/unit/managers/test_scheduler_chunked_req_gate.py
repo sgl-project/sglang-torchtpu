@@ -193,6 +193,10 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertIsNone(s.chunked_req)
 
 
+def _held_kv() -> SimpleNamespace:
+    return SimpleNamespace(holds_kv=True, holds_mamba=False)
+
+
 class TestChunkedAbortNativeReadDrain(CustomTestCase):
     def _scheduler(self, req):
         scheduler = Scheduler.__new__(Scheduler)
@@ -271,10 +275,10 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
     def test_sender_drain_keeps_prefill_non_idle_until_pages_release(self, release_kv):
         sender = MagicMock()
         sender.drained.side_effect = [False, True]
-        req = SimpleNamespace(disagg_kv_sender=sender)
+        req = SimpleNamespace(disagg_kv_sender=sender, kv=_held_kv())
         ready_sender = MagicMock()
         ready_sender.drained.return_value = True
-        ready_req = SimpleNamespace(disagg_kv_sender=ready_sender)
+        ready_req = SimpleNamespace(disagg_kv_sender=ready_sender, kv=_held_kv())
         scheduler = self._idle_prefill_scheduler()
         self.assertTrue(scheduler.is_fully_idle())
 
@@ -309,6 +313,25 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         self.assertTrue(scheduler.flush_cache(empty_cache=False))
         scheduler.tree_cache.reset.assert_called_once_with()
         scheduler.token_to_kv_pool_allocator.clear.assert_called_once_with()
+
+    @patch("sglang.srt.managers.scheduler.release_kv_cache")
+    def test_drain_skips_release_when_overlap_retire_already_released(self, release_kv):
+        # Under overlap, the parked request's in-flight chunk result retires it
+        # (and releases its KV) before the sender drains.
+        sender = MagicMock()
+        sender.drained.return_value = True
+        req = SimpleNamespace(
+            disagg_kv_sender=sender,
+            kv=SimpleNamespace(holds_kv=False, holds_mamba=False),
+        )
+        scheduler = self._idle_prefill_scheduler()
+        scheduler._deferred_chunked_sender_aborts = [req]
+
+        scheduler._drain_deferred_chunked_sender_aborts()
+
+        sender.clear.assert_called_once_with()
+        release_kv.assert_not_called()
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
 
     def test_prefill_event_loops_poll_deferred_aborts(self):
         for loop_name in (
@@ -353,7 +376,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.ingest_requests = MagicMock(side_effect=ingest)
         sender = MagicMock()
         sender.drained.side_effect = [False, True]
-        req = SimpleNamespace(disagg_kv_sender=sender)
+        req = SimpleNamespace(disagg_kv_sender=sender, kv=_held_kv())
         scheduler._deferred_chunked_sender_aborts = [req]
 
         with patch("sglang.srt.managers.scheduler.release_kv_cache") as release_kv:

@@ -3792,7 +3792,12 @@ class Scheduler(
                 still_held.append(req)
                 continue
             sender.clear()
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            # Under overlap, the in-flight chunk's result can retire this
+            # request (_retire_aborted_prefill_result) after it was parked
+            # here, which already released its KV. Releasing again would trip
+            # release_kv_cache's free-before-alloc assert.
+            if req.kv.holds_kv or req.kv.holds_mamba:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
         self._deferred_chunked_sender_aborts = still_held
 
     def _build_hisparse_decode_batch(self, reqs):
