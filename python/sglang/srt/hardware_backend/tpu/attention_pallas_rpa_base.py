@@ -47,7 +47,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInputType
 
 if TYPE_CHECKING:
@@ -1078,25 +1078,73 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             if draft_kv_lens is not None
             else self.forward_metadata.kv_lens
         )
-        out = op(
-            q,
-            k,
-            v,
-            kv_cache,
-            kv_lens,
-            page_indices,
-            self.forward_metadata.cu_q_lens,
-            self.forward_metadata.cu_kv_lens,
-            self.forward_metadata.distribution,
-            sinks,
-            float(layer.scaling),
-            sliding_window,
-            soft_cap,
-            k_scale,
-            v_scale,
-            self.forward_metadata.decode_query_size,
-            use_causal_mask=use_causal_mask,
-        )
+        dcp_size = get_parallel().attn_dcp_size
+        if dcp_size > 1:
+            dcp_group = get_parallel().dcp_group
+            dcp_rank = get_parallel().attn_dcp_rank
+
+            # 1. Gather Q across DCP group along head dimension
+            zeros_q = torch.zeros_like(q)
+            padded_q = torch.cat(
+                [q if i == dcp_rank else zeros_q for i in range(dcp_size)], dim=1
+            )
+            q_all = dcp_group.all_reduce(padded_q.contiguous())
+
+            # 2. Gather sinks across DCP group along head dimension
+            if sinks is not None:
+                zeros_s = torch.zeros_like(sinks)
+                padded_s = torch.cat(
+                    [sinks if i == dcp_rank else zeros_s for i in range(dcp_size)], dim=0
+                )
+                sinks_all = dcp_group.all_reduce(padded_s.contiguous())
+            else:
+                sinks_all = None
+
+            out = op(
+                q_all,
+                k,
+                v,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.cu_kv_lens,
+                self.forward_metadata.distribution,
+                sinks_all,
+                float(layer.scaling),
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+                self.forward_metadata.decode_query_size,
+                use_causal_mask=use_causal_mask,
+            )
+
+            # 3. Slice out this rank's own heads
+            heads_per_rank = layer.tp_q_head_num
+            head_start = heads_per_rank * dcp_rank
+            head_end = heads_per_rank * (dcp_rank + 1)
+            out = out[:, head_start:head_end, :].contiguous()
+        else:
+            out = op(
+                q,
+                k,
+                v,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.cu_kv_lens,
+                self.forward_metadata.distribution,
+                sinks,
+                float(layer.scaling),
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+                self.forward_metadata.decode_query_size,
+                use_causal_mask=use_causal_mask,
+            )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
         # FULL capture retains padded rows for later EAGLE steps.

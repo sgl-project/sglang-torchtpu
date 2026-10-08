@@ -107,7 +107,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     kind = ContextParallelStrategyKind.ZIGZAG
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
-        if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
+        if self.cp_size <= 1:
+            return False
+        min_tokens = self.cp_size * 2
+        if num_tokens < min_tokens:
             return False
         forward_mode = getattr(forward_batch, "forward_mode", None)
         if forward_mode is not None and not forward_mode.is_context_parallel_extend():
@@ -116,7 +119,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+        return all(int(length) >= min_tokens for length in extend_lens)
 
     def build_metadata(
         self,
@@ -169,37 +172,28 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         max_rank_len = [max(per_rank_actual_token)] * self.cp_size
 
         cp_rank = self.cp_rank
-        zigzag_index = list(
-            range(cp_rank, cp_rank + bs * cp_segment_num, cp_segment_num)
-        ) + list(
-            range(
-                cp_segment_num - cp_rank - 1,
-                bs * cp_segment_num,
-                cp_segment_num,
-            )
-        )
-
-        cp_reverse_index: List[int] = []
+        zigzag_index: List[int] = []
         for batch_id in range(bs):
-            cp_reverse_index.extend(
-                list(range(batch_id, cp_segment_num * bs, 2 * bs))
-                + list(
-                    range(
-                        (cp_segment_num - 1) * bs + batch_id,
-                        0,
-                        -2 * bs,
-                    )
-                )
+            zigzag_index.append(batch_id * cp_segment_num + cp_rank)
+            zigzag_index.append(
+                batch_id * cp_segment_num + (cp_segment_num - cp_rank - 1)
             )
 
         reverse_split_len: List[int] = []
-        for rank in range(self.cp_size):
+        gathered_chunk_ids: List[int] = []
+        for r in range(self.cp_size):
             for batch_id in range(bs):
-                reverse_split_len.append(per_seq_block_sizes[batch_id][rank])
-            for batch_id in range(bs):
+                reverse_split_len.append(per_seq_block_sizes[batch_id][r])
+                gathered_chunk_ids.append(batch_id * cp_segment_num + r)
                 reverse_split_len.append(
-                    per_seq_block_sizes[batch_id][cp_segment_num - 1 - rank]
+                    per_seq_block_sizes[batch_id][cp_segment_num - 1 - r]
                 )
+                gathered_chunk_ids.append(
+                    batch_id * cp_segment_num + (cp_segment_num - 1 - r)
+                )
+
+        target_chunk_ids = list(range(bs * cp_segment_num))
+        cp_reverse_index = [gathered_chunk_ids.index(c) for c in target_chunk_ids]
 
         kv_len_prev_list: List[int] = []
         kv_len_next_list: List[int] = []
@@ -223,8 +217,15 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         cu_next = [0] + list(accumulate(actual_seq_q_next_list))
         cu_kv_prev = [0] + list(accumulate(kv_len_prev_list))
         cu_kv_next = [0] + list(accumulate(kv_len_next_list))
-        actual_seq_q_combined_list = actual_seq_q_prev_list + actual_seq_q_next_list
-        kv_len_combined_list = kv_len_prev_list + kv_len_next_list
+
+        actual_seq_q_combined_list: List[int] = []
+        kv_len_combined_list: List[int] = []
+        for batch_id in range(bs):
+            actual_seq_q_combined_list.append(actual_seq_q_prev_list[batch_id])
+            actual_seq_q_combined_list.append(actual_seq_q_next_list[batch_id])
+            kv_len_combined_list.append(kv_len_prev_list[batch_id])
+            kv_len_combined_list.append(kv_len_next_list[batch_id])
+
         cu_q_combined = [0] + list(accumulate(actual_seq_q_combined_list))
         cu_kv_combined = [0] + list(accumulate(kv_len_combined_list))
 
@@ -357,6 +358,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,
             CPAttentionBackendKind.TRTLLM_MHA,
+            CPAttentionBackendKind.PALLAS_RPA,
         ]
 
     def run_attention(
@@ -461,10 +463,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         meta = forward_batch.attn_cp_metadata
         per_rank_token = meta.per_rank_logical_token or meta.per_rank_actual_token
         max_len = max(per_rank_token)
-        if per_rank_token == meta.per_rank_actual_token:
-            local_len = x.shape[0]
-        else:
-            local_len = per_rank_token[self.cp_rank]
+        local_len = per_rank_token[self.cp_rank]
         assert x.shape[0] >= local_len
         x = x[:local_len]
         pad_size = max_len - x.shape[0]

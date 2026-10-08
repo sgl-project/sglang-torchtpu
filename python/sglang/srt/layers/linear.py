@@ -1199,7 +1199,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 source_rank = (
                     self.tp_rank
                     if shard_id == "q"
-                    else self.tp_rank // self.num_kv_head_replicas
+                    else self.kv_tp_rank // self.num_kv_head_replicas
                 )
                 global_start = source_rank * local_size
                 block_start = global_start // block_n
@@ -1290,7 +1290,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 source_rank = (
                     self.tp_rank
                     if loaded_shard_id == "q"
-                    else self.tp_rank // self.num_kv_head_replicas
+                    else self.kv_tp_rank // self.num_kv_head_replicas
                 )
                 global_start = source_rank * local_size
                 param_offset = sum(

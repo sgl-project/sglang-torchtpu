@@ -389,20 +389,25 @@ class GptOssAttention(nn.Module):
 
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
+        # K/V are replicated within a DCP group, so they shard across
+        # attn_tp_size // dcp_size groups while Q stays sharded by attn_tp.
+        dcp_size = get_parallel().attn_dcp_size
+        kv_tp_rank = attn_tp_rank // dcp_size
+        kv_tp_size = attn_tp_size // dcp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
+        if self.total_num_kv_heads >= kv_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
+            assert self.total_num_kv_heads % kv_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
+            assert kv_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // kv_tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -421,6 +426,8 @@ class GptOssAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            kv_tp_rank=kv_tp_rank,
+            kv_tp_size=kv_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 

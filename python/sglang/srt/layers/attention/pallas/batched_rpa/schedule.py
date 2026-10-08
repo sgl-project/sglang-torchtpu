@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import dataclasses
 import functools
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any
 
 import jax
@@ -93,14 +93,16 @@ class SeqAlongLaneDmaNew(DmaNew):
 
     @property
     def fetch_val(self):
-        return self._flags[...] & 1
+        # First 16 bits are for fetch
+        return self._flags[...] & 0xFFFF
 
     @property
     def wb_val(self):
-        return (self._flags[...] >> 1) & 1
+        # Last 16 bits are for writeback
+        return self._flags[...] >> 16
 
     def set_flags(self, fetch_val, wb_val):
-        self._flags[...] = fetch_val | (wb_val << 1)
+        self._flags[...] = fetch_val | (wb_val << 16)
 
 
 @jax.tree_util.register_dataclass
@@ -167,7 +169,9 @@ class SmemArrayOfStructs(SmemWrapper):
     struct_size: int = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
-    def create_shape_dtype(cls, shape, struct_cls, struct_size):
+    def create_shape_dtype(
+        cls, shape, struct_cls, struct_size
+    ):  # pytype: disable=bad-override
         assert struct_size == struct_cls.num_fields()
         return cls(
             data=jax.ShapeDtypeStruct((np.prod(shape) * struct_size,), jnp.int32),
@@ -207,12 +211,18 @@ class RpaSchedule:
     total_wait_kv_out: SmemWrapper  # [steps]
     total_wait_q_in: SmemWrapper  # [steps]
     total_wait_o_out: SmemWrapper  # [steps]
+    total_wait_lse_out: SmemWrapper  # [steps]
     actual_steps: Any  # [1]
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
-    def create_shape_dtype(cls, cfgs: configs.RpaConfigs, multiplier: int = 1):
+    def create_shape_dtype(
+        cls,
+        cfgs: configs.RpaConfigs,
+        dma_kv_new_struct_cls: type[DmaNew] = SeqAlongLaneDmaNew,
+        multiplier: int = 1,
+    ):
         effective_max_steps = cfgs.max_steps_ub * multiplier
 
         idx_wrapper = SmemWrapper.create_shape_dtype(
@@ -239,17 +249,14 @@ class RpaSchedule:
                     cfgs.batch_size,
                     cfgs.bkv_p_new,
                 ),
-                struct_cls=(
-                    SeqAlongLaneDmaNew
-                    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
-                    else HeadAlongSublaneDmaNew
-                ),
+                struct_cls=dma_kv_new_struct_cls,
                 struct_size=cfgs.dma_kv_new_size,
             ),
             total_wait_kv_in=steps_wrapper,
             total_wait_kv_out=steps_wrapper,
             total_wait_q_in=steps_wrapper,
             total_wait_o_out=steps_wrapper,
+            total_wait_lse_out=steps_wrapper,
             actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),
             cfgs=cfgs,
         )
@@ -338,6 +345,7 @@ def _mask_out_steps(
     schedule_smem.total_wait_kv_out[step] = 0
     schedule_smem.total_wait_q_in[step] = 0
     schedule_smem.total_wait_o_out[step] = 0
+    schedule_smem.total_wait_lse_out[step] = 0
 
 
 def _write_schedule_to_hbm(
@@ -350,7 +358,9 @@ def _write_schedule_to_hbm(
     cfgs: configs.RpaConfigs,
 ):
     """Writes `num_steps` of metadata from `schedule_smem` to `schedule_hbm` at `hbm_offset`."""
-    hbm_offset_aligned = pl.multiple_of(hbm_offset, 128)
+    hbm_offset_aligned = pl.multiple_of(
+        hbm_offset, 128
+    )  # pytype: disable=bad-argument-type
     flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
     flat_smem = jax.tree_util.tree_leaves(schedule_smem)
     dma_list = []
@@ -398,24 +408,11 @@ def _compute_waits(
         # KV IN
         kv_in_tokens = 0
         for b in range(cfgs.batch_size):
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                for i in range(cfgs.bkv_p_cache):
-                    _, _, dma_valid = schedule.get_dma_kv_cache(step, b, i)
-                    kv_in_tokens += dma_valid * cfgs.serve.page_size
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_in_tokens += jnp.where(
-                        dma_entry.fetch_val > 0, cfgs.serve.page_size, 0
-                    )
-            else:
-                for i in range(cfgs.bkv_p_cache):
-                    _, _, sz = schedule.get_dma_kv_cache(step, b, i)
-                    kv_in_tokens += sz
-                total_new_sz = 0
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    total_new_sz += dma_entry.fetch_val
-                kv_in_tokens += total_new_sz
+            for i in range(cfgs.bkv_p_cache):
+                _, _, sz = schedule.get_dma_kv_cache(step, b, i)
+                kv_in_tokens += sz
+            for i in range(cfgs.bkv_p_new):
+                kv_in_tokens += schedule.dma_kv_new[step, b, i].fetch_val
 
         schedule.total_wait_kv_in[step] = (
             kv_in_tokens * kv_bytes_per_token
@@ -425,16 +422,9 @@ def _compute_waits(
         kv_out_tokens = 0
         for b in range(cfgs.batch_size):
             do_writeback = schedule.do_writeback[step, b] == 1
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_out_tokens += jnp.where(
-                        do_writeback & (dma_entry.wb_val > 0), cfgs.serve.page_size, 0
-                    )
-            else:
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val, 0)
+            for i in range(cfgs.bkv_p_new):
+                dma_entry = schedule.dma_kv_new[step, b, i]
+                kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val, 0)
 
         schedule.total_wait_kv_out[step] = (
             kv_out_tokens * kv_bytes_per_token
@@ -458,6 +448,17 @@ def _compute_waits(
         schedule.total_wait_o_out[step] = (
             o_out_tokens * o_bytes_per_token
         ) // dma_chunk_size
+
+        # LSE OUT
+        lse_bytes_per_token = (
+            cfgs.model.num_kv_heads
+            * cfgs.lse_rows_per_token
+            * 128
+            * cfgs.serve.dtype_out.itemsize
+        )
+        schedule.total_wait_lse_out[step] = pl.cdiv(
+            o_out_tokens * lse_bytes_per_token, dma_chunk_size
+        )
 
     jax.lax.fori_loop(start_step, end_step, body, None)
 
@@ -500,27 +501,44 @@ class LoopCarry:
     count: jax.Array | int
 
 
-def compute_metadata(
-    cu_q_lens_ref: jax.Ref,
-    kv_lens_ref: jax.Ref,
-    distribution_ref: jax.Ref,
-    schedule: RpaSchedule,
-    schedule_hbm_ref: RpaSchedule,
-    dma_sem: jax.Ref,
-    *,
-    cfgs: configs.RpaConfigs,
-    skip_kv_update: bool = False,
-) -> LoopCarry:
-    """Fill metadata using triple nested loop of seq->q->k loop.
+class BaseMetadataComputer:
+    """Base metadata scheduler computing seq -> q -> k loops."""
 
-    When `skip_kv_update=True` (cross-layer KV-share path): the current step's
-    K/V tokens are NOT pulled from the input k/v tensors, the whole `kv_len` is
-    read from the (redirected) cache slot, and `do_writeback` is forced to 0 so
-    the kernel doesn't overwrite the source layer's cache contents.
-    """
+    @classmethod
+    def get_rpa_schedule(
+        cls, cfgs: configs.RpaConfigs, multiplier: int = 1
+    ) -> RpaSchedule:
+        """Returns the RpaSchedule shape/dtype struct for this metadata computer."""
+        dma_kv_new_struct_cls = (
+            HeadAlongSublaneDmaNew
+            if cfgs.serve.kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+            else SeqAlongLaneDmaNew
+        )
+        return RpaSchedule.create_shape_dtype(
+            cfgs,
+            dma_kv_new_struct_cls=dma_kv_new_struct_cls,
+            multiplier=multiplier,
+        )
+
+    def __init__(
+        self,
+        schedule: RpaSchedule,
+        schedule_hbm_ref: RpaSchedule,
+        dma_sem: jax.Ref,
+        *,
+        cfgs: configs.RpaConfigs,
+        extra_refs: Sequence[jax.Ref] = (),
+        **kwargs,
+    ):
+        self.schedule = schedule
+        self.schedule_hbm_ref = schedule_hbm_ref
+        self.dma_sem = dma_sem
+        self.cfgs = cfgs
+        self.extra_refs = extra_refs
 
     @jax.named_scope("k_loop")
     def k_loop(
+        self,
         k_idx,
         carry: LoopCarry,
         *,
@@ -529,10 +547,17 @@ def compute_metadata(
         q_end,
         q_src,
         q_sz_task,
-        k_len,
-        q_len,
+        kv_cache_len,
+        kv_new_len,
         end_k_idx,
-    ):
+        update_kv_cache,
+        kv_new_start=0,
+        num_k=0,
+        num_q=0,
+        **kwargs,
+    ) -> LoopCarry:
+        cfgs = self.cfgs
+        schedule = self.schedule
         count = carry.count
         step, target_lane = divmod(count, cfgs.batch_size)
 
@@ -548,16 +573,9 @@ def compute_metadata(
 
         kv_len_start = k_idx * cfgs.bkv_sz
         kv_p_start = k_idx * cfgs.bkv_p
+        k_len = kv_cache_len + kv_new_len
         kv_left = k_len - kv_len_start
-        if skip_kv_update:
-            # KV-share: read everything from cache. The source (target) layer's
-            # call ran earlier in this step and already wrote the current-step
-            # K/V into the (redirected) cache slot, so this shared layer's
-            # locally-computed k/v is unused. Drives kv_left_frm_new -> 0 ->
-            # new_sz -> 0 -> do_writeback -> 0 automatically.
-            kv_left_frm_cache = kv_left
-        else:
-            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
 
         for i in range(cfgs.bkv_p_cache):
@@ -567,15 +585,11 @@ def compute_metadata(
 
             src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
 
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                dma_valid = jnp.where(dma_sz > 0, 1, 0)
-                schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                schedule.dma_kv_cache[step, target_lane, i, 2] = dma_valid
-            else:
-                schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                schedule.dma_kv_cache[step, target_lane, i, 2] = dma_sz
+            schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
+            schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
+            schedule.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
+                dma_sz, cfgs.kv_token_align
+            )
 
         kv_left_frm_new = kv_left - kv_left_frm_cache
         bkv_sz_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
@@ -583,47 +597,41 @@ def compute_metadata(
 
         # Writeback logic: each new k block is written back by the first q block
         # that attends to it.
-        q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
+        q_wb = jnp.maximum(0, kv_len_start - kv_cache_len) // cfgs.bq_sz
 
-        do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
+        do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb) & update_kv_cache, 1, 0)
         schedule.do_writeback[step, target_lane] = do_writeback
         src_hbm = q_end - kv_left_frm_new
 
-        def fill_dma_kv_new(i, dst_vmem, dma_sz, slot_start):
+        def fill_dma_kv_new(i, dst_vmem, dma_sz):
             dma_entry = schedule.dma_kv_new[step, target_lane, i]
             if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
-                hbm_token_idx_base = q_end - kv_left_frm_new
-                new_tok_offset = hbm_token_idx_base % cfgs.serve.page_size
-                # If new_sz = 150, new_tok_offset = 120, page_size = 128.  The new
-                # tokens occupy indices 120 through 269 relative to the HBM page
-                # boundaries.  This spans 3 pages: [120-127], [128-255], and [256-269].
-                # (120 + 150 - 1) // 128 + 1 = 269 // 128 + 1 = 3 pages.
-                num_pages_to_fetch = jnp.where(
-                    new_sz > 0,
-                    (new_tok_offset + new_sz - 1) // cfgs.serve.page_size + 1,
-                    0,
-                )
-                fetch_val = jnp.where(i < num_pages_to_fetch, 1, 0)
-                new_page_start = (
-                    hbm_token_idx_base - new_tok_offset
-                ) + i * cfgs.serve.page_size
-                # Fetched pages of new tokens are placed sequentially in VMEM
-                # immediately following the existing cached pages. E.g., if
-                # cache_pages=2, new pages go to offsets 2*page_size, 3*page_size, etc.
-                fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
+                align = cfgs.kv_token_align
+                # Fetch: the new tokens are contiguous, so one DMA moves all of them
+                # even though this loop runs once per page. Entry 0 carries that DMA
+                # and the other entries stay zero.
+                if i == 0:
+                    src, _, fetch_val = utils.align_span(src_hbm, new_sz, align)
+                    dma_entry.fetch_hbm[...] = src
+                    dma_entry.fetch_vmem[...] = utils.align_to(bkv_sz_cache, align)
+                    fetch_val = jnp.where(new_sz > 0, fetch_val, 0)
+                else:
+                    fetch_val = 0
+
+                # Writeback: one DMA per page, since page_indices scatters them.
+                tok_idx = kv_len_start + dst_vmem
                 p_idx = jnp.minimum(
-                    (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
+                    tok_idx >> cfgs.serve.page_size_log2,
                     cfgs.serve.pages_per_seq - 1,
                 )
-                dst_hbm = s_idx * cfgs.serve.pages_per_seq + p_idx
-                wb_val = jnp.where(dma_sz > 0, 1, 0)
-
-                dma_entry.fetch_hbm[...] = new_page_start
-                dma_entry.fetch_vmem[...] = fetch_vmem
-                dma_entry.wb_hbm[...] = dst_hbm
-                dma_entry.wb_vmem[...] = slot_start
-                dma_entry.set_flags(fetch_val, wb_val)
+                p_off = tok_idx & cfgs.serve.page_size_mask
+                dst, lead, wb_val = utils.align_span(p_off, dma_sz, align)
+                dma_entry.wb_hbm[...] = (
+                    (s_idx * cfgs.serve.pages_per_seq + p_idx)
+                    << cfgs.serve.page_size_log2
+                ) | dst
+                dma_entry.wb_vmem[...] = dst_vmem - lead
+                dma_entry.set_flags(fetch_val, jnp.where(dma_sz > 0, wb_val, 0))
             else:
                 p_idx = jnp.minimum(
                     (kv_len_start + dst_vmem) >> cfgs.serve.page_size_log2,
@@ -638,13 +646,25 @@ def compute_metadata(
                 dma_entry.fetch_hbm[...] = src_hbm
                 dma_entry.fetch_vmem[...] = dst_vmem
                 dma_entry.wb_hbm[...] = dst_hbm
+                dma_entry.wb_vmem[...] = dst_vmem
                 dma_entry.set_flags(dma_sz, dma_sz)
 
-        if cfgs.block.bq_sz == 1:
-            # Decode path
-            assert cfgs.bkv_p_new == 1
-            slot_start = (bkv_sz_cache // cfgs.serve.page_size) * cfgs.serve.page_size
-            fill_dma_kv_new(0, bkv_sz_cache, new_sz, slot_start)
+        if cfgs.bkv_p_new < cfgs.bkv_p:
+            # General decode path for any bkv_p_new
+            curr_vmem = bkv_sz_cache
+            curr_rem = new_sz
+
+            for i in range(cfgs.bkv_p_new):
+                slot_start = (curr_vmem // cfgs.serve.page_size) * cfgs.serve.page_size
+                slot_end = slot_start + cfgs.serve.page_size
+
+                dma_sz = jnp.minimum(curr_rem, slot_end - curr_vmem)
+                dma_sz = jnp.where(curr_rem > 0, dma_sz, 0)
+
+                fill_dma_kv_new(i, curr_vmem, dma_sz)
+
+                curr_vmem += dma_sz
+                curr_rem = jnp.maximum(0, curr_rem - dma_sz)
         else:
             iters = max(cfgs.bkv_p, cfgs.bkv_p_new)
             for i in range(iters):
@@ -655,92 +675,151 @@ def compute_metadata(
                 end_in_slot = jnp.minimum(slot_end, bkv_sz_cache + new_sz)
                 dma_sz = jnp.maximum(0, end_in_slot - dst_vmem)
 
-                fill_dma_kv_new(i, dst_vmem, dma_sz, slot_start)
+                fill_dma_kv_new(i, dst_vmem, dma_sz)
 
-        def flush(carry: LoopCarry):
-            hbm_offset = carry.hbm_offset
-            count = carry.count
-            new_hbm_offset, _ = flush_to_hbm(
-                count,
-                schedule,
-                schedule_hbm_ref,
-                hbm_offset,
-                dma_sem,
-                cfgs=cfgs,
-            )
-            return LoopCarry(new_hbm_offset, 0)
+        return self.advance_carry(carry)
 
-        hbm_offset = carry.hbm_offset
-        new_count = count + 1
-
+    def advance_carry(self, carry: LoopCarry) -> LoopCarry:
+        new_count = carry.count + 1
         return jax.lax.cond(
-            new_count < cfgs.max_steps_ub * cfgs.batch_size,
-            lambda carry: carry,
-            flush,
-            LoopCarry(hbm_offset, new_count),
+            new_count < self.cfgs.max_steps_ub * self.cfgs.batch_size,
+            lambda c: c,
+            self.flush_carry,
+            LoopCarry(carry.hbm_offset, new_count),
         )
 
+    def flush_carry(self, carry: LoopCarry) -> LoopCarry:
+        new_hbm_offset, _ = flush_to_hbm(
+            carry.count,
+            self.schedule,
+            self.schedule_hbm_ref,
+            carry.hbm_offset,
+            self.dma_sem,
+            cfgs=self.cfgs,
+        )
+        return LoopCarry(new_hbm_offset, 0)
+
     @jax.named_scope("q_loop")
-    def q_loop(q_idx, carry, *, s_idx, q_start, q_end, k_len, q_len, num_k):
+    def q_loop(
+        self,
+        q_idx,
+        carry: LoopCarry,
+        *,
+        s_idx,
+        q_start,
+        q_end,
+        q_position,
+        global_kv_cache_len,
+        kv_new_len,
+        num_k,
+        num_q,
+        update_kv_cache,
+    ) -> LoopCarry:
+        cfgs = self.cfgs
         q_src = q_start + q_idx * cfgs.bq_sz
         q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
 
         start_k_idx = 0
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
+            sw_start_idx = q_position + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
         end_k_idx_causal = (
-            k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1
+            q_position + q_idx * cfgs.bq_sz + q_sz_task - 1
         ) // cfgs.bkv_sz + 1
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
 
+        if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+            start_k_idx = jnp.maximum(start_k_idx, global_kv_cache_len // cfgs.bkv_sz)
+
         k_loop_fn = functools.partial(
-            k_loop,
+            self.k_loop,
             s_idx=s_idx,
             q_idx=q_idx,
             q_end=q_end,
             q_src=q_src,
             q_sz_task=q_sz_task,
-            k_len=k_len,
-            q_len=q_len,
+            kv_cache_len=global_kv_cache_len,
+            kv_new_len=kv_new_len,
             end_k_idx=end_k_idx,
+            update_kv_cache=update_kv_cache,
         )
 
         return jax.lax.fori_loop(start_k_idx, end_k_idx, k_loop_fn, carry)
 
     @jax.named_scope("seq_loop")
-    def seq_loop(s_idx, carry):
+    def seq_loop(
+        self,
+        s_idx,
+        carry: LoopCarry,
+        *,
+        cu_q_lens_ref,
+        q_positions_ref,
+        global_kv_cache_lens_ref,
+        kv_new_lens_ref,
+        update_kv_cache_ref,
+    ) -> LoopCarry:
         q_start = cu_q_lens_ref[s_idx]
         q_end = cu_q_lens_ref[s_idx + 1]
-        k_len = kv_lens_ref[s_idx]
         q_len = q_end - q_start
+        q_position = q_positions_ref[s_idx]
+        global_kv_cache_len = global_kv_cache_lens_ref[s_idx]
+        kv_new_len = kv_new_lens_ref[s_idx]
+        k_len = global_kv_cache_len + kv_new_len
+        update_kv_cache = update_kv_cache_ref[s_idx]
 
-        num_q = pl.cdiv(q_len, cfgs.bq_sz)
-        num_k = pl.cdiv(k_len, cfgs.bkv_sz)
+        num_q = pl.cdiv(q_len, self.cfgs.bq_sz)
+        num_k = pl.cdiv(k_len, self.cfgs.bkv_sz)
 
         q_loop_fn = functools.partial(
-            q_loop,
+            self.q_loop,
             s_idx=s_idx,
             q_start=q_start,
             q_end=q_end,
-            k_len=k_len,
-            q_len=q_len,
+            q_position=q_position,
+            global_kv_cache_len=global_kv_cache_len,
+            kv_new_len=kv_new_len,
             num_k=num_k,
+            num_q=num_q,
+            update_kv_cache=update_kv_cache,
         )
 
         return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
 
-    start_seq_idx, end_seq_idx = cfgs.mode.get_range(distribution_ref)
-    init_carry = LoopCarry(0, 0)
-    return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, init_carry)
+    def compute(
+        self,
+        cu_q_lens_ref: jax.Ref,
+        q_positions_ref: jax.Ref,
+        global_kv_cache_lens_ref: jax.Ref,
+        kv_new_lens_ref: jax.Ref,
+        update_kv_cache_ref: jax.Ref,
+        distribution_ref: jax.Ref,
+    ) -> LoopCarry:
+        """Generates the metadata schedule across all sequences."""
+        seq_loop_fn = functools.partial(
+            self.seq_loop,
+            cu_q_lens_ref=cu_q_lens_ref,
+            q_positions_ref=q_positions_ref,
+            global_kv_cache_lens_ref=global_kv_cache_lens_ref,
+            kv_new_lens_ref=kv_new_lens_ref,
+            update_kv_cache_ref=update_kv_cache_ref,
+        )
+        start_seq_idx, end_seq_idx = self.cfgs.mode.get_range(
+            distribution_ref
+        )  # pytype: disable=bad-argument-type
+        init_carry = LoopCarry(0, 0)
+        return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop_fn, init_carry)
 
 
 def rpa_metadata_schedule_kernel(
     ## Scalar prefetch.
     cu_q_lens_ref: jax.Ref,
-    kv_lens_ref: jax.Ref,
+    q_positions_ref: jax.Ref,
+    global_kv_cache_lens_ref: jax.Ref,
+    kv_new_lens_ref: jax.Ref,
+    update_kv_cache_ref: jax.Ref,
     distribution_ref: jax.Ref,
+    extra_scalars_ref: Sequence[jax.Ref],
     # Outputs.
     schedule_hbm_ref: RpaSchedule,
     # Scratch.
@@ -748,7 +827,7 @@ def rpa_metadata_schedule_kernel(
     dma_sem: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
-    skip_kv_update: bool = False,
+    computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
 ):
     """Generates the HBM-to-VMEM DMA schedule.
 
@@ -756,37 +835,51 @@ def rpa_metadata_schedule_kernel(
     1. Iterates through each (potentially ragged) sequence
     2. Breaks Queries (Q) and Key-Values (KV) into blocks (bq_sz, bkv_sz).
     3. Assigns tasks to 'lanes' (TPU batch items) based on current lane occupancy
-        to ensure balanced execution across the batch dimension.
+      to ensure balanced execution across the batch dimension.
     4. Encodes DMA offsets:
-        - dma_q: HBM start index and size for Query blocks.
-        - dma_kv_cache: Paged indices for existing KV tokens.
-        - dma_kv_new: offsets for new tokens being added to the cache.
-        - do_writeback: boolean flag indicating if a block should be flushed to
+      - dma_q: HBM start index and size for Query blocks.
+      - dma_kv_cache: Paged indices for existing KV tokens.
+      - dma_kv_new: offsets for new tokens being added to the cache.
+      - do_writeback: boolean flag indicating if a block should be flushed to
         HBM (ie does this block contain new tokens to add to KV cache).
 
     Args:
-        cu_q_lens_ref: [max_num_seqs + 1]. Cumulative sum of each sequence's query
-            length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
-            b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        kv_lens_ref: [max_num_seqs]. Existing kv cache length of each sequence.
-            distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
-            mixed
-        schedule_hbm_ref: HBM memory that will store output of the kernel.
-        schedule_ref: Scratch memory where schedule results gets written.
-        dma_sem: Semaphore used for writing scheduler output to HBM.
-        cfgs: Configuration of the kernel.
+      cu_q_lens_ref: [max_num_seqs + 1]. Cumulative sum of each sequence's query
+        length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
+        b=cu_q_lens[i+1] represents q/k/v of sequence i.
+      q_positions_ref: [max_num_seqs]. Position of each sequence's first query
+        token in the sequence's KV index space (cache tokens followed by new
+        tokens); the causal mask is relative to it.
+      global_kv_cache_lens_ref: [max_num_seqs]. Cache length of each sequence
+        before CP sharding; `RpaConfigs.local_kv_cache_len` narrows it to this
+        call's share.
+      kv_new_lens_ref: [max_num_seqs]. New kv length of each sequence.
+      update_kv_cache_ref: [max_num_seqs]. 1 if this sequence writes its new KV
+        back to the paged cache.
+      distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
+        mixed
+      extra_scalars_ref: Additional scalar refs for custom metadata computers.
+      schedule_hbm_ref: HBM memory that will store output of the kernel.
+      schedule_ref: Scratch memory where schedule results gets written.
+      dma_sem: Semaphore used for writing scheduler output to HBM.
+      cfgs: Configuration of the kernel.
+      computer_cls: Metadata computer class to use for schedule generation.
     """
-
     # Step 1: Compute and fill scheduler metadata.
-    loop_carry = compute_metadata(
-        cu_q_lens_ref,
-        kv_lens_ref,
-        distribution_ref,
-        schedule_ref,
-        schedule_hbm_ref,
-        dma_sem,
+    computer = computer_cls(
+        schedule=schedule_ref,
+        schedule_hbm_ref=schedule_hbm_ref,
+        dma_sem=dma_sem,
         cfgs=cfgs,
-        skip_kv_update=skip_kv_update,
+        extra_refs=extra_scalars_ref,
+    )
+    loop_carry = computer.compute(
+        cu_q_lens_ref=cu_q_lens_ref,
+        q_positions_ref=q_positions_ref,
+        global_kv_cache_lens_ref=global_kv_cache_lens_ref,
+        kv_new_lens_ref=kv_new_lens_ref,
+        update_kv_cache_ref=update_kv_cache_ref,
+        distribution_ref=distribution_ref,
     )
     count = loop_carry.count
     hbm_offset = loop_carry.hbm_offset
@@ -806,25 +899,32 @@ def rpa_metadata_schedule_kernel(
 
 def generate_rpa_metadata(
     cu_q_lens: jax.Array,
-    kv_lens: jax.Array,
+    q_positions: jax.Array,
+    global_kv_cache_lens: jax.Array,
+    kv_new_lens: jax.Array,
+    update_kv_cache: jax.Array,
     distribution: jax.Array,
     cfgs: configs.RpaConfigs,
     *,
+    computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
+    extra_scalars: Sequence[jax.Array] = (),
     interpret=False,
-    skip_kv_update: bool = False,
 ) -> RpaSchedule:
-    schedule_shaped_dtype = RpaSchedule.create_shape_dtype(cfgs)
-    schedule_hbm = RpaSchedule.create_shape_dtype(
+    """Generates RPA metadata schedule using the specified computer_cls."""
+    schedule_shaped_dtype = computer_cls.get_rpa_schedule(cfgs)
+    schedule_hbm = computer_cls.get_rpa_schedule(
         cfgs, multiplier=cfgs.max_schedule_size_multiplier
     )
 
     return pl.pallas_call(
         functools.partial(
-            rpa_metadata_schedule_kernel, cfgs=cfgs, skip_kv_update=skip_kv_update
+            rpa_metadata_schedule_kernel,
+            cfgs=cfgs,
+            computer_cls=computer_cls,
         ),
         out_shape=schedule_hbm,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=7,
             in_specs=[],
             out_specs=schedule_hbm.out_specs(),
             scratch_shapes=[
@@ -834,4 +934,12 @@ def generate_rpa_metadata(
         ),
         interpret=interpret,
         name="rpa_metadata_schedule",
-    )(cu_q_lens, kv_lens, distribution)
+    )(
+        cu_q_lens,
+        q_positions,
+        global_kv_cache_lens,
+        kv_new_lens,
+        update_kv_cache,
+        distribution,
+        extra_scalars,
+    )

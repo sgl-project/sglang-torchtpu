@@ -505,7 +505,7 @@ class CompiledFunction:
         pending_compile = None
         executable = None
         start = time.perf_counter()
-        if async_compile:
+        if async_compile and hasattr(tpu_torch_compile, "async_traverse_and_compile"):
             with dynamo_timed("direct_compile_async_submit"):
                 pending_compile = tpu_torch_compile.async_traverse_and_compile(
                     result_tensors, graph_inputs, argument_layouts=argument_layouts

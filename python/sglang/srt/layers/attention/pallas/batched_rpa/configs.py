@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import dataclasses
 import enum
 
@@ -22,6 +21,16 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.layers.attention.pallas.batched_rpa import utils
 
+# Inputs need three slots. The fetch for a tile is issued throughout the
+# preceding tile rather than all at once at its start, so it cannot be waited
+# on right away -- it needs one extra tile in flight for the DMA to land.
+NUM_INPUT_SLOTS = 3
+
+# Outputs only need two. The writeback issued at step N is waited at the top of
+# step N + 2, which is exactly when slot N % 2 comes back around, so the DMA
+# still gets all of step N + 1 to land.
+NUM_OUTPUT_SLOTS = 2
+
 
 @dataclasses.dataclass(frozen=True)
 class BlockSizes:
@@ -31,7 +40,7 @@ class BlockSizes:
     bq_c_sz: int
     bkv_sz: int
     batch_size: int
-    n_buffer: int
+    n_buffer: int = NUM_INPUT_SLOTS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -45,10 +54,24 @@ class ModelConfigs:
     sm_scale: float = 1.0
     soft_cap: float | None = None
     sliding_window: int | None = None
+    has_attention_sink: bool = False
 
     @property
     def num_q_heads_per_kv_head(self) -> int:
         return self.num_q_heads // self.num_kv_heads
+
+
+class AttentionScope(enum.StrEnum):
+    """Which KV positions to attend to.
+
+    FULL:            attend all positions (default).
+    CACHE_ONLY:      attend only cached tokens, skip new tokens.
+    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
+    """
+
+    FULL = enum.auto()
+    CACHE_ONLY = enum.auto()
+    NEW_TOKENS_ONLY = enum.auto()
 
 
 class KVLayout(enum.StrEnum):
@@ -60,6 +83,14 @@ class KVLayout(enum.StrEnum):
 
     HEAD_ALONG_SUBLANE = enum.auto()
     SEQ_ALONG_LANE = enum.auto()
+
+    @property
+    def symbol(self):
+        match self:
+            case KVLayout.HEAD_ALONG_SUBLANE:
+                return "snh"
+            case KVLayout.SEQ_ALONG_LANE:
+                return "nhs"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,12 +104,25 @@ class ServingConfigs:
     dtype_q: jnp.dtype
     dtype_kv: jnp.dtype
     dtype_out: jnp.dtype
+    per_token_scale: bool | None = None
+    per_token_scale_dtype: jnp.dtype | None = None
     scale_q: int | None = None
     scale_k: int | None = None
     scale_v: int | None = None
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
+    decode_query_size: int = 1
+    cp_group_size: int | None = None
+    pcp_ring_axis_name: str | None = None
+    pcp_ring_mesh_axis_names: tuple[str, ...] | None = None
+    paged_new_kv: bool = False
+    attention_scope: AttentionScope = AttentionScope.FULL
+    return_lse: bool = False
+
+    @property
+    def max_decode_bkv_p_new(self) -> int:
+        return 1 + pl.cdiv(self.decode_query_size - 1, self.page_size)
 
     @property
     def pages_per_seq(self) -> int:
@@ -100,6 +144,45 @@ class ServingConfigs:
     def packing_kv(self) -> int:
         return utils.get_dtype_packing(self.dtype_kv)
 
+    @property
+    def scale_channels(self) -> int:
+        if self.per_token_scale:
+            assert self.per_token_scale_dtype is not None
+            scale_bits = jax.dtypes.itemsize_bits(self.per_token_scale_dtype)
+            kv_bits = jax.dtypes.itemsize_bits(self.dtype_kv)
+            return max(1, scale_bits // kv_bits)
+        return 0
+
+    @property
+    def is_sharding_kv_cache(self) -> bool:
+        """Whether this kernel attend partial kv cache.
+
+        Only true under DCP cache phase.
+        """
+        return (
+            self.cp_group_size is not None
+            and self.attention_scope == AttentionScope.CACHE_ONLY
+            and self.pcp_ring_axis_name is None
+        )
+
+    @property
+    def write_last_q_block(self) -> bool:
+        """Whether the new-KV write is owned by a sequence's last Q block.
+
+        By default the first Q block that attends a new-KV block writes it.
+        In CP new_token_only phase, the write is owned by the last Q block,
+        whose KV loop `q_loop` extends to cover the full new KV.
+        """
+        return (
+            self.cp_group_size is not None
+            and self.attention_scope == AttentionScope.NEW_TOKENS_ONLY
+        )
+
+    @property
+    def is_packed_lse(self) -> bool:
+        """One LSE row per token (heads along lanes) instead of one per head."""
+        return self.pcp_ring_axis_name is not None
+
 
 class RpaCase(enum.StrEnum):
     """Represents the different cases for Ragged Paged Attention.
@@ -115,11 +198,13 @@ class RpaCase(enum.StrEnum):
 
     @property
     def symbol(self):
-        return {
-            RpaCase.DECODE: "d",
-            RpaCase.PREFILL: "p",
-            RpaCase.MIXED: "m",
-        }[self]
+        match self:
+            case RpaCase.DECODE:
+                return "d"
+            case RpaCase.PREFILL:
+                return "p"
+            case RpaCase.MIXED:
+                return "m"
 
     def get_range(
         self, distribution: jax.Array
@@ -162,9 +247,36 @@ class RpaConfigs:
 
     @property
     def n_buffer(self) -> int:
-        return self.block.n_buffer
+        return getattr(self.block, "n_buffer", NUM_INPUT_SLOTS)
 
     # Define derived values.
+
+    @property
+    def ring_enabled(self) -> bool:
+        """Whether this kernel rotates KV around the PCP ring."""
+        return (
+            self.serve.pcp_ring_axis_name is not None
+            and self.serve.attention_scope == AttentionScope.CACHE_ONLY
+            and self.mode != RpaCase.DECODE
+        )
+
+    def local_kv_cache_len(self, global_kv_cache_len, rank):
+        """This call's cache length in its own KV index space. CP only.
+
+        The cache is page-striped across the CP group, so a cache-phase call walks
+        only one rank's stripe.
+        """
+        if (
+            self.serve.cp_group_size is None
+            or self.serve.attention_scope != AttentionScope.CACHE_ONLY
+        ):
+            return global_kv_cache_len
+        return utils.cp_local_cache_len(
+            global_kv_cache_len,
+            self.serve.cp_group_size,
+            rank,
+            self.serve.page_size,
+        )
 
     @property
     def max_steps_ub(self) -> int:
@@ -195,9 +307,9 @@ class RpaConfigs:
             28 + 12 * self.bkv_p_cache + 4 * self.dma_kv_new_size * self.bkv_p_new
         )
         bytes_per_step *= self.block.batch_size
-        # Add 16 bytes for the 4 total_wait fields (total_wait_kv_in, total_wait_kv_out,
-        # total_wait_q_in, total_wait_o_out) which are 1D arrays (not multiplied by batch_size).
-        bytes_per_step += 16
+        # Add 20 bytes for the 5 total_wait fields (total_wait_kv_in, total_wait_kv_out,
+        # total_wait_q_in, total_wait_o_out, total_wait_lse_out) which are 1D arrays (not multiplied by batch_size).
+        bytes_per_step += 20
 
         max_steps_ub = available_bytes // bytes_per_step
 
@@ -218,7 +330,7 @@ class RpaConfigs:
     @property
     def bkv_p_new(self) -> int:
         if self.mode == RpaCase.DECODE or self.block.bq_sz == 1:
-            return 1
+            return min(self.serve.max_decode_bkv_p_new, self.bkv_p)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.bkv_p + 1
         return self.bkv_p
@@ -236,8 +348,9 @@ class RpaConfigs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         return utils.align_to(self.model.head_dim, num_lanes)
 
+    # Actual head dimension used for compute, does not include scale factors.
     @property
-    def aligned_kv_head_dim(self) -> int:
+    def compute_kv_head_dim(self) -> int:
         num_lanes = pltpu.get_tpu_info().num_lanes
         num_sublanes = pltpu.get_tpu_info().num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
@@ -245,8 +358,31 @@ class RpaConfigs:
             return utils.align_to(self.model.head_dim, num_sublanes * kv_packing)
         return utils.align_to(self.model.head_dim, num_lanes)
 
+    # Head dimension used for storing kv in VMEM, includes scale factors if
+    # per_token_scale is enabled.
+    @property
+    def aligned_kv_head_dim(self) -> int:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
+
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            total_head_dim = self.model.head_dim
+            if self.serve.dtype_kv == jnp.uint8:
+                total_head_dim = total_head_dim // 2
+            # If per-token scale is enabled, we need to add num_scale_channels to the
+            # head dimension to account for the scale factor. Note that if per-token
+            # scale is not enabled, self.serve.scale_channels is 0.
+            total_head_dim += self.serve.scale_channels
+
+            return utils.align_to(total_head_dim, num_sublanes * kv_packing)
+
+        return utils.align_to(self.model.head_dim, num_lanes)
+
     @property
     def aligned_num_kv_heads_x2(self) -> int:
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            return self.model.num_kv_heads * 2
         packing_kv = self.serve.packing_kv
         return utils.align_to(self.model.num_kv_heads * 2, packing_kv)
 
@@ -272,24 +408,34 @@ class RpaConfigs:
             num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
         else:
             num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
-        return num_elements * self.serve.dtype_kv.itemsize
+        # Calculate byte size using bits to account for subbyte dtypes like fp4.
+        kv_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_kv)
+        return int(num_elements * kv_dtype_bytes) >> 3  # 8 bits per byte
 
     @property
     def q_bytes_per_token(self) -> int:
+        q_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_q)
         return (
-            self.model.num_kv_heads
-            * self.aligned_num_q_heads_per_kv_head
-            * self.aligned_q_head_dim
-            * self.serve.dtype_q.itemsize
+            int(
+                self.model.num_kv_heads
+                * self.aligned_num_q_heads_per_kv_head
+                * self.aligned_q_head_dim
+                * q_dtype_bytes
+            )
+            >> 3
         )
 
     @property
     def o_bytes_per_token(self) -> int:
+        out_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_out)
         return (
-            self.model.num_kv_heads
-            * self.aligned_num_q_heads_per_kv_head
-            * self.aligned_q_head_dim
-            * self.serve.dtype_out.itemsize
+            int(
+                self.model.num_kv_heads
+                * self.aligned_num_q_heads_per_kv_head
+                * self.aligned_q_head_dim
+                * out_dtype_bytes
+            )
+            >> 3
         )
 
     @property
@@ -305,6 +451,29 @@ class RpaConfigs:
         )
 
     @property
+    def kv_token_align(self) -> int:
+        """DMA token granularity: the 128-lane tile for SEQ_ALONG_LANE, else 1.
+
+        SEQ_ALONG_LANE packs tokens along the lane dim, so every DMA token count
+        must be a multiple of the 128-lane tile. HEAD_ALONG_SUBLANE puts tokens on
+        the sublane dim, where single tokens are addressable.
+        """
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            return pltpu.get_tpu_info().num_lanes
+        return 1
+
+    @property
+    def kv_vmem_lanes(self) -> int:
+        """Lane-dim size of the KV VMEM buffer; SEQ_ALONG_LANE only."""
+        # o = kv from cache, n = kv from new, - = pad. Each [] is a 128-lane cell:
+        #
+        #   want  [onnn][nnnn]
+        #   got   [o---][---n][nnnn][nn--]
+        #
+        # because we fetch at 128-lane boundary, we need 2 extra padding slots
+        return self.block.bkv_sz + 2 * self.kv_token_align
+
+    @property
     def kv_vmem_shape(self):
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
@@ -312,7 +481,7 @@ class RpaConfigs:
                 self.model.num_kv_heads * 2,
                 self.aligned_kv_head_dim // self.serve.packing_kv,
                 self.serve.packing_kv,
-                self.block.bkv_sz + 2 * self.serve.page_size,
+                self.kv_vmem_lanes,
             )
         return (
             self.block.batch_size,
@@ -326,6 +495,11 @@ class RpaConfigs:
     def dma_kv_new_size(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return 5
+        if (
+            self.serve.kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+            and self.serve.cp_group_size is not None
+        ):
+            return 5
         return 4
 
     @property
@@ -338,11 +512,30 @@ class RpaConfigs:
         )
 
     @property
+    def lse_rows_per_token(self) -> int:
+        """LSE rows a token occupies."""
+        if self.serve.is_packed_lse:
+            # One row per token; assumes <= 128 q heads per KV head.
+            return 1
+        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        return utils.align_to(self.aligned_num_q_heads_per_kv_head, num_sublanes)
+
+    @property
+    def lse_vmem_shape(self):
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (
+            self.block.batch_size,
+            self.model.num_kv_heads,
+            self.block.bq_sz * self.lse_rows_per_token,
+            num_lanes,
+        )
+
+    @property
     def acc_scratch_shape(self):
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
-            self.aligned_kv_head_dim,
+            self.compute_kv_head_dim,
         )
 
     @property
@@ -369,15 +562,21 @@ class RpaConfigs:
             )
         if k.shape != v.shape:
             raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
-        if not (q.shape[0] == k.shape[0] == v.shape[0]):
+        if q.shape[0] > k.shape[0]:
             raise ValueError(
-                "Expected number of sequences in Q, K, and V to be the same, but got"
-                f" {q.shape[0]=}, {k.shape[0]=}, and {v.shape[0]=}"
+                "Expected at least as many K/V tokens as Q tokens, but got"
+                f" {q.shape[0]=} and {k.shape[0]=}"
             )
-        if not (q.shape[2] == k.shape[2] == v.shape[2]):
+        expected_kv_head_dim = q.shape[2]
+        if self.serve.dtype_kv == jnp.uint8:
+            expected_kv_head_dim = q.shape[2] // 2
+
+        if not (k.shape[2] == v.shape[2] == expected_kv_head_dim):
             raise ValueError(
-                "Expected number of head dimensions in Q, K, and V to be the same,"
-                f" but got {q.shape[2]=}, {k.shape[2]=}, and {v.shape[2]=}"
+                "Expected number of head dimensions in K and V to be"
+                f" {expected_kv_head_dim} (matching Q shape {q.shape[2]} with"
+                f" packing for {self.serve.dtype_kv}), but got {k.shape[2]=} and"
+                f" {v.shape[2]=}"
             )
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
@@ -407,14 +606,19 @@ class RpaConfigs:
                 f"Expected {kv_cache.shape=} to be equal to {expected_kv_cache_shape=}"
             )
 
-        # Integer kv quantization is currently not supported.
-        if not jnp.issubdtype(kv_cache.dtype, jnp.floating):
-            raise ValueError(f"Expected {kv_cache.dtype=} to be a floating point.")
-        if not (kv_cache.dtype == k.dtype == v.dtype):
-            raise ValueError(
-                "Expected KV cache dtype and K/V dtype to be the same, but got"
-                f" {kv_cache.dtype=}, {k.dtype=}, and {v.dtype=}"
-            )
+        # If we are using per-token quantization, we expect the kv-cache scale to be
+        # in VMEM, and so it will not be in the configs.
+        if self.serve.per_token_scale:
+            if self.serve.kv_layout != KVLayout.SEQ_ALONG_LANE:
+                raise ValueError(
+                    "Expected kv_layout=KVLayout.SEQ_ALONG_LANE when per_token_scale is"
+                    f" True, but got {self.serve.kv_layout=}."
+                )
+            if self.serve.scale_k is not None or self.serve.scale_v is not None:
+                raise ValueError(
+                    "Expected scale_k and scale_v to be None when per_token_scale is"
+                    " True."
+                )
 
         if not (
             jnp.int32
@@ -446,3 +650,23 @@ class RpaConfigs:
             )
         if distribution.shape != (3,):
             raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+
+        # Context Parallel Support
+        if self.serve.cp_group_size is not None:
+            if self.serve.attention_scope == AttentionScope.FULL:
+                raise ValueError(
+                    "Context Parallel does not support AttentionScope.FULL"
+                    " where cache is sharded but current tokens is sequential"
+                )
+            if self.model.sliding_window is not None:
+                raise ValueError(
+                    "Context Parallel does not support sliding window right now"
+                )
+
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            bkv_sz = self.block.bkv_sz
+            page_size = self.serve.page_size
+            if bkv_sz % page_size != 0:
+                raise NotImplementedError(
+                    f"SEQ_ALONG_LANE expects {bkv_sz=} to be aligned to {page_size=}."
+                )

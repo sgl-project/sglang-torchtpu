@@ -14,7 +14,8 @@ from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
 from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -1619,7 +1620,14 @@ class FusedMoE(torch.nn.Module):
             and (self.moe_tp_size > 1 or self.moe_ep_size > 1)
             and not self.handles_moe_reduction
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if self.moe_ep_size > 1:
+                final_hidden_states = moe_expert_parallel_all_reduce(
+                    final_hidden_states
+                )
+            if self.moe_tp_size > 1:
+                final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states
 

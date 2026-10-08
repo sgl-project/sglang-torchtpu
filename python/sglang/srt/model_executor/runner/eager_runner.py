@@ -428,7 +428,7 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        stream = torch.cuda.current_stream()
+        stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         if aux_hidden_states is not None:

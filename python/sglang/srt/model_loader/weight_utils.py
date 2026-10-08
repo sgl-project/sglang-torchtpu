@@ -1638,6 +1638,9 @@ def initialize_dummy_weights(
             if name.endswith("weight_scale_inv"):
                 param.fill_(1.0)
                 continue
+            if param.data.device.type in ["tpu", "xla", "privateuseone"]:
+                param.data.fill_(low + (high - low) / 2)
+                continue
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
             # Tensor subclasses such as MXFP8 wrappers expose a low-bit raw

@@ -29,7 +29,12 @@ def add_tpu_rank_assignment_to_compile_cache_key() -> None:
     """
     import torch.compiler.config as compiler_config
     import torch.distributed as dist
-    from torch_tpu._internal.distributed.device_mesh import get_device_assignment
+
+    try:
+        from torch_tpu._internal.distributed.device_mesh import get_device_assignment
+    except ImportError:
+        logger.debug("torch_tpu does not have get_device_assignment; skipping cache key tag")
+        return
 
     world_size = dist.get_world_size()
     if world_size == 1:

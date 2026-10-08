@@ -75,6 +75,9 @@ def handle_context_parallelism(server_args: Any):
         )
 
     view = resolved_view(server_args)
+    if not cfg.enable_prefill_cp and view.attn_cp_size <= 1:
+        return
+
     if view.attn_cp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
         assert cfg.tp_size % view.attn_cp_size == 0, (
@@ -107,7 +110,7 @@ def handle_context_parallelism(server_args: Any):
             "Aiter allreduce fusion is not supported with context parallelism"
         )
 
-    if view.attn_cp_size != cfg.moe_dp_size:
+    if view.attn_cp_size > 1 and view.attn_cp_size != cfg.moe_dp_size:
         assert cfg.moe_dp_size == 1, (
             "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
         )
