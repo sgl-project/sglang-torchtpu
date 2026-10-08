@@ -445,19 +445,22 @@ def _patch_compute_position_torch() -> None:
         prefix_lens = extend_prefix_lens.tolist()
         seq_lens = extend_seq_lens.tolist()
         positions_cpu = torch.cat(
-            [torch.arange(p, p + s) for p, s in zip(prefix_lens, seq_lens)],
+            [
+                torch.arange(p, p + s, device="cpu")
+                for p, s in zip(prefix_lens, seq_lens)
+            ],
             axis=0,
         ).to(torch.int64)
-        extend_start_loc = torch.zeros_like(extend_seq_lens)
-        if extend_seq_lens.numel() > 1:
-            # Set dtype to int32 rather than cumsum's default int64.
-            # 32-bit integers are TPU native while s64 requires emulation,
-            # and its buggy lowering can run into "Unsupported conversion
-            # from vmreg/vreg to U64". Token counts fit int32 comfortably.
-            extend_start_loc[1:] = torch.cumsum(
-                extend_seq_lens[:-1], dim=0, dtype=torch.int32
+        # Reuse the host lists from the readbacks above. Computing this on the
+        # input tensors would compile zeros/cumsum/view updates on TPU.
+        extend_start_loc_cpu = torch.zeros_like(extend_seq_lens, device="cpu")
+        if len(seq_lens) > 1:
+            extend_start_loc_cpu[1:] = torch.cumsum(
+                torch.tensor(seq_lens[:-1], dtype=torch.int32, device="cpu"),
+                dim=0,
+                dtype=torch.int32,
             )
-        return positions_cpu.to(device), extend_start_loc
+        return positions_cpu.to(device), extend_start_loc_cpu.to(device)
 
     forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged
 

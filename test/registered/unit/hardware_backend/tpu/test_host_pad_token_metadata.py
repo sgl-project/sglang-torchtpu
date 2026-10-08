@@ -1,4 +1,4 @@
-"""Tests for padding small per-token tensors on the host during TPU prefill."""
+"""Tests for preparing and padding token metadata on the host during TPU prefill."""
 
 import os
 import unittest
@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu import patches
 from sglang.srt.hardware_backend.tpu.compilation import compiled_forward_shim as shim
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
@@ -16,6 +18,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
@@ -23,6 +26,76 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestPositionOnHost(CustomTestCase):
+    def test_compute_position_torch_cpu_staged(self):
+        cases = (
+            ([7], [3], [7, 8, 9], [0]),
+            ([2, 10, 5], [2, 0, 3], [2, 3, 5, 6, 7], [0, 2, 2]),
+            ([0, 9], [0, 0], [], [0, 0]),
+        )
+        for dtype in (torch.int32, torch.int64):
+            for prefixes, lengths, expected_positions, expected_starts in cases:
+                with self.subTest(dtype=dtype, lengths=lengths):
+                    device = torch.device("meta")
+                    prefix_tensor = torch.empty(
+                        len(prefixes), dtype=dtype, device=device
+                    )
+                    length_tensor = torch.empty(
+                        len(lengths), dtype=dtype, device=device
+                    )
+                    host_values = {
+                        id(prefix_tensor): prefixes,
+                        id(length_tensor): lengths,
+                    }
+                    reads, uploads = [], []
+
+                    def read_lengths(tensor):
+                        reads.append(id(tensor))
+                        return host_values[id(tensor)]
+
+                    class CpuStaging(TorchDispatchMode):
+                        def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                            kwargs = kwargs or {}
+                            result = func(*args, **kwargs)
+                            if (
+                                func == torch.ops.aten._to_copy.default
+                                and kwargs.get("device") == device
+                            ):
+                                self.assertEqual(args[0].device.type, "cpu")
+                                uploads.append(args[0])
+                            elif isinstance(result, torch.Tensor):
+                                self.assertEqual(result.device.type, "cpu", str(func))
+                            return result
+
+                    # Simulate only the two input readbacks. Real meta tensors
+                    # cannot supply values to any device-side offset calculation.
+                    with (
+                        patch.object(patches, "_compute_position_torch_patched", False),
+                        patch.object(
+                            forward_batch_info,
+                            "compute_position_torch",
+                            forward_batch_info.compute_position_torch,
+                        ),
+                        patch.object(torch.Tensor, "tolist", read_lengths),
+                        CpuStaging(),
+                        torch.device("meta"),
+                    ):
+                        patches._patch_compute_position_torch()
+                        positions, starts = forward_batch_info.compute_position_torch(
+                            prefix_tensor, length_tensor
+                        )
+
+                    self.assertEqual(reads, [id(prefix_tensor), id(length_tensor)])
+                    self.assertEqual(
+                        (positions.device, starts.device), (device, device)
+                    )
+                    self.assertEqual(len(uploads), 2)
+                    self.assertEqual(uploads[0].dtype, torch.int64)
+                    self.assertEqual(uploads[1].dtype, dtype)
+                    self.assertEqual(uploads[0].tolist(), expected_positions)
+                    self.assertEqual(uploads[1].tolist(), expected_starts)
 
 
 class TestPadTensorOnHost(CustomTestCase):
