@@ -1019,11 +1019,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
-            mm_input_ids_cpu=(
-                batch.mm_input_ids_cpu
-                if batch.forward_mode.is_extend() and not model_runner.is_draft_worker
-                else None
-            ),
+            mm_input_ids_cpu=batch.mm_input_ids_cpu,
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],

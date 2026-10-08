@@ -64,17 +64,13 @@ class MultimodalCache(abc.ABC):
         raise NotImplementedError()
 
 
-def _get_tensor_size(embedding: torch.Tensor):
-    return embedding.untyped_storage().nbytes()
-
-
 @dataclass(kw_only=True)
 class EmbeddingResult:
     embedding: torch.Tensor
 
     def storage_size(self) -> int:
         """Bytes retained by this cache entry's backing storage."""
-        return _get_tensor_size(self.embedding)
+        return self.embedding.untyped_storage().nbytes()
 
     def cache_size(self) -> int:
         """Bytes needed after compacting an admitted entry."""

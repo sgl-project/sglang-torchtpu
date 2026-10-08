@@ -1,6 +1,6 @@
 import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -37,17 +37,12 @@ def test_eagle_mm_embeddings_survive_in_place_target_updates(algorithm):
         spec_algorithm=SpeculativeAlgorithm.from_string(algorithm),
     )
 
-    with (
-        get_context().override_server_args(),
-        patch(
-            "sglang.srt.managers.mm_utils.embed_mm_inputs",
-            return_value=(source_embeds, {}),
-        ),
-    ):
+    with get_context().override_server_args():
         hidden_states = general_mm_embed_routine(
             input_ids=torch.arange(4),
             forward_batch=forward_batch,
             language_model=_MutatingLanguageModel(),
+            mm_embedder=Mock(return_value=(source_embeds, {})),
         )
 
     torch.testing.assert_close(hidden_states, expected_embeds + 100)
