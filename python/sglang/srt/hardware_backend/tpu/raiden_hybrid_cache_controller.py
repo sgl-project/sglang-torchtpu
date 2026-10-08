@@ -24,6 +24,9 @@ from typing import Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+    assert_not_forward_write_target,
+)
 from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
@@ -123,6 +126,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        assert_not_forward_write_target(self.mem_pool_device_allocator)
         device_indices = super().load(
             host_indices=host_indices,
             priority=priority,

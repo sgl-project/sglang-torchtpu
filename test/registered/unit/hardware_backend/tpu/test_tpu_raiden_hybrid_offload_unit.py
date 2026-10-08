@@ -18,6 +18,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import threading
 import unittest
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -247,7 +248,7 @@ class TestHybridLoad(CustomTestCase):
 
         # Hybrid load reads allocator.full_attn_allocator (the SWA composite
         # allocator shape) and falls back to the allocator itself.
-        full_allocator = MagicMock()
+        full_allocator = MagicMock(kv_free_fence=None)
         full_allocator.full_attn_allocator.alloc = MagicMock(
             return_value=torch.arange(8, dtype=torch.int64)
         )
@@ -357,7 +358,7 @@ class TestHybridTransferWithoutFullPages(CustomTestCase):
                 ),
             ]
         )
-        self.ctrl.mem_pool_device_allocator = None
+        self.ctrl.mem_pool_device_allocator = SimpleNamespace(kv_free_fence=None)
         self.ctrl.device = "cpu"
 
     def _tokens(self, pages: List[int]) -> torch.Tensor:

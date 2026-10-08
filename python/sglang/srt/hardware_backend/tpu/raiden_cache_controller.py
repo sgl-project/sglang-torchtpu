@@ -13,6 +13,9 @@ forward on it, so the load overlaps whatever the scheduler runs in between.
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+    assert_not_forward_write_target,
+)
 from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     NOOP_EVENT,
 )
@@ -52,6 +55,7 @@ class TpuRaidenHiCacheController(HiCacheController):
         return host_indices, device_indices
 
     def load(self, host_indices, priority=None, node_id=-1):
+        assert_not_forward_write_target(self.mem_pool_device_allocator)
         # Return the reloaded prefix's device-slot indices on CPU. The allocator
         # hands them back on device, but the slot integers are identical and
         # raiden's DMA addresses pages by int, so moving them to CPU keeps every

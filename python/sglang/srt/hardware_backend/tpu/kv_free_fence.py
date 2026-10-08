@@ -239,6 +239,15 @@ class HeldPages:
         return torch.cat(taken)
 
 
+def assert_not_forward_write_target(allocator: BaseTokenToKVPoolAllocator) -> None:
+    """A DMA lands whenever it lands, so its target must never be a page an
+    in-flight forward may still write: only forward allocations may borrow."""
+    fence = allocator.kv_free_fence
+    assert fence is None or not fence.in_forward_write_target, (
+        "A DMA target was allocated inside forward_write_target()"
+    )
+
+
 def install_kv_free_fence(
     allocator: BaseTokenToKVPoolAllocator,
     *,
