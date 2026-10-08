@@ -18,13 +18,10 @@ export SGLANG_SIMULATE_ACC_METHOD=match-expected
 export SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed
 echo "[480b-agentic-spec] simulated accept_length=2.5 (includes bonus), method=$SGLANG_SIMULATE_ACC_METHOD, token_mode=$SGLANG_SIMULATE_ACC_TOKEN_MODE"
 
-model="${MODEL:-/weights/Qwen3-Coder-480B-A35B-Instruct-FP8}"
-
 # Capacity and compile buckets come from the same config as the baseline.
-# The draft sits next to the target in the external cluster's gcsfuse weight bucket.
 exec env \
-  MODEL="$model" \
-  DRAFT_MODEL="${DRAFT_MODEL:-$(dirname "$model")/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI}" \
+  MODEL="${MODEL:-/weights/Qwen3-Coder-480B-A35B-Instruct-FP8}" \
+  DRAFT_MODEL="${DRAFT_MODEL:-/weights/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI}" \
   PROFILE="$PROFILE" \
   ROLE=colocated \
   bash recipe/qwen3_coder_480b/nightly/serve.sh
