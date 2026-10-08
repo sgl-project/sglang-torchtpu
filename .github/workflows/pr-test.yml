@@ -11,8 +11,8 @@ on:
   schedule:
     - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   pull_request:
-    # PRs run only with the `run-ci` label. `/tag-and-rerun-ci` adds it and reruns
-    # the failed gate; `/tag-run-ci-label` alone waits for the next push.
+    # Ready PRs run automatically. `labeled` keeps `run-ci` available as an
+    # explicit draft opt-in or manual rerun trigger.
     types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
     inputs:
@@ -175,8 +175,8 @@ jobs:
       )
     uses: ./.github/workflows/pr-gate.yml
     with:
-      # `run-ci` is the CI opt-in for every PR, draft or ready.
-      require-run-ci: true
+      # Readiness is the default CI opt-in. Drafts still require `run-ci`.
+      require-run-ci: false
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
