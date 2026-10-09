@@ -19,8 +19,8 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
 from sglang.srt.hardware_backend.tpu.kv_pool import (
-    TpuFusedDSATokenToKVPool,
     TpuFusedMLATokenToKVPool,
+    TpuSplitMLATokenToKVPool,
     _zeros_kv_buffer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -60,8 +60,8 @@ class TestZerosKvBuffer(CustomTestCase):
             self.assertEqual(buf.dtype, FP8)
             self.assertIsNone(buf._base)
 
-    def test_dsa_pool_gives_index_keys_to_indexer_layers_only(self):
-        pool = TpuFusedDSATokenToKVPool(
+    def test_split_pool_allocates_the_buffers_the_sparse_kernels_read(self):
+        pool = TpuSplitMLATokenToKVPool(
             size=64,
             page_size=32,
             dtype=FP8,
@@ -73,21 +73,27 @@ class TestZerosKvBuffer(CustomTestCase):
             index_head_dim=128,
             index_key_layers=[True, False, True],
         )
-        latent_bytes = sum(pool.get_fused_kv_buffer(i).nbytes for i in range(3))
-        index_key_bytes = 0
-        for layer_id in (0, 2):
-            buf = pool.get_index_key_cache(layer_id)
-            # A 128-wide key takes 256 bytes: one lane of key, one scale byte,
-            # padded to a second lane. The buffer must be a whole tensor, not a
-            # view, or the indexer op cannot update it in place.
-            self.assertEqual(tuple(buf.shape), (pool.num_pages, 8, 4, 256))
-            self.assertEqual(buf.dtype, torch.uint8)
-            self.assertIsNone(buf._base)
-            index_key_bytes += buf.nbytes
+        # Per token: 512 NoPE bytes, 64 RoPE bytes padded to 128, and a
+        # 256-byte index-key record. Each buffer must be a whole uint8 tensor,
+        # not a view, or the ops cannot update it in place and copy the pool.
+        expected = {
+            pool.get_nope_cache: (pool.num_pages, 32, 4, 128),
+            pool.get_rope_cache: (pool.num_pages, 8, 4, 128),
+            pool.get_index_key_cache: (pool.num_pages, 8, 4, 256),
+        }
+        total_bytes = 0
+        for accessor, shape in expected.items():
+            layers = (0, 2) if accessor == pool.get_index_key_cache else (0, 1, 2)
+            for layer_id in layers:
+                buf = accessor(layer_id)
+                self.assertEqual(tuple(buf.shape), shape)
+                self.assertEqual(buf.dtype, torch.uint8)
+                self.assertIsNone(buf._base)
+                total_bytes += buf.nbytes
         # A layer that reuses the previous layer's result must have no cache.
         with self.assertRaisesRegex(ValueError, "no index-key cache"):
             pool.get_index_key_cache(1)
-        self.assertEqual(pool.get_kv_size_bytes(), latent_bytes + index_key_bytes)
+        self.assertEqual(pool.get_kv_size_bytes(), total_bytes)
 
 
 class TestQuantizeKvToFp8(CustomTestCase):
@@ -121,9 +127,9 @@ def _run_forward_mla(*, quant_dtype, k_scale_float):
         ),
         token_to_kv_pool=SimpleNamespace(get_fused_kv_buffer=lambda _: "kv"),
     )
-    # _forward_mla builds the op's arguments through this method.
-    backend._mla_kernel_args = functools.partial(
-        TpuPallasMlaAttnBackend._mla_kernel_args, backend
+    # _forward_mla prepares the op's inputs through this method.
+    backend._prepare_mla_inputs = functools.partial(
+        TpuPallasMlaAttnBackend._prepare_mla_inputs, backend
     )
     layer = SimpleNamespace(
         v_head_dim=R,

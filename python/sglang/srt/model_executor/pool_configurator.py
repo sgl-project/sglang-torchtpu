@@ -641,11 +641,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 allocate_all_layers = True
         if _is_tpu:
             from sglang.srt.hardware_backend.tpu.kv_pool import (
-                TpuFusedDSATokenToKVPool,
+                TpuSplitMLATokenToKVPool,
             )
 
             # On TPU each token's index key is one padded uint8 record.
-            indexer_size_per_token = TpuFusedDSATokenToKVPool.index_key_record_bytes(
+            indexer_size_per_token = TpuSplitMLATokenToKVPool.index_key_record_bytes(
                 index_head_dim
             )
             element_size = 1

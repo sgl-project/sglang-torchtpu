@@ -565,9 +565,9 @@ class TpuSRTPlatform(SRTPlatform):
         return MLATokenToKVPool
 
     def get_dsa_kv_pool_cls(self) -> type:
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedDSATokenToKVPool
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuSplitMLATokenToKVPool
 
-        return TpuFusedDSATokenToKVPool
+        return TpuSplitMLATokenToKVPool
 
     def get_paged_allocator_cls(self) -> type:
         from sglang.srt.hardware_backend.tpu.allocator_tpu import (

@@ -9,13 +9,11 @@ attends only over the keys the DSA indexer picked for it:
 * The attention op takes those rows and runs the sparse MLA kernels
   (``sglang.srt.layers.attention.pallas.mla_sparse``).
 
-Everything else is inherited from ``pallas_tpu_mla``: how the model calls the
-backend, and the metadata built for each forward pass.
+The KV cache is a ``TpuSplitMLATokenToKVPool``: two buffers per layer, in the
+layout the sparse kernels read.
 
-The KV cache is still the fused pool of ``pallas_tpu_mla``. The sparse kernels
-want two separate buffers, so the op splits the fused buffer and joins it
-again on every step, which copies the whole pool (see ``mla_sparse_fused``).
-TODO(sglang-torchtpu#1072): give this backend a pool with separate buffers.
+How the model calls the backend, and the metadata built for each forward
+pass, are inherited from ``pallas_tpu_mla``.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
@@ -44,13 +42,7 @@ _PALLAS_SPARSE_MLA_OP = None
 
 
 def _build_pallas_sparse_mla_kernel_op():
-    """Register the sparse MLA step as a torch custom op, once per process.
-
-    The op takes the same arguments as the ``pallas_tpu_mla`` op, followed by
-    the indexer's top-k rows. ``cu_kv_lens`` and ``v_scale`` are accepted but
-    not used: the sparse kernels find pages with a fixed stride, and they use
-    one scale for both keys and values.
-    """
+    """Register the sparse MLA step as a torch custom op, once per process."""
     global _PALLAS_SPARSE_MLA_OP
     if _PALLAS_SPARSE_MLA_OP is not None:
         return _PALLAS_SPARSE_MLA_OP
@@ -58,38 +50,39 @@ def _build_pallas_sparse_mla_kernel_op():
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang.srt.layers.attention.pallas.mla_sparse_fused import (
-        sparse_mla_attention_fused,
+    from sglang.srt.layers.attention.pallas.mla_sparse_step import (
+        sparse_mla_attention,
     )
 
-    op_name = "sglang_tpu_pallas::sparse_mla_attention_fused"
+    op_name = "sglang_tpu_pallas::sparse_mla_attention"
 
     # custom_jax_kernel reads this function's signature: every tensor has to
-    # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
-    # passed in directly, because it has keyword-only arguments and does not
-    # take cu_kv_lens or v_scale. This wrapper adapts one to the other.
+    # be a positional parameter annotated ``jax.Array``. The JAX step has
+    # keyword-only arguments, so it cannot be passed in directly. The wrapper
+    # also puts the two caches first in the result, which is the order the
+    # in-place update below refers to.
     def _wrapped(
         ql_nope: jax.Array,
         q_pe: jax.Array,
         new_kv_c: jax.Array,
         new_k_pe: jax.Array,
-        kv_cache_fused: jax.Array,
+        cache_nope: jax.Array,
+        cache_rope: jax.Array,
         kv_lens: jax.Array,
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
-        cu_kv_lens: jax.Array,
         distribution: jax.Array,
-        sm_scale: float,
-        k_scale: Optional[float],
-        v_scale: Optional[float],
         topk_indices: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        return sparse_mla_attention_fused(
+        sm_scale: float,
+        k_scale: float,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        out, cache_nope, cache_rope = sparse_mla_attention(
             ql_nope,
             q_pe,
             new_kv_c,
             new_k_pe,
-            kv_cache_fused,
+            cache_nope,
+            cache_rope,
             kv_lens,
             page_indices,
             cu_q_lens,
@@ -98,22 +91,24 @@ def _build_pallas_sparse_mla_kernel_op():
             sm_scale=sm_scale,
             k_scale=k_scale,
         )
+        return cache_nope, cache_rope, out
 
-    (kv_cache_argnum,) = argnums(_wrapped, "kv_cache_fused")
+    nope_argnum, rope_argnum = argnums(_wrapped, "cache_nope", "cache_rope")
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=argnums(_wrapped, "sm_scale", "k_scale", "v_scale"),
-        # The kernel updates the cache in place: its second output is the same
-        # buffer as the kv_cache_fused input.
-        donate_argnums=(kv_cache_argnum,),
-        input_output_aliases={kv_cache_argnum: 1},
+        static_argnums=argnums(_wrapped, "sm_scale", "k_scale"),
+        # The kernel updates both caches in place: its outputs 0 and 1 are the
+        # same buffers as the cache_nope and cache_rope inputs. This only works
+        # when each cache is a whole tensor, not a view of a larger one.
+        donate_argnums=(nope_argnum, rope_argnum),
+        input_output_aliases={nope_argnum: 0, rope_argnum: 1},
         warn_deprecated=False,
     )
 
     @torch.library.custom_op(
         op_name,
-        mutates_args=("kv_cache_fused",),
+        mutates_args=("cache_nope", "cache_rope"),
         device_types=["tpu"],
     )
     def custom_op(
@@ -121,37 +116,35 @@ def _build_pallas_sparse_mla_kernel_op():
         q_pe: torch.Tensor,
         new_kv_c: torch.Tensor,
         new_k_pe: torch.Tensor,
-        kv_cache_fused: torch.Tensor,
+        cache_nope: torch.Tensor,
+        cache_rope: torch.Tensor,
         kv_lens: torch.Tensor,
         page_indices: torch.Tensor,
         cu_q_lens: torch.Tensor,
-        cu_kv_lens: torch.Tensor,
         distribution: torch.Tensor,
-        sm_scale: float,
-        k_scale: Optional[float],
-        v_scale: Optional[float],
         topk_indices: torch.Tensor,
+        sm_scale: float,
+        k_scale: float,
     ) -> torch.Tensor:
         # The first call with a new shape compiles the kernel. In this process
         # JAX has no TPU device of its own (torch_tpu owns the device), so
         # Pallas cannot find out which TPU it is compiling for. This context
         # gives it the answer.
         with tpu_info_for_cpu_export():
-            output, _updated_kv = jax_kernel(
+            _nope, _rope, output = jax_kernel(
                 ql_nope,
                 q_pe,
                 new_kv_c,
                 new_k_pe,
-                kv_cache_fused,
+                cache_nope,
+                cache_rope,
                 kv_lens,
                 page_indices,
                 cu_q_lens,
-                cu_kv_lens,
                 distribution,
+                topk_indices,
                 sm_scale,
                 k_scale,
-                v_scale,
-                topk_indices,
             )
         return output
 
@@ -226,9 +219,25 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             f"layer {layer.layer_id} reached pallas_tpu_mla_sparse without the "
             "indexer's top-k rows."
         )
-        args = self._mla_kernel_args(
+        inputs = self._prepare_mla_inputs(
             q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope
         )
-        out = self._op(*args, topk_indices)
+        pool = self.token_to_kv_pool
+        metadata = self.forward_metadata
+        out = self._op(
+            inputs.ql_nope,
+            inputs.q_pe,
+            inputs.new_kv_c,
+            inputs.new_k_pe,
+            pool.get_nope_cache(layer.layer_id),
+            pool.get_rope_cache(layer.layer_id),
+            metadata.kv_lens,
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            topk_indices,
+            float(layer.scaling),
+            inputs.k_scale,
+        )
         # TODO(sglang-torchtpu#1072): avoid this reshape, as in pallas_tpu_mla.
         return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)

@@ -39,7 +39,7 @@ Design notes
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -177,6 +177,19 @@ def _build_pallas_mla_kernel_op():
     return custom_op
 
 
+class MlaStepInputs(NamedTuple):
+    """The inputs one layer passes to an MLA attention op.
+
+    A NamedTuple, because it is created inside the compiled forward pass.
+    """
+
+    ql_nope: torch.Tensor  # [num_tokens, num_q_heads, kv_lora_rank]
+    q_pe: torch.Tensor  # [num_tokens, num_q_heads, rope_dim]
+    new_kv_c: torch.Tensor  # [num_tokens, kv_lora_rank], cache dtype
+    new_k_pe: torch.Tensor  # [num_tokens, rope_dim], cache dtype
+    k_scale: Optional[float]  # None when the cache is not quantized
+
+
 class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     """SGLang attention backend backed by the Pallas MLA v2 kernel.
 
@@ -252,8 +265,27 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         k_rope: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        inputs = self._prepare_mla_inputs(
+            q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope
+        )
+        # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
+        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+
+        # MLA's V is the same latent tensor as K, so both take one scale.
         out = self._op(
-            *self._mla_kernel_args(q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope)
+            inputs.ql_nope,
+            inputs.q_pe,
+            inputs.new_kv_c,
+            inputs.new_k_pe,
+            kv_cache,
+            self.forward_metadata.kv_lens,
+            self.forward_metadata.page_indices,
+            self.forward_metadata.cu_q_lens,
+            self.forward_metadata.cu_kv_lens,
+            self.forward_metadata.distribution,
+            float(layer.scaling),
+            inputs.k_scale,
+            inputs.k_scale,
         )
         # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
         # views it back to 3D and folds W_UV.
@@ -261,7 +293,7 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         # right away, and it adds latency.
         return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
-    def _mla_kernel_args(
+    def _prepare_mla_inputs(
         self,
         *,
         q: torch.Tensor,
@@ -269,8 +301,12 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         layer: "RadixAttention",
         q_rope: Optional[torch.Tensor],
         k_rope: Optional[torch.Tensor],
-    ) -> tuple:
-        """The MLA op's positional arguments for one layer."""
+    ) -> "MlaStepInputs":
+        """Prepare one layer's queries and new tokens for the attention op.
+
+        Makes every tensor contiguous and converts the new tokens to the cache
+        dtype.
+        """
         assert self.forward_metadata is not None, (
             "Pallas MLA attention backend was not initialised for this forward "
             "pass; did you forget to call init_forward_metadata()?"
@@ -301,34 +337,19 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
 
         # fp8 KV cache: the kernel writes new_kv_c / new_k_pe into the cache
         # itself and requires them in the cache dtype. Quantize per-tensor with
-        # the layer's k_scale (1.0 when the checkpoint has none) and pass the
-        # same scale for K and V: MLA's V is the same latent tensor, so it
-        # must be dequantized with the scale it was quantized with. Q stays
-        # bf16 (the combination upstream tests).
+        # the layer's k_scale (1.0 when the checkpoint has none). Q stays bf16
+        # (the combination upstream tests).
         if self.kv_cache_quant_dtype is not None:
             k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
-            v_scale = k_scale
             new_kv_c = _quantize_kv_to_fp8(new_kv_c, k_scale, self.kv_cache_quant_dtype)
             new_k_pe = _quantize_kv_to_fp8(new_k_pe, k_scale, self.kv_cache_quant_dtype)
         else:
             k_scale = None
-            v_scale = None
 
-        # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
-        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
-
-        return (
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            kv_cache,
-            self.forward_metadata.kv_lens,
-            self.forward_metadata.page_indices,
-            self.forward_metadata.cu_q_lens,
-            self.forward_metadata.cu_kv_lens,
-            self.forward_metadata.distribution,
-            float(layer.scaling),
-            k_scale,
-            v_scale,
+        return MlaStepInputs(
+            ql_nope=ql_nope,
+            q_pe=q_pe,
+            new_kv_c=new_kv_c,
+            new_k_pe=new_k_pe,
+            k_scale=k_scale,
         )

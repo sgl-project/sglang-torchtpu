@@ -500,9 +500,9 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
-    def test_dsa_pool_is_the_fused_pool_with_index_keys(self):
+    def test_dsa_pool_is_the_split_pool(self):
         cls = self.platform.get_dsa_kv_pool_cls()
-        self.assertEqual(cls.__name__, "TpuFusedDSATokenToKVPool")
+        self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
 
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
