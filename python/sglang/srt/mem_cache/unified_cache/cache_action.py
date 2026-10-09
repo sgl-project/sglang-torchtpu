@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.mem_cache.hicache_storage import PoolTransfer
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 
@@ -71,6 +72,16 @@ class BackupKV(msgspec.Struct, frozen=True):
     node_ids: list[NodeId]
 
 
+class RestoreCanonicalKV(msgspec.Struct, frozen=True):
+    """Restore the original host KV into canonical insertion slots."""
+
+    node_id: NodeId
+    host_indices: torch.Tensor
+    device_indices: torch.Tensor
+    component_transfers: dict[ComponentType, list[PoolTransfer]]
+    host_lock_nodes: list[NodeId]
+
+
 class MambaEvictExcessPathStates(ComponentAction, frozen=True):
     """Per-path Mamba state-cap eviction from the tail's root path; applied at
     the insert's commit barrier, after the walk-time backups whose
@@ -108,5 +119,9 @@ class SWARebuild(ComponentAction, frozen=True):
 
 # Cache-owned actions, applied by UnifiedRadixCache itself.
 CacheAction = (
-    ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | FreeDeviceKVFullOnly | BackupKV
+    ReplaceWriteThroughOnNodeSplit
+    | FreeDeviceKV
+    | FreeDeviceKVFullOnly
+    | BackupKV
+    | RestoreCanonicalKV
 )

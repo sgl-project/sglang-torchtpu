@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
+    RestoreCanonicalKV,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
     _NUM_COMPONENT_TYPES,
@@ -1265,6 +1266,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             state.phase = _InsertPhase.COMMIT
             return
         step_actions = state.pending_actions
+        step_actions_start = len(step_actions)
         node = state.node.children[child_key]
         self._touch_node(node)
         prefix_len = node.key.match(key, page_size=self.page_size)
@@ -1275,6 +1277,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node.priority = max(node.priority, state.priority)
 
         if node.evicted:
+            canonical_restore = None
+            host_indices = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if (
+                self.enable_hicache
+                and not self.enable_external_cache_linker
+                and set(self.component_types) <= {ComponentType.FULL, ComponentType.SWA}
+                and host_indices is not None
+            ):
+                assert len(host_indices) == prefix_len
+                assert node.write_through_pending_id is None
+                assert node.load_back_pending_id is None
+                incoming_full = state.value[:prefix_len]
+                component_transfers = {}
+                for component in self.components:
+                    if component.component_type == BASE_COMPONENT_TYPE:
+                        continue
+                    transfers = component.build_insert_canonical_transfers(
+                        node, incoming_full, state.total_prefix_length, state.params
+                    )
+                    if transfers:
+                        component_transfers[component.component_type] = transfers
+                canonical_restore = RestoreCanonicalKV(
+                    node.id,
+                    host_indices.clone(),
+                    incoming_full.clone(),
+                    component_transfers,
+                    [],
+                )
             self._unevict_node_on_insert(
                 node,
                 state.value[:prefix_len],
@@ -1285,9 +1315,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.total_prefix_length,
                 state.total_prefix_length + prefix_len,
             )
-            # FULL was restored from the request's fresh KV. Aux
-            # components (e.g. SWA) may still hold tombstones and need
-            # to rebuild their value from the same slice.
+            # Aux tombstones adopt the same request slots. A backed duplicate
+            # restores canonical bytes before the insertion barrier returns.
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
                     continue
@@ -1299,6 +1328,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     result=state.result,
                     cache_actions=step_actions,
                 )
+            if canonical_restore is not None:
+                step_actions.append(canonical_restore)
         else:
             value_slice = state.value[:prefix_len]
             consumed_from = prefix_len
@@ -1332,6 +1363,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))
                 if swa_already_freed < dup.numel():
                     step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
+
+        for action in step_actions[step_actions_start:]:
+            if isinstance(action, RestoreCanonicalKV):
+                assert not action.host_lock_nodes
+                remaining = len(action.host_indices)
+                fragment = self.node_by_id(action.node_id)
+                while remaining:
+                    fragment_len = len(fragment.key)
+                    assert 0 < fragment_len <= remaining
+                    action.host_lock_nodes.append(fragment.id)
+                    remaining -= fragment_len
+                    fragment = fragment.parent
 
         if self._inc_hit_count_and_check(node, state.params.chunked):
             step_actions.append(self._build_backup_kv_action(node))

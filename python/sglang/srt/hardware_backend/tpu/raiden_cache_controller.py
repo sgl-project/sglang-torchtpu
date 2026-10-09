@@ -80,6 +80,13 @@ class TpuRaidenHiCacheController(HiCacheController):
             self.mem_pool_device, host_indices, device_indices
         )
 
+    def load_into_existing(self, operation: CacheOperation) -> None:
+        assert not operation.pool_transfers
+        host_indices, device_indices = self.move_indices(
+            operation.host_indices, operation.device_indices
+        )
+        self._load_all_pools(host_indices, device_indices).synchronize()
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return

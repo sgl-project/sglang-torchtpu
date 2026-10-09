@@ -422,6 +422,16 @@ class TreeComponent(ABC):
         is still tombstoned. Default no-op."""
         return None
 
+    def build_insert_canonical_transfers(
+        self,
+        node: UnifiedTreeNode,
+        incoming_full: torch.Tensor,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> list[PoolTransfer]:
+        """Describe canonical host state recoverable into incoming insert slots."""
+        return []
+
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,

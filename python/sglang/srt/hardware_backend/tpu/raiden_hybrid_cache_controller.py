@@ -152,7 +152,11 @@ class TpuRaidenHybridCacheController(HybridCacheController):
     # ----- transfers ----------------------------------------------------------
 
     def _issue_pool_dmas(
-        self, op: CacheOperation, load: bool
+        self,
+        op: CacheOperation,
+        load: bool,
+        *,
+        issued_events: Optional[List[RaidenFutureEvent]] = None,
     ) -> List[RaidenFutureEvent]:
         """One all-layer raiden DMA per pool entry of the merged operation.
 
@@ -160,7 +164,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         future-events, so the child host pools are driven directly.
         """
         anchor = self.mem_pool_host.anchor_entry
-        events = []
+        events = [] if issued_events is None else issued_events
         if load:
             events.append(
                 anchor.host_pool.load_all_layer(
@@ -198,6 +202,25 @@ class TpuRaidenHybridCacheController(HybridCacheController):
                     )
                 )
         return events
+
+    def load_into_existing(self, operation: CacheOperation) -> None:
+        events: List[RaidenFutureEvent] = []
+        errors: List[BaseException] = []
+        try:
+            self._issue_pool_dmas(operation, load=True, issued_events=events)
+        except BaseException as error:
+            errors.append(error)
+        # Drain all issued DMAs before propagating any submission/completion error.
+        for event in events:
+            try:
+                event.synchronize()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+            detail = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+            raise RuntimeError(f"Multiple errors restoring KV: {detail}") from errors[0]
 
     def start_writing(self) -> None:
         if not self.write_queue:

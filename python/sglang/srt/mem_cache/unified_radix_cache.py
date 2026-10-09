@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
+    RestoreCanonicalKV,
 )
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
@@ -1328,6 +1329,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.offload_nodes(action.node_ids)
             else:
                 self._execute_and_commit_kv_backup(action)
+        elif isinstance(action, RestoreCanonicalKV):
+            self._restore_canonical_kv(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1530,30 +1533,113 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             for name, saved in saved_by_name.items()
         ]
-        resolved = self.cache_controller._resolve_device_transfers(
-            restored_transfers or None,
-            kv_device_indices=device_indices,
-            kv_host_indices=backup.host_indices,
+        self._restore_host_kv(backup.host_indices, device_indices, restored_transfers)
+        self.discard_kv_cache_backup(backup)
+
+    def _restore_canonical_kv(self, action: RestoreCanonicalKV) -> None:
+        assert len(action.host_indices) == len(action.device_indices)
+        assert len(action.device_indices) % self.page_size == 0
+        assert action.node_id in action.host_lock_nodes
+        host_locks: list[tuple[NodeId, DecLockRefParams]] = []
+        try:
+            for node_id in action.host_lock_nodes:
+                host_locks.append(
+                    (node_id, self.inc_host_lock_ref(node_id).to_dec_params())
+                )
+            self._wait_for_kv_writes()
+            kv_transfer = PoolTransfer(
+                name=PoolName.KV,
+                host_indices=action.host_indices,
+                device_indices=action.device_indices,
+            )
+            component_transfers = {}
+            for component_type, transfers in action.component_transfers.items():
+                resolved_transfers = []
+                for transfer in transfers:
+                    assert transfer.host_indices is not None
+                    assert len(transfer.host_indices) % self.page_size == 0
+                    if transfer.device_indices is None:
+                        assert transfer.name == PoolName.SWA
+                        assert transfer.anchor_index_parts
+                        full_indices = torch.cat(
+                            [
+                                action.device_indices[part]
+                                if isinstance(part, slice)
+                                else part
+                                for part in transfer.anchor_index_parts
+                            ]
+                        )
+                        swa_indices = self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                            full_indices
+                        ).to(torch.int64)
+                        assert bool((swa_indices > 0).all()), (
+                            "unmapped canonical SWA insert slots"
+                        )
+                        transfer = replace(
+                            transfer,
+                            device_indices=swa_indices,
+                            anchor_index_parts=None,
+                        )
+                    assert len(transfer.host_indices) == len(transfer.device_indices)
+                    resolved_transfers.append(transfer)
+                component_transfers[component_type] = resolved_transfers
+            transfers = [
+                transfer
+                for resolved_transfers in component_transfers.values()
+                for transfer in resolved_transfers
+            ]
+            transfers.extend(
+                self._build_sidecar_transfers(
+                    CacheTransferPhase.LOAD_BACK,
+                    kv_transfer,
+                    component_transfers,
+                )
+            )
+            self._restore_host_kv(action.host_indices, action.device_indices, transfers)
+        finally:
+            for node_id, host_lock in reversed(host_locks):
+                self.dec_host_lock_ref(node_id, host_lock)
+
+    def _wait_for_kv_writes(self) -> None:
+        # These slots already belong to a request, so the DMA allocator scope
+        # cannot keep a later overlapping forward from writing them.
+        fence = self.token_to_kv_pool_allocator.kv_free_fence
+        if fence is not None:
+            fence.wait_for_in_flight()
+        if self.cache_controller.load_fence_stream is not None:
+            self.cache_controller.l2_transfer_engine.host_to_device_stream.wait_stream(
+                self.cache_controller.load_fence_stream
+            )
+
+    def _restore_host_kv(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: list[PoolTransfer],
+    ) -> None:
+        assert all(
+            transfer.device_indices is not None
+            or transfer.indices_from_pool is not None
+            for transfer in pool_transfers
         )
-        assert resolved is not None or not restored_transfers
+        resolved = (
+            self.cache_controller._resolve_device_transfers(
+                pool_transfers,
+                kv_device_indices=device_indices,
+                kv_host_indices=host_indices,
+            )
+            if pool_transfers
+            else None
+        )
+        assert resolved is not None or not pool_transfers
 
         operation = CacheOperation(
-            backup.host_indices,
+            host_indices,
             device_indices,
             node_id=-1,
             pool_transfers=resolved,
         )
-        load_host, load_device, load_pools = self.cache_controller._move_op_indices(
-            operation
-        )
-        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
-            self.cache_controller._l2_load_transfers(
-                load_host, load_device, load_pools
-            ),
-            transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
-        )
-        completion.finish_event.synchronize()
-        self.discard_kv_cache_backup(backup)
+        self.cache_controller.load_into_existing(operation)
 
     def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)

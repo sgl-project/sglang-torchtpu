@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
+    RestoreCanonicalKV,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -422,17 +423,53 @@ class SWAComponent(TreeComponent):
     ):
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
         old_full = full_cd.value
+        full_host = full_cd.host_value
+        swa_host = node.component_data[self.component_type].host_value
+        restore_canonical = (
+            self.tree_core.enable_hicache
+            and not self.tree_core.enable_external_cache_linker
+            and set(self.tree_core.component_types)
+            <= {ComponentType.FULL, ComponentType.SWA}
+            and full_host is not None
+            and swa_host is not None
+        )
+        if restore_canonical:
+            assert (
+                len(full_host) == len(swa_host) == len(incoming_full) == len(node.key)
+            )
+            assert node.write_through_pending_id is None
+            assert node.load_back_pending_id is None
         # A locked SWA tombstone also has Full locked, so only an unlocked
         # Full value can be replaced by the incoming ids.
         if full_cd.lock_ref > 0:
             cache_actions.append(
                 RecoverSWAWithLockedFull(node.id, old_full, incoming_full)
             )
-            return
-        result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
-        full_cd.value = incoming_full.clone()
-        cache_actions.append(FreeDeviceKVFullOnly([old_full]))
-        self._publish_window(node=node, cache_actions=cache_actions)
+            canonical_full = old_full
+        else:
+            result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
+            full_cd.value = incoming_full.clone()
+            cache_actions.append(FreeDeviceKVFullOnly([old_full]))
+            self._publish_window(node=node, cache_actions=cache_actions)
+            canonical_full = incoming_full
+        if restore_canonical:
+            cache_actions.append(
+                RestoreCanonicalKV(
+                    node.id,
+                    full_host.clone(),
+                    canonical_full.clone(),
+                    {
+                        self.component_type: [
+                            PoolTransfer(
+                                name=PoolName.SWA,
+                                host_indices=swa_host.clone(),
+                                anchor_index_parts=[canonical_full.clone()],
+                            )
+                        ]
+                    },
+                    [],
+                )
+            )
 
     def update_component_on_insert_overlap(
         self,
@@ -519,6 +556,31 @@ class SWAComponent(TreeComponent):
             cap_leaf=self._independent,
             cache_actions=cache_actions,
         )
+
+    def build_insert_canonical_transfers(
+        self,
+        node: UnifiedTreeNode,
+        incoming_full: torch.Tensor,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> list[PoolTransfer]:
+        host_indices = node.component_data[self.component_type].host_value
+        if host_indices is None:
+            return []
+        assert len(host_indices) == len(incoming_full) == len(node.key)
+        start = max(
+            0, params.get_evicted_seqlen(self.component_type) - total_prefix_len
+        )
+        if start >= len(incoming_full):
+            return []
+        assert start % self.tree_core.page_size == 0
+        return [
+            PoolTransfer(
+                name=PoolName.SWA,
+                host_indices=host_indices[start:].clone(),
+                anchor_index_parts=[incoming_full[start:].clone()],
+            )
+        ]
 
     def commit_insert_component_data(
         self,

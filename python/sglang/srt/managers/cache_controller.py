@@ -1051,6 +1051,15 @@ class HiCacheController:
     ) -> list[L2Transfer]:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
 
+    def load_into_existing(self, operation: CacheOperation) -> None:
+        """Synchronously load resolved slots without allocation or an ACK ticket."""
+        host_indices, device_indices, pool_transfers = self._move_op_indices(operation)
+        completion = self.l2_transfer_engine.submit_host_to_device(
+            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            transfer_layer_id_max=self.transfer_layer_id_max,
+        )
+        completion.finish_event.synchronize()
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
