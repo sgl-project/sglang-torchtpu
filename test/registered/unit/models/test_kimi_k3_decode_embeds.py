@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -12,7 +13,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,14 +105,23 @@ class TestKimiK3DecodeEmbedsInGraph(CustomTestCase):
             KimiK3ForConditionalGeneration.logits_processor.fget(fake_self), lp
         )
         fake_self = SimpleNamespace(language_model=None)
-        self.assertIsNone(
+        with self.assertRaisesRegex(AttributeError, "encoder-only"):
             KimiK3ForConditionalGeneration.logits_processor.fget(fake_self)
-        )
+
+
+@contextlib.contextmanager
+def _published_server_args(**fields):
+    override = get_context().override_server_args(**fields)
+    override.install()
+    try:
+        yield
+    finally:
+        override.restore()
 
 
 class TestKimiK3CompileAnnotation(CustomTestCase):
     @staticmethod
-    def _build(*, tpu: bool) -> KimiK3ForConditionalGeneration:
+    def _build(*, tpu: bool, **server_args) -> KimiK3ForConditionalGeneration:
         # A fresh class per build: an annotation on it cannot leak across tests.
         class LanguageModel(torch.nn.Linear):
             def __init__(self, *_, **__):
@@ -127,8 +137,20 @@ class TestKimiK3CompileAnnotation(CustomTestCase):
                 kimi_k3, "KimiK3MultiModalProjector", lambda _: torch.nn.Identity()
             ),
             patch.object(kimi_k3, "KimiK3LinearForCausalLM", LanguageModel),
+            _published_server_args(**server_args),
         ):
             return KimiK3ForConditionalGeneration(config)
+
+    def test_unsupported_tpu_compile_setups_fail_before_loading(self):
+        for server_args in (
+            {"enable_torch_compile": True, "tpu_compile_tracer": "direct"},
+            {"enable_torch_compile": True, "pp_size": 2},
+        ):
+            with self.subTest(**server_args):
+                with self.assertRaisesRegex(ValueError, "does not support"):
+                    self._build(tpu=True, **server_args)
+        # Without torch.compile neither matters.
+        self._build(tpu=True, tpu_compile_tracer="direct")
 
     def test_tpu_compiles_the_wrappers_language_model_instance(self):
         """The text-only entry, which shares the language model class, keeps the

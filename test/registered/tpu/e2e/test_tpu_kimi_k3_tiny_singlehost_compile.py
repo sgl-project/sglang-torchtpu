@@ -23,14 +23,16 @@ from sglang.test.test_utils import (
 )
 
 register_tpu_ci(
-    est_time=600,
+    est_time=240,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "kimi-k3", "compile", "multimodal"],
 )
 
 TINY_MODEL = "inference-optimization/Kimi-K3-0.40B"
+TINY_MODEL_REVISION = "d853649387ffe8f48ce0198a29ac1a44205031f7"
 # The tiny repo ships no image processor config; the full model's applies.
 PROCESSOR_SOURCE = "moonshotai/Kimi-K3"
+PROCESSOR_SOURCE_REVISION = "f831ab66814297da540d832a5235f8e904f29d06"
 # Dummy weights. The Pallas KDA kernel needs head_dim 128 (the checkpoint has
 # 32); v_head_dim follows it as in the full model.
 MODEL_OVERRIDE = {
@@ -95,11 +97,17 @@ def _download_model(root: str) -> None:
     # Config, tokenizer and remote code only: the weights are dummy.
     snapshot_download(
         TINY_MODEL,
+        revision=TINY_MODEL_REVISION,
         local_dir=root,
         allow_patterns=["*.json", "*.py", "*.model"],
         ignore_patterns=["checkpoint-*"],
     )
-    hf_hub_download(PROCESSOR_SOURCE, "preprocessor_config.json", local_dir=root)
+    hf_hub_download(
+        PROCESSOR_SOURCE,
+        "preprocessor_config.json",
+        revision=PROCESSOR_SOURCE_REVISION,
+        local_dir=root,
+    )
 
 
 def _prompt(length: int, seed: int) -> list[int]:

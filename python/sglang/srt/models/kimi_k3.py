@@ -729,8 +729,9 @@ class KimiK3MoE(nn.Module):
 
     def _warm_tpu_forward_properties(self) -> None:
         """Resolve the cached properties the TPU forward reads before compilation;
-        one first evaluated inside the trace fails its own guard on the next call.
-        The others gate CUDA-only paths and stay unevaluated."""
+        one first evaluated inside the trace fails its own guard on the next call,
+        a serving recompile. A TPU-path read of another cached property must be
+        added here. The others gate CUDA-only paths and stay unevaluated."""
         for name in (
             "_eligible_for_fused_front",
             "_ep_front_eligible",
@@ -3590,8 +3591,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         # The K3 tower is replicated (full weights on every rank). Off TPU the DP
         # runner shards images across ranks and gathers the embeddings. On TPU an
-        # image prefill through the runner hung with on-device embeds, so every
-        # rank encodes every image instead.
+        # image prefill through the runner hung with on-device embeds (not
+        # retried with host embeds), so every rank encodes every image instead.
         # TODO(chandrasekhard2): root-cause the hang and use the DP runner on TPU.
         self.use_data_parallel = not _is_tpu
 
@@ -3620,6 +3621,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # tower and the multimodal embed merge stay eager. The text-only entry
         # (KimiK3LinearForCausalLM) keeps the generic decoder policy.
         if _is_tpu and self.language_model is not None:
+            graph = get_exec().graph
+            if graph.enable_torch_compile and (
+                graph.tpu_compile_tracer == "direct" or get_parallel().pp_size > 1
+            ):
+                # Fail before the weight load: the shared VL policy has no
+                # later-stage warmup and no input_ids-only direct-tracer key.
+                raise ValueError(
+                    "Kimi-K3's multimodal model does not support pipeline "
+                    "parallelism or --tpu-compile-tracer direct with "
+                    "--enable-torch-compile on TPU yet."
+                )
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
             )
@@ -3648,7 +3660,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
     @property
     def logits_processor(self):
         # Looked up on model_runner.model by the TPU compile policy and sampler.
-        return getattr(self.language_model, "logits_processor", None)
+        if self.language_model is None:
+            raise AttributeError(
+                "logits_processor is not available in encoder-only mode"
+            )
+        return self.language_model.logits_processor
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:
@@ -3889,12 +3905,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
             return self.mm_projector(image_embeds)
 
         pixel_values = materialize_item_features(list(range(len(items))))
+        # On TPU the tower runs eagerly, so each new image grid compiles its XLA
+        # programs while serving (SGLANG_TPU_CHECK_RECOMPILATION reports them).
+        # TODO(chandrasekhard2): give the tower a compile boundary with bucketed
+        # patch counts, like Kimi-K2.5's vision runner.
         image_embeds = self.vision_tower(
             pixel_values, grid_thws_host, grid_thw_list=grid_thw_list
         )
         image_features = self.mm_projector(image_embeds)
-        # TPU merges multimodal rows on the host unless
-        # SGLANG_TPU_MM_EMBED_ON_DEVICE is set.
+        # The TPU embed merge (mm_embed_tpu._place_mm_rows) index_puts these rows
+        # into a host matrix unless SGLANG_TPU_MM_EMBED_ON_DEVICE is set, as for
+        # Gemma 4.
         if _is_tpu and not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
             return image_features.to("cpu")
         return image_features
