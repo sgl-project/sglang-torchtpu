@@ -1,6 +1,6 @@
 # PR gate: runs the registered TPU per-commit suite on a single-host 2x2x1 slice.
 #
-# Runs when EITHER:
+# Runs when the PR carries `run-ci` (`/tag-and-rerun-ci` adds it) AND EITHER:
 #   * the PR touches a TPU-explicit path (auto), OR
 #   * the PR carries the `tpu` label (manual opt-in -- for shared-code changes a
 #     maintainer judges need TPU coverage but that don't match those paths).
@@ -22,8 +22,8 @@ concurrency:
 jobs:
   decide:
     # For labeled events, only `tpu` and `run-ci` can affect this workflow.
-    # Readiness itself is fetched live below so label-then-rerun is not tied to
-    # the original event payload.
+    # Labels are fetched live below so label-then-rerun is not tied to the
+    # original event payload.
     if: >-
       github.event.action != 'labeled' ||
       github.event.label.name == 'tpu' ||
@@ -47,7 +47,6 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.issue.number,
             });
-            core.setOutput("draft", pr.data.draft);
             core.setOutput("labels", JSON.stringify(pr.data.labels.map(l => l.name)));
 
       - name: Detect TPU-explicit path changes
@@ -90,18 +89,20 @@ jobs:
               - '.github/workflows/feature-validation-tpu.yml'
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
-      - name: Gate on readiness and TPU relevance
+      # A TPU-relevant PR without `run-ci` FAILS here rather than skipping: a skip
+      # would leave the required pr-test-tpu-finish green, and a failed decide is
+      # what /tag-and-rerun-ci re-runs (labels are fetched live above).
+      - name: Gate on run-ci and TPU relevance
         id: gate
         run: |
-          if [[ "${{ steps.pr.outputs.draft }}" == "true" && \
-                "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" != "true" ]]; then
-            echo "Draft PR without run-ci; skipping TPU CI"
+          if [[ "${{ steps.paths.outputs.tpu }}" != "true" && \
+                "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" != "true" ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ steps.paths.outputs.tpu }}" == "true" || \
-                  "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" == "true" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" != "true" ]]; then
+            echo "::error::TPU CI needs the run-ci label. Comment /tag-and-rerun-ci on the PR to add it and start CI."
+            exit 1
           else
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
   # Build the image once (keyless WIF). Fork PRs can't get WIF secrets, so keep the

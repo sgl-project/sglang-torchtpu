@@ -188,6 +188,29 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         )
 
 
+def _validate_raiden_optimistic_prefill(
+    *,
+    disaggregation_mode: str,
+    transfer_backend: str,
+    optimistic_prefill_attempts: int,
+) -> None:
+    if (
+        disaggregation_mode == "null"
+        or transfer_backend != "raiden"
+        or optimistic_prefill_attempts == 0
+    ):
+        return
+    raise ValueError(
+        "--optimistic-prefill-attempts must be 0 with "
+        "--disaggregation-transfer-backend raiden "
+        f"(got {optimistic_prefill_attempts}). A raiden prefill must not compute "
+        "a request before its decode has reserved the KV pages for it. "
+        "Optimistic prefill computes it earlier and parks its KV, which under "
+        "load fills the prefill pool with requests the decodes have no pages "
+        "for and deadlocks prefill and decode."
+    )
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -295,6 +318,11 @@ class TpuSRTPlatform(SRTPlatform):
         cfg = resolving_view(server_args)
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
+        _validate_raiden_optimistic_prefill(
+            disaggregation_mode=cfg.disaggregation_mode,
+            transfer_backend=cfg.disaggregation_transfer_backend,
+            optimistic_prefill_attempts=cfg.optimistic_prefill_attempts,
+        )
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray

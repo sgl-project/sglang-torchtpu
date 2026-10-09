@@ -496,6 +496,7 @@ def _make_schedule_batch(
         tbo_split_seq_index=None,
         token_ids_logprobs=None,
         multimodal_inputs=None,
+        mm_input_ids_cpu=None,
         encoder_cached=None,
         encoder_lens_cpu=None,
         global_num_tokens=None,

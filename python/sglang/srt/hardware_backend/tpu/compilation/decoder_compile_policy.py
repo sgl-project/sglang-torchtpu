@@ -715,9 +715,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Prompt-logprob inputs are rejected on compiled TPU. Ignore this
             # request-only tensor before direct compile flattens ForwardBatch.
             "forward_batch.extend_input_logprob_token_ids_gpu",
-            # Pallas consumes these host mirrors before the compiled model.
+            # These host mirrors are consumed before the compiled model.
             "forward_batch.req_pool_indices_cpu",
             "forward_batch.seq_lens_cpu",
+            "forward_batch.mm_input_ids_cpu",
             *self._extra_ignored_argnames(),
         )
 

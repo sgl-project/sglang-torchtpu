@@ -23,11 +23,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_tpu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,47 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    if _is_npu:
+    if _is_tpu:
+        pool = runner.token_to_kv_pool
+        alloc = runner.token_to_kv_pool_allocator
+        kv_bytes = pool.get_kv_size_bytes()
+        total_gb = (kv_bytes[0] + kv_bytes[1]) / (1024**3)
+        swa_shape = tuple(pool.get_swa_buffer(0).shape)
+        c4_layer = next(
+            i
+            for i, m in enumerate(pool.layer_mapping)
+            if m is not None and m.compress_ratio == 4
+        )
+        csa_nope_shape = tuple(pool.get_csa_nope_buffer(c4_layer).shape)
+        csa_rope_shape = tuple(pool.get_csa_rope_buffer(c4_layer).shape)
+        indexer_shape = tuple(pool.get_indexer_k_buffer(c4_layer).shape)
+        c128_layer = next(
+            i
+            for i, m in enumerate(pool.layer_mapping)
+            if m is not None and m.compress_ratio == 128
+        )
+        hca_shape = tuple(pool.get_hca_buffer(c128_layer).shape)
+        c4_state_shape = tuple(
+            pool.get_state_buffer(c4_layer, from_indexer=False).shape
+        )
+        c4_idx_state_shape = tuple(
+            pool.get_state_buffer(c4_layer, from_indexer=True).shape
+        )
+        c128_state_shape = tuple(
+            pool.get_state_buffer(c128_layer, from_indexer=False).shape
+        )
+        logger.info(
+            f"[DSV4-TPU Stage 2 Verified] DSV4TPUTokenToKVPool & {type(alloc).__name__} initialized: "
+            f"kv_gb={total_gb:.2f} GiB, swa={swa_shape}, csa_nope={csa_nope_shape}, "
+            f"csa_rope={csa_rope_shape}, indexer={indexer_shape}, hca={hca_shape}, "
+            f"c4_state={c4_state_shape}, c4_idx_state={c4_idx_state_shape}, c128_state={c128_state_shape}"
+        )
+        raise NotImplementedError(
+            f"[DSV4-TPU Stage 2 Verified] DSV4TPUTokenToKVPool & {type(alloc).__name__} initialized "
+            f"({total_gb:.2f} GiB across {len(pool.layer_mapping)} layers). "
+            "Next step (Iteration 3): implement DSV4TPUAttnBackend skeleton & metadata."
+        )
+    elif _is_npu:
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             DeepseekV4AscendAttnBackend,
         )

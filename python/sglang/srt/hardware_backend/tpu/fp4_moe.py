@@ -156,7 +156,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ("layer allows backend reduction", layer.allow_backend_reduction),
         ("attn_dp_size == 1", parallel.attn_dp_size == 1),
         ("gated MoE", runner_config.is_gated),
-        ("silu activation", runner_config.activation == "silu"),
+        (
+            "silu activation",
+            runner_config.activation in ("silu", "silu_and_mul_clamp"),
+        ),
         (
             "router weight not applied on input",
             not runner_config.apply_router_weight_on_input,
@@ -298,6 +301,7 @@ def apply_tpu_nvfp4_moe(
     apply_router_weight_on_input: bool,
     no_combine: bool = False,
     use_fused_rs: bool = False,
+    swiglu_limit: float | None = None,
 ):
     """Run TPU NVFP4 MoE through the Pallas grouped-GEMM backend.
 
@@ -309,6 +313,11 @@ def apply_tpu_nvfp4_moe(
         raise NotImplementedError(
             "apply_router_weight_on_input is not supported on TPU yet."
         )
+
+    if swiglu_limit is not None:
+        if activation != "silu":
+            raise ValueError("TPU clamped MoE requires silu activation")
+        activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
 
     if use_fused_rs:
         from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (

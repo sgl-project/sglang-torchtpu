@@ -90,12 +90,12 @@ def _invoke_batched_kernel(
             "pallas_tpu_rpa_batched supports only causal attention; "
             "use pallas_tpu_rpa_v3."
         )
-    # cu_kv_lens and attention_sink are not consumed by the batched kernel.
+    # cu_kv_lens is not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
-    # the two arguments the shared shell passes for kernels that do are
+    # the argument the shared shell passes for kernels that do is
     # discarded here. The base never widens decode for this kernel
     # (``supports_decode_query_size`` is off), so the width is always 1.
-    del cu_kv_lens, attention_sink, decode_query_size
+    del cu_kv_lens, decode_query_size
     return jax_rpa(
         queries,
         keys,
@@ -105,6 +105,7 @@ def _invoke_batched_kernel(
         page_indices,
         cu_q_lens,
         distribution,
+        attention_sink=attention_sink,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -127,7 +128,7 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
-    supports_attention_sink=False,
+    supports_attention_sink=True,
     uses_cu_kv_lens=False,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
     min_page_size=_MIN_PAGE_SIZE,

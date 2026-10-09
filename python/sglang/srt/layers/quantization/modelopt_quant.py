@@ -3545,4 +3545,5 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             ),
             no_combine=self.moe_runner_config.no_combine,
             use_fused_rs=self.handles_moe_reduction,
+            swiglu_limit=self.moe_runner_config.swiglu_limit,
         )

@@ -933,6 +933,8 @@ def fused_topk_torch_native(
     renormalize: bool,
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     def scoring_func_impl(gating_output: torch.Tensor) -> torch.Tensor:
         if scoring_func == "softmax":
@@ -967,6 +969,8 @@ def fused_topk_torch_native(
             topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             + _RENORMALIZE_SUM_EPSILON
         )
+    if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
+        topk_weights = topk_weights * routed_scaling_factor
     return topk_weights, topk_ids
 
 
@@ -2661,25 +2665,45 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        assert num_token_non_padded is None, (
-            "num_token_non_padded is not yet supported in fused_topk_native"
-        )
-        assert expert_location_dispatch_info is None
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        topk_weights, topk_ids = fused_topk_native(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
-            renormalize=renormalize,
-            correction_bias=correction_bias,
-            scoring_func=scoring_func,
-        )
+        if (
+            _is_tpu
+            and correction_bias is not None
+            and scoring_func in ("sqrtsoftplus", "sigmoid")
+        ):
+            topk_weights, topk_ids = biased_topk_impl(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                correction_bias=correction_bias,
+                topk=num_routed_topk if _use_aiter else top_k,
+                renormalize=renormalize,
+                scoring_func=scoring_func,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+        else:
+            if not _is_tpu:
+                assert num_token_non_padded is None, (
+                    "num_token_non_padded is not yet supported in fused_topk_native"
+                )
+                assert expert_location_dispatch_info is None
+                assert not apply_routed_scaling_factor_on_output, "Not implemented"
+            topk_weights, topk_ids = fused_topk_native(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=num_routed_topk if _use_aiter else top_k,
+                renormalize=renormalize,
+                correction_bias=correction_bias,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
     elif custom_routing_function is None:
         if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
         # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
-        _can_use_jit_kernel = not _is_cpu
+        _can_use_jit_kernel = not (_is_cpu or _is_tpu)
 
         if _can_use_jit_kernel and (
             scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid"

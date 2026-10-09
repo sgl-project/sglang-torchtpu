@@ -30,6 +30,7 @@ Note: batched_rpa is build on top / derived from RPA3.
 """
 
 import dataclasses
+import math
 
 import jax
 import jax.numpy as jnp
@@ -144,6 +145,37 @@ def prepare_inputs(
             aligned_kv_head_dim,
         )
     return o_hbm_alias_q_hbm, new_kv_hbm
+
+
+def prepare_attention_sink(
+    attention_sink: jax.Array, num_kv_heads: int, q_dtype: jnp.dtype
+) -> jax.Array:
+    """Lays out per-q-head sink logits as rows of the kernel's l/m scratch.
+
+    Rows of a KV head are token-major with the aligned q heads of a KV head
+    inside each token, so the table repeats them over whole f32 sublane tiles:
+    [num_kv_heads, period, num_lanes], period a multiple of the aligned count.
+    """
+    num_q_heads_per_kv_head = attention_sink.shape[0] // num_kv_heads
+    aligned_num_q_heads_per_kv_head = utils.align_to(
+        num_q_heads_per_kv_head, utils.get_dtype_packing(q_dtype)
+    )
+    tpu_info = pltpu.get_tpu_info()
+    period = math.lcm(aligned_num_q_heads_per_kv_head, tpu_info.num_sublanes)
+
+    sink = attention_sink.astype(jnp.float32).reshape(
+        num_kv_heads, num_q_heads_per_kv_head
+    )
+    # Padded q heads get no sink weight; finite so that sink - m never sees -inf.
+    sink = jnp.pad(
+        sink,
+        ((0, 0), (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head)),
+        constant_values=-1e30,
+    )
+    sink = jnp.tile(sink, (1, period // aligned_num_q_heads_per_kv_head))
+    return jnp.broadcast_to(
+        sink[:, :, None], (num_kv_heads, period, tpu_info.num_lanes)
+    )
 
 
 def prepare_outputs(out: jax.Array) -> jax.Array:
@@ -436,6 +468,7 @@ def ragged_paged_attention(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
+    attention_sink: jax.Array | None = None,
     *,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -471,6 +504,8 @@ def ragged_paged_attention(
             b=cu_q_lens[i+1] represents q/k/v of sequence i.
         distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
             sequences. distribution[2] represents total number of sequences.
+        attention_sink: [num_q_heads]. Per-head sink logit, treated as one extra
+            key with a zero value for every query (same semantics as RPA v3).
         sm_scale: Softmax scale value.
         sliding_window: Size of sliding window (also known as local attention). kvs
             outside of the window is not fetched from hbm and masked out during
@@ -529,6 +564,9 @@ def ragged_paged_attention(
     num_kv_heads = keys.shape[1]
     num_page_indices = page_indices.shape[0]
 
+    if attention_sink is not None and attention_sink.shape != (num_q_heads,):
+        raise ValueError(f"Expected {attention_sink.shape=} to be ({num_q_heads},).")
+
     model_cfgs = configs.ModelConfigs(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -537,6 +575,7 @@ def ragged_paged_attention(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         mask_value=mask_value,
+        has_attention_sink=attention_sink is not None,
     )
     serve_cfgs = configs.ServingConfigs(
         num_seqs=max_num_seqs,
@@ -560,6 +599,11 @@ def ragged_paged_attention(
         kv_cache.dtype,
         kv_layout=kv_layout,
         page_size=page_size,
+    )
+    sink_table = (
+        None
+        if attention_sink is None
+        else prepare_attention_sink(attention_sink, num_kv_heads, queries.dtype)
     )
 
     default_decode, default_prefill = calculate_block_sizes(
@@ -609,6 +653,7 @@ def ragged_paged_attention(
             o_hbm_alias_q_hbm,
             new_kv_hbm,
             kv_cache,
+            sink_table,
             cfgs=cfgs,
         )
 

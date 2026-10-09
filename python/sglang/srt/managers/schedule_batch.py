@@ -2401,6 +2401,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     input_ids: torch.Tensor = None  # shape: [b], int64
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
+    # Original prefill IDs retained for MM masks after staging is consumed.
+    # Mixed-batch decode tokens are not included in this CPU prefix.
+    mm_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.

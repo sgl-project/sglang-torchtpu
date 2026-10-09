@@ -164,6 +164,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     is_cross_layer_mhc_fusion_enabled,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    _is_tpu,
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
@@ -245,13 +246,14 @@ def _get_mhc_ops() -> MhcOps:
         )
 
     from sglang.kernels.ops.layernorm.mhc import (
+        _hc_split_sinkhorn_torch,
         hc_split_sinkhorn,
         mhc_fused_post_pre,
         npu_hc_pre,
     )
 
     return MhcOps(
-        hc_split_sinkhorn=hc_split_sinkhorn,
+        hc_split_sinkhorn=_hc_split_sinkhorn_torch if _is_tpu else hc_split_sinkhorn,
         mhc_fused_post_pre=mhc_fused_post_pre,
         npu_hc_pre=npu_hc_pre,
         mhc_pre=None,
@@ -262,7 +264,7 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
-_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and not _is_tpu
 _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
@@ -959,7 +961,7 @@ class MqaAttentionBase(nn.Module):
         )
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
-        if self.attn_tp_size == 1:
+        if self.attn_tp_size == 1 or _is_tpu:
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -2905,6 +2907,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
+        if _is_tpu:
+            y = (
+                (
+                    x_flat.unflatten(-1, (self.hc_mult, -1)).float()
+                    * pre.squeeze(1).unsqueeze(-1)
+                )
+                .sum(dim=-2)
+                .to(dtype)
+            )
+            return y, post.squeeze(1), comb.squeeze(1), False
+
         from sglang.kernels.ops.layernorm.mhc import hc_combine
 
         # y is the post-norm activation fed into the MoE. Allocate it in the
@@ -4327,7 +4340,7 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        if x.numel() > 0:
+        if x.numel() > 0 and not _is_tpu:
             if _is_xpu:
                 return _get_mhc_ops().fused_hc_head(
                     x.contiguous(),
@@ -5295,7 +5308,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if (
+            _is_npu
+            or _is_xpu
+            or _is_tpu
+            or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        ):
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),

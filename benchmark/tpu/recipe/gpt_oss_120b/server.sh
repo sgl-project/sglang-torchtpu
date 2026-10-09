@@ -37,10 +37,10 @@ export SGLANG_TPU_FUSED_MOE_SC_GATHER=${SGLANG_TPU_FUSED_MOE_SC_GATHER:-0}
 export QUANTIZATION=unquant
 export KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
 
-# Only pallas_tpu_rpa_v3 implements attention sinks, which GPT-OSS needs
-# (per-head learned sink logits); pallas_tpu_rpa_batched declares
-# supports_attention_sink=False and would raise. GPT-OSS is also hybrid-SWA
-# (sliding_window=128 on every other layer) — the RPA base handles the
+# GPT-OSS needs attention sinks (per-head learned sink logits), which both
+# pallas_tpu_rpa_v3 and pallas_tpu_rpa_batched implement; this recipe keeps
+# RPA v3 as its default; batched needs PAGE_SIZE >= 256. GPT-OSS is also
+# hybrid-SWA (sliding_window=128 on every other layer) — the RPA base handles the
 # full->swa index mapping.
 export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_v3}
 
