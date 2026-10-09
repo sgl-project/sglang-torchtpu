@@ -26,6 +26,11 @@ register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 assert "jax" not in sys.modules
 os.environ["JAX_PLATFORMS"] = "tpu"
 
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
+
 import functools
 from typing import NamedTuple
 
@@ -1472,7 +1477,3 @@ class TestChunkedPipelining:
         assert "_scheduling_group_id" not in hlo, (
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))

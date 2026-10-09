@@ -59,6 +59,11 @@ register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 assert "jax" not in sys.modules
 os.environ["JAX_PLATFORMS"] = "tpu"
 
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -514,7 +519,3 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
