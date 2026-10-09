@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # GLM-5.3 text reference launch with sparse attention (DSA): the indexer picks
-# the keys and the sparse MLA kernels attend over them. CONTEXT_LEN may be
-# longer than the 2048 keys the indexer keeps per token.
+# the keys and the sparse MLA kernels attend over them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-glm_context=${CONTEXT_LEN:-2048}
+# The default context fits the 8k-in / 1k-out benchmark workload:
+# 8192 input tokens + 1024 output tokens + 64 spare.
+glm_context=${CONTEXT_LEN:-9280}
 if (( glm_context < 1 )); then
   echo 'GLM-5.3 reference recipe requires CONTEXT_LEN >= 1.' >&2
   exit 2
