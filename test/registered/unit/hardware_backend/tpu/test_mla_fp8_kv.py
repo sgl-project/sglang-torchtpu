@@ -70,19 +70,21 @@ class TestZerosKvBuffer(CustomTestCase):
             layer_num=3,
             device="cpu",
             enable_memory_saver=False,
+            index_head_dim=128,
             index_key_layers=[True, False, True],
         )
         latent_bytes = sum(pool.get_fused_kv_buffer(i).nbytes for i in range(3))
         index_key_bytes = 0
         for layer_id in (0, 2):
             buf = pool.get_index_key_cache(layer_id)
-            # One 256-byte record per token, in the page layout the kernel reads;
-            # a base tensor, or the indexer op's donation is dropped.
+            # A 128-wide key takes 256 bytes: one lane of key, one scale byte,
+            # padded to a second lane. The buffer must be a whole tensor, not a
+            # view, or the indexer op cannot update it in place.
             self.assertEqual(tuple(buf.shape), (pool.num_pages, 8, 4, 256))
             self.assertEqual(buf.dtype, torch.uint8)
             self.assertIsNone(buf._base)
             index_key_bytes += buf.nbytes
-        # A layer that reuses the previous selection must not get a cache to write.
+        # A layer that reuses the previous layer's result must have no cache.
         with self.assertRaisesRegex(ValueError, "no index-key cache"):
             pool.get_index_key_cache(1)
         self.assertEqual(pool.get_kv_size_bytes(), latent_bytes + index_key_bytes)

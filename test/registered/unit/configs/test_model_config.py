@@ -10,14 +10,11 @@ from transformers import LlamaConfig
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
-    dsa_context_fits_index_topk,
     get_hybrid_layer_ids,
-    is_deepseek_dsa,
     is_embedding_gemma,
     is_multimodal_model,
     register_model_config_factory,
     resolve_spec_hidden_size,
-    tpu_serves_dsa_as_dense_mla,
 )
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.server_args import ServerArgs
@@ -214,42 +211,6 @@ class TestExternalModelConfig(CustomTestCase):
         self.assertFalse(ordinary.is_multimodal_breakable_cuda_graph_supported)
         self.assertIs(type(external), ExternalConfig)
         self.assertTrue(external.is_multimodal_breakable_cuda_graph_supported)
-
-
-class TestDsaDenseFallback(CustomTestCase):
-    def test_dense_only_while_context_fits_index_topk(self):
-        """Dense MLA matches sparse DSA only while every sequence fits
-        index_topk; one token past it, or an unset context, must stay DSA."""
-        glm = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"], index_topk=2048)
-        self.assertTrue(dsa_context_fits_index_topk(glm, 2048))
-        self.assertFalse(dsa_context_fits_index_topk(glm, 2049))
-        self.assertFalse(dsa_context_fits_index_topk(glm, None))
-
-        other = SimpleNamespace(
-            architectures=["DeepseekV32ForCausalLM"], index_topk=2048
-        )
-        self.assertFalse(dsa_context_fits_index_topk(other, 2048))
-
-        self.assertTrue(is_deepseek_dsa(glm))
-        glm.tpu_dense_dsa = True
-        self.assertFalse(is_deepseek_dsa(glm))
-
-    def test_sparse_backend_keeps_the_indexer_at_any_context(self):
-        """The sparse TPU backend attends over the indexer's rows, so the
-        dense fallback must not drop the indexer under it."""
-        glm = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"], index_topk=2048)
-        for backend, dense in (
-            ("pallas_tpu_mla", True),
-            (None, True),
-            ("pallas_tpu_mla_sparse", False),
-        ):
-            with self.subTest(backend=backend):
-                self.assertEqual(
-                    tpu_serves_dsa_as_dense_mla(
-                        glm, context_length=2048, attention_backend=backend
-                    ),
-                    dense,
-                )
 
 
 if __name__ == "__main__":

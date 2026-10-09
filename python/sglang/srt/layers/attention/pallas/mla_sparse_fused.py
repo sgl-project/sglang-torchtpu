@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sparse MLA attention over the fused FP8 latent cache.
+"""Sparse MLA attention on the fused FP8 KV cache.
 
-The sparse MLA kernels (``mla_sparse``) read a split cache, one NoPE buffer
-and one RoPE buffer per layer. ``TpuFusedMLATokenToKVPool`` allocates one fused
-buffer per layer instead. Its FP8 token record already holds the same bytes,
-512 of NoPE then 64 of RoPE then padding, so this module derives the split
-buffers from it inside the op, runs the write and the attention, and merges
-them back.
+The sparse MLA kernels (``mla_sparse``) expect two cache buffers per layer:
+one for the NoPE part of each token and one for the RoPE part.
+``TpuFusedMLATokenToKVPool`` has a single buffer per layer instead. In it,
+each token is one 640-byte record: 512 NoPE bytes, 64 RoPE bytes, 64 bytes of
+padding.
 
-The derivation is a slice and the merge is a concatenation: each copies the
-whole pool, per layer, per step. That is acceptable for the pool sizes a 2k
-context needs and nothing more.
-TODO(sglang-torchtpu#1072): drop this module once a pool allocates the split
-buffers natively.
+The bytes are the same, only the grouping differs. So this module splits the
+fused buffer into the two buffers the kernels want, runs the cache write and
+the attention, and joins the two buffers back into one.
 
-The top-k rows come from the DSA indexer.
+The split and the join each copy the whole pool, for every layer, on every
+step. The cost grows with the pool.
+TODO(sglang-torchtpu#1072): remove this module once a pool allocates the two
+buffers directly.
 """
 
 import jax
@@ -31,27 +31,35 @@ from sglang.srt.layers.attention.pallas.mla_sparse.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 
-# The only geometry the sparse kernels accept.
+# The sparse kernels only support these two sizes.
 NOPE_DIM = 512
 ROPE_DIM = 64
-# A RoPE token is stored zero-padded to one 128-byte lane row.
+# In the cache, a token's 64 RoPE bytes are zero-padded to one 128-byte lane.
 _ROPE_ROW_BYTES = kv_cache_utils.TILE_LANE_BYTES
 _FUSED_TOKEN_BYTES = NOPE_DIM + _ROPE_ROW_BYTES
 
 
 def _split_specs(
-    kv_cache_fused: jax.Array,
+    kv_cache_fused: jax.Array,  # fp8[num_pages, page_size // 4, 4, 640]
 ) -> tuple[SparseMLAKVCacheSpec, SparseMLAKVCacheSpec]:
-    num_pages, rows_per_page, kv_packing, token_bytes = kv_cache_fused.shape
+    """Describe the NoPE and RoPE buffers that hold the fused cache's tokens.
+
+    A spec gives a buffer's shape and dtype. The kernels' cache writer needs
+    both specs, and the caller reshapes the fused bytes to the specs' shapes.
+
+    Raises ``ValueError`` if the fused cache is not FP8 with 640-byte tokens.
+    """
+    num_pages, rows_per_page, tokens_per_row, token_bytes = kv_cache_fused.shape
     if kv_cache_fused.dtype != jnp.float8_e4m3fn or token_bytes != _FUSED_TOKEN_BYTES:
         raise ValueError(
             "sparse MLA needs the fused latent cache as float8_e4m3fn with "
             f"{_FUSED_TOKEN_BYTES}-byte tokens, got {kv_cache_fused.dtype} "
             f"with {token_bytes}."
         )
-    page_size = rows_per_page * kv_packing
-    # TENSORCORE keeps a token's bytes contiguous, which is how the fused
-    # record already stores them; SPARSECORE would need a byte transpose.
+    page_size = rows_per_page * tokens_per_row
+    # The kernels support two cache layouts. TENSORCORE keeps each token's
+    # bytes together, as the fused record does, so a reshape is enough.
+    # SPARSECORE would need the bytes reordered.
     return (
         SparseMLAKVCacheSpec.create(
             KVCacheType.NOPE, KVCacheLayout.TENSORCORE, num_pages, page_size, NOPE_DIM
@@ -68,20 +76,23 @@ def sparse_mla_attention_fused(
     new_kv_c: jax.Array,  # fp8[max_num_tokens, 512]
     new_k_pe: jax.Array,  # fp8[max_num_tokens, 64]
     kv_cache_fused: jax.Array,  # fp8[num_pages, page_size // 4, 4, 640]
-    kv_lens: jax.Array,  # i32[max_num_seqs], includes this step's tokens
+    kv_lens: jax.Array,  # i32[max_num_seqs]; already counts this step's tokens
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    distribution: jax.Array,  # i32[3]; [2] is the active sequence count
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
     topk_indices: jax.Array,  # i32[max_num_tokens, index_topk], from the indexer
     *,
     sm_scale: float,
     k_scale: float,
 ) -> tuple[jax.Array, jax.Array]:
-    """One step on the fused cache: write the new latents, then attend.
+    """Run one step: store the new tokens in the cache, then attend.
 
-    A row of ``topk_indices`` holds positions within the token's own sequence,
-    valid ones first, then ``-1``. Returns the latent output
-    ``[max_num_tokens, num_q_heads, 512]`` and the updated fused cache.
+    Each row of ``topk_indices`` lists the key positions one query token may
+    attend to, counted from the start of its own sequence. The valid positions
+    come first and the rest of the row is ``-1``.
+
+    Returns ``(output, kv_cache_fused)``: the attention output
+    ``[max_num_tokens, num_q_heads, 512]`` and the updated cache.
     """
     if new_kv_c.shape[-1] != NOPE_DIM or new_k_pe.shape[-1] != ROPE_DIM:
         raise ValueError(
@@ -90,13 +101,20 @@ def sparse_mla_attention_fused(
         )
     nope_spec, rope_spec = _split_specs(kv_cache_fused)
 
+    # Split the fused cache into the two buffers the kernels read.
+    # token_rows: u8[num_pages * page_size, 640], one row per token slot.
     token_rows = jax.lax.bitcast_convert_type(kv_cache_fused, jnp.uint8).reshape(
         -1, _FUSED_TOKEN_BYTES
     )
+    # cache_nope: u8[num_pages, page_size, 4, 128], bytes 0..511 of each token.
     cache_nope = token_rows[:, :NOPE_DIM].reshape(nope_spec.shape)
+    # cache_rope: u8[num_pages, page_size // 4, 4, 128], bytes 512..639.
     cache_rope = token_rows[:, NOPE_DIM:].reshape(rope_spec.shape)
 
-    # Padded batch rows carry a query token as well; the writer would store it.
+    # A batch is padded to a fixed number of rows. A padded row still carries
+    # one query token, but it is not a real request, so its token must not be
+    # stored. distribution[2] is the number of real requests; clipping
+    # cu_q_lens there makes the writer skip every token after them.
     active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
     cache_nope, cache_rope = kv_cache_utils.update_sparse_mla_kv_cache(
         cache_nope,
@@ -110,6 +128,7 @@ def sparse_mla_attention_fused(
         rope_spec=rope_spec,
     )
 
+    # out: bf16[max_num_tokens, num_q_heads, 576].
     out = sparse_ragged_paged_attention(
         jnp.concatenate([ql_nope, q_pe], axis=-1),
         cache_nope,
@@ -123,6 +142,8 @@ def sparse_mla_attention_fused(
         cache_layout=TENSORCORE_CACHE_LAYOUT,
     )
 
+    # Join the two buffers back into the fused layout.
+    # token_rows: u8[num_pages * page_size, 640].
     token_rows = jnp.concatenate(
         [
             cache_nope.reshape(-1, NOPE_DIM),
@@ -133,5 +154,6 @@ def sparse_mla_attention_fused(
     kv_cache_fused = jax.lax.bitcast_convert_type(
         token_rows.reshape(kv_cache_fused.shape), kv_cache_fused.dtype
     )
-    # The kernel attends over nope + rope keys; only the nope part is the value.
+    # The kernel returns 512 NoPE + 64 RoPE values per head. Only the NoPE part
+    # is the attention output.
     return out[..., :NOPE_DIM], kv_cache_fused

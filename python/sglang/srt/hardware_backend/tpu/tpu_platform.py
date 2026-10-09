@@ -242,7 +242,7 @@ def _apply_page_size_default(server_args) -> None:
 
 
 def _apply_kv_cache_dtype_default(server_args) -> None:
-    """Default the KV cache to fp8 for the Pallas RPA backends.
+    """Default the KV cache to fp8 for the Pallas RPA/DSA backends.
 
     Those kernels dequantize KV on read, and at the head counts TPU serving
     runs (tensor parallel leaves one KV head per rank) fp8 halves KV bytes per
@@ -254,9 +254,6 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     Only those backends: ``pallas_tpu_mla`` accepts fp8 KV but stays opt-in
     until its accuracy is validated, and ``pallas_tpu_flash`` has no
     dequantization scale, so defaulting it to fp8 silently degrades it.
-
-    ``pallas_tpu_mla_sparse`` defaults to fp8 for a different reason: its
-    kernels read nothing else.
     """
     from sglang.srt.arg_groups.overrides import (
         declare_resolution,

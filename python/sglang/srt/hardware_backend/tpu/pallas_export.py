@@ -1,4 +1,6 @@
+import inspect
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 
 _TPU_INFO_PATCH_LOCK = threading.RLock()
@@ -6,6 +8,17 @@ _PALLAS_DEVICE_KIND_BY_TORCHTPU = {
     "TPU v6e": "TPU v6 lite",
     "TPU v7": "TPU7x",
 }
+
+
+def argnums(function: Callable, *names: str) -> tuple[int, ...]:
+    """Return the positions of the named parameters of ``function``.
+
+    ``custom_jax_kernel`` only accepts argument positions. Looking them up by
+    name keeps the call site readable, and the numbers cannot go stale when
+    the signature changes.
+    """
+    parameters = list(inspect.signature(function).parameters)
+    return tuple(parameters.index(name) for name in names)
 
 
 def get_torch_tpu_device_kind() -> str:

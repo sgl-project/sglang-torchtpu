@@ -1,24 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sparse MLA backend for the TPU torch_tpu platform.
+"""Sparse MLA attention backend for TPU (``--attention-backend pallas_tpu_mla_sparse``).
 
-Selected via ``--attention-backend pallas_tpu_mla_sparse``. It runs the sparse
-MLA kernels (``sglang.srt.layers.attention.pallas.mla_sparse``) in place of the
-dense MLA v2 kernel, and is otherwise ``pallas_tpu_mla``: the same absorbed
-call form, per-forward metadata and fused latent pool.
+This backend serves models with DeepSeek Sparse Attention (DSA). Each layer
+attends only over the keys the DSA indexer picked for it:
 
-The top-k rows come from the DSA indexer, which this backend also runs: one op
-per indexer layer stores that layer's index keys and selects (see
-``dsa_indexer_tpu``).
+* The indexer runs here too. One op per indexer layer stores that layer's
+  index keys and returns the top-k rows (see ``dsa_indexer_tpu``).
+* The attention op takes those rows and runs the sparse MLA kernels
+  (``sglang.srt.layers.attention.pallas.mla_sparse``).
 
-Two things bound what it serves today.
+Everything else is inherited from ``pallas_tpu_mla``: how the model calls the
+backend, and the metadata built for each forward pass.
 
-* The context is capped at ``index_topk``. Nothing here depends on that; a
-  longer context is simply not validated yet.
-* No pool allocates the split cache the kernels read, so the op derives it
-  from the fused FP8 buffer and merges it back, copying the pool each step
-  (see ``mla_sparse_fused``).
-
-TODO(sglang-torchtpu#1072): lift the context cap, then move to a split pool.
+The KV cache is still the fused pool of ``pallas_tpu_mla``. The sparse kernels
+want two separate buffers, so the op splits the fused buffer and joins it
+again on every step, which copies the whole pool (see ``mla_sparse_fused``).
+TODO(sglang-torchtpu#1072): give this backend a pool with separate buffers.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
@@ -28,15 +25,15 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import (
-    dsa_context_fits_index_topk,
-    is_glm_moe_dsa,
-)
+from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.hardware_backend.tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
 from sglang.srt.hardware_backend.tpu.dsa_indexer_tpu import build_dsa_index_topk_op
-from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
+from sglang.srt.hardware_backend.tpu.pallas_export import (
+    argnums,
+    tpu_info_for_cpu_export,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -47,12 +44,12 @@ _PALLAS_SPARSE_MLA_OP = None
 
 
 def _build_pallas_sparse_mla_kernel_op():
-    """Lazily register the fused-cache sparse MLA step as a torch custom op.
+    """Register the sparse MLA step as a torch custom op, once per process.
 
-    The op takes ``pallas_tpu_mla``'s arguments and then the indexer's top-k
-    rows. ``cu_kv_lens`` and ``v_scale`` are accepted and unused: the sparse
-    kernels address pages by a fixed stride and dequantize keys and values
-    with one scale.
+    The op takes the same arguments as the ``pallas_tpu_mla`` op, followed by
+    the indexer's top-k rows. ``cu_kv_lens`` and ``v_scale`` are accepted but
+    not used: the sparse kernels find pages with a fixed stride, and they use
+    one scale for both keys and values.
     """
     global _PALLAS_SPARSE_MLA_OP
     if _PALLAS_SPARSE_MLA_OP is not None:
@@ -67,6 +64,10 @@ def _build_pallas_sparse_mla_kernel_op():
 
     op_name = "sglang_tpu_pallas::sparse_mla_attention_fused"
 
+    # custom_jax_kernel reads this function's signature: every tensor has to
+    # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
+    # passed in directly, because it has keyword-only arguments and does not
+    # take cu_kv_lens or v_scale. This wrapper adapts one to the other.
     def _wrapped(
         ql_nope: jax.Array,
         q_pe: jax.Array,
@@ -98,12 +99,15 @@ def _build_pallas_sparse_mla_kernel_op():
             k_scale=k_scale,
         )
 
+    (kv_cache_argnum,) = argnums(_wrapped, "kv_cache_fused")
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=(10, 11, 12),
-        donate_argnums=(4,),
-        input_output_aliases={4: 1},
+        static_argnums=argnums(_wrapped, "sm_scale", "k_scale", "v_scale"),
+        # The kernel updates the cache in place: its second output is the same
+        # buffer as the kv_cache_fused input.
+        donate_argnums=(kv_cache_argnum,),
+        input_output_aliases={kv_cache_argnum: 1},
         warn_deprecated=False,
     )
 
@@ -128,7 +132,10 @@ def _build_pallas_sparse_mla_kernel_op():
         v_scale: Optional[float],
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
-        # JAX is CPU-only here, so Mosaic needs the TPU generation patched in.
+        # The first call with a new shape compiles the kernel. In this process
+        # JAX has no TPU device of its own (torch_tpu owns the device), so
+        # Pallas cannot find out which TPU it is compiling for. This context
+        # gives it the answer.
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
                 ql_nope,
@@ -148,6 +155,7 @@ def _build_pallas_sparse_mla_kernel_op():
             )
         return output
 
+    # Shape-only version for torch.compile tracing: same shape as the queries.
     def _fake_impl(ql_nope: torch.Tensor, *args, **kwargs):
         return torch.empty_like(ql_nope)
 
@@ -158,37 +166,17 @@ def _build_pallas_sparse_mla_kernel_op():
 
 
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
-    """``pallas_tpu_mla`` with the sparse MLA kernels, and the DSA indexer's host."""
+    """``pallas_tpu_mla`` with sparse attention: it runs the DSA indexer too."""
 
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
     ) -> None:
-        model_config = model_runner.model_config
-        hf_config = model_config.hf_config
-        if not is_glm_moe_dsa(hf_config):
-            # TODO(sglang-torchtpu#1072): other DSA checkpoints are not validated.
-            raise ValueError(
-                "--attention-backend pallas_tpu_mla_sparse serves GlmMoeDsa "
-                f"checkpoints only, got {hf_config.architectures}."
-            )
-        if not dsa_context_fits_index_topk(hf_config, model_config.context_len):
-            # TODO(sglang-torchtpu#1072): a longer context is not validated yet.
-            raise ValueError(
-                "--attention-backend pallas_tpu_mla_sparse serves a "
-                "--context-length of at most index_topk for now; got context "
-                f"length {model_config.context_len}."
-            )
-        if model_runner.kv_cache_dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                "--attention-backend pallas_tpu_mla_sparse reads an FP8 latent "
-                "cache only; pass --kv-cache-dtype fp8_e4m3 (or leave it unset), "
-                f"got {model_runner.kv_cache_dtype}."
-            )
-        self._topk = hf_config.index_topk
         super().__init__(model_runner, speculative_step_id)
+        self._topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self._index_topk_op = build_dsa_index_topk_op()
 
     def _build_kernel_op(self):
+        # The base class constructor calls this to set self._op.
         return _build_pallas_sparse_mla_kernel_op()
 
     def index_topk(
@@ -200,13 +188,15 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         head_weights: torch.Tensor,  # [num_tokens, index_n_heads]
         weight_scale: float,
     ) -> torch.Tensor:
-        """Store one layer's index keys and return its top-k rows.
+        """Run one layer's indexer: store its index keys, return its top-k rows.
 
-        ``i32[num_tokens, index_topk]``: positions within the token's own
-        sequence, selected ones first, then ``-1``.
+        Returns ``i32[num_tokens, index_topk]``. Each row lists the chosen key
+        positions, counted from the start of the token's own sequence. The
+        chosen positions come first and the rest of the row is ``-1``.
         """
         metadata = self.forward_metadata
-        # The torch->JAX bridge hands over raw buffers, so every input must be dense.
+        # The torch-to-JAX bridge passes raw buffers, so a tensor with strides
+        # would be read wrongly. contiguous() makes each input dense.
         return self._index_topk_op(
             query.contiguous(),
             key.contiguous(),
@@ -231,7 +221,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Every layer has rows: its own indexer's, or the previous layer's.
+        # Every layer gets rows: from its own indexer, or from the layer before.
         assert topk_indices is not None, (
             f"layer {layer.layer_id} reached pallas_tpu_mla_sparse without the "
             "indexer's top-k rows."

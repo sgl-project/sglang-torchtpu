@@ -269,6 +269,9 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         k_rope: Optional[torch.Tensor],
     ) -> tuple:
         """The MLA op's positional arguments for one layer."""
+        # TODO(sglang-torchtpu#1072): pallas_tpu_mla_sparse reuses this tuple
+        # because it shares the fused pool. Return named fields instead once
+        # that backend has its own pool.
         assert self.forward_metadata is not None, (
             "Pallas MLA attention backend was not initialised for this forward "
             "pass; did you forget to call init_forward_metadata()?"

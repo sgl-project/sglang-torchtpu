@@ -922,18 +922,18 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
 
 
 class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
-    """The fused latent pool plus the DSA indexer's key cache.
+    """The fused MLA KV pool, plus the index-key cache the DSA indexer needs.
 
-    A layer that runs its own indexer gets one paged ``uint8`` buffer of index
-    keys, addressed by the same page table as the latent cache. A layer that
-    reuses the previous layer's selection has none. As with the latent cache,
-    the op owns the writes: the buffer is donated to the indexer op.
+    Each layer that runs its own indexer gets one ``uint8`` buffer of index
+    keys. It is paged like the KV cache and uses the same page table. A layer
+    that reuses the previous layer's top-k result has no such buffer.
+
+    Like the KV cache, these buffers are written only by the op that uses them
+    (the indexer op), which updates them in place.
     """
 
-    # One token's record: 128 FP8 key bytes, one scale byte, padded to two
-    # 128-byte lanes. The indexer op checks this layout against its kernel's.
-    INDEX_KEY_RECORD_BYTES = 256
-    INDEX_KEY_PACKING = 4
+    # The index-key cache stores this many tokens per row of a page.
+    INDEX_KEY_TOKENS_PER_ROW = 4
 
     def __init__(
         self,
@@ -948,6 +948,7 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         *,
+        index_head_dim: int,
         index_key_layers: list[bool],
     ):
         if len(index_key_layers) != layer_num:
@@ -955,7 +956,8 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
                 f"index_key_layers has {len(index_key_layers)} entries for "
                 f"{layer_num} layers."
             )
-        # Read by _create_buffers, which the base constructor calls.
+        # Set these first: the base constructor calls _create_buffers.
+        self._index_head_dim = index_head_dim
         self._index_key_layers = index_key_layers
         super().__init__(
             size,
@@ -970,18 +972,32 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
             end_layer,
         )
 
+    @classmethod
+    def index_key_record_bytes(cls, index_head_dim: int) -> int:
+        """Bytes one token's index key takes in the cache.
+
+        A record is the key's FP8 bytes in whole 128-byte lanes, then one scale
+        byte per lane, rounded up to whole lanes again. A 128-wide key takes
+        256 bytes. The indexer op checks the buffer's shape against what its
+        kernel reads, so a mistake here fails at the first compile.
+        """
+        lane = cls.HEAD_DIM_ALIGNMENT
+        key_bytes = _cdiv(index_head_dim, lane) * lane
+        return _cdiv(key_bytes + key_bytes // lane, lane) * lane
+
     def _create_buffers(self):
         super()._create_buffers()
-        if self.page_size % self.INDEX_KEY_PACKING != 0:
+        tokens_per_row = self.INDEX_KEY_TOKENS_PER_ROW
+        if self.page_size % tokens_per_row != 0:
             raise ValueError(
                 f"page_size ({self.page_size}) must be divisible by "
-                f"{self.INDEX_KEY_PACKING} for the TPU index-key cache."
+                f"{tokens_per_row} for the TPU index-key cache."
             )
         shape = (
             self.num_pages,
-            self.page_size // self.INDEX_KEY_PACKING,
-            self.INDEX_KEY_PACKING,
-            self.INDEX_KEY_RECORD_BYTES,
+            self.page_size // tokens_per_row,
+            tokens_per_row,
+            self.index_key_record_bytes(self._index_head_dim),
         )
         logger.info(
             "Allocating TPU DSA index-key buffers: layers=%d of %d, shape per layer=%s",
@@ -989,6 +1005,8 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
             self.layer_num,
             shape,
         )
+        # One whole tensor per layer, not a view of a shared one: the indexer
+        # op can only update a whole tensor in place.
         self.index_key_buffer = [
             _zeros_kv_buffer(shape, torch.uint8, self.device) if has_indexer else None
             for has_indexer in self._index_key_layers
@@ -1002,7 +1020,7 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
         buf = self.index_key_buffer[layer_id - self.start_layer]
         if buf is None:
             raise ValueError(
-                f"layer {layer_id} reuses the previous layer's top-k selection "
+                f"layer {layer_id} reuses the previous layer's top-k result "
                 "and has no index-key cache."
             )
         return buf

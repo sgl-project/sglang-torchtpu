@@ -281,9 +281,7 @@ def handle_model_specific_adjustments(server_args: Any):
                 if cfg.attention_backend != "pallas_tpu_mla_sparse":
                     raise ValueError(
                         "Sparse attention (DSA) on TPU needs --attention-backend "
-                        f"pallas_tpu_mla_sparse, got {cfg.attention_backend!r}. "
-                        "A context of at most index_topk tokens also runs on "
-                        "pallas_tpu_mla."
+                        f"pallas_tpu_mla_sparse, got {cfg.attention_backend!r}."
                     )
             elif (
                 not get_platform().is_npu and not get_platform().is_xpu

@@ -1,20 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A/B tests: the fused-cache sparse MLA step against the dense MLA v2 kernel.
+"""Compares the sparse MLA step with the dense MLA v2 kernel on TPU.
 
-``pallas_tpu_mla_sparse`` reuses ``pallas_tpu_mla``'s forward, metadata and
-fused FP8 pool and swaps only the kernel behind the op. So the property worth
-pinning is that swap: fed the same step, ``sparse_mla_attention_fused`` must
-return what ``mla_ragged_paged_attention`` returns, and leave the same tokens in
-the fused cache. It can whenever its rows select every causal key, which is
-what the indexer returns while a sequence fits in top-k.
+``pallas_tpu_mla_sparse`` uses the same forward code, metadata and fused FP8
+pool as ``pallas_tpu_mla``. Only the kernel behind the op is different. So the
+tests give both kernels the same step and check that:
 
-Each case also checks the sparse step's cache byte for byte against a NumPy
-expectation. That is what catches a write outside the active tokens: compiled
-batches are padded, and a padded decode row still carries a query token.
+* ``sparse_mla_attention_fused`` returns the same output as
+  ``mla_ragged_paged_attention``, and
+* both leave the same tokens in the cache.
 
-Metadata mirrors ``TpuPallasRpaV3AttnBackend._build_metadata`` and the MLA
-backend's ``distribution``; geometry is GLM-5.2 at TP8 (8 q heads per rank,
-512 latent + 64 rope, page size 128).
+The outputs can only match when the top-k rows contain every key a token may
+attend to. That is what the indexer returns while a sequence is no longer
+than top-k, so the tests build such rows.
+
+Each test also compares the sparse step's cache, byte for byte, with a cache
+computed in NumPy. This catches writes to slots that must not change. Batches
+are padded to a fixed size, and a padded decode row still carries one query
+token, which must not be stored.
+
+The metadata has the same layout as ``TpuPallasRpaV3AttnBackend._build_metadata``
+produces, with the MLA backend's ``distribution``. Sizes are GLM-5.2's at TP8:
+8 query heads per rank, 512 latent + 64 rope dimensions, page size 128.
 
 Usage:
     python test/registered/tpu/unit/test_mla_sparse_fused.py
@@ -182,10 +188,11 @@ def _build_step(
 
 
 def _causal_rows(step):
-    """Top-k rows that select every causal key, for each token of the batch.
+    """Top-k rows that select every key each token may attend to.
 
-    Padded batch rows get one too, as the indexer gives them. Theirs name real
-    slots of the request whose page row they alias, and must not matter.
+    The tokens of padded batch rows get rows too, because the real indexer
+    produces them. Those rows point at slots of a real request (the padded row
+    reuses its page table row), and they must have no effect.
     """
     rows = np.full((step.ql_nope.shape[0], _TOPK), -1, np.int32)
     for seq, kv_len in enumerate(step.kv_lens):

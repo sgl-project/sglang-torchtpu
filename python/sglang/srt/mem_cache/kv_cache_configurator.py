@@ -1864,8 +1864,8 @@ class KVCacheConfigurator:
         )
 
     def _build_tpu_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        # The paged latent pool the sparse MLA kernels address, plus an index-key
-        # cache for each layer that runs its own indexer.
+        # The paged KV pool the TPU MLA kernels use, plus an index-key cache for
+        # each layer that runs its own indexer.
         PoolCls = current_platform.get_dsa_kv_pool_cls()
         return PoolCls(
             max_total_num_tokens,
@@ -1878,6 +1878,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
             index_key_layers=[
                 not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
                 for layer_id in range(

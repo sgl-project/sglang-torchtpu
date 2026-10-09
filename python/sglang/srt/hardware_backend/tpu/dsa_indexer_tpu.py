@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DSA indexer on TPU: its forward, and the custom op behind it.
+"""The DSA indexer on TPU.
 
-``Indexer.forward_tpu`` lands here. The projections and the rotary embedding
-stay ordinary torch; everything after them is one custom op per layer
-(``sglang.srt.layers.attention.pallas.dsa_index_topk``): quantise the queries
-and keys, append the keys to the layer's index-key cache, select top-k.
+``Indexer.forward_tpu`` calls ``indexer_forward`` in this module. It has two
+parts:
 
-The attention backend supplies the metadata and the cache, so this module owns
-no state beyond the registered op.
+* In torch: the indexer's linear layers and the rotary embedding.
+* In one custom op per layer: quantize the queries and keys, store the keys in
+  the layer's index-key cache, and pick the top-k keys for each query. The JAX
+  code for that op is in ``sglang.srt.layers.attention.pallas.dsa_index_topk``.
+
+The attention backend owns the cache and the per-forward metadata and passes
+them to the op. This module keeps no state except the registered op.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
@@ -17,7 +20,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
+from sglang.srt.hardware_backend.tpu.pallas_export import (
+    argnums,
+    tpu_info_for_cpu_export,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 
 if TYPE_CHECKING:
@@ -27,7 +33,7 @@ _PALLAS_DSA_INDEX_TOPK_OP = None
 
 
 def build_dsa_index_topk_op():
-    """Lazily register the indexer's device step as a torch custom op."""
+    """Register the indexer step as a torch custom op, once per process."""
     global _PALLAS_DSA_INDEX_TOPK_OP
     if _PALLAS_DSA_INDEX_TOPK_OP is not None:
         return _PALLAS_DSA_INDEX_TOPK_OP
@@ -39,6 +45,10 @@ def build_dsa_index_topk_op():
 
     op_name = "sglang_tpu_pallas::dsa_index_topk"
 
+    # custom_jax_kernel reads this function's signature: every tensor has to
+    # be a positional parameter annotated ``jax.Array``. The JAX step has
+    # keyword-only arguments, so it cannot be passed in directly. This wrapper
+    # adapts one to the other.
     def _wrapped(
         query: jax.Array,
         key: jax.Array,
@@ -48,8 +58,8 @@ def build_dsa_index_topk_op():
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         distribution: jax.Array,
-        weight_scale: float = 1.0,
-        topk: int = 0,
+        weight_scale: float,
+        topk: int,
     ) -> tuple[jax.Array, jax.Array]:
         return dsa_indexer_step(
             query,
@@ -64,12 +74,15 @@ def build_dsa_index_topk_op():
             topk=topk,
         )
 
+    (cache_argnum,) = argnums(_wrapped, "cache_k")
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=(8, 9),
-        donate_argnums=(3,),
-        input_output_aliases={3: 1},
+        static_argnums=argnums(_wrapped, "weight_scale", "topk"),
+        # The step updates the cache in place: its second output is the same
+        # buffer as the cache_k input.
+        donate_argnums=(cache_argnum,),
+        input_output_aliases={cache_argnum: 1},
         warn_deprecated=False,
     )
 
@@ -87,10 +100,13 @@ def build_dsa_index_topk_op():
         page_indices: torch.Tensor,
         cu_q_lens: torch.Tensor,
         distribution: torch.Tensor,
-        weight_scale: float = 1.0,
-        topk: int = 0,
+        weight_scale: float,
+        topk: int,
     ) -> torch.Tensor:
-        # JAX is CPU-only here, so Mosaic needs the TPU generation patched in.
+        # The first call with a new shape compiles the kernel. In this process
+        # JAX has no TPU device of its own (torch_tpu owns the device), so
+        # Pallas cannot find out which TPU it is compiling for. This context
+        # gives it the answer.
         with tpu_info_for_cpu_export():
             topk_indices, _updated_cache = jax_kernel(
                 query,
@@ -106,8 +122,19 @@ def build_dsa_index_topk_op():
             )
         return topk_indices
 
-    def _fake_impl(query: torch.Tensor, *args, **kwargs):
-        topk = kwargs["topk"] if "topk" in kwargs else args[8]
+    # Shape-only version for torch.compile tracing: one row of topk per token.
+    def _fake_impl(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        head_weights: torch.Tensor,
+        cache_k: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        weight_scale: float,
+        topk: int,
+    ):
         return torch.empty(
             (query.shape[0], topk), dtype=torch.int32, device=query.device
         )
@@ -126,20 +153,26 @@ def indexer_forward(
     positions: torch.Tensor,
     layer_id: int,
 ) -> torch.Tensor:
-    """Top-k key positions for each query token, ``i32[num_tokens, index_topk]``.
+    """Return the top-k key positions for each query token.
 
-    No Hadamard rotation, as in the fused CUDA writer this checkpoint family
-    takes on GPU.
+    The result is ``i32[num_tokens, index_topk]``; see
+    ``TpuPallasSparseMlaAttnBackend.index_topk`` for the row format.
+
+    The keys are stored without the Hadamard rotation. The fused CUDA writer,
+    which is what this checkpoint family uses on GPU, skips it as well.
     """
     query, _ = indexer.wq_b(q_lora)
     query = query.view(-1, indexer.n_heads, indexer.head_dim)
     key, _ = indexer.wk(x)
     key = indexer.k_norm(key)
 
+    # Only the first rope_dim dimensions of each vector are rotated.
     rope_dim = indexer.rope_head_dim
     q_rope, k_rope = indexer.rotary_emb(
         positions, query[..., :rope_dim], key[..., :rope_dim]
     )
+    # TODO(sglang-torchtpu#1072): write the rotated part back in place instead
+    # of building new tensors with torch.cat.
     query = torch.cat([q_rope.to(query.dtype), query[..., rope_dim:]], dim=-1)
     key = torch.cat([k_rope.to(key.dtype), key[..., rope_dim:]], dim=-1)
 

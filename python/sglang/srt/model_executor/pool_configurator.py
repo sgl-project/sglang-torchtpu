@@ -644,8 +644,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 TpuFusedDSATokenToKVPool,
             )
 
-            # The TPU key cache stores one padded uint8 record per token.
-            indexer_size_per_token = TpuFusedDSATokenToKVPool.INDEX_KEY_RECORD_BYTES
+            # On TPU each token's index key is one padded uint8 record.
+            indexer_size_per_token = TpuFusedDSATokenToKVPool.index_key_record_bytes(
+                index_head_dim
+            )
             element_size = 1
         memory_config = get_memory()
         indexer_ratio = 1
