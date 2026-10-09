@@ -29,11 +29,11 @@ jobs:
       github.event.action != 'labeled' ||
       github.event.label.name == 'tpu'
     runs-on: ubuntu-latest
-    # dorny/paths-filter lists the PR's changed files via the GitHub API, which
-    # needs pull-requests: read (the repo's default token is otherwise too narrow).
+    # dorny/paths-filter lists the PR's changed files via the GitHub API (read);
+    # write lets the gate post its on-demand notice on the PR.
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     outputs:
       run: ${{ steps.gate.outputs.run }}
     steps:
@@ -99,11 +99,57 @@ jobs:
                 "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" != "true" ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.run_attempt }}" == "1" ]]; then
-            echo "::error::TPU CI runs on demand. Comment /tag-and-rerun-ci on the PR to run it for this commit."
-            exit 1
+            echo "run=needs-trigger" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # One sticky comment per PR, edited on later pushes so it notifies once;
+      # a triggered run only refreshes an existing notice. Fork PRs get a
+      # read-only token, so a failed post must not mask the gate.
+      - name: Post the on-demand notice
+        if: steps.gate.outputs.run == 'needs-trigger' || steps.gate.outputs.run == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          GATE: ${{ steps.gate.outputs.run }}
+        with:
+          script: |
+            const marker = "<!-- tpu-ci-on-demand -->";
+            const sha = context.payload.pull_request.head.sha.slice(0, 10);
+            const triggered = process.env.GATE === "true";
+            const body = triggered
+              ? [
+                  marker,
+                  `### TPU CI was triggered for \`${sha}\``,
+                  "",
+                  "Results appear in the PR checks (`PR Test (TPU)`). A new push needs a new **`/tag-and-rerun-ci`**.",
+                ].join("\n")
+              : [
+                  marker,
+                  "### TPU CI has not run on this commit",
+                  "",
+                  `This PR touches TPU code, and TPU CI runs on demand: pushes do not start it. The latest commit (\`${sha}\`) is untested on TPU.`,
+                  "",
+                  "Comment **`/tag-and-rerun-ci`** when this commit is ready. Each comment runs the TPU suite once (about 1.5 h on a shared slice); a new push needs a new comment.",
+                ].join("\n");
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else if (!triggered) {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Require an explicit trigger
+        if: steps.gate.outputs.run == 'needs-trigger'
+        run: |
+          echo "::error::TPU CI runs on demand. Comment /tag-and-rerun-ci on the PR to run it for this commit."
+          exit 1
 
   # Build the image once (keyless WIF). Fork PRs can't get WIF secrets, so keep the
   # reserved slice for trusted branches only.
