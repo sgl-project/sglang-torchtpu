@@ -2221,9 +2221,6 @@ def set_mamba_track_indices_from_reqs(
     spec track plan, see mamba_lazy_spec_prepare).
     """
     req_to_token_pool = batch.req_to_token_pool
-    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
-    ]  # (bs, ping_pong_size), int64, on device
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
         # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
@@ -2241,6 +2238,26 @@ def set_mamba_track_indices_from_reqs(
         i for i, req in enumerate(batch.reqs) if req.kv.mamba_next_track_idx is None
     ]
     batch.mamba_track_buffer_indices = list(track_positions)
+    if torch.device(req_to_token_pool.mamba_pool.slot_allocator_device).type == "cpu":
+        # Snapshot the authoritative host IDs now: overlap may change each
+        # request's ping-pong buffer before this batch reaches the model worker.
+        # TPU uploads these only after padding to the compiled batch bucket.
+        batch.mamba_track_indices = torch.tensor(
+            [
+                (
+                    req.kv.mamba_ping_pong_track_buffer[pos].item()
+                    if req.kv.mamba_next_track_idx is not None
+                    else -1
+                )
+                for req, pos in zip(batch.reqs, track_positions, strict=True)
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        return
+    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+        batch.req_pool_indices
+    ]  # (bs, ping_pong_size), int64, on device
     idx = (
         torch.tensor(
             track_positions,
@@ -3015,20 +3032,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
             self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
+            track_device = self.req_to_token_pool.mamba_pool.slot_allocator_device
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
-                device=self.device,
+                device=track_device,
             )
             self.mamba_track_mask = torch.tensor(
                 mamba_track_mask_cpu,
                 dtype=torch.bool,
-                device=self.device,
+                device=track_device,
             )
             self.mamba_track_seqlens = torch.tensor(
                 mamba_track_seqlens_cpu,
                 dtype=torch.int64,
-                device=self.device,
+                device=track_device,
             )
 
         # Collect mamba init info for deferred ops on forward stream
@@ -3664,10 +3682,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
+            track_device = self.req_to_token_pool.mamba_pool.slot_allocator_device
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
-                    (0,), dtype=torch.int64, device=self.device
+                    (0,), dtype=torch.int64, device=track_device
                 )
                 self.mamba_track_buffer_indices = []
             else:
@@ -3689,10 +3708,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_decode_batch_idx_cpu = [
                 req.decode_batch_idx for req in self.reqs
             ]
-            # async H2D
-            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
-                device=self.device, non_blocking=True
-            )
+            if torch.device(track_device).type == "cpu":
+                self.mamba_track_mask = track_mask_cpu
+            else:
+                self.mamba_track_mask = track_mask_cpu.pin_memory().to(
+                    device=track_device, non_blocking=True
+                )
 
     def filter_batch(
         self,

@@ -554,7 +554,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether `out_cache_loc` holds physical ids: set by
     # KVIndexTranslator.rebind_write_loc; capture-time batches declare it.
     out_cache_loc_is_physical: bool = False
-    # The indices to track mamba state with
+    # The indices to track mamba state with. On TPU, these three tensors stay
+    # on CPU until the compiled-forward shim pads and transfers them.
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool

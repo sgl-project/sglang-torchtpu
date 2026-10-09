@@ -19,7 +19,7 @@ layout and slot bookkeeping that the fused Pallas GDN kernel depends on:
   the GPU ``[..., n_v, d_v, d_k]``);
 * slot 0 is reserved; ``alloc``/``free`` cycle real slots ``1..size``;
 * ``clear_slots`` is a no-op (kernel masks stale slots via
-  ``has_initial_state``) and ``copy_from`` raises (radix CoW unsupported);
+  ``has_initial_state``) and ``copy_from`` clones every layer for radix CoW;
 * ReplaySSM is disabled here, but its flags must still be *present* --
   the shared req-slot alloc path reads them without a hasattr guard.
 """
@@ -29,6 +29,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -221,10 +223,74 @@ class TestTpuMambaPool(CustomTestCase):
         # Kernel handles fresh-slot masking; pool must not touch the buffer.
         self.assertTrue(all(torch.all(t == 7.0) for t in pool.mamba_cache.temporal))
 
-    def test_copy_from_unsupported(self):
+    def test_copy_from_preserves_sources_and_other_slots(self):
         pool = self._pool()
-        with self.assertRaises(NotImplementedError):
-            pool.copy_from(torch.tensor([1]), torch.tensor([2]))
+        states = [*pool.mamba_cache.conv[0], *pool.mamba_cache.temporal]
+        for layer, state in enumerate(states):
+            state[1].fill_(layer + 1)
+            state[2].fill_(layer + 10)
+        pool.copy_from(torch.tensor([1, 1, 2]), torch.tensor([3, 4, 5]))
+        for layer, state in enumerate(states):
+            for slot in (1, 3, 4):
+                self.assertTrue(torch.all(state[slot] == layer + 1))
+            for slot in (2, 5):
+                self.assertTrue(torch.all(state[slot] == layer + 10))
+            self.assertTrue(torch.all(state[0] == 0))
+            self.assertTrue(torch.all(state[6:] == 0))
+
+    def test_tracking_ids_snapshot_request_state_before_overlap(self):
+        from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+
+        buffers = [torch.tensor([7, 8]), torch.tensor([9, 10])]
+        reqs = [
+            SimpleNamespace(
+                kv=SimpleNamespace(
+                    mamba_ping_pong_track_buffer=buf,
+                    mamba_next_track_idx=i,
+                )
+            )
+            for i, buf in enumerate(buffers)
+        ]
+        for allocator_device in ("cpu", "cuda"):
+            with self.subTest(allocator_device=allocator_device):
+                batch = SimpleNamespace(
+                    reqs=reqs,
+                    req_pool_indices=torch.tensor([0, 1]),
+                    req_to_token_pool=SimpleNamespace(
+                        mamba_pool=SimpleNamespace(
+                            slot_allocator_device=allocator_device
+                        ),
+                        req_index_to_mamba_ping_pong_track_buffer_mapping=torch.stack(
+                            buffers
+                        ),
+                    ),
+                )
+                # Exercise both the host-ID path and the existing device-gather
+                # path with CPU tensors; hardware lowering is tested separately.
+                tensor = torch.tensor
+
+                def unpinned_tensor(*args, **kwargs):
+                    kwargs.pop("pin_memory", None)
+                    return tensor(*args, **kwargs)
+
+                with patch("torch.tensor", side_effect=unpinned_tensor):
+                    set_mamba_track_indices_from_reqs(batch)
+                    self.assertEqual(batch.mamba_track_indices.tolist(), [7, 10])
+                    set_mamba_track_indices_from_reqs(batch, track_positions=[1, 0])
+                self.assertEqual(batch.mamba_track_buffer_indices, [1, 0])
+                self.assertEqual(batch.mamba_track_indices.tolist(), [8, 9])
+                saved = batch.mamba_track_indices.clone()
+                buffers[0][1] = 99
+                torch.testing.assert_close(batch.mamba_track_indices, saved)
+                buffers[0][1] = 8
+                reqs[0].kv.mamba_next_track_idx = None
+                reqs[0].kv.mamba_ping_pong_track_buffer = None
+                with patch("torch.tensor", side_effect=unpinned_tensor):
+                    for positions in (None, [1, 1]):
+                        set_mamba_track_indices_from_reqs(batch, positions)
+                        self.assertEqual(batch.mamba_track_indices.tolist(), [-1, 10])
+                reqs[0].kv.mamba_next_track_idx = 0
+                reqs[0].kv.mamba_ping_pong_track_buffer = buffers[0]
 
     def test_speculative_unsupported(self):
         cp = _make_cache_params(

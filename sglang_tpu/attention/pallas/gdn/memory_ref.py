@@ -96,6 +96,11 @@ class MetadataRef:
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
 
+    # Optional native radix-cache snapshot. End locations are exclusive token
+    # offsets in the packed input; -1 disables tracking for a sequence.
+    s_idx_to_track_indices: Any = None
+    s_idx_to_track_end: Any = None
+
     @classmethod
     def create(
         cls,
@@ -412,6 +417,13 @@ class StateBufferedRef(BaseBufferedRef):
         wait_ref = self._wait_slice(vmem_ref, dma_size)
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
+    def _track_size(self, p_id, idx):
+        s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+        r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
+        r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+        end = self.metadata_ref.s_idx_to_track_end[s_idx]
+        return jnp.where((r_size > 0) & (r_base + r_size == end), 1, 0)
+
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -437,6 +449,14 @@ class StateBufferedRef(BaseBufferedRef):
                 self._src_slice(dst_ref, state_idx, dma_size),
                 sem,
             ).start()
+            if self.metadata_ref.s_idx_to_track_indices is not None:
+                track_size = self._track_size(p_id, idx)
+                track_idx = self.metadata_ref.s_idx_to_track_indices[s_idx]
+                pltpu.make_async_copy(
+                    vmem_ref.at[idx, pl.ds(0, track_size)],
+                    self._src_slice(dst_ref, track_idx, track_size),
+                    sem,
+                ).start()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -452,6 +472,10 @@ class StateBufferedRef(BaseBufferedRef):
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            if self.metadata_ref.s_idx_to_track_indices is not None:
+                # Wait for both the active-state write and the snapshot before
+                # the pipeline reuses this VMEM window.
+                dma_size += self._track_size(p_id, idx)
 
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used

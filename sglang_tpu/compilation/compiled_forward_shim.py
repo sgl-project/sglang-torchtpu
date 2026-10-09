@@ -88,6 +88,12 @@ _HOST_PAD_TOKEN_FIELDS = frozenset(
     ("input_ids", "positions", "out_cache_loc", "mrope_positions")
 )
 
+_MAMBA_TRACK_FIELDS = (
+    "mamba_track_indices",
+    "mamba_track_mask",
+    "mamba_track_seqlens",
+)
+
 # Fields whose batch dim gets padded to the bs bucket.
 _BS_FIELDS = (
     "seq_lens",
@@ -98,6 +104,7 @@ _BS_FIELDS = (
     "extend_prefix_lens",
     "extend_start_loc",
     "encoder_lens",
+    *_MAMBA_TRACK_FIELDS,
 )
 
 # Python-list batch metadata can become Dynamo guards; pad to bucket length.
@@ -568,6 +575,29 @@ def _pad_tensor(
     return F.pad(t, padding)
 
 
+def _pad_mamba_tracking(forward_batch: Any, pad_b: int) -> None:
+    """Upload scheduler-owned tracking metadata only at the bucketed shape."""
+    originals = getattr(forward_batch, "_tpu_mamba_tracking_cpu", None)
+    if originals is None:
+        originals = {}
+    for field in _MAMBA_TRACK_FIELDS:
+        val = getattr(forward_batch, field, None)
+        if not isinstance(val, torch.Tensor):
+            continue
+        if val.device.type == "cpu":
+            originals[field] = val
+            setattr(
+                forward_batch,
+                field,
+                _zero_pad_dim0(val, pad_b).to(forward_batch.seq_lens.device),
+            )
+        elif val.shape[0] != pad_b:
+            # Already-padded inputs make repeated preparation harmless. Never
+            # hide an early upload by reading it back or padding it on TPU.
+            raise ValueError("TPU Mamba tracking metadata must be padded on CPU")
+    forward_batch._tpu_mamba_tracking_cpu = originals
+
+
 def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
@@ -658,7 +688,10 @@ def _pad_batch_fields(
     if pad_t is not None:
         _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
 
+    _pad_mamba_tracking(forward_batch, pad_b)
     for field in _BS_FIELDS:
+        if field in _MAMBA_TRACK_FIELDS:
+            continue
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
             setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
@@ -750,8 +783,16 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
 
     for field in _BS_FIELDS:
         value = getattr(forward_batch, field, None)
+        if field in _MAMBA_TRACK_FIELDS:
+            # Restore the host snapshot, avoiding a variable-size TPU slice
+            # when unpadding the completed forward.
+            originals = getattr(forward_batch, "_tpu_mamba_tracking_cpu", None)
+            if originals is not None and field in originals:
+                value = originals[field]
+                setattr(forward_batch, field, value)
         if isinstance(value, torch.Tensor) and value.shape[0] > real_b:
             setattr(forward_batch, field, value[:real_b])
+    forward_batch._tpu_mamba_tracking_cpu = None
 
     for field in _BS_CPU_LIST_FIELDS:
         value = getattr(forward_batch, field, None)

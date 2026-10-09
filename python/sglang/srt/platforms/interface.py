@@ -50,6 +50,16 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    supports_mamba_extra_buffer: bool = False
+
+    def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
+        """Validate platform-specific recurrent prefix-cache constraints.
+
+        ``hf_config`` is provided for extra-buffer strategies. The default
+        adds no restrictions to the shared backend validation.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
