@@ -1865,6 +1865,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     "sp_video_start_frame",
                     "sp_video_tokens_per_frame",
                     "sp_video_valid_token_count",
+                    "sp_video_padded",
                 )
                 if hasattr(batch, name)
             }
