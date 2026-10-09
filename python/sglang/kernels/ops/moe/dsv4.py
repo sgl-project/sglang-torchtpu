@@ -9,8 +9,9 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_tpu, is_xpu
 
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 
@@ -184,6 +185,13 @@ def silu_and_mul_clamp(
         from sgl_kernel import silu_and_mul_clamp
 
         silu_and_mul_clamp(input, output, float(swiglu_limit))
+    elif _is_tpu:
+        limit = float(swiglu_limit)
+        gate, up = input.float().chunk(2, dim=-1)
+        res = torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(
+            min=-limit, max=limit
+        )
+        output.copy_(res.to(output.dtype))
     else:
         module = _jit_silu_and_mul_clamp_module(input.dtype)
         module.run(input, output, float(swiglu_limit))

@@ -678,8 +678,6 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
         self.maybe_init_kv_free_fence()
-        if current_platform.is_tpu() and self.draft_worker is not None:
-            self.precompile_tpu_spec_ops()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1119,6 +1117,8 @@ class Scheduler(
             self.tp_worker.init_cuda_graphs()
             if self.draft_worker is not None:
                 self.draft_worker.init_cuda_graphs()
+                if current_platform.is_tpu():
+                    self.precompile_tpu_spec_ops()
 
         # Independent DP groups repeat distributed ranks but run identical model
         # replicas. DP0 writes their shared bundles; DP-attention ranks are unique.
@@ -1365,6 +1365,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # TPU drain votes use list positions, so entries must match across TP/CP.
         self._deferred_chunked_sender_aborts: list[Req] = []
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -1821,7 +1822,7 @@ class Scheduler(
         )
 
         precompile_spec_v2_ops(
-            device=torch.device(self.device),
+            device=torch.device(self.tp_worker.model_runner.device),
             physical_batch_buckets=compile_policy.b_bucketer.buckets,
             num_verify_tokens=compile_policy.draft_token_num,
             vocab_size=self.model_config.vocab_size,
@@ -3755,7 +3756,7 @@ class Scheduler(
             defer_page_release = (
                 getattr(req.disagg_kv_sender, "group_failure_requires_drain", False)
                 and hasattr(req.disagg_kv_sender, "drained")
-                and not req.disagg_kv_sender.drained()
+                and not self._group_drained([req.disagg_kv_sender])[0]
             )
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
@@ -3781,19 +3782,40 @@ class Scheduler(
         pending = self._deferred_chunked_sender_aborts
         if not pending:
             return
+        drained = None
+        if current_platform.is_tpu():
+            for req in pending:
+                req.disagg_kv_sender.poll()
+            # TPU ranks must free in the same step to admit matching batches.
+            # Abort seals each sender before the group samples its drain state.
+            drained = self._group_drained([req.disagg_kv_sender for req in pending])
         still_held = []
-        for req in pending:
+        for i, req in enumerate(pending):
             sender = req.disagg_kv_sender
-            # Poll through the public transfer interface: Raiden drains native
-            # completions here, while any future drain-aware backend can own
-            # its progress mechanism without exposing manager internals.
-            sender.poll()
-            if not sender.drained():
+            if drained is None:
+                sender.poll()
+                req_drained = sender.drained()
+            else:
+                req_drained = drained[i]
+            if not req_drained:
                 still_held.append(req)
                 continue
             sender.clear()
             release_kv_cache(req, self.tree_cache, is_insert=False)
         self._deferred_chunked_sender_aborts = still_held
+
+    def _group_drained(self, senders) -> List[bool]:
+        """Return drain state, coordinated across attention TP/CP on TPU."""
+        drained = [sender.drained() for sender in senders]
+        if not current_platform.is_tpu():
+            return drained
+        bits = torch.tensor(drained, dtype=torch.uint8, device="cpu")
+        for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+            if group is not None and torch.distributed.get_world_size(group) > 1:
+                torch.distributed.all_reduce(
+                    bits, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+        return [bool(bit) for bit in bits.tolist()]
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""

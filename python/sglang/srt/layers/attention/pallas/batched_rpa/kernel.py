@@ -75,6 +75,25 @@ def strided_load_bkv(
     )
 
 
+def add_attention_sink(l: jax.Array, m: jax.Array, sink_ref: jax.Ref) -> jax.Array:
+    """Adds exp(sink - m) to one lane's softmax denominator l: [KV, rows, 128].
+
+    The sink is one extra key per row with logit sink[head] and a zero value.
+    """
+    num_rows = l.shape[1]
+    num_kv_heads, period, num_lanes = sink_ref.shape
+    if num_rows <= period:
+        sink = sink_ref[:, :num_rows]
+    else:
+        assert num_rows % period == 0, (num_rows, period)
+        sink = jnp.broadcast_to(
+            sink_ref[...][:, None],
+            (num_kv_heads, num_rows // period, period, num_lanes),
+        ).reshape(l.shape)
+    l_sink = l.astype(jnp.float32) + jnp.exp(sink - m.astype(jnp.float32))
+    return l_sink.astype(l.dtype)
+
+
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
@@ -82,10 +101,19 @@ def calculate_and_store_out(
     l_list: list[jax.Array],
     o_vref: jax.Ref,
     *,
+    m_list: jax.Array | None,
+    sink_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
 ):
 
-    def _accum(b_idx: jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
+    def _accum(
+        b_idx: jax.Array,
+        batch_acc: jax.Array,
+        batch_l: jax.Array,
+        batch_m: jax.Array | None,
+    ):
+        if cfgs.model.has_attention_sink:
+            batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
@@ -107,7 +135,7 @@ def calculate_and_store_out(
 
     if cfgs.fuse_accum:
         for b in range(cfgs.batch_size):
-            _accum(b, acc_list[b], l_list[b])
+            _accum(b, acc_list[b], l_list[b], None if m_list is None else m_list[b])
     else:
         # Adding a conditional causes a scheduling barrier. In prefill, we often
         # use small block sizes, so it's not worth executing the accumulation
@@ -118,9 +146,10 @@ def calculate_and_store_out(
             is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
             acc_val = acc_list[b]
             l_val = l_list[b]
+            m_val = None if m_list is None else m_list[b]
             accum_named_call = jax.named_call(_accum, name=f"accum_{b}")
             jax.lax.cond(
-                is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val
+                is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val, m_val
             )
 
 
@@ -139,6 +168,7 @@ def rpa_body(
     # Passed refs
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
+    sink_ref: jax.Ref | None,
     # Configs.
     cfgs: configs.RpaConfigs,
 ):
@@ -282,6 +312,7 @@ def rpa_body(
     acc_val = acc_scratch_ref[...]
 
     l_new_list = []
+    m_new_list = []
     acc_new_list = []
 
     prev_p = prev_alpha_list = prev_q_slice = None
@@ -291,21 +322,24 @@ def rpa_body(
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
 
-        p, alpha_list, m_next, l_next = flash_attention.flash_attention_qk_softmax(
-            step,
-            q[:, :, q_slice],
-            k,
-            m_val[:, q_slice],
-            l_val[:, q_slice],
-            schedule_ref.is_last_k,
-            processed_q_len=processed_q_len,
-            processed_kv_len=processed_kv_len,
-            cfgs=cfgs,
-            bq_start=bq_start,
+        p, alpha_list, m_next, l_next, m_lanes = (
+            flash_attention.flash_attention_qk_softmax(
+                step,
+                q[:, :, q_slice],
+                k,
+                m_val[:, q_slice],
+                l_val[:, q_slice],
+                schedule_ref.is_last_k,
+                processed_q_len=processed_q_len,
+                processed_kv_len=processed_kv_len,
+                cfgs=cfgs,
+                bq_start=bq_start,
+            )
         )
         m_scratch_ref[:, q_slice] = m_next
         l_scratch_ref[:, q_slice] = l_next[-1]
         l_new_list.append(l_next)
+        m_new_list.append(m_lanes)
 
         if prev_p is not None:
             o_next = flash_attention.flash_attention_pv(
@@ -335,6 +369,9 @@ def rpa_body(
 
     l_next = jnp.concatenate(l_new_list, axis=2)
     acc_next = jnp.concatenate(acc_new_list, axis=2)
+    m_lanes = None
+    if cfgs.model.has_attention_sink:
+        m_lanes = jnp.concatenate(m_new_list, axis=2)
 
     # Step 4: Write back outputs.
     calculate_and_store_out(
@@ -343,6 +380,8 @@ def rpa_body(
         acc_next,
         l_next,
         o_vref,
+        m_list=m_lanes,
+        sink_ref=sink_ref,
         cfgs=cfgs,
     )
 
@@ -412,6 +451,8 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
+    if cfgs.model.has_attention_sink:
+        name += "-sink"
     return name
 
 
@@ -436,6 +477,7 @@ def rpa_kernel(
     q_hbm: jax.Array,
     new_kv_hbm: jax.Array,
     kv_cache_hbm: jax.Array,
+    attention_sink: jax.Array | None,
     *,
     cfgs: configs.RpaConfigs,
 ) -> tuple[jax.Array, jax.Array]:
@@ -459,6 +501,8 @@ def rpa_kernel(
         kv_cache_hbm: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
             kv_packing, head_dim]. Stores existing kv cache data where k & vs are
             concatenated along num kv heads dim.
+        attention_sink: [num_kv_heads, period, 128] f32 or None. Per-row sink
+            logits from `wrapper.prepare_attention_sink`.
         cfgs: Configuration of the kernel.
 
     Returns:
@@ -478,6 +522,7 @@ def rpa_kernel(
         q_hbm_ref: jax.Ref,
         new_kv_hbm_ref: jax.Ref,
         kv_cache_hbm_ref: jax.Ref,
+        sink_ref: jax.Ref | None,
         # Outputs.
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
@@ -530,6 +575,11 @@ def rpa_kernel(
             kv_alloc = final_allocs[1]
             kv_ref_flat = kv_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
             kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
+            # Q rows past a block's q_sz keep stale VMEM. A NaN there turns the
+            # same rows of later blocks to NaN through 0 * NaN in l/acc.
+            q_window = final_allocs[0].window_ref
+            q_ref_flat = q_window.bitcast(jnp.uint32).reshape(-1, num_lanes)
+            q_ref_flat[...] = jnp.zeros_like(q_ref_flat)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
@@ -565,6 +615,7 @@ def rpa_kernel(
                         cfgs=cfgs,
                         cu_q_lens_ref=cu_q_lens_ref,
                         kv_lens_ref=kv_lens_ref,
+                        sink_ref=sink_ref,
                     ),
                     grid=(num_steps + prefix_steps,),
                     in_specs=(q_alloc.spec, kv_cache_alloc.spec),
@@ -605,6 +656,11 @@ def rpa_kernel(
                 pl.BlockSpec(memory_space=pltpu.HBM),  # q_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_hbm_ref
+                (
+                    None
+                    if attention_sink is None
+                    else pl.BlockSpec(memory_space=pltpu.VMEM)
+                ),  # sink_ref
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
@@ -626,4 +682,5 @@ def rpa_kernel(
         q_hbm,
         new_kv_hbm,
         kv_cache_hbm,
+        attention_sink,
     )

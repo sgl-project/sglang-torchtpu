@@ -1356,6 +1356,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not _is_xpu
             and not _use_aiter
+            and not self.experts.should_fuse_routed_scaling_factor_in_topk
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             # fused in biased_grouped_topk so we can skip here

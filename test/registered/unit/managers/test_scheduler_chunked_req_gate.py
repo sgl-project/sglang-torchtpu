@@ -2,10 +2,16 @@
 
 import unittest
 from array import array
+from datetime import timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,7 +31,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.common import Range
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 
 def _make_req(
@@ -193,8 +199,144 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertIsNone(s.chunked_req)
 
 
+def _run_chunked_abort_rank(rank: int, init_file: str) -> None:
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=Path(init_file).as_uri(),
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        tp_groups = [
+            dist.new_group(ranks, timeout=timedelta(seconds=30))
+            for ranks in ([0, 1], [2, 3])
+        ]
+        cp_groups = [
+            dist.new_group(ranks, timeout=timedelta(seconds=30))
+            for ranks in ([0, 2], [1, 3])
+        ]
+        tp_group, cp_group = tp_groups[rank // 2], cp_groups[rank % 2]
+        sender = MagicMock(group_failure_requires_drain=True)
+        sender.drained.return_value = rank != 0
+
+        def drained(sender):
+            assert sender.abort.call_count == 1
+            return sender.drained.return_value
+
+        sender.drained.side_effect = lambda: drained(sender)
+        req = TestChunkedAbortNativeReadDrain._aborted_chunked_req(sender)
+        scheduler = TestChunkedAbortNativeReadDrain._scheduler(req)
+        scheduler.attn_tp_cpu_group = tp_group
+        scheduler.attn_cp_cpu_group = cp_group
+
+        def release(owner, tree_cache, *, is_insert):
+            assert tree_cache is scheduler.tree_cache
+            assert not is_insert and owner.kv.holds_kv
+            owner.kv.holds_kv = False
+
+        def assert_all_ranks(state, expected):
+            tensor = torch.tensor(state, dtype=torch.int64)
+            states = [torch.empty_like(tensor) for _ in range(4)]
+            dist.all_gather(states, tensor)
+            assert [s.tolist() for s in states] == [expected] * 4
+
+        native_all_reduce = dist.all_reduce
+        votes = []
+
+        def all_reduce(tensor, op, group):
+            assert op == dist.ReduceOp.MIN
+            assert group is tp_group or group is cp_group
+            votes.append(group)
+            native_all_reduce(tensor, op=op, group=group)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.current_platform",
+                SimpleNamespace(is_tpu=lambda: True),
+            ),
+            patch("torch.distributed.all_reduce", side_effect=all_reduce),
+            patch(
+                "sglang.srt.managers.scheduler.release_kv_cache", side_effect=release
+            ) as free,
+            get_context().override_server_args(),
+        ):
+            scheduler.process_pending_chunked_abort()
+            assert votes == [tp_group, cp_group]
+            assert_all_ranks(
+                [
+                    len(scheduler._deferred_chunked_sender_aborts),
+                    req.kv.holds_kv,
+                    sender.abort.call_count,
+                    free.call_count,
+                ],
+                [1, 1, 1, 0],
+            )
+
+            second_sender = MagicMock(group_failure_requires_drain=True)
+            second_sender.drained.return_value = rank != 2
+            second_sender.drained.side_effect = lambda: drained(second_sender)
+            second_req = TestChunkedAbortNativeReadDrain._aborted_chunked_req(
+                second_sender, rid="second-abort"
+            )
+            scheduler.chunked_req = second_req
+            scheduler._pending_chunked_abort_req = second_req
+            votes.clear()
+            scheduler.process_pending_chunked_abort()
+            assert votes == [tp_group, cp_group] * 2
+            assert_all_ranks(
+                [
+                    len(scheduler._deferred_chunked_sender_aborts),
+                    req.kv.holds_kv,
+                    second_req.kv.holds_kv,
+                    sender.abort.call_count,
+                    second_sender.abort.call_count,
+                    free.call_count,
+                ],
+                [2, 1, 1, 1, 1, 0],
+            )
+
+            # Only the second request has drained on every rank. The first
+            # still has a reader on rank 0, across both TP and CP subgroups.
+            second_sender.drained.return_value = True
+            votes.clear()
+            scheduler._drain_deferred_chunked_sender_aborts()
+            assert votes == [tp_group, cp_group]
+            assert_all_ranks(
+                [
+                    len(scheduler._deferred_chunked_sender_aborts),
+                    req.kv.holds_kv,
+                    second_req.kv.holds_kv,
+                    sender.clear.call_count,
+                    second_sender.clear.call_count,
+                    free.call_count,
+                ],
+                [1, 1, 0, 0, 1, 1],
+            )
+
+            sender.drained.return_value = True
+            votes.clear()
+            scheduler._drain_deferred_chunked_sender_aborts()
+            assert votes == [tp_group, cp_group]
+            assert_all_ranks(
+                [
+                    len(scheduler._deferred_chunked_sender_aborts),
+                    req.kv.holds_kv,
+                    second_req.kv.holds_kv,
+                    sender.clear.call_count,
+                    second_sender.clear.call_count,
+                    free.call_count,
+                ],
+                [0, 0, 0, 1, 1, 2],
+            )
+    finally:
+        dist.destroy_process_group()
+
+
 class TestChunkedAbortNativeReadDrain(CustomTestCase):
-    def _scheduler(self, req):
+    @staticmethod
+    def _scheduler(req):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.chunked_req = req
         scheduler._pending_chunked_abort_req = req
@@ -204,7 +346,25 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.enable_hicache_storage = False
         scheduler.tree_cache = MagicMock()
         scheduler.ipc_channels = MagicMock()
+        scheduler.attn_tp_cpu_group = None
+        scheduler.attn_cp_cpu_group = None
         return scheduler
+
+    @staticmethod
+    def _aborted_chunked_req(sender, rid="chunked-abort"):
+        return SimpleNamespace(
+            rid=rid,
+            disagg_kv_sender=sender,
+            time_stats=SimpleNamespace(trace_ctx=MagicMock()),
+            to_finish=object(),
+            return_logprob=False,
+            metadata_buffer_index=7,
+            pending_bootstrap=True,
+            weight_version_events=[],
+            output_ids=array("q"),
+            cache_request_handle=object(),
+            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+        )
 
     @patch("sglang.srt.managers.scheduler.release_kv_cache")
     @patch("sglang.srt.managers.scheduler.maybe_release_metadata_buffer")
@@ -214,17 +374,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
     ):
         sender = MagicMock(group_failure_requires_drain=True)
         sender.drained.return_value = False
-        req = SimpleNamespace(
-            rid="chunked-abort",
-            disagg_kv_sender=sender,
-            time_stats=SimpleNamespace(trace_ctx=MagicMock()),
-            to_finish=object(),
-            pending_bootstrap=True,
-            # A Req aborted mid chunked-prefill has no events and no output tokens yet.
-            weight_version_events=[],
-            output_ids=array("q"),
-            cache_request_handle=object(),
-        )
+        req = self._aborted_chunked_req(sender)
         scheduler = self._scheduler(req)
 
         # The same notice reads the live weight version off the serving bag.
@@ -234,6 +384,58 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         sender.abort.assert_called_once_with()
         release_kv.assert_not_called()
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+
+    def test_non_tpu_abort_and_drain_do_not_use_collectives(self):
+        sender = MagicMock(group_failure_requires_drain=True)
+        sender.drained.return_value = False
+        req = self._aborted_chunked_req(sender)
+        scheduler = self._scheduler(req)
+        scheduler.attn_tp_cpu_group = object()
+        scheduler.attn_cp_cpu_group = object()
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.current_platform",
+                SimpleNamespace(is_tpu=lambda: False),
+            ),
+            patch("torch.distributed.get_world_size", return_value=2) as world_size,
+            patch("torch.distributed.all_reduce") as all_reduce,
+            patch("sglang.srt.managers.scheduler.release_kv_cache") as free,
+            get_context().override_server_args(),
+        ):
+            scheduler.process_pending_chunked_abort()
+            free.assert_not_called()
+            self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+            sender.drained.return_value = True
+            scheduler.process_pending_chunked_abort()
+
+        sender.abort.assert_called_once_with()
+        sender.poll.assert_called_once_with()
+        sender.clear.assert_called_once_with()
+        free.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
+        world_size.assert_not_called()
+        all_reduce.assert_not_called()
+
+    @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
+    def test_real_tp_cp_groups_release_requests_in_the_same_step(self):
+        with TemporaryDirectory() as directory:
+            workers = mp.spawn(
+                _run_chunked_abort_rank,
+                args=(str(Path(directory) / "gloo-init"),),
+                nprocs=4,
+                join=False,
+            )
+            deadline = monotonic() + 120
+            try:
+                while not workers.join(timeout=5):
+                    if monotonic() >= deadline:
+                        self.fail("chunked-abort drain test exceeded 120 seconds")
+            finally:
+                for process in workers.processes:
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(timeout=5)
 
     def _idle_prefill_scheduler(self):
         # is_fully_idle reads the pipeline width from the published config.
@@ -261,6 +463,8 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.enable_lmcache = False
         scheduler._engine_paused = False
         scheduler._deferred_chunked_sender_aborts = []
+        scheduler.attn_tp_cpu_group = None
+        scheduler.attn_cp_cpu_group = None
         scheduler.req_to_token_pool = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.metrics_reporter = MagicMock()

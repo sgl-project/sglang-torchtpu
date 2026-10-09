@@ -12,7 +12,7 @@ from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 
 # Expected runtime includes model download, compilation, and the eviction probe.
 register_tpu_ci(
-    est_time=1800,
+    est_time=1100,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "gpt-oss-20b", "prefix-cache", "kv-offload"],
 )

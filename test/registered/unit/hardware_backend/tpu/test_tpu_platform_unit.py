@@ -243,6 +243,9 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             speculative_algorithm=None,
             speculative_eagle_topk=None,
             speculative_use_rejection_sampling=False,
+            disaggregation_mode="null",
+            disaggregation_transfer_backend="mooncake",
+            optimistic_prefill_attempts=0,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -257,6 +260,37 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         from sglang.srt.arg_groups.overrides import resolution_result
 
         return resolution_result(args, field)
+
+    def test_rejects_optimistic_prefill_on_raiden_pd(self):
+        """Optimistic prefill on raiden parks KV for requests the decode has
+        no pages for, and deadlocked the PD pools under burst load."""
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                args = self._args(
+                    disaggregation_mode=mode,
+                    disaggregation_transfer_backend="raiden",
+                    optimistic_prefill_attempts=1,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "--optimistic-prefill-attempts must be 0"
+                ):
+                    self._apply(args)
+
+    def test_optimistic_prefill_allowed_outside_raiden_pd(self):
+        for overrides in (
+            dict(disaggregation_mode="prefill", optimistic_prefill_attempts=1),
+            dict(
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="raiden",
+                optimistic_prefill_attempts=0,
+            ),
+            dict(
+                disaggregation_transfer_backend="raiden",
+                optimistic_prefill_attempts=1,
+            ),
+        ):
+            with self.subTest(**overrides):
+                self._apply(self._args(**overrides))
 
     def test_defaults_applied(self):
         args = self._args(enable_torch_compile=False)

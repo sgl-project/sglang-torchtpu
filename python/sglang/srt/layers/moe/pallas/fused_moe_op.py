@@ -340,10 +340,11 @@ def _fuse_act_name(activation_name):
     ``silu`` / ``gelu`` / ``swigluoai`` / ``situ:{beta}:{linear_beta|none}``;
     SGLang spells the GPT-OSS one ``swiglu_oai``.
     """
-    if activation_name.startswith("situ:"):
+    if activation_name.startswith(("situ:", "silu_and_mul_clamp:")):
         return activation_name
     mapping = {
         "silu": "silu",
+        "silu_and_mul_clamp": "silu_and_mul_clamp",
         "gelu": "gelu",
         "swiglu_oai": "swigluoai",
         "swigluoai": "swigluoai",
@@ -351,7 +352,7 @@ def _fuse_act_name(activation_name):
     if activation_name not in mapping:
         raise NotImplementedError(
             f"Unsupported activation '{activation_name}' for the Pallas "
-            "fused-MoE op. Supported: silu, gelu, swiglu_oai."
+            "fused-MoE op. Supported: silu, silu_and_mul_clamp, gelu, swiglu_oai."
         )
     return mapping[activation_name]
 

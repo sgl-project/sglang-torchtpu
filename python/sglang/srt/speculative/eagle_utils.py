@@ -455,7 +455,7 @@ def _verify_tree_greedy_torch(
     accept_index = torch.where(
         columns.unsqueeze(0) < accept_len.unsqueeze(1),
         retrieve_index.to(torch.int32),
-        torch.tensor(-1, dtype=torch.int32, device=candidates.device),
+        -1,
     )
     return predicts, accept_index, accept_len.to(torch.int32)
 

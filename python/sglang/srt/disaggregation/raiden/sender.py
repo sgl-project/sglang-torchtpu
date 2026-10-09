@@ -10,6 +10,7 @@ not instantiated on its own and deliberately defines no ``__init__``.
 
 from __future__ import annotations
 
+import errno
 import secrets
 import threading
 import time
@@ -45,6 +46,18 @@ from sglang.srt.disaggregation.raiden.serde import (
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
+
+# Send errors whose cause belongs to one peer, so they cost that peer's room
+# rather than the engine. An errno not listed here is assumed engine-wide
+# (ETERM, ENOMEM, ENOTSOCK, ...) and is re-raised so the scheduler still dies.
+ROOM_SCOPED_SEND_ERRNOS = frozenset(
+    {
+        zmq.EAGAIN,  # the peer stopped draining, or SNDTIMEO expired
+        errno.EHOSTUNREACH,  # the peer is unreachable
+        errno.EINVAL,  # a malformed endpoint from the decode's own PULL_REQ
+        errno.EINTR,  # a signal interrupted the send
+    }
+)
 
 
 class RaidenSenderMixin:
@@ -222,7 +235,30 @@ class RaidenSenderMixin:
                 endpoint=self.raiden_endpoint or "",
             ).to_frames()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
-            self._send_multipart_locked(endpoint, payload)
+            try:
+                self._send_multipart_locked(endpoint, payload)
+            except zmq.ZMQError as exc:
+                # As for the BLOCKS reply in _maybe_reply: an announce this
+                # rank cannot deliver fails its own room. Unguarded, the error
+                # reaches the scheduler's catch-all and kills every rank.
+                if exc.errno not in ROOM_SCOPED_SEND_ERRNOS:
+                    raise
+                logger.error(
+                    "RaidenKVManager rank%d room %s: CHUNK announce to %s "
+                    "failed (errno %s), failing the room: %s",
+                    self.attn_tp_rank,
+                    room,
+                    endpoint,
+                    exc.errno,
+                    exc,
+                )
+                with self._state_lock:
+                    if room not in self._aborted:
+                        self._mark_aborted_locked(room)
+                        self._fail_room_locked(
+                            room, f"CHUNK announce to {endpoint} failed: {exc}"
+                        )
+                        self.update_status(room, KVPoll.Failed)
 
     def finalize_send(self, room: int, aux_index: Optional[int]) -> bool:
         """Announce the room's blocks to the decode. False if the room was aborted.

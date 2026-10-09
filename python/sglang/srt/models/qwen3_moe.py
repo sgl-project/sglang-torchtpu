@@ -17,6 +17,9 @@
 
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+# TODO(#1065): the FP8 fused-RS MoE backend is kept out of `auto` because the
+# decoder layer sums its output twice. Re-enable it in fp8.py once #1122 lands.
+
 import logging
 import math
 from functools import lru_cache

@@ -56,11 +56,13 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_tpu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 @dataclass
@@ -1152,6 +1154,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    _is_tpu_dsv4 = False
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1256,6 +1259,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
         self._spec_infl = 1.0
+        self._is_tpu_dsv4 = get_exec().kernel.dsv4_attn_backend == "tpu_dsv4"
 
         # The unified pool ignores --kv-cache-dtype; V4 resolves "auto" to fp8_e4m3
         # (overrides.py _deepseek_v4_kv_cache_dtype), so only bfloat16 is explicit.
@@ -1419,7 +1423,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
         # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
-        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+        if (
+            self._unified
+            or _is_npu
+            or self._is_tpu_dsv4
+            or get_exec().kernel.dsv4_attn_backend == "trtllm"
+        ):
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
@@ -1438,6 +1447,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
+        if self._is_tpu_dsv4:
+            return 1024.0 * self.num_layers_total
         if self.encoder_replay:
             # Target SWA lives in the request window; only the draft owns paged SWA
             # bytes, and its layers carry no compressed state.
@@ -1473,6 +1484,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
+        if self._is_tpu_dsv4:
+            # TPU uses 4D uint8 Pallas layouts:
+            # - SWA: 1024 B/token (raw bf16)
+            # - CSA (C4): 640 B/compressed token (512 B NoPE + 128 B RoPE)
+            # - HCA (C128): 1024 B/compressed token (raw bf16)
+            # - Indexer: 256 B/compressed token
+            # - Compressor states (C4 & C128) are fixed-size (per-request ring +
+            #   8192-token prefill scratch) and accounted in _fixed_c4_state_bytes
+            #   and _get_c128_state_fixed_bytes.
+            c4_frac = 1 / (4 * self.c4_shrink_factor)
+            return (
+                swa_ratio * self.bytes_per_swa_token
+                + c4_frac * 640 * self.num_layers(4)
+                + 1 / 128 * 1024 * self.num_layers(128)
+                + 1 / 4 * 256 * self.num_layers(4)
+            )
         return swa_ratio * self.bytes_per_swa_token + sum(
             self._compressed_bytes_per_full_token(ratio) * len(layers)
             for ratio, layers in self.stage_owner_layers.items()
@@ -1544,9 +1571,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if num_layers == 0:
             return 0
 
-        _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[128]
+
+        if self._is_tpu_dsv4:
+            ring_tokens = max(ring_size, 256)
+            state_rows = 8 + num_req_slots * ring_tokens + 8192
+            return state_rows * (2 * self.attn_head_dim * 4) * num_layers
+
+        _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
 
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
             state_rows = num_req_slots + ring_size + 1
@@ -1582,7 +1615,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _fixed_c4_state_bytes(self, max_running_requests: int) -> int:
         num_layers = self.num_layers(4)
-        if not self._unified or num_layers == 0:
+        if num_layers == 0:
+            return 0
+
+        if self._is_tpu_dsv4:
+            num_req_slots = self._get_num_req_slots(max_running_requests)
+            ring_tokens = max(self.ring_sizes[4], 32)
+            state_rows = 4 + num_req_slots * ring_tokens + 8192
+            core_bytes = 4 * self.attn_head_dim * 4
+            indexer_bytes = 4 * self.indexer_head_dim * 4
+            return state_rows * (core_bytes + indexer_bytes) * num_layers
+
+        if not self._unified:
             return 0
 
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()

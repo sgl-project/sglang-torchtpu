@@ -8,6 +8,7 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 import types
 import unittest
 from typing import Optional
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -266,6 +267,36 @@ class TestBatchedRpaNonEmptyBatchSize(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             self._backend()._non_empty_batch_size(fb)
+
+
+class TestBatchedRpaKernelArguments(CustomTestCase):
+    def test_attention_sink_reaches_the_kernel(self):
+        from sglang.srt.hardware_backend.tpu import attention_pallas_rpa_batched
+
+        kernel = Mock(return_value="out")
+        sinks = object()
+        with patch.object(
+            attention_pallas_rpa_batched, "kv_layout", return_value="layout"
+        ):
+            attention_pallas_rpa_batched._invoke_batched_kernel(
+                kernel,
+                queries="q",
+                keys="k",
+                values="v",
+                kv_cache_fused="cache",
+                kv_lens="kv_lens",
+                page_indices="pages",
+                cu_q_lens="cu_q_lens",
+                cu_kv_lens="cu_kv_lens",
+                distribution="distribution",
+                attention_sink=sinks,
+                sm_scale=0.125,
+                sliding_window=128,
+                soft_cap=None,
+                k_scale=None,
+                v_scale=None,
+            )
+        self.assertIs(kernel.call_args.kwargs["attention_sink"], sinks)
 
 
 if __name__ == "__main__":

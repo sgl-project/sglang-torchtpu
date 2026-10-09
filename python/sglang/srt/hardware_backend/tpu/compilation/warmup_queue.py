@@ -26,8 +26,9 @@ class WarmupQueue:
 
     def wait(self) -> None:
         with torch.no_grad():
-            for call in self.calls:
-                call.wait()
+            # Release completed calls' inputs before executing the next program.
+            while self.calls:
+                self.calls.pop(0).wait()
         for complete in self.completions:
             complete()
 
@@ -51,12 +52,13 @@ def collect_warmups() -> Iterator[WarmupQueue]:
     try:
         yield queue
         submitted = time.perf_counter()
-        logger.info("TPU global warmup: submitted %d calls; joining", len(queue.calls))
+        count = len(queue.calls)
+        logger.info("TPU global warmup: submitted %d calls; joining", count)
         queue.wait()
         finished = time.perf_counter()
         logger.info(
             "TPU global warmup: pending=%d submit=%.3fs wait=%.3fs total=%.3fs",
-            len(queue.calls),
+            count,
             submitted - start,
             finished - submitted,
             finished - start,

@@ -1198,6 +1198,10 @@ class SchedulerDisaggregationPrefillMixin:
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
         self.clear_pending_chunk_send(req)
+        if any(held is req for held in self._deferred_chunked_sender_aborts):
+            # process_pending_chunked_abort already retired it and parked its
+            # pages until the sender drains; only that drain may free them.
+            return False
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
         )

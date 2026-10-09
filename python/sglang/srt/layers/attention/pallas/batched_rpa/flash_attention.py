@@ -141,7 +141,9 @@ def flash_attention_qk_softmax(
 
     l_next = jnp.stack(l_next_list, axis=0)
 
-    return p, alpha_list, m_prev, l_next
+    # m_prev is the carry into the next step (reset after a last k block);
+    # m_next is each lane's running max, which the sink term is scaled by.
+    return p, alpha_list, m_prev, l_next, m_next
 
 
 def flash_attention_pv(

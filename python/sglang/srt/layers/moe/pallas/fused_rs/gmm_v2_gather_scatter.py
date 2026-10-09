@@ -143,6 +143,17 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
     match fuse_act:
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
+        case "silu_and_mul_clamp":
+            limit = 10.0
+            acc_gate = jnp.minimum(acc_gate, limit)
+            acc_up = jnp.clip(acc_up, min=-limit, max=limit)
+            return jax.nn.silu(acc_gate) * acc_up
+        case str() if fuse_act.startswith("silu_and_mul_clamp:"):
+            _, limit_str = fuse_act.split(":")
+            limit = float(limit_str)
+            acc_gate = jnp.minimum(acc_gate, limit)
+            acc_up = jnp.clip(acc_up, min=-limit, max=limit)
+            return jax.nn.silu(acc_gate) * acc_up
         case "gelu":
             return jax.nn.gelu(acc_gate) * acc_up
         case "swigluoai":

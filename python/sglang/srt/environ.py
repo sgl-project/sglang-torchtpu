@@ -1160,7 +1160,7 @@ class Envs:
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
-    # Set to 0 to compile direct warmups synchronously.
+    # Set to 0 to compile direct and compiled-op warmups synchronously.
     SGLANG_DIRECT_COMPILE_ASYNC = EnvBool(True)
 
     # ===================================================================
