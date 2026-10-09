@@ -45,6 +45,7 @@ class ModelConfigs:
     sm_scale: float = 1.0
     soft_cap: float | None = None
     sliding_window: int | None = None
+    has_attention_sink: bool = False
 
     @property
     def num_q_heads_per_kv_head(self) -> int:

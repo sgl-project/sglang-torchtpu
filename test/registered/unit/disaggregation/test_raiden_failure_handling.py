@@ -1,5 +1,6 @@
 """Unit tests for the raiden transport's failure handling between prefill and decode."""
 
+import errno
 import threading
 import time
 import types
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -1350,6 +1352,104 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         self.assertFalse(waiting.is_alive())
         self.assertFalse(clear.is_alive())
         self.assertNotIn(ROOM, mgr.request_status)
+
+
+ANNOUNCE_ROOM = 21
+ANNOUNCE_PAGES = 64
+
+
+def _armed_for_announce(mgr, room):
+    """Top up the prefill fixture with what _announce_chunk needs to reach its send."""
+    mgr.chunked_transfer = True
+    mgr.attn_tp_rank = 0
+    mgr.raiden_endpoint = "tcp://10.0.0.1:40000"
+    mgr._ensure_engine = Mock(return_value=Mock())
+    mgr._register_sender_read = Mock()
+    mgr._prefill.decode_addr[room] = ("10.0.0.9", 5555)
+    mgr._prefill.decode_pages[room] = ANNOUNCE_PAGES
+    mgr.request_status[room] = KVPoll.WaitingForInput
+
+
+def _announce(mgr, room=ANNOUNCE_ROOM):
+    mgr._announce_chunk(
+        room, 0, list(range(1000, 1000 + ANNOUNCE_PAGES)), ANNOUNCE_PAGES
+    )
+
+
+class TestAnnounceSendFailureIsContained(unittest.TestCase):
+    """An undeliverable CHUNK announce must fail its own room, not the engine.
+
+    Unguarded, the zmq error propagates out of _announce_chunk to the scheduler
+    event loop, whose catch-all handler takes down every TP rank.
+    """
+
+    @staticmethod
+    def _dead_send(endpoint, parts, is_ipv6=False):
+        raise zmq.Again("Resource temporarily unavailable")
+
+    def test_undeliverable_chunk_fails_room_not_engine(self):
+        mgr = _prefill_manager()
+        _armed_for_announce(mgr, ANNOUNCE_ROOM)
+        mgr._send_multipart_locked = self._dead_send
+
+        try:
+            _announce(mgr)
+        except zmq.ZMQError as exc:
+            self.fail(f"zmq error escaped _announce_chunk to the scheduler: {exc!r}")
+
+        self.assertEqual(mgr.check_status(ANNOUNCE_ROOM), KVPoll.Failed)
+        self.assertIn(ANNOUNCE_ROOM, mgr.failure_records)
+        self.assertIn(ANNOUNCE_ROOM, mgr._aborted)
+
+    def test_failed_announce_leaves_other_rooms_alone(self):
+        mgr = _prefill_manager()
+        other = ANNOUNCE_ROOM + 1
+        for room in (ANNOUNCE_ROOM, other):
+            _armed_for_announce(mgr, room)
+        mgr.request_status[other] = KVPoll.Transferring
+        mgr._send_multipart_locked = self._dead_send
+
+        _announce(mgr)
+
+        self.assertEqual(mgr.check_status(other), KVPoll.Transferring)
+        self.assertNotIn(other, mgr._aborted)
+
+    def test_engine_wide_zmq_errors_still_reach_the_scheduler(self):
+        for bad in (zmq.ETERM, errno.ENOMEM, errno.ENOTSOCK):
+            with self.subTest(errno=bad):
+                mgr = _prefill_manager()
+                _armed_for_announce(mgr, ANNOUNCE_ROOM)
+
+                def engine_wide(endpoint, parts, is_ipv6=False, _e=bad):
+                    raise zmq.ZMQError(_e)
+
+                mgr._send_multipart_locked = engine_wide
+                with self.assertRaises(zmq.ZMQError):
+                    _announce(mgr)
+                self.assertNotEqual(mgr.check_status(ANNOUNCE_ROOM), KVPoll.Failed)
+
+    def test_peer_scoped_errnos_are_absorbed(self):
+        for ok in (zmq.EAGAIN, errno.EHOSTUNREACH, errno.EINVAL, errno.EINTR):
+            with self.subTest(errno=ok):
+                mgr = _prefill_manager()
+                _armed_for_announce(mgr, ANNOUNCE_ROOM)
+
+                def peer_scoped(endpoint, parts, is_ipv6=False, _e=ok):
+                    raise zmq.ZMQError(_e)
+
+                mgr._send_multipart_locked = peer_scoped
+                _announce(mgr)
+                self.assertEqual(mgr.check_status(ANNOUNCE_ROOM), KVPoll.Failed)
+
+    def test_absorbed_failure_is_logged(self):
+        mgr = _prefill_manager()
+        _armed_for_announce(mgr, ANNOUNCE_ROOM)
+        mgr._send_multipart_locked = self._dead_send
+
+        with patch("sglang.srt.disaggregation.raiden.sender.logger.error") as log_error:
+            _announce(mgr)
+        self.assertEqual(log_error.call_count, 1)
+        self.assertIn("CHUNK announce", log_error.call_args[0][0])
 
 
 if __name__ == "__main__":

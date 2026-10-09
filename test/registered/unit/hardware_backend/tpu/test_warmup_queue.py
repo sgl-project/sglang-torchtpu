@@ -2,8 +2,10 @@
 
 import contextvars
 import sys
+import weakref
 
 import pytest
+import torch
 
 from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
@@ -36,6 +38,22 @@ def test_collect_warmups_nests_and_preserves_context():
     assert current_warmup_queue() is None
     assert queue.calls == []
     assert queue.completions == []
+
+
+def test_collect_warmups_releases_inputs_between_calls():
+    events = []
+
+    def enqueue(queue):
+        tensor = torch.ones(8)
+        queue.calls.append(PendingCall(lambda: events.append(tensor.numel())))
+        return weakref.ref(tensor)
+
+    with collect_warmups() as queue:
+        reference = enqueue(queue)
+        queue.calls.append(PendingCall(lambda: events.append(reference() is None)))
+        assert reference() is not None
+
+    assert events == [8, True]
 
 
 def test_collect_warmups_clears_after_failure():

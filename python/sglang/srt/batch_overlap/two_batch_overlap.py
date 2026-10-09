@@ -837,6 +837,7 @@ class TboForwardBatchPreparer:
                 temperature=None,
                 top_p=None,
                 mm_inputs=None,
+                mm_input_ids_cpu=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
                 extend_input_logprob_token_ids_gpu=None,

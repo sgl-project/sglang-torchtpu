@@ -57,7 +57,7 @@ LAUNCH_ENV = {
     "PAGE_SIZE": str(PAGE_SIZE),
     "TPU_COMPILE_TOKENS": "512 2048 4096",
     "TPU_COMPILE_BS": "1 2 4 8 16 32 64",
-    # gpt-oss needs RPA v3 (attention sinks), and raiden needs the fused
+    # This gate runs gpt-oss on RPA v3, and raiden needs the fused
     # page-first layout; server_args rejects other offload combinations. Both
     # are already the recipe's default -- pinned here so a recipe change cannot
     # silently take the offload path away from this gate.

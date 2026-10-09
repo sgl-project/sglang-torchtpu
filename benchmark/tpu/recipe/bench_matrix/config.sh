@@ -181,8 +181,8 @@ case "$BENCH_MODEL" in
         # MXFP4 is declared by the checkpoint's own quantization_config.
         QUANTIZATION=unquant
         KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
-        # rpa_v3: the only TPU backend with attention sinks (GPT-OSS needs
-        # them).
+        # GPT-OSS needs attention sinks, which rpa_v3 and rpa_batched both
+        # implement; the matrix keeps rpa_v3, the TPU default.
         ATTENTION_BACKEND=pallas_tpu_rpa_v3
         PAGE_SIZE=${PAGE_SIZE:-64}
         CONTEXT_LEN=${CONTEXT_LEN:-131072}
