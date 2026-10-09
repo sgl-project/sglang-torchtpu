@@ -434,6 +434,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         return PendingCall(wait_and_record)
 
+    def _register_host_extend_padding(self) -> None:
+        """Let host-built prefill tensors arrive at the extend token bucket.
+
+        Mirrors the plain-extend branch of ``_pad_forward_batch_inputs`` so the
+        host padding and the compiled shapes cannot disagree.
+        """
+        from sglang.srt.model_executor.host_token_padding import (
+            register_extend_buckets,
+        )
+
+        t_bucketer = self.t_bucketer
+        cap = self._extend_compile_cap()
+
+        def bucket(num_tokens: int, num_reqs: int) -> int | None:
+            if num_reqs > cap:
+                return None
+            return t_bucketer.next_bucket(max(num_tokens, cap))
+
+        register_extend_buckets(bucket, batch_cap=cap)
+
     def _extend_compile_cap(self) -> int:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
@@ -554,6 +574,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 get_schedule().prefill_max_requests or b_bucketer.max_val,
                 b_bucketer.max_val,
             )
+
+        if not self.model_runner.is_draft_worker and not is_dp_attention_enabled():
+            self._register_host_extend_padding()
 
         outer_model = self.model_runner.model
         existing_prep = getattr(outer_model, "prepare_forward_batch", None)
@@ -1533,6 +1556,13 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             logits_output_mode,
         )
         return key
+
+    def _register_host_extend_padding(self) -> None:
+        # Host-padded prefill is validated on text models only; the multimodal
+        # input_embeds prefill keeps padding on the device.
+        if self._uses_input_embeds(self.owner):
+            return
+        super()._register_host_extend_padding()
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode / verify raw ``input_ids``, skipping embed.

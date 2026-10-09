@@ -2404,6 +2404,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Original prefill IDs retained for MM masks after staging is consumed.
     # Mixed-batch decode tokens are not included in this CPU prefix.
     mm_input_ids_cpu: Optional[torch.Tensor] = None
+    # Host copy of the uploaded (possibly host-padded) prefill ids, for a
+    # speculative draft extend that rotates them; cleared by its consumer.
+    prefill_input_ids_host: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.
@@ -2429,6 +2432,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
+    # Host values of orig_seq_lens as built by prepare_for_extend; not kept in
+    # sync by later batch updates, so only that extend forward may read it.
+    orig_seq_lens_cpu: Optional[list[int]] = None
+    # Host copy of out_cache_loc from alloc_for_extend when the backend host-pads
+    # prefill tokens; like orig_seq_lens_cpu, only that extend forward reads it.
+    out_cache_loc_cpu: Optional[torch.Tensor] = None
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
@@ -2947,6 +2956,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = req_pool_indices_tensor
         self.req_pool_indices_cpu = req_pool_indices_cpu
         self.orig_seq_lens = orig_seq_lens_tensor
+        self.orig_seq_lens_cpu = orig_seq_lens
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds, pin_memory=_pin).to(

@@ -87,6 +87,8 @@ class TestHostPadFieldSelection(CustomTestCase):
             extend_start_loc=torch.tensor([0, 3], dtype=torch.int32),
             extend_seq_lens_cpu=[3, 2],
             extend_prefix_lens_cpu=[11, 50],
+            extend_num_tokens=5,
+            batch_size=2,
             extend_logprob_start_lens_cpu=[0, 0],
             spec_info=None,
             mm_inputs=None,

@@ -13,7 +13,11 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+    _rotate_prefill_ids_on_host,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -85,6 +89,22 @@ def _make_backend_factory(decode_backend, draft_extend_backend, captured_kwargs=
             return draft_extend_backend
 
     return FakeDraftBackendFactory
+
+
+class TestRotatePrefillIdsOnHost(CustomTestCase):
+    """The host rotation must match the per-request device rotation it replaces:
+    each request shifts left by one and ends in its tail token, and the padding
+    past the real tokens stays zero."""
+
+    def test_matches_per_request_rotation_with_padding(self):
+        host_ids = torch.tensor([10, 11, 12, 20, 21, 30, 0, 0], dtype=torch.int64)
+        tail_tokens = torch.tensor([13, 22, 31], dtype=torch.int32)
+
+        rotated = _rotate_prefill_ids_on_host(host_ids, [3, 2, 1], tail_tokens)
+
+        self.assertEqual(rotated.tolist(), [11, 12, 13, 21, 22, 31, 0, 0])
+        self.assertEqual(rotated.dtype, torch.int64)
+        self.assertEqual(host_ids.tolist()[:6], [10, 11, 12, 20, 21, 30])
 
 
 class TestEagleWorkerV2Topk1FastPath(CustomTestCase):

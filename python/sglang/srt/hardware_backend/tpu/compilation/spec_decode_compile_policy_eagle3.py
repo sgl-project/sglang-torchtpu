@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
     use_attention_rank_tensors,
 )
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    _HOST_PADDED_EXTEND_KEY,
     _REAL_B_KEY,
     _REAL_Q_KEY,
     _dp_attn_apply_bucket_metadata,
@@ -42,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
@@ -1198,7 +1200,20 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             if logit_rows < next_token_logits.shape[0]:
                 outputs.next_token_logits = next_token_logits[:logit_rows]
 
-        if hidden_states is not None and not preserve_padded_outputs:
+        # A host-padded target prefill's per-token hidden states only feed the
+        # draft extend, which runs at the same token bucket: trimming here made
+        # the draft pad them back, one program per prompt length. Per-request
+        # (LAST) captures still trim; they become the next cycle's draft seed.
+        keep_padded_hidden = (
+            getattr(forward_batch, _HOST_PADDED_EXTEND_KEY, False)
+            and forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            and get_server_return_hidden_states_mode() == CaptureHiddenMode.NULL
+        )
+        if (
+            hidden_states is not None
+            and not preserve_padded_outputs
+            and not keep_padded_hidden
+        ):
             # Capture-LAST (draft extend) emits one hidden row per
             # sequence (batch-dim), so slice to real_b. Every other capture mode
             # emits one row per token (real_q).

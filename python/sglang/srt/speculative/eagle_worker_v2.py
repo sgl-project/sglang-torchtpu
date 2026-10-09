@@ -242,6 +242,33 @@ def _qsa_index_share_requested(hf_config) -> bool:
     )
 
 
+def _rotate_prefill_ids_on_host(
+    host_ids: torch.Tensor, extend_lens: list[int], tail_tokens: torch.Tensor
+) -> torch.Tensor:
+    """Shift each request's prefill ids left by one on the host, then write its
+    device tail token with one scatter at host-known slots.
+
+    Rotating on the device slices per request, so every prompt length compiles
+    its own program; here the upload has the (bucketed) shape of ``host_ids``
+    and the scatter depends only on that shape and the request count.
+    """
+    rotated = torch.zeros(
+        host_ids.shape, dtype=host_ids.dtype, pin_memory=host_ids.is_pinned()
+    )
+    last_slots = []
+    pt = 0
+    for extend_len in extend_lens:
+        rotated[pt : pt + extend_len - 1] = host_ids[pt + 1 : pt + extend_len]
+        pt += extend_len
+        last_slots.append(pt - 1)
+    device = tail_tokens.device
+    rotated = rotated.to(device, non_blocking=True)
+    last_slots = torch.tensor(
+        last_slots, dtype=torch.int64, pin_memory=host_ids.is_pinned()
+    ).to(device, non_blocking=True)
+    return rotated.index_copy_(0, last_slots, tail_tokens.to(rotated.dtype))
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -1217,28 +1244,41 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
 
-            new_input_ids = torch.empty_like(batch.input_ids)
-            if mm_input_embeds is not None:
-                # Rotate mm embeddings the same way as input_ids: shift left by
-                # one per request so they stay aligned with the rotated ids. The
-                # last position per request is filled by the draft model's own
-                # embed_tokens lookup on next_token_ids (see DeepseekModelNextN).
-                rotated_mm = torch.empty_like(mm_input_embeds)
-            pt = 0
-            for i, extend_len in enumerate(batch.extend_lens):
-                input_ids = batch.input_ids[pt : pt + extend_len]
-                new_input_ids[pt : pt + extend_len].copy_(
-                    torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
+            host_ids = batch.prefill_input_ids_host
+            batch.prefill_input_ids_host = None
+            if (
+                mm_input_embeds is None
+                and host_ids is not None
+                and host_ids.shape == batch.input_ids.shape
+            ):
+                batch.input_ids = _rotate_prefill_ids_on_host(
+                    host_ids, batch.extend_lens, tail_tokens
                 )
+            else:
+                # zeros: host-padded input_ids carry a tail past the real tokens.
+                new_input_ids = torch.zeros_like(batch.input_ids)
                 if mm_input_embeds is not None:
-                    rotated_mm[pt : pt + extend_len - 1].copy_(
-                        mm_input_embeds[pt + 1 : pt + extend_len]
+                    # Rotate mm embeddings the same way as input_ids: shift left by
+                    # one per request so they stay aligned with the rotated ids.
+                    # The last position per request is filled by the draft model's
+                    # own embed_tokens lookup on next_token_ids (see
+                    # DeepseekModelNextN).
+                    rotated_mm = torch.empty_like(mm_input_embeds)
+                pt = 0
+                for i, extend_len in enumerate(batch.extend_lens):
+                    input_ids = batch.input_ids[pt : pt + extend_len]
+                    new_input_ids[pt : pt + extend_len].copy_(
+                        torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
                     )
-                pt += extend_len
-            assert pt == batch.input_ids.numel()
-            batch.input_ids = new_input_ids
-            if mm_input_embeds is not None:
-                mm_input_embeds = rotated_mm
+                    if mm_input_embeds is not None:
+                        rotated_mm[pt : pt + extend_len - 1].copy_(
+                            mm_input_embeds[pt + 1 : pt + extend_len]
+                        )
+                    pt += extend_len
+                assert pt <= batch.input_ids.numel()
+                batch.input_ids = new_input_ids
+                if mm_input_embeds is not None:
+                    mm_input_embeds = rotated_mm
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.

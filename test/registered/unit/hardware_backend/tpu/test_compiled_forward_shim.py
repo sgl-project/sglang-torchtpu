@@ -112,6 +112,8 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         extend_seq_lens_cpu=([real_t // real_b] * real_b if extend else None),
         extend_prefix_lens_cpu=([0] * real_b if extend else None),
         extend_logprob_start_lens_cpu=([0] * real_b if extend else None),
+        extend_num_tokens=(real_t if extend else None),
+        batch_size=real_b,
         forward_mode=_ForwardModeMock(mode),
         return_logprob=return_logprob,
         dp_padding_mode=None,
@@ -235,6 +237,57 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.out_cache_loc.shape[0], 8)
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.extend_seq_lens.shape[0], 4)
+
+    def test_host_padded_extend_reports_the_real_token_count(self):
+        # Host padding uploads input_ids at the bucket; the real count must come
+        # from extend_num_tokens or outputs keep the padded rows.
+        fb = _forward_batch(real_t=8, real_b=1, mode="extend")
+        fb.extend_num_tokens = 5
+        real_q, _ = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual(real_q, 5)
+        self.assertEqual(fb.input_ids.shape[0], 8)
+
+    def test_host_padded_batch_fields_report_the_real_batch_size(self):
+        # init_new uploads seq_lens & co. at the extend cap; batch_size keeps
+        # the real request count that restore trims back to.
+        fb = _forward_batch(real_t=8, real_b=4, mode="extend")
+        fb.batch_size = 2
+        _, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual(real_b, 2)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+
+    def test_extend_num_tokens_above_input_ids_keeps_the_input_length(self):
+        # Precompile dummies size extend_num_tokens on their own; trusting it
+        # picked a bigger bucket than the graph being compiled.
+        fb = _forward_batch(real_t=8, real_b=1, mode="extend")
+        fb.extend_num_tokens = 16
+        real_q, _ = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual(real_q, 8)
+        self.assertEqual(fb.input_ids.shape[0], 8)
+
+    def test_decode_keeps_token_fields_wider_than_the_bucket(self):
+        # Draft decode's out_cache_loc holds bs * topk * num_steps slots, more
+        # than the decode token bucket; trimming it broke the draft precompile.
+        fb = _forward_batch(real_t=1, real_b=1, mode="decode")
+        fb.out_cache_loc = torch.arange(3, dtype=torch.int32)
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual(fb.out_cache_loc.shape[0], 3)
 
     def test_extend_batched(self):
         # tokens=10 -> 16; bs=3 -> 4; ghost slots zero-filled.

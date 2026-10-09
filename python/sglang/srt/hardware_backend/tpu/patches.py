@@ -436,30 +436,80 @@ def _patch_compute_position_torch() -> None:
 
     import torch
 
+    from sglang.srt.hardware_backend.tpu.host_extend_padding import (
+        current_extend_padding,
+        host_positions,
+    )
     from sglang.srt.model_executor import forward_batch_info
 
     def compute_position_torch_cpu_staged(
         extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
     ):
         device = extend_prefix_lens.device
-        prefix_lens = extend_prefix_lens.tolist()
-        seq_lens = extend_seq_lens.tolist()
-        positions_cpu = torch.cat(
-            [torch.arange(p, p + s) for p, s in zip(prefix_lens, seq_lens)],
-            axis=0,
-        ).to(torch.int64)
-        extend_start_loc = torch.zeros_like(extend_seq_lens)
-        if extend_seq_lens.numel() > 1:
-            # Set dtype to int32 rather than cumsum's default int64.
-            # 32-bit integers are TPU native while s64 requires emulation,
-            # and its buggy lowering can run into "Unsupported conversion
-            # from vmreg/vreg to U64". Token counts fit int32 comfortably.
-            extend_start_loc[1:] = torch.cumsum(
-                extend_seq_lens[:-1], dim=0, dtype=torch.int32
+        plan = current_extend_padding()
+        if plan is not None and len(plan.seq_lens) == extend_seq_lens.shape[0]:
+            # A host-padded EXTEND (see host_extend_padding.py): use the host
+            # lists, so there is no device read, and pad to the bucket.
+            positions, extend_start_loc = host_positions(
+                plan.prefix_lens,
+                plan.seq_lens,
+                plan.padded_num_tokens,
+                plan.padded_batch_size,
+                extend_seq_lens.dtype,
             )
-        return positions_cpu.to(device), extend_start_loc
+        else:
+            # int32 extend_start_loc: TPU native, and token counts fit. Built
+            # on the host so no device cumsum compiles per batch size.
+            positions, extend_start_loc = host_positions(
+                extend_prefix_lens.tolist(),
+                extend_seq_lens.tolist(),
+                None,
+                None,
+                extend_seq_lens.dtype,
+            )
+        return positions.to(device), extend_start_loc.to(device)
 
     forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged
+
+
+_forward_batch_host_extend_padding_patched = False
+
+
+def _patch_forward_batch_host_extend_padding() -> None:
+    """Build a host-padded EXTEND forward's metadata at the extend bucket.
+
+    With an extend bucket registered, prefill input_ids arrive host-padded;
+    this pads the rest of the extend metadata on the host too, instead of
+    leaving it to per-prompt-length device pads. See host_extend_padding.py.
+    """
+    global _forward_batch_host_extend_padding_patched
+    if _forward_batch_host_extend_padding_patched:
+        return
+    _forward_batch_host_extend_padding_patched = True
+
+    from sglang.srt.hardware_backend.tpu.host_extend_padding import (
+        apply_extend_padding,
+        plan_extend_padding,
+        reset_extend_padding,
+        set_extend_padding,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+    orig_init_new = ForwardBatch.init_new.__func__
+
+    def init_new(cls, batch, model_runner, **kwargs):
+        plan = plan_extend_padding(batch)
+        if plan is None:
+            return orig_init_new(cls, batch, model_runner, **kwargs)
+        token = set_extend_padding(plan)
+        try:
+            forward_batch = orig_init_new(cls, batch, model_runner, **kwargs)
+        finally:
+            reset_extend_padding(token)
+        apply_extend_padding(forward_batch, batch, plan)
+        return forward_batch
+
+    ForwardBatch.init_new = classmethod(init_new)
 
 
 _torch_native_attn_backend_patched = False
@@ -884,6 +934,7 @@ def apply_tpu_patches() -> None:
     _unwrap_dynamic_compile_fns()
     _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()
+    _patch_forward_batch_host_extend_padding()
     _patch_torch_native_attn_backend()
     _patch_support_triton_for_tpu()
     _register_aten_fallbacks()

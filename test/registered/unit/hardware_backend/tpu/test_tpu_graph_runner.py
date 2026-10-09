@@ -8,6 +8,28 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+
+# Installing a decoder policy registers the host extend-padding buckets for
+# the process; keep that from leaking into later test modules.
+_extend_bucket_patches = []
+
+
+def setUpModule():
+    from unittest.mock import patch
+
+    from sglang.srt.model_executor import host_token_padding
+
+    for name in ("_extend_token_bucket", "_extend_batch_cap"):
+        p = patch.object(host_token_padding, name, getattr(host_token_padding, name))
+        p.start()
+        _extend_bucket_patches.append(p)
+
+
+def tearDownModule():
+    while _extend_bucket_patches:
+        _extend_bucket_patches.pop().stop()
+
+
 import inspect
 import unittest
 from contextlib import nullcontext

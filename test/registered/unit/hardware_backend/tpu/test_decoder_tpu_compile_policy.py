@@ -4,6 +4,28 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+
+# Installing a decoder policy registers the host extend-padding buckets for
+# the process; keep that from leaking into later test modules.
+_extend_bucket_patches = []
+
+
+def setUpModule():
+    from unittest.mock import patch
+
+    from sglang.srt.model_executor import host_token_padding
+
+    for name in ("_extend_token_bucket", "_extend_batch_cap"):
+        p = patch.object(host_token_padding, name, getattr(host_token_padding, name))
+        p.start()
+        _extend_bucket_patches.append(p)
+
+
+def tearDownModule():
+    while _extend_bucket_patches:
+        _extend_bucket_patches.pop().stop()
+
+
 import contextlib
 import sys
 import unittest
@@ -1190,6 +1212,41 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         self.assertEqual(result.shape, (3, 4))
         self.assertEqual(forward_batch.batch_size, 2)
+
+    def _host_padded_eagle3_finalize(self, capture_hidden_mode):
+        class _SpecPolicy(Eagle3SpecDecodeCompilePolicyMixin, DecoderTpuCompilePolicy):
+            pass
+
+        policy = object.__new__(_SpecPolicy)
+        forward_batch = self._forward_batch()  # real q=3 / b=2, padded b=4
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        forward_batch.capture_hidden_mode = capture_hidden_mode
+        forward_batch.spec_info = None
+        forward_batch._tpu_host_padded_extend = True
+        out = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(4, 8), hidden_states=torch.zeros(5, 6)
+        )
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation."
+            "spec_decode_compile_policy_eagle3.get_server_return_hidden_states_mode",
+            return_value=CaptureHiddenMode.NULL,
+        ):
+            return policy.finalize_forward_batch(out, forward_batch)
+
+    def test_host_padded_target_prefill_keeps_hidden_states_at_the_bucket(self):
+        # The draft extend runs at the same token bucket; trimming made it pad
+        # the hidden states back, one compile per prompt length.
+        result = self._host_padded_eagle3_finalize(CaptureHiddenMode.FULL)
+
+        self.assertEqual(result.hidden_states.shape[0], 5)
+        self.assertEqual(result.next_token_logits.shape[0], 2)
+
+    def test_host_padded_draft_prefill_still_trims_its_seed_hidden_states(self):
+        # The draft's LAST capture seeds the next cycle per request; keeping its
+        # padding handed bucket-many rows to the overlap future map.
+        result = self._host_padded_eagle3_finalize(CaptureHiddenMode.LAST)
+
+        self.assertEqual(result.hidden_states.shape[0], 2)
 
 
 class TestMakeDummyForwardBatch(_PolicyTestCase):

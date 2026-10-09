@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
@@ -27,6 +28,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.model_executor.host_token_padding import extend_token_bucket
 from sglang.srt.runtime_context import attention_backends, get_parallel
 from sglang.srt.utils import (
     is_cpu,
@@ -495,6 +497,7 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
+    out_cache_loc_host = None
     if reuse_kv is not None and any(reuse_kv):
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
@@ -515,6 +518,18 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=_last_loc_dev))
             for t in prefix_tensors
         ]
+        # A backend that host-pads prefill tokens also wants the host copy of
+        # the slots: it uploads them at the bucket and skips a device read below.
+        allocator = batch.tree_cache.token_to_kv_pool_allocator
+        if (
+            extend_token_bucket(batch.extend_num_tokens, len(batch.reqs)) is not None
+            and "out_indices_cpu"
+            in inspect.signature(allocator.alloc_extend).parameters
+        ):
+            # -1: an allocator path that ignores the buffer leaves it unwritten.
+            out_cache_loc_host = torch.full(
+                (batch.extend_num_tokens,), -1, dtype=torch.int32, pin_memory=pin_memory
+            )
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
@@ -525,11 +540,20 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
+            out_cache_loc_host=out_cache_loc_host,
         )
+        if out_cache_loc_host is not None and int(out_cache_loc_host.min()) < 0:
+            out_cache_loc_host = None
 
+    batch.out_cache_loc_cpu = out_cache_loc_host
+    host_page_table = batch.req_to_token_pool.req_to_token.device.type == "cpu"
     # Write to req_to_token_pool
     write_cache_indices(
-        out_cache_loc,
+        (
+            out_cache_loc_host
+            if host_page_table and out_cache_loc_host is not None
+            else out_cache_loc
+        ),
         req_pool_indices_device,
         req_pool_indices_cpu,
         prefix_lens_device,

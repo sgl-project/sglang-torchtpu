@@ -102,6 +102,8 @@ _BS_CPU_LIST_FIELDS = (
 
 _REAL_Q_KEY = "_tpu_real_q"
 _REAL_B_KEY = "_tpu_real_b"
+# Set per forward: whether this extend arrived host-padded (host_token_padding).
+_HOST_PADDED_EXTEND_KEY = "_tpu_host_padded_extend"
 _DEFAULT_KWARG_TYPES = (type(None), bool, int, float, str)
 
 
@@ -513,6 +515,7 @@ def _pad_forward_batch_inputs(
     is_decode = forward_batch.forward_mode.is_decode()
     is_draft_extend_v2 = forward_batch.forward_mode.is_draft_extend_v2()
     real_q = forward_batch.input_ids.shape[0]
+    host_padded_extend = False
     real_b = forward_batch.seq_lens.shape[0]
 
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -558,11 +561,27 @@ def _pad_forward_batch_inputs(
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
         pad_b = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+        # Host-padded batch fields arrive at the cap; batch_size keeps the
+        # real request count.
+        if forward_batch.batch_size < real_b == pad_b:
+            real_b = forward_batch.batch_size
         if real_b > pad_b:
             raise ValueError(
                 f"TPU extend batch size {real_b} exceeds its compile cap {pad_b}. "
                 "Set --prefill-max-requests to at least the largest extend batch."
             )
+        # Host-padded token fields (host_token_padding) arrive at exactly the
+        # bucket of the real count, so read the count from extend_num_tokens.
+        # Anything else (precompile dummies size extend_num_tokens on their
+        # own) keeps the input_ids length.
+        real_tokens = forward_batch.extend_num_tokens
+        if (
+            real_tokens is not None
+            and real_tokens < real_q
+            and t_bucketer.next_bucket(max(real_tokens, pad_b)) == real_q
+        ):
+            real_q = real_tokens
+            host_padded_extend = True
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
@@ -579,7 +598,17 @@ def _pad_forward_batch_inputs(
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         dim = _TOKEN_FIELD_DIM.get(field, 0)
-        if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
+        if (
+            host_padded_extend
+            and isinstance(val, torch.Tensor)
+            and val.shape[dim] > pad_t
+        ):
+            # Host-padded to another runner's bucket (draft extend reuses the
+            # target's prefill tensors); the tail past real_q is padding. Other
+            # modes legitimately carry wider token fields (multi-step draft
+            # out_cache_loc), so only a host-padded extend is trimmed.
+            setattr(forward_batch, field, val.narrow(dim, 0, pad_t))
+        elif isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
             on_host = host_pad and field in _HOST_PAD_TOKEN_FIELDS
             val = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
             setattr(forward_batch, field, val)
@@ -633,13 +662,17 @@ def _pad_forward_batch_inputs(
     spec_info = forward_batch.spec_info
     if spec_info is not None:
         hs = getattr(spec_info, "hidden_states", None)
-        if isinstance(hs, torch.Tensor) and hs.ndim >= 1 and hs.shape[0] < pad_t:
+        if host_padded_extend and isinstance(hs, torch.Tensor) and hs.shape[0] > pad_t:
+            # The target kept its hidden states at its own bucket.
+            spec_info.hidden_states = hs.narrow(0, 0, pad_t)
+        elif isinstance(hs, torch.Tensor) and hs.ndim >= 1 and hs.shape[0] < pad_t:
             pad_rows = pad_t - hs.shape[0]
             spec_info.hidden_states = F.pad(
                 hs, (0,) * (2 * (hs.ndim - 1)) + (0, pad_rows)
             )
 
     forward_batch.batch_size = pad_b
+    setattr(forward_batch, _HOST_PADDED_EXTEND_KEY, host_padded_extend)
 
     return real_q_out, real_b_out
 
