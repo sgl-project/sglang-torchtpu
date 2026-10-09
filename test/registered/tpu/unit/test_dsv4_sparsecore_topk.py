@@ -51,7 +51,6 @@ output and is required to reject it.
 
 import os
 import sys
-import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
