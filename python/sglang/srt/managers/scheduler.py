@@ -1772,7 +1772,8 @@ class Scheduler(
         )
 
     def maybe_init_kv_free_fence(self):
-        """Hold KV pages freed under overlap back from DMA write targets."""
+        """Hold KV pages freed under overlap back from DMA write targets.
+        Raises if the fence cannot cover every KV write of this server."""
         if not self._needs_kv_free_fence():
             return
         from sglang.srt.hardware_backend.tpu.kv_free_fence import (
@@ -1789,19 +1790,17 @@ class Scheduler(
             self.token_to_kv_pool_allocator, **fence_kwargs
         )
         if reason is not None:
-            if self._uses_raiden_hicache():
-                raise ValueError(
-                    f"The raiden HiCache backend needs the KV free fence: {reason}"
-                )
-            # Unlike raiden HiCache, a PD decode server can serve unfenced.
-            # TODO(#1213): fail startup here once every PD decode
-            # configuration can be fenced.
-            logger.warning(
-                "KV arriving on this PD decode server is not fenced against "
-                "in-flight forwards: %s",
-                reason,
+            # Unfenced, a DMA into a freed page can land before an in-flight
+            # forward's write to it and be overwritten without any error.
+            needed_by = (
+                "The raiden HiCache backend"
+                if self._uses_raiden_hicache()
+                else "A PD decode server under overlap scheduling"
             )
-            return
+            raise ValueError(
+                f"{needed_by} needs the KV free fence: {reason} "
+                "Pass --disable-overlap-schedule to run without it."
+            )
         self.kv_free_fence = install_kv_free_fence(
             self.token_to_kv_pool_allocator,
             synchronize_device=self.device_module.synchronize,
