@@ -17,11 +17,20 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List, Optional, Tuple
+import time
+from typing import List, Optional, Set, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# ``req_pool_idx`` of resumes whose restore DMA failed on this rank, until the
+# resume patch (``pd_decode_restore_abort``) aborts them on every rank.
+_failed_restores: Set[int] = set()
+
+
+class RaidenRestoreError(RuntimeError):
+    """A retraction restore DMA failed; the request's restored KV is invalid."""
 
 
 def sequential_page_runs(
@@ -143,8 +152,49 @@ class RaidenKVBackup:
                 f"{handle.num_rows} rows at offset {handle.first_offset}, "
                 f"asked to restore {num_rows} at {first_offset}"
             )
-        self._transfer.load(handle.host_pages, page_ids).synchronize()
+        event = self._transfer.load(handle.host_pages, page_ids)
+        try:
+            try:
+                event.synchronize()
+            except TimeoutError as e:
+                # The DMA is still writing the resume pages, so neither they
+                # nor the host pages can be reused yet: wait for it to land
+                # (the scheduler watchdog still bounds a hung DMA).
+                logger.warning(
+                    "raiden retraction restore DMA slow (%s); waiting for it", e
+                )
+                while not event.query():
+                    time.sleep(0.001)
+        except RuntimeError as e:
+            handle.release()  # the DMA has landed; its host pages are free
+            raise RaidenRestoreError(str(e)) from e
         handle.release()
+
+
+def restore_or_mark_failed(
+    backup: RaidenKVBackup,
+    handle: RaidenKVBackupHandle,
+    indices: torch.Tensor,
+    req_pool_index: Optional[int],
+) -> None:
+    """Restores ``handle``; a failed DMA marks the request for an abort.
+
+    Raising here would kill the scheduler on only the ranks whose DMA failed.
+    """
+    try:
+        backup.restore(handle, indices)
+    except RaidenRestoreError as e:
+        if req_pool_index is None:
+            raise
+        logger.error("raiden retraction restore DMA failed: %s", e)
+        _failed_restores.add(int(req_pool_index))
+
+
+def take_failed_restores() -> Set[int]:
+    """The marked ``req_pool_idx`` values, clearing the mark."""
+    failed = set(_failed_restores)
+    _failed_restores.clear()
+    return failed
 
 
 def backup_pool_pages(env_gb: float, page_host_bytes: int) -> int:

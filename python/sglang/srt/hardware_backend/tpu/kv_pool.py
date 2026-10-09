@@ -335,11 +335,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
         from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
             RaidenKVBackupHandle,
+            restore_or_mark_failed,
         )
 
         if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
             self._synchronize_device()
-            self._raiden_backup().restore(kv_cache_cpu, indices)
+            restore_or_mark_failed(
+                self._raiden_backup(), kv_cache_cpu, indices, req_pool_index
+            )
             self._synchronize_device()
             return
 
@@ -620,11 +623,14 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
         from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
             RaidenKVBackupHandle,
+            restore_or_mark_failed,
         )
 
         if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
             self._synchronize_device()
-            self._raiden_backup().restore(kv_cache_cpu, indices)
+            restore_or_mark_failed(
+                self._raiden_backup(), kv_cache_cpu, indices, req_pool_index
+            )
             self._synchronize_device()
             return
 

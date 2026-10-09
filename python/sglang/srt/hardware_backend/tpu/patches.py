@@ -885,6 +885,16 @@ def _patch_pd_decode_async_prefill_info() -> None:
     pd_decode_async_prefill_info.install()
 
 
+def _patch_pd_decode_restore_abort() -> None:
+    """Abort, on every rank, a PD decode resume whose raiden restore DMA failed.
+
+    See ``pd_decode_restore_abort``.
+    """
+    from sglang.srt.hardware_backend.tpu import pd_decode_restore_abort
+
+    pd_decode_restore_abort.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -906,3 +916,4 @@ def apply_tpu_patches() -> None:
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
     _patch_pd_decode_async_prefill_info()
+    _patch_pd_decode_restore_abort()
