@@ -229,6 +229,75 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         self.assertEqual(int(pool._req_state_shifts[4][2].item()), 0)
         self.assertEqual(int(pool._req_state_shifts[128][2].item()), 0)
 
+    def test_deepseek_v4_pro_61_layers_with_trailing_mtp_compress_ratios(self):
+        """Verify DeepSeek-V4-Pro's 61-layer config (`[128, 128, 4, ..., 4, 0, 0, 0]`).
+
+        In DeepSeek-V4-Pro (`gs://tpu-commons-ci/deepseek-v4-pro-0813`):
+        - `num_hidden_layers = 61`, while `compress_ratios` has 64 entries
+          (`[128] + [128, 4] * 30 + [0, 0, 0]`, where the 3 trailing `0`s are
+          for MTP / DSpark draft layers 61..63).
+        - Layers 0 and 1 are both HCA (`ratio=128`), and there are zero pure-SWA
+          (`ratio=0`) layers in the 61 target layers (`31` HCA + `30` CSA).
+        - `sliding_window = 128`.
+        """
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(
+            dsv4_attn_backend="tpu_dsv4", page_size=256
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        pro_compress_ratios = [128] + [128, 4] * 30 + [0, 0, 0]
+        self.assertEqual(len(pro_compress_ratios), 64)
+
+        pool = DSV4TPUTokenToKVPool(
+            max_num_reqs=2,
+            num_req_slots=3,
+            swa_size=256,
+            c4_size=256,
+            c128_size=8,
+            c4_state_pool_size=32,
+            c128_state_pool_size=256,
+            page_size=256,
+            swa_page_size=256,
+            sliding_window=128,
+            dtype=torch.bfloat16,
+            c4_state_dtype=torch.float32,
+            c128_state_dtype=torch.float32,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            indexer_head_dim=128,
+            layer_num=61,
+            device="cpu",
+            enable_memory_saver=False,
+            compression_ratios=pro_compress_ratios,
+            full_size=1024,
+        )
+
+        # Must allocate exactly 61 SWA layers (excluding the 3 trailing MTP 0s),
+        # 30 CSA layers, and 31 HCA layers.
+        self.assertEqual(len(pool.swa_kv_pool.k_buffer), 61)
+        self.assertEqual(len(pool.c4_kv_pool.nope_buffer), 30)
+        self.assertEqual(len(pool.c4_kv_pool.rope_buffer), 30)
+        self.assertEqual(len(pool.c4_indexer_kv_pool.index_k_with_scale_buffer), 30)
+        self.assertEqual(len(pool.c128_kv_pool.k_buffer), 31)
+
+        # Layer 0 and Layer 1 are both HCA (128), Layer 2 is the first CSA (4),
+        # and Layer 60 is the last CSA (4).
+        self.assertEqual(pool.layer_mapping[0].compress_ratio, 128)
+        self.assertEqual(pool.layer_mapping[0].compress_layer_id, 0)
+        self.assertEqual(pool.layer_mapping[1].compress_ratio, 128)
+        self.assertEqual(pool.layer_mapping[1].compress_layer_id, 1)
+        self.assertEqual(pool.layer_mapping[2].compress_ratio, 4)
+        self.assertEqual(pool.layer_mapping[2].compress_layer_id, 0)
+        self.assertEqual(pool.layer_mapping[59].compress_ratio, 128)
+        self.assertEqual(pool.layer_mapping[59].compress_layer_id, 30)
+        self.assertEqual(pool.layer_mapping[60].compress_ratio, 4)
+        self.assertEqual(pool.layer_mapping[60].compress_layer_id, 29)
+        for mtp_idx in (61, 62, 63):
+            self.assertIsNone(pool.layer_mapping[mtp_idx])
+
 
 class TestDSV4TPUAttentionMetadata(CustomTestCase):
     def _make_backend_stub(self, pool: DSV4TPUTokenToKVPool) -> DSV4TPUAttnBackend:

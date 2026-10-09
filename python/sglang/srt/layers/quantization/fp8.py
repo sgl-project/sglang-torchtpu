@@ -56,7 +56,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     block_fp8_scale_to_mxfp8_e8m0,
-    block_quant_dequant,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
@@ -665,7 +664,9 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         if _is_tpu:
-            tp_rank = get_parallel().tp_rank
+            tp_rank = getattr(layer, "tp_rank", None)
+            if tp_rank is None:
+                tp_rank = get_parallel().tp_rank
             layer.tpu_fp8_output_tp_rank = (
                 tp_rank if output_size != output_size_per_partition else 0
             )
@@ -714,7 +715,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 if _is_tpu and not use_mxfp8:
-                    tp_rank = get_parallel().tp_rank
+                    tp_rank = getattr(layer, "tp_rank", None)
+                    if tp_rank is None:
+                        tp_rank = get_parallel().tp_rank
                     output_tp_rank = (
                         tp_rank if output_size != output_size_per_partition else 0
                     )
@@ -1136,12 +1139,77 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def _requantize_tpu_block_fp8_to_channelwise(self, layer: Module) -> None:
         weight = layer.weight.data
-        weight_dequant = block_quant_dequant(
-            weight,
-            layer.weight_scale_inv.data,
-            self.quant_config.weight_block_size,
-            torch.float32,
-        )
+        weight_scale_inv = layer.weight_scale_inv.data
+        block_n, block_k = self.quant_config.weight_block_size
+        out_size, in_size = weight.shape
+        logical_widths = getattr(layer, "logical_widths", None) or [out_size]
+        if sum(logical_widths) != out_size:
+            raise ValueError(
+                "TPU FP8 block linear logical widths must cover the local output "
+                f"dimension, got {logical_widths=} and {out_size=}."
+            )
+        tp_rank = getattr(layer, "tpu_fp8_output_tp_rank", None)
+        if tp_rank is None:
+            raw_tp_rank = getattr(layer, "tp_rank", None)
+            if raw_tp_rank is None:
+                raw_tp_rank = get_parallel().tp_rank
+            tp_rank = (
+                raw_tp_rank
+                if getattr(layer, "output_size", out_size) != out_size
+                else 0
+            )
+        input_offset = getattr(layer, "tpu_fp8_input_offset", None)
+        if input_offset is None:
+            raw_tp_rank = getattr(layer, "tp_rank", None)
+            if raw_tp_rank is None:
+                raw_tp_rank = get_parallel().tp_rank
+            input_offset = (
+                raw_tp_rank * in_size
+                if getattr(layer, "input_size", in_size) != in_size
+                else 0
+            )
+
+        first_k_block = input_offset // block_k
+        last_k_block = (input_offset + in_size + block_k - 1) // block_k
+        k_blocks = last_k_block - first_k_block
+        k_offset = input_offset - first_k_block * block_k
+        k_block_ids = (
+            torch.arange(in_size, device=weight.device) + k_offset
+        ) // block_k
+
+        dequantized_shards = []
+        weight_offset = 0
+        scale_offset = 0
+        for logical_width in logical_widths:
+            global_start = tp_rank * logical_width
+            first_block = global_start // block_n
+            last_block = (global_start + logical_width + block_n - 1) // block_n
+            num_blocks = last_block - first_block
+            row_offset = global_start - first_block * block_n
+
+            shard_weight = weight[weight_offset : weight_offset + logical_width]
+            shard_scale = weight_scale_inv[scale_offset : scale_offset + num_blocks]
+            if shard_scale.shape != (num_blocks, k_blocks):
+                raise ValueError(
+                    "TPU FP8 block linear scale shard shape mismatch: "
+                    f"got {tuple(shard_scale.shape)}, expected {(num_blocks, k_blocks)}."
+                )
+
+            n_block_ids = (
+                torch.arange(logical_width, device=weight.device) + row_offset
+            ) // block_n
+            expanded_scale = shard_scale[n_block_ids][:, k_block_ids].to(torch.float32)
+            dequantized_shards.append(shard_weight.to(torch.float32) * expanded_scale)
+            weight_offset += logical_width
+            scale_offset += num_blocks
+
+        if scale_offset != weight_scale_inv.shape[0]:
+            raise ValueError(
+                "TPU FP8 block linear scale rows were not fully consumed: "
+                f"used {scale_offset}, got {weight_scale_inv.shape[0]}."
+            )
+        weight_dequant = torch.cat(dequantized_shards, dim=0)
+
         dtype_max = torch.finfo(weight.dtype).max
         weight_scale = torch.clamp(
             weight_dequant.abs().amax(dim=1, keepdim=True) / dtype_max,
@@ -1163,14 +1231,29 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
             if _is_tpu and not self.use_mxfp8:
-                if _get_tpu_fp8_runtime() == "channelwise":
-                    logger.warning_once(
-                        "TPU dense FP8 linear is converting block-FP8 checkpoint "
-                        "weights to channelwise runtime scales by default for "
-                        "performance. Use --tpu-fp8-runtime=channelwise to make "
-                        "this explicit, or --tpu-fp8-runtime=blockwise to preserve "
-                        "blockwise runtime scales."
-                    )
+                block_n, block_k = self.quant_config.weight_block_size
+                out_size, in_size = layer.weight.shape
+                logical_widths = getattr(layer, "logical_widths", None) or [out_size]
+                has_subblock_partition = (
+                    in_size % block_k != 0
+                    or out_size % block_n != 0
+                    or any(w % block_n != 0 for w in logical_widths)
+                )
+                if _get_tpu_fp8_runtime() == "channelwise" or has_subblock_partition:
+                    if _get_tpu_fp8_runtime() == "channelwise":
+                        logger.warning_once(
+                            "TPU dense FP8 linear is converting block-FP8 checkpoint "
+                            "weights to channelwise runtime scales by default for "
+                            "performance. Use --tpu-fp8-runtime=channelwise to make "
+                            "this explicit, or --tpu-fp8-runtime=blockwise to preserve "
+                            "blockwise runtime scales."
+                        )
+                    else:
+                        logger.warning_once(
+                            "TPU dense FP8 linear is converting sub-block-partitioned "
+                            "checkpoint weights to channelwise runtime scales because "
+                            "local partition shapes are not divisible by weight_block_size."
+                        )
                     self._requantize_tpu_block_fp8_to_channelwise(layer)
                 else:
                     layer.weight_block_size = self.quant_config.weight_block_size

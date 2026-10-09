@@ -231,6 +231,66 @@ class TestTpuFp8Linear(CustomTestCase):
         recovered = (layer.weight.float() * layer.weight_scale.reshape(1, -1)).t()
         torch.testing.assert_close(recovered, expected, rtol=0.1, atol=0.1)
 
+    def test_deepseek_v4_pro_shared_experts_subblock_tp16_sharding(self):
+        """Verify sub-block TP=16 sharding for DeepSeek-V4-Pro shared_experts (3072 // 16 = 192)."""
+        block_size = [128, 128]
+        method = Fp8LinearMethod(_FakeBlockFp8Config())
+
+        # 1. MergedColumnParallelLinear (gate_up_proj): logical_widths=[192, 192], in_size=256
+        gate_w, gate_s = self._make_block_fp8_weight((384, 256), block_size)
+        up_w, up_s = self._make_block_fp8_weight((384, 256), block_size)
+        gate_deq = block_quant_dequant(gate_w, gate_s, block_size, torch.float32)
+        up_deq = block_quant_dequant(up_w, up_s, block_size, torch.float32)
+
+        for tp_rank in (0, 1):
+            start = tp_rank * 192
+            end = start + 192
+            s_start = start // 128
+            s_end = (end + 127) // 128
+            layer = torch.nn.Module()
+            layer.logical_widths = [192, 192]
+            layer.tpu_fp8_output_tp_rank = tp_rank
+            layer.tpu_fp8_input_offset = 0
+            layer.weight = torch.nn.Parameter(
+                torch.cat([gate_w[start:end], up_w[start:end]], dim=0),
+                requires_grad=False,
+            )
+            layer.weight_scale_inv = torch.nn.Parameter(
+                torch.cat([gate_s[s_start:s_end], up_s[s_start:s_end]], dim=0),
+                requires_grad=False,
+            )
+            layer.input_scale = None
+
+            method._requantize_tpu_block_fp8_to_channelwise(layer)
+            recovered = (layer.weight.float() * layer.weight_scale.reshape(1, -1)).t()
+            expected = torch.cat([gate_deq[start:end], up_deq[start:end]], dim=0)
+            torch.testing.assert_close(recovered, expected, rtol=0.1, atol=0.1)
+
+        # 2. RowParallelLinear (down_proj): out_size=256, in_size=192
+        down_w, down_s = self._make_block_fp8_weight((256, 384), block_size)
+        down_deq = block_quant_dequant(down_w, down_s, block_size, torch.float32)
+        for tp_rank in (0, 1):
+            start = tp_rank * 192
+            end = start + 192
+            s_start = start // 128
+            s_end = (end + 127) // 128
+            layer = torch.nn.Module()
+            layer.logical_widths = [256]
+            layer.tpu_fp8_output_tp_rank = 0
+            layer.tpu_fp8_input_offset = start
+            layer.weight = torch.nn.Parameter(
+                down_w[:, start:end].contiguous(), requires_grad=False
+            )
+            layer.weight_scale_inv = torch.nn.Parameter(
+                down_s[:, s_start:s_end].contiguous(), requires_grad=False
+            )
+            layer.input_scale = None
+
+            method._requantize_tpu_block_fp8_to_channelwise(layer)
+            recovered = (layer.weight.float() * layer.weight_scale.reshape(1, -1)).t()
+            expected = down_deq[:, start:end]
+            torch.testing.assert_close(recovered, expected, rtol=0.1, atol=0.1)
+
     def test_moe_block_to_channelwise_releases_block_scales(self):
         num_experts = 2
         out_size = 256
