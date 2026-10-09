@@ -1845,8 +1845,8 @@ class Envs:
     # per-length XLA compilations.
     SGLANG_TPU_HOST_PADDING = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
-    # Log the sglang source line of every post-warmup eager op that compiles.
-    SGLANG_DEBUG_TPU_EAGER_COMPILE_SITES = EnvBool(True)
+    # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
+    SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill
