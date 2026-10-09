@@ -1805,6 +1805,8 @@ class Scheduler(
                     f"The raiden HiCache backend needs the KV free fence: {reason}"
                 )
             # Unlike raiden HiCache, a PD decode server can serve unfenced.
+            # TODO(#1213): fail startup here once every PD decode
+            # configuration can be fenced.
             logger.warning(
                 "KV arriving on this PD decode server is not fenced against "
                 "in-flight forwards: %s",
