@@ -67,6 +67,13 @@ def install_canary(
 
     perturb_config = PerturbConfig.from_env()
     device = torch.device(model_runner.device)
+    if not current_platform.supports_kv_canary():
+        # Refuse up front instead of dying mid-start.
+        raise ValueError(
+            "kv-canary: the canary runtime is not available on "
+            f"{current_platform.device_type.upper()} yet "
+            f"(--kv-canary {config.mode.value}); start with --kv-canary none."
+        )
     if torch_reference_conflicts_with_decode_graph(device):
         raise ValueError(
             f"kv-canary: {device.type} has no canary CUDA kernels and its torch reference "

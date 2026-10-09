@@ -47,6 +47,7 @@ def attach_canary_buffers(
     ``kv_token_id_vs_position_offset`` is propagated into every produced :class:`CanaryBufferGroup` (0 for target
     pools; 1 for draft pools where the input-ids rotation shifts the slot-to-token mapping by one).
     """
+    # Platform pools register from init_backend() (register_pool_attacher).
     attacher = _POOL_ATTACHERS.get(type(pool))
     if attacher is None:
         raise NotImplementedError(

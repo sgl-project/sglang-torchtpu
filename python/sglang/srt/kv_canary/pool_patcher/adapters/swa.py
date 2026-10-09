@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Dict, Optional
 
 import torch
 
@@ -10,6 +10,15 @@ from sglang.srt.kv_canary.pool_patcher.buffer_alloc import (
     alloc_canary_buf,
     make_row_source,
 )
+
+#: Sub-pool class -> group builder for pools without K/V halves (``k_buffer``).
+_SUBPOOL_GROUP_BUILDERS: Dict[type, Callable[..., CanaryBufferGroup]] = {}
+
+
+def register_subpool_group_builder(
+    pool_class: type, builder: Callable[..., CanaryBufferGroup]
+) -> None:
+    _SUBPOOL_GROUP_BUILDERS[pool_class] = builder
 
 
 def attach_swa(
@@ -40,14 +49,14 @@ def attach_swa(
         pool,
         method_name="get_contiguous_buf_infos",
         group=full_group,
-        has_v_half=True,
+        has_v_half=full_group.has_v_half,
         page_size=pool.page_size,
     )
     patch_buf_info_method(
         pool,
         method_name="get_state_buf_infos",
         group=swa_group,
-        has_v_half=True,
+        has_v_half=swa_group.has_v_half,
         page_size=pool.page_size,
     )
     return (full_group, swa_group)
@@ -62,6 +71,18 @@ def _build_subpool_group(
     swa_lut: Optional[torch.Tensor],
     kv_token_id_vs_position_offset: int,
 ) -> CanaryBufferGroup:
+    builder = _SUBPOOL_GROUP_BUILDERS.get(type(sub_pool))
+    if builder is not None:
+        # A fused sub-pool (one buffer per layer, no K/V halves) is laid out
+        # by the platform that registered it.
+        return builder(
+            pool=sub_pool,
+            kind=kind,
+            device=device,
+            read_bytes=read_bytes,
+            swa_lut=swa_lut,
+            kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
+        )
     num_slots = int(sub_pool.k_buffer[0].shape[0])
     k_head = alloc_canary_buf(num_slots=num_slots, device=device)
     k_tail = alloc_canary_buf(num_slots=num_slots, device=device)

@@ -125,6 +125,10 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform consumes annotation-driven compile policies."""
         return False
 
+    def supports_kv_canary(self) -> bool:
+        """Whether the KV canary runtime (--kv-canary) runs on this platform."""
+        return True
+
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError

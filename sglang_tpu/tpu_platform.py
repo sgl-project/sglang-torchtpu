@@ -873,6 +873,11 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuPagedTokenToKVPoolAllocator
 
+    def supports_kv_canary(self) -> bool:
+        # The pools can be attached (kv_canary_tpu.py) but the canary runtime
+        # does not run on TPU yet.
+        return False
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
@@ -970,6 +975,9 @@ class TpuSRTPlatform(SRTPlatform):
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        from sglang_tpu.kv_canary_tpu import register_tpu_attachers
+
+        register_tpu_attachers()
         self._backend_initialized = True
 
     # ------------------------------------------------------------------

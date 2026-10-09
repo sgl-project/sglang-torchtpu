@@ -2,7 +2,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.kv_canary import api as canary_api
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
+from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -131,6 +135,74 @@ class TestCanaryHeadroom(CustomTestCase):
                     self._resize(target, drafts),
                     self._resize(None) - large.per_forward_workspace_bytes(),
                 )
+
+
+class TestCanaryInstallGate(CustomTestCase):
+    """install_canary asks the platform before touching any pool."""
+
+    def test_install_refuses_where_the_platform_lacks_the_runtime(self):
+        # A platform without the canary runtime says so and install refuses up front.
+        with get_context().override_server_args(
+            kv_canary="log",
+            kv_canary_real_data="none",
+            disaggregation_mode="null",
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED, max_bs=8),
+                decode=PhaseConfig(backend=Backend.DISABLED, max_bs=8),
+            ),
+        ):
+            with (
+                patch.object(
+                    canary_api.current_platform,
+                    "supports_kv_canary",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(
+                    ValueError, r"not available on \w+ yet.*--kv-canary none"
+                ),
+            ):
+                canary_api.install_canary(
+                    server_args=Mock(),
+                    model_runner=SimpleNamespace(device="cpu", is_draft_worker=False),
+                )
+
+    def test_generic_mha_pool_path_is_unchanged(self):
+        class _Mha:
+            def __init__(self, layers):
+                self.k_buffer = [
+                    torch.zeros(16, 2, 16, dtype=torch.bfloat16) for _ in range(layers)
+                ]
+                self.v_buffer = [
+                    torch.zeros(16, 2, 16, dtype=torch.bfloat16) for _ in range(layers)
+                ]
+
+            def get_contiguous_buf_infos(self):
+                bufs = self.k_buffer + self.v_buffer
+                return (
+                    [b.data_ptr() for b in bufs],
+                    [b.nbytes for b in bufs],
+                    [b[0].nbytes for b in bufs],
+                )
+
+        pool = SimpleNamespace(
+            page_size=1,
+            full_kv_pool=_Mha(2),
+            swa_kv_pool=_Mha(2),
+            full_to_swa_index_mapping=torch.zeros(17, dtype=torch.int64),
+        )
+        pool.get_contiguous_buf_infos = pool.full_kv_pool.get_contiguous_buf_infos
+        pool.get_state_buf_infos = pool.swa_kv_pool.get_contiguous_buf_infos
+        full, swa = attach_swa(
+            pool=pool,
+            device=torch.device("cpu"),
+            read_bytes=16,
+            kv_token_id_vs_position_offset=0,
+        )
+        self.assertTrue(full.has_v_half and swa.has_v_half)
+        ptrs, _, _ = pool.get_contiguous_buf_infos()
+        self.assertEqual(
+            len(ptrs), 4 + 4
+        )  # k_head, K layers, k_tail, v_head, V layers, v_tail
 
 
 if __name__ == "__main__":
