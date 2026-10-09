@@ -81,6 +81,9 @@ class DecodeState:
     # Announcement time by read id; expired reads must never be issued.
     announced_at: Dict[str, float] = field(default_factory=dict)
 
+    # Latest announcement time by registered room; restarts its waiting deadline.
+    last_announced_at: Dict[int, float] = field(default_factory=dict)
+
     # Announced chunks waiting for admission and reads issued for each room.
     chunk_queue: Dict[int, List[tuple]] = field(default_factory=dict)
     remote_total: Dict[int, int] = field(default_factory=dict)

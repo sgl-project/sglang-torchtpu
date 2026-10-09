@@ -1042,6 +1042,7 @@ class RaidenKVManager(
                     self._decode.chunk_queue,
                     self._decode.remote_total,
                     self._decode.announced_spans,
+                    self._decode.last_announced_at,
                     self._decode.chunk_reads,
                     self._decode.reshard_covered,
                     self._decode.reshard_chunk_registering,

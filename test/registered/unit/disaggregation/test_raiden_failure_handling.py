@@ -229,6 +229,7 @@ def _decode_manager_stub(**overrides):
         _drain_engine=lambda: None,
         is_failed=lambda room: False,
         is_recv_done=lambda room: False,
+        last_announcement_age=lambda room: None,
         maybe_start_pull=lambda room: False,
         request_status={ROOM: KVPoll.WaitingForInput},
         failure_records={},

@@ -54,6 +54,12 @@ class RaidenReceiverMixin:
                 covered[pg] = True
         return [pg for pg in range(total) if not covered[pg]]
 
+    def _record_announcement_locked(self, room: int, req_id: str) -> None:
+        now = self._monotonic()
+        self._decode.announced_at[req_id] = now
+        if room in self._decode.local_blocks:
+            self._decode.last_announced_at[room] = now
+
     def _on_chunk(self, msg: List[bytes]) -> None:
         req = Chunk.from_frames(msg)
         room = req.room
@@ -70,7 +76,7 @@ class RaidenReceiverMixin:
                 or req_id in self._decode.announced_at
             ):
                 return
-            self._decode.announced_at[req_id] = self._monotonic()
+            self._record_announcement_locked(room, req_id)
             self._decode.remote_total[room] = total_pages
             self._decode.announced_spans.setdefault(room, []).append(
                 (start, start + len(blocks))
@@ -106,7 +112,7 @@ class RaidenReceiverMixin:
             self._decode.remote_endpoint[room] = endpoint
             self._decode.remote_swa_blocks[room] = remote_swa_blocks
             self._decode.remote_swa_endpoint[room] = swa_endpoint
-            self._decode.announced_at[str(room)] = self._monotonic()
+            self._record_announcement_locked(room, str(room))
             aux_index = self._decode.decode_aux_index.get(room)
             # Written under the lock: a room failing concurrently frees its
             # metadata slot, and the write must never land in a reused one.
@@ -363,6 +369,15 @@ class RaidenReceiverMixin:
         if self._pulling is not None:
             self._pulling.forget(req_id)
         return True
+
+    def last_announcement_age(self, room: int) -> Optional[float]:
+        """Time (seconds) since the room's last chunk or closing announcement,
+        or None if it has had none yet."""
+        with self._state_lock:
+            announced = self._decode.last_announced_at.get(room)
+        if announced is None:
+            return None
+        return self._monotonic() - announced
 
     def maybe_start_pull(self, room: int) -> bool:
         """Issue whatever of this room's pull is announced and affordable.
@@ -1142,6 +1157,35 @@ class RaidenKVReceiver(CommonKVReceiver):
         # The waiting timeout counts from here: the request is now known to
         # prefill and nothing else bounds how long its reply can take.
         self.init_time = time.time()
+
+    def _check_waiting_timeout(self) -> Optional[KVPoll]:
+        """Time out a room only after its prefill has gone quiet.
+
+        Each chunk or closing announcement restarts the clock. Until the first
+        announcement arrives, the clock runs from send_metadata, so a prefill
+        that never responds is still caught. Resharded and pipeline rooms
+        record no announcements, so their clock always runs from send_metadata.
+        """
+        if self.init_time is None:
+            return None
+        age = self.kv_mgr.last_announcement_age(self.bootstrap_room)
+        if age is None:
+            return super()._check_waiting_timeout()
+        if age < self.kv_mgr.waiting_timeout:
+            return None
+        # send_metadata predates every announcement, so the base check fails
+        # the room here.
+        result = super()._check_waiting_timeout()
+        if result is not None:
+            # Replace the base reason, which counts from send_metadata.
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"Request {self.bootstrap_room} timed out after {age:.1f}s without "
+                f"a new KV announcement ({time.time() - self.init_time:.1f}s since "
+                "send_metadata, SGLANG_DISAGGREGATION_WAITING_TIMEOUT="
+                f"{self.kv_mgr.waiting_timeout:.0f}s)",
+            )
+        return result
 
     def poll(self) -> KVPoll:
         """Every terminal condition is checked before any native read is

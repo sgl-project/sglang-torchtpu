@@ -106,6 +106,8 @@ speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 A decode rank issues a pull only while its host staging pool has the pages for it; requests past that stay in the transfer queue, in order, and are retried as pages free, so the pool does not have to hold a max-length transfer per running request. A pull that does not fit waits at the head of the queue, so smaller pulls cannot starve it. A request that waits in that queue for longer than `SGLANG_RAIDEN_TIMEOUT_S` fails with that reason: its KV is gone from the prefill by then, so the pull is never sent.
 
+The decode's `SGLANG_DISAGGREGATION_WAITING_TIMEOUT` restarts at each chunk or closing announcement of a request, so it bounds how long the prefill goes quiet, not how long the whole transfer takes. A request with nothing announced yet still fails that long after the decode asked the prefill for its KV, and resharded and pipeline transfers always count it from then.
+
 ## Launch (one host each, equal TP)
 
 ```bash
