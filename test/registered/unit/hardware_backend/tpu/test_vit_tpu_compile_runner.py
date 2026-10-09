@@ -430,6 +430,61 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         self.assertEqual(ctx.padding.bucket_len, bucket_len)
         self.assertTrue(ctx.padding.padded)
 
+    @staticmethod
+    def _installed_qwen3_vl_policy(buckets):
+        """A Qwen3-VL policy wired onto a runner, with both fns as spies."""
+        policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=1))
+        policy._patch_buckets = list(buckets)
+
+        def boundary(x, cu_seqlens, cos, sin, segment_ids):
+            return x[:, 0] + 1
+
+        # Stand in for install(): eager is the runner's forward, compiled is its
+        # torch.compile wrapper; both compute the same thing here.
+        policy.eager_fn = MagicMock(side_effect=boundary)
+        policy.compiled_fn = MagicMock(side_effect=boundary)
+        runner = SimpleNamespace()
+        policy._install_run_adapter(runner)
+        return policy, runner
+
+    def test_qwen3_vl_images_past_the_ladder_run_eagerly(self):
+        """Past the top bucket, recompiling would raise under fail_on_recompile
+        and take down every scheduler rank, so these images run uncompiled."""
+        policy, runner = self._installed_qwen3_vl_policy([16])
+        # The caller found no bucket, so it left x at its real 20 patches.
+        x = torch.arange(20 * 4, dtype=torch.float32).reshape(20, 4)
+        rope = torch.zeros(20, 2)
+        cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32)
+
+        out = runner.run(
+            x, cu_seqlens, rotary_pos_emb_cos=rope, rotary_pos_emb_sin=rope
+        )
+
+        policy.compiled_fn.assert_not_called()
+        policy.eager_fn.assert_called_once()
+        x_3d, graph_cu_seqlens, _, _, segment_ids = policy.eager_fn.call_args.args
+        self.assertEqual(tuple(x_3d.shape), (20, 1, 4))
+        # Same boundary arguments the compiled fn takes: the segmentation rides
+        # on segment_ids, and with no padding there is no trailing segment.
+        self.assertEqual(graph_cu_seqlens.tolist(), [0, 20])
+        self.assertEqual(segment_ids.tolist(), [[0] * 8 + [1] * 12])
+        torch.testing.assert_close(out, x + 1)
+
+    def test_qwen3_vl_bucketed_images_stay_compiled(self):
+        policy, runner = self._installed_qwen3_vl_policy([16])
+        # 12 real patches, padded on the host to the 16 bucket.
+        x = torch.arange(16 * 4, dtype=torch.float32).reshape(16, 4)
+        rope = torch.zeros(16, 2)
+        cu_seqlens = torch.tensor([0, 12], dtype=torch.int32)
+
+        out = runner.run(
+            x, cu_seqlens, rotary_pos_emb_cos=rope, rotary_pos_emb_sin=rope
+        )
+
+        policy.eager_fn.assert_not_called()
+        policy.compiled_fn.assert_called_once()
+        torch.testing.assert_close(out, x[:12] + 1)
+
     def test_segment_ids_are_built_from_host_cumulative_lengths(self):
         cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
 

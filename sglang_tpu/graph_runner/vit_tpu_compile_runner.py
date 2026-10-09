@@ -483,6 +483,25 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         # its host-side buffers. Only reached once install succeeds.
         runner.padded_patch_buckets = tuple(self.resolve_patch_buckets())
 
+    def run(
+        self,
+        x_3d: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        output_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raw = (x_3d, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, output_indices)
+        # The caller pads to a bucket, so an unbucketed length means the images
+        # are past the top one. Recompiling is not allowed once warmup has
+        # finished (fail_on_recompile), so run them uncompiled.
+        # ViTTpuCompileRunner.bucket_for_patches has already warned.
+        if self._bucket_for(x_3d.shape[0]) is None and self.eager_fn is not None:
+            args, ctx = self.prepare_call(*raw)
+            with torch.no_grad():
+                return self.unpad_outputs(self.eager_fn(*args), ctx)
+        return super().run(*raw)
+
     def compute_patch_buckets(self) -> list[int]:
         merge_size = self.vit.spatial_merge_size
         # Set but empty disables precompile: EnvTuple drops empty entries, so the
@@ -625,9 +644,10 @@ class ViTTpuCompileRunner:
             self._warned_oversize_patches.add(total_patches)
             logger.warning(
                 "ViTTpuCompileRunner: patch count %d exceeds the largest "
-                "precompiled bucket %d; this image triggers a one-time ViT "
-                "recompile. Raise SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES, or "
-                "lower max_pixels via --mm-process-config.",
+                "precompiled bucket %d; running these images through the "
+                "uncompiled ViT, which is slower. Raise "
+                "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES, or lower max_pixels via "
+                "--mm-process-config.",
                 total_patches,
                 self.padded_patch_buckets[-1],
             )
