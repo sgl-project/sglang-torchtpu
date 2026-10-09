@@ -5212,6 +5212,11 @@ class Scheduler(
         if model_runner.device != "tpu":
             # Only enable this for tpu
             return
+        from sglang.srt.hardware_backend.tpu.compilation.eager_compile_tracer import (
+            maybe_install_eager_compile_tracer,
+        )
+
+        maybe_install_eager_compile_tracer()
         if not get_exec().graph.enable_torch_compile:
             return
         if (
