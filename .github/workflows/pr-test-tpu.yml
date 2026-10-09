@@ -1,6 +1,8 @@
 # PR gate: runs the registered TPU per-commit suite on a single-host 2x2x1 slice.
 #
-# Runs when the PR carries `run-ci` (`/tag-and-rerun-ci` adds it) AND EITHER:
+# On demand only: a push never claims a slice. Each `/tag-and-rerun-ci` (or
+# `/rerun-failed-ci`, or "Re-run failed jobs") runs the suite once for the current
+# head commit; a new push needs a new trigger. Applies when EITHER:
 #   * the PR touches a TPU-explicit path (auto), OR
 #   * the PR carries the `tpu` label (manual opt-in -- for shared-code changes a
 #     maintainer judges need TPU coverage but that don't match those paths).
@@ -21,13 +23,11 @@ concurrency:
 
 jobs:
   decide:
-    # For labeled events, only `tpu` and `run-ci` can affect this workflow.
-    # Labels are fetched live below so label-then-rerun is not tied to the
-    # original event payload.
+    # Only the `tpu` label can make a PR TPU-relevant. Labels are fetched live
+    # below so label-then-rerun is not tied to the original event payload.
     if: >-
       github.event.action != 'labeled' ||
-      github.event.label.name == 'tpu' ||
-      github.event.label.name == 'run-ci'
+      github.event.label.name == 'tpu'
     runs-on: ubuntu-latest
     # dorny/paths-filter lists the PR's changed files via the GitHub API, which
     # needs pull-requests: read (the repo's default token is otherwise too narrow).
@@ -89,17 +89,17 @@ jobs:
               - '.github/workflows/feature-validation-tpu.yml'
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
-      # A TPU-relevant PR without `run-ci` FAILS here rather than skipping: a skip
-      # would leave the required pr-test-tpu-finish green, and a failed decide is
-      # what /tag-and-rerun-ci re-runs (labels are fetched live above).
-      - name: Gate on run-ci and TPU relevance
+      # A TPU-relevant first attempt FAILS here rather than skipping: a skip would
+      # leave the required pr-test-tpu-finish green, and a failed decide is what
+      # /tag-and-rerun-ci re-runs. Only that re-run (attempt > 1) claims a slice.
+      - name: Gate on an explicit trigger and TPU relevance
         id: gate
         run: |
           if [[ "${{ steps.paths.outputs.tpu }}" != "true" && \
                 "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" != "true" ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" != "true" ]]; then
-            echo "::error::TPU CI needs the run-ci label. Comment /tag-and-rerun-ci on the PR to add it and start CI."
+          elif [[ "${{ github.run_attempt }}" == "1" ]]; then
+            echo "::error::TPU CI runs on demand. Comment /tag-and-rerun-ci on the PR to run it for this commit."
             exit 1
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
