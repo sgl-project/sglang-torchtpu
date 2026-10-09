@@ -94,8 +94,7 @@ def _worker(local_rank: int, hosts: list[str], node_rank: int, result_q) -> None
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         # libtpu's atexit vBAR StopSession can hang on GKE, and a parent SIGTERM mid-teardown
-        # wedges the slice; exit without it, as node_normalization does. Source:
-        # https://github.com/sgl-project/sglang-torchtpu/pull/943
+        # wedges the slice; exit without it, as node_normalization does.
         result_q.close()
         result_q.join_thread()  # flush the result before the hard exit drops the feeder thread
         os._exit(status)
