@@ -136,9 +136,17 @@ def _coordinate_worker(local_rank, config, host_index, timeout, writer):
 
     import torch.distributed as dist
     from torch_tpu._internal.distributed import tpu_distributed
-    from torch_tpu._internal.distributed.launchers.multihost_wrapper import (
-        calculate_topological_node_rank,
-    )
+
+    try:
+        from torch_tpu._internal.distributed.distributed import (
+            _calculate_topological_node_rank as calculate_topological_node_rank,
+        )
+    except ImportError:
+        # TODO: Remove legacy multihost_wrapper fallback once torch_tpu >= 0.1.2
+        # is baseline.
+        from torch_tpu._internal.distributed.launchers.multihost_wrapper import (
+            calculate_topological_node_rank,
+        )
 
     from sglang.srt.utils import kill_itself_when_parent_died
 

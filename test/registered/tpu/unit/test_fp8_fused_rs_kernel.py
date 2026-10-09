@@ -28,9 +28,13 @@ class TestFp8FusedRsKernel(CustomTestCase):
         layers: int = 1,
         skewed_routing: bool = False,
     ):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            get_tpu_launcher_module,
+        )
+
         repo_root = Path(__file__).resolve().parents[4]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
-        wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+        wrapper_module = get_tpu_launcher_module()
         worker_command = shlex.join(
             [
                 str(worker),

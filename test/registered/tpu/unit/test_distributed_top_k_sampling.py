@@ -84,9 +84,13 @@ class TestDistributedTopKSampling(CustomTestCase):
     A subprocess owns the complete distributed runtime for test isolation."""
 
     def test_exactness_and_speed_regression(self):
+        from sglang.srt.hardware_backend.tpu.patches import (
+            get_tpu_launcher_module,
+        )
+
         repo_root = Path(__file__).resolve().parents[4]
         worker = Path(__file__).resolve()
-        wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+        wrapper_module = get_tpu_launcher_module()
         python = shlex.quote(sys.executable)
         command = "\n".join(
             (

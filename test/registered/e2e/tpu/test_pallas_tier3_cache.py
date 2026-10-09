@@ -87,11 +87,15 @@ _WORKER = textwrap.dedent("""
 
 
 def _singlehost_environment() -> dict[str, str]:
+    from sglang.srt.hardware_backend.tpu.patches import (
+        get_tpu_launcher_module,
+    )
+
     completed = subprocess.run(
         [
             sys.executable,
             "-m",
-            "torch_tpu._internal.distributed.launchers.singlehost_wrapper",
+            get_tpu_launcher_module(),
         ],
         capture_output=True,
         check=False,

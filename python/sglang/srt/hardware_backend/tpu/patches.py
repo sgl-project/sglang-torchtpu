@@ -872,6 +872,23 @@ def _patch_pd_decode_swa_hicache() -> None:
     pd_decode_swa_hicache.install()
 
 
+def get_tpu_launcher_module(multihost: bool = False) -> str:
+    """Return the available TPU launcher module for subprocess invocation."""
+    import importlib.util
+
+    legacy = (
+        "torch_tpu._internal.distributed.launchers.multihost_wrapper"
+        if multihost
+        else "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+    )
+    try:
+        if importlib.util.find_spec(legacy) is not None:
+            return legacy
+    except ModuleNotFoundError:
+        pass
+    return "torch.tpu.distributed"
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
