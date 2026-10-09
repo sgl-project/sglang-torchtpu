@@ -135,7 +135,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.weight_version = "1"
     tm.server_args.crash_dump_folder = ""
     tm.server_args.dp_size = 1
-    tm.disaggregation_mode = "none"
+    tm.disaggregation_mode = DisaggregationMode.NULL
     tm.rid_to_state = {}
     tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
@@ -1129,6 +1129,7 @@ class TestLoRARequestLifecycle(CustomTestCase):
                 lora_id=req.lora_id,
                 input_ids=[1],
                 mm_inputs=None,
+                bootstrap_room=None,
                 time_stats=tm.rid_to_state[req.rid].time_stats,
                 sampling_params=SimpleNamespace(max_new_tokens=4),
             )
@@ -1193,3 +1194,91 @@ class TestLoRARequestLifecycle(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestParallelSamplingBootstrapRooms(CustomTestCase):
+    """n > 1 through a P/D pair: every sub-request needs its own bootstrap room,
+    and the max_new_tokens=0 prefix request must not be sent (nothing to decode)."""
+
+    def _drive(self, disaggregation_mode, bootstrap_room):
+        from types import SimpleNamespace
+
+        tm = _make_tokenizer_manager(self)
+        tm.disaggregation_mode = disaggregation_mode
+        sent = []
+
+        async def tokenize(o):
+            return SimpleNamespace(
+                rid=o.rid,
+                bootstrap_room=o.bootstrap_room,
+                sampling_params=SimpleNamespace(max_new_tokens=8),
+                stream=False,
+                input_ids=[1, 2, 3],
+            )
+
+        async def send(t):
+            sent.append(t)
+
+        async def wait_one(o, request):
+            yield {"text": "ok", "meta_info": {"id": o.rid}}
+
+        tm._tokenize_one_request = tokenize
+        tm._send_one_request = send
+        tm._wait_one_response = wait_one
+        tm._init_req_state = lambda o: tm.rid_to_state.__setitem__(o.rid, MagicMock())
+        obj = GenerateReqInput(
+            text=["prompt a", "prompt b"],
+            sampling_params={"n": 2, "max_new_tokens": 8},
+            bootstrap_host="h" if bootstrap_room is not None else None,
+            bootstrap_port=1 if bootstrap_room is not None else None,
+            bootstrap_room=bootstrap_room,
+        )
+        obj.normalize_batch_and_arguments()
+        # generate_request registers the batch's own rids before handing over.
+        for rid in obj.rid:
+            tm.rid_to_state[rid] = MagicMock()
+        request_states = {rid: tm.rid_to_state[rid] for rid in obj.rid}
+
+        async def run():
+            outputs = []
+            async for out in tm._handle_batch_request(obj, None, request_states):
+                outputs.append(out)
+            return outputs
+
+        asyncio.run(run())
+        return sent
+
+    def test_pd_pair_gives_each_sample_its_own_room_and_skips_the_prefix_request(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        sent = self._drive(DisaggregationMode.PREFILL, bootstrap_room=100)
+        self.assertEqual(len(sent), 4, "2 prompts x n=2, no prefix request")
+        self.assertTrue(all(t.sampling_params.max_new_tokens == 8 for t in sent))
+        rooms = [t.bootstrap_room for t in sent]
+        self.assertEqual(len(set(rooms)), 4, rooms)
+        self.assertEqual(
+            sorted(rooms),
+            [100, 101, 102, 103],
+            "the normalized block of batch_size*n rooms",
+        )
+        self.assertEqual(len({t.rid for t in sent}), 4)
+
+    def test_decode_engine_derives_the_same_rooms(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        prefill = [
+            t.bootstrap_room for t in self._drive(DisaggregationMode.PREFILL, 100)
+        ]
+        decode = [t.bootstrap_room for t in self._drive(DisaggregationMode.DECODE, 100)]
+        self.assertEqual(
+            prefill, decode, "both engines expand the same request identically"
+        )
+
+    def test_single_engine_keeps_the_prefix_request_and_no_rooms(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        sent = self._drive(DisaggregationMode.NULL, bootstrap_room=None)
+        prefix = [t for t in sent if t.sampling_params.max_new_tokens == 0]
+        samples = [t for t in sent if t.sampling_params.max_new_tokens == 8]
+        self.assertEqual((len(prefix), len(samples)), (2, 4))
+        self.assertTrue(all(t.bootstrap_room is None for t in sent))
