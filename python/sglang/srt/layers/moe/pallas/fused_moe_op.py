@@ -126,6 +126,52 @@ def _valid_rows_mask(row_start, row_end, unsort_idx):
     return (row_start <= unsort_idx) & (unsort_idx < row_end)
 
 
+def _use_destination_major_combine(*, gmm2_out, unsort_idx, num_tokens, topk):
+    # Local (non-EP) combine: the destination-major SparseCore kernel replaces
+    # the dense gather-reduce's XLA fallback; the kernel pairs routes, so it
+    # needs top-k >= 2.
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang.srt.layers.moe.pallas.sparse_core.dense_gather_reduce import (
+        is_compatible,
+    )
+
+    if topk < 2 or gmm2_out.dtype != jnp.bfloat16:
+        return False
+    # The kernel packs source row indices into 20 bits.
+    if gmm2_out.shape[0] > 1 << 20:
+        return False
+    try:
+        tpu_info = pltpu.get_tpu_info()
+    except ValueError:
+        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+        return False
+    sc_info = tpu_info.sparse_core
+    if sc_info is None or sc_info.num_lanes != 16:
+        return False
+    if gmm2_out.shape[-1] % tpu_info.num_lanes != 0:
+        return False
+    # The dense SparseCore kernel is faster where it applies (measured at
+    # top-k 4 and 8 with 8K tokens); it needs 16 lanes divisible by top-k and
+    # routes in whole 16384-row waves.
+    if is_compatible(gmm2_out, unsort_idx, topk):
+        return False
+    # Below the kernel's VMEM cutoff (two BF16 buffers at 60% of VMEM) it would
+    # fall back to a TensorCore gather.
+    if gmm2_out.size * 4 < tpu_info.vmem_capacity_bytes * 0.6:
+        return False
+    from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v3 import (
+        token_block_alignment,
+    )
+
+    # Destination tokens pad to one 64-token block per SparseCore row partition;
+    # require a full block and at most half the batch as padding.
+    alignment = token_block_alignment(gmm2_out.shape[-1], tpu_info)
+    padded_tokens = -(-num_tokens // alignment) * alignment
+    return num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3
+
+
 def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     """Pick a ``TileSizes`` for this gmm_v2 call.
 
@@ -666,6 +712,21 @@ def _fused_moe_jax(
                     unsort_idx.astype(jnp.int32),
                     topk_weights.reshape(-1),
                     _valid_rows_mask(row_start, row_end, unsort_idx),
+                    topk,
+                )
+            elif _use_destination_major_combine(
+                gmm2_out=gmm2_out, unsort_idx=unsort_idx, num_tokens=m, topk=topk
+            ):
+                from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v3 import (
+                    ragged_gather_reduce as ragged_gather_reduce_v3,
+                )
+
+                # All experts local: every row is valid.
+                combined = ragged_gather_reduce_v3(
+                    gmm2_out,
+                    unsort_idx.astype(jnp.int32),
+                    topk_weights.reshape(-1),
+                    jnp.ones((m * topk,), dtype=jnp.bool_),
                     topk,
                 )
             else:
