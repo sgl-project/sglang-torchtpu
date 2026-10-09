@@ -254,6 +254,9 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     Only those backends: ``pallas_tpu_mla`` accepts fp8 KV but stays opt-in
     until its accuracy is validated, and ``pallas_tpu_flash`` has no
     dequantization scale, so defaulting it to fp8 silently degrades it.
+
+    ``pallas_tpu_mla_sparse`` defaults to fp8 for a different reason: its
+    kernels read nothing else.
     """
     from sglang.srt.arg_groups.overrides import (
         declare_resolution,
@@ -264,7 +267,10 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "auto":
         return
-    if _rpa_kernel_spec(cfg.attention_backend) is None:
+    if (
+        _rpa_kernel_spec(cfg.attention_backend) is None
+        and cfg.attention_backend != "pallas_tpu_mla_sparse"
+    ):
         return
     declare_resolution(
         server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
@@ -536,11 +542,15 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_mla_kv_pool_cls(self) -> type:
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel
-        # addresses; other backends (torch_native reference) keep the flat
+        # addresses, and pallas_tpu_mla_sparse derives its split cache from the
+        # same buffer; other backends (torch_native reference) keep the flat
         # upstream pool.
         from sglang.srt.runtime_context import get_exec
 
-        if get_exec().kernel.attention_backend == "pallas_tpu_mla":
+        if get_exec().kernel.attention_backend in (
+            "pallas_tpu_mla",
+            "pallas_tpu_mla_sparse",
+        ):
             from sglang.srt.hardware_backend.tpu.kv_pool import (
                 TpuFusedMLATokenToKVPool,
             )

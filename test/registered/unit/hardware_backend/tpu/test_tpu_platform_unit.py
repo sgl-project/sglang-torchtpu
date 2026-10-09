@@ -136,6 +136,8 @@ class TestTpuCompileCache(CustomTestCase):
                 srt_root / "layers/attention/pallas/kernel.py",
                 srt_root / "layers/moe/pallas/kernel.py",
                 srt_root / "hardware_backend/tpu/attention_pallas.py",
+                srt_root / "hardware_backend/tpu/attention_pallas_mla.py",
+                srt_root / "hardware_backend/tpu/attention_pallas_mla_sparse.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_base.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_batched.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_v3.py",
@@ -347,6 +349,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self._apply(args)
         self.assertEqual(self._resolved(args, "kv_cache_dtype"), "auto")
         self.assertEqual(self._resolved(args, "page_size"), 64)
+
+    def test_sparse_mla_backend_defaults_kv_cache_to_fp8(self):
+        # Its kernels read an FP8 cache and nothing else, so "auto" cannot be
+        # left to mean the model dtype.
+        args = self._args(attention_backend="pallas_tpu_mla_sparse")
+        self._apply(args)
+        self.assertEqual(self._resolved(args, "kv_cache_dtype"), "fp8_e4m3")
 
     def test_batched_rpa_page_size_default_meets_the_kernel_floor(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched")
