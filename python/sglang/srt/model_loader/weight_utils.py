@@ -19,6 +19,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     Generator,
@@ -68,6 +69,11 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
+
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.ep_local_expert_reader import (
+        EpLocalExpertReader,
+    )
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
@@ -1130,16 +1136,18 @@ def _ep_local_expert_reader(
     hf_weights_files: List[str],
     disable_mmap: bool,
     local_expert_range: Optional[Tuple[int, int]],
-):
+) -> Optional["EpLocalExpertReader"]:
     """TPU EP-local expert reader for ``local_expert_range``, or None to read whole
     shards (no range, mmap on, or no checkpoint index)."""
-    if not disable_mmap or local_expert_range is None:
+    if local_expert_range is None:
         return None
     from sglang.srt.hardware_backend.tpu.ep_local_expert_reader import (
         EpLocalExpertReader,
     )
 
-    return EpLocalExpertReader.maybe_create(hf_weights_files, local_expert_range)
+    return EpLocalExpertReader.maybe_create(
+        hf_weights_files, local_expert_range, disable_mmap=disable_mmap
+    )
 
 
 def safetensors_weights_iterator(

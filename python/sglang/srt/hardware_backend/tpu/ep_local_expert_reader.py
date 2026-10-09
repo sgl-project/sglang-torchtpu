@@ -7,7 +7,6 @@ import os
 import re
 import struct
 import threading
-from typing import Dict, List, Optional, Set, Tuple
 
 import safetensors
 import torch
@@ -18,9 +17,10 @@ logger = logging.getLogger(__name__)
 
 _is_tpu = is_tpu()
 
-# Bound on a single readinto() call while filling a span buffer.
+# Bound on a single readinto() call while filling a span buffer (not tuned).
 _READ_CHUNK_BYTES = 64 * 1024 * 1024
-# Kept tensors at most this far apart are read with one seek + read.
+# Kept tensors at most this far apart are read with one seek + read: a little
+# extra read for fewer seeks on network filesystems (not tuned).
 _SPAN_MERGE_GAP_BYTES = 16 * 1024 * 1024
 _EXPERT_ID_KEY_RE = re.compile(r"^(.*)\.experts\.(\d+)\.")
 
@@ -43,12 +43,18 @@ _SAFETENSORS_DTYPES = {
     "F8_E4M3FNUZ": torch.float8_e4m3fnuz,
     "F8_E5M2FNUZ": torch.float8_e5m2fnuz,
     "C64": torch.complex64,
+    "F8_E8M0": torch.float8_e8m0fnu,
 }
-if hasattr(torch, "float8_e8m0fnu"):
-    _SAFETENSORS_DTYPES["F8_E8M0"] = torch.float8_e8m0fnu
 
 
-def tpu_local_routed_expert_range(model: torch.nn.Module) -> Optional[Tuple[int, int]]:
+def _log_whole_shards(reason: str) -> None:
+    # An opted-in model reading whole shards can need far more host memory.
+    log_info_on_rank0(
+        logger, f"EP-local expert reads off ({reason}); reading whole shards."
+    )
+
+
+def tpu_local_routed_expert_range(model: torch.nn.Module) -> tuple[int, int] | None:
     """Routed-expert ids [start, end) this EP rank stores, for EP-local reads.
 
     For models that set ``supports_tpu_ep_local_expert_reads`` (every
@@ -62,25 +68,21 @@ def tpu_local_routed_expert_range(model: torch.nn.Module) -> Optional[Tuple[int,
     if not _is_tpu or not getattr(model, "supports_tpu_ep_local_expert_reads", False):
         return None
     from sglang.srt.environ import envs
-
-    def whole_shards(reason: str) -> None:
-        # An opted-in model reading whole shards can need far more host memory.
-        log_info_on_rank0(
-            logger, f"EP-local expert reads off ({reason}); reading whole shards."
-        )
-
-    if envs.SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS.get():
-        return whole_shards("SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS")
     from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.utils import local_routed_expert_range
     from sglang.srt.runtime_context import get_exec
 
-    if get_global_expert_location_metadata() is not None:
-        return whole_shards("expert location metadata")
-    if get_exec().moe.ep_join_mode == "scale":
-        return whole_shards("elastic EP join")
     moes = [m for m in model.modules() if isinstance(m, FusedMoE)]
+    # Without MoE layers or EP there is nothing to skip, and nothing to report.
+    if not moes or all(m.moe_ep_size <= 1 for m in moes):
+        return None
+    if envs.SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS.get():
+        return _log_whole_shards("SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS")
+    if get_global_expert_location_metadata() is not None:
+        return _log_whole_shards("expert location metadata")
+    if get_exec().moe.ep_join_mode == "scale":
+        return _log_whole_shards("elastic EP join")
     if any(
         m._has_fused_shared
         or any(
@@ -88,15 +90,13 @@ def tpu_local_routed_expert_range(model: torch.nn.Module) -> Optional[Tuple[int,
         )
         for m in moes
     ):
-        return whole_shards("a MoE layer loads experts outside its routed range")
+        return _log_whole_shards("a MoE layer loads experts outside its routed range")
     layouts = {
         (m.moe_ep_size, m._expert_storage_rank, m._num_local_routed) for m in moes
     }
     if len(layouts) != 1:
-        return whole_shards("MoE layers disagree on the expert layout")
-    ep_size, storage_rank, num_local_routed = layouts.pop()
-    if ep_size <= 1:
-        return None
+        return _log_whole_shards("MoE layers disagree on the expert layout")
+    _, storage_rank, num_local_routed = layouts.pop()
     return local_routed_expert_range(storage_rank, num_local_routed)
 
 
@@ -108,7 +108,7 @@ class EpLocalExpertReader:
     local expert the index lists was read.
     """
 
-    def __init__(self, hf_weights_files: List[str], expert_range: Tuple[int, int]):
+    def __init__(self, hf_weights_files: list[str], expert_range: tuple[int, int]):
         self.expert_range = expert_range
         index_path = os.path.join(
             os.path.dirname(hf_weights_files[0]), "model.safetensors.index.json"
@@ -116,23 +116,35 @@ class EpLocalExpertReader:
         with open(index_path) as f:
             weight_map = json.load(f)["weight_map"]
         self.indexed_files = set(weight_map.values())
-        # Index entries for this rank's routed experts: all must be read.
-        self.expected: Set[str] = {
-            name for name in weight_map if self._local_expert_id(name) not in (None, -1)
+        # Index entries for this rank's routed experts in the shards this load
+        # reads: all must be read.
+        loaded = {os.path.basename(path) for path in hf_weights_files}
+        self.expected: set[str] = {
+            name
+            for name, shard in weight_map.items()
+            if shard in loaded and self._local_expert_id(name) not in (None, -1)
         }
-        self.seen: Set[str] = set()
+        self.seen: set[str] = set()
         self._seen_lock = threading.Lock()
 
     @classmethod
     def maybe_create(
-        cls, hf_weights_files: List[str], expert_range: Optional[Tuple[int, int]]
-    ) -> Optional["EpLocalExpertReader"]:
-        if expert_range is None or not hf_weights_files:
+        cls,
+        hf_weights_files: list[str],
+        expert_range: tuple[int, int],
+        *,
+        disable_mmap: bool,
+    ) -> "EpLocalExpertReader | None":
+        if not hf_weights_files:
+            return None
+        if not disable_mmap:
+            _log_whole_shards("they need --weight-loader-disable-mmap")
             return None
         index_path = os.path.join(
             os.path.dirname(hf_weights_files[0]), "model.safetensors.index.json"
         )
         if not os.path.isfile(index_path):
+            _log_whole_shards("no model.safetensors.index.json")
             return None
         log_info_on_rank0(
             logger,
@@ -141,7 +153,7 @@ class EpLocalExpertReader:
         )
         return cls(hf_weights_files, expert_range)
 
-    def _local_expert_id(self, name: str) -> Optional[int]:
+    def _local_expert_id(self, name: str) -> int | None:
         m = _EXPERT_ID_KEY_RE.match(name)
         if m is None:
             return None
@@ -151,7 +163,7 @@ class EpLocalExpertReader:
     def handles(self, st_file: str) -> bool:
         return os.path.basename(st_file) in self.indexed_files
 
-    def read(self, st_file: str) -> Dict[str, torch.Tensor]:
+    def read(self, st_file: str) -> dict[str, torch.Tensor]:
         with open(st_file, "rb") as f:
             header_len = struct.unpack("<Q", f.read(8))[0]
             header = json.loads(f.read(header_len))
@@ -198,15 +210,25 @@ class EpLocalExpertReader:
                     if end == start:
                         result[name] = torch.empty(meta["shape"], dtype=dtype)
                         continue
-                    result[name] = torch.frombuffer(
-                        buf,
-                        dtype=dtype,
-                        count=(end - start) // dtype.itemsize,
-                        offset=start - span_start,
-                    ).view(meta["shape"])
+                    offset = start - span_start
+                    if offset % dtype.itemsize:
+                        # A writer that does not align tensors to their dtype
+                        # leaves this one unaligned in the span: copy it out.
+                        tensor = torch.frombuffer(
+                            buf, dtype=torch.uint8, count=end - start, offset=offset
+                        )
+                        tensor = tensor.clone().view(dtype)
+                    else:
+                        tensor = torch.frombuffer(
+                            buf,
+                            dtype=dtype,
+                            count=(end - start) // dtype.itemsize,
+                            offset=offset,
+                        )
+                    result[name] = tensor.view(meta["shape"])
         if unviewable:
-            # Dtypes missing from _SAFETENSORS_DTYPES are read through safetensors
-            # (mmap).
+            # Dtypes missing from _SAFETENSORS_DTYPES are read through safetensors,
+            # which maps the file; no Kimi-K3 checkpoint has one.
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as sf:
                 for name in unviewable:
                     result[name] = sf.get_tensor(name)
@@ -219,5 +241,6 @@ class EpLocalExpertReader:
         if missing:
             raise RuntimeError(
                 f"EP-local expert read missed {len(missing)} local expert tensors "
-                f"listed in the index, e.g. {missing[:3]}."
+                f"listed in the index, e.g. {missing[:3]}. "
+                "SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS=1 reads whole shards."
             )

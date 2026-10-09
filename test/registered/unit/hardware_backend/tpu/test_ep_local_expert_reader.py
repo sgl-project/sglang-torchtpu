@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import struct
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -145,14 +146,20 @@ class TestEpLocalExpertReads(CustomTestCase):
                 self.assertEqual(sum(read_bytes), kept)
 
     def test_reads_everything_without_range_mmap_off_or_index(self):
-        with tempfile.TemporaryDirectory() as d:
+        with (
+            tempfile.TemporaryDirectory() as d,
+            patch(f"{_MOD}.log_info_on_rank0") as log,
+        ):
             files, tensors = _write_checkpoint(d)
             self.assertEqual(set(_read(files, "single", None)), set(tensors))
+            log.assert_not_called()
             self.assertEqual(
                 set(_read(files, "single", (2, 4), disable_mmap=False)), set(tensors)
             )
+            self.assertIn("--weight-loader-disable-mmap", log.call_args.args[1])
             os.remove(os.path.join(d, "model.safetensors.index.json"))
             self.assertEqual(set(_read(files, "single", (2, 4))), set(tensors))
+            self.assertIn("no model.safetensors.index.json", log.call_args.args[1])
 
     def test_files_outside_the_index_are_read_whole(self):
         # e.g. an MTP shard that maybe_add_mtp_safetensors appends beside the index.
@@ -180,8 +187,62 @@ class TestEpLocalExpertReads(CustomTestCase):
                 )
                 with open(index, "w") as f:
                     json.dump(meta, f)
-                with self.assertRaisesRegex(RuntimeError, "missed 1 local expert"):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "missed 1 local expert.*SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS=1",
+                ):
                     _read(files, iterator, (2, 4))
+
+    def test_index_shards_outside_this_load_are_not_expected(self):
+        for iterator in _ITERATORS:
+            with self.subTest(iterator=iterator), tempfile.TemporaryDirectory() as d:
+                files, tensors = _write_checkpoint(d)
+                index = os.path.join(d, "model.safetensors.index.json")
+                with open(index) as f:
+                    meta = json.load(f)
+                # A local expert in an indexed shard this load does not read.
+                meta["weight_map"]["model.layers.0.mlp.experts.3.up_proj.weight"] = (
+                    "model-00003-of-00003.safetensors"
+                )
+                with open(index, "w") as f:
+                    json.dump(meta, f)
+                loaded = _read(files, iterator, (2, 4))
+                expected = {n for n in tensors if _expert_id(n) in (None, 2, 3)}
+                self.assertEqual(set(loaded), expected)
+
+    def test_tensor_unaligned_for_its_dtype_is_copied_out(self):
+        # A hand-written shard: a 3-byte tensor, then a bf16 expert at offset 3.
+        local = torch.arange(4, dtype=torch.bfloat16)
+        names = {"model.norm.bias": torch.arange(3, dtype=torch.uint8)}
+        names["model.layers.0.mlp.experts.2.down_proj.weight"] = local
+        header = {
+            "model.norm.bias": {"dtype": "U8", "shape": [3], "data_offsets": [0, 3]},
+            "model.layers.0.mlp.experts.2.down_proj.weight": {
+                "dtype": "BF16",
+                "shape": [4],
+                "data_offsets": [3, 11],
+            },
+        }
+        payload = names["model.norm.bias"].numpy().tobytes()
+        payload += local.view(torch.int16).numpy().tobytes()
+        for iterator in _ITERATORS:
+            with self.subTest(iterator=iterator), tempfile.TemporaryDirectory() as d:
+                shard = os.path.join(d, "model-00001-of-00001.safetensors")
+                header_bytes = json.dumps(header).encode()
+                with open(shard, "wb") as f:
+                    f.write(struct.pack("<Q", len(header_bytes)) + header_bytes)
+                    f.write(payload)
+                with open(os.path.join(d, "model.safetensors.index.json"), "w") as f:
+                    json.dump(
+                        {"weight_map": {n: os.path.basename(shard) for n in header}}, f
+                    )
+                loaded = _read([shard], iterator, (2, 4))
+                self.assertEqual(set(loaded), set(names))
+                for name, tensor in names.items():
+                    self.assertTrue(torch.equal(loaded[name], tensor), name)
+                    self.assertEqual(
+                        loaded[name].data_ptr() % tensor.element_size(), 0, name
+                    )
 
     def test_truncated_shard_fails_before_reading(self):
         for iterator in _ITERATORS:
@@ -361,21 +422,34 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
                 True,
             ),
         }
+        # Reads that could never be EP-local stay silent; an opted-in model under
+        # EP that falls back says why on rank 0.
+        silent = {"not_tpu", "not_opted_in", "ep1", "no_moe"}
         for label, (env, layers, opted_in) in cases.items():
-            with self.subTest(label), self._env(**env):
+            with (
+                self.subTest(label),
+                self._env(**env),
+                patch(f"{_MOD}.log_info_on_rank0") as log,
+            ):
                 self.assertIsNone(
                     ep_local_expert_reader.tpu_local_routed_expert_range(
                         _model(layers, opted_in)
                     )
                 )
+                self.assertEqual(log.call_count, 0 if label in silent else 1)
 
     def test_kill_switch(self):
-        with self._env(), envs.SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS.override(True):
+        with (
+            self._env(),
+            envs.SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS.override(True),
+            patch(f"{_MOD}.log_info_on_rank0") as log,
+        ):
             self.assertIsNone(
                 ep_local_expert_reader.tpu_local_routed_expert_range(
                     _model([_fused_moe(4, 1, 8, 32)])
                 )
             )
+        self.assertIn("SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS", log.call_args.args[1])
 
 
 class TestLoaderPassesTheRange(CustomTestCase):
