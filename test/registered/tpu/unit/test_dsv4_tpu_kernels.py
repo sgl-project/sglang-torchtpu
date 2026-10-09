@@ -391,6 +391,225 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         self.assertEqual(tuple(out_hca.shape), (num_tokens, num_q_heads, head_dim))
         self.assertFalse(torch.isnan(out_hca).any().item())
 
+        # DeepSeek-V4-Pro CSA & Indexer (`index_topk = 1024, sliding_window = 128`):
+        topk_indices_pro = topk_op(
+            q_idx,
+            positions,
+            cos_sin,
+            idx_weights,
+            idx_k_buf,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            1024,
+            4,
+            1.0 / math.sqrt(128),
+            64,
+        )
+        self.assertEqual(tuple(topk_indices_pro.shape), (num_tokens, 1024))
+        out_csa_pro = csa_attn_op(
+            q,
+            hidden_states,
+            sw_cache,
+            kv_lens,
+            page_indices,
+            csa_nope,
+            csa_rope,
+            topk_indices_pro,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sinks,
+            1.0 / math.sqrt(512),
+            128,
+            256,
+        )
+        self.assertEqual(tuple(out_csa_pro.shape), (num_tokens, num_q_heads, head_dim))
+        self.assertFalse(torch.isnan(out_csa_pro).any().item())
+
+    def test_dsv4_mxfp4_w4a8_moe_equivalence(self):
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from torch.nn.parameter import Parameter
+
+        from sglang.srt.layers.quantization.fp8 import cast_e2m1fn_to_e4m3fn
+        from sglang.srt.runtime_context import get_context
+        from sglang_tpu.fp8_moe import (
+            _dequantize_dsv4_mxfp4_block32,
+            prepare_tpu_fp8_moe_weights,
+        )
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+
+        override = get_context().override_server_args(
+            pp_size=1, tpu_fp8_runtime="channelwise"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        num_tokens = 16
+        num_experts = 4
+        topk = 2
+        hidden_size = 1024
+
+        g = torch.Generator().manual_seed(2026)
+        x_cpu = torch.randn(num_tokens, hidden_size, generator=g, dtype=torch.bfloat16)
+        topk_ids_cpu = (
+            torch.arange(num_tokens * topk, dtype=torch.int32).reshape(num_tokens, topk)
+            % num_experts
+        )
+        topk_weights_cpu = torch.softmax(
+            torch.randn(num_tokens, topk, generator=g, dtype=torch.float32), dim=-1
+        ).to(torch.bfloat16)
+
+        x = x_cpu.to(self.device)
+        topk_ids = topk_ids_cpu.to(self.device)
+        topk_weights = topk_weights_cpu.to(self.device)
+
+        for inter_size in (512, 384):
+            with self.subTest(inter_size=inter_size):
+                w13_u8 = torch.randint(
+                    0,
+                    256,
+                    (num_experts, 2 * inter_size, hidden_size // 2),
+                    dtype=torch.uint8,
+                    generator=g,
+                )
+                w2_u8 = torch.randint(
+                    0,
+                    256,
+                    (num_experts, hidden_size, inter_size // 2),
+                    dtype=torch.uint8,
+                    generator=g,
+                )
+                w13_scale_fp32 = torch.full(
+                    (num_experts, 2 * inter_size, hidden_size // 32),
+                    2.0**-5,
+                    dtype=torch.float32,
+                )
+                w2_scale_fp32 = torch.full(
+                    (num_experts, hidden_size, inter_size // 32),
+                    2.0**-5,
+                    dtype=torch.float32,
+                )
+
+                # 1. Exact PyTorch BF16 reference on CPU
+                w13_ref = _dequantize_dsv4_mxfp4_block32(w13_u8, w13_scale_fp32).to(
+                    torch.bfloat16
+                )
+                w2_ref = _dequantize_dsv4_mxfp4_block32(w2_u8, w2_scale_fp32).to(
+                    torch.bfloat16
+                )
+                ref_out = torch.zeros_like(x_cpu, dtype=torch.float32)
+                for t in range(num_tokens):
+                    for k_idx in range(topk):
+                        e = int(topk_ids_cpu[t, k_idx].item())
+                        weight = float(topk_weights_cpu[t, k_idx].item())
+                        gate_up = F.linear(x_cpu[t : t + 1], w13_ref[e]).float()
+                        gate = torch.clamp(gate_up[:, :inter_size], max=10.0)
+                        up = torch.clamp(gate_up[:, inter_size:], min=-10.0, max=10.0)
+                        act = (F.silu(gate) * up).to(torch.bfloat16)
+                        down = F.linear(act, w2_ref[e]).float()
+                        ref_out[t] += weight * down.squeeze(0)
+                ref_out = ref_out.to(torch.bfloat16)
+
+                # 2. Phase 2 Native Packed-FP4 (W4A8) on TPU
+                layer_w4a8 = nn.Module()
+                layer_w4a8.w13_weight = Parameter(
+                    w13_u8.view(torch.int8).to(self.device), requires_grad=False
+                )
+                layer_w4a8.w2_weight = Parameter(
+                    w2_u8.view(torch.int8).to(self.device), requires_grad=False
+                )
+                layer_w4a8.w13_weight_scale_inv = Parameter(
+                    w13_scale_fp32.to(self.device), requires_grad=False
+                )
+                layer_w4a8.w2_weight_scale_inv = Parameter(
+                    w2_scale_fp32.to(self.device), requires_grad=False
+                )
+                prepare_tpu_fp8_moe_weights(
+                    layer_w4a8,
+                    block_quant=True,
+                    weight_block_size=[128, 128],
+                    use_mxfp8=False,
+                    is_fp4_expert=True,
+                )
+                out_w4a8 = fused_moe_call(
+                    hidden_states=x,
+                    w1=layer_w4a8.w13_weight,
+                    w2=layer_w4a8.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    topk=topk,
+                    activation="silu_and_mul_clamp",
+                    w1_scale=layer_w4a8.w13_weight_scale,
+                    w2_scale=layer_w4a8.w2_weight_scale,
+                ).cpu()
+
+                self.assertEqual(tuple(out_w4a8.shape), (num_tokens, hidden_size))
+                self.assertFalse(torch.isnan(out_w4a8).any().item())
+                self.assertFalse(torch.isinf(out_w4a8).any().item())
+
+                cos_vs_ref = F.cosine_similarity(
+                    out_w4a8.float().flatten().unsqueeze(0),
+                    ref_out.float().flatten().unsqueeze(0),
+                ).item()
+                self.assertGreater(cos_vs_ref, 0.99)
+
+                # 3. Compare against Phase 1 W8A8 dequant-to-FP8 path on aligned size
+                if inter_size == 512:
+                    layer_w8a8 = nn.Module()
+                    w13_fp8_list, s13_fp8_list = [], []
+                    w2_fp8_list, s2_fp8_list = [], []
+                    for e in range(num_experts):
+                        w13_e, s13_e = cast_e2m1fn_to_e4m3fn(
+                            w13_u8[e].view(torch.int8), w13_scale_fp32[e]
+                        )
+                        w2_e, s2_e = cast_e2m1fn_to_e4m3fn(
+                            w2_u8[e].view(torch.int8), w2_scale_fp32[e]
+                        )
+                        w13_fp8_list.append(w13_e)
+                        s13_fp8_list.append(s13_e)
+                        w2_fp8_list.append(w2_e)
+                        s2_fp8_list.append(s2_e)
+                    layer_w8a8.w13_weight = Parameter(
+                        torch.stack(w13_fp8_list).to(self.device), requires_grad=False
+                    )
+                    layer_w8a8.w13_weight_scale_inv = Parameter(
+                        torch.stack(s13_fp8_list).float().to(self.device),
+                        requires_grad=False,
+                    )
+                    layer_w8a8.w2_weight = Parameter(
+                        torch.stack(w2_fp8_list).to(self.device), requires_grad=False
+                    )
+                    layer_w8a8.w2_weight_scale_inv = Parameter(
+                        torch.stack(s2_fp8_list).float().to(self.device),
+                        requires_grad=False,
+                    )
+                    prepare_tpu_fp8_moe_weights(
+                        layer_w8a8,
+                        block_quant=True,
+                        weight_block_size=[128, 128],
+                        use_mxfp8=False,
+                        is_fp4_expert=False,
+                    )
+                    out_w8a8 = fused_moe_call(
+                        hidden_states=x,
+                        w1=layer_w8a8.w13_weight,
+                        w2=layer_w8a8.w2_weight,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        topk=topk,
+                        activation="silu_and_mul_clamp",
+                        w1_scale=layer_w8a8.w13_weight_scale,
+                        w2_scale=layer_w8a8.w2_weight_scale,
+                    ).cpu()
+                    cos_vs_w8a8 = F.cosine_similarity(
+                        out_w4a8.float().flatten().unsqueeze(0),
+                        out_w8a8.float().flatten().unsqueeze(0),
+                    ).item()
+                    self.assertGreater(cos_vs_w8a8, 0.99)
+
 
 if __name__ == "__main__":
     unittest.main()

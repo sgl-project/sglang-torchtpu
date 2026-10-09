@@ -2217,6 +2217,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
+                if _is_tpu:
+                    return
                 if _is_npu:
                     self._process_npu_fp4_expert_weights(layer)
                     return
@@ -2610,6 +2612,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.is_shuffled = True
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        quant_fn = _scaled_fp8_quant_tpu_weight if _is_tpu else scaled_fp8_quant
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
@@ -2634,22 +2637,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             for expert in range(layer.num_local_experts):
-                if _is_tpu:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        _scaled_fp8_quant_tpu_weight(
-                            layer.w13_weight.data[expert, :, :]
-                        )
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        _scaled_fp8_quant_tpu_weight(layer.w2_weight.data[expert, :, :])
-                    )
-                else:
-                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                        scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                    )
-                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                        scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                    )
+                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = quant_fn(
+                    layer.w13_weight.data[expert, :, :]
+                )
+                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = quant_fn(
+                    layer.w2_weight.data[expert, :, :]
+                )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -2728,22 +2721,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             layer.w13_weight[expert_id][start : start + shard_size, :],
                             layer.w13_weight_scale[expert_id][shard_id],
                         )
-                        if _is_tpu:
-                            (
-                                layer.w13_weight[expert_id][
-                                    start : start + shard_size, :
-                                ],
-                                _,
-                            ) = _scaled_fp8_quant_tpu_weight(
-                                dq_weight, max_w13_scales[expert_id]
-                            )
-                        else:
-                            (
-                                layer.w13_weight[expert_id][
-                                    start : start + shard_size, :
-                                ],
-                                _,
-                            ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = quant_fn(dq_weight, max_w13_scales[expert_id])
                         start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
