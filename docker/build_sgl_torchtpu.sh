@@ -109,12 +109,25 @@ fi
 # to keep a history of local builds).
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 echo "===> Building sglang-torchtpu image (tags: latest, ${TIMESTAMP})..."
-docker build \
+
+TOKEN_FILE="$(mktemp)"
+trap 'rm -f "${TOKEN_FILE}"' EXIT
+if command -v gcloud >/dev/null 2>&1; then
+  gcloud auth print-access-token > "${TOKEN_FILE}" 2>/dev/null || true
+fi
+
+DOCKER_SECRET_ARGS=()
+if [ -s "${TOKEN_FILE}" ]; then
+  DOCKER_SECRET_ARGS+=(--secret "id=gcp_token,src=${TOKEN_FILE}")
+fi
+
+DOCKER_BUILDKIT=1 docker build \
   --progress=plain \
   -f "${SCRIPT_DIR}/sgl-torchtpu.Dockerfile" \
   -t sglang-torchtpu:latest \
   -t "sglang-torchtpu:${TIMESTAMP}" \
   --build-arg BASEIMAGE="${BASEIMAGE}" \
+  "${DOCKER_SECRET_ARGS[@]}" \
   "${SGLANG_ROOT}"
 
 echo "===> Done! sglang-torchtpu:latest (also tagged ${TIMESTAMP}) built successfully."
