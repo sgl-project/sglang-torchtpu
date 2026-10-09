@@ -104,46 +104,25 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # One sticky comment per PR, edited on later pushes so it notifies once;
-      # a triggered run only refreshes an existing notice. Fork PRs get a
-      # read-only token, so a failed post must not mask the gate.
+      # Posted once per PR; later pushes find the marker and stay quiet. Fork PRs
+      # get a read-only token, so a failed post must not mask the gate.
       - name: Post the on-demand notice
-        if: steps.gate.outputs.run == 'needs-trigger' || steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'needs-trigger'
         continue-on-error: true
         uses: actions/github-script@v8
-        env:
-          GATE: ${{ steps.gate.outputs.run }}
         with:
           script: |
             const marker = "<!-- tpu-ci-on-demand -->";
-            const sha = context.payload.pull_request.head.sha.slice(0, 10);
-            const triggered = process.env.GATE === "true";
-            const body = triggered
-              ? [
-                  marker,
-                  `### TPU CI was triggered for \`${sha}\``,
-                  "",
-                  "Results appear in the PR checks (`PR Test (TPU)`). A new push needs a new **`/tag-and-rerun-ci`**.",
-                ].join("\n")
-              : [
-                  marker,
-                  "### TPU CI has not run on this commit",
-                  "",
-                  `This PR touches TPU code, and TPU CI runs on demand: pushes do not start it. The latest commit (\`${sha}\`) is untested on TPU.`,
-                  "",
-                  "Comment **`/tag-and-rerun-ci`** when this commit is ready. Each comment runs the TPU suite once (about 1.5 h on a shared slice); a new push needs a new comment.",
-                ].join("\n");
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number, per_page: 100,
             });
-            const existing = comments.find(c => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else if (!triggered) {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            }
+            if (comments.some(c => c.body && c.body.includes(marker))) return;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: `${marker}\nComment **\`/tag-and-rerun-ci\`** when this commit is ready. Each comment runs the TPU suite once.`,
+            });
 
       - name: Require an explicit trigger
         if: steps.gate.outputs.run == 'needs-trigger'
