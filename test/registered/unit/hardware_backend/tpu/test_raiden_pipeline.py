@@ -31,6 +31,11 @@ from sglang.srt.disaggregation.raiden.pipeline import (
     warn_if_staging_exceeds_premapped,
 )
 from sglang.srt.disaggregation.raiden.serde import MessageTag
+from sglang.srt.environ import envs
+
+# PipelineTransfer imports this lazily; load it before the tests patch
+# sys.modules so the patch does not unload it after each test.
+from sglang.srt.hardware_backend.tpu import attention_pallas_rpa_batched  # noqa: F401
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -873,6 +878,11 @@ class TestPipelineInitialization(unittest.TestCase):
         get_context().override("test.speculative", speculative_algorithm="EAGLE3")
         with self.assertRaisesRegex(ValueError, "does not support speculative"):
             self._initialize()
+
+    def test_seq_along_lane_kv_layout_is_rejected(self):
+        with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
+            with self.assertRaisesRegex(ValueError, "token-major KV layout"):
+                self._initialize()
 
     def test_legacy_host_budget_uses_resolved_node_count(self):
         get_context().override("test.multihost", nnodes=2)

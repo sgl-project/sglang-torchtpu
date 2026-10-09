@@ -407,6 +407,10 @@ class PipelineTransfer:
 
     def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+            uses_seq_along_lane_kv,
+        )
+
         manager = self.manager
         if manager.attn_cp_size != 1:
             raise ValueError("Raiden pipeline transfer requires attention CP=1")
@@ -423,6 +427,13 @@ class PipelineTransfer:
         if get_spec().speculative_algorithm is not None:
             raise ValueError(
                 "Raiden pipeline transfer does not support speculative decoding"
+            )
+        # The seq-along-lane buffer is also rank 5, so the fused-KV rank check
+        # would accept it and slice heads along the wrong axis.
+        if uses_seq_along_lane_kv():
+            raise ValueError(
+                "Raiden pipeline transfer supports only the token-major KV "
+                "layout; unset SGLANG_TPU_USE_SEQ_ALONG_LANE_KV"
             )
         if (
             "wire_pool_indices"
