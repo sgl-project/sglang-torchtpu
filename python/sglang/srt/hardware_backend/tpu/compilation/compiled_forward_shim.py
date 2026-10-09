@@ -784,7 +784,7 @@ class CompiledForwardShim:
             )
         parallel = get_parallel()
         # get_attention_dp_size() asserts on live DP state; read the parallel leaves.
-        attn_dp_size = parallel.dp_size if parallel.enable_dp_attention else 1
+        attn_dp_size = parallel.attn_dp_size
         # _attach_input_logprobs re-runs the LogitsProcessor, whose logits path
         # enters the attention-TP/DP collectives. Wanting input logprobs is a
         # property of the local batch, so under DP attention a rank holding

@@ -87,7 +87,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.addCleanup(override.restore)
         # Flush init's lazy imports before the torch.compile patch: their
         # import-time @torch.compile decorators must not hit the recorder.
-        import sglang.kernels.ops.moe.virtual_experts  # noqa: F401
+        import sglang.kernels.ops.lora.moe.virtual_experts  # noqa: F401
         import sglang.kernels.ops.speculative.cache_locs  # noqa: F401
         import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe  # noqa: F401
         import sglang.srt.layers.sampler  # noqa: F401

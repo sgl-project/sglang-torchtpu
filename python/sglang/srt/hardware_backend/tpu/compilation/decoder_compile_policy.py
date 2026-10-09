@@ -1264,7 +1264,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """
         from sglang.srt.layers.dp_attention import DpPaddingMode
 
-        dp_size = get_parallel().dp_size
+        # One entry per attention-DP rank (dp_size counts replicas now).
+        dp_size = get_parallel().attn_dp_size
         device = self.model_runner.device
         global_num_tokens = [num_tokens] * dp_size
         forward_batch.dp_padding_mode = DpPaddingMode.MAX_LEN

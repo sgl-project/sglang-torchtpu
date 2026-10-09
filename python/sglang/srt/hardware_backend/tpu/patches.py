@@ -787,9 +787,13 @@ def _patch_raiden_is_load_back_event_done() -> None:
 
     The PD decode restore loop polls this method, which reads a per-layer
     ``finish_event`` from the done counter's slot. Raiden stores the combined
-    future-event itself in a ``BatchDoneCounter`` slot, and the answer must
-    agree across ranks before ``loading_check`` runs its collectives. Other
-    controllers keep the original method.
+    future-event itself in a ``BatchDoneCounter`` slot, and a raiden DMA can
+    land at different times on different ranks, so the answer is combined
+    over the cache's rank groups: every rank flips the request READY in the
+    same step. Like upstream's method (#41393) the poll only answers; the
+    tree-side bookkeeping (``loading_check``) runs from check_hicache_events,
+    which every rank enters together. Other controllers keep the original
+    method.
     """
     global _raiden_is_load_back_event_done_patched
     if _raiden_is_load_back_event_done_patched:
@@ -807,11 +811,7 @@ def _patch_raiden_is_load_back_event_done() -> None:
         controller = self.cache_controller
         if not isinstance(controller, TpuRaidenHybridCacheController):
             return orig_is_load_back_event_done(self, consumer_index)
-        if not controller.is_load_back_event_done(consumer_index, self._all_reduce):
-            return False
-        if consumer_index >= 0:
-            self.loading_check()
-        return True
+        return controller.is_load_back_event_done(consumer_index, self._all_reduce)
 
     UnifiedRadixCache.is_load_back_event_done = is_load_back_event_done
 

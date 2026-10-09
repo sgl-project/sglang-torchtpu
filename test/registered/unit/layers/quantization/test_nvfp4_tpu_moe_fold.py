@@ -246,6 +246,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         parallel = types.SimpleNamespace(
             attn_dp_size=1,
             enable_dp_attention=False,
+            attn_dp_enabled=False,
             tp_group=tp_group,
             world_group=world_group,
         )
@@ -313,6 +314,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
             )
             del layer.supports_tpu_fused_rs_post_expert_norm
             parallel.enable_dp_attention = True
+            parallel.attn_dp_enabled = True
             self.assertFalse(
                 can_use_tpu_nvfp4_fused_rs(
                     layer, group_size=BLOCK_SIZE, no_combine=False
@@ -345,6 +347,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         parallel = types.SimpleNamespace(
             attn_dp_size=1,
             enable_dp_attention=False,
+            attn_dp_enabled=False,
             tp_group=tp_group,
             world_group=world_group,
         )
@@ -1314,6 +1317,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 return_value=types.SimpleNamespace(
                     attn_dp_size=1,
                     enable_dp_attention=False,
+                    attn_dp_enabled=False,
                     tp_group=types.SimpleNamespace(world_size=world_size),
                     world_group=types.SimpleNamespace(world_size=world_size),
                 ),

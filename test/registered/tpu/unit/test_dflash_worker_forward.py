@@ -209,8 +209,9 @@ def _create_dflash_worker_for_tpu(
     worker._selector_sample = None
     worker._draft_probs_buf = None
     # This fixture bypasses DFlashWorkerV2.__init__; mirror its DP-attention state.
+    # draft_tp_context is a module function now; draft_owns_attention=False
+    # above makes it a null context.
     worker._full_embed_gpu = None
-    worker.draft_tp_context = dflash_worker_mod.empty_context
     worker.nccl_port = 0
     worker._need_mamba_verify_commit = False
     worker._warned_sampling_fallback = False
@@ -488,6 +489,7 @@ def _make_schedule_batch(
         can_run_dp_breakable_cuda_graph=False,
         can_run_decode_cuda_graph=False,
         can_run_dp_prefill_cuda_graph=False,
+        can_run_dp_draft_cuda_graph=False,
         dp_prefill_cuda_graph_max_prefix_len=None,
         return_hidden_states_mode=CaptureHiddenMode.NULL,
         global_forward_mode=forward_mode,

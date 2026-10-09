@@ -410,6 +410,11 @@ class TpuSRTPlatform(SRTPlatform):
                 )
             os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
 
+        # There is no CUDA coredump on TPU: on a crash the handler would trigger
+        # a no-op dump, then sleep SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS
+        # (60 s) with the dead server still up. An explicit setting still wins.
+        os.environ.setdefault("SGLANG_CUDA_COREDUMP_BEFORE_CRASH", "0")
+
         # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
         # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page
         # axis. SGLang's global page_size=1 default is valid for token-granular
@@ -442,12 +447,17 @@ class TpuSRTPlatform(SRTPlatform):
                         "yet (only EAGLE3 and DFLASH among builtin algorithms)."
                     )
 
-        if cfg.enable_dp_attention:
-            attn_tp_size = cfg.tp_size // cfg.dp_size
+        # Attention DP is declared by width (--attn-dp-size); the deprecated
+        # --dp-size N --enable-dp-attention spelling may not have resolved yet here.
+        attn_dp_size = cfg.attn_dp_size
+        if attn_dp_size == 1 and cfg.enable_dp_attention:
+            attn_dp_size = cfg.dp_size
+        if attn_dp_size > 1:
+            attn_tp_size = cfg.tp_size // attn_dp_size
             if attn_tp_size > 1 and not cfg.enable_dp_lm_head:
                 raise ValueError(
                     f"When attention TP > 1 under DP attention on TPU (attn_tp_size={attn_tp_size} "
-                    f"from tp_size={cfg.tp_size} and dp_size={cfg.dp_size}), "
+                    f"from tp_size={cfg.tp_size} and attn_dp_size={attn_dp_size}), "
                     "--enable-dp-lm-head must be enabled."
                 )
 

@@ -286,7 +286,7 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     cache = MagicMock()
     cache.disable = False
     cache.supports_mamba.return_value = False
-    cache.is_tree_cache.return_value = False
+    cache.supports_prefix_sharing.return_value = False
     cache.evictable_size.return_value = 0
     cache.full_evictable_size.return_value = 0
     cache.inc_lock_ref.return_value = IncLockRefResult()

@@ -108,6 +108,9 @@ def make_req():
         swa_prefix_lock_released=True,
         kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=64),
         _compute_max_prefix_len=lambda n: n - 1,
+        finished=lambda: False,
+        refresh_fill_ids=lambda: None,
+        full_untruncated_fill_ids=array("q", range(512)),
     )
 
 
@@ -157,9 +160,18 @@ def memory(**overrides):
 
 
 def make_ctx():
+    # The registry resolves a non-CPU/CUDA allocator device to the Python core.
+    # "meta" stands in for "tpu", which torch knows only with torch_tpu imported.
+    params = SimpleNamespace(
+        tree_core_backend=None,
+        enable_session_radix_cache=False,
+        tree_components=None,
+        component_registry_override=None,
+        token_to_kv_pool_allocator=SimpleNamespace(device="meta"),
+    )
     return TreeCacheBuildContext(
         server_args=None,
-        params=None,
+        params=params,
         is_hybrid_swa=True,
         is_hybrid_ssm=False,
         enable_hierarchical_cache=False,
@@ -323,6 +335,21 @@ class TestCacheConstruction(CustomTestCase):
             tpu._build_kv_cache(upstream_build, **build_kwargs())
         self.assertFalse(tpu._is_building_full_only_host_cache)
 
+    def test_full_only_build_requires_the_python_tree_core(self):
+        # The Rust tree core has its own SWA validator without this policy.
+        def upstream_build(**kwargs):
+            return tpu._create_tree_cache(MagicMock(), make_ctx())
+
+        with (
+            patch(TPU + ".get_disagg", return_value=disagg()),
+            patch(TPU + ".get_memory", return_value=memory()),
+            patch(TPU + ".auto_size_hicache"),
+            patch(TPU + ".select_tree_core_backend", return_value="rust"),
+            self.assertRaisesRegex(ValueError, "TREE_CORE_BACKEND"),
+        ):
+            tpu._build_kv_cache(upstream_build, **build_kwargs())
+        self.assertFalse(tpu._is_building_full_only_host_cache)
+
     def test_unsupported_configs_are_rejected(self):
         for overrides, mem, dis, tree_core, reason in (
             ({"page_size": 1}, {}, {}, "python", "page-size"),
@@ -351,8 +378,6 @@ class TestCacheConstruction(CustomTestCase):
             ({}, {"hicache_storage_backend": "file"}, {}, "python", "storage-backend"),
             # Upstream already auto-sizes the host pool for host_pool retraction.
             ({}, {}, {"retraction_backup": "host_pool"}, "python", "retraction"),
-            # The Rust tree core has its own SWA validator without this policy.
-            ({}, {}, {}, "rust", "TREE_CORE_BACKEND"),
         ):
             with (
                 self.subTest(reason),

@@ -174,7 +174,7 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ),
         ("no fused shared experts", not layer.num_fused_shared_experts),
         ("standard token dispatcher", get_moe_a2a_backend().is_none()),
-        ("dp attention disabled", not parallel.enable_dp_attention),
+        ("dp attention disabled", not parallel.attn_dp_enabled),
         (
             "fused MoE sum all-reduce disabled",
             not get_exec().moe.enable_fused_moe_sum_all_reduce,

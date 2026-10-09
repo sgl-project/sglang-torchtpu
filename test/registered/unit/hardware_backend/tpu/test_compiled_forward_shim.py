@@ -1380,10 +1380,12 @@ class TestShimInputLogprobPath(CustomTestCase):
 
     def _publish_topology(self, *, pp_size=1, dp_size=1, enable_dp_attention=False):
         """Publish the topology the prompt-logprob gate reads, for this test."""
+        # Attention DP is declared by width now; the flag alone no longer
+        # resolves to a width inside an override.
         override = get_context().override_server_args(
             pp_size=pp_size,
-            dp_size=dp_size,
-            enable_dp_attention=enable_dp_attention,
+            dp_size=1 if enable_dp_attention else dp_size,
+            attn_dp_size=dp_size if enable_dp_attention else 1,
         )
         override.install()
         self.addCleanup(override.restore)

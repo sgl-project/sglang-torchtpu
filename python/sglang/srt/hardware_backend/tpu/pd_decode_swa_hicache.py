@@ -50,6 +50,9 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    select_tree_core_backend,
+)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
@@ -159,11 +162,6 @@ def _validate_full_only_host_cache_config(
             get_disagg().disaggregation_decode_retraction_backup != "host_pool",
             "--disaggregation-decode-retraction-backup host_pool is not supported",
         ),
-        # The match policy below is implemented for the Python tree core only.
-        (
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() == "python",
-            "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND must be python",
-        ),
     )
     for is_met, requirement in requirements:
         if not is_met:
@@ -222,6 +220,20 @@ def _create_tree_cache(upstream: Callable, ctx: TreeCacheBuildContext):
     if not _is_building_full_only_host_cache:
         return upstream(ctx)
     draft_plan = _building_draft_plan
+    # The match policy below is implemented for the Python tree core only.
+    # Upstream defaults to the Rust core, which the registry resolves back to
+    # Python for a TPU allocator; check what it resolves to, not the setting.
+    tree_core = (
+        select_tree_core_backend(ctx.params)
+        if ctx.params is not None
+        else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+    )
+    if tree_core != "python":
+        raise ValueError(
+            "PD decode radix cache + HiCache for sliding-window models: "
+            "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND must resolve to python, "
+            f"got {tree_core!r}."
+        )
     # build_kv_cache skips auto-sizing and draft registration with the flag
     # off. Sizing against the full + SWA device bytes leaves the full-only
     # host pool within budget.
@@ -492,6 +504,9 @@ def _restore_rematch(
     )
     if boundary and token_ids is not None:
         token_ids = req.origin_input_ids[: len(token_ids) + boundary]
+        # Upstream also caps the key at the decode prefix; widen it the same way.
+        if kwargs.get("max_prefix_len") is not None:
+            kwargs["max_prefix_len"] += boundary
     return upstream(tree_cache, req, token_ids, **kwargs)
 
 

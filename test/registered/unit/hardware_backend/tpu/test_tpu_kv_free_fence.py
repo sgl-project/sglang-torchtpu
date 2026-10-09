@@ -133,7 +133,8 @@ class TestKVFreeFence(CustomTestCase):
         self.allocator.free(busy)
 
         tree_cache = SimpleNamespace(
-            token_to_kv_pool_allocator=self.allocator, is_chunk_cache=lambda: True
+            token_to_kv_pool_allocator=self.allocator,
+            supports_prefix_sharing=lambda: False,
         )
         alloc_token_slots(tree_cache, num_tokens=PAGE)
         alloc_paged_token_slots_extend(
@@ -345,7 +346,11 @@ class TestOverlapLoopWiring(CustomTestCase):
             running_batch=None,
             last_batch=None,
             kv_free_fence=_install(allocator, synchronize_device=lambda: None),
+            # Upstream's loop skips batch creation while input is deferred.
+            _deferred_input_requests=[],
         )
+        # ... and waits for the oldest result when continuous polling is on.
+        scheduler._is_continuous_input_polling_enabled.return_value = False
         scheduler.ngram_embedding_manager.prepare_for_forward.side_effect = (
             lambda batch, **kwargs: batch
         )
@@ -427,6 +432,9 @@ class TestRadixEvictionUnderFence(CustomTestCase):
                 page_size=PAGE,
                 eviction_policy="lru",
                 tree_components=(ComponentType.FULL,),
+                # The fence's release stamps live in the Python core, which a TPU
+                # allocator always resolves to; this CPU one would pick Rust.
+                tree_core_backend="python",
             )
         )
 

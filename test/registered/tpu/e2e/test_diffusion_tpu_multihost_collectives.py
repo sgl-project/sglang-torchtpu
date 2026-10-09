@@ -5,6 +5,7 @@ CFG x Ulysses needs all_reduce, all_gather and all_to_all_single on `tpu` tensor
 
 import os
 import queue
+import traceback
 import unittest
 
 import torch
@@ -46,6 +47,7 @@ def _worker(local_rank: int, hosts: list[str], node_rank: int, result_q) -> None
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
+    status = 1
     try:
         current_platform.set_device(current_platform.get_device(local_rank))
         backend = current_platform.get_torch_distributed_backend_str()
@@ -84,12 +86,18 @@ def _worker(local_rank: int, hosts: list[str], node_rank: int, result_q) -> None
         )
 
         result_q.put((rank, "ok"))
+        status = 0
     except Exception as e:  # surfaced by the parent as the failure message
         result_q.put((rank, f"{type(e).__name__}: {e}"))
-        raise
+        traceback.print_exc()
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
+        # libtpu's atexit vBAR StopSession can hang on GKE, and a parent SIGTERM mid-teardown
+        # wedges the slice; exit without it, as node_normalization does.
+        result_q.close()
+        result_q.join_thread()  # flush the result before the hard exit drops the feeder thread
+        os._exit(status)
 
 
 class TestTpuDistCollectivesMultihost(CustomTestCase):

@@ -94,7 +94,7 @@ class TestRaidenCacheLoadBackEventDonePatch(CustomTestCase):
         cache.loading_check = MagicMock()
         return cache
 
-    def test_bookkeeping_runs_only_after_every_rank_is_done(self):
+    def test_the_answer_waits_for_every_rank_and_runs_no_bookkeeping(self):
         controller = _make_controller()
         future = _FakeFuture(ready=False)
         controller.layer_done_counter.set_event(0, future)
@@ -105,11 +105,11 @@ class TestRaidenCacheLoadBackEventDonePatch(CustomTestCase):
         future.ready = True
         cache._all_reduce = _all_reduce_as(0)
         self.assertFalse(cache.is_load_back_event_done(0))
-        cache.loading_check.assert_not_called()
 
         cache._all_reduce = _all_reduce_as(1)
         self.assertTrue(cache.is_load_back_event_done(0))
-        cache.loading_check.assert_called_once()
+        # The poll only answers; loading_check runs from check_hicache_events.
+        cache.loading_check.assert_not_called()
 
     def test_unused_slot_skips_bookkeeping_for_no_load(self):
         cache = self._make_cache(_make_controller())
@@ -125,7 +125,7 @@ class TestRaidenCacheLoadBackEventDonePatch(CustomTestCase):
         cache._all_reduce = MagicMock()
         self.assertTrue(cache.is_load_back_event_done(0))
         cache._all_reduce.assert_not_called()
-        cache.loading_check.assert_called_once()
+        cache.loading_check.assert_not_called()
 
     def test_patch_is_installed_once(self):
         patched = UnifiedRadixCache.is_load_back_event_done

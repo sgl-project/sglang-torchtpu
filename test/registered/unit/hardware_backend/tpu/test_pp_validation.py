@@ -31,6 +31,7 @@ def _args(**overrides):
         pp_size=1,
         dp_size=1,
         enable_dp_attention=False,
+        attn_dp_size=1,
         enable_dp_lm_head=False,
         enable_dynamic_chunking=False,
         page_size=None,

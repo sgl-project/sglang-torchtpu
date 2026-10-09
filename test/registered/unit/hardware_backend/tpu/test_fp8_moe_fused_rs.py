@@ -13,10 +13,13 @@ from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     fp8_fused_rs_unsupported_reason,
     supports_fp8_fused_rs,
 )
+from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
+    post_experts_output_is_complete,
     should_skip_post_experts_all_reduce,
+    sum_post_experts_output,
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -214,6 +217,61 @@ class TestFp8MoeFusedRs(CustomTestCase):
                     is_tp_path=False, experts_reduced=False
                 )
             )
+
+    def test_boundary_leaves_the_ep_sum_to_the_fused_rs_kernel(self):
+        """The fused-RS experts kernel returns the EP-summed output. The layer
+        boundary owns the post-experts sum since upstream retired the model-level
+        ``experts_reduced`` flag, so it has to learn from the runner backend that
+        the EP reduction is done -- a boundary that sums it again doubles every
+        MoE output (gsm8k 0.96 -> 0.02 on the 480B, #1122). The MoE-TP sum, when
+        present, is still owed."""
+        ep_calls, tp_calls = [], []
+        parallel = SimpleNamespace(
+            dwdp_size=1, tp_size=4, moe_ep_size=4, moe_tp_size=2, moe_dp_size=2
+        )
+        a2a = SimpleNamespace(
+            is_flashinfer=lambda: False,
+            is_pplx=lambda: False,
+            is_flashinfer_megamoe=lambda: False,
+        )
+        with (
+            patch.object(moe_utils, "_is_tpu", True),
+            patch.object(moe_utils, "get_parallel", return_value=parallel),
+            patch.object(moe_utils, "get_moe_a2a_backend", return_value=a2a),
+            patch.object(
+                moe_utils,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.distributed.communication_op.moe_expert_parallel_all_reduce",
+                side_effect=lambda x: ep_calls.append(x) or x,
+            ),
+            patch(
+                "sglang.srt.distributed.communication_op.moe_tensor_model_parallel_all_reduce",
+                side_effect=lambda x: tp_calls.append(x) or x,
+            ),
+        ):
+            for backend, ep_sums in (
+                (MoeRunnerBackend.PALLAS_TPU_FUSED_RS, 0),
+                (MoeRunnerBackend.PALLAS_TPU, 1),
+            ):
+                with (
+                    self.subTest(backend=backend.value),
+                    patch.object(
+                        moe_utils, "get_moe_runner_backend", return_value=backend
+                    ),
+                ):
+                    ep_calls.clear()
+                    tp_calls.clear()
+                    self.assertEqual(
+                        post_experts_output_is_complete(is_tp_path=False),
+                        ep_sums == 0,
+                    )
+                    self.assertFalse(post_experts_output_is_complete(is_tp_path=True))
+                    sum_post_experts_output(torch.ones(2, 3))
+                    self.assertEqual(len(ep_calls), ep_sums)
+                    self.assertEqual(len(tp_calls), 1)
 
     def test_fused_moe_exposes_quant_method_reduction_contract(self):
         layer = object.__new__(FusedMoE)

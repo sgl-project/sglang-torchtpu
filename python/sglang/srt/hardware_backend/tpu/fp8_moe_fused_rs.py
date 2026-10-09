@@ -154,7 +154,7 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
         no_combine=runner_config.no_combine and not allow_no_combine,
         has_fused_shared_experts=bool(layer.num_fused_shared_experts),
         standard_dispatcher=get_moe_a2a_backend().is_none(),
-        enable_dp_attention=parallel.enable_dp_attention,
+        enable_dp_attention=parallel.attn_dp_enabled,
         enable_fused_moe_sum_all_reduce=(
             get_exec().moe.enable_fused_moe_sum_all_reduce
         ),

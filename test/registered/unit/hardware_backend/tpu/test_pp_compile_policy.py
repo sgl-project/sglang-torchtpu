@@ -356,7 +356,9 @@ def _shim(pp_group=None):
     runner = SimpleNamespace(
         model=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
-        server_args=SimpleNamespace(pp_size=8, dp_size=1, enable_dp_attention=False),
+        server_args=SimpleNamespace(
+            pp_size=8, dp_size=1, attn_dp_size=1, enable_dp_attention=False
+        ),
         pp_group=pp_group,
     )
     policy.model_runner = runner

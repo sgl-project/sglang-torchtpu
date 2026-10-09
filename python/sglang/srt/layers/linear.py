@@ -897,7 +897,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset=rank_shard_offset,
                 shard_size=rank_shard_size,
                 tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
                 use_presharded_weights=self.use_presharded_weights,
             )
 
@@ -929,7 +928,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                         loaded_weight=loaded_weight,
                         shard_id=shard_id,
                         tp_rank=self.tp_rank,
-                        tp_size=self.tp_size,
                     )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
@@ -939,7 +937,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param.load_merged_column_weight(
                     loaded_weight=loaded_weight,
                     tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
                 )
                 return
             output_sizes = (
@@ -1005,7 +1002,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
             tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
 
@@ -1829,9 +1825,9 @@ class RowParallelLinear(LinearBase):
                     self, input_parallel, output_tensor, bias=bias_
                 )
 
-        # skip_all_reduce: explicit call-site override. Also honor
-        # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
-        # the decoder — callers should not thread those flags into modules.
+        # skip_all_reduce: explicit call-site override. Also honor the
+        # mlp_reduce_scatter ForwardFlag published by the decoder — callers
+        # should not thread it into modules.
         if (
             ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
             and not skip_all_reduce

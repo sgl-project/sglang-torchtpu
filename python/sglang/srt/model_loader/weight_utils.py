@@ -1168,8 +1168,9 @@ def safetensors_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
     ep_reader = _ep_local_expert_reader(
@@ -1198,6 +1199,8 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
     if ep_reader is not None:
         ep_reader.verify()
 
@@ -1275,8 +1278,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     ``local_expert_range``: as in ``safetensors_weights_iterator``.
     """
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
     enable_tqdm = (
@@ -1333,6 +1337,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     # but later mmap-backed tensor access may fault pages again.
                     _drop_file_cache_after_load(st_file)
                 pbar.update(1)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
     if ep_reader is not None:
         ep_reader.verify()
 
