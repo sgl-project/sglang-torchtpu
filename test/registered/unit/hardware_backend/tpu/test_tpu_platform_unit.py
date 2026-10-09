@@ -249,6 +249,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             disaggregation_mode="null",
             disaggregation_transfer_backend="mooncake",
             optimistic_prefill_attempts=0,
+            max_queued_requests=None,
+            enable_priority_scheduling=False,
             dcp_size=1,
             attn_cp_size=1,
             enable_prefill_cp=False,
@@ -284,6 +286,26 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 ):
                     self._apply(args)
 
+    def test_rejects_max_queued_requests_under_pd(self):
+        """The two sides admit independently, so a queue cap cannot be enforced
+        consistently; refuse at start-up instead of silently ignoring it."""
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                args = self._args(disaggregation_mode=mode, max_queued_requests=4)
+                with self.assertRaisesRegex(
+                    ValueError, "--max-queued-requests is not supported"
+                ):
+                    self._apply(args)
+
+    def test_queue_limit_allowed_outside_pd(self):
+        for overrides in (
+            dict(max_queued_requests=4, enable_priority_scheduling=True),
+            dict(max_queued_requests=0),
+            dict(disaggregation_mode="decode"),
+        ):
+            with self.subTest(**overrides):
+                self._apply(self._args(**overrides))
+
     def test_optimistic_prefill_allowed_outside_raiden_pd(self):
         for overrides in (
             dict(disaggregation_mode="prefill", optimistic_prefill_attempts=1),
@@ -291,6 +313,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 disaggregation_mode="prefill",
                 disaggregation_transfer_backend="raiden",
                 optimistic_prefill_attempts=0,
+                max_queued_requests=None,
+                enable_priority_scheduling=False,
             ),
             dict(
                 disaggregation_transfer_backend="raiden",
@@ -601,6 +625,8 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             disaggregation_mode="null",
             disaggregation_transfer_backend="mooncake",
             optimistic_prefill_attempts=0,
+            max_queued_requests=None,
+            enable_priority_scheduling=False,
             enable_hierarchical_cache=False,
             dcp_comm_backend="ag_rs",
             dcp_replicate_q_proj=False,
