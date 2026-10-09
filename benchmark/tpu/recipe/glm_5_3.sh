@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # GLM-5.3 text reference launch with sparse attention (DSA): the indexer picks
-# the keys and the sparse MLA kernels attend over them.
-# TODO(sglang-torchtpu#1072): allow a context above 2048 tokens.
+# the keys and the sparse MLA kernels attend over them. CONTEXT_LEN may be
+# longer than the 2048 keys the indexer keeps per token.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 glm_context=${CONTEXT_LEN:-2048}
-if (( glm_context < 1 || glm_context > 2048 )); then
-  echo 'GLM-5.3 reference recipe requires 1 <= CONTEXT_LEN <= 2048.' >&2
+if (( glm_context < 1 )); then
+  echo 'GLM-5.3 reference recipe requires CONTEXT_LEN >= 1.' >&2
   exit 2
 fi
 exec env \
@@ -17,7 +17,7 @@ exec env \
   CONTEXT_LEN="$glm_context" \
   CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-128}" \
   MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-128}" \
-  MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-4096}" \
+  MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-$(( glm_context * 2 ))}" \
   PAGE_SIZE="${PAGE_SIZE:-128}" \
   MAX_RUNNING="${MAX_RUNNING:-2}" \
   TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-2}" \
