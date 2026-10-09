@@ -513,11 +513,13 @@ jobs:
 
   # tpu_dist collectives across a 2x2x2 slice. No server: exec mode, because the
   # file spawns each host's ranks itself and a launch group runs it on rank 0 alone.
+  # Quarantined: only with only=diffusion-mh-collectives. Its retry after a killed
+  # worker fails TPU init and wedges the slice for every later multihost job.
   diffusion-mh-collectives:
     needs: [build, discover-tests]
     if: >-
       ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && contains(fromJSON('["all","diffusion-mh-collectives"]'), inputs.only || 'all')
+          && inputs.only == 'diffusion-mh-collectives'
           && contains('test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py', inputs.test_filter) }}
     name: ${{ fromJSON(needs.discover-tests.outputs.diffusion_mh_collectives)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
