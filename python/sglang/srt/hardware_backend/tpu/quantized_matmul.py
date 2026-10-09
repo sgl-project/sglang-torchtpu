@@ -11,7 +11,6 @@ import torch
 from jax._src import dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from torch_tpu._internal import pallas
 
 MXU_SIZE = 256
 
@@ -357,7 +356,10 @@ def _get_block_fp8_matmul_op() -> Callable:
         if _BLOCK_FP8_OP is not None:
             return _BLOCK_FP8_OP
 
-        op = pallas.jax_op(
+        from sglang.srt.hardware_backend.tpu.patches import get_tpu_jax_op
+
+        jax_op = get_tpu_jax_op()
+        op = jax_op(
             "sglang_tpu_pallas::block_fp8_quantized_matmul",
             _blockwise_quantized_matmul_jax,
         )

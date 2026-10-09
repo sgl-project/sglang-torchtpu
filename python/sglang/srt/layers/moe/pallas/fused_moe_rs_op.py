@@ -55,7 +55,10 @@ def _build_fused_moe_rs_op():
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from torch_tpu._internal.pallas import jax_op
+
+    from sglang.srt.hardware_backend.tpu.patches import get_tpu_jax_op
+
+    jax_op = get_tpu_jax_op()
 
     from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
 

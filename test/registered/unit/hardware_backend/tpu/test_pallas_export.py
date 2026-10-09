@@ -49,7 +49,11 @@ class TestPallasExportEnvironment(CustomTestCase):
             ),
             patch("torch_tpu._internal.pallas.get_pallas_mesh", return_value=mesh),
             patch("torch_tpu._internal.pallas.jax_op") as register,
+            patch(
+                "sglang.srt.hardware_backend.tpu.pp_wave.get_tpu_jax_op"
+            ) as get_jax_op,
         ):
+            get_jax_op.return_value = register
             pp_wave.build_pp_wave(
                 group, rows=8, hidden=16, dtype=torch.float32, device="cpu"
             )

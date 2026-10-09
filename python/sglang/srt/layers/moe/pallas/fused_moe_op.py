@@ -5,7 +5,7 @@
 This module wraps the JAX/Pallas ``gmm_v2`` grouped-matmul kernel
 (``sglang.srt.layers.moe.pallas.gmm_v2``) and assembles it into a
 single-host fused-MoE op exposed to PyTorch via
-``torch_tpu._internal.pallas.jax_op``. It mirrors the pattern used by the
+``torch.tpu.pallas.jax_op``. It mirrors the pattern used by the
 ragged-paged-attention v3 backend in
 ``sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3``: register one custom
 ``torch.library`` op whose implementation is a ``jax.jit``-traced JAX
@@ -46,7 +46,7 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here —
-# ``torch_tpu._internal.pallas.jax_op`` inspects ``param.annotation is
+# ``torch.tpu.pallas.jax_op`` inspects ``param.annotation is
 # jax.Array`` at registration time; PEP 563 would turn those into
 # strings and validation would reject them.
 
@@ -55,7 +55,10 @@ import math
 from typing import Optional
 
 import torch
-from torch_tpu._internal.pallas import jax_op
+
+from sglang.srt.hardware_backend.tpu.patches import get_tpu_jax_op
+
+jax_op = get_tpu_jax_op()
 
 from sglang.srt.environ import envs
 
@@ -70,7 +73,7 @@ _PALLAS_MOE_OP = None
 # ---- JAX kernel body -------------------------------------------------------
 #
 # ``_fused_moe_jax`` (with ``_fuse_act_name``) is the
-# function that ``torch_tpu._internal.pallas.jax_op`` exports and that all the
+# function that ``jax_op`` exports and that all the
 # per-shape JAX traces specialise. It lives at module scope (not in the
 # ``_build_fused_moe_op`` closure) so unit tests can import and call it
 # directly with JAX inputs — exercising the exact production execution path

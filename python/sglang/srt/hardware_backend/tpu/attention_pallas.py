@@ -50,7 +50,9 @@ def _get_flash_op(causal: bool, sm_scale: float):
     if op is not None:
         return op
 
-    from torch_tpu._internal import pallas
+    from sglang.srt.hardware_backend.tpu.patches import get_tpu_jax_op
+
+    jax_op = get_tpu_jax_op()
 
     def _jax_flash(q, k, v):
         # q, k, v: [batch, num_heads, seq_len, head_dim].
@@ -77,7 +79,7 @@ def _get_flash_op(causal: bool, sm_scale: float):
     op_name = f"sglang_tpu::flash_attn_c{int(causal)}_s{key[1]!r}".replace(
         ".", "_"
     ).replace("-", "m")
-    op = pallas.jax_op(op_name, _jax_flash)
+    op = jax_op(op_name, _jax_flash)
 
     def _fake_flash(q, k, v):
         return torch.empty_like(q)
@@ -101,7 +103,9 @@ def _get_paged_op(pages_per_compute_block: int):
     if op is not None:
         return op
 
-    from torch_tpu._internal import pallas
+    from sglang.srt.hardware_backend.tpu.patches import get_tpu_jax_op
+
+    jax_op = get_tpu_jax_op()
 
     def _jax_paged(q, k_pages, v_pages, lengths, page_indices):
         return paged_attention(
@@ -123,7 +127,7 @@ def _get_paged_op(pages_per_compute_block: int):
     }
 
     op_name = f"sglang_tpu::paged_attn_ppb{pages_per_compute_block}"
-    op = pallas.jax_op(op_name, _jax_paged)
+    op = jax_op(op_name, _jax_paged)
 
     def _fake_paged(q, k_pages, v_pages, lengths, page_indices):
         return torch.empty_like(q)
@@ -475,7 +479,9 @@ def _get_vision_flash_op(sm_scale: float):
     if op is not None:
         return op
 
-    from torch_tpu._internal import pallas
+    from sglang.srt.hardware_backend.tpu.patches import get_tpu_jax_op
+
+    jax_op = get_tpu_jax_op()
 
     def _jax_vision_flash(q, k, v, seg_ids):
         return flash_attention(
@@ -497,7 +503,7 @@ def _get_vision_flash_op(sm_scale: float):
     }
 
     op_name = f"sglang_tpu::vision_flash_s{key!r}".replace(".", "_").replace("-", "m")
-    op = pallas.jax_op(op_name, _jax_vision_flash)
+    op = jax_op(op_name, _jax_vision_flash)
 
     def _fake_vision_flash(q, k, v, seg_ids):
         return torch.empty_like(q)

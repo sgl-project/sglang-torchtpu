@@ -63,7 +63,11 @@ def build_pp_permute_op(perm: tuple[tuple[int, int], ...]) -> Any:
     import jax
     from jax.experimental.shard_map import shard_map
     from jax.sharding import PartitionSpec
-    from torch_tpu._internal.pallas import get_pallas_mesh, jax_op
+    from torch_tpu._internal.pallas import get_pallas_mesh
+
+    from sglang.srt.hardware_backend.tpu.patches import get_tpu_jax_op
+
+    jax_op = get_tpu_jax_op()
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     mesh = get_pallas_mesh(("pp",), (world_size,))

@@ -872,6 +872,26 @@ def _patch_pd_decode_swa_hicache() -> None:
     pd_decode_swa_hicache.install()
 
 
+def get_tpu_jax_op():
+    """Return the available TPU jax_op callable across TorchTPU versions.
+
+    Backwards-compatible bridge supporting:
+      - torch_tpu >= 0.1.2: torch.tpu.pallas.jax_op (public API)
+      - torch_tpu <= 0.1.1: torch_tpu._internal.pallas.jax_op
+    """
+    try:
+        from torch.tpu.pallas import jax_op
+
+        return jax_op
+    except (ImportError, AttributeError):
+        pass
+
+    # TODO: Remove legacy pallas.jax_op fallback once torch_tpu >= 0.1.2 is baseline.
+    from torch_tpu._internal.pallas import jax_op
+
+    return jax_op
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
