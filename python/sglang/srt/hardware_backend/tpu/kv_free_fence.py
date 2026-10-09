@@ -49,6 +49,13 @@ logger = logging.getLogger(__name__)
 _STATS_LOG_INTERVAL_S = 60.0
 
 
+class _AfterInFlight(msgspec.Struct, frozen=True):
+    """A callback awaiting every forward formed up to ``seq``."""
+
+    seq: int
+    callback: Callable[[], None]
+
+
 class KVFreeFenceStats(msgspec.Struct):
     """Counts since the last stats line, summed over page pools. Device syncs
     per non-forward pool allocation rise if eviction frees stop skipping the hold."""
@@ -82,8 +89,7 @@ class KVFreeFence:
         self._device_done = 0
         self._forward_write_target = False
         self._free_write_horizon: Optional[float] = None
-        # (latest formed seq at registration, callback) awaiting those forwards.
-        self._after: Deque[Tuple[int, Callable[[], None]]] = deque()
+        self._after: Deque[_AfterInFlight] = deque()
         self._allocators: List[TpuPagedTokenToKVPoolAllocator] = []
         self.stats = KVFreeFenceStats()
         self._stats_since = time.monotonic()
@@ -170,13 +176,13 @@ class KVFreeFence:
         ):
             callback()
             return
-        self._after.append((self._formed, callback))
+        self._after.append(_AfterInFlight(self._formed, callback))
 
     def _release(self, completed: int) -> None:
         for allocator in self._allocators:
             allocator.release_held_pages(completed)
-        while self._after and self._after[0][0] <= completed:
-            self._after.popleft()[1]()
+        while self._after and self._after[0].seq <= completed:
+            self._after.popleft().callback()
 
     def _maybe_log_stats(self) -> None:
         now = time.monotonic()

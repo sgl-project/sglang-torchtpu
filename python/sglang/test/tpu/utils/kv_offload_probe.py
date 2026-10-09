@@ -57,6 +57,7 @@ _TAIL_REQUESTS = 8
 # a replay of only the committed tokens would recompute the tail page instead of
 # reading it.
 _TAIL_REPLAY_EXTRA_TOKENS = 2
+# Tokens each replay generates; their ids and logprobs are what the two replays compare.
 _TAIL_REPLAY_NEW_TOKENS = 4
 
 
