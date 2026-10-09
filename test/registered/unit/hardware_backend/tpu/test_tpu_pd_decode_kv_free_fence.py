@@ -4,6 +4,7 @@ so preallocation must not hand out pages that forward may still write."""
 
 import unittest
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -187,6 +188,33 @@ class TestPdDecodeFenceInstall(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "raiden HiCache"):
                     scheduler.maybe_init_kv_free_fence()
                 self.assertIsNone(scheduler.kv_free_fence)
+
+
+class TestHicacheBackupFence(CustomTestCase):
+    def test_backups_are_fenced_on_servers_that_decode(self):
+        controller = object()
+        for mode, fenced in (
+            (DisaggregationMode.NULL, True),
+            (DisaggregationMode.DECODE, True),
+            (DisaggregationMode.PREFILL, False),
+        ):
+            with self.subTest(mode=str(mode)):
+                scheduler = _scheduler(
+                    disaggregation_mode=mode,
+                    tree_cache=SimpleNamespace(cache_controller=controller),
+                )
+                scheduler._uses_raiden_hicache = lambda: True
+                with patch(
+                    "sglang.srt.hardware_backend.tpu.kv_free_fence.fence_hicache_backups"
+                ) as fence_backups:
+                    scheduler.maybe_init_kv_free_fence()
+                self.assertIsNotNone(scheduler.kv_free_fence)
+                if fenced:
+                    fence_backups.assert_called_once_with(
+                        controller, scheduler.kv_free_fence
+                    )
+                else:
+                    fence_backups.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1808,7 +1808,12 @@ class Scheduler(
             synchronize_device=self.device_module.synchronize,
             **fence_kwargs,
         )
-        if self._uses_raiden_hicache():
+        # A PD prefill server releases requests after their prefill forward,
+        # whose copy_done precedes the backup, so its backups need no deferral.
+        if (
+            self._uses_raiden_hicache()
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
             fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
 
     def precompile_tpu_spec_ops(self) -> None:
