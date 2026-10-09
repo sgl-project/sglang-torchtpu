@@ -205,7 +205,7 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
-        # TODO(sglang-torchtpu#1072): remove once sparse DSA runs on TPU.
+        # Set when a TPU server serves the checkpoint as dense MLA.
         and not _hf_attr(config, "tpu_dense_dsa")
     )
 
@@ -217,6 +217,20 @@ def dsa_context_fits_index_topk(config, context_length: Optional[int]) -> bool:
         and index_topk is not None
         and context_length is not None
         and context_length <= index_topk
+    )
+
+
+def tpu_serves_dsa_as_dense_mla(
+    config, *, context_length: Optional[int], attention_backend: Optional[str]
+) -> bool:
+    """Whether a TPU server drops the DSA indexer and serves plain MLA.
+
+    Within index_topk the indexer selects every causal key, so plain MLA is
+    exact and the dense backend needs no indexer. The sparse backend runs the
+    indexer whatever the context.
+    """
+    return attention_backend != "pallas_tpu_mla_sparse" and (
+        dsa_context_fits_index_topk(config, context_length)
     )
 
 
@@ -466,6 +480,7 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
+        attention_backend: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -505,12 +520,14 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        # TODO(sglang-torchtpu#1072): TPU has no sparse DSA, so serve GLM dense;
-        # within index_topk the indexer selects every causal key and MLA is exact.
         if (
             get_platform().is_tpu
             and not is_draft_model
-            and dsa_context_fits_index_topk(self.hf_config, context_length)
+            and tpu_serves_dsa_as_dense_mla(
+                self.hf_config,
+                context_length=context_length,
+                attention_backend=attention_backend,
+            )
         ):
             self.hf_config.tpu_dense_dsa = True
         self.requires_mm_token_modalities = requires_mm_token_modalities(
@@ -840,6 +857,7 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
+            attention_backend=cfg.attention_backend,
             **kwargs,
         )
 

@@ -14,8 +14,7 @@ context needs and nothing more.
 TODO(sglang-torchtpu#1072): drop this module once a pool allocates the split
 buffers natively.
 
-There is no indexer on TPU yet, so the top-k rows are built here too: every
-causal position, which makes the result dense attention.
+The top-k rows come from the DSA indexer.
 """
 
 import jax
@@ -38,25 +37,6 @@ ROPE_DIM = 64
 # A RoPE token is stored zero-padded to one 128-byte lane row.
 _ROPE_ROW_BYTES = kv_cache_utils.TILE_LANE_BYTES
 _FUSED_TOKEN_BYTES = NOPE_DIM + _ROPE_ROW_BYTES
-
-
-def causal_topk_indices(
-    *,
-    num_tokens: int,
-    kv_lens: jax.Array,  # i32[max_num_seqs], includes this step's tokens
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    topk: int,
-) -> jax.Array:
-    """Top-k rows that select every causal key: positions ``0..p``, then ``-1``.
-
-    A token past ``cu_q_lens[-1]`` gets an all ``-1`` row. Exact only while every
-    sequence is at most ``topk`` long; the caller enforces that.
-    """
-    # The writer's own position rule, so a row cannot name a slot it did not fill.
-    _, _, pos, valid = kv_cache_utils._row_positions(num_tokens, kv_lens, cu_q_lens)
-    slots = jnp.arange(topk, dtype=jnp.int32)
-    selected = valid[:, None] & (slots[None, :] <= pos[:, None])
-    return jnp.where(selected, slots[None, :], -1)
 
 
 def _split_specs(
@@ -92,15 +72,16 @@ def sparse_mla_attention_fused(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]; [2] is the active sequence count
+    topk_indices: jax.Array,  # i32[max_num_tokens, index_topk], from the indexer
     *,
     sm_scale: float,
     k_scale: float,
-    topk: int,
 ) -> tuple[jax.Array, jax.Array]:
     """One step on the fused cache: write the new latents, then attend.
 
-    Returns the latent output ``[max_num_tokens, num_q_heads, 512]`` and the
-    updated fused cache.
+    A row of ``topk_indices`` holds positions within the token's own sequence,
+    valid ones first, then ``-1``. Returns the latent output
+    ``[max_num_tokens, num_q_heads, 512]`` and the updated fused cache.
     """
     if new_kv_c.shape[-1] != NOPE_DIM or new_k_pe.shape[-1] != ROPE_DIM:
         raise ValueError(
@@ -129,12 +110,6 @@ def sparse_mla_attention_fused(
         rope_spec=rope_spec,
     )
 
-    topk_indices = causal_topk_indices(
-        num_tokens=ql_nope.shape[0],
-        kv_lens=kv_lens,
-        cu_q_lens=active_cu_q_lens,
-        topk=topk,
-    )
     out = sparse_ragged_paged_attention(
         jnp.concatenate([ql_nope, q_pe], axis=-1),
         cache_nope,

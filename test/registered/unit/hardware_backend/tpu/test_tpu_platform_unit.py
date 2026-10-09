@@ -142,6 +142,8 @@ class TestTpuCompileCache(CustomTestCase):
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_batched.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_v3.py",
                 srt_root / "hardware_backend/tpu/distributed_topk_pallas.py",
+                srt_root / "hardware_backend/tpu/dsa_indexer_tpu.py",
+                srt_root / "hardware_backend/tpu/dsv4/streamindex_topk/kernel.py",
                 srt_root / "hardware_backend/tpu/kernels/distributed_topk.py",
                 srt_root / "hardware_backend/tpu/kernels/kernel.py",
                 srt_root / "hardware_backend/tpu/pallas_export.py",
@@ -496,9 +498,9 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
-    def test_nsa_raises(self):
-        with self.assertRaises(NotImplementedError):
-            self.platform.get_nsa_kv_pool_cls()
+    def test_dsa_pool_is_the_fused_pool_with_index_keys(self):
+        cls = self.platform.get_dsa_kv_pool_cls()
+        self.assertEqual(cls.__name__, "TpuFusedDSATokenToKVPool")
 
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):

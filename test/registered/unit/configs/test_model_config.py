@@ -17,6 +17,7 @@ from sglang.srt.configs.model_config import (
     is_multimodal_model,
     register_model_config_factory,
     resolve_spec_hidden_size,
+    tpu_serves_dsa_as_dense_mla,
 )
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.server_args import ServerArgs
@@ -232,6 +233,23 @@ class TestDsaDenseFallback(CustomTestCase):
         self.assertTrue(is_deepseek_dsa(glm))
         glm.tpu_dense_dsa = True
         self.assertFalse(is_deepseek_dsa(glm))
+
+    def test_sparse_backend_keeps_the_indexer_at_any_context(self):
+        """The sparse TPU backend attends over the indexer's rows, so the
+        dense fallback must not drop the indexer under it."""
+        glm = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"], index_topk=2048)
+        for backend, dense in (
+            ("pallas_tpu_mla", True),
+            (None, True),
+            ("pallas_tpu_mla_sparse", False),
+        ):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    tpu_serves_dsa_as_dense_mla(
+                        glm, context_length=2048, attention_backend=backend
+                    ),
+                    dense,
+                )
 
 
 if __name__ == "__main__":

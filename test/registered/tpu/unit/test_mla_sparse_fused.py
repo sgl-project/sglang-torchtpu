@@ -5,7 +5,8 @@
 fused FP8 pool and swaps only the kernel behind the op. So the property worth
 pinning is that swap: fed the same step, ``sparse_mla_attention_fused`` must
 return what ``mla_ragged_paged_attention`` returns, and leave the same tokens in
-the fused cache. It can, because the rows it builds select every causal key.
+the fused cache. It can whenever its rows select every causal key, which is
+what the indexer returns while a sequence fits in top-k.
 
 Each case also checks the sparse step's cache byte for byte against a NumPy
 expectation. That is what catches a write outside the active tokens: compiled
@@ -180,6 +181,21 @@ def _build_step(
     )
 
 
+def _causal_rows(step):
+    """Top-k rows that select every causal key, for each token of the batch.
+
+    Padded batch rows get one too, as the indexer gives them. Theirs name real
+    slots of the request whose page row they alias, and must not matter.
+    """
+    rows = np.full((step.ql_nope.shape[0], _TOPK), -1, np.int32)
+    for seq, kv_len in enumerate(step.kv_lens):
+        start, end = step.cu_q_lens[seq], step.cu_q_lens[seq + 1]
+        for token in range(start, end):
+            num_causal = kv_len - (end - token) + 1
+            rows[token, :num_causal] = np.arange(num_causal)
+    return rows
+
+
 def _stored_tokens(cache, rows):
     """The nope and rope bytes of ``rows``, without the padding either kernel
     is free to leave as it likes."""
@@ -225,9 +241,9 @@ class TestSparseMlaFused(CustomTestCase):
             jnp.asarray(step.cache_before),
             *metadata,
             distribution,
+            jnp.asarray(_causal_rows(step)),
             sm_scale=_SM_SCALE,
             k_scale=step.k_scale,
-            topk=_TOPK,
         )
         dense_out, dense_cache, sparse_out, sparse_cache = jax.block_until_ready(
             (dense_out, dense_cache, sparse_out, sparse_cache)

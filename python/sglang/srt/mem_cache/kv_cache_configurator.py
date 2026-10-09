@@ -1849,9 +1849,37 @@ class KVCacheConfigurator:
             **mxint8_subpool_kwargs,
         )
 
+    def _build_tpu_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        # The paged latent pool the sparse MLA kernels address, plus an index-key
+        # cache for each layer that runs its own indexer.
+        PoolCls = current_platform.get_dsa_kv_pool_cls()
+        return PoolCls(
+            max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            kv_lora_rank=self.model_config.kv_lora_rank,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            layer_num=self.layer_info.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            index_key_layers=[
+                not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                for layer_id in range(
+                    self.layer_info.start_layer, self.layer_info.end_layer
+                )
+            ],
+        )
+
     def _build_dsa_kv_pool(
         self, *, max_total_num_tokens: int, max_running_requests: int
     ) -> KVCache:
+        if current_platform.is_tpu():
+            return self._build_tpu_dsa_kv_pool(
+                max_total_num_tokens=max_total_num_tokens
+            )
+
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
         (

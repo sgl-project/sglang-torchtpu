@@ -919,3 +919,98 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             "TpuFusedMLATokenToKVPool.set_mla_kv_buffer was called; the Pallas "
             "MLA kernel owns cache writes (see set_kv_buffer)."
         )
+
+
+class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
+    """The fused latent pool plus the DSA indexer's key cache.
+
+    A layer that runs its own indexer gets one paged ``uint8`` buffer of index
+    keys, addressed by the same page table as the latent cache. A layer that
+    reuses the previous layer's selection has none. As with the latent cache,
+    the op owns the writes: the buffer is donated to the indexer op.
+    """
+
+    # One token's record: 128 FP8 key bytes, one scale byte, padded to two
+    # 128-byte lanes. The indexer op checks this layout against its kernel's.
+    INDEX_KEY_RECORD_BYTES = 256
+    INDEX_KEY_PACKING = 4
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        *,
+        index_key_layers: list[bool],
+    ):
+        if len(index_key_layers) != layer_num:
+            raise ValueError(
+                f"index_key_layers has {len(index_key_layers)} entries for "
+                f"{layer_num} layers."
+            )
+        # Read by _create_buffers, which the base constructor calls.
+        self._index_key_layers = index_key_layers
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
+    def _create_buffers(self):
+        super()._create_buffers()
+        if self.page_size % self.INDEX_KEY_PACKING != 0:
+            raise ValueError(
+                f"page_size ({self.page_size}) must be divisible by "
+                f"{self.INDEX_KEY_PACKING} for the TPU index-key cache."
+            )
+        shape = (
+            self.num_pages,
+            self.page_size // self.INDEX_KEY_PACKING,
+            self.INDEX_KEY_PACKING,
+            self.INDEX_KEY_RECORD_BYTES,
+        )
+        logger.info(
+            "Allocating TPU DSA index-key buffers: layers=%d of %d, shape per layer=%s",
+            sum(self._index_key_layers),
+            self.layer_num,
+            shape,
+        )
+        self.index_key_buffer = [
+            _zeros_kv_buffer(shape, torch.uint8, self.device) if has_indexer else None
+            for has_indexer in self._index_key_layers
+        ]
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        del self.index_key_buffer
+
+    def get_index_key_cache(self, layer_id: int) -> torch.Tensor:
+        buf = self.index_key_buffer[layer_id - self.start_layer]
+        if buf is None:
+            raise ValueError(
+                f"layer {layer_id} reuses the previous layer's top-k selection "
+                "and has no index-key cache."
+            )
+        return buf
+
+    def get_kv_size_bytes(self):
+        index_key_bytes = sum(
+            get_tensor_size_bytes(buf)
+            for buf in self.index_key_buffer
+            if buf is not None
+        )
+        return super().get_kv_size_bytes() + index_key_bytes

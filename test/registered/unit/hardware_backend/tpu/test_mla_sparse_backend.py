@@ -1,9 +1,8 @@
 """CPU guards for what ``pallas_tpu_mla_sparse`` refuses to serve.
 
-The backend builds its own top-k rows, every causal position up to
-``index_topk``, and its kernels read an FP8 cache only. Outside those bounds it
-would not fail on its own: rows would silently drop keys past ``index_topk``.
-So the constructor has to refuse, before it touches the device.
+Its kernels read an FP8 cache only, and it is validated on GlmMoeDsa alone,
+up to a context of ``index_topk``. None of those bounds fails on its own, so the
+constructor has to refuse, before it touches the device.
 """
 
 import unittest
@@ -38,12 +37,11 @@ class TestSparseMlaBackendRefusals(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "at most index_topk"):
             TpuPallasSparseMlaAttnBackend(runner)
 
-    def test_checkpoint_without_dsa_is_refused(self):
+    def test_other_dsa_checkpoint_is_refused(self):
         runner = _runner(
-            architecture="DeepseekV3ForCausalLM",
+            architecture="DeepseekV32ForCausalLM",
             context_len=2048,
             kv_cache_dtype=torch.float8_e4m3fn,
-            index_topk=None,
         )
         with self.assertRaisesRegex(ValueError, "GlmMoeDsa"):
             TpuPallasSparseMlaAttnBackend(runner)

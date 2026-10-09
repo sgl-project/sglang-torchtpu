@@ -252,6 +252,23 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         k_rope: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        out = self._op(
+            *self._mla_kernel_args(q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope)
+        )
+        # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
+        # views it back to 3D and folds W_UV.
+        return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
+    def _mla_kernel_args(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        layer: "RadixAttention",
+        q_rope: Optional[torch.Tensor],
+        k_rope: Optional[torch.Tensor],
+    ) -> tuple:
+        """The MLA op's positional arguments for one layer."""
         assert self.forward_metadata is not None, (
             "Pallas MLA attention backend was not initialised for this forward "
             "pass; did you forget to call init_forward_metadata()?"
@@ -298,7 +315,7 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
         kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
-        out = self._op(
+        return (
             ql_nope,
             q_pe,
             new_kv_c,
@@ -313,7 +330,3 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             k_scale,
             v_scale,
         )
-
-        # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
-        # views it back to 3D and folds W_UV.
-        return out.reshape(num_tokens, layer.tp_q_head_num * kv_lora_rank)

@@ -542,15 +542,11 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_mla_kv_pool_cls(self) -> type:
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel
-        # addresses, and pallas_tpu_mla_sparse derives its split cache from the
-        # same buffer; other backends (torch_native reference) keep the flat
+        # addresses; other backends (torch_native reference) keep the flat
         # upstream pool.
         from sglang.srt.runtime_context import get_exec
 
-        if get_exec().kernel.attention_backend in (
-            "pallas_tpu_mla",
-            "pallas_tpu_mla_sparse",
-        ):
+        if get_exec().kernel.attention_backend == "pallas_tpu_mla":
             from sglang.srt.hardware_backend.tpu.kv_pool import (
                 TpuFusedMLATokenToKVPool,
             )
@@ -561,8 +557,10 @@ class TpuSRTPlatform(SRTPlatform):
 
         return MLATokenToKVPool
 
-    def get_nsa_kv_pool_cls(self) -> type:
-        raise NotImplementedError("NSA is not supported on TPU.")
+    def get_dsa_kv_pool_cls(self) -> type:
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedDSATokenToKVPool
+
+        return TpuFusedDSATokenToKVPool
 
     def get_paged_allocator_cls(self) -> type:
         from sglang.srt.hardware_backend.tpu.allocator_tpu import (

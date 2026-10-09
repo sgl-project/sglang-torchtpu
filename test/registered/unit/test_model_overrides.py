@@ -3236,8 +3236,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return SimpleNamespace(**defaults)
 
         # DSA path on CUDA: dsa fill + page 64
-        with patch(
-            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_tpu=False),
         ):
             with override_platform(is_npu=False):
                 with override_platform(is_xpu=False):
@@ -3272,9 +3273,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 _deepseek_family_overrides(_args(), None),
                                 {"attention_backend": "dsa", "page_size": 1},
                             )
+        # DSA on TPU: none of the GPU defaults, the operator's page size stands
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_tpu=True),
+        ):
+            self.assertEqual(
+                _deepseek_family_overrides(
+                    _args(attention_backend="pallas_tpu_mla_sparse"), None
+                ),
+                {},
+            )
         # DSA CP (zigzag): the coupled parallel-field declaration
-        with patch(
-            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_tpu=False),
         ):
             with override_platform(is_npu=False):
                 with override_platform(is_xpu=False):

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # GLM-5.3 text reference launch. Within 2048 tokens the indexer selects every
 # causal key, so ordinary MLA is exact and needs no sparse-indexer kernel.
-# ATTENTION_BACKEND=pallas_tpu_mla_sparse serves the same context through the
-# sparse MLA kernels instead.
+# ATTENTION_BACKEND=pallas_tpu_mla_sparse serves the same context with the
+# indexer running and the sparse MLA kernels attending over what it selects.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 glm_context=${CONTEXT_LEN:-2048}

@@ -5,6 +5,7 @@ base tensors (no uint8 view), the per-tensor quantizer, and the backend's
 fp8 branch handing quantized latents plus one shared scale to the kernel op.
 """
 
+import functools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -18,6 +19,7 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
 from sglang.srt.hardware_backend.tpu.kv_pool import (
+    TpuFusedDSATokenToKVPool,
     TpuFusedMLATokenToKVPool,
     _zeros_kv_buffer,
 )
@@ -58,6 +60,33 @@ class TestZerosKvBuffer(CustomTestCase):
             self.assertEqual(buf.dtype, FP8)
             self.assertIsNone(buf._base)
 
+    def test_dsa_pool_gives_index_keys_to_indexer_layers_only(self):
+        pool = TpuFusedDSATokenToKVPool(
+            size=64,
+            page_size=32,
+            dtype=FP8,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            index_key_layers=[True, False, True],
+        )
+        latent_bytes = sum(pool.get_fused_kv_buffer(i).nbytes for i in range(3))
+        index_key_bytes = 0
+        for layer_id in (0, 2):
+            buf = pool.get_index_key_cache(layer_id)
+            # One 256-byte record per token, in the page layout the kernel reads;
+            # a base tensor, or the indexer op's donation is dropped.
+            self.assertEqual(tuple(buf.shape), (pool.num_pages, 8, 4, 256))
+            self.assertEqual(buf.dtype, torch.uint8)
+            self.assertIsNone(buf._base)
+            index_key_bytes += buf.nbytes
+        # A layer that reuses the previous selection must not get a cache to write.
+        with self.assertRaisesRegex(ValueError, "no index-key cache"):
+            pool.get_index_key_cache(1)
+        self.assertEqual(pool.get_kv_size_bytes(), latent_bytes + index_key_bytes)
+
 
 class TestQuantizeKvToFp8(CustomTestCase):
     def test_divides_by_scale_clamps_and_casts(self):
@@ -89,6 +118,10 @@ def _run_forward_mla(*, quant_dtype, k_scale_float):
             distribution=torch.zeros(3, dtype=torch.int32),
         ),
         token_to_kv_pool=SimpleNamespace(get_fused_kv_buffer=lambda _: "kv"),
+    )
+    # _forward_mla builds the op's arguments through this method.
+    backend._mla_kernel_args = functools.partial(
+        TpuPallasMlaAttnBackend._mla_kernel_args, backend
     )
     layer = SimpleNamespace(
         v_head_dim=R,

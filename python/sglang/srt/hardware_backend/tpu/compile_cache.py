@@ -73,6 +73,8 @@ def get_pallas_kernel_sources() -> tuple[str, ...]:
         "hardware_backend/tpu/attention_pallas_rpa_batched.py",
         "hardware_backend/tpu/attention_pallas_rpa_v3.py",
         "hardware_backend/tpu/distributed_topk_pallas.py",
+        "hardware_backend/tpu/dsa_indexer_tpu.py",
+        "hardware_backend/tpu/dsv4/streamindex_topk",
         "hardware_backend/tpu/kernels",
         "hardware_backend/tpu/pallas_export.py",
         "hardware_backend/tpu/pallas_jax_op.py",
