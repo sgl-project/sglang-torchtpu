@@ -45,6 +45,8 @@ _current: ContextVar[Optional[MhcPostFusion]] = ContextVar("moe_mhc_post", defau
 
 
 def current_mhc_post_fusion():
+    if torch.compiler.is_compiling():
+        return None
     return _current.get()
 
 

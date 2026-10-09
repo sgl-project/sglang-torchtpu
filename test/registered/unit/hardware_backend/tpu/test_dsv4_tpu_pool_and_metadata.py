@@ -1,0 +1,330 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CPU-runnable unit tests for DeepSeek-V4 TPU memory pools and attention metadata.
+
+``DSV4TPUTokenToKVPool`` and ``DSV4TPUAttnBackend._compute_metadata`` operate on
+plain PyTorch tensors and CPU metadata arrays, so these tests run on CPU
+(``device="cpu"``) without requiring TPU hardware. They guard:
+
+1. **4D ``torch.uint8`` buffer shapes and ``_base is None`` donation invariant**:
+   every SWA, CSA (NoPE + RoPE), HCA, Indexer K, and Compressor State buffer
+   must be a genuine ``torch.uint8`` base tensor so ``torch_tpu`` can donate it
+   in-place across Pallas kernel calls without defensive copies.
+2. **6-slot ``state_block_table`` construction (`[bs, 6]` `int32`)**:
+   ``(ring_base, b_prev, old_shift, b_tail_start, new_shift, scratch_base)``
+   across decode, short extend (`<= window_blocks`), long initial prefill, and
+   long continuation extend (`> window_blocks`), plus slot reset hooks.
+3. **Bucket-padded ``DSV4TPUForwardMetadata`` construction**:
+   when ``compiled_forward_shim`` pads ``seq_lens`` to bucket ``bs`` while
+   keeping ``seq_lens_cpu`` at ``_tpu_real_b < bs``, ``_compute_metadata`` must
+   still produce ``(bs,)``-shaped ``kv_lens`` and ``c128_kv_lens`` and
+   ``(bs + 1,)``-shaped ``cu_seqlens_q`` so ``torch.compile(dynamic=False)``
+   never sees shape drift across active request counts.
+"""
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.dsv4.dsv4_attention_backend import (
+    DSV4TPUAttnBackend,
+)
+from sglang_tpu.dsv4.dsv4_memory_pool import (
+    DSV4TPUTokenToKVPool,
+    TPUCompressStatePool,
+)
+from sglang_tpu.patches import _PALLAS_TPU_BACKENDS
+
+
+def _make_dsv4_tpu_pool(
+    testcase: unittest.TestCase, num_req_slots: int = 5
+) -> DSV4TPUTokenToKVPool:
+    from sglang.srt.runtime_context import get_context
+
+    override = get_context().override_server_args(
+        dsv4_attn_backend="tpu_dsv4", page_size=256
+    )
+    override.install()
+    testcase.addCleanup(override.restore)
+
+    compression_ratios = [0, 0, 128, 4, 128, 4]
+    pool = DSV4TPUTokenToKVPool(
+        max_num_reqs=num_req_slots - 1,
+        num_req_slots=num_req_slots,
+        swa_size=512,
+        c4_size=256,
+        c128_size=8,
+        c4_state_pool_size=32,
+        c128_state_pool_size=256,
+        page_size=256,
+        swa_page_size=256,
+        sliding_window=512,
+        dtype=torch.bfloat16,
+        c4_state_dtype=torch.float32,
+        c128_state_dtype=torch.float32,
+        qk_nope_head_dim=448,
+        qk_rope_head_dim=64,
+        indexer_head_dim=128,
+        layer_num=len(compression_ratios),
+        device="cpu",
+        enable_memory_saver=False,
+        compression_ratios=compression_ratios,
+        start_layer=0,
+        end_layer=len(compression_ratios),
+        full_size=1024,
+    )
+    # Set up a non-identity full -> SWA page mapping:
+    # Full page 0 -> SWA page 0, full page 1 -> SWA page 2, full page 2 -> SWA page 1
+    mapping = torch.zeros(1024 + 256, dtype=torch.int64, device="cpu")
+    mapping[256:512] = torch.arange(512, 768, dtype=torch.int64)
+    mapping[512:768] = torch.arange(256, 512, dtype=torch.int64)
+    pool.full_to_swa_index_mapping = mapping
+    return pool
+
+
+class TestDSV4TPUMemoryPool(CustomTestCase):
+    def test_buffer_shapes_and_base_ownership(self):
+        pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+
+        # SWA: (512 + 256 + 1) // 256 = 3 pages, 512 rows/page, (4, 128) uint8
+        for layer_id in range(6):
+            swa_buf = pool.get_swa_buffer(layer_id)
+            self.assertEqual(swa_buf.dtype, torch.uint8)
+            self.assertEqual(tuple(swa_buf.shape), (3, 512, 4, 128))
+            self.assertIsNone(swa_buf._base)
+
+        # CSA (layers 3, 5): c4_page_size = 64, (256 + 64 + 1) // 64 = 5 pages
+        for layer_id in (3, 5):
+            nope_buf, rope_buf = pool.get_csa_kv_buffers(layer_id)
+            self.assertEqual(nope_buf.dtype, torch.uint8)
+            self.assertEqual(rope_buf.dtype, torch.uint8)
+            self.assertEqual(tuple(nope_buf.shape), (5, 64, 4, 128))
+            self.assertEqual(tuple(rope_buf.shape), (5, 16, 4, 128))
+            self.assertIsNone(nope_buf._base)
+            self.assertIsNone(rope_buf._base)
+
+            idx_buf = pool.get_indexer_k_buffer(layer_id)
+            self.assertEqual(idx_buf.dtype, torch.uint8)
+            self.assertEqual(tuple(idx_buf.shape), (5, 16, 4, 256))
+            self.assertIsNone(idx_buf._base)
+
+            c4_state = pool.get_state_buffer(layer_id, from_indexer=False)
+            c4_idx_state = pool.get_state_buffer(layer_id, from_indexer=True)
+            # 1 dummy page + 5 * 8 ring pages + 8192 // 4 scratch pages = 2089 pages
+            self.assertEqual(tuple(c4_state.shape), (2089, 64, 4, 128))
+            self.assertEqual(tuple(c4_idx_state.shape), (2089, 8, 4, 256))
+            self.assertIsNone(c4_state._base)
+            self.assertIsNone(c4_idx_state._base)
+
+        # HCA (layers 2, 4): c128_page_size = 2, (8 + 2 + 1) // 2 = 5 pages
+        for layer_id in (2, 4):
+            hca_buf = pool.get_hca_buffer(layer_id)
+            self.assertEqual(hca_buf.dtype, torch.uint8)
+            self.assertEqual(tuple(hca_buf.shape), (5, 4, 4, 128))
+            self.assertIsNone(hca_buf._base)
+
+            c128_state = pool.get_state_buffer(layer_id, from_indexer=False)
+            # 1 dummy page + 5 * 32 ring pages + 8192 // 8 scratch pages = 1185 pages
+            self.assertEqual(tuple(c128_state.shape), (1185, 64, 4, 128))
+            self.assertIsNone(c128_state._base)
+
+    def test_state_block_table_decode_and_extend_transitions(self):
+        pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+        c4_proto = pool._state_pool_proto[4]
+        self.assertIsInstance(c4_proto, TPUCompressStatePool)
+        ring_pages = c4_proto.ring_pages_per_req  # 8 pages/req
+        scratch_start = c4_proto.scratch_start_page  # 1 + 5 * 8 = 41
+
+        # 1. Short initial prefill (12 tokens -> b_prev = -1, b_end = 2, 3 blocks <= 4):
+        # Fits inside persistent ring without scratch pages.
+        table_short = pool.build_state_block_table(
+            ratio=4,
+            req_pool_indices_cpu=[1],
+            seq_lens_cpu=[12],
+            extend_seq_lens_cpu=[12],
+            is_decode=False,
+            bs=2,
+            non_empty_bs=1,
+            device="cpu",
+        )
+        self.assertEqual(tuple(table_short.shape), (2, 6))
+        self.assertEqual(
+            table_short[0].tolist(),
+            [1 + 1 * ring_pages, 0, 0, 0, 0, 0],
+        )
+        self.assertEqual(table_short[1].tolist(), [0, 0, 0, 0, 0, 0])
+
+        # 2. Long initial prefill on req 2 (64 tokens -> b_prev = -1, b_end = 15,
+        # window_blocks = 4 -> b_tail_start = 12, num_scratch = 12):
+        table_long = pool.build_state_block_table(
+            ratio=4,
+            req_pool_indices_cpu=[2],
+            seq_lens_cpu=[64],
+            extend_seq_lens_cpu=[64],
+            is_decode=False,
+            bs=1,
+            non_empty_bs=1,
+            device="cpu",
+        )
+        self.assertEqual(
+            table_long[0].tolist(),
+            [1 + 2 * ring_pages, -1, 0, 12, 0, scratch_start],
+        )
+
+        # 3. Long continuation chunk on req 2 (start_pos = 64, q_len = 32 -> seq_len = 96,
+        # b_prev = 15, b_end = 23, b_end - b_prev = 8 > 4 -> b_tail_start = 20,
+        # new_shift = (0 + 4 - 8) % 8 = 4):
+        table_cont = pool.build_state_block_table(
+            ratio=4,
+            req_pool_indices_cpu=[2],
+            seq_lens_cpu=[96],
+            extend_seq_lens_cpu=[32],
+            is_decode=False,
+            bs=1,
+            non_empty_bs=1,
+            device="cpu",
+        )
+        self.assertEqual(
+            table_cont[0].tolist(),
+            [1 + 2 * ring_pages, 15, 0, 20, 4, scratch_start],
+        )
+        self.assertEqual(int(pool._req_state_shifts[4][2].item()), 4)
+
+        # 4. Subsequent decode on req 2 uses updated shift = 4:
+        table_decode = pool.build_state_block_table(
+            ratio=4,
+            req_pool_indices_cpu=[2],
+            seq_lens_cpu=[97],
+            extend_seq_lens_cpu=None,
+            is_decode=True,
+            bs=2,
+            non_empty_bs=1,
+            device="cpu",
+        )
+        self.assertEqual(
+            table_decode[0].tolist(),
+            [1 + 2 * ring_pages, 0, 4, 0, 4, 0],
+        )
+
+        # 5. Clearing req 2 resets its ring shift to 0:
+        pool.clear_c4_req_states([2])
+        self.assertEqual(int(pool._req_state_shifts[4][2].item()), 0)
+        self.assertEqual(int(pool._req_state_shifts[128][2].item()), 0)
+
+
+class TestDSV4TPUAttentionMetadata(CustomTestCase):
+    def _make_backend_stub(self, pool: DSV4TPUTokenToKVPool) -> DSV4TPUAttnBackend:
+        backend = object.__new__(DSV4TPUAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.page_size = 256
+        backend.max_context_len = 1024
+        backend.token_to_kv_pool = pool
+        req_to_token = torch.zeros((5, 1024), dtype=torch.int32, device="cpu")
+        # Req 1: full page 1 (256..512) then full page 2 (512..768)
+        req_to_token[1, :256] = 256
+        req_to_token[1, 256:512] = 512
+        # Req 2: full page 2 (512..768) then full page 1 (256..512)
+        req_to_token[2, :256] = 512
+        req_to_token[2, 256:512] = 256
+        backend.req_to_token = req_to_token
+        return backend
+
+    def test_extend_metadata_and_swa_table_translation(self):
+        pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+        backend = self._make_backend_stub(pool)
+
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            seq_lens=torch.tensor([300, 512], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([300, 512], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([300, 256], dtype=torch.int32),
+            extend_seq_lens_cpu=[300, 256],
+            req_pool_indices=torch.tensor([1, 2], dtype=torch.int32),
+            req_pool_indices_cpu=torch.tensor([1, 2], dtype=torch.int32),
+            positions=torch.arange(556, dtype=torch.int64),
+        )
+        meta = backend._compute_metadata(fb)
+        self.assertEqual(meta.distribution.tolist(), [0, 0, 2])
+        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, 300, 556])
+        self.assertEqual(meta.kv_lens.tolist(), [300, 512])
+        # c128_kv_lens = kv_lens // 128 -> [300 // 128, 512 // 128] = [2, 4]
+        self.assertEqual(meta.c128_kv_lens.tolist(), [2, 4])
+        # C4/C128 block tables (max_pages_per_req = 4):
+        # Req 1 pages: [1, 2, 0, 0]; Req 2 pages: [2, 1, 0, 0]
+        self.assertEqual(
+            meta.c4_block_tables_flat.view(2, 4).tolist(),
+            [[1, 2, 0, 0], [2, 1, 0, 0]],
+        )
+        self.assertEqual(
+            meta.c128_block_tables_flat.view(2, 4).tolist(),
+            [[1, 2, 0, 0], [2, 1, 0, 0]],
+        )
+        # SWA block table translated via full_to_swa_index_mapping (1 -> 2, 2 -> 1):
+        self.assertEqual(
+            meta.swa_block_tables_flat.view(2, 4).tolist(),
+            [[2, 1, 0, 0], [1, 2, 0, 0]],
+        )
+
+    def test_bucket_padded_decode_metadata_preserves_static_shapes(self):
+        """Regression test for compiled_forward_shim bucket padding (`_tpu_real_b < bs`).
+
+        ``_pad_forward_batch_inputs`` pads ``seq_lens`` and ``req_pool_indices``
+        to ``bs`` (e.g., 4) while leaving ``seq_lens_cpu`` at ``_tpu_real_b``
+        (e.g., 2). ``_compute_metadata`` must still emit ``(bs,)``-shaped
+        ``kv_lens`` and ``c128_kv_lens`` so ``torch.compile(dynamic=False)``
+        never recompiles or fails a shape guard.
+        """
+        pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+        backend = self._make_backend_stub(pool)
+
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=4,
+            _tpu_real_b=2,
+            seq_lens=torch.tensor([260, 128, 0, 0], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([260, 128], dtype=torch.int32),
+            extend_seq_lens=None,
+            extend_seq_lens_cpu=None,
+            req_pool_indices=torch.tensor([1, 2, 0, 0], dtype=torch.int32),
+            req_pool_indices_cpu=torch.tensor([1, 2, 0, 0], dtype=torch.int32),
+            positions=torch.tensor([259, 127, 0, 0], dtype=torch.int64),
+        )
+        meta = backend._compute_metadata(fb)
+        self.assertEqual(meta.distribution.tolist(), [2, 2, 2])
+        self.assertEqual(tuple(meta.cu_seqlens_q.shape), (5,))
+        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(tuple(meta.kv_lens.shape), (4,))
+        self.assertEqual(meta.kv_lens.tolist(), [260, 128, 0, 0])
+        self.assertEqual(tuple(meta.c128_kv_lens.shape), (4,))
+        self.assertEqual(meta.c128_kv_lens.tolist(), [2, 1, 0, 0])
+        self.assertEqual(tuple(meta.c4_state_block_tables_flat.shape), (24,))
+        self.assertEqual(tuple(meta.c128_state_block_tables_flat.shape), (24,))
+
+
+class TestDSV4TPUPatches(CustomTestCase):
+    def test_dsv4_in_pallas_tpu_backends(self):
+        self.assertIn("dsv4", _PALLAS_TPU_BACKENDS)
+        self.assertIn("tpu_dsv4", _PALLAS_TPU_BACKENDS)
+
+
+if __name__ == "__main__":
+    unittest.main()
