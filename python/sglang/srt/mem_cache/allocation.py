@@ -265,7 +265,8 @@ def alloc_token_slots(
     allocator = tree_cache.token_to_kv_pool_allocator
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    out_cache_loc = allocator.alloc(num_tokens)
+    with allocator.forward_write_target():
+        out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
         error_msg = (
@@ -321,15 +322,16 @@ def alloc_paged_token_slots_extend(
     if out_cache_loc_host is not None:
         extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
 
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
-    )
+    with allocator.forward_write_target():
+        out = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            **extra_alloc_kwargs,
+        )
 
     if is_dsv4:
         bundle = out
@@ -675,7 +677,10 @@ def alloc_paged_token_slots_decode(
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
 
-    out = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs)
+    with allocator.forward_write_target():
+        out = allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
+        )
 
     if is_dsv4:
         bundle = out
@@ -721,7 +726,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         if _r2t.device.type == "cpu":
             # Host-resident pool: gather last_loc on host (alloc_decode runs
             # its formula on host).
-            last_loc = _r2t[batch.req_pool_indices.cpu(), seq_lens - 1]
+            last_loc = _r2t[batch.req_pool_indices_cpu, seq_lens - 1]
         else:
             last_loc = _r2t[batch.req_pool_indices, seq_lens - 1]
         seq_lens_next = seq_lens + token_per_req

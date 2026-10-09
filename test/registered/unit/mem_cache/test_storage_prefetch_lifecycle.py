@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from array import array
 from collections import defaultdict, deque
-from contextlib import nullcontext
 from datetime import timedelta
 from queue import Queue
 from types import SimpleNamespace
@@ -69,7 +68,7 @@ def _staged_fixture(full_match=2):
     cache.supports_swa = lambda: True
     cache.evict_for_alloc = Mock()
     cache.token_to_kv_pool_allocator = SimpleNamespace(
-        full_available_size=Mock(return_value=100), dma_write_target=nullcontext
+        full_available_size=Mock(return_value=100)
     )
     cc = HybridCacheController.__new__(HybridCacheController)
     cc.pp_prefetch_command_group = None

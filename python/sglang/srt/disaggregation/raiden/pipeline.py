@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.raiden.serde import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -352,7 +353,7 @@ class PipelineTransfer:
 
         self.manager = manager
         self.producer = manager.disaggregation_mode == DisaggregationMode.PREFILL
-        self._check_support(raiden_service_pb2)
+        self._check_support(raiden_service_pb2, groups)
         self.hbm_mem_type = raiden_service_pb2.MEMORY_TYPE_HBM
         self.lock = threading.RLock()
         self.pools = pool_manifest(groups)
@@ -405,7 +406,7 @@ class PipelineTransfer:
         fingerprint = self._register_pools(staging_options=staging.options)
         self._log_ready(staging=staging, fingerprint=fingerprint)
 
-    def _check_support(self, raiden_service_pb2) -> None:
+    def _check_support(self, raiden_service_pb2, groups) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
         manager = self.manager
         if manager.attn_cp_size != 1:
@@ -420,9 +421,18 @@ class PipelineTransfer:
                 "Raiden pipeline transfer takes attention TP>1 only on a decode "
                 "without pipeline stages"
             )
-        if get_spec().speculative_algorithm is not None:
+        # The transfer moves target-pool pages and the prefill's aux blob only.
+        # A decode can speculate if its draft keeps no pool of its own and needs
+        # no draft state from the prefill (e.g. NGRAM, or a plugin draft that
+        # writes into the target pool).
+        spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+        if spec.is_speculative() and (
+            self.producer or groups.has_draft_pool or spec.carries_draft_hidden_states()
+        ):
             raise ValueError(
-                "Raiden pipeline transfer does not support speculative decoding"
+                "Raiden pipeline transfer supports speculative decoding only on "
+                "the decode, without a separate draft KV pool or draft hidden "
+                "states from the prefill"
             )
         if (
             "wire_pool_indices"

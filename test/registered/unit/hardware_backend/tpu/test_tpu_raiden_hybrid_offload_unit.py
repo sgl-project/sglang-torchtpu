@@ -18,6 +18,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import threading
 import unittest
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -248,7 +249,7 @@ class TestHybridLoad(CustomTestCase):
 
         # Hybrid load reads allocator.full_attn_allocator (the SWA composite
         # allocator shape) and falls back to the allocator itself.
-        full_allocator = MagicMock()
+        full_allocator = MagicMock(kv_free_fence=None)
         full_allocator.full_attn_allocator.alloc = MagicMock(
             return_value=torch.arange(8, dtype=torch.int64)
         )
@@ -358,7 +359,7 @@ class TestHybridTransferWithoutFullPages(CustomTestCase):
                 ),
             ]
         )
-        self.ctrl.mem_pool_device_allocator = MagicMock(kv_free_fence=None)
+        self.ctrl.mem_pool_device_allocator = SimpleNamespace(kv_free_fence=None)
         self.ctrl.device = "cpu"
 
     def _tokens(self, pages: List[int]) -> torch.Tensor:
@@ -526,20 +527,20 @@ class TestKVFreeFenceCoverage(CustomTestCase):
             with self.assertRaises(NotImplementedError):
                 TpuRaidenHybridCacheController()
 
-    def test_load_allocated_outside_dma_write_target_is_rejected(self):
-        """A load path that allocates its DMA targets outside
-        dma_write_target() can be given pages an in-flight forward still writes."""
+    def test_load_inside_forward_write_target_is_rejected(self):
+        """A raiden load inside forward_write_target() could be given a page an
+        in-flight forward still writes, since only forward allocations may borrow."""
         ctrl = _make_controller()
         allocator = MagicMock()
         allocator.full_attn_allocator.alloc.return_value = torch.arange(8)
         allocator.kv_free_fence = KVFreeFence(synchronize_device=MagicMock())
         ctrl.mem_pool_device_allocator = allocator
-        with self.assertRaises(AssertionError):
-            ctrl.load(host_indices=torch.arange(8))
+        with allocator.kv_free_fence.forward_write_target():
+            with self.assertRaises(AssertionError):
+                ctrl.load(host_indices=torch.arange(8))
         allocator.full_attn_allocator.alloc.assert_not_called()
 
-        with allocator.kv_free_fence.dma_write_target():
-            self.assertIsNotNone(ctrl.load(host_indices=torch.arange(8)))
+        self.assertIsNotNone(ctrl.load(host_indices=torch.arange(8)))
 
 
 class TestDraftSidecarPlatformHook(CustomTestCase):

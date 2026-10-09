@@ -282,7 +282,9 @@ class Model(msgspec.Struct):
     ] = None
     weight_loader_disable_mmap: A[
         bool,
-        "Disable mmap while loading weight using safetensors.",
+        "Disable mmap while loading weight using safetensors. On TPU, models that "
+        "support it then read only their EP rank's routed experts "
+        "(SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS=1 reads whole shards).",
     ] = False
     weight_loader_prefetch_checkpoints: A[
         bool,

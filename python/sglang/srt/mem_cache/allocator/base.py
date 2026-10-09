@@ -41,7 +41,7 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
-    # Holds freed pages back from DMA write targets; None frees at once.
+    # Holds freed pages back from non-forward allocations; None frees at once.
     kv_free_fence: KVFreeFence | None = None
 
     @abc.abstractmethod
@@ -195,20 +195,23 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return self.free_pages
         return torch.cat((self.free_pages, self.release_pages))
 
-    def dma_write_target(self) -> ContextManager:
-        """Scope allocations whose pages a DMA unordered against device
-        compute writes, such as a host-to-device KV load."""
+    def forward_write_target(self) -> ContextManager:
+        """Scope allocations whose pages only forwards write. Pages outside it
+        may be written by a DMA unordered against device compute, such as a
+        host-to-device KV load or a PD transfer."""
         if self.kv_free_fence is None:
             return nullcontext()
-        return self.kv_free_fence.dma_write_target()
+        return self.kv_free_fence.forward_write_target()
 
-    def freeing_released_values(self, release_time: float | None) -> ContextManager:
+    def freeing_values_written_before(
+        self, write_horizon: float | None
+    ) -> ContextManager:
         """Scope frees of cached values no forward formed after
-        ``release_time`` (the radix tree's time counter) can write; None when
+        ``write_horizon`` (the radix tree's time counter) can write; None when
         unknown."""
         if self.kv_free_fence is None:
             return nullcontext()
-        return self.kv_free_fence.freeing_released_values(release_time)
+        return self.kv_free_fence.freeing_values_written_before(write_horizon)
 
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"

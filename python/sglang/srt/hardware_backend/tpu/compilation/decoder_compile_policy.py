@@ -1480,12 +1480,13 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             hasattr(outer, "get_image_feature")
             and is_dp_attention_enabled()
             # A wrapper that routes every rank through one input_embeds program
-            # on image steps and compiles its logits processor (Kimi).
+            # on image steps and compiles its logits processor (Kimi-K2.5).
             and not getattr(outer, "serves_dp_attention", False)
         ):
             raise NotImplementedError(
-                "Qwen3-VL TPU decoder compilation does not support DP attention; "
-                "disable --enable-torch-compile for this configuration."
+                f"{type(outer).__name__}: TPU decoder compilation of this "
+                "multimodal wrapper does not support DP attention; disable "
+                "--enable-torch-compile or --enable-dp-attention."
             )
         return super().install()
 
@@ -1855,3 +1856,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_embeds=input_embeds,
         )
         return (), call_kwargs
+
+
+# Kimi-K3's multimodal wrapper compiles its language model with the Qwen3-VL
+# policy unchanged.
+KimiK3VLDecoderTpuCompilePolicy = Qwen3VLDecoderTpuCompilePolicy

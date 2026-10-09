@@ -140,6 +140,11 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     def _ensure_free_pages(self, num_pages: int) -> bool:
         """Make ``free_pages`` hold at least ``num_pages``, taking held pages
         when short."""
+        if (
+            self.kv_free_fence is not None
+            and not self.kv_free_fence.in_forward_write_target
+        ):
+            self.kv_free_fence.stats.non_forward_allocs += 1
         if num_pages > len(self.free_pages):
             self.merge_and_sort_free()
         short = num_pages - len(self.free_pages)
@@ -147,15 +152,17 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return True
         if short > self.held_pages.num_pages:
             return False
-        if self.kv_free_fence.in_dma_write_target:
-            # A DMA is not ordered after the forward that may still write these.
-            self.kv_free_fence.wait_for_in_flight()
-            self.merge_and_sort_free()
-        else:
+        if self.kv_free_fence.in_forward_write_target:
             # Device compute runs in launch order, so this forward writes last.
+            self.kv_free_fence.stats.pages_borrowed += short
             self.free_pages = torch.cat(
                 (self.held_pages.borrow(short), self.free_pages)
             )
+        else:
+            # Other allocations may be DMA targets, which are not ordered after
+            # the forward that may still write these.
+            self.kv_free_fence.wait_for_in_flight()
+            self.merge_and_sort_free()
         return num_pages <= len(self.free_pages)
 
     def alloc(self, need_size: int):
@@ -296,7 +303,13 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         normalized = tuple(
             page_id.to(device="cpu", dtype=torch.int32) for page_id in page_ids
         )
-        tag = None if self.kv_free_fence is None else self.kv_free_fence.hold_tag()
+        tag = (
+            None
+            if self.kv_free_fence is None
+            else self.kv_free_fence.hold_tag(
+                num_pages=sum(page_id.numel() for page_id in normalized)
+            )
+        )
         if tag is None:
             super()._release_page_ids(*normalized)
         else:

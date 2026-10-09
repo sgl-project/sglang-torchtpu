@@ -323,6 +323,9 @@ class Envs:
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
+    # Seconds the TP ranks that finished loading wait at the post-load barrier
+    # for the remaining ranks.
+    SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S = EnvInt(480)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     # In seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
@@ -1907,6 +1910,9 @@ class Envs:
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
     # and tune from there.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # Turn off EP-local expert reads (models that opt in read only their EP
+    # rank's routed experts with --weight-loader-disable-mmap).
+    SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

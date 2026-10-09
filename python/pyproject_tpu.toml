@@ -82,7 +82,7 @@ dependencies = [
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
   # Published to PyPI as nightly .dev pre-releases (see [tool.uv.sources]).
-  "tpu-sync-torch==0.0.1.dev20261002213151",
+  "tpu-sync-torch==0.0.1.dev20261008082921",
   "libtpu==0.0.47",
   "torch==2.11.0",
   "torchvision==0.26.0",

@@ -2,6 +2,7 @@
 
 import unittest
 from array import array
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -25,6 +26,9 @@ class _FakeAllocator:
 
     def available_size(self):
         return 1 << 30
+
+    def forward_write_target(self):
+        return nullcontext()
 
     def alloc(self, need_size):
         self.alloc_calls.append(need_size)

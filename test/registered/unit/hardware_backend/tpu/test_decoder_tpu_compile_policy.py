@@ -991,6 +991,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         # A wrapper whose image steps or logits run eager collectives hangs
         # under DP attention; fail at install as before.
         policy = self._policy_for(multimodal=True)
+        model_name = type(policy.model_runner.model).__name__
 
         with (
             patch(
@@ -1002,7 +1003,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
                 DecoderTpuCompilePolicy, "install", return_value=True
             ) as base_install,
         ):
-            with self.assertRaises(NotImplementedError):
+            with self.assertRaisesRegex(NotImplementedError, f"^{model_name}: "):
                 policy.install()
 
         base_install.assert_not_called()

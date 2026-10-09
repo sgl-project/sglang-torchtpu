@@ -59,6 +59,8 @@ class RaidenKVCacheGroups:
     swa: List[Any]
     full_layer_ids: List[int] = field(default_factory=list)
     swa_layer_ids: List[int] = field(default_factory=list)
+    # A speculative draft pool separate from the target pool, appended above.
+    has_draft_pool: bool = False
 
 
 def get_raiden_kv_caches(
@@ -116,7 +118,8 @@ def get_raiden_kv_caches(
     groups = group_one(pool)
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
-    if draft_pool is not None and draft_pool is not pool:
+    has_draft_pool = draft_pool is not None and draft_pool is not pool
+    if has_draft_pool:
         draft_groups = group_one(draft_pool)
         full.extend(draft_groups.full)
         swa.extend(draft_groups.swa)
@@ -131,5 +134,9 @@ def get_raiden_kv_caches(
                 f"{sorted(block_counts)}"
             )
     return RaidenKVCacheGroups(
-        full=full, swa=swa, full_layer_ids=full_ids, swa_layer_ids=swa_ids
+        full=full,
+        swa=swa,
+        full_layer_ids=full_ids,
+        swa_layer_ids=swa_ids,
+        has_draft_pool=has_draft_pool,
     )

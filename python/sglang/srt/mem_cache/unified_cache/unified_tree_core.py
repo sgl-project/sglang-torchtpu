@@ -125,7 +125,7 @@ class UnifiedTreeNode:
         self.creation_time = get_and_increase_time_counter()
         # Last insert or lock release on this node: a forward formed after
         # it cannot write the node's device values.
-        self.last_release_time = self.creation_time
+        self.write_horizon = self.creation_time
         self.hash_value = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
@@ -490,7 +490,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
         self._tracked_unbacked_tokens = 0
         self._is_tracking_unbacked_tokens = False
-        self._device_frees_release_time: Optional[float] = None
+        self._device_frees_write_horizon: Optional[float] = None
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -728,7 +728,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._assert_receipt_anchor(node, params)
         # After an SWA early release (dec_swa_lock_only), SWA and the
         # lower-priority components it dropped are already released.
-        self._stamp_release(node)
+        self._stamp_write_horizon(node)
         self._release_components(node, params, skip_swa_and_below=skip_swa)
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
@@ -745,7 +745,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def dec_full_pin(self, node_id: NodeId) -> None:
         node = self.node_by_id(node_id)
-        self._stamp_release(node)
+        self._stamp_write_horizon(node)
         self.components_by_type[BASE_COMPONENT_TYPE].release_component_lock(
             node=node, params=None
         )
@@ -762,7 +762,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._assert_receipt_anchor(node, params)
         if node is self.root_node or component_type in params.skipped_lock_components:
             return result
-        self._stamp_release(node)
+        self._stamp_write_horizon(node)
         self.components_by_type[component_type].release_window_lock(
             node,
             params.get_lock_uuid(component_type),
@@ -786,7 +786,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
-        self._stamp_release(node)
+        self._stamp_write_horizon(node)
         swa_component.release_window_lock(
             node,
             params.get_lock_uuid(ComponentType.SWA),
@@ -805,18 +805,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     @staticmethod
-    def _stamp_release(node: UnifiedTreeNode) -> None:
-        """Stamp node's root path, which covers every node a release or
+    def _stamp_write_horizon(node: UnifiedTreeNode) -> None:
+        """Stamp node's root path, which covers every node a lock release or
         insert through it can touch."""
         now = get_and_increase_time_counter()
         while node is not None:
-            node.last_release_time = now
+            node.write_horizon = now
             node = node.parent
 
-    def take_device_frees_release_time(self) -> Optional[float]:
-        release_time = self._device_frees_release_time
-        self._device_frees_release_time = None
-        return release_time
+    def take_device_frees_write_horizon(self) -> Optional[float]:
+        write_horizon = self._device_frees_write_horizon
+        self._device_frees_write_horizon = None
+        return write_horizon
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         node = self.node_by_id(node_id)
@@ -1409,7 +1409,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
         """Refresh the LRUs and append terminal backup actions."""
         # The insert may have put request-owned pages on any node of the path.
-        self._stamp_release(state.target_node)
+        self._stamp_write_horizon(state.target_node)
         if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -1433,7 +1433,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time
-        new_node.last_release_time = child.last_release_time
+        new_node.write_horizon = child.write_horizon
         if self.tlru_bookkeeping:
             # A split adds no depth to the branch: the new parent sits at
             # split_len tokens and inherits the branch's high-water mark, while
@@ -2048,10 +2048,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, target=target, device_frees=device_frees, host_frees=host_frees
         )
         if device_freed > 0 and (
-            self._device_frees_release_time is None
-            or node.last_release_time > self._device_frees_release_time
+            self._device_frees_write_horizon is None
+            or node.write_horizon > self._device_frees_write_horizon
         ):
-            self._device_frees_release_time = node.last_release_time
+            self._device_frees_write_horizon = node.write_horizon
         if tracker is not None:
             if EvictLayer.DEVICE in target:
                 tracker[comp.component_type] += device_freed

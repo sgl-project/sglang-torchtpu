@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.raiden.common import get_raiden_kv_caches
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
 from sglang.srt.disaggregation.raiden.host_pool import (
     StagingAdmission,
@@ -32,6 +33,8 @@ from sglang.srt.disaggregation.raiden.pipeline import (
 )
 from sglang.srt.disaggregation.raiden.serde import MessageTag
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -90,6 +93,7 @@ def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer):
         swa=[buffer(pages) for _ in swa],
         full_layer_ids=list(full),
         swa_layer_ids=list(swa),
+        has_draft_pool=False,
     )
 
 
@@ -871,7 +875,7 @@ class TestPipelineInitialization(unittest.TestCase):
 
     def test_resolved_speculative_mode_is_rejected(self):
         get_context().override("test.speculative", speculative_algorithm="EAGLE3")
-        with self.assertRaisesRegex(ValueError, "does not support speculative"):
+        with self.assertRaisesRegex(ValueError, "draft hidden states"):
             self._initialize()
 
     def test_legacy_host_budget_uses_resolved_node_count(self):
@@ -1003,6 +1007,63 @@ class TestPipelineInitialization(unittest.TestCase):
         message = [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000", b"{}"]
         manager._dispatch(message)
         self.assertEqual(manager._pipeline_messages, [message])
+
+
+class TestSpeculativeSupport(unittest.TestCase):
+    PB2 = SimpleNamespace(
+        StartTransferRequest=SimpleNamespace(
+            DESCRIPTOR=SimpleNamespace(fields_by_name={"wire_pool_indices": None})
+        )
+    )
+
+    def check(self, algorithm, producer=False, has_draft_pool=False):
+        pipe = transfer(producer=producer, pp_size=8 if producer else 1)
+        pipe.manager.attn_cp_size = 1
+        spec = SimpleNamespace(speculative_algorithm=algorithm)
+        layers = SimpleNamespace(has_draft_pool=has_draft_pool)
+        with patch(
+            "sglang.srt.disaggregation.raiden.pipeline.get_spec", return_value=spec
+        ):
+            pipe._check_support(self.PB2, layers)
+
+    def test_no_speculation_is_accepted_on_both_peers(self):
+        self.check(None, producer=True)
+        self.check(None)
+
+    def test_prefill_rejects_any_speculative_algorithm(self):
+        with self.assertRaisesRegex(ValueError, "only on the decode"):
+            self.check("NGRAM", producer=True)
+
+    def test_decode_accepts_a_draft_without_its_own_pool(self):
+        self.check("NGRAM")
+        plugin = CustomSpecAlgo("TARGET_POOL_DRAFT", factory=Mock())
+        with patch.object(SpeculativeAlgorithm, "from_string", return_value=plugin):
+            self.check("TARGET_POOL_DRAFT")
+
+    def test_decode_rejects_a_separate_draft_pool(self):
+        with self.assertRaisesRegex(ValueError, "separate draft KV pool"):
+            self.check("NGRAM", has_draft_pool=True)
+
+    def test_decode_rejects_draft_hidden_states_from_the_prefill(self):
+        with self.assertRaisesRegex(ValueError, "draft hidden"):
+            self.check("EAGLE")
+
+
+class TestDraftPoolGroups(unittest.TestCase):
+    def pool(self, layers=2):
+        return SimpleNamespace(
+            start_layer=0, kv_buffer=[Buffer() for _ in range(layers)]
+        )
+
+    def test_target_pool_alone_has_no_draft_pool(self):
+        target = self.pool()
+        self.assertFalse(get_raiden_kv_caches(target).has_draft_pool)
+        self.assertFalse(get_raiden_kv_caches(target, draft_pool=target).has_draft_pool)
+
+    def test_separate_draft_pool_is_appended_and_flagged(self):
+        groups = get_raiden_kv_caches(self.pool(), draft_pool=self.pool(layers=1))
+        self.assertTrue(groups.has_draft_pool)
+        self.assertEqual(len(groups.full), 3)
 
 
 if __name__ == "__main__":

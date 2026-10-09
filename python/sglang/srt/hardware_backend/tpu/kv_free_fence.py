@@ -1,29 +1,32 @@
-"""Hold freed KV pages back from raiden DMAs until in-flight forwards finish.
+"""Hold freed KV pages back from DMAs until in-flight forwards finish.
 
 Under overlap scheduling, the scheduler processes result N-1 while forward N
 still runs. A request that finished at N-1 is still in forward N's batch, so
-its last pages are freed while forward N is still writing them. raiden's H2D
-DMAs are not ordered against device compute, so a HiCache load allocated one of
-those pages can land before forward N's write and be overwritten.
+its last pages are freed while forward N is still writing them. DMAs such as
+raiden's H2D loads are not ordered against device compute, so a DMA into one
+of those pages can land before forward N's write and be overwritten.
 
 ``KVFreeFence`` holds every page freed while a queued forward result is
 unprocessed, tagged with the latest formed forward, and releases it once that
 result is processed. Which pages a forward writes is never modeled: eviction
 frees are held too, since a finished request's tree insert can cover the slot
 the in-flight forward writes, unless every evicted node was last inserted or
-unlocked before the oldest running forward's batch formed. Forward allocations may
-take held pages, because device compute runs in launch order and the later
-forward's write lands last. Allocations inside ``dma_write_target()`` use free
-pages first and, when short, wait for the in-flight forwards before taking held
-ones.
+unlocked before the oldest running forward's batch formed. Allocations inside
+``forward_write_target()`` may take held pages, because device compute runs in
+launch order and the later forward's write lands last. Every other allocation
+uses free pages first and, when short, waits for the in-flight forwards before
+taking held ones, so a missed scope costs a device sync, not corrupted KV.
 """
 
 from __future__ import annotations
 
+import logging
+import time
 from collections import deque
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Deque, Iterator, List, Optional, Tuple
 
+import msgspec
 import torch
 
 if TYPE_CHECKING:
@@ -31,6 +34,26 @@ if TYPE_CHECKING:
         TpuPagedTokenToKVPoolAllocator,
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+logger = logging.getLogger(__name__)
+
+# Arbitrary; one stats line a minute while forwards run.
+_STATS_LOG_INTERVAL_S = 60.0
+
+
+class KVFreeFenceStats(msgspec.Struct):
+    """Counts since the last stats line, summed over page pools. Device syncs
+    per non-forward pool allocation rise if eviction frees stop skipping the hold."""
+
+    pages_held: int = 0
+    pages_freed_idle: int = 0
+    pages_freed_past_write_horizon: int = 0
+    pages_borrowed: int = 0
+    non_forward_allocs: int = 0
+    device_syncs: int = 0
+    device_sync_s: float = 0.0
 
 
 class KVFreeFence:
@@ -51,30 +74,36 @@ class KVFreeFence:
         self._in_flight: Deque[Tuple[int, float, object]] = deque()
         # Latest seq a device sync has covered.
         self._device_done = 0
-        self._dma_write_target = False
-        self._free_release_time: Optional[float] = None
+        self._forward_write_target = False
+        self._free_write_horizon: Optional[float] = None
         self._allocators: List[TpuPagedTokenToKVPoolAllocator] = []
+        self.stats = KVFreeFenceStats()
+        self._stats_since = time.monotonic()
 
     def attach(self, allocator: TpuPagedTokenToKVPoolAllocator) -> None:
         allocator.kv_free_fence = self
         self._allocators.append(allocator)
 
     @property
-    def in_dma_write_target(self) -> bool:
-        return self._dma_write_target
+    def in_forward_write_target(self) -> bool:
+        return self._forward_write_target
 
-    def hold_tag(self) -> Optional[int]:
-        """Forward a page freed now must wait for, or None to free it at once."""
+    def hold_tag(self, *, num_pages: int) -> Optional[int]:
+        """Forward ``num_pages`` pages freed now must wait for, or None to free
+        them at once."""
         oldest_running = next(
             (t for seq, t, _ in self._in_flight if seq > self._device_done), None
         )
         if oldest_running is None:
+            self.stats.pages_freed_idle += num_pages
             return None
         if (
-            self._free_release_time is not None
-            and self._free_release_time < oldest_running
+            self._free_write_horizon is not None
+            and self._free_write_horizon < oldest_running
         ):
+            self.stats.pages_freed_past_write_horizon += num_pages
             return None
+        self.stats.pages_held += num_pages
         return self._formed
 
     def on_batch_formed(self) -> None:
@@ -107,6 +136,7 @@ class KVFreeFence:
         # Pages tagged with a forward still in flight stay held.
         oldest = self._in_flight[0][0] if self._in_flight else self._formed + 1
         self._release(oldest - 1)
+        self._maybe_log_stats()
 
     def wait_for_in_flight(self) -> None:
         """Block until every in-flight forward finishes, then release the
@@ -116,7 +146,10 @@ class KVFreeFence:
         launched = self._formed
         if self._in_flight and self._in_flight[-1][2] is None:
             launched -= 1
+        start = time.perf_counter()
         self._synchronize_device()
+        self.stats.device_syncs += 1
+        self.stats.device_sync_s += time.perf_counter() - start
         self._device_done = launched
         self._release(launched)
 
@@ -124,25 +157,49 @@ class KVFreeFence:
         for allocator in self._allocators:
             allocator.release_held_pages(completed)
 
-    @contextmanager
-    def freeing_released_values(self, release_time: Optional[float]) -> Iterator[None]:
-        """Frees here are of values no forward formed after ``release_time``
-        writes; they skip the hold if every running forward formed later."""
-        prev, self._free_release_time = self._free_release_time, release_time
-        try:
-            yield
-        finally:
-            self._free_release_time = prev
+    def _maybe_log_stats(self) -> None:
+        now = time.monotonic()
+        if now - self._stats_since < _STATS_LOG_INTERVAL_S:
+            return
+        stats, self.stats = self.stats, KVFreeFenceStats()
+        window_s, self._stats_since = now - self._stats_since, now
+        logger.info(
+            "KV free fence over %.0fs: pages held %d, freed idle %d, freed past "
+            "write horizon %d, borrowed %d, held now %d; non-forward pool "
+            "allocations %d, device syncs %d (%.3f per allocation, %.1f ms)",
+            window_s,
+            stats.pages_held,
+            stats.pages_freed_idle,
+            stats.pages_freed_past_write_horizon,
+            stats.pages_borrowed,
+            sum(allocator.held_pages.num_pages for allocator in self._allocators),
+            stats.non_forward_allocs,
+            stats.device_syncs,
+            stats.device_syncs / max(stats.non_forward_allocs, 1),
+            stats.device_sync_s * 1e3,
+        )
 
     @contextmanager
-    def dma_write_target(self) -> Iterator[None]:
-        """Allocations here are written by DMAs that are not ordered against
-        device compute, so they only get pages no in-flight forward may write."""
-        prev, self._dma_write_target = self._dma_write_target, True
+    def freeing_values_written_before(
+        self, write_horizon: Optional[float]
+    ) -> Iterator[None]:
+        """Frees here are of values no forward formed after ``write_horizon``
+        writes; they skip the hold if every running forward formed later."""
+        prev, self._free_write_horizon = self._free_write_horizon, write_horizon
         try:
             yield
         finally:
-            self._dma_write_target = prev
+            self._free_write_horizon = prev
+
+    @contextmanager
+    def forward_write_target(self) -> Iterator[None]:
+        """Allocations here are written only by forwards, which run after the
+        in-flight ones, so they may take pages those forwards still write."""
+        prev, self._forward_write_target = self._forward_write_target, True
+        try:
+            yield
+        finally:
+            self._forward_write_target = prev
 
 
 class HeldPages:
@@ -181,21 +238,42 @@ class HeldPages:
         self.num_pages -= num_pages
         return torch.cat(taken)
 
-    def clear(self) -> None:
-        self._entries.clear()
-        self.num_pages = 0
+
+def assert_not_forward_write_target(allocator: BaseTokenToKVPoolAllocator) -> None:
+    """A DMA lands whenever it lands, so its target must never be a page an
+    in-flight forward may still write: only forward allocations may borrow."""
+    fence = allocator.kv_free_fence
+    assert fence is None or not fence.in_forward_write_target, (
+        "A DMA target was allocated inside forward_write_target()"
+    )
 
 
 def install_kv_free_fence(
-    allocator: BaseTokenToKVPoolAllocator, synchronize_device: Callable[[], None]
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    synchronize_device: Callable[[], None],
+    spec_algorithm: SpeculativeAlgorithm | CustomSpecAlgo,
+    copies_draft_tail: bool,
 ) -> KVFreeFence:
     """Attach a fence to ``allocator`` and its page pools. Raises unless every
-    pool is a TPU paged allocator, whose frees and allocations it hooks."""
+    pool is a TPU paged allocator, whose frees and allocations it hooks, and
+    every KV write of a forward precedes a tensor its result copies to host."""
     from sglang.srt.hardware_backend.tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
+    if not spec_algorithm.supports_kv_free_fence(copies_draft_tail=copies_draft_tail):
+        # copy_done would complete before the KV writes that follow every copy.
+        hint = (
+            " unless SGLANG_TPU_ASYNC_COPY_WORKER is on"
+            if spec_algorithm.supports_kv_free_fence(copies_draft_tail=True)
+            else ""
+        )
+        raise ValueError(
+            f"{spec_algorithm.name} speculative decoding is not supported with "
+            f"the raiden HiCache backend under overlap scheduling on TPU{hint}."
+        )
     if type(allocator) is SWATokenToKVPoolAllocator:
         pools = [allocator.full_attn_allocator, allocator.swa_attn_allocator]
     else:

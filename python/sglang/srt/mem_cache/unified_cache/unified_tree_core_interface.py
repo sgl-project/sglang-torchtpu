@@ -162,10 +162,11 @@ class UnifiedTreeCoreInterface(ABC):
         """Hand the queued KV placement events to the Controller."""
         return self.kv_events.take()
 
-    def take_device_frees_release_time(self) -> Optional[float]:
-        """Latest insert or lock-release time, on the tree's time counter, of
-        the nodes whose device values were freed since the last call; None
-        when unknown. Forwards formed after it cannot write those values."""
+    def take_device_frees_write_horizon(self) -> Optional[float]:
+        """Write horizon: latest insert or lock-release time, on the tree's
+        time counter, of the nodes whose device values were freed since the
+        last call; None when unknown. Forwards formed after it cannot write
+        those values."""
         return None
 
     @abstractmethod

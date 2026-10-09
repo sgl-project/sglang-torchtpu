@@ -435,8 +435,19 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        local_expert_range: Optional[Tuple[int, int]] = None
+        """Routed-expert ids this EP rank stores, when the model opts into
+        EP-local reads (see ``tpu_local_routed_expert_range``)."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
+            local_expert_range = None
+            if _is_tpu:
+                from sglang.srt.hardware_backend.tpu.ep_local_expert_reader import (
+                    tpu_local_routed_expert_range,
+                )
+
+                local_expert_range = tpu_local_routed_expert_range(model)
             return cls(
                 model_config.model_path,
                 model_config.revision,
@@ -446,6 +457,7 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                local_expert_range=local_expert_range,
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -714,6 +726,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    local_expert_range=source.local_expert_range,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -722,6 +735,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    local_expert_range=source.local_expert_range,
                 )
 
         else:

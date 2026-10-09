@@ -168,7 +168,9 @@ and a cached decode prefix is clipped from each layer's transfer.
 Each worker owns one Raiden engine. Pipeline stages share one controller hosted
 by stage zero; independent attention-DP workers each own one. Pool geometry and
 materialized TPU layouts must match between peers. Every pipeline stage needs
-at least one full-attention layer, and speculative decoding is unsupported.
+at least one full-attention layer. Speculative decoding is supported only on
+the decode, and only when its draft has no separate KV pool and takes no draft
+hidden states from the prefill.
 Host staging uses bounded leases when the installed Raiden supports per-pool
 staging. Older PP-capable wheels use full host mirrors; startup measures their
 materialized block-major page layouts and bounds their

@@ -24,6 +24,9 @@ from typing import Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+    assert_not_forward_write_target,
+)
 from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
@@ -123,10 +126,7 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
-        # The fence keeps in-flight forward writes off only the pages allocated
-        # inside dma_write_target(); this DMA's targets are allocated below.
-        fence = self.mem_pool_device_allocator.kv_free_fence
-        assert fence is None or fence.in_dma_write_target
+        assert_not_forward_write_target(self.mem_pool_device_allocator)
         device_indices = super().load(
             host_indices=host_indices,
             priority=priority,
