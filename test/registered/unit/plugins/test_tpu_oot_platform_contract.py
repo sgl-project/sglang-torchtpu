@@ -51,6 +51,7 @@ def _load_tool(filename: str, name: str):
 
 gate_audit = _load_tool("gate_audit.py", "_tpu_gate_audit")
 tpu_debt = _load_tool("check_tpu_branches.py", "_tpu_debt_ratchet")
+inventory = _load_tool("inventory.py", "_tpu_inventory")
 
 
 # Gate-reachable methods the TPU platform does not answer; the list only shrinks.
@@ -550,6 +551,43 @@ class TestTpuDebtRatchet(CustomTestCase):
             return counter(path)
         finally:
             os.unlink(path)
+
+
+# Attributes a patch creates on a core class rather than replaces.
+ADDED_BY_PATCHES = {
+    "sglang.srt.managers.overlap_utils.FutureMap.tpu_direct_handoff",
+    "sglang.srt.managers.overlap_utils.FutureMap.tpu_published_seq_lens",
+}
+
+
+class TestTpuPatchInventory(CustomTestCase):
+    def test_every_patched_core_attribute_exists(self):
+        """After an upstream rename, a setattr patch adds a dead attribute and the
+        renamed code runs unpatched, silently."""
+        import pkgutil
+
+        targets = [
+            (patch.name, target)
+            for patch in inventory.collect_patches(_REPO_ROOT)
+            for target in patch.targets
+            if target.startswith("sglang.")
+        ]
+        self.assertGreater(len(targets), 0)
+        missing = []
+        for name, target in targets:
+            try:
+                pkgutil.resolve_name(target)
+                exists = True
+            except (ImportError, AttributeError):
+                exists = False
+            if exists == (target in ADDED_BY_PATCHES):
+                missing.append(f"{name}: {target}")
+        self.assertEqual(
+            missing,
+            [],
+            "Retarget a patch whose core attribute is gone; list one the patch adds "
+            "on purpose in ADDED_BY_PATCHES, and drop it once core defines it.",
+        )
 
 
 if __name__ == "__main__":

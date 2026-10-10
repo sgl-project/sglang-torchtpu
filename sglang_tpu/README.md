@@ -70,6 +70,10 @@ The old paths under `python/sglang/srt/` are one-file re-export shims so
 in-flight branches keep importing; they are deleted once the open-PR backlog
 drains. Do not add code to them.
 
+`tools/plugin/inventory.py` lists every hook and runtime patch with the core
+attributes it replaces; `tools/plugin/scoreboard.py` prints every debt counter
+of the migration. The TPU Plugin Scoreboard workflow publishes both daily.
+
 ## Rules for new TPU code
 
 1. New TPU-only modules go here, never under `python/sglang/srt/`.
