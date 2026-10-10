@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch.compiler.config as compiler_config
 
@@ -63,7 +63,18 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertEqual(self.platform.get_compile_backend(), "tpu")
 
     def test_distributed_backend(self):
-        self.assertEqual(self.platform.get_torch_distributed_backend_str(), "tpu_dist")
+        for world_size, backend in [
+            ("1", "gloo"),
+            ("8", "tpu_dist"),
+            ("16", "tpu_dist"),
+        ]:
+            with (
+                self.subTest(world_size=world_size),
+                patch.dict(os.environ, {"WORLD_SIZE": world_size}),
+            ):
+                self.assertEqual(
+                    self.platform.get_torch_distributed_backend_str(), backend
+                )
 
     def test_default_attention_backend(self):
         self.assertEqual(
@@ -74,6 +85,48 @@ class TestTpuPlatformIdentity(CustomTestCase):
 class TestTpuPlatformInitialization(CustomTestCase):
     def setUp(self):
         self.platform = TpuSRTPlatform()
+
+    def test_single_process_initialization_restores_world_size(self):
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                platform = TpuSRTPlatform()
+                tensor = Mock()
+
+                def initialize(*args, **kwargs):
+                    self.assertNotIn("WORLD_SIZE", os.environ)
+                    if fails:
+                        raise RuntimeError("TPU initialization failed")
+                    return tensor
+
+                with (
+                    patch.dict(os.environ, {"WORLD_SIZE": "1"}),
+                    patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
+                    compiler_config.patch(cache_key_tag=""),
+                    patch(
+                        "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+                    ) as prepare,
+                    patch(
+                        "sglang.srt.hardware_backend.tpu.patches.apply_tpu_patches"
+                    ) as apply_patches,
+                    patch(
+                        "sglang.srt.hardware_backend.tpu.tpu_platform.torch.ones",
+                        side_effect=initialize,
+                    ) as allocate,
+                ):
+                    if fails:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "TPU initialization failed"
+                        ):
+                            platform.init_backend()
+                        apply_patches.assert_not_called()
+                    else:
+                        platform.init_backend()
+                        platform.init_backend()
+                        allocate.assert_called_once_with(1, device="tpu")
+                        tensor.cpu.assert_called_once_with()
+                        apply_patches.assert_called_once_with()
+                    self.assertEqual(os.environ["WORLD_SIZE"], "1")
+                    prepare.assert_called_once_with(1, setup_slicebuilder=False)
 
     def test_rejects_backend_initialization_without_worker_world_size(self):
         with (

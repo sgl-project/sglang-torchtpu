@@ -655,7 +655,21 @@ class TpuSRTPlatform(SRTPlatform):
         # WORLD_SIZE is authoritative only inside a scheduler worker. Validate
         # the inherited launch environment here; any TorchTPU-dependent
         # topology discovery is therefore confined to the worker.
-        _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
+        if int(world_size) == 1:
+            _prepare_tpu_env(1, setup_slicebuilder=False)
+            # TorchTPU treats even WORLD_SIZE=1 as a distributed slice and
+            # restricts it to one chip. Dynamic TPU pools require a whole-host
+            # session. Initialize the native client before restoring c10d's
+            # worker environment; TorchTPU uses its first addressable device.
+            os.environ.pop("WORLD_SIZE")
+            try:
+                import torch_tpu  # noqa: F401
+
+                torch.ones(1, device="tpu").cpu()
+            finally:
+                os.environ["WORLD_SIZE"] = world_size
+        else:
+            _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
 
         import torch_tpu  # noqa: F401
 
@@ -743,6 +757,10 @@ class TpuSRTPlatform(SRTPlatform):
         return (total - used, total)
 
     def get_torch_distributed_backend_str(self) -> str:
+        # A native client can expose several devices to one process, which
+        # tpu_dist rejects. One-rank groups only need CPU coordination.
+        if os.environ.get("WORLD_SIZE") == "1":
+            return "gloo"
         return "tpu_dist"
 
     @classmethod
