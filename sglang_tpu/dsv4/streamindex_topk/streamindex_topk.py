@@ -26,11 +26,11 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
-from sglang.srt.hardware_backend.tpu.dsv4.sparsecore_topk import (
+from sglang_tpu.dsv4.sparsecore_topk import (
     BITS_NEG_INF,
     sparsecore_topk,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk import (
+from sglang_tpu.dsv4.streamindex_topk import (
     bref_override,
     config,
     metadata,

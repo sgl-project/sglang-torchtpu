@@ -18,9 +18,9 @@ from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.patches import _register_tpu_compile_backend
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
                     raise ValueError(
                         "Async direct vision compilation does not support bundles"
                     )
-                from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+                from sglang_tpu.compilation.direct_compile import (
                     direct_compile,
                 )
 
@@ -381,7 +381,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
         Defaults to the compiled region. Override when the encoder has an
         eager prologue or epilogue that is shape-static per bucket too.
         """
-        from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+        from sglang_tpu.compilation.direct_compile import (
             CompiledFunction,
         )
 

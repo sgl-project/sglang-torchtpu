@@ -7,17 +7,17 @@ import weakref
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
-    collect_warmups,
-    current_warmup_queue,
-)
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.warmup_queue import (
+    collect_warmups,
+    current_warmup_queue,
+)
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

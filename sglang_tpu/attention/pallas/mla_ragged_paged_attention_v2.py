@@ -45,7 +45,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.attention.pallas import mla_kv_utils as kv_utils
+from sglang_tpu.attention.pallas import mla_kv_utils as kv_utils
 
 logger = logging.getLogger(__name__)
 
@@ -2398,7 +2398,7 @@ def mla_ragged_paged_attention(
         # only live when chunk_prefill_size is set (sglang never sets it),
         # MIXED uses slot[2]. The "decode" tuned entry also carries
         # `decode_batch_size`, which overrides the caller's value if hit.
-        from sglang.srt.layers.attention.pallas.tuned_block_sizes_mla import (
+        from sglang_tpu.attention.pallas.tuned_block_sizes_mla import (
             get_tuned_block_sizes_mla,
         )
 

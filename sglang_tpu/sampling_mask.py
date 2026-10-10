@@ -39,7 +39,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+from sglang_tpu.row_pad import pad_rows, row_bucket
 
 _TPU_FILTER_PROBS_OP: Optional[Callable] = None
 
@@ -56,7 +56,7 @@ def _get_tpu_filter_probs_op() -> Callable:
     import jax.numpy as jnp
     from jax import lax
 
-    from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     # Cutoffs live in [0, 2), where only bits 29..0 of the pattern vary.
     search_bits = 30

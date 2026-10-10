@@ -35,7 +35,12 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
 )
-from sglang.srt.disaggregation.raiden.common import (
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_disagg, get_schedule
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.network import NetworkAddress
+from sglang_tpu.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
     RaidenKVCacheGroups,
@@ -43,19 +48,19 @@ from sglang.srt.disaggregation.raiden.common import (
     get_raiden_kv_caches,
     logger,
 )
-from sglang.srt.disaggregation.raiden.host_pool import (
+from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     node_worker_rank,
     ranks_per_node,
     slot_host_bytes,
     slots_within_budget,
 )
-from sglang.srt.disaggregation.raiden.receiver import (
+from sglang_tpu.disaggregation.raiden.receiver import (
     RaidenKVReceiver,
     RaidenReceiverMixin,
 )
-from sglang.srt.disaggregation.raiden.sender import RaidenKVSender, RaidenSenderMixin
-from sglang.srt.disaggregation.raiden.serde import (
+from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender, RaidenSenderMixin
+from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     MessageTag,
@@ -66,12 +71,7 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
-from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_disagg, get_schedule
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.network import NetworkAddress
+from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 
 # Re-exported so that "from …raiden.conn import X" keeps resolving for the
 # callers and tests that predate the split into common/sender/receiver.
@@ -290,7 +290,7 @@ class RaidenKVManager(
         is identical. Taking it from the SWA tensor rather than assuming it
         matches keeps the two pools free to differ in dtype or head_dim.
         """
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
             head_pair_bytes,
         )
@@ -322,7 +322,7 @@ class RaidenKVManager(
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
         if self._pipeline_enabled:
-            from sglang.srt.disaggregation.raiden.pipeline import PipelineTransfer
+            from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
             pipeline = PipelineTransfer(self, kv_caches)
             self._engine = pipeline.engine

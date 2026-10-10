@@ -3,8 +3,8 @@
 import threading
 import unittest
 
-from sglang.srt.hardware_backend.tpu.kv_copy_worker import TpuKvCopyWorker
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.kv_copy_worker import TpuKvCopyWorker
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

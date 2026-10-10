@@ -10,8 +10,8 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sglang.srt.hardware_backend.tpu._logging import get_logger
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
+from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.pending_call import PendingCall
 
 logger = get_logger(__name__)
 

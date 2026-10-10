@@ -205,7 +205,7 @@ def get_fused_rope_write_op(num_layers: int, max_span_len: int) -> Callable[...,
     """
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
     aliases = {7 + i: i for i in range(num_layers)}
     jax_kernel = _torch_pallas.custom_jax_kernel(

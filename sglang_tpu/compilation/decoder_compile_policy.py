@@ -16,25 +16,6 @@ from torch.utils._pytree import tree_leaves
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu._logging import get_logger
-from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
-    get_attention_rank_tensors,
-    use_attention_rank_tensors,
-)
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    _REAL_B_KEY,
-    _REAL_Q_KEY,
-    CompiledForwardShim,
-    _extend_batch_cap,
-    _pad_forward_batch_inputs,
-    _restore_forward_batch_inputs,
-    build_bucketers,
-)
-from sglang.srt.hardware_backend.tpu.compilation.frame_stack import (
-    call_with_reserved_frame_stack,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -60,6 +41,25 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.attention_rank_inputs import (
+    get_attention_rank_tensors,
+    use_attention_rank_tensors,
+)
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.compiled_forward_shim import (
+    _REAL_B_KEY,
+    _REAL_Q_KEY,
+    CompiledForwardShim,
+    _extend_batch_cap,
+    _pad_forward_batch_inputs,
+    _restore_forward_batch_inputs,
+    build_bucketers,
+)
+from sglang_tpu.compilation.frame_stack import (
+    call_with_reserved_frame_stack,
+)
+from sglang_tpu.compilation.pending_call import PendingCall
 
 logger = get_logger(__name__)
 
@@ -645,7 +645,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self, fn: Callable[..., Any]
     ) -> tuple[Callable[..., Any], Callable[..., PendingCall]]:
         """Compile directly through TorchTPU without Dynamo or AOTAutograd."""
-        from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+        from sglang_tpu.compilation.direct_compile import (
             direct_compile,
         )
 
@@ -805,7 +805,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _distributed_top_k_width(self) -> int | None:
         if not self._compiles_logits_processor():
             return None
-        from sglang.srt.hardware_backend.tpu.sampler import (
+        from sglang_tpu.sampler import (
             distributed_top_k_candidate_width_for_model,
         )
 
@@ -821,7 +821,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
         if spec_algorithm is not None and not spec_algorithm.is_none():
             return (LogitsOutputMode.FULL_VOCAB,)
-        from sglang.srt.hardware_backend.tpu.sampler import (
+        from sglang_tpu.sampler import (
             distributed_top_k_min_batch_size,
         )
 
@@ -1169,7 +1169,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 args = (*args[:2], prepared_batch, *args[3:])
             forward_batch = prepared_batch
         if profile_prefix is not None:
-            from sglang.srt.hardware_backend.tpu.pp_profile import set_profile_inputs
+            from sglang_tpu.pp_profile import set_profile_inputs
 
             args, kwargs = set_profile_inputs(
                 self, forward_batch, args, kwargs, num_tokens, profile_prefix
@@ -1677,7 +1677,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         each token bucket unless warmed here. The deepstack grid needs no warm:
         it is bound straight from its host matrix, which is a plain transfer.
         """
-        from sglang.srt.hardware_backend.tpu.mm_embed_tpu import apply_host_mm_embeds
+        from sglang_tpu.mm_embed_tpu import apply_host_mm_embeds
 
         assert self.t_bucketer is not None
 

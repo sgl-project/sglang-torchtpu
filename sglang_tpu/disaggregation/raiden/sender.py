@@ -22,16 +22,16 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVSender
-from sglang.srt.disaggregation.raiden.chunk_plan import (
+from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
 )
-from sglang.srt.disaggregation.raiden.common import (
+from sglang_tpu.disaggregation.raiden.common import (
     RESHARD_PUSH_PARALLELISM,
     _tcp_endpoint,
     logger,
 )
-from sglang.srt.disaggregation.raiden.serde import (
+from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     PullReq,
@@ -45,7 +45,7 @@ from sglang.srt.disaggregation.raiden.serde import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
+    from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 
 # Send errors whose cause belongs to one peer, so they cost that peer's room
 # rather than the engine. An errno not listed here is assumed engine-wide
@@ -773,7 +773,7 @@ class RaidenSenderMixin:
 
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             build_sender_request,
         )
 
@@ -858,7 +858,7 @@ class RaidenSenderMixin:
     ) -> None:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             build_sender_request,
         )
 

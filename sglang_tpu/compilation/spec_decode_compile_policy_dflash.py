@@ -11,21 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hardware_backend.tpu._logging import get_logger
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    _REAL_B_KEY,
-    _REAL_Q_KEY,
-    _restore_forward_batch_inputs,
-)
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-)
-from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-    install_recompilation_checker,
-)
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    BaseSpecDecodeCompilePolicyMixin,
-)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -38,6 +23,21 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.spec_info import SpecInput, SpecPaddingState
+from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.compiled_forward_shim import (
+    _REAL_B_KEY,
+    _REAL_Q_KEY,
+    _restore_forward_batch_inputs,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+)
+from sglang_tpu.compilation.recompilation_checker import (
+    install_recompilation_checker,
+)
+from sglang_tpu.compilation.spec_decode_compile_policy import (
+    BaseSpecDecodeCompilePolicyMixin,
+)
 
 logger = get_logger(__name__)
 
@@ -164,7 +164,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         """
         fn = torch.no_grad()(fn)
         if self.tracer == "direct":
-            from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+            from sglang_tpu.compilation.direct_compile import (
                 direct_compile,
             )
 
@@ -314,7 +314,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
         fn = torch.no_grad()(fn)
         if self.tracer == "direct":
-            from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+            from sglang_tpu.compilation.direct_compile import (
                 direct_compile,
             )
 

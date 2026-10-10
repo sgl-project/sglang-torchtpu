@@ -6,9 +6,9 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.tpu.allocator_tpu import alloc_extend_vectorized_cpu
 from sglang.srt.mem_cache.allocator import alloc_extend_naive
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.allocator_tpu import alloc_extend_vectorized_cpu
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

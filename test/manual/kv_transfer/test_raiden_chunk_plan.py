@@ -8,7 +8,7 @@ Run: python -m pytest test/manual/kv_transfer/test_raiden_chunk_plan.py
 
 import unittest
 
-from sglang.srt.disaggregation.raiden.chunk_plan import (
+from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
 )

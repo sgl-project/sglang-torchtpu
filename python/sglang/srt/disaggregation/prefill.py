@@ -115,7 +115,7 @@ _is_npu = is_npu()
 _is_tpu = is_tpu()
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.prefill_early_send import (
+    from sglang_tpu.prefill_early_send import (
         tpu_clip_cached_prefix_send_end,
         tpu_clip_hicache_load_send_end,
         tpu_update_inflight_kv_write_pages,
@@ -385,7 +385,7 @@ class PrefillBootstrapQueue:
         # Raiden needs the per-layer device KV tensors (it indexes their major
         # dim as pages). The TPU fused KV pool exposes them via kv_buffer.
         if hasattr(kv_manager, "set_kv_caches"):
-            from sglang.srt.disaggregation.raiden.conn import get_raiden_kv_caches
+            from sglang_tpu.disaggregation.raiden.conn import get_raiden_kv_caches
 
             kv_manager.set_kv_caches(
                 get_raiden_kv_caches(

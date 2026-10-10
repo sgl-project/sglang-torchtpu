@@ -10,7 +10,6 @@ from typing import NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.top_k import PallasDistributedTopKConfig
 from sglang.srt.layers.sampler import (
     Sampler,
     _SamplingMaskCapture,
@@ -21,6 +20,7 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang_tpu.top_k import PallasDistributedTopKConfig
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
             "the logits processor does not use a supported TP gather"
         )
 
-    from sglang.srt.hardware_backend.tpu.top_k import (
+    from sglang_tpu.top_k import (
         negotiate_pallas_distributed_top_k_config,
     )
 
@@ -105,7 +105,7 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
     )
     config = negotiation.config
     if config is not None:
-        from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
+        from sglang_tpu.distributed_topk_pallas import (
             register_pallas_distributed_top_k_op,
         )
 
@@ -200,7 +200,7 @@ def _filter_gathered_top_k_probs(
     first column. Nothing renormalizes on this path, so gathered
     probabilities stay directly comparable to full-row ones."""
 
-    from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+    from sglang_tpu.sampling_mask import tpu_filter_probs
 
     return tpu_filter_probs(
         top_k_probs,
@@ -446,7 +446,7 @@ class TpuSampler(Sampler):
             and sampling_info.need_top_k_sampling
             and (not needs_top_p_or_min_p or _use_bsearch_filtering(probs))
         ):
-            from sglang.srt.hardware_backend.tpu.top_k import tpu_top_k
+            from sglang_tpu.top_k import tpu_top_k
 
             global_top_k_probs, global_top_k_token_ids = tpu_top_k(probs, top_k)
             if needs_top_p_or_min_p:
@@ -478,7 +478,7 @@ class TpuSampler(Sampler):
             # Sort-free path: the torch fallback below needs a full-vocab sort
             # plus boolean-mask scatters, which run eagerly on TPU at ~415 ms
             # per decode step. The binary-search mask is one compiled program.
-            from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+            from sglang_tpu.sampling_mask import tpu_filter_probs
 
             filtered_probs = tpu_filter_probs(
                 probs,

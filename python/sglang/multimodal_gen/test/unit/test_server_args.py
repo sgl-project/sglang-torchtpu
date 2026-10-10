@@ -3455,7 +3455,7 @@ class TestTpuDistributedArgs(unittest.TestCase):
     def _slice_env(self, **env):
         with (
             patch.dict(os.environ, env, clear=False),
-            patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env") as prep,
+            patch("sglang_tpu.patches._prepare_tpu_env") as prep,
         ):
             yield prep
 

@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.attention.pallas.gdn import config, memory_ref, typed_ldst
+from sglang_tpu.attention.pallas.gdn import config, memory_ref, typed_ldst
 
 
 def load_strided_heads(

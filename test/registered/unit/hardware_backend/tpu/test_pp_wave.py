@@ -15,8 +15,8 @@ import unittest
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.pp_wave import PPWave
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.pp_wave import PPWave
 
 ROWS, HIDDEN = 8, 4
 

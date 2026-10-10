@@ -106,7 +106,7 @@ if _is_npu:
     graph_runners_dict["npu"] = ViTNpuGraphRunner
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+    from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
         Qwen3VLVisionTpuCompilePolicy,
         ViTTpuCompileRunner,
     )
@@ -1399,7 +1399,7 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 if current_platform.supports_torch_compile():
-    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    from sglang_tpu.compilation.decoder_compile_policy import (
         Qwen3VLDecoderTpuCompilePolicy,
     )
 

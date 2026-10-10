@@ -92,7 +92,7 @@ class RaidenKVBackup:
     """Pinned host staging for retracted requests, moved by raiden DMA."""
 
     def __init__(self, device_pool, num_host_pages: int):
-        from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
+        from sglang_tpu.raiden_transfer import RaidenKVTransfer
 
         self._transfer = RaidenKVTransfer(device_pool, num_host_pages)
         self._page_size = device_pool.page_size

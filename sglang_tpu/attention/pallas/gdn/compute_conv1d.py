@@ -18,7 +18,7 @@
 import jax
 import jax.numpy as jnp
 
-from sglang.srt.layers.attention.pallas.gdn import config
+from sglang_tpu.attention.pallas.gdn import config
 
 
 def causal_conv1d(

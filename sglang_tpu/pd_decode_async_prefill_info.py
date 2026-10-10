@@ -19,7 +19,7 @@ from concurrent.futures import Future
 from typing import Dict, List, Tuple
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
-from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang_tpu._logging import get_logger
 
 logger = get_logger(__name__)
 

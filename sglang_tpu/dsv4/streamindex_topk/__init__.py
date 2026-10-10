@@ -16,17 +16,17 @@
 # Source: src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/__init__.py
 """TPU-Friendly StreamIndex Top-K kernel."""
 
-from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk import (
+from sglang_tpu.dsv4.streamindex_topk import (
     bref_override,
     config,
     metadata,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk.config import (
+from sglang_tpu.dsv4.streamindex_topk.config import (
     DEFAULT_BUFFER_COUNT,
     KVLayout,
     MlaCase,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk.streamindex_topk import (
+from sglang_tpu.dsv4.streamindex_topk.streamindex_topk import (
     DCP_AXIS_NAME,
     DEFAULT_VMEM_LIMIT_BYTES,
     _select_owned_winners,

@@ -22,9 +22,9 @@ import time
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
-from sglang.srt.hardware_backend.tpu.kv_pool_host import TpuRaidenHostKVCache
-from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.kv_pool_host import TpuRaidenHostKVCache
+from sglang_tpu.raiden_transfer import RaidenKVTransfer
 
 DEVICE = "tpu:0"
 PAGE_SIZE = 64

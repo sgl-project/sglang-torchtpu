@@ -19,9 +19,9 @@
 import jax
 import jax.numpy as jnp
 
-import sglang.srt.hardware_backend.tpu.dsv4.compress_and_store.config as config
-import sglang.srt.hardware_backend.tpu.dsv4.compress_and_store.kernel as compress_kernel
-import sglang.srt.hardware_backend.tpu.dsv4.compress_and_store.proj_and_save_state as proj_kernel
+import sglang_tpu.dsv4.compress_and_store.config as config
+import sglang_tpu.dsv4.compress_and_store.kernel as compress_kernel
+import sglang_tpu.dsv4.compress_and_store.proj_and_save_state as proj_kernel
 
 
 def block_table_row_stride(block_table: jax.Array, num_reqs: int) -> int:

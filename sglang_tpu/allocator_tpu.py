@@ -32,9 +32,9 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_free_fence import HeldPages
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_num_new_pages
+from sglang_tpu.kv_free_fence import HeldPages
 
 
 def alloc_extend_vectorized_cpu(

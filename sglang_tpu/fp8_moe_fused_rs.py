@@ -14,13 +14,13 @@ import os
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
+from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+from sglang_tpu.fused_rs_sequence_parallel import (
     get_tpu_fused_rs_post_expert_norm_weight,
     has_tpu_fused_rs_post_expert_norm,
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
 )
-from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 
 def supports_fp8_fused_rs(
@@ -166,7 +166,7 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
 
     # prepare_tpu_fp8_moe_weights stores weights as (E, K, N) and scales as
     # (E, 1, 1, N) channelwise or (E, K // block, 1, N) blockwise.
-    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
+    from sglang_tpu.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
 
     prepare_fused_moe_rs(layer)
     return True
@@ -208,7 +208,7 @@ def _apply_fp8_fused_rs(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk = int(topk_ids.shape[-1])
     block_quantized = getattr(layer, "weight_block_size", None) is not None
-    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
+    from sglang_tpu.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
 
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)

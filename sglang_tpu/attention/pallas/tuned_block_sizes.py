@@ -5,8 +5,8 @@ import logging
 
 import jax.numpy as jnp
 
-from sglang.srt.hardware_backend.tpu.pallas_export import get_torch_tpu_device_kind
-from sglang.srt.layers.attention.pallas.util import get_tpu_version, next_power_of_2
+from sglang_tpu.attention.pallas.util import get_tpu_version, next_power_of_2
+from sglang_tpu.pallas_export import get_torch_tpu_device_kind
 
 
 def get_device_name(num_devices: int | None = None) -> str:

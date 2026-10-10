@@ -58,11 +58,11 @@ import numpy.typing as npt
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
+from sglang_tpu.disaggregation.tpu import transfer as tpu_transfer
 
 # Re-exported from base so existing imports (and a future raiden backend)
 # keep resolving ``from ...tpu.conn import KVTransferError, _tcp_endpoint``.
-from sglang.srt.disaggregation.tpu.base import (  # noqa: F401
+from sglang_tpu.disaggregation.tpu.base import (  # noqa: F401
     KVTransferError,
     TpuKVBootstrapServerBase,
     TpuKVManagerBase,
@@ -70,13 +70,13 @@ from sglang.srt.disaggregation.tpu.base import (  # noqa: F401
     TpuKVSenderBase,
     _tcp_endpoint,
 )
-from sglang.srt.disaggregation.tpu.host_staging import (
+from sglang_tpu.disaggregation.tpu.host_staging import (
     PinnedHostPool,
     StageBuf,
     default_pool_max_bytes,
 )
-from sglang.srt.disaggregation.tpu.serde import KVDataChannelHeader, MessageTag
-from sglang.srt.disaggregation.tpu.transfer import (
+from sglang_tpu.disaggregation.tpu.serde import KVDataChannelHeader, MessageTag
+from sglang_tpu.disaggregation.tpu.transfer import (
     DecodeTransferState,
     PendingChunk,
     PrefillTransferInfo,

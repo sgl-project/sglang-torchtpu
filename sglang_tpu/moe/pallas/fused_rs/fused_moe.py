@@ -27,18 +27,18 @@ from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sglang.srt.layers.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
+from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     _select_fused_rs_block_sizes,
 )
-from sglang.srt.layers.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
+from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
 )
-from sglang.srt.layers.moe.pallas.fused_rs.utils import (
+from sglang_tpu.moe.pallas.fused_rs.utils import (
     combine_partition_axes,
     get_mesh_shape_product,
     get_moe_expert_axis,
 )
-from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
+from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
 
 EXPERT = "model"
 MLP_DATA = "data"

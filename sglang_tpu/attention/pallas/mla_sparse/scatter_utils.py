@@ -26,7 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from sglang.srt.layers.attention.pallas.mla_sparse import kv_cache_utils
+from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
 
 
 class Plan(NamedTuple):

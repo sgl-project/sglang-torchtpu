@@ -7,15 +7,15 @@ import torch
 
 from sglang.srt.compilation.support_torch_compile import get_torch_compile_policy
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    KimiK3VLDecoderTpuCompilePolicy,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation.decoder_compile_policy import (
+    KimiK3VLDecoderTpuCompilePolicy,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

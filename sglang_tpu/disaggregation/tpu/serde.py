@@ -7,8 +7,8 @@ from typing import Any, ClassVar
 
 import msgspec
 
-from sglang.srt.disaggregation.tpu.transfer import PrefillTransferInfo
-from sglang.srt.disaggregation.tpu.wire import WireMessage, require_non_negative
+from sglang_tpu.disaggregation.tpu.transfer import PrefillTransferInfo
+from sglang_tpu.disaggregation.tpu.wire import WireMessage, require_non_negative
 
 
 class MessageTag(bytes, enum.Enum):

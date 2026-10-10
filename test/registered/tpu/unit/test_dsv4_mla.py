@@ -33,7 +33,7 @@ import numpy as np
 from absl.testing import parameterized
 
 # Import the kernels
-from sglang.srt.hardware_backend.tpu.dsv4.core_attention import mla
+from sglang_tpu.dsv4.core_attention import mla
 
 
 def cdiv(a, b):

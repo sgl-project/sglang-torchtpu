@@ -12,31 +12,6 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
-from sglang.srt.hardware_backend.tpu._logging import get_logger
-from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
-    get_attention_rank_tensors,
-    use_attention_rank_tensors,
-)
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    _REAL_B_KEY,
-    _REAL_Q_KEY,
-    _dp_attn_apply_bucket_metadata,
-    _restore_forward_batch_inputs,
-)
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    _COMPILE_BAR_FORMAT,
-    DecoderTpuCompilePolicy,
-    _get_hbm_usage_mb,
-    _hbm_delta_str,
-    _materialize_out,
-)
-from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-    install_recompilation_checker,
-)
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    BaseSpecDecodeCompilePolicyMixin,
-    _pad_first_dim,
-)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -54,6 +29,31 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType, SpecPaddingState
 from sglang.srt.utils.common import ceil_align
+from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.attention_rank_inputs import (
+    get_attention_rank_tensors,
+    use_attention_rank_tensors,
+)
+from sglang_tpu.compilation.compiled_forward_shim import (
+    _REAL_B_KEY,
+    _REAL_Q_KEY,
+    _dp_attn_apply_bucket_metadata,
+    _restore_forward_batch_inputs,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    _COMPILE_BAR_FORMAT,
+    DecoderTpuCompilePolicy,
+    _get_hbm_usage_mb,
+    _hbm_delta_str,
+    _materialize_out,
+)
+from sglang_tpu.compilation.recompilation_checker import (
+    install_recompilation_checker,
+)
+from sglang_tpu.compilation.spec_decode_compile_policy import (
+    BaseSpecDecodeCompilePolicyMixin,
+    _pad_first_dim,
+)
 
 logger = get_logger(__name__)
 
@@ -256,7 +256,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 "model compile policy"
             )
 
-        from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+        from sglang_tpu.compilation.direct_compile import (
             direct_compile,
         )
 

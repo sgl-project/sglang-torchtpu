@@ -7,7 +7,7 @@ These kernels are vendored from sglang-jax (which adapts the upstream
 can still load the rest of SGLang.
 """
 
-from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
     get_kv_cache_shape,
     ragged_paged_attention,
 )

@@ -40,7 +40,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs
-from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool, StageBuf
+from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool, StageBuf
 
 logger = logging.getLogger(__name__)
 

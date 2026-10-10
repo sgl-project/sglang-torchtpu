@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.attention.pallas.gdn import config
+from sglang_tpu.attention.pallas.gdn import config
 
 
 @jax.tree_util.register_dataclass

@@ -6,7 +6,7 @@ from typing import NamedTuple
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+from sglang_tpu.row_pad import pad_rows, row_bucket
 
 _TPU_TOP_K_OP: Callable | None = None
 
@@ -184,7 +184,7 @@ def negotiate_pallas_distributed_top_k_config(
     transport failure cannot safely become a rank-local fallback decision.
     """
 
-    from sglang.srt.hardware_backend.tpu.kernels.distributed_topk import (
+    from sglang_tpu.kernels.distributed_topk import (
         MAX_DISTRIBUTED_TOP_K,
         SUPPORTED_WORLD_SIZES,
     )
@@ -340,7 +340,7 @@ def _get_tpu_top_k_op() -> Callable:
 
     import jax
 
-    from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     def _wrapped(values: jax.Array, k: int) -> tuple[jax.Array, jax.Array]:
         # torch_tpu's aten::topk lowering is currently a full StableHLO
@@ -394,7 +394,7 @@ def distributed_tpu_top_k(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run exact distributed TopK through the direct-HBM Pallas ring."""
 
-    from sglang.srt.hardware_backend.tpu.kernels.distributed_topk import (
+    from sglang_tpu.kernels.distributed_topk import (
         MAX_DISTRIBUTED_TOP_K,
         SUPPORTED_WORLD_SIZES,
     )
@@ -440,7 +440,7 @@ def distributed_tpu_top_k(
             local_logits.new_empty(shape, dtype=torch.int32),
         )
 
-    from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
+    from sglang_tpu.distributed_topk_pallas import (
         pallas_distributed_top_k,
     )
 

@@ -23,6 +23,6 @@ Adapted from vllm-project/tpu-inference ``tpu_inference.kernels.gdn.v3``
 ``torch_tpu._internal.pallas``.
 """
 
-from sglang.srt.layers.attention.pallas.gdn.wrapper import fused_conv1d_gdn
+from sglang_tpu.attention.pallas.gdn.wrapper import fused_conv1d_gdn
 
 __all__ = ["fused_conv1d_gdn"]

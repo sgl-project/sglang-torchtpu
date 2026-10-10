@@ -13,17 +13,17 @@ forward on it, so the load overlaps whatever the scheduler runs in between.
 
 from __future__ import annotations
 
-from sglang.srt.hardware_backend.tpu.kv_free_fence import (
-    assert_not_forward_write_target,
-)
-from sglang.srt.hardware_backend.tpu.raiden_transfer import (
-    NOOP_EVENT,
-)
 from sglang.srt.managers.cache_controller import (
     BatchDoneCounter,
     CacheOperation,
     HiCacheAck,
     HiCacheController,
+)
+from sglang_tpu.kv_free_fence import (
+    assert_not_forward_write_target,
+)
+from sglang_tpu.raiden_transfer import (
+    NOOP_EVENT,
 )
 
 

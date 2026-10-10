@@ -18,9 +18,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    Qwen3VLDecoderTpuCompilePolicy,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
@@ -30,6 +27,9 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation.decoder_compile_policy import (
+    Qwen3VLDecoderTpuCompilePolicy,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

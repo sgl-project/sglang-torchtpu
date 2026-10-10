@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.attention.pallas.batched_rpa import utils
+from sglang_tpu.attention.pallas.batched_rpa import utils
 
 
 @dataclasses.dataclass(frozen=True)

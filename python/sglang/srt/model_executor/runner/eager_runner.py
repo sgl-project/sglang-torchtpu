@@ -232,7 +232,7 @@ class EagerRunner(BaseRunner):
     def _set_logits_output_mode(self, forward_batch: ForwardBatch) -> None:
         if not _is_tpu:
             return
-        from sglang.srt.hardware_backend.tpu.sampler import (
+        from sglang_tpu.sampler import (
             select_logits_output_mode,
         )
 

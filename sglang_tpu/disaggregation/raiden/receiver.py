@@ -19,9 +19,9 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
-from sglang.srt.disaggregation.raiden.chunk_plan import chunk_pull_window
-from sglang.srt.disaggregation.raiden.common import _tcp_endpoint, logger
-from sglang.srt.disaggregation.raiden.serde import (
+from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
+from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     PullReq,
@@ -34,7 +34,7 @@ from sglang.srt.disaggregation.raiden.serde import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
+    from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 
 
 class RaidenReceiverMixin:
@@ -738,7 +738,7 @@ class RaidenReceiverMixin:
         """
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             build_receiver_request,
         )
 
@@ -949,7 +949,7 @@ class RaidenReceiverMixin:
 
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             build_receiver_request,
         )
 
@@ -1015,7 +1015,7 @@ class RaidenReceiverMixin:
     def _register_receiver_and_signal(self, room: int) -> None:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             build_receiver_request,
         )
 

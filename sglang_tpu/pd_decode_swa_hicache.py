@@ -35,9 +35,6 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
-)
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
@@ -56,6 +53,9 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
+from sglang_tpu.raiden_hybrid_cache_controller import (
+    TpuRaidenHybridCacheController,
+)
 
 logger = logging.getLogger(__name__)
 

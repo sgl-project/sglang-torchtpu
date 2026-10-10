@@ -7,15 +7,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.mm_embedding import (
-    MultimodalEmbedding,
-    PaddedEmbedding,
-    TpuEmbeddingResult,
-    concat_embeddings,
-    flatten_embedding,
-    slice_embedding,
-    split_embedding,
-)
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.mm_schedule import (
     PerImageRequestInfo,
@@ -31,6 +22,15 @@ from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils.async_probe import maybe_assert_sum
+from sglang_tpu.mm_embedding import (
+    MultimodalEmbedding,
+    PaddedEmbedding,
+    TpuEmbeddingResult,
+    concat_embeddings,
+    flatten_embedding,
+    slice_embedding,
+    split_embedding,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ DataEmbeddingFunc = Callable[
 
 def _patch_budget() -> int:
     """Patches one vision-encoder call may carry."""
-    from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+    from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
         precompiled_max_patch_count,
     )
 

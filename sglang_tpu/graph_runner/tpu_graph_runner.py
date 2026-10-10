@@ -34,26 +34,26 @@ from sglang.srt.compilation.support_torch_compile import (
     get_torch_compile_policy,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu._logging import get_logger
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+from sglang.srt.platforms import current_platform
+from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
-from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+from sglang_tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
 )
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
+from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecodeCompilePolicyMixin,
 )
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
-from sglang.srt.hardware_backend.tpu.compile_cache import (
+from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
-from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -92,10 +92,8 @@ def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
     return type(f"Spec{policy_cls.__name__}", (spec_mixin_cls, policy_cls), {})
 
 
-# This module lives outside the tpu/ tree, so __name__ does not start with
-# the TPU logger root. Pass a short suffix so the logger lands cleanly under
-# that root (one setLevel covers the whole backend) instead of producing a
-# doubled "...tpu.sglang.srt.model_executor.tpu_graph_runner" name.
+# Short suffix, not __name__: keeps the logger name the module had before it
+# moved under graph_runner/.
 logger = get_logger("tpu_graph_runner")
 
 
@@ -151,7 +149,7 @@ class TpuGraphRunner:
         # torch.compile(backend="tpu", ...) resolves. apply_tpu_patches does
         # this in init_backend; redo it defensively in case the runner is
         # constructed on a path that skipped that hook.
-        from sglang.srt.hardware_backend.tpu.patches import (
+        from sglang_tpu.patches import (
             _register_tpu_compile_backend,
         )
 
@@ -298,7 +296,7 @@ class TpuGraphRunner:
             return
 
         warmup_submitted = time.perf_counter()
-        from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+        from sglang_tpu.compilation.warmup_queue import (
             current_warmup_queue,
         )
 

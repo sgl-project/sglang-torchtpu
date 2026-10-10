@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from sglang.srt.layers.attention.pallas.batched_rpa import configs, utils
+from sglang_tpu.attention.pallas.batched_rpa import configs, utils
 
 
 def flash_attention_qk_softmax(

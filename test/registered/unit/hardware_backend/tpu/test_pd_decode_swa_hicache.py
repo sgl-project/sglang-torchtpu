@@ -31,7 +31,6 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu import pd_decode_swa_hicache as tpu
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -58,10 +57,11 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import pd_decode_swa_hicache as tpu
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
 BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
-TPU = "sglang.srt.hardware_backend.tpu.pd_decode_swa_hicache"
+TPU = "sglang_tpu.pd_decode_swa_hicache"
 
 
 @contextlib.contextmanager

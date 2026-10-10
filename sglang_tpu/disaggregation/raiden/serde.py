@@ -13,7 +13,7 @@ from typing import ClassVar, List
 
 import msgspec
 
-from sglang.srt.disaggregation.tpu.wire import WireMessage, require_non_negative
+from sglang_tpu.disaggregation.tpu.wire import WireMessage, require_non_negative
 
 
 class MessageTag(bytes, enum.Enum):

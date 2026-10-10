@@ -14,9 +14,9 @@ from dataclasses import asdict, replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.hardware_backend.tpu import node_normalization as normalization
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_scope
+from sglang_tpu import node_normalization as normalization
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 

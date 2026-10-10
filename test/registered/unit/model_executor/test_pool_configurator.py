@@ -1306,10 +1306,10 @@ class TestMixedKVFormats(CustomTestCase):
                 )
 
     def test_mixed_formats_reserve_dummy_pages_and_align_capacity(self):
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # 512 INT8 payload bytes plus 16 exponent rows aligned to 32.
@@ -1415,10 +1415,10 @@ class TestMixedKVFormats(CustomTestCase):
                     )
 
     def test_mxint8_groups_preserve_asymmetric_full_swa_geometry(self):
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # Full: 2048 payload bytes plus 128/64/32 exponent rows.

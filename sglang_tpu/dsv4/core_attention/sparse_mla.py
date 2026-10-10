@@ -24,7 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.hardware_backend.tpu.dsv4.core_attention import csa_gather
+from sglang_tpu.dsv4.core_attention import csa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 

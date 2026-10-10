@@ -405,7 +405,7 @@ def _scatter_caches(
     (`page`, `slot`).
     """
     # Imported here, not at module scope: `scatter` imports this module back.
-    from sglang.srt.layers.attention.pallas.mla_sparse import scatter
+    from sglang_tpu.attention.pallas.mla_sparse import scatter
 
     dst_rows = _dst_rows(page, slot, nope_spec.page_size)
     kv_cache_nope = scatter.scatter(

@@ -2,7 +2,7 @@
 """Pallas MLA (Multi-head Latent Attention) backend for the TPU torch_tpu platform.
 
 Wraps the JAX/Pallas MLA v2 ragged-paged-attention kernel
-(``sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2``, vendored
+(``sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2``, vendored
 from sglang-jax, itself adapted from vllm/tpu-inference) and exposes it as a
 PyTorch custom op, mirroring ``attention_pallas_rpa_v3``. Selected via
 ``--attention-backend pallas_tpu_mla``; used by MLA models (DeepSeek V2/V3).
@@ -27,7 +27,7 @@ Design notes
   ``[T, H, kv_lora_rank]``; the model folds W_UV into it afterwards.
 * The kernel writes the new latent KV into the paged cache itself (the cache
   is donated to the pallas call), so ``save_kv_cache`` is ignored and the pool
-  (:class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMLATokenToKVPool`)
+  (:class:`sglang_tpu.kv_pool.TpuFusedMLATokenToKVPool`)
   rejects out-of-band writes.
 * All attention metadata is identical to the RPA v3 backend's (the MLA v2
   kernel was adapted to the same ragged ``cu_kv_lens``-offset page-indices
@@ -43,14 +43,14 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang_tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+from sglang_tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
-from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -77,7 +77,7 @@ def _build_pallas_mla_kernel_op():
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
-    from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
+    from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
         mla_ragged_paged_attention as _jax_mla,
     )
 

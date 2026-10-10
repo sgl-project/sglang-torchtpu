@@ -15,22 +15,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.compilation import decoder_compile_policy
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    CompiledForwardShim,
-    _fit_pp_proxy_in_args,
-    _fit_pp_proxy_rows,
-)
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-    _materialize_out,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pp_proxy_pytree import (
-    flatten_pp_proxy_with_keys,
-    register_pp_proxy_pytree,
-    unflatten_pp_proxy,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -40,6 +24,22 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation import decoder_compile_policy
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.compiled_forward_shim import (
+    CompiledForwardShim,
+    _fit_pp_proxy_in_args,
+    _fit_pp_proxy_rows,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+    _materialize_out,
+)
+from sglang_tpu.compilation.pp_proxy_pytree import (
+    flatten_pp_proxy_with_keys,
+    register_pp_proxy_pytree,
+    unflatten_pp_proxy,
+)
 
 _HIDDEN = 16
 
@@ -222,7 +222,7 @@ class TestLogitsProcessorGating(CustomTestCase):
     def test_non_last_stage_warms_only_full_vocab(self):
         policy = _policy(_model_runner(_pp_group(first=False, last=False)))
         with patch(
-            "sglang.srt.hardware_backend.tpu.sampler.distributed_top_k_candidate_width_for_model"
+            "sglang_tpu.sampler.distributed_top_k_candidate_width_for_model"
         ) as width:
             self.assertIsNone(policy._distributed_top_k_width())
             self.assertEqual(

@@ -9,19 +9,6 @@ from typing import Any
 import torch
 import tqdm
 
-from sglang.srt.hardware_backend.tpu._logging import get_logger
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    _REAL_B_KEY,
-    _REAL_Q_KEY,
-    _restore_forward_batch_inputs,
-)
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    _COMPILE_BAR_FORMAT,
-    _get_hbm_usage_mb,
-    _hbm_delta_str,
-    _warmup_progress,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -30,6 +17,19 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.compiled_forward_shim import (
+    _REAL_B_KEY,
+    _REAL_Q_KEY,
+    _restore_forward_batch_inputs,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    _COMPILE_BAR_FORMAT,
+    _get_hbm_usage_mb,
+    _hbm_delta_str,
+    _warmup_progress,
+)
+from sglang_tpu.compilation.pending_call import PendingCall
 
 logger = get_logger(__name__)
 

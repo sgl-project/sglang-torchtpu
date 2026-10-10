@@ -88,7 +88,7 @@ def _actor_options(server_args: ServerArgs) -> dict:
     options = {"num_cpus": 0}
     options.update(_accelerator_actor_options())
     if get_device().device == "tpu":
-        from sglang.srt.hardware_backend.tpu.ray_utils import tpu_actor_runtime_env
+        from sglang_tpu.ray_utils import tpu_actor_runtime_env
 
         options.update(tpu_actor_runtime_env(server_args))
     return options
@@ -335,7 +335,7 @@ class RayEngine(Engine):
         if get_device().use_ray and get_device().device == "tpu":
             # Lazy TPU import: keeps the GPU Ray path from importing the TPU
             # package (see _actor_options).
-            from sglang.srt.hardware_backend.tpu.ray_utils import (
+            from sglang_tpu.ray_utils import (
                 _forwarded_driver_env,
                 detect_tpu_nnodes,
                 discover_tpu_worker_hostnames,
@@ -397,7 +397,7 @@ class RayEngine(Engine):
             # (host:base_port+i), so the driver only stashes the physically-
             # ordered host list and each actor rebuilds them itself.
             if nnodes <= 1:
-                from sglang.srt.hardware_backend.tpu.patches import (
+                from sglang_tpu.patches import (
                     compute_single_host_tpu_env,
                 )
 
@@ -465,7 +465,7 @@ class RayEngine(Engine):
             # worker id and order bundle_for_node by it. Also verifies rank0
             # (worker 0) is co-located with the Engine; anything inconsistent
             # raises here instead of hanging later at PJRT bind / rendezvous.
-            from sglang.srt.hardware_backend.tpu.ray_utils import (
+            from sglang_tpu.ray_utils import (
                 order_tpu_bundles_by_worker_id,
             )
 

@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 
 def dflash_write_draft_kv(
@@ -46,7 +46,7 @@ def dflash_write_draft_kv(
     """
     # kv_fused_rope_write imports jax eagerly; keep the span math and the rope
     # gather above importable without it.
-    from sglang.srt.hardware_backend.tpu.kv_fused_rope_write import (
+    from sglang_tpu.kv_fused_rope_write import (
         fused_rope_write_kv,
     )
 

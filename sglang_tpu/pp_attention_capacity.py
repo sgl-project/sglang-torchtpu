@@ -5,7 +5,7 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.pp_chunks import chunk_pairs
+from sglang_tpu.pp_chunks import chunk_pairs
 
 
 @lru_cache(maxsize=None)
@@ -25,11 +25,11 @@ def _capacity_for_shape(
     import jax.numpy as jnp
     from jax.experimental.pallas import tpu as pltpu
 
-    from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
-    from sglang.srt.layers.attention.pallas.batched_rpa import configs
-    from sglang.srt.layers.attention.pallas.batched_rpa.wrapper import (
+    from sglang_tpu.attention.pallas.batched_rpa import configs
+    from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         calculate_block_sizes,
     )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
     with tpu_info_for_cpu_export():
         model = configs.ModelConfigs(
@@ -71,7 +71,7 @@ def _capacity_from_config(cfg, pages_per_seq, page_size):
 
 def capacity_for_batch(runner, backend, *, mode, num_seqs, total_q_tokens):
     """Use the kernel's actual padded batch shape, dtype, layout and tile choice."""
-    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import kv_layout
+    from sglang_tpu.attention_pallas_rpa_batched import kv_layout
 
     config = runner.model_config
     return _capacity_for_shape(
@@ -91,7 +91,7 @@ def capacity_for_batch(runner, backend, *, mode, num_seqs, total_q_tokens):
 
 def attention_schedule_capacity(runner, policy):
     """Batched attention prefill capacity for the largest compiled pipeline step."""
-    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+    from sglang_tpu.attention_pallas_rpa_batched import (
         TpuPallasRpaBatchedAttnBackend,
     )
 

@@ -15,9 +15,9 @@
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/__init__.py
 
-from sglang.srt.hardware_backend.tpu.dsv4.compress_and_store.compressor_v1 import (
+from sglang_tpu.dsv4.compress_and_store.compressor_v1 import (
     compressor_forward,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.compress_and_store.config import Configs
+from sglang_tpu.dsv4.compress_and_store.config import Configs
 
 __all__ = ["Configs", "compressor_forward"]

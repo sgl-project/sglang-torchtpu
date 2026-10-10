@@ -14,7 +14,7 @@ import os
 from collections.abc import Sequence
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang_tpu._logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -81,8 +81,8 @@ def _register_tpu_sampler_backend() -> None:
     if _tpu_sampler_backend_registered:
         return
 
-    from sglang.srt.hardware_backend.tpu.sampler import TpuSampler
     from sglang.srt.layers.sampler import register_sampler_backend
+    from sglang_tpu.sampler import TpuSampler
 
     register_sampler_backend("tpu", TpuSampler)
     _tpu_sampler_backend_registered = True
@@ -243,7 +243,7 @@ def _prepare_tpu_env(
 
     # Apply LIBTPU_INIT_ARGS overrides before the early return and before
     # any torch_tpu import; libtpu reads these flags at load time.
-    from sglang.srt.hardware_backend.tpu.env_override import (
+    from sglang_tpu.env_override import (
         apply_tpu_env_overrides,
     )
 
@@ -740,12 +740,12 @@ def _patch_future_map_direct_handoff() -> None:
         return
     _future_map_direct_handoff_patched = True
 
-    from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang_tpu.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
         publish_tpu,
         stash_tpu,
     )
-    from sglang.srt.managers.overlap_utils import FutureMap
 
     orig_stash = FutureMap.stash
     orig_publish = FutureMap.publish
@@ -799,10 +799,10 @@ def _patch_raiden_is_load_back_event_done() -> None:
         return
     _raiden_is_load_back_event_done_patched = True
 
-    from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang_tpu.raiden_hybrid_cache_controller import (
         TpuRaidenHybridCacheController,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     orig_is_load_back_event_done = UnifiedRadixCache.is_load_back_event_done
 
@@ -830,8 +830,8 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
     _prefill_transfer_finish_from_raiden_patched = True
 
     from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-    from sglang.srt.disaggregation.raiden.sender import RaidenKVSender
     from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+    from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 
     # Each polled request's time stats -> its sender, during the poll only.
     polled_senders = {}
@@ -870,7 +870,7 @@ def _patch_pd_decode_swa_hicache() -> None:
 
     Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
     """
-    from sglang.srt.hardware_backend.tpu import pd_decode_swa_hicache
+    from sglang_tpu import pd_decode_swa_hicache
 
     pd_decode_swa_hicache.install()
 
@@ -880,7 +880,7 @@ def _patch_pd_decode_async_prefill_info() -> None:
 
     See ``pd_decode_async_prefill_info``.
     """
-    from sglang.srt.hardware_backend.tpu import pd_decode_async_prefill_info
+    from sglang_tpu import pd_decode_async_prefill_info
 
     pd_decode_async_prefill_info.install()
 

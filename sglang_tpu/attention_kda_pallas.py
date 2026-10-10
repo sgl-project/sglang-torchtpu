@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import TpuGDNAttnBackend
+from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention

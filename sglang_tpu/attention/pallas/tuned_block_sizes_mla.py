@@ -41,8 +41,8 @@ import logging
 
 import jax.numpy as jnp
 
-from sglang.srt.layers.attention.pallas.tuned_block_sizes import get_device_name
-from sglang.srt.layers.attention.pallas.util import (
+from sglang_tpu.attention.pallas.tuned_block_sizes import get_device_name
+from sglang_tpu.attention.pallas.util import (
     get_tpu_version,
     next_power_of_2,
 )

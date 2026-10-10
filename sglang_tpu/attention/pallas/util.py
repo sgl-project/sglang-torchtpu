@@ -3,7 +3,7 @@
 
 from jax._src import dtypes
 
-from sglang.srt.hardware_backend.tpu.pallas_export import get_torch_tpu_device_kind
+from sglang_tpu.pallas_export import get_torch_tpu_device_kind
 
 
 def cdiv(a, b):

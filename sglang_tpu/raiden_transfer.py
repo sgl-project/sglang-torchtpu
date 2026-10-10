@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, List
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 logger = logging.getLogger(__name__)
 

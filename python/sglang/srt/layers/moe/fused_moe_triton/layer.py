@@ -530,7 +530,7 @@ class FusedMoE(torch.nn.Module):
         # torch.compile traces the model -- rather than in each quant method.
         # Mirrors the RPA v3 attention backend.
         if _is_tpu:
-            from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
+            from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
 
             _build_fused_moe_op()
 

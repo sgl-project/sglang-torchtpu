@@ -30,8 +30,8 @@ import torch
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
-    from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenFutureEvent
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang_tpu.raiden_transfer import RaidenFutureEvent
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ class TpuRaidenHostKVCache(HostKVCache):
                 device_pool.size,
             )
 
-        from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
+        from sglang_tpu.raiden_transfer import RaidenKVTransfer
 
         self.transfer = RaidenKVTransfer(device_pool, self.page_num)
 

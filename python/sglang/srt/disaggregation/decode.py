@@ -805,7 +805,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Raiden needs the per-layer device KV tensors (it indexes their major
         # dim as pages). The TPU fused KV pool exposes them via kv_buffer.
         if hasattr(kv_manager, "set_kv_caches"):
-            from sglang.srt.disaggregation.raiden.conn import get_raiden_kv_caches
+            from sglang_tpu.disaggregation.raiden.conn import get_raiden_kv_caches
 
             kv_manager.set_kv_caches(
                 get_raiden_kv_caches(

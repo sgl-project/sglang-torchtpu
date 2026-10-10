@@ -171,8 +171,8 @@ def prepare_pipeline_stage_fp8_moe_weights(
     other weights are transposed per expert chunk. Returns whether the layer
     keeps blockwise runtime scales.
     """
-    from sglang.srt.hardware_backend.tpu.fp8_moe import _get_tpu_fp8_runtime
     from sglang.srt.utils import print_warning_once
+    from sglang_tpu.fp8_moe import _get_tpu_fp8_runtime
 
     if block_quant and _get_tpu_fp8_runtime() == "channelwise":
         print_warning_once(
@@ -200,13 +200,13 @@ def requantize_stage_experts_to_channelwise(
     transpose: bool = False,
 ) -> None:
     """Convert a few experts at a time and concatenate their runtime weights."""
-    from sglang.srt.hardware_backend.tpu.fp8_moe import (
+    from sglang.srt.platforms import current_platform
+    from sglang_tpu.fp8_moe import (
         _clear_replaced_param,
         _quantize_moe_weight_channelwise,
         block_quant_dequant,
         copy_or_rebind_param,
     )
-    from sglang.srt.platforms import current_platform
 
     free_bytes = current_platform.get_available_memory()[0]
     target_transient_bytes = int(
@@ -257,7 +257,7 @@ def _replace_with_expert_chunks(
 ) -> None:
     """Free the parameter's data, then set it to the chunks joined along the
     expert axis; the chunks must not share storage with the freed data."""
-    from sglang.srt.hardware_backend.tpu.fp8_moe import _free_replaced_storage
+    from sglang_tpu.fp8_moe import _free_replaced_storage
 
     old = param.data
     param.data = torch.empty(0, dtype=old.dtype, device=old.device)

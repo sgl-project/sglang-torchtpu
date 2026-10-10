@@ -19,15 +19,6 @@ import torch.nn.functional as F
 
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu._logging import get_logger
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
-    Bucketer,
-    PowerBucketer,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-    snapshot_recompilation_baseline,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -36,6 +27,15 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils.common import next_power_of_2
+from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.bucketer import (
+    Bucketer,
+    PowerBucketer,
+)
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
@@ -920,7 +920,7 @@ class CompiledForwardShim:
             and forward_batch.forward_mode.is_extend()
         ):
             # Local import: the eagle3 policy imports this module.
-            from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+            from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
                 fold_last_token_embeds,
             )
 
@@ -1130,10 +1130,10 @@ def build_bucketers(
             name="TokenBucketer", min_val=64, max_val=max_t, power=2
         )
 
-    from sglang.srt.hardware_backend.tpu.pp_chunks import uses_dynamic_chunks
+    from sglang_tpu.pp_chunks import uses_dynamic_chunks
 
     if uses_dynamic_chunks():
-        from sglang.srt.hardware_backend.tpu.pp_chunks import (
+        from sglang_tpu.pp_chunks import (
             chunk_buckets,
             chunk_granularity,
         )

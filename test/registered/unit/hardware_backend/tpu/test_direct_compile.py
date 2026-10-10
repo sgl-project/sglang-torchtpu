@@ -12,15 +12,6 @@ from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayou
 
 from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation import direct_compile
-from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
-    use_attention_rank_tensors,
-)
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import collect_warmups
 from sglang.srt.layers import dp_attention
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -35,6 +26,15 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation import direct_compile
+from sglang_tpu.compilation.attention_rank_inputs import (
+    use_attention_rank_tensors,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+)
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.warmup_queue import collect_warmups
 
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
 
@@ -413,8 +413,8 @@ class TestDirectCompile(CustomTestCase):
         from sglang.srt.compilation.compiled_op import (
             get_compiled_ops,
         )
-        from sglang.srt.hardware_backend.tpu import spec_op_precompile  # noqa: F401
-        from sglang.srt.hardware_backend.tpu.spec_op_warmup import SpecOpWarmupContext
+        from sglang_tpu import spec_op_precompile  # noqa: F401
+        from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
 
         cases = []
         with (

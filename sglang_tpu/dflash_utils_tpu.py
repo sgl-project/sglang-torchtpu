@@ -18,17 +18,17 @@ from torch import nn
 
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.distributed import model_parallel_is_initialized
-from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
+from sglang.srt.runtime_context import get_parallel
+from sglang_tpu.spec_op_warmup import (
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
     make_dflash_verify_cache_locs_args,
 )
-from sglang.srt.hardware_backend.tpu.top_k import (
+from sglang_tpu.top_k import (
     TpuVocabShard,
     distributed_tpu_top_k,
     supports_distributed_tpu_top_k,
 )
-from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch

@@ -34,7 +34,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from sglang.srt.layers.moe.pallas.sparse_core import core_map_helper
+from sglang_tpu.moe.pallas.sparse_core import core_map_helper
 
 NUM_CORES = 2
 NUM_SUBCORES = 16

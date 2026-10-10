@@ -578,7 +578,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 # torch.compile traces the model, so the traced forward is a
                 # plain op lookup. Mirrors the RPA v3 backend and the fused-MoE
                 # registration path.
-                from sglang.srt.hardware_backend.tpu.quantized_matmul import (
+                from sglang_tpu.quantized_matmul import (
                     register_tpu_block_fp8_matmul_op,
                 )
 
@@ -1387,7 +1387,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.block_quant:
             if _is_tpu and not self.use_mxfp8 and layer.weight_block_size is None:
-                from sglang.srt.hardware_backend.tpu.fp8_linear import (
+                from sglang_tpu.fp8_linear import (
                     apply_tpu_fp8_linear,
                 )
 
@@ -1435,7 +1435,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if _is_tpu and not self.block_quant and not self.use_mxfp8:
-            from sglang.srt.hardware_backend.tpu.fp8_linear import apply_tpu_fp8_linear
+            from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
 
             return apply_tpu_fp8_linear(
                 x=x,
@@ -2765,7 +2765,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if _is_tpu:
-            from sglang.srt.hardware_backend.tpu.fp8_moe import (
+            from sglang_tpu.fp8_moe import (
                 prepare_tpu_fp8_moe_weights,
             )
 
@@ -2780,7 +2780,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Until then Qwen3 MoE sums the fused-RS output twice, so only the
             # explicit backend opts in.
             if get_moe_runner_backend().is_pallas_tpu_fused_rs():
-                from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+                from sglang_tpu.fp8_moe_fused_rs import (
                     prepare_fp8_fused_rs,
                 )
 
@@ -3134,7 +3134,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if _is_tpu:
             if self.handles_moe_reduction:
-                from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+                from sglang_tpu.fp8_moe_fused_rs import (
                     apply_fp8_fused_rs,
                 )
 
@@ -3144,7 +3144,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     activation=moe_runner_config.activation,
                     swiglu_limit=moe_runner_config.swiglu_limit,
                 )
-            from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
+            from sglang_tpu.fp8_moe import apply_tpu_fp8_moe
 
             return apply_tpu_fp8_moe(
                 layer=layer,

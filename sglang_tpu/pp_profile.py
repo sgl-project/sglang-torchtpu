@@ -94,7 +94,7 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
     if "pp_proxy_tensors" in kwargs:
         # Local import: decoder_compile_policy reaches this module through the
         # profiling entry point.
-        from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+        from sglang_tpu.compilation.decoder_compile_policy import (
             max_extend_tokens,
         )
 

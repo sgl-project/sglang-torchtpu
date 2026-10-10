@@ -24,7 +24,7 @@ import traceback
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 
-from sglang.srt.hardware_backend.tpu.patches import build_slicebuilder_addresses
+from sglang_tpu.patches import build_slicebuilder_addresses
 
 logger = logging.getLogger(__name__)
 

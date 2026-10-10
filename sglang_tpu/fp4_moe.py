@@ -13,14 +13,6 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.fp8_moe import _clear_replaced_param, _own_storage
-from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
-    get_tpu_fused_rs_post_expert_norm_weight,
-    has_tpu_fused_rs_post_expert_norm,
-    prepare_fused_moe_sequence_parallel_input,
-    prepare_tpu_fused_rs_post_expert_norm,
-)
-from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.mxfp4_tpu_util import (
@@ -28,6 +20,14 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang_tpu.fp8_moe import _clear_replaced_param, _own_storage
+from sglang_tpu.fused_rs_sequence_parallel import (
+    get_tpu_fused_rs_post_expert_norm_weight,
+    has_tpu_fused_rs_post_expert_norm,
+    prepare_fused_moe_sequence_parallel_input,
+    prepare_tpu_fused_rs_post_expert_norm,
+)
+from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
 # Block-512 matches the original FP8 activation quantization block. The fused-RS
 # kernel additionally supports block-256 with W4A8 and blocks 16-128 with W4A16.
@@ -272,7 +272,7 @@ def prepare_tpu_nvfp4_moe_weights(
     w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)  # (E, I_pad/G, 1, H)
 
     if use_fused_rs:
-        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
+        from sglang_tpu.moe.pallas.fused_moe_rs_op import (
             prepare_fused_moe_rs,
         )
 
@@ -320,7 +320,7 @@ def apply_tpu_nvfp4_moe(
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
 
     if use_fused_rs:
-        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
+        from sglang_tpu.moe.pallas.fused_moe_rs_op import (
             fused_moe_rs_gather,
         )
 

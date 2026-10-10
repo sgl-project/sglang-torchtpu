@@ -36,12 +36,12 @@ import msgspec
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.allocator_tpu import (
-        TpuPagedTokenToKVPoolAllocator,
-    )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+    from sglang_tpu.allocator_tpu import (
+        TpuPagedTokenToKVPoolAllocator,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -366,7 +366,7 @@ def kv_free_fence_unsupported_reason(
 ) -> Optional[str]:
     """Why a fence on ``allocator`` would miss KV writes, or None: it hooks only
     TPU paged pools, and needs every KV write to precede a copied result tensor."""
-    from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+    from sglang_tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
 

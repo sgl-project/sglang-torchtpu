@@ -24,7 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.attention.pallas.mla_sparse import (
+from sglang_tpu.attention.pallas.mla_sparse import (
     dsa_gather,
     kv_cache_utils,
     native_sc_gather,

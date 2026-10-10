@@ -23,7 +23,7 @@ import torch
 
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang_tpu._logging import get_logger
 
 logger = get_logger(__name__)
 

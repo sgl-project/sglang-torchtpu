@@ -280,7 +280,7 @@ def prepare_tpu_fp8_moe_weights(
         # A pipeline stage holds every expert of its layers on one device, so
         # the runtime weights are converted and transposed a few experts at a
         # time instead of through whole-layer intermediates.
-        from sglang.srt.hardware_backend.tpu.expert_loading import (
+        from sglang_tpu.expert_loading import (
             prepare_pipeline_stage_fp8_moe_weights,
         )
 
@@ -386,7 +386,7 @@ def apply_tpu_fp8_moe(
     # layout helpers above -- pure host-side torch -- be unit-tested on the CPU
     # lane. See test/registered/unit/hardware_backend/tpu/
     # test_fp8_moe_scale_layout.py.
-    from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+    from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu

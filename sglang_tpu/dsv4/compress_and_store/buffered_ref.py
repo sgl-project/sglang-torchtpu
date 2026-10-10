@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.hardware_backend.tpu.dsv4.compress_and_store import config
+from sglang_tpu.dsv4.compress_and_store import config
 
 
 @jax.tree_util.register_dataclass

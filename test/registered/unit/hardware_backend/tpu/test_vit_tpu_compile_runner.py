@@ -7,11 +7,15 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation import direct_compile
-from sglang.srt.hardware_backend.tpu.graph_runner import (
-    vit_tpu_compile_runner as vit_runner,
+from sglang.srt.layers.attention.vision import (
+    VisionTpuAttention,
+    _build_tpu_segment_ids,
 )
-from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang_tpu.compilation import direct_compile
+from sglang_tpu.graph_runner import vit_tpu_compile_runner as vit_runner
+from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
     VisionPaddingContext,
     VisionTpuCompilePolicy,
@@ -19,12 +23,6 @@ from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import 
     _cu_seqlens_to_segment_ids,
     _Qwen3VLRunContext,
 )
-from sglang.srt.layers.attention.vision import (
-    VisionTpuAttention,
-    _build_tpu_segment_ids,
-)
-from sglang.srt.observability.compile_timing import CompileTimingRecorder
-from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
 

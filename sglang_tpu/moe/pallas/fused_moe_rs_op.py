@@ -57,7 +57,7 @@ def _build_fused_moe_rs_op():
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal.pallas import jax_op
 
-    from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
+    from sglang_tpu.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
 
     mesh = _get_mesh()
 

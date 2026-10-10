@@ -28,16 +28,16 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from sglang.srt.hardware_backend.tpu.dsv4.dsv4_memory_pool import (
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang_tpu.dsv4.dsv4_memory_pool import (
     DSV4TPUTokenToKVPool,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.rope import (
+from sglang_tpu.dsv4.rope import (
     get_or_build_cos_sin_cache,
     rope_quant,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk import streamindex_topk
-from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
-from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang_tpu.dsv4.streamindex_topk import streamindex_topk
+from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 _STREAMINDEX_TOPK_OP_NAME = "sglang_tpu_pallas::dsv4_streamindex_topk"
 _streamindex_topk_custom_op = None

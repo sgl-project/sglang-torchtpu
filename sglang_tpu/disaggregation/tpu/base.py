@@ -63,17 +63,17 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
-from sglang.srt.disaggregation.tpu.host_staging import StageBuf
-from sglang.srt.disaggregation.tpu.serde import Transfer
-from sglang.srt.disaggregation.tpu.transfer import (
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.server_args import ServerArgs
+from sglang_tpu.disaggregation.tpu import transfer as tpu_transfer
+from sglang_tpu.disaggregation.tpu.host_staging import StageBuf
+from sglang_tpu.disaggregation.tpu.serde import Transfer
+from sglang_tpu.disaggregation.tpu.transfer import (
     DecodeTransferState,
     PendingChunk,
     PrefillTransferInfo,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 

@@ -12,9 +12,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
-from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
 def _args(**overrides):
@@ -52,9 +52,7 @@ def _args(**overrides):
 
 
 def _apply(args):
-    with patch(
-        "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-    ) as prepare_tpu_env:
+    with patch("sglang_tpu.patches._prepare_tpu_env") as prepare_tpu_env:
         TpuSRTPlatform().apply_server_args_defaults(args)
     return prepare_tpu_env
 
@@ -98,9 +96,7 @@ class TestPipelineParallelValidation(CustomTestCase):
     def test_resolved_unsupported_depth_is_rejected_before_environment_setup(self):
         args = _args(pp_size=8)
         declare_resolution(args, "test.pipeline", pp_async_batch_depth=2)
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ) as prepare:
+        with patch("sglang_tpu.patches._prepare_tpu_env") as prepare:
             with self.assertRaisesRegex(NotImplementedError, "pp-async-batch-depth 1"):
                 TpuSRTPlatform().apply_server_args_defaults(args)
         prepare.assert_not_called()
@@ -133,9 +129,7 @@ class TestPipelineParallelValidation(CustomTestCase):
             _apply(_args(pp_size=2))
 
     def test_rejection_happens_before_the_slice_env_is_prepared(self):
-        with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
-        ) as prepare_tpu_env:
+        with patch("sglang_tpu.patches._prepare_tpu_env") as prepare_tpu_env:
             with self.assertRaises(NotImplementedError):
                 TpuSRTPlatform().apply_server_args_defaults(_args(pp_size=2, tp_size=2))
         prepare_tpu_env.assert_not_called()

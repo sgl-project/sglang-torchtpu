@@ -18,7 +18,7 @@ Design notes
 * The kernel writes K/V into the fused KV cache itself. The backend therefore
   ignores ``save_kv_cache``: the cache is always updated.
 * The fused KV cache must be allocated by
-  :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`.
+  :class:`sglang_tpu.kv_pool.TpuFusedMHATokenToKVPool`.
 * All attention metadata (cu_q_lens, cu_kv_lens, page_indices, distribution)
   is built once per forward pass in :meth:`init_forward_metadata` and reused
   by every layer.
@@ -41,14 +41,14 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
-from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.spec_info import SpecInputType
+from sglang_tpu.host_metadata_cache import HostMetadataCache
+from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -400,7 +400,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
     Subclasses set :attr:`kernel_spec` to a :class:`RpaKernelSpec` and inherit
     everything else. Requires a KV pool in the layout its kernel reads:
-    :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`
+    :class:`sglang_tpu.kv_pool.TpuFusedMHATokenToKVPool`
     or a subclass (batched's SEQ_ALONG_LANE layout uses
     ``TpuSeqAlongLaneKVPool``). ``tpu_platform._mha_kv_pool_cls`` maps each
     backend to its pool, and the model_runner passes it as

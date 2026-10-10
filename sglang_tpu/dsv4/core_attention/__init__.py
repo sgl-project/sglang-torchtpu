@@ -15,13 +15,13 @@
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/deepseek_v4/core_attention/__init__.py
 
-from sglang.srt.hardware_backend.tpu.dsv4.core_attention.mla import (
+from sglang_tpu.dsv4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.core_attention.mla_swa import (
+from sglang_tpu.dsv4.core_attention.mla_swa import (
     mla_sliding_window_ragged_paged_attention,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.core_attention.sparse_mla import (
+from sglang_tpu.dsv4.core_attention.sparse_mla import (
     sparse_ragged_paged_attention,
 )
 

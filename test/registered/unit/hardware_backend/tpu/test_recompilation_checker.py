@@ -8,8 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation import recompilation_checker
-from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation import recompilation_checker
+from sglang_tpu.compilation.recompilation_checker import (
     RecompilationChecker,
     _build_event,
     _format_event,
@@ -17,8 +19,6 @@ from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
     snapshot_recompilation_baseline,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 # Pure logic over injected cache readers, no torch_tpu needed.
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -377,7 +377,7 @@ class TestSharedChecker(CustomTestCase):
         self.assertEqual(checker.check(context_fn=_context).durations_ms, (50,))
 
     def test_speculative_op_warmup_refreshes_shared_baseline(self):
-        from sglang.srt.hardware_backend.tpu import spec_op_precompile
+        from sglang_tpu import spec_op_precompile
 
         def warmup(cache):
             op = SimpleNamespace(
@@ -405,7 +405,7 @@ class TestSharedChecker(CustomTestCase):
         self._assert_late_warmup_is_excluded(warmup)
 
     def test_kv_offload_warmup_refreshes_shared_baseline(self):
-        from sglang.srt.hardware_backend.tpu.compilation import compiled_forward_shim
+        from sglang_tpu.compilation import compiled_forward_shim
 
         def warmup(cache):
             pool = SimpleNamespace(

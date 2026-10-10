@@ -7,16 +7,6 @@ from contextlib import contextmanager
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.pp_attention_capacity import (
-    attention_schedule_capacity,
-)
-from sglang.srt.hardware_backend.tpu.pp_chunks import (
-    StepCostModel,
-    chunk_granularity,
-    longest_prompt,
-    profile_points,
-    uses_dynamic_chunks,
-)
 from sglang.srt.managers.schedule_policy import (
     MAX_PREFIX_MATCHED_WAITING_REQS,
     AddReqResult,
@@ -25,6 +15,16 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang_tpu.pp_attention_capacity import (
+    attention_schedule_capacity,
+)
+from sglang_tpu.pp_chunks import (
+    StepCostModel,
+    chunk_granularity,
+    longest_prompt,
+    profile_points,
+    uses_dynamic_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,13 +204,13 @@ def profile_and_install_cost_model(scheduler):
             "not to exceed --context-length."
         )
     schedule = attention_schedule_capacity(runner, policy)
-    from sglang.srt.hardware_backend.tpu.pp_chunks import chunk_pairs
+    from sglang_tpu.pp_chunks import chunk_pairs
 
     if schedule is not None and chunk_pairs(schedule, buckets[-1], 0) > schedule[0]:
         raise ValueError(
             "A full pipeline chunk exceeds the attention schedule capacity."
         )
-    from sglang.srt.hardware_backend.tpu.pp_profile import profile_cache
+    from sglang_tpu.pp_profile import profile_cache
 
     samples = []
     with profile_cache(policy, buckets[-1]):

@@ -3,11 +3,11 @@
 """Pallas fused-MoE bridge for the TPU torch_tpu platform.
 
 This module wraps the JAX/Pallas ``gmm_v2`` grouped-matmul kernel
-(``sglang.srt.layers.moe.pallas.gmm_v2``) and assembles it into a
+(``sglang_tpu.moe.pallas.gmm_v2``) and assembles it into a
 single-host fused-MoE op exposed to PyTorch via
 ``torch_tpu._internal.pallas.jax_op``. It mirrors the pattern used by the
 ragged-paged-attention v3 backend in
-``sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3``: register one custom
+``sglang_tpu.attention_pallas_rpa_v3``: register one custom
 ``torch.library`` op whose implementation is a ``jax.jit``-traced JAX
 function. Per-shape / per-(topk, activation) specialisation happens
 inside the JAX trace cache maintained by ``JaxCallable``; dynamo sees
@@ -156,8 +156,8 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     """
     import jax.numpy as jnp
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
-    from sglang.srt.layers.moe.pallas.tuned_block_sizes import (
+    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes
+    from sglang_tpu.moe.pallas.tuned_block_sizes import (
         get_tuned_block_sizes,
     )
 
@@ -229,7 +229,7 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
     VMEM at an untested shape. Widening this gate is a separate change that
     needs its own perf data.
     """
-    from sglang.srt.layers.moe.pallas.gmm_v2 import calculate_tiling
+    from sglang_tpu.moe.pallas.gmm_v2 import calculate_tiling
 
     if not w2_packed:
         return calculate_tiling
@@ -252,7 +252,7 @@ def _vmem_safe_packed_tile_n(base_tile_info):
     import jax
     import jax.numpy as jnp
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import (
+    from sglang_tpu.moe.pallas.gmm_v2 import (
         TileSizes,
         _largest_aligned_divisor_at_most,
     )
@@ -303,7 +303,7 @@ def _dividing_tile_k(base_tile_info):
     """
     import dataclasses
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
+    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes
 
     def wrapped(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
         if isinstance(base_tile_info, TileSizes):
@@ -388,7 +388,7 @@ def _fused_moe_jax(
     import jax
     import jax.numpy as jnp
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import (
+    from sglang_tpu.moe.pallas.gmm_v2 import (
         TileSizes,
         apply_act_fn,
         calculate_tiling,
@@ -486,7 +486,7 @@ def _fused_moe_jax(
             preferred_element_type=hidden_states.dtype,
         )
     elif use_sc_gather:
-        from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import (
+        from sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2 import (
             ragged_gather_v2,
         )
 
@@ -653,10 +653,10 @@ def _fused_moe_jax(
     if use_sc_gather:
         if not no_combine:
             # Fused gather + weighted top-k sum.
-            from sglang.srt.layers.moe.pallas.sparse_core.dense_gather_reduce import (
+            from sglang_tpu.moe.pallas.sparse_core.dense_gather_reduce import (
                 dense_gather_reduce,
             )
-            from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
+            from sglang_tpu.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
                 ragged_gather_reduce,
             )
 
@@ -680,7 +680,7 @@ def _fused_moe_jax(
             return combined[:m_orig].astype(out_dtype)
 
         # no_combine: just gather, without the weighted top-k sum.
-        from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import (
+        from sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2 import (
             ragged_gather_v2,
         )
 

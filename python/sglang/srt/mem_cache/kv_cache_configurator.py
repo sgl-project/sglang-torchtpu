@@ -1501,7 +1501,7 @@ class KVCacheConfigurator:
             pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
         elif current_platform.is_tpu():
-            from sglang.srt.hardware_backend.tpu.dsv4.dsv4_memory_pool import (
+            from sglang_tpu.dsv4.dsv4_memory_pool import (
                 DSV4TPUTokenToKVPool,
             )
 

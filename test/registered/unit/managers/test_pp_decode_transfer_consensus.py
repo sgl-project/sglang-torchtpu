@@ -11,11 +11,11 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.base.conn import KVPoll  # noqa: E402
-from sglang.srt.hardware_backend.tpu.pp_scheduler import (  # noqa: E402
-    PPDecodeTransferStatus,
-)
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.utils.common import point_to_point_pyobj  # noqa: E402
+from sglang_tpu.pp_scheduler import (  # noqa: E402
+    PPDecodeTransferStatus,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

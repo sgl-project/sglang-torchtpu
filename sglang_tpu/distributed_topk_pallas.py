@@ -7,10 +7,10 @@ from threading import Lock
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kernels.distributed_topk import (
+from sglang_tpu.kernels.distributed_topk import (
     SUPPORTED_WORLD_SIZES,
 )
-from sglang.srt.hardware_backend.tpu.kernels.distributed_topk import (
+from sglang_tpu.kernels.distributed_topk import (
     distributed_top_k as distributed_top_k_kernel,
 )
 
@@ -29,7 +29,7 @@ def _build_op(world_size: int) -> Callable:
     import jax
     from jax.sharding import PartitionSpec as P
 
-    from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     mesh = _get_mesh(world_size)
 

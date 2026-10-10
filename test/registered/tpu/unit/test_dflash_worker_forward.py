@@ -15,12 +15,6 @@ import torch.nn as nn
 
 import sglang.srt.speculative.dflash_worker_v2 as dflash_worker_mod
 import sglang.srt.speculative.spec_utils as spec_utils
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
-    DFlashSpecDecodeCompilePolicyMixin,
-    _DFlashVerifyPadding,
-)
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -39,6 +33,12 @@ from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.spec_info import SpecPaddingState
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecodeCompilePolicyMixin,
+    _DFlashVerifyPadding,
+)
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 
 def _detect_tpu() -> bool:

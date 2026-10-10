@@ -5,7 +5,7 @@
 * Unifies log level control under a single namespace.
 
 Usage:
-    from sglang.srt.hardware_backend.tpu._logging import get_logger
+    from sglang_tpu._logging import get_logger
     logger = get_logger(__name__)
     logger.info("hello")     # → "[TPU] hello"
 """

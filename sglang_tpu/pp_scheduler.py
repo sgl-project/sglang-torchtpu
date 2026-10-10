@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.hardware_backend.tpu.pp_wave import PPWave, build_pp_wave
+from sglang_tpu.pp_wave import PPWave, build_pp_wave
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -25,7 +25,7 @@ class PPDecodeTransferStatus(NamedTuple):
 def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
     """The stage's hand-off wave, sized to the largest batch a compiled
     forward can hand on."""
-    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    from sglang_tpu.compilation.decoder_compile_policy import (
         DecoderTpuCompilePolicy,
     )
 

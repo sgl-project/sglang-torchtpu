@@ -1660,7 +1660,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.dist_init_addr = f"{hosts[0]}:{_TPU_DIST_PORT}"
 
         if self.num_gpus > 1:
-            from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+            from sglang_tpu.patches import _prepare_tpu_env
 
             # Single-host ports are random, so pick them once for workers to inherit.
             _prepare_tpu_env(

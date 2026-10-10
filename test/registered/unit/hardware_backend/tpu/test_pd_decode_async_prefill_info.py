@@ -12,8 +12,8 @@ from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation import decode
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
-from sglang.srt.hardware_backend.tpu import pd_decode_async_prefill_info as tpu
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import pd_decode_async_prefill_info as tpu
 
 ADDR = "127.0.0.1:11500"
 

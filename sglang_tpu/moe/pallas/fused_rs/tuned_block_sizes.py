@@ -6,7 +6,7 @@ import logging
 
 import jax.numpy as jnp
 
-from sglang.srt.hardware_backend.tpu.pallas_export import get_pallas_tpu_device_kind
+from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
 from .v2_fused_rs_tuned_block_sizes import (
     FUSED_RS_TUNED_BLOCK_SIZES,

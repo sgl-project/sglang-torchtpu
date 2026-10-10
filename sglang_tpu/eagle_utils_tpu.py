@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op
-from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
+from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
+from sglang_tpu.spec_op_warmup import (
     make_draft_extend_select_args,
 )
-from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -359,7 +359,7 @@ def _renorm_filtered(kept: torch.Tensor) -> torch.Tensor:
 
 def top_k_renorm_prob_tpu(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
     """Sort-free top-k renormalization; keeps every value tied with the k-th."""
-    from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+    from sglang_tpu.sampling_mask import tpu_filter_probs
 
     rows = probs.shape[0]
     kept = tpu_filter_probs(
@@ -376,7 +376,7 @@ def top_k_renorm_prob_tpu(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Te
 
 def top_p_renorm_prob_tpu(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
     """Sort-free top-p renormalization; keeps every value tied with the cutoff."""
-    from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+    from sglang_tpu.sampling_mask import tpu_filter_probs
 
     rows = probs.shape[0]
     kept = tpu_filter_probs(

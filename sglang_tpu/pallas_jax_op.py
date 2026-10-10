@@ -10,7 +10,7 @@ import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
-from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
+from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 
 def _partition_axis_size(mesh: Mesh, axes: str | Sequence[str] | None) -> int:

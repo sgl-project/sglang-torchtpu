@@ -8,18 +8,18 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.mm_embedding import (
-    MultimodalEmbedding,
-    PaddedEmbedding,
-)
-from sglang.srt.hardware_backend.tpu.mm_schedule_tpu import (
-    DataEmbeddingFunc,
-    get_embedding_and_mask,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_disagg, get_server_args
 from sglang.srt.utils import flatten_nested_list
+from sglang_tpu.mm_embedding import (
+    MultimodalEmbedding,
+    PaddedEmbedding,
+)
+from sglang_tpu.mm_schedule_tpu import (
+    DataEmbeddingFunc,
+    get_embedding_and_mask,
+)
 
 
 def merge_mm_rows(

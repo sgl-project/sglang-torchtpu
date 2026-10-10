@@ -24,7 +24,7 @@ from jax import lax
 from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
+from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
     FusedDims,
     FusedWeightsRef,
@@ -42,10 +42,10 @@ from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     zero_out_end_3d,
     zero_out_start_3d,
 )
-from sglang.srt.layers.moe.pallas.fused_rs.tuned_block_sizes import (
+from sglang_tpu.moe.pallas.fused_rs.tuned_block_sizes import (
     get_fused_rs_tuned_block_sizes,
 )
-from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
+from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
 
 # =============================================================================
 # Phase 1: Pre-kernel metadata computation (JAX level)

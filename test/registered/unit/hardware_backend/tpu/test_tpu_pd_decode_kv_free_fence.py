@@ -10,15 +10,15 @@ import torch
 
 from sglang.srt.disaggregation.decode import alloc_for_decode_prealloc
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.hardware_backend.tpu.allocator_tpu import (
-    TpuPagedTokenToKVPoolAllocator,
-)
-from sglang.srt.hardware_backend.tpu.kv_free_fence import install_kv_free_fence
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.allocator_tpu import (
+    TpuPagedTokenToKVPoolAllocator,
+)
+from sglang_tpu.kv_free_fence import install_kv_free_fence
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

@@ -218,7 +218,7 @@ class SchedulerProfilerManager:
             # TorchTPU xprof: capture TPU device activity (and host CPU only if
             # "CPU" was also requested).
             if _is_tpu:
-                from sglang.srt.hardware_backend.tpu.profiler import start_tpu_profile
+                from sglang_tpu.profiler import start_tpu_profile
 
                 subdir_parts = [self.profile_prefix or "profile"]
                 if self.profile_id:
@@ -412,7 +412,7 @@ class SchedulerProfilerManager:
             self.rpd_profile_path = None
 
         if self.tpu_profiler is not None:
-            from sglang.srt.hardware_backend.tpu.profiler import stop_tpu_profile
+            from sglang_tpu.profiler import stop_tpu_profile
 
             stop_tpu_profile(self.tpu_profiler)
             self.tpu_profiler = None

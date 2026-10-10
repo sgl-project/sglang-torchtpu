@@ -3,7 +3,7 @@
 
 Thin wrapper over :class:`BaseTpuPallasRpaAttnBackend` (see
 ``attention_pallas_rpa_base``) selecting the JAX/Pallas v3 kernel
-(``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``). Selected via
+(``sglang_tpu.attention.pallas.ragged_paged_attention_v3``). Selected via
 ``--attention-backend pallas_tpu_rpa_v3`` (the TPU platform default). Supports
 attention sinks, bidirectional (``ENCODER_ONLY``) layers, and EAGLE speculative decoding (TARGET_VERIFY,
 DRAFT_EXTEND_V2, multi-step draft decode). Target verification and the
@@ -16,7 +16,7 @@ decode-phase draft extension run on the kernel's DECODE range with a static
 
 from typing import Optional
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     BaseTpuPallasRpaMultiStepDraftBackend,
     PallasForwardMetadata,
@@ -31,7 +31,7 @@ __all__ = [
 
 
 def _import_v3_kernel():
-    from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+    from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
         ragged_paged_attention,
     )
 

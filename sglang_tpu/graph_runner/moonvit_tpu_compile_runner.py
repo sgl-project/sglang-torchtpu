@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     VisionPaddingContext,
     VisionTpuCompilePolicy,
     _compute_patch_counts,

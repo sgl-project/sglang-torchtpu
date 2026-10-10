@@ -24,15 +24,15 @@ head_dim 64, page 128) with the page count scaled down.
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.dflash_draft_kv_write import (
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
+from sglang_tpu.dflash_draft_kv_write import (
     get_contiguous_slot_spans,
 )
-from sglang.srt.hardware_backend.tpu.kv_fused_rope_write import (
+from sglang_tpu.kv_fused_rope_write import (
     fused_rope_write_kv,
     fused_rope_write_kv_ref,
 )
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
 
 DEVICE = "tpu:0"
 LAYERS = 8

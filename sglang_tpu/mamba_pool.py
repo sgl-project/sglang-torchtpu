@@ -6,7 +6,7 @@ conv/ssm buffers with CUDA-specific machinery (memory-saver regions, custom
 NVLink mem pools, fp8 quirks, CUDA-only speculative buffers) and in the layout
 expected by the Triton GDN kernels. This subclass reallocates the two state
 buffers on the TPU device in the layout expected by the fused Pallas kernel
-:func:`sglang.srt.layers.attention.pallas.gdn.fused_conv1d_gdn`:
+:func:`sglang_tpu.attention.pallas.gdn.fused_conv1d_gdn`:
 
 * ``conv``:      ``[size + 1, kernel_size - 1, conv_dim]``    (one per layer)
 * ``recurrent``: ``[size + 1, num_v_heads, d_k, d_v]``        (one per layer)

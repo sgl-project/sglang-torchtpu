@@ -10,7 +10,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from sglang.srt.layers.moe.pallas.sparse_core import core_map_helper
+from sglang_tpu.moe.pallas.sparse_core import core_map_helper
 
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:

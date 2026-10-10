@@ -21,13 +21,6 @@ from torch.nn.utils.stateless import _reparametrize_module
 from torch_tpu._internal import execution_mode
 from torch_tpu._internal.compile import tpu_torch_compile
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
-    PallasForwardMetadata,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.pp_proxy_pytree import (
-    register_pp_proxy_pytree,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -35,6 +28,13 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
+)
+from sglang_tpu.attention_pallas_rpa_base import (
+    PallasForwardMetadata,
+)
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.pp_proxy_pytree import (
+    register_pp_proxy_pytree,
 )
 
 logger = logging.getLogger(__name__)

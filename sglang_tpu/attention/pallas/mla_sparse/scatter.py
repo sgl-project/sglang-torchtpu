@@ -18,7 +18,7 @@
 
 import jax
 
-from sglang.srt.layers.attention.pallas.mla_sparse import kv_cache_utils, scatter_utils
+from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils, scatter_utils
 
 
 def scatter(

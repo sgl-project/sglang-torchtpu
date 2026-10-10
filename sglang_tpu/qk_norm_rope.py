@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
 if TYPE_CHECKING:
     import jax

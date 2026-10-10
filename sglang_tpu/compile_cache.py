@@ -58,23 +58,23 @@ def add_tpu_rank_assignment_to_compile_cache_key() -> None:
 
 
 def get_pallas_kernel_sources() -> tuple[str, ...]:
-    """Return paths to Pallas source files and directories in sglang-torchtpu.
+    """Return Pallas source files and directories, relative to the sglang_tpu package.
 
     PLEASE add every new Pallas kernel to this list. Missing sources can cause
     torch.compile to reuse stale artifacts and produce confusing behavior.
     """
     return (
-        "layers/attention/pallas",
-        "layers/moe/pallas",
-        "hardware_backend/tpu/attention_pallas.py",
-        "hardware_backend/tpu/attention_pallas_rpa_base.py",
-        "hardware_backend/tpu/attention_pallas_rpa_batched.py",
-        "hardware_backend/tpu/attention_pallas_rpa_v3.py",
-        "hardware_backend/tpu/distributed_topk_pallas.py",
-        "hardware_backend/tpu/kernels",
-        "hardware_backend/tpu/pallas_export.py",
-        "hardware_backend/tpu/pallas_jax_op.py",
-        "hardware_backend/tpu/quantized_matmul.py",
+        "attention/pallas",
+        "moe/pallas",
+        "attention_pallas.py",
+        "attention_pallas_rpa_base.py",
+        "attention_pallas_rpa_batched.py",
+        "attention_pallas_rpa_v3.py",
+        "distributed_topk_pallas.py",
+        "kernels",
+        "pallas_export.py",
+        "pallas_jax_op.py",
+        "quantized_matmul.py",
     )
 
 
@@ -86,8 +86,8 @@ def add_pallas_kernel_sources_to_compile_cache_key() -> None:
     """
     import torch.compiler.config as compiler_config
 
-    srt_root = Path(__file__).resolve().parents[2]
-    source_digest = _hash_source_paths(srt_root, get_pallas_kernel_sources())
+    package_root = Path(__file__).resolve().parent
+    source_digest = _hash_source_paths(package_root, get_pallas_kernel_sources())
     existing_tag = str(compiler_config.cache_key_tag or "")
     cache_tag = f"{existing_tag}|{source_digest}" if existing_tag else source_digest
 

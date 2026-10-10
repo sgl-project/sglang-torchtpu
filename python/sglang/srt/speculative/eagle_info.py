@@ -44,7 +44,7 @@ from sglang.srt.utils import is_tpu, next_power_of_2
 _is_tpu = is_tpu()
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+    from sglang_tpu.eagle_utils_tpu import (
         filter_device_accept_tpu,
         merge_device_accept_tpu,
     )

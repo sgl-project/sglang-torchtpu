@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang_tpu._logging import get_logger
 
 logger = get_logger(__name__)
 

@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from sglang.srt.layers.attention.pallas.gdn import config, memory_ref
+from sglang_tpu.attention.pallas.gdn import config, memory_ref
 
 
 def compute_batched_seq_metadata(

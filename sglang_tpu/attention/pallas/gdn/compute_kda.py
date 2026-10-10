@@ -26,7 +26,7 @@ which is what drives the split intra-chunk solve in
 import jax
 import jax.numpy as jnp
 
-from sglang.srt.layers.attention.pallas.gdn import compute_gdn, config
+from sglang_tpu.attention.pallas.gdn import compute_gdn, config
 
 
 def _l2_norm_f32(x: jax.Array, eps: float = 1e-6) -> jax.Array:

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 # One logger for the whole package, deliberately keeping the name of the module
 # this code used to live in: emitted record names and the existing test
 # monkeypatch target "…raiden.conn.logger" both depend on it.
-logger = logging.getLogger("sglang.srt.disaggregation.raiden.conn")
+logger = logging.getLogger("sglang_tpu.disaggregation.raiden.conn")
 
 # Pages are announced to the decode in pieces of at least this many tokens. A
 # raiden read costs about the same whether it moves 16 pages or 200, so

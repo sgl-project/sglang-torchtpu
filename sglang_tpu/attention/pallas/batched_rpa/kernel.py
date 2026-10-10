@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax import lax
 
 # yapf: disable
-from sglang.srt.layers.attention.pallas.batched_rpa import (
+from sglang_tpu.attention.pallas.batched_rpa import (
     bref_override,
     configs,
     flash_attention,

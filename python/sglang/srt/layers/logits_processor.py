@@ -581,7 +581,7 @@ class LogitsProcessor(nn.Module):
         if self.use_tpu_distributed_top_k:
             # Register before an optional fullgraph torch.compile trace reaches
             # the logits processor. StableHLO export itself remains lazy.
-            from sglang.srt.hardware_backend.tpu.top_k import register_tpu_top_k_ops
+            from sglang_tpu.top_k import register_tpu_top_k_ops
 
             register_tpu_top_k_ops()
 
@@ -639,7 +639,7 @@ class LogitsProcessor(nn.Module):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_output_mode = logits_metadata.logits_output_mode
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
-                from sglang.srt.hardware_backend.tpu.sampler import (
+                from sglang_tpu.sampler import (
                     distributed_top_k_candidate_width,
                 )
 
@@ -1043,7 +1043,7 @@ class LogitsProcessor(nn.Module):
         """Reduce sharded LM-head logits into an exact global TopK.
         Monotonic final softcapping is applied after the global merge."""
 
-        from sglang.srt.hardware_backend.tpu.top_k import (
+        from sglang_tpu.top_k import (
             TpuVocabShard,
             distributed_tpu_top_k,
         )
@@ -1114,7 +1114,7 @@ class LogitsProcessor(nn.Module):
             and hidden_states.ndim == 2
         )
         if bucket_rows:
-            from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+            from sglang_tpu.row_pad import pad_rows, row_bucket
 
             hidden_states = pad_rows(hidden_states, row_bucket(rows))
         lora_batch_layout = (
@@ -1197,7 +1197,7 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if _is_tpu and hidden_states.ndim == 2 and not torch.compiler.is_compiling():
-            from sglang.srt.hardware_backend.tpu.row_pad import pad_rows, row_bucket
+            from sglang_tpu.row_pad import pad_rows, row_bucket
 
             # Eager on TPU, each row count compiles its own program; bucket rows.
             rows = hidden_states.shape[0]

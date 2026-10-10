@@ -150,7 +150,7 @@ class HiRadixCache(RadixCache):
             )
             if host_pool_cls is TpuFusedMHATokenToKVPoolHost:
                 # TPU fused host: pre-compile the native reload/backup XLA
-                from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+                from sglang_tpu.compilation.compiled_forward_shim import (
                     precompile_kv_offload,
                 )
 

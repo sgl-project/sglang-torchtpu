@@ -24,18 +24,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_free_fence import (
-    KVFreeFence,
-    fence_hicache_backups,
-)
-from sglang.srt.hardware_backend.tpu.kv_pool_host import (
-    RAIDEN_LAYOUT,
-    TpuRaidenHostKVCache,
-)
-from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
-)
-from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
 from sglang.srt.managers.cache_controller import BatchDoneCounter, LayerDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -45,6 +33,15 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kv_free_fence import KVFreeFence, fence_hicache_backups
+from sglang_tpu.kv_pool_host import (
+    RAIDEN_LAYOUT,
+    TpuRaidenHostKVCache,
+)
+from sglang_tpu.raiden_hybrid_cache_controller import (
+    TpuRaidenHybridCacheController,
+)
+from sglang_tpu.raiden_transfer import RaidenKVTransfer
 
 
 class _FakeFuture:

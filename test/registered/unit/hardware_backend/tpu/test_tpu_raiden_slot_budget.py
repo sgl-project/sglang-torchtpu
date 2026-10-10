@@ -10,7 +10,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.disaggregation.raiden.host_pool import (
+from sglang_tpu.disaggregation.raiden.host_pool import (
     node_worker_rank,
     ranks_per_node,
     slot_host_bytes,

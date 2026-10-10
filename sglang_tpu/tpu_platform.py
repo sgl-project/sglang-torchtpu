@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
-from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang_tpu._logging import get_logger
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -75,13 +75,9 @@ def _rpa_kernel_spec(backend: str | None):
     declared on the spec rather than restated here.
     """
     if backend == "pallas_tpu_rpa_batched":
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
-            RPA_BATCHED_SPEC as spec,
-        )
+        from sglang_tpu.attention_pallas_rpa_batched import RPA_BATCHED_SPEC as spec
     elif backend == "pallas_tpu_rpa_v3":
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
-            RPA_V3_SPEC as spec,
-        )
+        from sglang_tpu.attention_pallas_rpa_v3 import RPA_V3_SPEC as spec
     else:
         return None
     return spec
@@ -89,7 +85,7 @@ def _rpa_kernel_spec(backend: str | None):
 
 def _uses_seq_along_lane_kv() -> bool:
     """Ask the backend, so the pool cannot disagree with the kernel."""
-    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+    from sglang_tpu.attention_pallas_rpa_batched import (
         uses_seq_along_lane_kv,
     )
 
@@ -107,7 +103,7 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
     if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
         # SEQ_ALONG_LANE puts the token index on the lane axis, so the
         # buffer shape differs from the fused one the other backends read.
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuSeqAlongLaneKVPool
+        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
 
         return TpuSeqAlongLaneKVPool
 
@@ -117,7 +113,7 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
         "pallas_tpu_rpa_v3",
         "pallas_tpu_rpa_batched",
     ):
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         return TpuFusedMHATokenToKVPool
 
@@ -308,12 +304,12 @@ class TpuSRTPlatform(SRTPlatform):
             declare_resolution,
             resolving_view,
         )
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
         from sglang.srt.model_executor.cuda_graph_config import (
             Backend,
             Phase,
             with_phase,
         )
+        from sglang_tpu.patches import _prepare_tpu_env
 
         cfg = resolving_view(server_args)
         if cfg.pp_size > 1:
@@ -335,7 +331,7 @@ class TpuSRTPlatform(SRTPlatform):
         # One device per scheduler process across all pipeline stages.
         _prepare_tpu_env(cfg.tp_size * cfg.pp_size, setup_slicebuilder=not cfg.use_ray)
 
-        from sglang.srt.hardware_backend.tpu.env_override import (
+        from sglang_tpu.env_override import (
             apply_small_kv_pool_vmem_prefetch_override,
         )
 
@@ -485,7 +481,7 @@ class TpuSRTPlatform(SRTPlatform):
         return "pallas_tpu_rpa_v3"
 
     def get_graph_runner_cls(self) -> type:
-        from sglang.srt.model_executor.tpu_graph_runner import TpuGraphRunner
+        from sglang_tpu.graph_runner.tpu_graph_runner import TpuGraphRunner
 
         return TpuGraphRunner
 
@@ -515,12 +511,11 @@ class TpuSRTPlatform(SRTPlatform):
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
-        from sglang.srt.hardware_backend.tpu.mamba_pool import TpuMambaPool
+        from sglang_tpu.mamba_pool import TpuMambaPool
 
         return TpuMambaPool
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
         from sglang.srt.mem_cache.memory_pool_host import (
             TpuFusedMHATokenToKVPoolHost,
         )
@@ -530,11 +525,12 @@ class TpuSRTPlatform(SRTPlatform):
         # fork's own class and still lives in memory_pool_host.
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.runtime_context import get_memory
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         # raiden offloads through tpu-sync's DMA-pinned host pool instead of the
         # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
         if get_memory().hicache_io_backend == "raiden":
-            from sglang.srt.hardware_backend.tpu.kv_pool_host import (
+            from sglang_tpu.kv_pool_host import (
                 TpuRaidenHostKVCache,
             )
 
@@ -551,7 +547,7 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.runtime_context import get_exec
 
         if get_exec().kernel.attention_backend == "pallas_tpu_mla":
-            from sglang.srt.hardware_backend.tpu.kv_pool import (
+            from sglang_tpu.kv_pool import (
                 TpuFusedMLATokenToKVPool,
             )
 
@@ -565,7 +561,7 @@ class TpuSRTPlatform(SRTPlatform):
         raise NotImplementedError("NSA is not supported on TPU.")
 
     def get_paged_allocator_cls(self) -> type:
-        from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+        from sglang_tpu.allocator_tpu import (
             TpuPagedTokenToKVPoolAllocator,
         )
 
@@ -619,7 +615,7 @@ class TpuSRTPlatform(SRTPlatform):
                 "Initialize it from the scheduler worker bootstrap."
             )
 
-        from sglang.srt.hardware_backend.tpu.compile_cache import (
+        from sglang_tpu.compile_cache import (
             add_pallas_kernel_sources_to_compile_cache_key,
         )
 
@@ -647,7 +643,7 @@ class TpuSRTPlatform(SRTPlatform):
             premapped_bytes,
         )
 
-        from sglang.srt.hardware_backend.tpu.patches import (
+        from sglang_tpu.patches import (
             _prepare_tpu_env,
             apply_tpu_patches,
         )
@@ -717,10 +713,10 @@ class TpuSRTPlatform(SRTPlatform):
 
     @contextmanager
     def weight_loading_context(self, weights):
-        from sglang.srt.hardware_backend.tpu.expert_loading import (
+        from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.expert_loading import (
             expert_loading_context,
         )
-        from sglang.srt.runtime_context import get_parallel
 
         if get_parallel().pp_size > 1:
             with expert_loading_context():

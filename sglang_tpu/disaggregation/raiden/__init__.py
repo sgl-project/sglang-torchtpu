@@ -1,9 +1,9 @@
-from sglang.srt.disaggregation.raiden.conn import (
+from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVBootstrapServer,
     RaidenKVManager,
 )
-from sglang.srt.disaggregation.raiden.receiver import RaidenKVReceiver
-from sglang.srt.disaggregation.raiden.sender import RaidenKVSender
+from sglang_tpu.disaggregation.raiden.receiver import RaidenKVReceiver
+from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 
 __all__ = [
     "RaidenKVManager",

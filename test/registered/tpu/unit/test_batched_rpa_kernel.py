@@ -49,13 +49,13 @@ class TestBatchedRpaKernel(unittest.TestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.batched_rpa.utils import (
+        from sglang_tpu.attention.pallas.batched_rpa.utils import (
             get_dtype_packing,
         )
-        from sglang.srt.layers.attention.pallas.batched_rpa.wrapper import (
+        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
             ragged_paged_attention,
         )
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ref_ragged_paged_attention,
         )
 
@@ -177,7 +177,7 @@ def _kv_cache_to_kernel(fused: np.ndarray, kv_dtype, kv_layout):
     """[pages, page, 2 * kv_heads, head_dim] interleaved K/V as the kernel's cache."""
     import jax.numpy as jnp
 
-    from sglang.srt.layers.attention.pallas.batched_rpa import configs, wrapper
+    from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
 
     pages, page_size, heads_x2, head_dim = fused.shape
     shape = wrapper.get_kv_cache_shape(
@@ -204,7 +204,7 @@ def _kv_cache_from_kernel(cache, heads_x2: int, head_dim: int, kv_layout):
     """Inverse of ``_kv_cache_to_kernel``, as f32 on the host."""
     import jax.numpy as jnp
 
-    from sglang.srt.layers.attention.pallas.batched_rpa import configs
+    from sglang_tpu.attention.pallas.batched_rpa import configs
 
     cache = np.asarray(cache.astype(jnp.float32))
     pages = cache.shape[0]
@@ -260,11 +260,11 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         """
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.batched_rpa import configs
-        from sglang.srt.layers.attention.pallas.batched_rpa.wrapper import (
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
             ragged_paged_attention,
         )
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ref_ragged_paged_attention,
         )
 
@@ -425,7 +425,7 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
     def test_packed_extend_sink_uses_final_max_across_lanes(self):
         """Small blocks over two lanes: a q block's running max moves between
         k blocks and lanes, and the sink must be scaled by the final one."""
-        from sglang.srt.layers.attention.pallas.batched_rpa.configs import (
+        from sglang_tpu.attention.pallas.batched_rpa.configs import (
             BlockSizes,
         )
 

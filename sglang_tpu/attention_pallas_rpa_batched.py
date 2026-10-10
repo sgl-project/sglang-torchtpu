@@ -19,7 +19,7 @@ The kernel reads either of two KV cache layouts, chosen once here from
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     BaseTpuPallasRpaMultiStepDraftBackend,
     PallasForwardMetadata,
@@ -49,7 +49,7 @@ def kv_layout():
 
     Read at trace time, not per token, so a plain lookup is fine here.
     """
-    from sglang.srt.layers.attention.pallas.batched_rpa import configs
+    from sglang_tpu.attention.pallas.batched_rpa import configs
 
     if uses_seq_along_lane_kv():
         return configs.KVLayout.SEQ_ALONG_LANE
@@ -57,7 +57,7 @@ def kv_layout():
 
 
 def _import_batched_kernel():
-    from sglang.srt.layers.attention.pallas.batched_rpa.wrapper import (
+    from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
 
@@ -148,7 +148,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
     def init_forward_metadata(self, forward_batch):
         if self._pp_schedule_runner is not None:
-            from sglang.srt.hardware_backend.tpu.pp_attention_capacity import (
+            from sglang_tpu.pp_attention_capacity import (
                 check_batch_schedule,
             )
 

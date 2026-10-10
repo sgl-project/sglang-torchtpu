@@ -62,7 +62,7 @@ from torch.distributed import barrier
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
-    from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
+    from sglang_tpu.kv_free_fence import KVFreeFence
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
@@ -1104,7 +1104,7 @@ class Scheduler(
 
         warmup_scope = nullcontext()
         if current_platform.is_tpu() and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
-            from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+            from sglang_tpu.compilation.warmup_queue import (
                 collect_warmups,
             )
 
@@ -1372,7 +1372,7 @@ class Scheduler(
         self._tpu_pp_chunk_cost = None
         self._tpu_pp_cached_prefix = {}
         if current_platform.is_tpu() and get_parallel().pp_size > 1:
-            from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
+            from sglang_tpu.pp_chunk_scheduler import (
                 profile_and_install_cost_model,
             )
 
@@ -1667,7 +1667,7 @@ class Scheduler(
             and self.enable_overlap
             and envs.SGLANG_TPU_ASYNC_COPY_WORKER.get()
         ):
-            from sglang.srt.hardware_backend.tpu.result_copy_worker import (
+            from sglang_tpu.result_copy_worker import (
                 TPUAsyncCopyWorker,
             )
 
@@ -1775,7 +1775,7 @@ class Scheduler(
         """Hold KV pages freed under overlap back from DMA write targets."""
         if not self._needs_kv_free_fence():
             return
-        from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+        from sglang_tpu.kv_free_fence import (
             fence_hicache_backups,
             install_kv_free_fence,
             kv_free_fence_unsupported_reason,
@@ -1817,10 +1817,10 @@ class Scheduler(
             fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
 
     def precompile_tpu_spec_ops(self) -> None:
-        from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+        from sglang_tpu.compilation.spec_decode_compile_policy import (
             BaseSpecDecodeCompilePolicyMixin,
         )
-        from sglang.srt.hardware_backend.tpu.spec_op_precompile import (
+        from sglang_tpu.spec_op_precompile import (
             precompile_spec_v2_ops,
         )
 
@@ -4186,7 +4186,7 @@ class Scheduler(
         adder_cls = PrefillAdder
         adder_kwargs = {}
         if self._tpu_pp_chunk_cost is not None:
-            from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
+            from sglang_tpu.pp_chunk_scheduler import (
                 TpuPipelinePrefillAdder,
                 pending_step_limit,
             )
@@ -4405,7 +4405,7 @@ class Scheduler(
                 and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
                 and adder.host_load_indices
             ):
-                from sglang.srt.hardware_backend.tpu.prefill_early_send import (
+                from sglang_tpu.prefill_early_send import (
                     tpu_hicache_load_page_ids,
                 )
 

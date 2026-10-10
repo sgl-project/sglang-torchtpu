@@ -6,10 +6,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
-from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
-from sglang.srt.disaggregation.raiden.state import DecodeState
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
+from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.state import DecodeState
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

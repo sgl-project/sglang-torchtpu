@@ -27,16 +27,16 @@ from typing import Optional
 import jax
 import torch
 
-from sglang.srt.hardware_backend.tpu.dsv4.compress_and_store.compressor_v1 import (
+from sglang.srt.runtime_context import get_exec
+from sglang_tpu.dsv4.compress_and_store.compressor_v1 import (
     compressor_forward,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.dsv4_memory_pool import (
+from sglang_tpu.dsv4.dsv4_memory_pool import (
     DSV4TPUTokenToKVPool,
     TPUCompressStatePool,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.rope import get_or_build_cos_sin_cache
-from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
-from sglang.srt.runtime_context import get_exec
+from sglang_tpu.dsv4.rope import get_or_build_cos_sin_cache
+from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 _CSA_OP_NAME = "sglang_tpu_pallas::dsv4_compressor_csa"
 _HCA_OP_NAME = "sglang_tpu_pallas::dsv4_compressor_hca"

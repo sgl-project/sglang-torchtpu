@@ -131,7 +131,7 @@ def tpu_w8a8_block_fp8_linear(
     # TODO(torch_tpu#1831): try torch._scaled_mm_v2 once torch_tpu registers a
     # native block-scaled matmul op. Until then, keep true blockwise FP8 behind
     # one Pallas custom op, matching torchtpu-vllm's serving path.
-    from sglang.srt.hardware_backend.tpu.quantized_matmul import (
+    from sglang_tpu.quantized_matmul import (
         blockwise_quantized_matmul,
     )
 

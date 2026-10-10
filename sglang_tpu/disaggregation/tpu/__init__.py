@@ -6,14 +6,14 @@ backend (e.g. ``tpu_sync``) subclasses the same base classes and implements
 only the data-plane seam — see ``base.py`` for the contract.
 """
 
-from sglang.srt.disaggregation.tpu.base import (
+from sglang_tpu.disaggregation.tpu.base import (
     KVTransferError,
     TpuKVBootstrapServerBase,
     TpuKVManagerBase,
     TpuKVReceiverBase,
     TpuKVSenderBase,
 )
-from sglang.srt.disaggregation.tpu.conn import (
+from sglang_tpu.disaggregation.tpu.conn import (
     TpuKVBootstrapServer,
     TpuKVManager,
     TpuKVReceiver,

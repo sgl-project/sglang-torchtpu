@@ -24,21 +24,21 @@ from typing import Any, Callable, List, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_free_fence import (
-    KVFreeFence,
-    assert_not_forward_write_target,
-    deferred_dma_read,
-)
-from sglang.srt.hardware_backend.tpu.raiden_transfer import (
-    NOOP_EVENT,
-    CombinedFutureEvent,
-    RaidenFutureEvent,
-)
 from sglang.srt.managers.cache_controller import BatchDoneCounter, HiCacheAck
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
+)
+from sglang_tpu.kv_free_fence import (
+    KVFreeFence,
+    assert_not_forward_write_target,
+    deferred_dma_read,
+)
+from sglang_tpu.raiden_transfer import (
+    NOOP_EVENT,
+    CombinedFutureEvent,
+    RaidenFutureEvent,
 )
 
 logger = logging.getLogger(__name__)

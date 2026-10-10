@@ -17,23 +17,23 @@ from typing import Any, Sequence
 import msgspec
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.raiden.host_pool import (
-    StagingAdmission,
-    ranks_per_node,
-)
-from sglang.srt.disaggregation.raiden.reshard_schedule import (
-    ReshardGeometry,
-    head_bytes,
-)
-from sglang.srt.disaggregation.raiden.serde import (
-    MessageTag,
-    read_aux_blob,
-    write_aux_blob,
-)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.network import NetworkAddress
+from sglang_tpu.disaggregation.raiden.host_pool import (
+    StagingAdmission,
+    ranks_per_node,
+)
+from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+    ReshardGeometry,
+    head_bytes,
+)
+from sglang_tpu.disaggregation.raiden.serde import (
+    MessageTag,
+    read_aux_blob,
+    write_aux_blob,
+)
 
 logger = logging.getLogger(__name__)
 

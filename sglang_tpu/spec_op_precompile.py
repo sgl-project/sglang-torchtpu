@@ -9,18 +9,17 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import get_compiled_ops, warmup_compiled_op
-from sglang.srt.hardware_backend.tpu import (  # noqa: F401
-    eagle_utils_tpu as _eagle_utils_tpu,
-)
-from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-    snapshot_recompilation_baseline,
-)
-from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
-    current_warmup_queue,
-)
-from sglang.srt.hardware_backend.tpu.spec_op_warmup import SpecOpWarmupContext
 from sglang.srt.speculative import dflash_utils as _dflash_utils  # noqa: F401
 from sglang.srt.speculative import eagle_utils as _eagle_utils  # noqa: F401
+from sglang_tpu import dflash_utils_tpu as _dflash_utils_tpu  # noqa: F401
+from sglang_tpu import eagle_utils_tpu as _eagle_utils_tpu  # noqa: F401
+from sglang_tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
+from sglang_tpu.compilation.warmup_queue import (
+    current_warmup_queue,
+)
+from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
 
 logger = logging.getLogger(__name__)
 

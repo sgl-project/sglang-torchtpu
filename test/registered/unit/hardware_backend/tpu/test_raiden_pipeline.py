@@ -11,14 +11,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.raiden.common import get_raiden_kv_caches
-from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
-from sglang.srt.disaggregation.raiden.host_pool import (
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     node_worker_rank,
     ranks_per_node,
 )
-from sglang.srt.disaggregation.raiden.pipeline import (
+from sglang_tpu.disaggregation.raiden.pipeline import (
     PipelineTransfer,
     Receive,
     destination_blocks,
@@ -31,11 +35,7 @@ from sglang.srt.disaggregation.raiden.pipeline import (
     source_spans,
     warn_if_staging_exceeds_premapped,
 )
-from sglang.srt.disaggregation.raiden.serde import MessageTag
-from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_registry import CustomSpecAlgo
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden.serde import MessageTag
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -475,7 +475,7 @@ class TestLegacyPoolBudget(unittest.TestCase):
 
     def test_staging_above_the_premapped_buffer_warns(self):
         with self.assertLogs(
-            "sglang.srt.disaggregation.raiden.pipeline", level="WARNING"
+            "sglang_tpu.disaggregation.raiden.pipeline", level="WARNING"
         ) as logs:
             self.assertTrue(
                 warn_if_staging_exceeds_premapped(
@@ -640,7 +640,7 @@ class TestPipelineLifetimes(unittest.TestCase):
     def test_matching_pipeline_rejects_different_stage_layer_subsets(self):
         """A topology mismatch found on the listener thread fails the room at
         once instead of leaving it to wait out the transfer deadline."""
-        from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
+        from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 
         pipe = transfer(pp_size=8, pp_rank=3)
         pipe.receives[7] = receive(rank=3)
@@ -881,7 +881,7 @@ class TestPipelineInitialization(unittest.TestCase):
     def test_legacy_host_budget_uses_resolved_node_count(self):
         get_context().override("test.multihost", nnodes=2)
         with patch(
-            "sglang.srt.disaggregation.raiden.pipeline.ranks_per_node",
+            "sglang_tpu.disaggregation.raiden.pipeline.ranks_per_node",
             wraps=ranks_per_node,
         ) as local_ranks:
             self._initialize(legacy=True)
@@ -997,7 +997,7 @@ class TestPipelineInitialization(unittest.TestCase):
         self._initialize(legacy=True)
 
     def test_bootstrap_messages_wait_for_pool_initialization(self):
-        from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
+        from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 
         manager = RaidenKVManager.__new__(RaidenKVManager)
         manager._pipeline_enabled = True
@@ -1022,7 +1022,7 @@ class TestSpeculativeSupport(unittest.TestCase):
         spec = SimpleNamespace(speculative_algorithm=algorithm)
         layers = SimpleNamespace(has_draft_pool=has_draft_pool)
         with patch(
-            "sglang.srt.disaggregation.raiden.pipeline.get_spec", return_value=spec
+            "sglang_tpu.disaggregation.raiden.pipeline.get_spec", return_value=spec
         ):
             pipe._check_support(self.PB2, layers)
 

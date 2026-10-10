@@ -38,7 +38,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.pallas.batched_rpa import (
+from sglang_tpu.attention.pallas.batched_rpa import (
     configs,
     kernel,
     schedule,

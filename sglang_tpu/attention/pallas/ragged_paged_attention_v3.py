@@ -34,7 +34,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.attention.pallas.util import (
+from sglang_tpu.attention.pallas.util import (
     align_to,
     cdiv,
     get_dtype_bitwidth,

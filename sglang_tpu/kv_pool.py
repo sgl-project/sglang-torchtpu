@@ -277,7 +277,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     def _raiden_backup(self):
         """The pool's retraction backup, built once when budgeted."""
         if not hasattr(self, "_raiden_backup_obj"):
-            from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+            from sglang_tpu.raiden_kv_backup import (
                 maybe_build_backup,
             )
 
@@ -332,8 +332,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         layer buffer in place; a page that ``indices`` only partly covers is
         read back first and merged on device.
         """
-        from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
-        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+        from sglang_tpu.kv_page_write import write_pages_torch
+        from sglang_tpu.raiden_kv_backup import (
             RaidenKVBackupHandle,
         )
 
@@ -519,7 +519,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         # physical device's metadata for the duration of the query.
         from jax.experimental.pallas import tpu as pltpu
 
-        from sglang.srt.hardware_backend.tpu.pallas_export import (
+        from sglang_tpu.pallas_export import (
             tpu_info_for_cpu_export,
         )
 
@@ -617,8 +617,8 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         """Restore host rows with page-bounded device writes."""
-        from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
-        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+        from sglang_tpu.kv_page_write import write_pages_torch
+        from sglang_tpu.raiden_kv_backup import (
             RaidenKVBackupHandle,
         )
 

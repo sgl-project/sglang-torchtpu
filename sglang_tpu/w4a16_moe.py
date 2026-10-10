@@ -18,10 +18,10 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.hardware_backend.tpu.fp8_moe import _own_storage
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_parallel
+from sglang_tpu.fp8_moe import _own_storage
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -166,7 +166,7 @@ def apply_tpu_w4a16_moe(
 ):
     """Run TPU W4A16 MoE through the Pallas fused grouped-GEMM backend."""
     # Lazy: the Pallas bridge imports torch_tpu, which the CPU test runner lacks.
-    from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+    from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
     if apply_router_weight_on_input:
         raise NotImplementedError(

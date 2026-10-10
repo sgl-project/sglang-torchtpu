@@ -26,12 +26,12 @@ from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel impo
     paged_attention,
 )
 
-from sglang.srt.hardware_backend.tpu.kernels.flash_attention import (
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
+from sglang_tpu.kernels.flash_attention import (
     SegmentIds,
     flash_attention,
 )
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.radix_attention import AttentionType
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
