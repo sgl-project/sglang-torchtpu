@@ -211,6 +211,15 @@ def _validate_raiden_optimistic_prefill(
     )
 
 
+def _validate_kv_canary(kv_canary: str) -> None:
+    if kv_canary == "none":
+        return
+    raise ValueError(
+        f"--kv-canary {kv_canary} is not supported on TPU: the canary cannot "
+        "attach to the TPU fused KV pools. Use --kv-canary none."
+    )
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -323,6 +332,7 @@ class TpuSRTPlatform(SRTPlatform):
             transfer_backend=cfg.disaggregation_transfer_backend,
             optimistic_prefill_attempts=cfg.optimistic_prefill_attempts,
         )
+        _validate_kv_canary(cfg.kv_canary)
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray

@@ -46,6 +46,7 @@ def _args(**overrides):
         disaggregation_mode="null",
         disaggregation_transfer_backend="mooncake",
         optimistic_prefill_attempts=0,
+        kv_canary="none",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

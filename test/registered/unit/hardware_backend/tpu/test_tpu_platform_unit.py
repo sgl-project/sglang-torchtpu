@@ -247,6 +247,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             disaggregation_mode="null",
             disaggregation_transfer_backend="mooncake",
             optimistic_prefill_attempts=0,
+            kv_canary="none",
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -292,6 +293,19 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         ):
             with self.subTest(**overrides):
                 self._apply(self._args(**overrides))
+
+    def test_rejects_kv_canary(self):
+        """The canary has no attacher for the TPU fused KV pools, and used to
+        take every rank down after the weights were loaded."""
+        for mode in ("log", "raise"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    ValueError, f"--kv-canary {mode} is not supported on TPU"
+                ):
+                    self._apply(self._args(kv_canary=mode))
+
+    def test_kv_canary_none_allowed(self):
+        self._apply(self._args(kv_canary="none"))
 
     def test_defaults_applied(self):
         args = self._args(enable_torch_compile=False)
