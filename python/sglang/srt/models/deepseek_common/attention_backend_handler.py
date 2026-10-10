@@ -286,7 +286,6 @@ AttentionBackendRegistry.register(
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
 AttentionBackendRegistry.register("pallas_tpu_mla", handle_attention_pallas_tpu_mla)
-# Same absorbed call form; only the kernel behind the backend differs.
 AttentionBackendRegistry.register(
     "pallas_tpu_mla_sparse", handle_attention_pallas_tpu_mla
 )

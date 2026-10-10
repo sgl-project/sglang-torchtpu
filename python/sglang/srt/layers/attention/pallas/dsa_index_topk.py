@@ -31,9 +31,6 @@ from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk.streamindex_topk impo
 from sglang.srt.layers.attention.pallas.mla_sparse import kv_cache_utils
 from sglang.srt.layers.attention.pallas.util import align_to, quantize_fp8_ue8m0
 
-# The top-k kernel reads keys in whole lanes of this many bytes.
-_LANE_BYTES = 128
-
 # Block sizes for the top-k kernel's (decode, prefill, mixed) passes. These
 # are the values the kernel's authors use; they are not tuned for GLM.
 _NUM_KV_PAGES_PER_BLOCK = (2, 2, 2)
@@ -45,8 +42,15 @@ def index_key_cache_shape(
 ) -> tuple[int, ...]:
     """Shape of one layer's index-key cache, as the top-k kernel reads it.
 
-    ``uint8[num_pages, page_size // 4, 4, record_bytes]``. For a 128-wide key
-    ``record_bytes`` is 256.
+    ``uint8[num_pages, page_size // 4, 4, record_bytes]``.
+
+    ``record_bytes`` is the size of one token's record. The kernel computes it
+    as: the key, padded to whole 128-byte lanes, plus one scale byte per lane,
+    rounded up to whole lanes again. For a 128-wide key that is 128 + 1 = 129
+    bytes, rounded up to 256.
+
+    ``KVLayout.HEAD_ALONG_SUBLANE`` is not a size. It names how the kernel
+    arranges the records inside a page.
     """
     return get_kv_cache_shape(
         num_pages, page_size, index_head_dim, KVLayout.HEAD_ALONG_SUBLANE
@@ -78,7 +82,7 @@ def _store_keys(
     # Build one record per token: key bytes, padded to whole lanes, then the
     # scale byte, then zeros up to the record size.
     key_bytes = jax.lax.bitcast_convert_type(key, jnp.uint8)
-    key_lanes = align_to(index_head_dim, _LANE_BYTES)
+    key_lanes = align_to(index_head_dim, kv_cache_utils.TILE_LANE_BYTES)
     key_bytes = jnp.pad(key_bytes, ((0, 0), (0, key_lanes - index_head_dim)))
     records = jnp.concatenate([key_bytes, key_scale_byte], axis=-1)
     records = jnp.pad(records, ((0, 0), (0, record_bytes - records.shape[-1])))

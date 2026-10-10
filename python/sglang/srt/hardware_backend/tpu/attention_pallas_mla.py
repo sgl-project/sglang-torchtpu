@@ -257,6 +257,8 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         )
         # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
         # views it back to 3D and folds W_UV.
+        # TODO(sglang-torchtpu#1072): avoid this reshape. The model undoes it
+        # right away, and it adds latency.
         return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
     def _mla_kernel_args(
@@ -269,9 +271,6 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         k_rope: Optional[torch.Tensor],
     ) -> tuple:
         """The MLA op's positional arguments for one layer."""
-        # TODO(sglang-torchtpu#1072): pallas_tpu_mla_sparse reuses this tuple
-        # because it shares the fused pool. Return named fields instead once
-        # that backend has its own pool.
         assert self.forward_metadata is not None, (
             "Pallas MLA attention backend was not initialised for this forward "
             "pass; did you forget to call init_forward_metadata()?"

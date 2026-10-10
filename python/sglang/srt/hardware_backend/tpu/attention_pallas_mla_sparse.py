@@ -230,4 +230,5 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope
         )
         out = self._op(*args, topk_indices)
+        # TODO(sglang-torchtpu#1072): avoid this reshape, as in pallas_tpu_mla.
         return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
