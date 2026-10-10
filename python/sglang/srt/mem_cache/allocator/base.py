@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import abc
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, ContextManager, Protocol
+from typing import TYPE_CHECKING, ContextManager, Hashable, Protocol
 
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
     from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang_tpu.kv_free_fence import KVFreeFence
 
 
 class MambaFullCacheDonor(Protocol):
@@ -41,7 +41,7 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
-    # Holds freed pages back from DMA write targets; None frees at once.
+    # Holds freed pages back from non-forward allocations; None frees at once.
     kv_free_fence: KVFreeFence | None = None
 
     @abc.abstractmethod
@@ -146,7 +146,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
         from sglang.srt.mem_cache.common import _evict_until_allocatable
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         shortfall = num_tokens - self.available_size()
         if shortfall > 0:
@@ -195,20 +195,23 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return self.free_pages
         return torch.cat((self.free_pages, self.release_pages))
 
-    def dma_write_target(self) -> ContextManager:
-        """Scope allocations whose pages a DMA unordered against device
-        compute writes, such as a host-to-device KV load."""
+    def forward_write_target(self) -> ContextManager:
+        """Scope allocations whose pages only forwards write. Pages outside it
+        may be written by a DMA unordered against device compute, such as a
+        host-to-device KV load or a PD transfer."""
         if self.kv_free_fence is None:
             return nullcontext()
-        return self.kv_free_fence.dma_write_target()
+        return self.kv_free_fence.forward_write_target()
 
-    def freeing_released_values(self, release_time: float | None) -> ContextManager:
+    def freeing_values_written_before(
+        self, write_horizon: float | None
+    ) -> ContextManager:
         """Scope frees of cached values no forward formed after
-        ``release_time`` (the radix tree's time counter) can write; None when
+        ``write_horizon`` (the radix tree's time counter) can write; None when
         unknown."""
         if self.kv_free_fence is None:
             return nullcontext()
-        return self.kv_free_fence.freeing_released_values(release_time)
+        return self.kv_free_fence.freeing_values_written_before(write_horizon)
 
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"
@@ -253,6 +256,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError()
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        """Record an asynchronous HiCache transfer completion event if needed."""
+        return
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")

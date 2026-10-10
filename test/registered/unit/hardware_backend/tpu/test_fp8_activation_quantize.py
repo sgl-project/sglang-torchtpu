@@ -17,9 +17,9 @@ import unittest
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.fp8_linear import _quantize_activation_per_row
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.fp8_linear import _quantize_activation_per_row
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

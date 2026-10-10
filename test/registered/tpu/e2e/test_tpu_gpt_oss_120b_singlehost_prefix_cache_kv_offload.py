@@ -2,8 +2,8 @@
 
 Covers the P1 `prefix_caching_kv_offload` requirement (issue #372): one server with
 the radix cache on and HiCache mirroring it into host RAM over the raiden DMA
-backend must show a cache hit, show offloading actually happening, and still clear
-the GSM8K quality bar.
+backend must show a cache hit, show offloading actually happening, return prompt
+and decode KV from host unchanged, and still clear the GSM8K quality bar.
 
 GPT-OSS is hybrid-SWA, which is what makes raiden the backend under test rather
 than torch_tpu: raiden gives each sub-pool its own host pool, while torch_tpu
@@ -106,6 +106,7 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
+                decode_tails=True,
             ),
         },
         {

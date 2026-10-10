@@ -1,7 +1,7 @@
 """GPT-OSS-20B single-host cache/offload and quality gate.
 
-The PR gate verifies device-cache reuse, Raiden host offload, and basic GSM8K
-quality. The 120B variant provides broader nightly coverage.
+The PR gate verifies device-cache reuse, Raiden host offload of prompt and
+decode KV, and basic GSM8K quality. The 120B variant provides broader nightly coverage.
 """
 
 import os
@@ -76,6 +76,7 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
+                decode_tails=True,
             ),
         },
         {

@@ -13,15 +13,15 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.raiden.conn import (
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVManager,
     RaidenKVReceiver,
     RaidenKVSender,
 )
-from sglang.srt.disaggregation.raiden.serde import MessageTag, PullReq, ReshardReq
-from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden.serde import MessageTag, PullReq, ReshardReq
+from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -96,7 +96,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
     def test_dispatch_rejects_missing_or_invalid_tags(self):
         mgr = _prefill_manager()
 
-        with patch("sglang.srt.disaggregation.raiden.conn.logger.error") as log_error:
+        with patch("sglang_tpu.disaggregation.raiden.conn.logger.error") as log_error:
             mgr._dispatch([])
             mgr._dispatch([b""])
             mgr._dispatch([None])
@@ -157,7 +157,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
         mgr = _prefill_manager()
         _populate_send_state(mgr, ROOM)
 
-        with patch("sglang.srt.disaggregation.raiden.conn.logger.error") as log_error:
+        with patch("sglang_tpu.disaggregation.raiden.conn.logger.error") as log_error:
             mgr._dispatch([MessageTag.ABORT, b"not-a-room", b"10.0.0.2", b"5555"])
             mgr._dispatch([MessageTag.ABORT])
 
@@ -229,6 +229,7 @@ def _decode_manager_stub(**overrides):
         _drain_engine=lambda: None,
         is_failed=lambda room: False,
         is_recv_done=lambda room: False,
+        last_announcement_age=lambda room: None,
         maybe_start_pull=lambda room: False,
         request_status={ROOM: KVPoll.WaitingForInput},
         failure_records={},
@@ -284,7 +285,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
 
     def test_abort_while_start_read_blocks_cannot_be_overwritten(self):
-        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+        from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 
         started = threading.Event()
         resume = threading.Event()
@@ -788,7 +789,7 @@ class TestGroupFailureQuiescesRaiden(unittest.TestCase):
 
 class TestAdmissionRespectsTheTombstone(unittest.TestCase):
     def test_a_tombstoned_room_cannot_admit_a_read(self):
-        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+        from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 
         mgr = _prefill_manager()  # provides locks and the tombstone dict
         mgr.disaggregation_mode = DisaggregationMode.DECODE
@@ -998,7 +999,7 @@ class TestSendFinishTime(unittest.TestCase):
 
 class TestFailureWaitsForActiveIo(unittest.TestCase):
     def test_failed_room_is_not_concluded_while_its_read_is_in_flight(self):
-        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+        from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 
         mgr = _decode_manager_stub(is_failed=lambda room: True)
         mgr._swa_engine = None
@@ -1446,7 +1447,7 @@ class TestAnnounceSendFailureIsContained(unittest.TestCase):
         _armed_for_announce(mgr, ANNOUNCE_ROOM)
         mgr._send_multipart_locked = self._dead_send
 
-        with patch("sglang.srt.disaggregation.raiden.sender.logger.error") as log_error:
+        with patch("sglang_tpu.disaggregation.raiden.sender.logger.error") as log_error:
             _announce(mgr)
         self.assertEqual(log_error.call_count, 1)
         self.assertIn("CHUNK announce", log_error.call_args[0][0])

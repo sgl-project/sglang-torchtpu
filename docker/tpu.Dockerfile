@@ -11,6 +11,8 @@ WORKDIR /sgl-workspace/sglang
 # Copy source trees
 COPY README.md LICENSE ./
 COPY python    ./python
+COPY sglang_tpu ./sglang_tpu
+COPY pyproject.toml ./pyproject.toml
 COPY test      ./test
 COPY scripts   ./scripts
 COPY benchmark ./benchmark
@@ -18,8 +20,8 @@ COPY benchmark ./benchmark
 # Swap the TPU dependency manifest into place
 RUN cd python && rm -f pyproject.toml && cp pyproject_tpu.toml pyproject.toml
 
-# Install SGLang in editable mode without reinstalling dependencies
-# Fast build on top of base
-RUN pip install --no-deps -e ./python
+# Install SGLang and the TPU plugin in editable mode without reinstalling
+# dependencies. Fast build on top of base.
+RUN pip install --no-deps -e ./python && pip install --no-deps -e .
 
 CMD ["/bin/bash"]

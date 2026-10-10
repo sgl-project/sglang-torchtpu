@@ -14,8 +14,8 @@ from unittest import mock
 
 import jax.numpy as jnp
 
-from sglang.srt.layers.attention.pallas import ragged_paged_attention_v3 as rpa
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas import ragged_paged_attention_v3 as rpa
 
 MIB = 1024 * 1024
 TPU7X_VMEM = 64 * MIB

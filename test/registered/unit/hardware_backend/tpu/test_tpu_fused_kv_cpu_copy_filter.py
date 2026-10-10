@@ -22,13 +22,13 @@ try:
 except Exception:
     _HAS_JAX = False
 
-from sglang.srt.hardware_backend.tpu.kv_pool import (
-    TpuFusedMHATokenToKVPool,
-    TpuSeqAlongLaneKVPool,
-)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kv_pool import (
+    TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+)
 
 HEAD_NUM = 1
 HEAD_DIM = 128
@@ -229,7 +229,7 @@ class TestKvPageWriteKernel(CustomTestCase):
     def test_kernel_writes_only_listed_blocks(self):
         import jax.numpy as jnp
 
-        from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages
+        from sglang_tpu.kv_page_write import write_pages
 
         kv = jnp.arange(6 * 4 * 2 * 1 * 8, dtype=jnp.float32).reshape(6, 4, 2, 1, 8)
         kv = kv.astype(jnp.bfloat16)
@@ -281,7 +281,7 @@ class _Ready:
 
 class TestRaidenRetractionBackup(CustomTestCase):
     def _pool_with_backup(self, size=64 * 8, page=8, layers=2, pages=16):
-        from sglang.srt.hardware_backend.tpu import raiden_kv_backup
+        from sglang_tpu import raiden_kv_backup
 
         pool = _make_fused_pool(size=size, page_size=page, layer_num=layers)
         backup = raiden_kv_backup.RaidenKVBackup.__new__(
@@ -294,7 +294,7 @@ class TestRaidenRetractionBackup(CustomTestCase):
         return pool, backup
 
     def test_sequential_page_runs(self):
-        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+        from sglang_tpu.raiden_kv_backup import (
             sequential_page_runs,
         )
 
@@ -326,7 +326,7 @@ class TestRaidenRetractionBackup(CustomTestCase):
             for l in range(pool.layer_num)
         ]
         handle = pool.get_cpu_copy(saved_indices)
-        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+        from sglang_tpu.raiden_kv_backup import (
             RaidenKVBackupHandle,
         )
 

@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch._dynamo.source import AttrSource, GlobalSource, LocalSource
+from torch._dynamo.source import (
+    AttrSource,
+    DefaultsSource,
+    GlobalSource,
+    LocalSource,
+)
 from torch._guards import ChainedSource
 
 logger = logging.getLogger(__name__)
@@ -58,6 +63,7 @@ def load(path: Path) -> None:
             "configuration."
         )
     serialized = path.read_bytes()
+    _install_guards_state_loader()
     if torch.compiler.load_cache_artifacts(serialized) is None:
         raise RuntimeError(f"torch.compile cache bundle is invalid: {path}")
     logger.info(
@@ -65,6 +71,58 @@ def load(path: Path) -> None:
         path,
         len(serialized),
     )
+
+
+_guards_state_loader_installed = False
+
+
+def _install_guards_state_loader() -> None:
+    """Drop the dict key-order records a bundle cannot evaluate on load.
+
+    Dynamo records the dicts whose key order a graph relies on (an enum-keyed
+    dict read in the forward, such as a layer boundary's ``plan.paths``) next
+    to the guards, and evaluates every record while rebuilding the guard
+    manager. The guard filter never sees them, and one reached through the
+    compiled wrapper's closure dereferences a placeholder on load. Those dicts
+    are built by the same code that wrote the bundle, so the record adds
+    nothing here.
+    """
+    global _guards_state_loader_installed
+    if _guards_state_loader_installed:
+        return
+    _guards_state_loader_installed = True
+    from torch._dynamo import package
+
+    orig_load_guards_state = package.load_guards_state
+
+    def load_guards_state(guards_state: bytes) -> Any:
+        state = orig_load_guards_state(guards_state)
+        output_graph = state.output_graph
+        kept = {
+            source
+            for source in output_graph.guard_on_key_order
+            if not _rooted_in_transient_fn(source)
+        }
+        if len(kept) != len(output_graph.guard_on_key_order):
+            object.__setattr__(output_graph, "guard_on_key_order", kept)
+        return state
+
+    package.load_guards_state = load_guards_state
+
+
+def _source_chain(source: Any) -> tuple[Any, list[Any]]:
+    """Return (root, chained sources from the root outwards)."""
+    chain = []
+    while isinstance(source, ChainedSource):
+        chain.append(source)
+        source = source.base
+    chain.reverse()
+    return source, chain
+
+
+def _rooted_in_transient_fn(source: Any) -> bool:
+    root, _ = _source_chain(source)
+    return isinstance(root, LocalSource) and root.local_name == "fn"
 
 
 def set_fresh_compiler_cache() -> tempfile.TemporaryDirectory[str]:
@@ -117,18 +175,22 @@ class Compiler:
 
 
 def _skip_unrestorable_guards_unsafe(guard_entries: Any) -> list[bool]:
-    """Drop guards rooted in transient wrapper and forward-context state."""
+    """Drop guards rooted in transient wrapper and forward-context state, and
+    guards on a function's default arguments.
+
+    A DefaultsSource guard cannot be restored from a bundle: torch's
+    ``dataclass_with_cached_hash.__reduce__`` hands the source's ``init=False``
+    fields to ``__init__`` on unpickle. A default argument is a code constant,
+    so the guard adds nothing a same-code bundle needs.
+    """
 
     forward_context_global = (
         "__import_sglang_dot_srt_dot_model_executor_dot_forward_context"
     )
+    runtime_context_global = "__import_sglang_dot_srt_dot_runtime_context"
     keep = []
     for entry in guard_entries:
-        source = entry.orig_guard.originating_source
-        chain = []
-        while isinstance(source, ChainedSource):
-            chain.append(source)
-            source = source.base
+        source, chain = _source_chain(entry.orig_guard.originating_source)
 
         transient_fn = isinstance(source, LocalSource) and source.local_name == "fn"
         transient_forward_context = (
@@ -140,5 +202,27 @@ def _skip_unrestorable_guards_unsafe(guard_entries: Any) -> list[bool]:
                 for chained_source in chain
             )
         )
-        keep.append(not (transient_fn or transient_forward_context))
+        # The same transient state read through _CONTEXT.forward; its ``scoped``
+        # closure pickles as a placeholder the load-side guard dereferences.
+        attrs = [
+            chained_source.member
+            for chained_source in chain
+            if isinstance(chained_source, AttrSource)
+        ]
+        transient_runtime_forward = (
+            isinstance(source, GlobalSource)
+            and source.global_name == runtime_context_global
+            and attrs[:2] == ["_CONTEXT", "forward"]
+        )
+        defaults_guard = any(
+            isinstance(chained_source, DefaultsSource) for chained_source in chain
+        )
+        keep.append(
+            not (
+                transient_fn
+                or transient_forward_context
+                or transient_runtime_forward
+                or defaults_guard
+            )
+        )
     return keep

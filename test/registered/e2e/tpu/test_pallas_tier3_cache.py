@@ -31,7 +31,7 @@ _WORKER = textwrap.dedent("""
     import torch.distributed as dist
     from torch_tpu._internal.distributed import tpu_distributed  # noqa: F401
 
-    from sglang.srt.hardware_backend.tpu.compilation.direct_compile import direct_compile
+    from sglang_tpu.compilation.direct_compile import direct_compile
 
     torch.manual_seed(0)
     torch.set_num_threads(4)
@@ -49,7 +49,7 @@ _WORKER = textwrap.dedent("""
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
 
-    from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     def add_kernel(value_ref, output_ref):
         output_ref[...] = value_ref[...] + KERNEL_INCREMENT

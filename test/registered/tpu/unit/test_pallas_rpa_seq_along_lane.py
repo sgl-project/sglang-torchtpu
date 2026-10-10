@@ -15,34 +15,34 @@ import types
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+from sglang.srt.runtime_context import get_context
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_rpa_batched import (
     RPA_BATCHED_SPEC,
     kv_layout,
 )
-from sglang.srt.runtime_context import get_context
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestKvLayoutSelection(CustomTestCase):
     """One flag picks the layout, and the KV pool has to follow it."""
 
     def test_defaults_to_token_major(self):
-        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+        from sglang_tpu.attention.pallas.batched_rpa import configs
 
         self.assertEqual(kv_layout(), configs.KVLayout.HEAD_ALONG_SUBLANE)
 
     def test_flag_selects_seq_along_lane(self):
-        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+        from sglang_tpu.attention.pallas.batched_rpa import configs
 
         with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
             self.assertEqual(kv_layout(), configs.KVLayout.SEQ_ALONG_LANE)
 
     def test_pool_class_follows_the_flag(self):
-        from sglang.srt.hardware_backend.tpu.kv_pool import (
+        from sglang_tpu.kv_pool import (
             TpuFusedMHATokenToKVPool,
             TpuSeqAlongLaneKVPool,
         )
-        from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         # get_mha_kv_pool_cls reads the exec bag; publish the backend.
         with get_context().override_server_args(
@@ -73,7 +73,7 @@ class TestPageSizeFloor(CustomTestCase):
         return resolution_result(sa, field)
 
     def test_default_is_raised_to_the_floor(self):
-        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+        from sglang_tpu.tpu_platform import (
             _apply_page_size_default,
         )
 
@@ -84,7 +84,7 @@ class TestPageSizeFloor(CustomTestCase):
         )
 
     def test_explicit_below_floor_is_rejected(self):
-        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+        from sglang_tpu.tpu_platform import (
             _apply_page_size_default,
         )
 
@@ -92,7 +92,7 @@ class TestPageSizeFloor(CustomTestCase):
             _apply_page_size_default(self._server_args(64))
 
     def test_explicit_above_floor_is_kept(self):
-        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+        from sglang_tpu.tpu_platform import (
             _apply_page_size_default,
         )
 
@@ -116,7 +116,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
         return resolution_result(sa, field)
 
     def test_auto_becomes_fp8_for_the_rpa_backends(self):
-        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+        from sglang_tpu.tpu_platform import (
             _apply_kv_cache_dtype_default,
         )
 
@@ -129,7 +129,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
         # pallas_tpu_mla raises on an fp8 KV cache and pallas_tpu_flash has no
         # dequantization scale, so the default must not reach them -- the
         # DeepSeek recipe launches MLA with no --kv-cache-dtype.
-        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+        from sglang_tpu.tpu_platform import (
             _apply_kv_cache_dtype_default,
         )
 
@@ -139,7 +139,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
             self.assertEqual(self._resolved(sa, "kv_cache_dtype"), "auto", backend)
 
     def test_explicit_choice_is_left_alone(self):
-        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+        from sglang_tpu.tpu_platform import (
             _apply_kv_cache_dtype_default,
         )
 
@@ -155,10 +155,10 @@ class TestPrefillBlockSizes(CustomTestCase):
     def _resolve(self, num_q_heads=4, ctx_pages=133):
         import jax.numpy as jnp
 
-        from sglang.srt.hardware_backend.tpu.pallas_export import (
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import (
             tpu_info_for_cpu_export,
         )
-        from sglang.srt.layers.attention.pallas.batched_rpa import configs, wrapper
 
         model = configs.ModelConfigs(
             num_q_heads=num_q_heads,

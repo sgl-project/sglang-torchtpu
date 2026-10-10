@@ -24,7 +24,7 @@ class Allocator:
 def scheduler(swa=True):
     return NS(
         tree_cache=NS(
-            is_chunk_cache=lambda: True,
+            supports_prefix_sharing=lambda: False,
             supports_swa=lambda: swa,
             sliding_window_size=WINDOW,
             page_size=PAGE,

@@ -71,7 +71,7 @@ class TestFusedMoEExpertParallel(CustomTestCase):
         global_num_experts=0,
         expert_group_offset=0,
     ):
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
         return _fused_moe_jax(
             x,
