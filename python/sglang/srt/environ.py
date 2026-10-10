@@ -740,6 +740,9 @@ class Envs:
     # Raiden: a decode starts a room's next read as soon as the prefill
     # announces it; 0 starts reads only on the next scheduler poll.
     SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
+    # Raiden: test-only fault injection in the KV transfer, a preset name from
+    # disaggregation/raiden/fault_injection.json. Unset injects nothing.
+    SGLANG_TEST_RAIDEN_FAULT_INJECTION = EnvStr(None)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )

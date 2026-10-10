@@ -22,6 +22,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.raiden import fault_injection
 from sglang.srt.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
@@ -364,6 +365,8 @@ class RaidenSenderMixin:
             if room in self._aborted:
                 return
             self._send_reads.setdefault(room, set()).add(req_id)
+        if fault_injection.active():
+            fault_injection.note_read(room=room, layers=self._layer_count(engine))
         try:
             accepted = bool(engine.register_read(req_id, uuid, block_ids))
         except Exception as exc:

@@ -1,0 +1,41 @@
+{
+  "presets": {
+    "delay_5_percent_req_max_5_sec": {
+      "description": "5% of requests meet a delay of 0 to 5 s, no failure",
+      "fails_per_request": 0.0,
+      "delays_per_request": 0.05,
+      "max_delay_ms": 5000
+    },
+    "delay_5_percent_req_max_60_sec": {
+      "description": "5% of requests meet a delay of 0 to 60 s, no failure",
+      "fails_per_request": 0.0,
+      "delays_per_request": 0.05,
+      "max_delay_ms": 60000
+    },
+    "fail_5_percent_req_delay_5_percent_req_max_5_sec": {
+      "description": "5% of requests meet a fatal transfer error and 5% a delay of 0 to 5 s",
+      "fails_per_request": 0.05,
+      "delays_per_request": 0.05,
+      "max_delay_ms": 5000
+    }
+  },
+  "sites": [
+    {"role": "prefill", "action": "fail", "hook": "kv_cache_manager.pull.spawn"},
+    {"role": "prefill", "action": "fail", "hook": "staging_allocator.acquire"},
+    {"role": "prefill", "action": "fail", "hook": "transfer_send_session.d2h.dispatch", "per_layer": true},
+    {"role": "prefill", "action": "fail", "hook": "transfer_send_session.d2h.complete", "per_layer": true},
+    {"role": "prefill", "action": "fail", "hook": "raiden_manager_base.h2h.write", "per_layer": true},
+    {"role": "prefill", "action": "delay", "hook": "kv_cache_manager.pull.register_wait", "limit_ms": 10000},
+    {"role": "prefill", "action": "delay", "hook": "raiden_manager_base.h2h.write", "per_layer": true},
+    {"role": "decode", "action": "fail", "hook": "kv_cache_manager.api.start_read"},
+    {"role": "decode", "action": "fail", "hook": "kv_cache_manager.api.start_read.submit_pull"},
+    {"role": "decode", "action": "fail", "hook": "transfer_recv_session.pull.request"},
+    {"role": "decode", "action": "fail", "hook": "transfer_recv_session.pull.reply"},
+    {"role": "decode", "action": "fail", "hook": "staging_allocator.acquire"},
+    {"role": "decode", "action": "fail", "hook": "transfer_recv_session.h2d.dispatch", "per_layer": true},
+    {"role": "decode", "action": "fail", "hook": "transfer_recv_session.h2d.complete", "per_layer": true},
+    {"role": "decode", "action": "fail", "hook": "block_transport.recv.layer_done", "per_layer": true},
+    {"role": "decode", "action": "delay", "hook": "transfer_recv_session.pull.request"},
+    {"role": "decode", "action": "delay", "hook": "block_transport.recv.layer_done", "per_layer": true}
+  ]
+}

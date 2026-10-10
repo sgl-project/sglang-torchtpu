@@ -19,6 +19,7 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.disaggregation.raiden import fault_injection
 from sglang.srt.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang.srt.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang.srt.disaggregation.raiden.serde import (
@@ -332,6 +333,8 @@ class RaidenReceiverMixin:
         keeps from being issued. They are settled here so the admission is
         released, and the room concludes once its other reads settle.
         """
+        if fault_injection.active():
+            fault_injection.note_read(room=room, layers=self._layer_count(engine))
         try:
             engine.start_read(req_id, uuid, endpoint, remote, local)
             return True

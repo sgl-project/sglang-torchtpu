@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
 )
+from sglang.srt.disaggregation.raiden import fault_injection
 from sglang.srt.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
@@ -343,6 +344,18 @@ class RaidenKVManager(
                 "Raiden requires at least one full-attention KV cache tensor"
             )
         self._build_engine()
+        fault_injection.start(
+            role=(
+                "prefill"
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else "decode"
+            ),
+            ranks=self.attn_tp_size * self.attn_cp_size,
+        )
+
+    def _layer_count(self, engine: Any) -> int:
+        tensors = self._swa_kv_caches if engine is self._swa_engine else self._kv_caches
+        return len(tensors)
 
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
