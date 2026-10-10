@@ -2692,6 +2692,75 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+# Plain CPU tensors at least this large (e.g. image features) are broadcast as
+# their own buffers instead of being copied through the pickle stream.
+_PYOBJ_TENSOR_BUFFER_MIN_BYTES = 1 << 20
+
+
+def _tensor_from_buffer(buffer, dtype: torch.dtype, shape: torch.Size) -> torch.Tensor:
+    return torch.frombuffer(buffer, dtype=torch.uint8).view(dtype).view(shape)
+
+
+class _TensorBufferPickler(pickle.Pickler):
+    """Pickles large plain CPU tensors as out-of-band uint8 buffers.
+
+    Default tensor pickling copies a tensor's bytes into a ``torch.save``
+    stream and again into the pickle output; unpickling copies them back out.
+    Out of band, the sender broadcasts the tensor's own memory and the receiver
+    rebuilds the tensor on the buffer it received into. Other protocol-5
+    buffers (e.g. numpy arrays) stay in band.
+    """
+
+    def __init__(self, file):
+        super().__init__(
+            file,
+            protocol=pickle.HIGHEST_PROTOCOL,
+            buffer_callback=self._buffer_callback,
+        )
+        self.buffers: List[pickle.PickleBuffer] = []
+        # Our tensor buffers, kept alive so their ids cannot be reused mid-dump.
+        self._tensor_buffers: Dict[int, pickle.PickleBuffer] = {}
+
+    def _buffer_callback(self, buffer: pickle.PickleBuffer) -> bool:
+        if id(buffer) not in self._tensor_buffers:
+            return True  # serialize in band
+        self.buffers.append(buffer)
+        return False
+
+    def reducer_override(self, obj):
+        if (
+            type(obj) is not torch.Tensor
+            or obj.__dict__
+            or obj.device.type != "cpu"
+            or obj.layout != torch.strided
+            or obj.requires_grad
+            or obj.is_quantized
+            or obj.is_conj()
+            or obj.is_neg()
+            or not obj.is_contiguous()
+            or obj.numel() * obj.element_size() < _PYOBJ_TENSOR_BUFFER_MIN_BYTES
+        ):
+            return NotImplemented
+        flat = obj.reshape(-1).view(torch.uint8)
+        buffer = pickle.PickleBuffer(flat.numpy())
+        self._tensor_buffers[id(buffer)] = buffer
+        return _tensor_from_buffer, (buffer, obj.dtype, obj.shape)
+
+
+def _dumps_with_tensor_buffers(data: Any) -> Tuple[memoryview, List[torch.Tensor]]:
+    """Pickle ``data``, returning the stream and its out-of-band tensor buffers."""
+    stream = io.BytesIO()
+    pickler = _TensorBufferPickler(stream)
+    pickler.dump(data)
+    buffers = [torch.frombuffer(b, dtype=torch.uint8) for b in pickler.buffers]
+    return stream.getbuffer(), buffers
+
+
+def _loads_with_tensor_buffers(stream, buffers: List[torch.Tensor]) -> Any:
+    """Inverse of ``_dumps_with_tensor_buffers``; tensors share ``buffers``' memory."""
+    return pickle.loads(stream, buffers=[b.numpy() for b in buffers])
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,
@@ -2702,6 +2771,9 @@ def broadcast_pyobj(
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
+
+    Large CPU tensors travel as separate broadcasts so that no rank builds
+    whole-batch copies of them (see ``_TensorBufferPickler``).
     """
     device = torch.device(
         "cuda"
@@ -2713,35 +2785,48 @@ def broadcast_pyobj(
 
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.broadcast(tensor_size, src=src, group=dist_group)
+            sizes = torch.tensor([0, 0], dtype=torch.long, device=device)
+            dist.broadcast(sizes, src=src, group=dist_group)
         else:
-            serialized_data = pickle.dumps(data)
-            size = len(serialized_data)
-
-            tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(device)
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
-
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-            dist.broadcast(tensor_data, src=src, group=dist_group)
+            stream, buffers = _dumps_with_tensor_buffers(data)
+            sizes = torch.tensor(
+                [len(stream), len(buffers)], dtype=torch.long, device=device
+            )
+            dist.broadcast(sizes, src=src, group=dist_group)
+            if buffers:
+                buffer_sizes = torch.tensor(
+                    [b.numel() for b in buffers], dtype=torch.long, device=device
+                )
+                dist.broadcast(buffer_sizes, src=src, group=dist_group)
+            stream_data = torch.frombuffer(stream, dtype=torch.uint8).to(device)
+            dist.broadcast(stream_data, src=src, group=dist_group)
+            for buffer in buffers:
+                dist.broadcast(buffer.to(device), src=src, group=dist_group)
         return data
     else:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        dist.broadcast(tensor_size, src=src, group=dist_group)
-        size = tensor_size.item()
+        sizes = torch.tensor([0, 0], dtype=torch.long, device=device)
+        dist.broadcast(sizes, src=src, group=dist_group)
+        stream_size, num_buffers = sizes.tolist()
 
-        if size == 0:
+        if stream_size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
+        buffer_sizes = []
+        if num_buffers > 0:
+            buffer_sizes_data = torch.empty(
+                num_buffers, dtype=torch.long, device=device
+            )
+            dist.broadcast(buffer_sizes_data, src=src, group=dist_group)
+            buffer_sizes = buffer_sizes_data.tolist()
+        stream_data = torch.empty(stream_size, dtype=torch.uint8, device=device)
+        dist.broadcast(stream_data, src=src, group=dist_group)
+        buffers = []
+        for buffer_size in buffer_sizes:
+            buffer = torch.empty(buffer_size, dtype=torch.uint8, device=device)
+            dist.broadcast(buffer, src=src, group=dist_group)
+            buffers.append(buffer.cpu())
 
-        # Unpickle directly from the contiguous buffer to avoid a full bytes copy.
-        # The NumPy view keeps the CPU tensor alive until deserialization finishes.
-        data = pickle.loads(tensor_data.cpu().numpy())
-        return data
+        return _loads_with_tensor_buffers(stream_data.cpu().numpy(), buffers)
 
 
 def point_to_point_pyobj(
