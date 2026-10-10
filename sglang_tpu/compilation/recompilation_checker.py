@@ -9,17 +9,22 @@ loads are counted separately because their load times are unavailable.
 Periodic summaries report cumulative compile durations relative to elapsed
 wall time, helping identify the cost of repeated small compilations.
 
-Enable with ``SGLANG_TPU_CHECK_RECOMPILATION=1``.
+Enable with ``SGLANG_TPU_CHECK_RECOMPILATION=1``. Add
+``SGLANG_TPU_CHECK_RECOMPILATION_SITES=1`` to also attribute eager compiles on
+the scheduler thread to sglang source lines, at a per-op dispatch cost.
 """
 
 import collections
 import datetime
 import functools
 import time
+import traceback
 from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 import msgspec
 import torch
+from torch.utils import _pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
@@ -33,6 +38,10 @@ _ONE_MICROSECOND = datetime.timedelta(microseconds=1)
 _FORWARD_COMPILE_WARN_MS = 100
 # Arbitrary, kept long so the line stays rare on a busy server.
 _SUMMARY_WINDOW_SEC = 300.0
+_SITE_FRAMES = 3
+
+# (site description, compiles at that site)
+_Sites = tuple[tuple[str, int], ...]
 
 
 class RecompileEvent(msgspec.Struct, frozen=True):
@@ -45,6 +54,8 @@ class RecompileEvent(msgspec.Struct, frozen=True):
     # duration. The load stall is real but not measurable from Python.
     load_count: int
     heavy: bool
+    # None when site tracing is off.
+    sites: _Sites | None = None
 
 
 def _duration_multiset(stats: Any) -> collections.Counter:
@@ -59,7 +70,11 @@ def _duration_multiset(stats: Any) -> collections.Counter:
 
 
 def _build_event(
-    *, new_us: Iterable[int], context: str, warn_ms: int
+    *,
+    new_us: Iterable[int],
+    context: str,
+    warn_ms: int,
+    sites: _Sites | None = None,
 ) -> RecompileEvent:
     new_us = tuple(new_us)
     durations_ms = tuple(
@@ -73,10 +88,26 @@ def _build_event(
         load_count=sum(1 for us in new_us if us == 0),
         # One heavy compile or several adding up both stall the step.
         heavy=total_ms >= warn_ms,
+        sites=sites,
+    )
+
+
+def _format_sites(sites: _Sites | None) -> str:
+    if sites is None:
+        return ""
+    if not sites:
+        # The tracer skips compiled regions and other threads.
+        return "\n  eager compile sites: none on the traced thread (compiled graph?)"
+    return "\n  eager compile sites:" + "".join(
+        f"\n    {n}x {site}" for site, n in sites
     )
 
 
 def _format_event(event: RecompileEvent, *, warn_ms: int) -> str:
+    return _format_compiles(event, warn_ms=warn_ms) + _format_sites(event.sites)
+
+
+def _format_compiles(event: RecompileEvent, *, warn_ms: int) -> str:
     # The shape is a contract: log-based checks parse the "durations_ms=[...]"
     # list and the bracketed context, so keep both.
     load_note = (
@@ -106,6 +137,52 @@ def _format_event(event: RecompileEvent, *, warn_ms: int) -> str:
         f"(total {event.total_ms} ms, below the {warn_ms} ms warning "
         f"threshold){load_note}."
     )
+
+
+def _short_path(filename: str) -> str:
+    return filename[filename.rfind("/sglang/") + 1 :]
+
+
+def _describe_site(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    leaves = ", ".join(
+        (
+            f"{tuple(leaf.shape)}:{str(leaf.dtype).removeprefix('torch.')}"
+            if isinstance(leaf, torch.Tensor)
+            else repr(leaf)
+        )
+        for leaf in pytree.tree_leaves((args, kwargs))
+    )
+    frames = [
+        fs
+        for fs in reversed(traceback.extract_stack())
+        if "/sglang/" in fs.filename and fs.filename != __file__
+    ][:_SITE_FRAMES]
+    where = " <- ".join(f"{_short_path(fs.filename)}:{fs.lineno}" for fs in frames)
+    return f"{func}({leaves}) @ {where or '<no sglang frame>'}"
+
+
+class _CompileSiteTracer(TorchDispatchMode):
+    """Records the sglang call site of each eager op that misses the TPU program cache."""
+
+    def __init__(
+        self, *, read_misses: Callable[[], int], record: Callable[[str], None]
+    ) -> None:
+        super().__init__()
+        self._read_misses = read_misses
+        self._record = record
+
+    @classmethod
+    def ignore_compile_internals(cls) -> bool:
+        # Otherwise Dynamo runs compiled functions eagerly while the mode is active.
+        return True
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        before = self._read_misses()
+        out = func(*args, **kwargs)
+        if self._read_misses() != before:
+            self._record(_describe_site(func, args, kwargs))
+        return out
 
 
 class RecompilationChecker:
@@ -147,6 +224,27 @@ class RecompilationChecker:
         self.serving_compiles: int = 0
         self.serving_compile_ms: int = 0
         self.worst_compile_ms: int = 0
+        self._site_tracer: _CompileSiteTracer | None = None
+        self._pending_sites: collections.Counter[str] = collections.Counter()
+
+    @property
+    def has_baseline(self) -> bool:
+        return self._baseline is not None
+
+    def enable_site_tracing(self) -> None:
+        """Attach eager compile sites from the calling thread to later events.
+
+        Dispatch modes are thread-local, so ops from other threads are not traced.
+        """
+        if self._site_tracer is not None:
+            return
+        self._site_tracer = _CompileSiteTracer(
+            read_misses=self._read_misses, record=self._record_site
+        )
+        self._site_tracer.__enter__()
+
+    def _record_site(self, site: str) -> None:
+        self._pending_sites[site] += 1
 
     def snapshot_baseline(self) -> None:
         """Record the cache contents, compiles before this are not reported."""
@@ -182,6 +280,7 @@ class RecompilationChecker:
         if misses == self._seen_misses:
             return None
         self._seen_misses = misses
+        sites = self._take_sites()
         self._sync_device()
         current = _duration_multiset(self._read_stats())
         new = current - self._baseline
@@ -190,12 +289,22 @@ class RecompilationChecker:
         if not new:
             return None
         event = _build_event(
-            new_us=new.elements(), context=context_fn(), warn_ms=self._warn_ms
+            new_us=new.elements(),
+            context=context_fn(),
+            warn_ms=self._warn_ms,
+            sites=sites,
         )
         self._record_event(event)
         log = logger.warning if event.heavy else logger.info
         log(_format_event(event, warn_ms=self._warn_ms))
         return event
+
+    def _take_sites(self) -> _Sites | None:
+        if self._site_tracer is None:
+            return None
+        sites = tuple(self._pending_sites.most_common())
+        self._pending_sites.clear()
+        return sites
 
     def _record_event(self, event: RecompileEvent) -> None:
         self._window_events += 1
@@ -293,3 +402,23 @@ def snapshot_recompilation_baseline() -> None:
     checker = _shared_recompilation_checker()
     if checker is not None:
         checker.snapshot_baseline()
+
+
+def maybe_enable_site_tracing() -> None:
+    """Trace eager compile sites on the calling thread. Call after all warmup."""
+    if not envs.SGLANG_TPU_CHECK_RECOMPILATION_SITES.get():
+        return
+    if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
+        logger.warning(
+            "[recompilation checker] SGLANG_TPU_CHECK_RECOMPILATION_SITES needs "
+            "SGLANG_TPU_CHECK_RECOMPILATION=1, site tracing disabled."
+        )
+        return
+    checker = _shared_recompilation_checker()
+    if checker is None or not checker.has_baseline:
+        logger.warning(
+            "[recompilation checker] checker not installed, site tracing disabled."
+        )
+        return
+    checker.enable_site_tracing()
+    logger.info("[recompilation checker] eager compile site tracing enabled.")
