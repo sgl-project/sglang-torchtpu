@@ -83,7 +83,7 @@
     "python/sglang/srt/speculative/eagle_worker_common.py": 7,
     "python/sglang/srt/speculative/eagle_worker_v2.py": 8,
     "python/sglang/srt/speculative/spec_utils.py": 6,
-    "python/sglang/srt/utils/common.py": 8
+    "python/sglang/srt/utils/common.py": 9
   },
   "imports": {
     "python/sglang/multimodal_gen/runtime/platforms/tpu.py": 1,

@@ -27,28 +27,29 @@ fork already satisfies the plugin's `sglang` requirement.
 `tpu_oot` only activates when named: with `SGLANG_PLATFORM` unset the loader
 calls every installed `activate()` and errors when two answer.
 
-## Known mode-B divergences (gates that take a different arm under OOT)
+## Mode-B divergences (gates that take a different arm under OOT)
 
 Measured against the fork at the wave-0 move; re-audit after every sync.
 
-- `kv_cache_configurator.py`, `--prefill-only-disable-kv-cache`: refused for any
-  OOT pool family. Mode A accepts it on TPU.
-- `utils/common.py:get_device_memory_capacity`: returns the real HBM size after
-  `init_backend()`; mode A returns `None` on TPU. Changes the pre-capture
-  activation reserve for mamba/GDN models (`kv_pool_runtime.py`).
-- `arg_groups/speculative_hook.py`: the DFLASH draft backend check answers only
-  `pallas_tpu_rpa_v3` / `pallas_tpu_rpa_batched`; mode A accepts any name in
-  `DRAFT_ATTENTION_BACKEND_CHOICES` and fails later at construction.
-- `utils/profile_utils.py`: a caller passing `"TPU"` in `activities` gets an
-  extra torch profiler on `ProfilerActivity.PrivateUse1`; the scheduler's
-  profiler path does not.
-- MLA models: the OOT pool arm builds through `_build_oot_mla_kv_pool`, mode A
-  through the shared MLA arm. Same pool class (`get_mla_kv_pool_cls()`), one
-  extra `index_head_dim=None` kwarg; not validated end to end.
+Closed: hybrid-SWA MHA models (the OOT pool and allocator arms mirror the TPU
+arms); the import-time `init_backend()` call (`TpuOOTPlatform.init_backend`
+defers to the worker bootstrap); MLA pool construction (the OOT builder's
+`index_head_dim` kwarg); `get_device_memory_capacity`, which reports nothing
+for TPU in both modes.
 
-Closed in wave 0: hybrid-SWA MHA models (the OOT pool and allocator arms now
-mirror the TPU arms) and the import-time `init_backend()` call
-(`TpuOOTPlatform.init_backend` defers to the worker bootstrap).
+Different arm, same outcome for every configuration that runs:
+
+- `--prefill-only-disable-kv-cache`: the pool-family check refuses OOT pools,
+  but argument resolution already rejects the flag on TPU in both modes (it
+  needs the fa3/fa4 prefill backend).
+- DFLASH draft backend: mode B falls back to `pallas_tpu_rpa_v3` for a backend
+  `speculative/draft_utils.py` cannot build on TPU; mode A fails at construction.
+- `SGLANG_PROFILE_V2=1` with the `"TPU"` activity: mode B also records a torch
+  `PrivateUse1` trace, mode A records none; neither reaches xprof on that path.
+
+Unreachable today: MLA with hybrid SWA or an FP4 KV cache takes the plain OOT
+MLA builder in mode B and the generic builders in mode A; no TPU model uses
+either.
 
 ## Layout
 

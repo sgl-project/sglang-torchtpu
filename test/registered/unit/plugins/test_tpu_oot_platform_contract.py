@@ -266,6 +266,23 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         """Core still branches on _is_tpu for this; one implementation only."""
         self.assertIsNone(self.platform.get_speculative_cache_locs_fn())
 
+    # -- memory ------------------------------------------------------------
+
+    def test_device_memory_capacity_matches_mode_a(self):
+        """Mode B reported HBM here; above 60 GiB that floors the mamba/GDN
+        pre-capture activation reserve at 10 GiB, shrinking the KV pool."""
+        from sglang.srt.utils import common
+
+        for platform in (self.TpuSRTPlatform(), self.platform):
+            with (
+                self.subTest(platform=type(platform).__name__),
+                patch.object(common, "current_platform", platform),
+                patch.object(
+                    type(platform), "get_device_total_memory", return_value=96 << 30
+                ),
+            ):
+                self.assertIsNone(common.get_device_memory_capacity("tpu"))
+
     # -- profiler ----------------------------------------------------------
 
     def test_profiler_activity_str_is_the_xprof_name_not_a_torch_activity(self):
