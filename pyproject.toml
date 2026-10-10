@@ -9,6 +9,7 @@ build-backend = "setuptools.build_meta"
 name = "sglang-tpu"
 version = "0.0.0.dev0"
 description = "Out-of-tree TPU platform plugin for SGLang, backed by torch_tpu."
+readme = "sglang_tpu/README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 classifiers = [
@@ -18,5 +19,14 @@ classifiers = [
 # Not published to PyPI while the plugin still needs the fork tree.
 dependencies = ["sglang"]
 
+[project.entry-points."sglang.srt.platforms"]
+tpu_oot = "sglang_tpu:activate"
+
+[project.entry-points."sglang.srt.plugins"]
+tpu_oot_hooks = "sglang_tpu.hooks:register"
+
 [tool.setuptools.packages.find]
 include = ["sglang_tpu*"]
+
+[tool.setuptools.package-data]
+"sglang_tpu" = ["**/*.md"]

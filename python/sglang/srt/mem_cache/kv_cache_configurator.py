@@ -1358,6 +1358,12 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     is_dsa_model=is_dsa_model,
                 )
+            elif self.is_hybrid_swa:
+                # Same full+SWA sub-pools as the TPU arm below.
+                token_to_kv_pool = self._build_tpu_swa_kv_pool(
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                )
             else:
                 token_to_kv_pool = self._build_oot_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -2288,7 +2294,8 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
-            if current_platform.is_out_of_tree():
+            if current_platform.is_out_of_tree() and not self.is_hybrid_swa:
+                # Hybrid SWA uses the generic SWA allocator arms, as the TPU arm does.
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(
                     sizes.max_total_num_tokens,
