@@ -1,3 +1,4 @@
+import datetime
 import os
 import tempfile
 import unittest
@@ -37,11 +38,12 @@ def _payload():
             "tagged": tagged,
             "np_empty": np.zeros((0,), dtype=np.float32),
             "np_small": np.arange(4, dtype=np.float32),
+            "np_readonly": np.frombuffer(b"\x00" * 16, dtype=np.float32),
         },
     ]
 
 
-def _assert_payload_equal(test, got, expected):
+def _assert_payload_equal(test, got, expected, unpickled=True):
     test.assertEqual(len(got), len(expected))
     for got_req, expected_req in zip(got, expected):
         test.assertEqual(got_req.keys(), expected_req.keys())
@@ -53,20 +55,26 @@ def _assert_payload_equal(test, got, expected):
             elif isinstance(value, np.ndarray):
                 test.assertEqual(got_req[key].dtype, value.dtype)
                 test.assertTrue(np.array_equal(got_req[key], value), key)
+                if unpickled:
+                    test.assertTrue(got_req[key].flags.writeable, key)
             else:
                 test.assertEqual(got_req[key], value)
 
 
 def _broadcast_worker(rank, init_file, results):
     dist.init_process_group(
-        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=_WORLD_SIZE
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=_WORLD_SIZE,
+        timeout=datetime.timedelta(seconds=60),
     )
     try:
         # A non-zero src on an explicit gloo group, as in the scheduler's TP broadcast.
         group = dist.new_group([0, 1, 2], backend="gloo")
         data = _payload() if rank == 1 else None
         out = broadcast_pyobj(data, rank, group, src=1)
-        _assert_payload_equal(unittest.TestCase(), out, _payload())
+        _assert_payload_equal(unittest.TestCase(), out, _payload(), unpickled=rank != 1)
         empty = broadcast_pyobj([] if rank == 1 else None, rank, group, src=1)
         results[rank] = empty == []
     finally:
@@ -93,8 +101,8 @@ class TestBroadcastPyobj(CustomTestCase):
         out[0]["feature"].add_(1)  # rebuilt tensors are writable
 
     def test_broadcast_across_processes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            results = mp.Manager().dict()
+        with tempfile.TemporaryDirectory() as tmp, mp.Manager() as manager:
+            results = manager.dict()
             mp.spawn(
                 _broadcast_worker,
                 args=(os.path.join(tmp, "init"), results),

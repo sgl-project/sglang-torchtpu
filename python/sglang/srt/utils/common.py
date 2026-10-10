@@ -2707,8 +2707,12 @@ class _TensorBufferPickler(pickle.Pickler):
     Default tensor pickling copies a tensor's bytes into a ``torch.save``
     stream and again into the pickle output; unpickling copies them back out.
     Out of band, the sender broadcasts the tensor's own memory and the receiver
-    rebuilds the tensor on the buffer it received into. Other protocol-5
-    buffers (e.g. numpy arrays) stay in band.
+    rebuilds the tensor on the buffer it received into. Numpy arrays and other
+    protocol-5 buffers stay in band, pickled as before.
+
+    Each out-of-band tensor arrives with its own storage: a tensor referenced
+    twice is sent once and keeps its identity, but distinct views of one
+    storage (e.g. overlapping slices) no longer share memory on receivers.
     """
 
     def __init__(self, file):
@@ -2728,6 +2732,10 @@ class _TensorBufferPickler(pickle.Pickler):
         return False
 
     def reducer_override(self, obj):
+        if isinstance(obj, np.ndarray):
+            # Protocol 4 copies the array into the stream, so read-only arrays
+            # still arrive writable (protocol 5 would rebuild them as views).
+            return obj.__reduce_ex__(4)
         if (
             type(obj) is not torch.Tensor
             or obj.__dict__
