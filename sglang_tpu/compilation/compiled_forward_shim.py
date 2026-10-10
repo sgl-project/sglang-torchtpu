@@ -862,13 +862,14 @@ class CompiledForwardShim:
         self._default_kwargs = _static_default_kwargs(compiled_fn)
         functools.update_wrapper(self, compiled_fn)
 
-    def _prompt_logprob_rejection(self) -> str | None:
+    @staticmethod
+    def _prompt_logprob_rejection(enabled: bool) -> str | None:
         """Why this server cannot serve input logprobs, or None if it can.
 
         Consulted only for requests that actually ask for them, so none of this
-        lands on anyone else's forward.
+        lands on anyone else's forward. Intake asks the same question first.
         """
-        if not self._prompt_logprob_enabled:
+        if not enabled:
             return (
                 "input/prompt logprobs (echo) need "
                 "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1 on the TPU compiled "
@@ -1055,7 +1056,7 @@ class CompiledForwardShim:
         # extend graph is the NULL-capture one warmup has always compiled.
         wants_input_logprob = needs_input_logprob(forward_batch)
         if wants_input_logprob:
-            rejection = self._prompt_logprob_rejection()
+            rejection = self._prompt_logprob_rejection(self._prompt_logprob_enabled)
             if rejection is not None:
                 raise NotImplementedError(rejection)
         saved: dict[str, Any] = {}

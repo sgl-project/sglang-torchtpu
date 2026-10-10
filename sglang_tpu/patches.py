@@ -895,6 +895,42 @@ def _patch_host_heap_trim() -> None:
     host_heap_trim.install()
 
 
+def _patch_scheduler_reject_prompt_logprob() -> None:
+    """Finish prompt-logprob requests the compiled forward cannot serve with a
+    400 at scheduler intake, instead of raising inside the forward.
+
+    Same shape as the scheduler's MLX check: a logprob_start_len inside the
+    prompt asks for input logprobs. The answer comes from the shim, so intake
+    and forward cannot disagree.
+    """
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang_tpu.compilation.compiled_forward_shim import CompiledForwardShim
+
+    original = Scheduler._add_request_to_queue
+    if getattr(original, "_tpu_prompt_logprob_gate", None) is True:
+        return
+
+    def _add_request_to_queue(self, req, is_retracted: bool = False):
+        if (
+            not is_retracted
+            and req.to_finish is None
+            and req.return_logprob
+            # -1 means output logprobs only; any other start below the prompt
+            # length asks for prompt logprobs.
+            and req.logprob_start_len != -1
+            and req.logprob_start_len < len(req.origin_input_ids)
+        ):
+            rejection = CompiledForwardShim._prompt_logprob_rejection(
+                envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            )
+            if rejection is not None:
+                req.set_finish_with_abort(rejection)
+        return original(self, req, is_retracted)
+
+    _add_request_to_queue._tpu_prompt_logprob_gate = True
+    Scheduler._add_request_to_queue = _add_request_to_queue
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -917,3 +953,4 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _patch_pd_decode_async_prefill_info()
     _patch_host_heap_trim()
+    _patch_scheduler_reject_prompt_logprob()
