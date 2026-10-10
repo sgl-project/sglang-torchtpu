@@ -115,7 +115,7 @@ class _DirectVisionPolicy(_FakeVisionPolicy):
 
 
 class TestViTTpuCompileRunner(unittest.TestCase):
-    def test_direct_warmup_queues_buckets_before_execution(self):
+    def test_direct_warmup_queues_buckets_without_execution(self):
         owner = SimpleNamespace(forward=lambda x, extra=None: x * 2)
         recorder = CompileTimingRecorder()
         policy = _DirectVisionPolicy(
@@ -133,17 +133,23 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         events = []
         clock = SimpleNamespace(now=0.0)
 
+        class Artifact:
+            def __init__(self, patch_count):
+                self.patch_count = patch_count
+
+            def wait_for_compile(self):
+                events.append(("wait", self.patch_count))
+                clock.now += 2
+
+            def __call__(self, call):
+                args, kwargs = call
+                events.append(("execute", len(args[0])))
+                return policy.compiled_fn.fn(*args, **kwargs)
+
         def compile_artifact(args, kwargs, **options):
             events.append(("compile", len(args[0]), options["async_compile"]))
             clock.now += 1
-
-            def execute(call):
-                args, kwargs = call
-                events.append(("execute", len(args[0])))
-                clock.now += 2
-                return policy.compiled_fn.fn(*args, **kwargs)
-
-            return execute
+            return Artifact(len(args[0]))
 
         def synchronize(*args, **kwargs):
             clock.now += 3
@@ -171,14 +177,14 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             clock.now += 100  # Other warmups must not inflate this shape's timing.
             for call in pending:
                 call.wait()
-            self.assertEqual(events[-2:], [("execute", 4), ("execute", 8)])
-            self.assertEqual(sync.call_count, 2)
-            self.assertTrue(all(c.kwargs["wait"] for c in sync.call_args_list))
+            self.assertEqual(events[-2:], [("wait", 4), ("wait", 8)])
+            sync.assert_not_called()
             steps = recorder.snapshot()
             self.assertEqual([step["num_tokens"] for step in steps], [4, 8])
-            self.assertEqual([step["duration_seconds"] for step in steps], [6, 6])
+            self.assertEqual([step["duration_seconds"] for step in steps], [3, 3])
 
             self.assertEqual(policy.run(torch.arange(4)).tolist(), [0, 2])
+            self.assertEqual(events[-1], ("execute", 4))
             self.assertEqual(len(policy.compiled_fn.cache), 2)
 
     def test_default_policy_keeps_dynamo_with_async_enabled(self):

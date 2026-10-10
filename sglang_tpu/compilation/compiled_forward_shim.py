@@ -837,7 +837,7 @@ class CompiledForwardShim:
         return self._call(self.fn, input_ids, positions, forward_batch, *args, **kwargs)
 
     def warmup_async(self, *args: Any, **kwargs: Any) -> Any:
-        """Queue direct compilation and defer execution until ``wait``."""
+        """Submit direct compilation without executing the warmup inputs."""
         return self._call(self.warmup_async_fn, *args, **kwargs)
 
     def _call(
@@ -998,19 +998,7 @@ class CompiledForwardShim:
             forward_batch.mm_input_embeds = None
         try:
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)
-            if isinstance(out, PendingCall):
-                finalize_fields = {key: getattr(forward_batch, key) for key in saved}
-                finalize_fields["is_prefill_only"] = forward_batch.is_prefill_only
-
-                def finalize_pending(result: Any) -> Any:
-                    previous = _pin_fields(forward_batch, finalize_fields)
-                    try:
-                        return self._finalize_forward(result, forward_batch)
-                    finally:
-                        _restore_fields(forward_batch, previous)
-
-                out = out.then(finalize_pending)
-            else:
+            if not isinstance(out, PendingCall):
                 out = self._finalize_forward(out, forward_batch)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
@@ -1021,30 +1009,17 @@ class CompiledForwardShim:
                 mm_embeds = mm_embeds[:real_q]
             forward_batch.mm_input_embeds = mm_embeds
 
-        def finish(result: Any) -> Any:
-            # Re-attach the embeds the graph did not see; a hidden-state boundary
-            # leaves them on the batch for the wrapper's eager tail.
-            if (
-                mm_embeds is not None
-                and isinstance(result, LogitsProcessorOutput)
-                and result.mm_input_embeds is None
-            ):
-                result.mm_input_embeds = mm_embeds
-            return self._finish_forward(result, forward_batch, wants_input_logprob)
-
         if isinstance(out, PendingCall):
-            return out.then(finish)
-        return finish(out)
+            return out
 
-    def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
-        spec_info = forward_batch.spec_info
-        if spec_info is None or not spec_info.keep_outputs_padded:
-            out = self.policy.finalize_forward_batch(out, forward_batch)
-        return out
-
-    def _finish_forward(
-        self, out: Any, forward_batch: Any, wants_input_logprob: bool = False
-    ) -> Any:
+        # Re-attach the embeds the graph did not see; a hidden-state boundary
+        # leaves them on the batch for the wrapper's eager tail.
+        if (
+            mm_embeds is not None
+            and isinstance(out, LogitsProcessorOutput)
+            and out.mm_input_embeds is None
+        ):
+            out.mm_input_embeds = mm_embeds
         # After the restore: LogitsMetadata.from_forward_batch branches on
         # capture_hidden_mode, so the gather must see the caller's value.
         if wants_input_logprob:
@@ -1054,6 +1029,12 @@ class CompiledForwardShim:
                 model=self.policy.model_runner.model,
             )
 
+        return out
+
+    def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
+        spec_info = forward_batch.spec_info
+        if spec_info is None or not spec_info.keep_outputs_padded:
+            out = self.policy.finalize_forward_batch(out, forward_batch)
         return out
 
 

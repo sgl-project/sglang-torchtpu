@@ -152,8 +152,8 @@ def direct_compile(
     values are graph inputs.
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
 
-    ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
-    Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
+    ``CompiledFunction.warmup`` submits compilation without executing or
+    retaining example inputs. Its ``PendingCall`` waits for compilation.
 
     This API is specialized for SGLang inference. A more general API adds
     complexity and can be added when needed.
@@ -275,9 +275,15 @@ class CompiledFunction:
         artifact = self._get_artifact(args, kwargs)
         return artifact((args, kwargs))
 
-    def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
-        artifact = self._get_artifact(args, kwargs, async_compile=True)
-        return PendingCall(lambda: artifact((args, kwargs)))
+    def warmup(
+        self,
+        *args: Any,
+        async_compile: bool = True,
+        **kwargs: Any,
+    ) -> PendingCall:
+        """Compile without executing or retaining the example inputs."""
+        artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
+        return PendingCall(artifact.wait_for_compile)
 
     def _get_artifact(
         self,
@@ -591,7 +597,7 @@ class _CompiledArtifact:
     pending_compile: Any | None = None
     rng_device: torch.device | None = None
 
-    def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+    def wait_for_compile(self) -> None:
         if self.pending_compile is not None:
             start = time.perf_counter()
             self.executable = self.pending_compile.get()
@@ -600,6 +606,9 @@ class _CompiledArtifact:
                 "[direct_compile] native async resolution %.3fs",
                 time.perf_counter() - start,
             )
+
+    def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+        self.wait_for_compile()
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.

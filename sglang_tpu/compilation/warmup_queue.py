@@ -26,7 +26,7 @@ class WarmupQueue:
 
     def wait(self) -> None:
         with torch.no_grad():
-            # Release completed calls' inputs before executing the next program.
+            # Release completed calls before waiting for the next compilation.
             while self.calls:
                 self.calls.pop(0).wait()
         for complete in self.completions:

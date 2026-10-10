@@ -308,7 +308,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             call("input_ids")
             warmup_async("input_ids")
 
-        for recorded in (compiled.call_args, compiled.warmup_async.call_args):
+        for recorded in (compiled.call_args, compiled.warmup.call_args):
             self.assertIs(recorded.kwargs["attention_rank_tensors"], rank_tensors)
 
     def test_custom_annotated_policy_forwards_extra_tensor_attrs(self):
@@ -346,7 +346,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         trace_forward = compile_module.direct_compile.call_args.args[0]
         compiled = compile_module.direct_compile.return_value
         compiled.side_effect = trace_forward
-        compiled.warmup_async.side_effect = trace_forward
+        compiled.warmup.side_effect = trace_forward
         backend = SimpleNamespace(forward_metadata=object())
         inputs = (torch.ones(2), None, None)
         with forward_context(ForwardContext(attn_backend=backend)):

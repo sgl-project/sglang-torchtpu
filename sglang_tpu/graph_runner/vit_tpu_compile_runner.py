@@ -253,7 +253,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
     def precompile(
         self, patch_counts: list[int] | None = None
     ) -> list[PendingCall] | None:
-        """Warm common patch counts, returning any deferred executions."""
+        """Warm common patch counts, returning any pending compilations."""
         owner = self.owner
         runner = self._resolve_runner()
         if owner is None or runner is None:
@@ -376,7 +376,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
         """
 
     def warmup_once(self, patch_count: int) -> PendingCall | None:
-        """Warm one patch count, deferring execution for direct compilation.
+        """Warm one patch count, skipping execution for direct compilation.
 
         Defaults to the compiled region. Override when the encoder has an
         eager prologue or epilogue that is shape-static per bucket too.
@@ -387,7 +387,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
         inputs = self.make_warmup_inputs(patch_count)
         if isinstance(self.compiled_fn, CompiledFunction):
-            return self.compiled_fn.warmup_async(*inputs).then(self._sync_warmup)
+            return self.compiled_fn.warmup(*inputs)
         self._sync_warmup(self.compiled_fn(*inputs))
 
     @staticmethod

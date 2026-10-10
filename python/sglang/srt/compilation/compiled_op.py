@@ -76,8 +76,9 @@ def compiled_op(
     A ``warmup`` factory registers the helper for the speculative-op grid.
     Model-specific owners can instead
     call ``warmup_compiled_op(op, ...)`` with their own representative inputs.
-    The internal ``_warmup_async`` keyword submits each new specialization
-    without waiting when direct asynchronous compilation is enabled.
+    Direct helper warmups compile without executing; the queue joins compilation
+    futures without retaining example inputs. Dynamo warmups still execute to
+    trigger tracing and compilation.
     """
 
     def decorator(fn):
@@ -85,7 +86,7 @@ def compiled_op(
         use_direct = False
 
         @functools.wraps(fn)
-        def wrapper(*args, _warmup_async=False, **kwargs):
+        def wrapper(*args, _warmup=False, **kwargs):
             nonlocal compiled_fn, use_direct
             if (
                 torch.compiler.is_compiling()
@@ -113,12 +114,15 @@ def compiled_op(
                     compiled_fn = torch.compile(
                         fn, backend="tpu", fullgraph=True, dynamic=False
                     )
-            if use_direct and _warmup_async and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
+            if use_direct and _warmup:
                 # Repeated storage/layout warmups share one compiled program.
-                # Keep only its first inputs alive until the queue joins.
                 if _specialization_key(*args, **kwargs) in compiled_fn.cache:
                     return None
-                return compiled_fn.warmup_async(*args, **kwargs)
+                return compiled_fn.warmup(
+                    *args,
+                    async_compile=envs.SGLANG_DIRECT_COMPILE_ASYNC.get(),
+                    **kwargs,
+                )
             return compiled_fn(*args, **kwargs)
 
         if warmup is not None:
@@ -139,7 +143,7 @@ def warmup_compiled_op(op: Callable, *args, **kwargs) -> None:
         current_warmup_queue,
     )
 
-    pending = op(*args, _warmup_async=True, **kwargs)
+    pending = op(*args, _warmup=True, **kwargs)
     if isinstance(pending, PendingCall):
         queue = current_warmup_queue()
         if queue is None:

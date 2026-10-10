@@ -694,7 +694,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         def warmup_async(*args: Any, **kwargs: Any) -> PendingCall:
             backend = get_forward_context().attn_backend
-            return compiled.warmup_async(
+            return compiled.warmup(
                 backend.forward_metadata,
                 *args,
                 attention_rank_tensors=get_attention_rank_tensors(
@@ -1149,7 +1149,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
     ) -> PendingCall | float | None:
-        """Run one warmup, defer async execution, or time synchronous profiling."""
+        """Submit async compilation, run a sync warmup, or profile execution."""
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
             bs=bs,
@@ -1232,13 +1232,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else:
                 out = call_with_reserved_frame_stack(entry.forward, *args, **kwargs)
             if isinstance(out, PendingCall):
-                return out.then(
-                    lambda result: _materialize_out(
-                        result,
-                        forward_attn_backend,
-                        self.model_runner.token_to_kv_pool,
-                    )
-                )
+                return out
             _materialize_out(
                 out,
                 forward_attn_backend,

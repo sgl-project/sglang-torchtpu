@@ -1471,20 +1471,20 @@ class TestShimInputLogprobPath(CustomTestCase):
                 if deferred:
 
                     def warmup(*args, **kwargs):
-                        out = shim.fn(*args, **kwargs)
-                        return PendingCall(lambda: out)
+                        shim.fn(*args, **kwargs)
+                        return PendingCall(lambda: None)
 
                     shim.warmup_async_fn = warmup
                     out = shim.warmup_async(None, None, fb)
                     self.assertEqual(finalized, [])
                     self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
                     self.assertTrue(fb.return_logprob)
-                    out = out.wait()
+                    self.assertIsNone(out.wait())
+                    self.assertEqual(finalized, [])
                 else:
                     out = shim(None, None, fb)
-
-                self.assertEqual(finalized, [CaptureHiddenMode.FULL])
-                self.assertIsNotNone(out.input_token_logprobs)
+                    self.assertEqual(finalized, [CaptureHiddenMode.FULL])
+                    self.assertIsNotNone(out.input_token_logprobs)
                 self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
                 self.assertTrue(fb.return_logprob)
                 self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
