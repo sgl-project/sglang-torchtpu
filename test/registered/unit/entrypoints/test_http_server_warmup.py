@@ -1,9 +1,13 @@
 import asyncio
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.http_server import (
     _send_disaggregation_warmup_requests,
 )
@@ -82,6 +86,95 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["json"]["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
             self.assertEqual(kwargs["json"]["bootstrap_room"], dp_rank)
             self.assertFalse(kwargs["ssl"])
+
+
+class _FreezeOk:
+    def raise_for_status(self):
+        return None
+
+
+class _FreezeServerError:
+    def raise_for_status(self):
+        raise requests.exceptions.HTTPError("500")
+
+
+class TestFreezeGcAfterWarmup(unittest.TestCase):
+    def setUp(self):
+        self.server_args = SimpleNamespace(url=lambda: "http://127.0.0.1:30000")
+        self.calls = []
+        self.sleeps = []
+        # Every clock read advances one second.
+        clock = itertools.count()
+        stubs = dict(
+            get_model=lambda: SimpleNamespace(
+                checkpoint_engine_wait_weights_before_ready=False,
+                delete_ckpt_after_loading=False,
+            ),
+            get_exec=lambda: SimpleNamespace(
+                moe=SimpleNamespace(is_ep_scale_joiner=False)
+            ),
+            get_serving=lambda: SimpleNamespace(
+                skip_server_warmup=True, admin_api_key=None, api_key="k"
+            ),
+            get_observability=lambda: SimpleNamespace(
+                debug_tensor_dump_input_file=None
+            ),
+            ssl_verify_of=lambda args: True,
+            _global_state=SimpleNamespace(
+                tokenizer_manager=SimpleNamespace(server_status=None)
+            ),
+            time=SimpleNamespace(
+                monotonic=lambda: float(next(clock)), sleep=self.sleeps.append
+            ),
+        )
+        for name, value in stubs.items():
+            p = patch.object(http_server, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _post(self, outcomes):
+        outcomes = list(outcomes)
+
+        def post(url, **kwargs):
+            self.calls.append((url, kwargs))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return patch.object(http_server.requests, "post", post)
+
+    def test_skip_server_warmup_freezes_once_the_server_listens(self):
+        """With --skip-server-warmup, /freeze_gc can run before the HTTP server
+        listens; the heap must still be frozen before the server reports ready."""
+        refused = requests.exceptions.ConnectionError("Connection refused")
+        ready = []
+        with self._post([refused, refused, refused, _FreezeOk()]):
+            http_server._wait_and_warmup(
+                self.server_args, launch_callback=lambda: ready.append(len(self.calls))
+            )
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(ready, [4])
+
+    def test_retry_is_bounded(self):
+        refused = requests.exceptions.ConnectionError("Connection refused")
+        with (
+            patch.object(http_server, "_FREEZE_GC_RETRY_SECS", 1.5),
+            self._post([refused] * 3),
+        ):
+            http_server._freeze_gc_after_server_warmup(self.server_args)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_http_and_ssl_errors_are_not_retried(self):
+        for error in (
+            _FreezeServerError(),
+            requests.exceptions.SSLError("bad certificate"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.calls.clear()
+                with self._post([error, _FreezeOk()]):
+                    http_server._freeze_gc_after_server_warmup(self.server_args)
+                self.assertEqual(len(self.calls), 1)
 
 
 if __name__ == "__main__":
