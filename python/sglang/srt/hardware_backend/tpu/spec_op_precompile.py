@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Sequence
+from functools import partial
 
 import torch
 
@@ -62,11 +63,13 @@ def precompile_spec_v2_ops(
     with torch.no_grad():
         for context in warmup_contexts:
             for registered_op in registered_ops:
-                args = registered_op.make_warmup_args(context)
                 if queue is None:
-                    registered_op.op(*args)
+                    registered_op.op(*registered_op.make_warmup_args(context))
                 else:
-                    warmup_compiled_op(registered_op.op, *args)
+                    warmup_compiled_op(
+                        registered_op.op,
+                        partial(registered_op.make_warmup_args, context),
+                    )
 
     def finish():
         if device.type == "tpu":

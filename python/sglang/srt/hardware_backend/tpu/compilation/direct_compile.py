@@ -275,8 +275,20 @@ class CompiledFunction:
         artifact = self._get_artifact(args, kwargs)
         return artifact((args, kwargs))
 
-    def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
+    def warmup_async(
+        self,
+        *args: Any,
+        input_factory: Callable[[], tuple[tuple, dict]] | None = None,
+        **kwargs: Any,
+    ) -> PendingCall:
+        """Submit compilation, optionally recreating inputs for deferred execution.
+
+        ``input_factory`` must return equivalent ``(args, kwargs)`` without
+        capturing temporary tensors. Otherwise the original inputs are retained.
+        """
         artifact = self._get_artifact(args, kwargs, async_compile=True)
+        if input_factory is not None:
+            return PendingCall(lambda: artifact(input_factory()))
         return PendingCall(lambda: artifact((args, kwargs)))
 
     def _get_artifact(

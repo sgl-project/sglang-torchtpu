@@ -1,8 +1,10 @@
 """Tests for direct TPU compilation and artifact dispatch."""
 
 import unittest
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -215,8 +217,8 @@ class TestDirectCompile(CustomTestCase):
         def compile_helper(fn, **kwargs):
             compiled = MagicMock(side_effect=fn)
             compiled.cache = {}
-            compiled.warmup_async.side_effect = lambda *args: PendingCall(
-                lambda: compiled(*args)
+            compiled.warmup_async.side_effect = lambda *args, input_factory: (
+                PendingCall(lambda: compiled(*input_factory()[0]))
             )
             return compiled
 
@@ -236,8 +238,55 @@ class TestDirectCompile(CustomTestCase):
                     with collect_warmups() as queue:
                         self.assertTrue(torch.equal(op(x), x * 3))
                         self.assertEqual(queue.calls, [])
-                    self.assertIsNone(warmup_compiled_op(op, x))
+                    self.assertIsNone(
+                        warmup_compiled_op(op, lambda: (torch.arange(3),))
+                    )
                     self.assertTrue(torch.equal(op(x), x * 3))
+
+    def test_warmup_factory_releases_inputs_before_join(self):
+        references, events = [], []
+
+        def make_args(size):
+            base = torch.arange(size * 4).reshape(size, 4)
+            value = base[:, 1::2]
+            references.extend((weakref.ref(base), weakref.ref(value)))
+            return (value,)
+
+        def compile_helper(compiled, args, kwargs, *, async_compile):
+            self.assertTrue(async_compile)
+            references.append(weakref.ref(args[0]))
+            events.append(("submit", args[0].shape[0]))
+
+            def execute(inputs):
+                value = inputs[0][0]
+                self.assertEqual(value.stride(), (2, 1))
+                self.assertEqual(value.storage_offset(), 0)
+                events.append(("execute", value.shape[0]))
+                return compiled.fn(*inputs[0], **inputs[1])
+
+            return execute
+
+        with (
+            patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+            patch.object(direct_compile.CompiledFunction, "_compile", compile_helper),
+            get_context().override_server_args(tpu_compile_tracer="direct"),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+        ):
+            op = compiled_op()(lambda x: x * 3)
+            with collect_warmups():
+                warmup_compiled_op(op, partial(make_args, 1))
+                warmup_compiled_op(op, partial(make_args, 3))
+                self.assertEqual(events, [("submit", 1), ("submit", 3)])
+                self.assertTrue(all(ref() is None for ref in references))
+            self.assertEqual(
+                events,
+                [("submit", 1), ("submit", 3), ("execute", 1), ("execute", 3)],
+            )
+            self.assertTrue(all(ref() is None for ref in references))
+            with torch.compiler.set_stance("fail_on_recompile"):
+                value = make_args(3)[0]
+                self.assertTrue(torch.equal(op(value), value * 3))
 
     def test_compiled_helper_inlines_inside_outer_dynamo_graph(self):
         @compiled_op()
@@ -435,12 +484,13 @@ class TestDirectCompile(CustomTestCase):
                         hidden_dtype=torch.float32,
                     )
                     for registered in get_compiled_ops():
-                        args = registered.make_warmup_args(context)
-                        warmup_compiled_op(registered.op, *args)
-                        cases.append((registered.op, args))
+                        make_args = partial(registered.make_warmup_args, context)
+                        warmup_compiled_op(registered.op, make_args)
+                        cases.append((registered.op, make_args))
             self.assertEqual(len(cases), 12)
             with torch.compiler.set_stance("fail_on_recompile"):
-                for op, args in cases:
+                for op, make_args in cases:
+                    args = make_args()
                     cpu_args = tree_util.tree_map(
                         lambda x: x.cpu() if isinstance(x, torch.Tensor) else x, args
                     )

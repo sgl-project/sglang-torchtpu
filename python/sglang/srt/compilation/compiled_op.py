@@ -75,9 +75,10 @@ def compiled_op(
     and ``uses_rng=True`` for helpers drawing from the default TPU generator.
     A ``warmup`` factory registers the helper for the speculative-op grid.
     Model-specific owners can instead
-    call ``warmup_compiled_op(op, ...)`` with their own representative inputs.
-    The internal ``_warmup_async`` keyword submits each new specialization
-    without waiting when direct asynchronous compilation is enabled.
+    call ``warmup_compiled_op(op, make_args)`` with a zero-argument input factory.
+    The factory must reproduce the same specialization without retaining tensors.
+    Direct asynchronous warmup releases tracing inputs after submission and
+    calls the factory again when the queue executes the compiled program.
     """
 
     def decorator(fn):
@@ -85,8 +86,10 @@ def compiled_op(
         use_direct = False
 
         @functools.wraps(fn)
-        def wrapper(*args, _warmup_async=False, **kwargs):
+        def wrapper(*args, _warmup_args=None, **kwargs):
             nonlocal compiled_fn, use_direct
+            if _warmup_args is not None:
+                args = _warmup_args()
             if (
                 torch.compiler.is_compiling()
                 or not is_tpu()
@@ -113,12 +116,19 @@ def compiled_op(
                     compiled_fn = torch.compile(
                         fn, backend="tpu", fullgraph=True, dynamic=False
                     )
-            if use_direct and _warmup_async and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
+            if (
+                use_direct
+                and _warmup_args is not None
+                and envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
+            ):
                 # Repeated storage/layout warmups share one compiled program.
-                # Keep only its first inputs alive until the queue joins.
                 if _specialization_key(*args, **kwargs) in compiled_fn.cache:
                     return None
-                return compiled_fn.warmup_async(*args, **kwargs)
+
+                def make_inputs():
+                    return tree_util.tree_map(_canonical_tensor, (_warmup_args(), {}))
+
+                return compiled_fn.warmup_async(*args, input_factory=make_inputs)
             return compiled_fn(*args, **kwargs)
 
         if warmup is not None:
@@ -132,14 +142,14 @@ def compiled_op(
     return decorator
 
 
-def warmup_compiled_op(op: Callable, *args, **kwargs) -> None:
-    """Submit output-free warmup to the current queue, or finish immediately."""
+def warmup_compiled_op(op: Callable, make_args: Callable[[], tuple]) -> None:
+    """Warm up with fresh inputs at submission and execution, or run immediately."""
     from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
     from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
         current_warmup_queue,
     )
 
-    pending = op(*args, _warmup_async=True, **kwargs)
+    pending = op(_warmup_args=make_args)
     if isinstance(pending, PendingCall):
         queue = current_warmup_queue()
         if queue is None:
