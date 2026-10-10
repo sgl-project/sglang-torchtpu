@@ -94,6 +94,7 @@ npu:
 tpu:
   - changed-files:
     - any-glob-to-any-file:
+      - 'sglang_tpu/**'
       - 'python/sglang/srt/hardware_backend/tpu/**'
       - 'python/sglang/multimodal_gen/runtime/platforms/tpu.py'
       - 'python/sglang/multimodal_gen/runtime/platforms/__init__.py'

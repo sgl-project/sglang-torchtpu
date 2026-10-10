@@ -81,6 +81,7 @@ Start from the `lmsysorg/sglang:dev` Docker image, which provides development to
 
 ```bash
 pip install -e "python"
+pip install --no-deps -e .   # the TPU plugin in sglang_tpu/; core imports it
 ```
 
 In an activated virtual environment, you can use `uv pip install --prerelease=allow -e "python"` instead. See the [development guide](https://docs.sglang.io/docs/developer_guide/development_guide_using_docker) for container setup and testing.
