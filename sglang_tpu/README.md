@@ -85,6 +85,13 @@ drains. Do not add code to them.
    existing `SGLANG_TPU_*` entries stay in `sglang.srt.environ` until their
    core readers move; never declare one name in both registries.
 
+## Hooks
+
+`hooks.register` is declared by both distributions (`tpu_hooks` in `python/`,
+`tpu_oot_hooks` here): `SGLANG_PLATFORM=tpu` skips every general plugin of
+`sglang-tpu`, so mode A needs its own entry point. `register()` runs once per
+process and only on TPU, since every host installs the plugin.
+
 ## Tests
 
 `test/registered/tpu/**` and `test/registered/unit/hardware_backend/tpu/**`

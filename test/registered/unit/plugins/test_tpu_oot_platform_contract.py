@@ -337,6 +337,97 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         return keys
 
 
+def _declared_entry_points(pyproject_relpath: str, dist_name: str) -> list:
+    """Entry points a pyproject declares, as installed-metadata lookalikes."""
+    import pkgutil
+    import re
+    from types import SimpleNamespace
+
+    section = re.compile(r'^\[project\.entry-points\."([^"]+)"\]$')
+    dist = SimpleNamespace(name=dist_name)
+    eps, group = [], None
+    with open(os.path.join(_REPO_ROOT, pyproject_relpath), encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if line.startswith("["):
+                match = section.match(line)
+                group = match.group(1) if match else None
+            elif group and "=" in line and not line.startswith("#"):
+                name, value = (part.strip().strip('"') for part in line.split("=", 1))
+                eps.append(
+                    SimpleNamespace(
+                        name=name,
+                        value=value,
+                        group=group,
+                        dist=dist,
+                        load=lambda value=value: pkgutil.resolve_name(value),
+                    )
+                )
+    return eps
+
+
+class TestTpuPluginHooksLoad(CustomTestCase):
+    """The plugin's hooks reach HookRegistry under every way of selecting TPU."""
+
+    def _loaded_general_plugins(self, core_pyproject: str, selected: Optional[str]):
+        from sglang.srt import plugins
+
+        installed = _declared_entry_points(
+            core_pyproject, "sglang"
+        ) + _declared_entry_points("pyproject.toml", "sglang-tpu")
+
+        def entry_points(group):
+            return [ep for ep in installed if ep.group == group]
+
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_PLATFORM"}
+        if selected is not None:
+            env["SGLANG_PLATFORM"] = selected
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(plugins, "entry_points", entry_points),
+        ):
+            loaded = plugins.load_plugins_by_group(
+                plugins.GENERAL_PLUGINS_GROUP,
+                excluded_dists=plugins._get_excluded_dists(),
+            )
+        return [func for func, _dist in loaded.values()]
+
+    def test_hooks_load_in_both_modes_and_with_the_platform_unset(self):
+        """Selecting the in-tree tpu platform skips the sglang-tpu dist entirely."""
+        from sglang_tpu.hooks import register
+
+        for core_pyproject in ("python/pyproject.toml", "python/pyproject_tpu.toml"):
+            for selected in ("tpu", "tpu_oot", None):
+                with self.subTest(pyproject=core_pyproject, platform=selected):
+                    self.assertIn(
+                        register,
+                        self._loaded_general_plugins(core_pyproject, selected),
+                    )
+
+    def test_register_is_idempotent_and_tpu_only(self):
+        """Both entry points run when the platform is unset; non-TPU hosts load them too."""
+        from types import SimpleNamespace
+
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+        from sglang_tpu import hooks
+
+        target = "sglang.srt.utils.common.get_device_name"
+        fake_hook = (target, lambda result, *a, **k: result, HookType.AFTER)
+        for is_tpu, expected in ((True, 1), (False, 0)):
+            with self.subTest(is_tpu=is_tpu):
+                HookRegistry.reset()
+                self.addCleanup(HookRegistry.reset)
+                platform = SimpleNamespace(is_tpu=lambda is_tpu=is_tpu: is_tpu)
+                with (
+                    patch.object(hooks, "HOOKS", [fake_hook]),
+                    patch.object(hooks, "_registered", False),
+                    patch("sglang.srt.platforms.current_platform", platform),
+                ):
+                    hooks.register()
+                    hooks.register()
+                self.assertEqual(len(HookRegistry._hooks.get(target, [])), expected)
+
+
 class TestTpuDebtRatchet(CustomTestCase):
     """The ratchet must catch an increase; its failure mode is a silent pass."""
 
