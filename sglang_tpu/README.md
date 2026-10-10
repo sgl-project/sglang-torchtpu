@@ -91,3 +91,7 @@ drains. Do not add code to them.
 stay where they are (`test/run_suite.py` only collects `test/registered/**`).
 The e2e smoke suites honour an inherited `SGLANG_PLATFORM`, so mode B is
 `SGLANG_PLATFORM=tpu_oot python test/registered/tpu/e2e/<file>.py`.
+The `test_tpu_oot_*.py` wrappers run three of them that way: the Qwen3 smoke
+(dense MHA) in the PR gate, gpt-oss-20b EAGLE3 (hybrid SWA) and Kimi-K3-tiny
+(MLA with linear attention) nightly. The rest of CI stays on mode A; move the
+nightly two into the PR gate before `tpu_oot` becomes the default.
