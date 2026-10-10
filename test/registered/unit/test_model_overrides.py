@@ -3536,6 +3536,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {},
         )
 
+    def test_dsa_on_tpu_refuses_what_it_would_serve_wrongly(self):
+        """TPU has one DSA backend, and its top-k kernel cannot force the
+        init/local positions in. Either mismatch must stop the launch: served
+        anyway, the model would attend over a different selection."""
+        from sglang.srt.arg_groups.model_hook import _validate_dsa_on_tpu
+
+        glm = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"], index_topk=2048)
+        _validate_dsa_on_tpu("pallas_tpu_mla_sparse", glm)
+        with self.assertRaisesRegex(ValueError, "pallas_tpu_mla_sparse"):
+            _validate_dsa_on_tpu("pallas_tpu_mla", glm)
+        for field in ("index_init_tokens", "index_local_tokens"):
+            with self.subTest(field=field):
+                config = SimpleNamespace(index_topk=2048, **{field: 4})
+                with self.assertRaisesRegex(ValueError, field):
+                    _validate_dsa_on_tpu("pallas_tpu_mla_sparse", config)
+
     def test_deepseek_family_order_safe_declarations(self):
         from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
             _deepseek_family_overrides,

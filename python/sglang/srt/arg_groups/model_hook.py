@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
@@ -72,6 +72,27 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
             f"index_topk_freq={index_topk_freq!r}, "
             f"index_topk_pattern={index_topk_pattern!r}, and "
             f"indexer_types={indexer_types!r}."
+        )
+
+
+def _validate_dsa_on_tpu(attention_backend: Optional[str], hf_config: Any) -> None:
+    """Reject the DSA setups that TPU cannot serve correctly."""
+    if attention_backend != "pallas_tpu_mla_sparse":
+        raise ValueError(
+            "Sparse attention (DSA) on TPU needs --attention-backend "
+            f"pallas_tpu_mla_sparse, got {attention_backend!r}."
+        )
+    # With these two settings the GPU indexer always keeps the first
+    # index_init_tokens and the last index_local_tokens positions. The TPU
+    # top-k kernel cannot do that yet, and ignoring them would change the
+    # selection without any error.
+    # TODO(sglang-torchtpu#1072): support them on TPU.
+    init_tokens = getattr(hf_config, "index_init_tokens", 0)
+    local_tokens = getattr(hf_config, "index_local_tokens", 0)
+    if init_tokens or local_tokens:
+        raise ValueError(
+            "DSA on TPU does not support index_init_tokens or index_local_tokens "
+            f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
 
 
@@ -277,12 +298,8 @@ def handle_model_specific_adjustments(server_args: Any):
             _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
             if get_platform().is_tpu:
-                # The TPU platform resolves the KV dtype; only the backend is checked.
-                if cfg.attention_backend != "pallas_tpu_mla_sparse":
-                    raise ValueError(
-                        "Sparse attention (DSA) on TPU needs --attention-backend "
-                        f"pallas_tpu_mla_sparse, got {cfg.attention_backend!r}."
-                    )
+                # The TPU platform resolves the KV dtype, so nothing else to do.
+                _validate_dsa_on_tpu(cfg.attention_backend, hf_config)
             elif (
                 not get_platform().is_npu and not get_platform().is_xpu
             ):  # CUDA or ROCm GPU

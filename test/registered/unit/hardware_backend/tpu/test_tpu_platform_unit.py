@@ -143,6 +143,7 @@ class TestTpuCompileCache(CustomTestCase):
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_v3.py",
                 srt_root / "hardware_backend/tpu/distributed_topk_pallas.py",
                 srt_root / "hardware_backend/tpu/dsa_indexer_tpu.py",
+                srt_root / "hardware_backend/tpu/dsv4/sparsecore_topk.py",
                 srt_root / "hardware_backend/tpu/dsv4/streamindex_topk/kernel.py",
                 srt_root / "hardware_backend/tpu/kernels/distributed_topk.py",
                 srt_root / "hardware_backend/tpu/kernels/kernel.py",
