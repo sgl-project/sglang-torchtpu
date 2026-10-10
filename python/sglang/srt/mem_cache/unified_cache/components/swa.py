@@ -81,6 +81,9 @@ class SWAComponent(TreeComponent):
 
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
+        self._evict_stale_windows_first = (
+            envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.get()
+        )
         self.sliding_window_size = params.sliding_window_size
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
@@ -960,6 +963,8 @@ class SWAComponent(TreeComponent):
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
+        if self._evict_stale_windows_first and req.swa_stale_window_floor is None:
+            req.swa_stale_window_floor = req.kv.cache_protected_len
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
         # Let MambaComponent select the insertion length for hybrid caches.
@@ -1019,6 +1024,52 @@ class SWAComponent(TreeComponent):
         ):
             forward_key_len = len(req.get_fill_ids()) - int(self.tree_core.is_eagle)
             self._free_out_of_window_slots(req, forward_key_len - 1)
+
+        if (
+            self._evict_stale_windows_first
+            and insert_result is not None
+            and insert_result.last_device_node is not None
+            and req.swa_stale_window_floor is not None
+        ):
+            self._demote_stale_windows(
+                last_node=self.tree_core.node_by_id(insert_result.last_device_node),
+                floor=req.swa_stale_window_floor,
+            )
+
+    # Each chunk insert leaves one window of live SWA at the chunk boundary that the
+    # request can no longer free; move those behind its window to the SWA LRU end.
+    def _demote_stale_windows(self, *, last_node: UnifiedTreeNode, floor: int) -> None:
+        ct = self.component_type
+        root = self.tree_core.root_node
+        path = []
+        node = last_node
+        while node is not root:
+            assert node is not None, "insert returned a node detached from the tree"
+            path.append(node)
+            node = node.parent
+        depth = sum(len(n.key) for n in path)
+        # Same bound as the INSERT_END refresh, so a demoted node is never one that
+        # refresh just made MRU.
+        window_bound = self.sliding_window_size + self.tree_core.page_size
+        lru = self.tree_core.lru_lists[ct]
+        end = depth
+        child = None
+        for n in path:
+            start = end - len(n.key)
+            # Above a branch point the path is shared: another sequence's window may
+            # need these nodes.
+            if start < floor or any(c is not child for c in n.children.values()):
+                break
+            cd = n.component_data[ct]
+            if (
+                depth - end >= window_bound
+                and cd.value is not None
+                and cd.lock_ref == 0
+                and lru.in_list(n)
+            ):
+                lru.reset_node_lru(n)
+            child = n
+            end = start
 
     # ---- HiCache Hooks ----
 
