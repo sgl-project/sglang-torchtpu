@@ -59,6 +59,7 @@ from sglang.srt.model_executor.runner_utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -231,7 +232,7 @@ class EagerRunner(BaseRunner):
     def _set_logits_output_mode(self, forward_batch: ForwardBatch) -> None:
         if not _is_tpu:
             return
-        from sglang.srt.hardware_backend.tpu.sampler import (
+        from sglang_tpu.sampler import (
             select_logits_output_mode,
         )
 
@@ -308,8 +309,12 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                get_parallel().attn_dcp_size > 1
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
+                and forward_batch.extend_prefix_lens is not None
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (

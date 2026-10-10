@@ -1,18 +1,14 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
-
-maybe_stub_sgl_kernel()
-
 from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -64,17 +60,21 @@ class TestTokenizerFlushCache(unittest.TestCase):
 
 
 class TestSchedulerFlushCache(unittest.TestCase):
-    def _new_scheduler(self) -> Scheduler:
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.ipc_channels = MagicMock()
-        scheduler.flush_cache = MagicMock(return_value=True)
-        scheduler.is_fully_idle = MagicMock(return_value=False)
-        scheduler.flush_wrapper = SchedulerFlushWrapper(
-            flush_cache=scheduler.flush_cache,
-            is_fully_idle=scheduler.is_fully_idle,
-            ipc_channels=scheduler.ipc_channels,
+    def _new_scheduler(self) -> SimpleNamespace:
+        """The wrapper plus the three collaborators it was handed."""
+        flush_cache = MagicMock(return_value=True)
+        is_fully_idle = MagicMock(return_value=False)
+        ipc_channels = MagicMock()
+        return SimpleNamespace(
+            flush_cache=flush_cache,
+            is_fully_idle=is_fully_idle,
+            ipc_channels=ipc_channels,
+            flush_wrapper=SchedulerFlushWrapper(
+                flush_cache=flush_cache,
+                is_fully_idle=is_fully_idle,
+                ipc_channels=ipc_channels,
+            ),
         )
-        return scheduler
 
     def test_immediate_flush_no_timeout(self):
         """No timeout → flush immediately regardless of idle state."""

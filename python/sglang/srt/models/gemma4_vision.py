@@ -579,7 +579,7 @@ class Gemma4VisionEncoder(nn.Module):
         # runner so the patch axis is padded to a precompiled bucket first.
         self.graph_runners = None
         if _is_tpu:
-            from sglang.srt.hardware_backend.tpu.graph_runner.gemma4_vision_tpu_compile_runner import (
+            from sglang_tpu.graph_runner.gemma4_vision_tpu_compile_runner import (
                 Gemma4VisionTpuCompileRunner,
             )
 
@@ -644,7 +644,7 @@ if _is_tpu:
     # Register the encoder as a torch.compile boundary for the TPU graph runner
     # to discover (inert unless --enable-torch-compile).
     from sglang.srt.compilation.support_torch_compile import support_torch_compile
-    from sglang.srt.hardware_backend.tpu.graph_runner.gemma4_vision_tpu_compile_runner import (
+    from sglang_tpu.graph_runner.gemma4_vision_tpu_compile_runner import (
         Gemma4VisionTpuCompilePolicy,
     )
 

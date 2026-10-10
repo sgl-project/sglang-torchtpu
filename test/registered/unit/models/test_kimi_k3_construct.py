@@ -126,6 +126,58 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
         model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
         self.assertIsNone(model.model.alt_streams)
 
+    def test_mla_binds_mha_kv_b_proj_after_load(self):
+        """Loading reads the unaliased kv_b_proj key; the compiled forward then
+        finds attn_mha.kv_b_proj bound instead of setting it in the trace."""
+        from sglang.srt.model_loader.loader import ShardedStateLoader
+        from sglang.srt.models.kimi_k3 import KimiK3MLAAttention
+
+        model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
+        mla = [
+            layer.self_attn
+            for layer in model.model.layers
+            if isinstance(layer.self_attn, KimiK3MLAAttention)
+        ]
+        self.assertTrue(mla)
+        load_keys = [
+            key
+            for key in ShardedStateLoader._filter_subtensors(model.state_dict())
+            if "kv_b_proj" in key
+        ]
+        self.assertTrue(load_keys)
+        self.assertFalse([key for key in load_keys if "attn_mha" in key])
+        model.post_load_weights()
+        for attn in mla:
+            self.assertIs(attn.attn_mha.kv_b_proj, attn.kv_b_proj)
+
+    def test_post_load_resolves_only_the_tpu_forward_properties(self):
+        """A cached property first read inside the compiled trace recompiles
+        while serving; the CUDA-only ones may probe CUDA kernels."""
+        from functools import cached_property
+
+        model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
+        model.post_load_weights()
+        cached = {
+            name
+            for name, attr in vars(KimiK3MoE).items()
+            if isinstance(attr, cached_property)
+        }
+        moes = [
+            layer.mlp
+            for layer in model.model.layers
+            if isinstance(layer.mlp, KimiK3MoE)
+        ]
+        self.assertTrue(moes)
+        for moe in moes:
+            self.assertEqual(
+                cached & moe.__dict__.keys(),
+                {
+                    "_eligible_for_fused_front",
+                    "_ep_front_eligible",
+                    "_routed_needs_reduce",
+                },
+            )
+
     def test_post_load_keeps_unfused_weights(self):
         """CUDA-only merged layouts stay unset on TPU."""
         model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)

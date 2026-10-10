@@ -23,7 +23,7 @@ except ImportError:
 @unittest.skipUnless(_HAS_JAX, "requires JAX")
 class TestInt4Fp8Dispatch(CustomTestCase):
     def test_bs1_ep_window_and_padding(self):
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
         w1 = jax.ShapeDtypeStruct((48, 896, 4096), jnp.int32)
         w2 = jax.ShapeDtypeStruct((48, 256, 7168), jnp.int32)
@@ -56,13 +56,11 @@ class TestInt4Fp8Dispatch(CustomTestCase):
 
             with (
                 self.subTest(ids=ids),
-                mock.patch(
-                    "sglang.srt.layers.moe.pallas.gmm_v2.gmm_v2", side_effect=fake_gmm
-                ),
+                mock.patch("sglang_tpu.moe.pallas.gmm_v2.gmm_v2", side_effect=fake_gmm),
                 # bf16 sublane tiling on TPU (m pads from 1 to 2 at top-8), here
                 # without a TPU backend for JAX.
                 mock.patch(
-                    "sglang.srt.layers.moe.pallas.gmm_v2.lhs_sublane_tiling",
+                    "sglang_tpu.moe.pallas.gmm_v2.lhs_sublane_tiling",
                     return_value=16,
                 ),
             ):

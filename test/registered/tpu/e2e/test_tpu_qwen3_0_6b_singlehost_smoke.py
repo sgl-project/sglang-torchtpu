@@ -44,7 +44,8 @@ class TestTpuQwen306bSinglehostSmoke(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_PLATFORM"] = "tpu"
+        # setdefault: mode B runs these suites with SGLANG_PLATFORM=tpu_oot.
+        os.environ.setdefault("SGLANG_PLATFORM", "tpu")
         cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

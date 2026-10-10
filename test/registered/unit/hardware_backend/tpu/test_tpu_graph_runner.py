@@ -20,31 +20,30 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    BaseSpecDecodeCompilePolicyMixin,
-)
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
-    DFlashSpecDecodeCompilePolicyMixin,
-)
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
-    Eagle3SpecDecodeCompilePolicyMixin,
-)
-from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import collect_warmups
-from sglang.srt.model_executor.tpu_graph_runner import (
-    TpuGraphRunner,
-    _augment_spec_policy,
-)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+)
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.spec_decode_compile_policy import (
+    BaseSpecDecodeCompilePolicyMixin,
+)
+from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecodeCompilePolicyMixin,
+)
+from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    Eagle3SpecDecodeCompilePolicyMixin,
+)
+from sglang_tpu.compilation.warmup_queue import collect_warmups
+from sglang_tpu.graph_runner.tpu_graph_runner import (
+    TpuGraphRunner,
+    _augment_spec_policy,
+)
 
 DECODER_POLICY_PRECOMPILE = (
-    "sglang.srt.hardware_backend.tpu.compilation."
-    "decoder_compile_policy.DecoderTpuCompilePolicy.precompile"
+    "sglang_tpu.compilation.decoder_compile_policy.DecoderTpuCompilePolicy.precompile"
 )
 
 
@@ -87,7 +86,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.addCleanup(override.restore)
         # Flush init's lazy imports before the torch.compile patch: their
         # import-time @torch.compile decorators must not hit the recorder.
-        import sglang.kernels.ops.moe.virtual_experts  # noqa: F401
+        import sglang.kernels.ops.lora.moe.virtual_experts  # noqa: F401
         import sglang.kernels.ops.speculative.cache_locs  # noqa: F401
         import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe  # noqa: F401
         import sglang.srt.layers.sampler  # noqa: F401
@@ -110,14 +109,13 @@ class TestTpuGraphRunner(CustomTestCase):
             return m
 
         compile_patcher = patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "decoder_compile_policy.torch.compile",
+            "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
             side_effect=_fake_compile,
         )
         self.mock_compile = compile_patcher.start()
         self.addCleanup(compile_patcher.stop)
         direct_patcher = patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
+            "sglang_tpu.compilation."
             "decoder_compile_policy.DecoderTpuCompilePolicy._direct_compile",
             return_value=(
                 MagicMock(name="direct_compiled"),
@@ -127,15 +125,13 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_direct_compile = direct_patcher.start()
         self.addCleanup(direct_patcher.stop)
         # Stub the backend-registration import so the test doesn't need torch_tpu.
-        register_patcher = patch(
-            "sglang.srt.hardware_backend.tpu.patches._register_tpu_compile_backend"
-        )
+        register_patcher = patch("sglang_tpu.patches._register_tpu_compile_backend")
         self.mock_register = register_patcher.start()
         self.addCleanup(register_patcher.stop)
         self.mock_cache_key = enter_scope(
             self,
             patch(
-                "sglang.srt.model_executor.tpu_graph_runner."
+                "sglang_tpu.graph_runner.tpu_graph_runner."
                 "add_tpu_rank_assignment_to_compile_cache_key"
             ),
         )
@@ -146,19 +142,18 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_precompile = precompile_patcher.start()
         self.addCleanup(precompile_patcher.stop)
         dispatch_patcher = patch(
-            "sglang.srt.model_executor.tpu_graph_runner._resolve_fused_op_dispatch"
+            "sglang_tpu.graph_runner.tpu_graph_runner._resolve_fused_op_dispatch"
         )
         dispatch_patcher.start()
         self.addCleanup(dispatch_patcher.stop)
         platform_patcher = patch(
-            "sglang.srt.model_executor.tpu_graph_runner.current_platform",
+            "sglang_tpu.graph_runner.tpu_graph_runner.current_platform",
             SimpleNamespace(device_type="tpu"),
         )
         platform_patcher.start()
         self.addCleanup(platform_patcher.stop)
         backend_patcher = patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "decoder_compile_policy.current_platform",
+            "sglang_tpu.compilation.decoder_compile_policy.current_platform",
             SimpleNamespace(get_compile_backend=lambda: "tpu"),
         )
         backend_patcher.start()
@@ -166,8 +161,7 @@ class TestTpuGraphRunner(CustomTestCase):
         # install() consults is_dp_attention_enabled() -> get_flags(), which
         # needs global server args set. No DP in these unit tests, so stub it.
         dp_patcher = patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "decoder_compile_policy.is_dp_attention_enabled",
+            "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
             return_value=False,
         )
         dp_patcher.start()
@@ -298,12 +292,12 @@ class TestTpuGraphRunner(CustomTestCase):
         with (
             envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker",
                 return_value=checker,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "decoder_compile_policy.DecoderTpuCompilePolicy."
                 "set_recompilation_checker",
                 side_effect=lambda *a, **k: events.append("install"),
@@ -336,7 +330,7 @@ class TestTpuGraphRunner(CustomTestCase):
                     model = self._annotate(_model_with(forward=MagicMock()))
                     scope = collect_warmups() if global_queue else nullcontext()
                     with patch(
-                        "sglang.srt.model_executor.tpu_graph_runner.logger.info",
+                        "sglang_tpu.graph_runner.tpu_graph_runner.logger.info",
                         side_effect=record_log,
                     ):
                         with scope:
@@ -480,12 +474,12 @@ class TestTpuGraphRunner(CustomTestCase):
         with (
             envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker",
                 return_value=checker,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "decoder_compile_policy.DecoderTpuCompilePolicy.set_recompilation_checker",
                 side_effect=lambda *a, **k: events.append("install"),
             ),
@@ -498,7 +492,7 @@ class TestTpuGraphRunner(CustomTestCase):
         with (
             envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker"
             ) as shared,
         ):
@@ -513,7 +507,7 @@ class TestTpuGraphRunner(CustomTestCase):
         with (
             envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker"
             ) as shared,
         ):
@@ -598,7 +592,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_direct_compile.assert_not_called()
 
     def test_dynamic_compile_unwrap_updates_repetition_penalty_alias(self):
-        from sglang.srt.hardware_backend.tpu import patches as tpu_patches
+        from sglang_tpu import patches as tpu_patches
 
         repetition_path = "sglang.srt.sampling.penaltylib.repetition_penalty"
         sampling_path = "sglang.srt.sampling.sampling_batch_info"

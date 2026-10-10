@@ -55,6 +55,9 @@ jobs:
         with:
           filters: |
             tpu:
+              - 'sglang_tpu/**'
+              - 'pyproject.toml'
+              # Re-export shims left by the plugin move.
               - 'python/sglang/srt/hardware_backend/tpu/**'
               - 'python/sglang/srt/layers/attention/pallas/**'
               - 'python/sglang/srt/layers/moe/pallas/**'

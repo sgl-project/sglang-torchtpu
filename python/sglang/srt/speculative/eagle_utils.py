@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -14,10 +15,6 @@ from sglang.kernels.ops.speculative.spec_tree import (
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
-)
-from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
-    make_verify_bookkeeping_args,
-    make_verify_tree_greedy_args,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
@@ -56,7 +53,7 @@ _is_tpu = is_tpu()
 _is_cpu = is_cpu()
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+    from sglang_tpu.eagle_utils_tpu import (
         build_topk1_verify_tree_tpu,
         prepare_device_accept_tpu,
         prepare_verify_cache_locs_tpu,
@@ -428,7 +425,20 @@ def _verify_tree_greedy_torch_inplace(
     accept_token_num[:bs] = num_correct.to(accept_token_num.dtype)
 
 
-@compiled_op(warmup=make_verify_tree_greedy_args)
+def _make_verify_tree_greedy_args(context):
+    # Imported on first call so this module loads without sglang_tpu installed.
+    from sglang_tpu.spec_op_warmup import make_verify_tree_greedy_args
+
+    return make_verify_tree_greedy_args(context)
+
+
+def _make_verify_bookkeeping_args(context):
+    from sglang_tpu.spec_op_warmup import make_verify_bookkeeping_args
+
+    return make_verify_bookkeeping_args(context)
+
+
+@compiled_op(warmup=_make_verify_tree_greedy_args)
 def _verify_tree_greedy_torch(
     next_token_logits: torch.Tensor,
     candidates: torch.Tensor,
@@ -623,7 +633,7 @@ def verify_tree_greedy_func(
     return predicts, accept_index, accept_token_num
 
 
-@compiled_op(warmup=make_verify_bookkeeping_args)
+@compiled_op(warmup=_make_verify_bookkeeping_args)
 def fused_verify_bookkeeping(
     seq_lens: torch.Tensor,
     accept_lens: torch.Tensor,
@@ -774,6 +784,8 @@ def eagle_prepare_for_verify(
             batch.out_cache_loc = prepare_verify_cache_locs_tpu(
                 verify_input, req_to_token_pool, batch
             )
+        elif verify_input.prepared_out_cache_loc is not None:
+            batch.out_cache_loc = verify_input.prepared_out_cache_loc
         else:
             # Uniform variant: end offsets (= start + draft_token_num) are computed
             # inside the kernel, keeping the eager `seq_lens + N` add off the host
@@ -813,6 +825,7 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
+        spec_mrope_positions=verify_input.prepared_mrope_positions,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -951,8 +964,6 @@ def eagle_sample(
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
     """
-    import torch.nn.functional as F
-
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
@@ -1148,8 +1159,8 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
+        target_probs = sampling_softmax(
+            next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:

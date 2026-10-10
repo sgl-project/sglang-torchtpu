@@ -12,7 +12,7 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.disaggregation.raiden.serde import (
+from sglang_tpu.disaggregation.raiden.serde import (
     MessageTag,
     read_aux_blob,
     write_aux_blob,

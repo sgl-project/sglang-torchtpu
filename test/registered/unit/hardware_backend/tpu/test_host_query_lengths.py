@@ -6,12 +6,12 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
-    BaseTpuPallasRpaAttnBackend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.attention_pallas_rpa_base import (
+    BaseTpuPallasRpaAttnBackend,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -89,15 +89,15 @@ def test_eagle_refresh_requires_complete_host_query_shape_without_readback(
 def test_query_mirror_survives_padding_before_metadata(
     padding, physical_bs, mirror_kind, enabled
 ):
-    from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-    from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang_tpu.compilation.bucketer import Bucketer
+    from sglang_tpu.compilation.compiled_forward_shim import (
         _pad_forward_batch_inputs,
         _restore_forward_batch_inputs,
     )
-    from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
         Eagle3SpecDecodeCompilePolicyMixin,
     )
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
     mirror = {
         "missing": None,

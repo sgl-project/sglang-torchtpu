@@ -8,9 +8,9 @@ from unittest.mock import Mock, patch
 
 import torch.compiler.config as compiler_config
 
-from sglang.srt.hardware_backend.tpu import compile_cache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_scope
+from sglang_tpu import compile_cache
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

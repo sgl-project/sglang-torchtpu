@@ -38,7 +38,9 @@ class TestPDTransferMetrics(CustomTestCase):
         self.reporter.scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
             disagg_prefill_inflight_queue=[],
-            disagg_decode_transfer_queue=SimpleNamespace(queue=[]),
+            disagg_decode_transfer_queue=SimpleNamespace(
+                queue=[], num_pending_deferred_releases=lambda: 0
+            ),
         )
 
     def set_queue(self, mode, times):

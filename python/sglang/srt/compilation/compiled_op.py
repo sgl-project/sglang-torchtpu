@@ -99,7 +99,7 @@ def compiled_op(
             if compiled_fn is None:
                 use_direct = get_exec().graph.tpu_compile_tracer == "direct"
                 if use_direct:
-                    from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+                    from sglang_tpu.compilation.direct_compile import (
                         direct_compile,
                     )
 
@@ -134,8 +134,8 @@ def compiled_op(
 
 def warmup_compiled_op(op: Callable, *args, **kwargs) -> None:
     """Submit output-free warmup to the current queue, or finish immediately."""
-    from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-    from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+    from sglang_tpu.compilation.pending_call import PendingCall
+    from sglang_tpu.compilation.warmup_queue import (
         current_warmup_queue,
     )
 

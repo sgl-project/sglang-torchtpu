@@ -14,14 +14,14 @@ import os
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.hardware_backend.tpu.env_override import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.env_override import (
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
     apply_small_kv_pool_vmem_prefetch_override,
     apply_tpu_env_overrides,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestLibtpuInitArgsOverrides(CustomTestCase):

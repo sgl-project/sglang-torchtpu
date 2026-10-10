@@ -1,4 +1,4 @@
-"""KV pages freed under overlap stay out of DMA-written allocations until the
+"""KV pages freed under overlap stay out of non-forward allocations until the
 forwards in flight at free time are processed."""
 
 import ast
@@ -12,14 +12,17 @@ from array import array
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Tuple
+from unittest.mock import Mock
 
 import torch
 
 import sglang
-from sglang.srt.hardware_backend.tpu.allocator_tpu import (
-    TpuPagedTokenToKVPoolAllocator,
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocation import (
+    alloc_paged_token_slots_decode,
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
 )
-from sglang.srt.hardware_backend.tpu.kv_free_fence import install_kv_free_fence
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -32,12 +35,24 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.allocator_tpu import (
+    TpuPagedTokenToKVPoolAllocator,
+)
+from sglang_tpu.kv_free_fence import install_kv_free_fence
 
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 PAGE = 4
+
+_install = functools.partial(
+    install_kv_free_fence,
+    spec_algorithm=SpeculativeAlgorithm.NONE,
+    copies_draft_tail=False,
+)
 
 
 class _CopyDone:
@@ -59,7 +74,7 @@ class TestKVFreeFence(CustomTestCase):
             kvcache=None,
             need_sort=need_sort,
         )
-        self.fence = install_kv_free_fence(
+        self.fence = _install(
             self.allocator, synchronize_device=lambda: self.log.append("device")
         )
 
@@ -72,11 +87,10 @@ class TestKVFreeFence(CustomTestCase):
     def _pages(self, locs):
         return set((locs[::PAGE] // PAGE).tolist())
 
-    def _alloc_dma(self, num_pages):
-        with self.allocator.dma_write_target():
-            return self.allocator.alloc(num_pages * PAGE)
+    def _alloc_pages(self, num_pages):
+        return self.allocator.alloc(num_pages * PAGE)
 
-    def test_dma_target_never_gets_a_page_an_in_flight_forward_may_write(self):
+    def test_unscoped_allocation_never_gets_a_page_in_flight_forwards_write(self):
         """A page freed while forward N runs can be overwritten by forward N, so
         a host-to-device load into it must not be issued before N finishes."""
         for need_sort in (False, True):
@@ -90,25 +104,27 @@ class TestKVFreeFence(CustomTestCase):
 
                 # Free pages exist only on the held side, so the DMA waits.
                 self.assertEqual(self.allocator.available_size(), 3 * PAGE)
-                loaded = self._alloc_dma(3)
+                loaded = self._alloc_pages(3)
                 self.assertEqual(self.log, ["device"])
+                self.assertEqual(self.fence.stats.pages_held, 3)
+                self.assertEqual(self.fence.stats.device_syncs, 1)
                 self.assertEqual(
                     self._pages(loaded), self._pages(busy) | self._pages(spare[:PAGE])
                 )
 
-    def test_dma_target_uses_free_pages_without_waiting(self):
+    def test_unscoped_allocation_uses_free_pages_without_waiting(self):
         self._setup()
         busy = self.allocator.alloc(2 * PAGE)
         self._launch()
         self.allocator.free(busy)
 
-        loaded = self._alloc_dma(2)
+        loaded = self._alloc_pages(2)
         self.assertEqual(self.log, [])
         self.assertTrue(self._pages(loaded).isdisjoint(self._pages(busy)))
-        self.assertIsNone(self._alloc_dma(3))
+        self.assertIsNone(self._alloc_pages(3))
         self.assertEqual(self.log, [])
 
-    def test_forward_allocation_borrows_held_pages_without_waiting(self):
+    def test_forward_allocations_borrow_held_pages_without_waiting(self):
         """Device compute runs in launch order, so a later forward's write to a
         held page lands after the in-flight forward's write."""
         self._setup()
@@ -116,7 +132,13 @@ class TestKVFreeFence(CustomTestCase):
         self._launch()
         self.allocator.free(busy)
 
-        out = self.allocator.alloc_extend(
+        tree_cache = SimpleNamespace(
+            token_to_kv_pool_allocator=self.allocator,
+            supports_prefix_sharing=lambda: False,
+        )
+        alloc_token_slots(tree_cache, num_tokens=PAGE)
+        alloc_paged_token_slots_extend(
+            tree_cache,
             prefix_lens=torch.tensor([0]),
             prefix_lens_cpu=torch.tensor([0]),
             seq_lens=torch.tensor([PAGE + 1]),
@@ -124,9 +146,15 @@ class TestKVFreeFence(CustomTestCase):
             last_loc=torch.tensor([-1]),
             extend_num_tokens=PAGE + 1,
         )
-        self.assertIsNotNone(out)
+        alloc_paged_token_slots_decode(
+            tree_cache,
+            seq_lens=torch.tensor([1]),
+            seq_lens_cpu=torch.tensor([1]),
+            last_loc=torch.tensor([-1]),
+        )
         self.assertEqual(self.log, [])
-        self.assertEqual(self.allocator.available_size(), 2 * PAGE)
+        self.assertEqual(self.allocator.available_size(), 0)
+        self.assertEqual(self.fence.stats.pages_borrowed, 4)
 
     def test_pages_release_once_every_forward_in_flight_at_free_is_processed(self):
         self._setup()
@@ -191,7 +219,7 @@ class TestKVFreeFence(CustomTestCase):
         self.allocator.free(busy[:PAGE])
         self.fence.on_forward_done(prev)
         # A sync before launch does not cover the formed batch's writes.
-        self.assertIsNone(self._alloc_dma(3))
+        self.assertIsNone(self._alloc_pages(3))
         self.assertEqual(self.log, ["copy_done", "device"])
         self.assertEqual(self.allocator.held_pages.num_pages, 1)
 
@@ -200,6 +228,38 @@ class TestKVFreeFence(CustomTestCase):
         self.allocator.free(busy[PAGE:])
         self.fence.on_forward_done(nxt)
         self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+    def test_after_in_flight_runs_once_the_forwards_formed_so_far_finish(self):
+        """A DMA read registered while forward N runs must not run before N
+        finishes, and reads registered later never overtake earlier ones."""
+        self._setup()
+        ran = []
+        first = self._launch()
+        self.fence.after_in_flight(lambda: ran.append("a"))
+        second = self._launch()
+        self.fence.after_in_flight(lambda: ran.append("b"))
+        self.assertEqual(ran, [])
+        self.fence.on_forward_done(first)
+        self.assertEqual(ran, ["a"])
+        self.fence.on_forward_done(second)
+        self.assertEqual(ran, ["a", "b"])
+        self.fence.after_in_flight(lambda: ran.append("c"))
+        self.assertEqual(ran, ["a", "b", "c"])
+
+    def test_after_in_flight_waits_for_a_formed_batch_not_yet_launched(self):
+        """With overlap off for a batch, the previous result is processed after
+        the batch forms; a read registered then must wait for that batch."""
+        self._setup()
+        ran = []
+        previous = self._launch()
+        self.fence.on_batch_formed()
+        self.fence.after_in_flight(lambda: ran.append("read"))
+        self.fence.on_forward_done(previous)
+        self.assertEqual(ran, [])
+        current = SimpleNamespace(copy_done=None)
+        self.fence.on_forward_launched(current)
+        self.fence.on_forward_done(current)
+        self.assertEqual(ran, ["read"])
 
     def test_install_covers_swa_sub_pools_and_rejects_other_allocators(self):
         full, swa = (
@@ -216,7 +276,7 @@ class TestKVFreeFence(CustomTestCase):
         wrapper = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
         wrapper.full_attn_allocator = full
         wrapper.swa_attn_allocator = swa
-        fence = install_kv_free_fence(wrapper, synchronize_device=lambda: None)
+        fence = _install(wrapper, synchronize_device=lambda: None)
         self.assertIs(full.kv_free_fence, fence)
         self.assertIs(swa.kv_free_fence, fence)
 
@@ -229,7 +289,141 @@ class TestKVFreeFence(CustomTestCase):
             need_sort=False,
         )
         with self.assertRaises(ValueError):
-            install_kv_free_fence(generic, synchronize_device=lambda: None)
+            _install(generic, synchronize_device=lambda: None)
+
+    def test_install_allows_only_spec_algorithms_whose_result_copy_follows_kv(self):
+        """copy_done covers a KV write only if a copied tensor is computed after
+        it; EAGLE's draft extend writes KV after every result tensor but topk,
+        and DFLASH, DSPARK and NGRAM write KV after all of them."""
+        allowed = [
+            (SpeculativeAlgorithm.NONE, False),
+            (SpeculativeAlgorithm.FROZEN_KV_MTP, False),
+            (SpeculativeAlgorithm.UNO, False),
+            (SpeculativeAlgorithm.EAGLE, True),
+            (SpeculativeAlgorithm.EAGLE3, True),
+            (SpeculativeAlgorithm.STANDALONE, True),
+        ]
+        rejected = [
+            (SpeculativeAlgorithm.EAGLE, False),
+            (SpeculativeAlgorithm.DFLASH, True),
+            (SpeculativeAlgorithm.DSPARK, True),
+            (SpeculativeAlgorithm.NGRAM, True),
+            (CustomSpecAlgo("PLUGIN", factory=lambda server_args: None), True),
+        ]
+        for spec_algorithm, copies_draft_tail in allowed + rejected:
+            with self.subTest(spec=spec_algorithm, copies_draft_tail=copies_draft_tail):
+                allocator = TpuPagedTokenToKVPoolAllocator(
+                    size=4 * PAGE,
+                    page_size=PAGE,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=None,
+                    need_sort=False,
+                )
+                install = functools.partial(
+                    install_kv_free_fence,
+                    allocator,
+                    synchronize_device=lambda: None,
+                    spec_algorithm=spec_algorithm,
+                    copies_draft_tail=copies_draft_tail,
+                )
+                if (spec_algorithm, copies_draft_tail) in allowed:
+                    install()
+                else:
+                    with self.assertRaises(ValueError):
+                        install()
+
+
+class _StopLoop(Exception):
+    pass
+
+
+class TestOverlapLoopWiring(CustomTestCase):
+    """Each overlap loop must form the next batch before processing the last
+    result, and release a result's held pages only once it is processed."""
+
+    def _run(self, loop, *, disable_overlap: bool):
+        """Run batches A, B, then none; processing A frees two pages that a
+        request still in B writes."""
+        log = []
+        allocator = TpuPagedTokenToKVPoolAllocator(
+            size=4 * PAGE,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        finished = allocator.alloc(2 * PAGE)
+        held_at_processing = []
+
+        def process_result(batch, result):
+            held_at_processing.append(allocator.held_pages.num_pages)
+            if batch is batch_a:
+                allocator.free(finished)
+
+        batch_a, batch_b = Mock(reqs=[]), Mock(reqs=[])
+        for batch in (batch_a, batch_b):
+            batch.copy.return_value = batch
+            batch.forward_mode.is_decode.return_value = True
+        plans = [
+            SimpleNamespace(running_batch=None, batch_to_run=b)
+            for b in (batch_a, batch_b, None)
+        ]
+        scheduler = Mock(
+            gracefully_exit=False,
+            _engine_paused=False,
+            enable_unified_memory=False,
+            is_generation=True,
+            running_batch=None,
+            last_batch=None,
+            kv_free_fence=_install(allocator, synchronize_device=lambda: None),
+            # Upstream's loop skips batch creation while input is deferred.
+            _deferred_input_requests=[],
+        )
+        # ... and waits for the oldest result when continuous polling is on.
+        scheduler._is_continuous_input_polling_enabled.return_value = False
+        scheduler.ngram_embedding_manager.prepare_for_forward.side_effect = (
+            lambda batch, **kwargs: batch
+        )
+        for name in (
+            "get_next_batch_to_run",
+            "get_next_disagg_prefill_batch_to_run",
+            "get_next_disagg_decode_batch_to_run",
+        ):
+            getattr(scheduler, name).side_effect = list(plans)
+        scheduler.is_disable_overlap_for_batch.side_effect = [
+            False,
+            disable_overlap,
+            False,
+        ]
+        scheduler.run_batch.side_effect = lambda batch: SimpleNamespace(
+            copy_done=_CopyDone(log)
+        )
+        scheduler.batch_result_processor.process_batch_result_decode.side_effect = (
+            process_result
+        )
+        scheduler.process_batch_result = functools.partial(
+            Scheduler.process_batch_result, scheduler
+        )
+        scheduler.launch_batch_sample_if_needed.side_effect = [None, None, _StopLoop]
+        with self.assertRaises(_StopLoop):
+            loop(scheduler)
+        self.assertEqual(held_at_processing, [0, 2])
+        self.assertEqual(allocator.held_pages.num_pages, 0)
+        self.assertEqual(log, ["copy_done", "copy_done"])
+
+    def test_pages_freed_by_a_result_wait_for_the_next_forward(self):
+        loops = [
+            (Scheduler.event_loop_overlap, False),
+            (Scheduler.event_loop_overlap, True),
+            (Scheduler.event_loop_overlap_disagg_prefill, False),
+            (Scheduler.event_loop_overlap_disagg_decode, False),
+            (Scheduler.event_loop_overlap_disagg_decode, True),
+        ]
+        for loop, disable_overlap in loops:
+            with self.subTest(loop=loop.__name__, disable_overlap=disable_overlap):
+                self._run(loop, disable_overlap=disable_overlap)
 
 
 class TestRadixEvictionUnderFence(CustomTestCase):
@@ -256,9 +450,7 @@ class TestRadixEvictionUnderFence(CustomTestCase):
             kvcache=kv_pool,
             need_sort=False,
         )
-        self.fence = install_kv_free_fence(
-            self.allocator, synchronize_device=lambda: None
-        )
+        self.fence = _install(self.allocator, synchronize_device=lambda: None)
         self.cache = UnifiedRadixCache(
             CacheInitParams(
                 disable=False,
@@ -272,6 +464,9 @@ class TestRadixEvictionUnderFence(CustomTestCase):
                 page_size=PAGE,
                 eviction_policy="lru",
                 tree_components=(ComponentType.FULL,),
+                # The fence's release stamps live in the Python core, which a TPU
+                # allocator always resolves to; this CPU one would pick Rust.
+                tree_core_backend="python",
             )
         )
 
@@ -302,6 +497,7 @@ class TestRadixEvictionUnderFence(CustomTestCase):
         )
         self._evict_all()
         self.assertEqual(self.allocator.held_pages.num_pages, 0)
+        self.assertEqual(self.fence.stats.pages_freed_past_write_horizon, 2)
 
     def test_node_inserted_or_unlocked_after_batch_formed_is_held(self):
         """A request in a running forward's batch can insert or unlock its
@@ -365,7 +561,7 @@ class TestRadixEvictionUnderFence(CustomTestCase):
             for call in _attribute_calls(func):
                 lines.setdefault(call.func.attr, []).append(call.lineno)
             release_lines = [n for name in releases for n in lines.get(name, ())]
-            stamp_lines = lines.get("_stamp_release", [])
+            stamp_lines = lines.get("_stamp_write_horizon", [])
             if release_lines and min(stamp_lines, default=float("inf")) > min(
                 release_lines
             ):
@@ -379,7 +575,7 @@ def _srt_functions() -> List[Tuple[Path, ast.FunctionDef | ast.AsyncFunctionDef]
     srt = Path(sglang.__file__).parent / "srt"
     functions = []
     for path in srt.rglob("*.py"):
-        # The Rust core reports no release time, so all its frees are held.
+        # The Rust core reports no write horizon, so all its frees are held.
         if "rust_tree_core" in path.parts:
             continue
         with warnings.catch_warnings():
@@ -411,7 +607,7 @@ class TestTpuImportOrder(CustomTestCase):
             sglang.srt.utils.is_tpu = lambda: True
             import sglang.srt.mem_cache.allocator.swa
             import sys
-            assert "sglang.srt.hardware_backend.tpu.kv_free_fence" in sys.modules
+            assert "sglang_tpu.kv_free_fence" in sys.modules
             """)
         completed = subprocess.run(
             [sys.executable, "-c", script],

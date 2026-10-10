@@ -8,11 +8,16 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_context, get_exec
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+from sglang_tpu.compilation.compiled_forward_shim import (
     _BS_FIELDS,
     _PINNED_LOGPROB_FIELDS,
     _TOKEN_FIELDS,
@@ -33,19 +38,14 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     needs_input_logprob,
     reconcile_tpu_batch_limits,
 )
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _DummyForwardBatchFields,
 )
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.runtime_context import get_context, get_exec
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
 # torch_tpu-free, so this runs on the CPU CI runner (no TPU required).
@@ -670,8 +670,7 @@ class TestCompiledForwardShim(CustomTestCase):
         shim.set_recompilation_checker(checker, model_label="M")
         fb = self._forward_batch(input_ids=torch.arange(8, dtype=torch.int32))
         with patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "compiled_forward_shim.torch.compiler.is_compiling",
+            "sglang_tpu.compilation.compiled_forward_shim.torch.compiler.is_compiling",
             return_value=True,
         ):
             shim(None, None, fb)
@@ -1380,10 +1379,12 @@ class TestShimInputLogprobPath(CustomTestCase):
 
     def _publish_topology(self, *, pp_size=1, dp_size=1, enable_dp_attention=False):
         """Publish the topology the prompt-logprob gate reads, for this test."""
+        # Attention DP is declared by width now; the flag alone no longer
+        # resolves to a width inside an override.
         override = get_context().override_server_args(
             pp_size=pp_size,
-            dp_size=dp_size,
-            enable_dp_attention=enable_dp_attention,
+            dp_size=1 if enable_dp_attention else dp_size,
+            attn_dp_size=dp_size if enable_dp_attention else 1,
         )
         override.install()
         self.addCleanup(override.restore)

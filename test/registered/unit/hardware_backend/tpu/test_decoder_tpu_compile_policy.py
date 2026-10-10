@@ -18,31 +18,6 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu import sampler as tpu_sampler_module
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    CompiledForwardShim,
-)
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-    Qwen3VLDecoderTpuCompilePolicy,
-    _materialize_out,
-    _unpad_decoder_outputs,
-)
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
-    DFlashSpecDecoderTpuCompilePolicy,
-    _kv_appender_specialization_key,
-)
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
-    Eagle3SpecDecodeCompilePolicyMixin,
-    SpecDecoderTpuCompilePolicy,
-)
-from sglang.srt.hardware_backend.tpu.sampler import select_logits_output_mode
-from sglang.srt.hardware_backend.tpu.top_k import (
-    PallasDistributedTopKConfig,
-    TpuVocabShard,
-)
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
@@ -65,6 +40,31 @@ from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import sampler as tpu_sampler_module
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.compiled_forward_shim import (
+    CompiledForwardShim,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+    Qwen3VLDecoderTpuCompilePolicy,
+    _materialize_out,
+    _unpad_decoder_outputs,
+)
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecoderTpuCompilePolicy,
+    _kv_appender_specialization_key,
+)
+from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    Eagle3SpecDecodeCompilePolicyMixin,
+    SpecDecoderTpuCompilePolicy,
+)
+from sglang_tpu.sampler import select_logits_output_mode
+from sglang_tpu.top_k import (
+    PallasDistributedTopKConfig,
+    TpuVocabShard,
+)
 
 
 class _FakeAttnBackend:
@@ -264,9 +264,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         model_runner = _model_runner()
         runner_kv_pool = model_runner.token_to_kv_pool
         policy = CustomPolicy(model_runner=model_runner, owner=model_runner.model)
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
@@ -287,15 +285,11 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             model_runner=model_runner, owner=model_runner.model
         )
         compiled = MagicMock()
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = MagicMock(return_value=compiled)
         rank_tensors = (torch.tensor(0), torch.tensor(1))
-        policy_module = (
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
-        )
+        policy_module = "sglang_tpu.compilation.decoder_compile_policy"
 
         with (
             patch.dict(sys.modules, {compile_module_name: compile_module}),
@@ -342,9 +336,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             owner=model,
             tracer="direct",
         )
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
@@ -429,16 +421,14 @@ class TestEagle3DirectCompile(_SpecPolicyTestCase):
             self.assertIs(backend.forward_metadata, captured["trace_metadata"])
             return (value + 1,)
 
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = fake_direct_compile
 
         with (
             patch.dict(sys.modules, {compile_module_name: compile_module}),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "spec_decode_compile_policy_eagle3.get_forward_context",
                 return_value=SimpleNamespace(attn_backend=backend),
             ),
@@ -660,18 +650,15 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "build_bucketers",
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
                 return_value=(t_bucketer, b_bucketer),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=dp_attention,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=MagicMock(),
             ),
             patch.object(policy, "_install_dp_idle_as_decode"),
@@ -725,13 +712,11 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=False,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=MagicMock(),
             ),
         ):
@@ -773,21 +758,18 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "build_bucketers",
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
                 return_value=(
                     Bucketer(name="Token", buckets=[64, 2048]),
                     Bucketer(name="Bs", buckets=[16, 32, 64]),
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=False,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=compiled_outer,
             ) as compile_mock,
         ):
@@ -835,21 +817,18 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "build_bucketers",
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
                 return_value=(
                     Bucketer(name="Token", buckets=[64, 2048]),
                     Bucketer(name="Bs", buckets=[16, 32, 64]),
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=False,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 side_effect=[compiled_backbone, compiled_logits],
             ) as compile_mock,
         ):
@@ -892,21 +871,18 @@ class TestInstallExtendCap(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "build_bucketers",
+                "sglang_tpu.compilation.decoder_compile_policy.build_bucketers",
                 return_value=(
                     Bucketer(name="Token", buckets=[64, 2048]),
                     Bucketer(name="Bs", buckets=[16, 32, 64]),
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=False,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "torch.compile",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.compile",
                 return_value=compiled_model,
             ) as compile_mock,
         ):
@@ -991,18 +967,18 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         # A wrapper whose image steps or logits run eager collectives hangs
         # under DP attention; fail at install as before.
         policy = self._policy_for(multimodal=True)
+        model_name = type(policy.model_runner.model).__name__
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=True,
             ),
             patch.object(
                 DecoderTpuCompilePolicy, "install", return_value=True
             ) as base_install,
         ):
-            with self.assertRaises(NotImplementedError):
+            with self.assertRaisesRegex(NotImplementedError, f"^{model_name}: "):
                 policy.install()
 
         base_install.assert_not_called()
@@ -1015,8 +991,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=True,
             ),
             patch.object(
@@ -1034,8 +1009,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "is_dp_attention_enabled",
+                "sglang_tpu.compilation.decoder_compile_policy.is_dp_attention_enabled",
                 return_value=True,
             ),
             patch.object(
@@ -1258,9 +1232,7 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
         dies under fail_on_recompile (two-host tp16/ep16 R1-0528 and V3.1).
         """
         policy = _make_policy()
-        policy_module = (
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
-        )
+        policy_module = "sglang_tpu.compilation.decoder_compile_policy"
 
         with (
             patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
@@ -1388,7 +1360,7 @@ class TestPrecompileLoops(_PolicyTestCase):
                 with (
                     patch.object(policy, "_run_one", side_effect=run_one),
                     patch(
-                        "sglang.srt.hardware_backend.tpu.compilation."
+                        "sglang_tpu.compilation."
                         "decoder_compile_policy.time.perf_counter",
                         side_effect=lambda: clock[0],
                     ),
@@ -1476,7 +1448,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy = _make_distributed_top_k_policy()
 
         with patch(
-            "sglang.srt.hardware_backend.tpu.sampler.distributed_top_k_min_batch_size",
+            "sglang_tpu.sampler.distributed_top_k_min_batch_size",
             return_value=64,
         ):
             self.assertEqual(
@@ -1666,9 +1638,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy._run_one = MagicMock()
 
         with (
-            patch(
-                "sglang.srt.hardware_backend.tpu.mm_embed_tpu.apply_host_mm_embeds"
-            ) as warmed,
+            patch("sglang_tpu.mm_embed_tpu.apply_host_mm_embeds") as warmed,
             get_parallel().override(
                 tp_size=2,
                 tp_rank=1,
@@ -1741,15 +1711,14 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
             patch.object(envs.SGLANG_DIRECT_COMPILE_ASYNC, "get", return_value=True),
             patch.object(policy, "_supports_async_warmup", return_value=True),
             patch(
-                "sglang.srt.hardware_backend.tpu.pp_profile.set_profile_inputs",
+                "sglang_tpu.pp_profile.set_profile_inputs",
                 side_effect=lambda policy, batch, args, kwargs, tokens, prefix: (
                     args,
                     kwargs,
                 ),
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
-                "decoder_compile_policy.time.perf_counter",
+                "sglang_tpu.compilation.decoder_compile_policy.time.perf_counter",
                 side_effect=[10.0, 10.25],
             ),
         ):
@@ -1790,12 +1759,11 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         cm = MagicMock()
         with (
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy.torch.no_grad",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.no_grad",
                 return_value=cm,
             ) as no_grad,
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
-                "decoder_compile_policy.torch.inference_mode",
+                "sglang_tpu.compilation.decoder_compile_policy.torch.inference_mode",
                 side_effect=AssertionError("inference_mode should not be used"),
             ),
         ):
@@ -1939,10 +1907,8 @@ def _make_spec_policy(
     return policy
 
 
-_SPEC_POLICY = (
-    "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3."
-)
-_DECODER_POLICY = "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+_SPEC_POLICY = "sglang_tpu.compilation.spec_decode_compile_policy_eagle3."
+_DECODER_POLICY = "sglang_tpu.compilation.decoder_compile_policy."
 
 
 @contextlib.contextmanager
@@ -2204,7 +2170,7 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
                 moe_tp_rank=1,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "spec_decode_compile_policy_eagle3.install_recompilation_checker",
                 side_effect=install,
             ),
@@ -2571,9 +2537,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         worker = SimpleNamespace(
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
         )
-        compile_module_name = (
-            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
-        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
         compile_module = ModuleType(compile_module_name)
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
@@ -2785,9 +2749,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy, _ = self._make_dflash_policy(
             hidden_size=32, draft_token_num=4, is_draft_worker=True
         )
-        policy_module = (
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
-        )
+        policy_module = "sglang_tpu.compilation.decoder_compile_policy"
         with (
             patch(f"{policy_module}.enable_num_token_non_padded", return_value=True),
             patch(
@@ -3693,7 +3655,7 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
                 moe_tp_rank=1,
             ),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "spec_decode_compile_policy_eagle3._materialize_out"
             ) as materialize,
         ):
@@ -3737,9 +3699,7 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             )
             return torch.zeros(forward_batch.batch_size)
 
-        policy_module = (
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
-        )
+        policy_module = "sglang_tpu.compilation.decoder_compile_policy"
         with (
             get_parallel().override(
                 tp_size=2,
@@ -3756,7 +3716,7 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             ),
             patch("sglang.srt.layers.cp.utils.is_mla_cp_enabled", return_value=False),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation."
+                "sglang_tpu.compilation."
                 "spec_decode_compile_policy_eagle3._materialize_out"
             ),
         ):

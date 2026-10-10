@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 try:
     import jax.numpy as jnp
 
-    from sglang.srt.layers.moe.pallas import gmm_v2
+    from sglang_tpu.moe.pallas import gmm_v2
 
     _HAS_GMM = True
 except Exception:  # pragma: no cover - depends on JAX/pallas availability

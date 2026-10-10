@@ -10,14 +10,6 @@ import torch
 from torch_tpu._internal import execution_mode
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu import mm_embed_tpu
-from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
-    Qwen3VLVisionTpuCompilePolicy,
-    VisionPaddingContext,
-    ViTTpuCompileRunner,
-    _Qwen3VLRunContext,
-)
-from sglang.srt.hardware_backend.tpu.patches import _register_aten_fallbacks
 from sglang.srt.managers import mm_schedule, mm_utils
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -26,6 +18,14 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang_tpu import mm_embed_tpu
+from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
+    Qwen3VLVisionTpuCompilePolicy,
+    VisionPaddingContext,
+    ViTTpuCompileRunner,
+    _Qwen3VLRunContext,
+)
+from sglang_tpu.patches import _register_aten_fallbacks
 
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit")
 

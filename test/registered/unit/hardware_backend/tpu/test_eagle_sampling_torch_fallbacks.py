@@ -9,11 +9,11 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
-    build_topk1_verify_chain_torch,
-)
 from sglang.srt.speculative.eagle_utils import (
     _tree_speculative_sampling_target_only_torch,
+)
+from sglang_tpu.eagle_utils_tpu import (
+    build_topk1_verify_chain_torch,
 )
 
 
@@ -467,7 +467,7 @@ class TestDraftExtendSelectFused(unittest.TestCase):
     """Fused draft-extend select must match the eager gather + argmax."""
 
     def test_matches_eager_select_and_argmax(self):
-        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        from sglang_tpu.eagle_utils_tpu import (
             fused_draft_extend_select_argmax_func,
         )
 
@@ -497,7 +497,7 @@ class TestDraftExtendSelectFused(unittest.TestCase):
                 self.assertEqual(tp.shape, want_ti.shape)
 
     def test_none_hidden_states_passes_through(self):
-        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        from sglang_tpu.eagle_utils_tpu import (
             fused_draft_extend_select_argmax_func,
         )
 
@@ -510,7 +510,7 @@ class TestDraftExtendSelectFused(unittest.TestCase):
         self.assertTrue(torch.equal(sel_l, logits[torch.tensor([0, 7])]))
 
     def test_zero_count_padding_selects_a_safe_row(self):
-        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        from sglang_tpu.eagle_utils_tpu import (
             last_accepted_row_indices,
         )
 

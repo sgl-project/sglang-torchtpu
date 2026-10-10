@@ -7,7 +7,7 @@ the fully-qualified platform class name when TPU hardware is available.
 
 import importlib.util
 
-from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang_tpu._logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -32,4 +32,4 @@ def activate():
         return None
 
     logger.info("TPU plugin detected (torch_tpu installable).")
-    return "sglang.srt.hardware_backend.tpu.tpu_platform:TpuSRTPlatform"
+    return "sglang_tpu.tpu_platform:TpuSRTPlatform"

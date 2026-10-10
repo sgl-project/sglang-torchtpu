@@ -12,7 +12,7 @@ import torch
 
 import sglang.srt.speculative.eagle_utils as eagle_utils
 import sglang.srt.speculative.spec_utils as kernels
-from sglang.srt.hardware_backend.tpu import eagle_utils_tpu
+from sglang_tpu import eagle_utils_tpu
 
 
 class _ForceTpu:
@@ -660,7 +660,7 @@ def test_device_accept_state_tracks_filtered_and_merged_future_rows():
     [((5,), (1,)), ((2, 5), (1,)), ((1, 5), (2,)), ((1, 4), (1,))],
 )
 def test_device_accept_rejects_invalid_future_window(candidate_shape, accept_shape):
-    from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+    from sglang_tpu.overlap_utils_tpu import (
         resolve_spec_extras_tpu,
     )
 
@@ -750,8 +750,8 @@ def test_device_accept_cache_window_follows_verify_input(is_tpu):
 
 @pytest.mark.parametrize("with_hidden", (False, True))
 def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
-    from sglang.srt.hardware_backend.tpu import overlap_utils_tpu
     from sglang.srt.managers import overlap_utils
+    from sglang_tpu import overlap_utils_tpu
 
     bs = 3
     indices = torch.arange(1, bs + 1, dtype=torch.int64)
@@ -841,7 +841,7 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
 
 
 def test_draft_extend_positions_follow_device_seq_lens():
-    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+    from sglang_tpu.eagle_utils_tpu import (
         draft_extend_positions_tpu,
     )
 

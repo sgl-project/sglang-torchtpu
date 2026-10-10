@@ -58,7 +58,8 @@ class TestTpuQwen306bSinglehostPromptLogprob(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_PLATFORM"] = "tpu"
+        # setdefault: mode B runs these suites with SGLANG_PLATFORM=tpu_oot.
+        os.environ.setdefault("SGLANG_PLATFORM", "tpu")
         # Prompt logprobs are opt-in: serving them warms the extend graph with
         # FULL capture, which costs every prefill, so the default build rejects
         # the request. override() mutates the real environment, so the server

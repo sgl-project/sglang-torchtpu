@@ -6,17 +6,17 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu import pp_attention_capacity as capacity
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import pp_attention_capacity as capacity
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestResolvedPipelineGuard(CustomTestCase):
     def test_resolved_pipeline_enables_capacity_guard(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+        from sglang_tpu.attention_pallas_rpa_batched import (
             BaseTpuPallasRpaAttnBackend,
             TpuPallasRpaBatchedAttnBackend,
         )

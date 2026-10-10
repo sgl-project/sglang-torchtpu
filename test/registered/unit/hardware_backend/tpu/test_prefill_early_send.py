@@ -27,7 +27,10 @@ from sglang.srt.disaggregation import prefill
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.prefill_early_send import (
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.prefill_early_send import (
     _collect_prefill_write_page_ids,
     _find_safe_prefix_send_end,
     tpu_clip_cached_prefix_send_end,
@@ -35,9 +38,6 @@ from sglang.srt.hardware_backend.tpu.prefill_early_send import (
     tpu_hicache_load_page_ids,
     tpu_update_inflight_kv_write_pages,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -124,6 +124,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.gracefully_exit = False
         self.kv_checksum_computer = None
         self.kv_free_fence = None
+        self._deferred_input_requests = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=PAGE_SIZE, translate_kv_indices_for_transfer=lambda kv: kv
         )

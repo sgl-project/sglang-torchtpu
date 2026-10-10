@@ -35,20 +35,20 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
-    _resolve_decode_query_size,
-)
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
-    PallasForwardMetadata,
-    TpuPallasRpaV3AttnBackend,
-    _invoke_v3_kernel,
-)
-from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_rpa_base import (
+    _resolve_decode_query_size,
+)
+from sglang_tpu.attention_pallas_rpa_v3 import (
+    PallasForwardMetadata,
+    TpuPallasRpaV3AttnBackend,
+    _invoke_v3_kernel,
+)
+from sglang_tpu.host_metadata_cache import HostMetadataCache
 
 
 class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
@@ -884,7 +884,7 @@ class TestFixedWidthAsDecode(CustomTestCase):
     def test_resolved_width_is_the_speculative_draft_token_count(self):
         spec = types.SimpleNamespace(speculative_num_draft_tokens=self.WIDTH)
         with patch(
-            "sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base.get_spec",
+            "sglang_tpu.attention_pallas_rpa_base.get_spec",
             return_value=spec,
         ):
             target = dict(supports_decode_query_size=True, spec_enabled=True)

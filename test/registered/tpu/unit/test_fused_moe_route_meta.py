@@ -56,7 +56,7 @@ def _moe(
     activation="silu",
     num_global=GLOBAL,
 ):
-    from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+    from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
     kwargs = {}
     if rank is not None:
@@ -115,7 +115,7 @@ class TestSingleTokenRouteMetaMxfp4Situ(CustomTestCase):
     ACT = "situ:4.0:25.0"
 
     def _compare(self, *, rank, num_global, seed):
-        from sglang.srt.layers.moe.pallas import route_meta
+        from sglang_tpu.moe.pallas import route_meta
 
         w1, w2, w1_s, w2_s = _mxfp4_weights(num_global, self.HIDDEN, self.INTER, 0)
         rng = np.random.default_rng(seed)
@@ -164,7 +164,7 @@ class TestSingleTokenRouteMetaMxfp4Situ(CustomTestCase):
 @unittest.skipUnless(_HAS_TPU, _SKIP)
 class TestSingleTokenRouteMeta(CustomTestCase):
     def test_kernel_matches_stable_sort(self):
-        from sglang.srt.layers.moe.pallas.route_meta import single_token_route_meta
+        from sglang_tpu.moe.pallas.route_meta import single_token_route_meta
 
         rng = np.random.default_rng(0)
         n = TOPK
@@ -198,7 +198,7 @@ class TestSingleTokenRouteMeta(CustomTestCase):
                 np.testing.assert_array_equal(np.asarray(gs), ref_gs)
 
     def _check(self, m, *, rank, expect_route_meta):
-        from sglang.srt.layers.moe.pallas import route_meta
+        from sglang_tpu.moe.pallas import route_meta
 
         inputs = _inputs(m, seed=m - 1)
         with mock.patch.object(
@@ -236,7 +236,7 @@ class TestSingleTokenRouteMeta(CustomTestCase):
         self._check(8, rank=1, expect_route_meta=False)
 
     def test_bs1_no_combine_keeps_existing_path(self):
-        from sglang.srt.layers.moe.pallas import route_meta
+        from sglang_tpu.moe.pallas import route_meta
 
         inputs = _inputs(1, seed=3)
         with mock.patch.object(
@@ -323,9 +323,9 @@ class TestSingleTokenRouteMetaWeightKinds(CustomTestCase):
     def _run(self, kw, x, w, ids, *, rank, threshold, poison, expect_route_meta=None):
         import importlib
 
-        from sglang.srt.layers.moe.pallas import fused_moe_op, route_meta
+        from sglang_tpu.moe.pallas import fused_moe_op, route_meta
 
-        gmm_mod = importlib.import_module("sglang.srt.layers.moe.pallas.gmm_v2")
+        gmm_mod = importlib.import_module("sglang_tpu.moe.pallas.gmm_v2")
         names = ("w1", "w2", "w1_scale", "w2_scale", "w1_bias", "w2_bias")
         weights = {name: kw.get(name) for name in names}
         static = dict(w_quant_bits=kw.get("w_quant_bits", 0))

@@ -69,6 +69,7 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow
+          uv pip install --no-deps -e .
           uv pip install pytest
           uv pip install -e "tools/sglang-simulator[aic]"
 

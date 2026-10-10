@@ -14,9 +14,9 @@ from dataclasses import asdict, replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.hardware_backend.tpu import node_normalization as normalization
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_scope
+from sglang_tpu import node_normalization as normalization
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -260,7 +260,9 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
         from sglang.srt.arg_groups.overrides import resolving_view
         from sglang.srt.server_args import PortArgs
 
-        self.server_args.enable_dp_attention = True
+        # Attention DP is declared by width now; the deprecated flag alone
+        # resolves to attn_dp_size == dp_size == 1, i.e. no DP attention.
+        self.server_args.attn_dp_size = 2
         normalization.prepare_tpu_environment(self.server_args)
         cfg = resolving_view(self.server_args)
         self.assertEqual(cfg.node_rank, 1)

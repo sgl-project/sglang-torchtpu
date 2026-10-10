@@ -1,6 +1,6 @@
 """Correctness tests for the vendored Pallas fused Conv1D + GDN kernel.
 
-The kernel lives in ``sglang.srt.layers.attention.pallas.gdn`` (public entry
+The kernel lives in ``sglang_tpu.attention.pallas.gdn`` (public entry
 ``fused_conv1d_gdn``). These tests build small ragged batches and compare the
 kernel output and updated conv/recurrent state against an in-file pure-JAX
 eager reference that runs the gated-delta-rule sequence-by-sequence.
@@ -356,7 +356,7 @@ class TestGDNAttentionV3(CustomTestCase):
     ]
 
     def _kernel(self):
-        from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
+        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
 
         return jax.jit(
             fused_conv1d_gdn,
@@ -591,7 +591,7 @@ class TestGDNAttentionV3(CustomTestCase):
         state checkpoint per window position lands at `base + t`, matching a
         token-by-token eager reference. Prefill sequences in the same batch
         keep the original PER_SEQ behavior (read/write the base slot)."""
-        from sglang.srt.layers.attention.pallas.gdn import wrapper
+        from sglang_tpu.attention.pallas.gdn import wrapper
 
         kq_head_dim = 128
         v_head_dim = 128
