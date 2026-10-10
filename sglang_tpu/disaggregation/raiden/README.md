@@ -14,6 +14,10 @@ staging, D2H/H2D DMA, and completion tracking.
 Per request (keyed by `bootstrap_room`): prefill `register_read`s its page
 block-ids; decode pushes a pull request with its rank endpoint; prefill replies
 with its block-ids + raiden endpoint + aux blob; decode issues `start_read`.
+The decode sends the pull request only after it reserved the request's KV
+pages, and the prefill holds the request in its bootstrap queue until that
+request (or a reshard or pipeline request) arrives, so prefill KV is never
+computed for a decode that has no pages for it.
 Both sides drain `poll_stats_with_details()` in `poll()` — prefill frees on
 `sent`, decode runs on `received`. Each settled transfer carries raiden's finish
 time; on TPU the prefill's `prefill_transfer_kv_cache` stage ends there, not at

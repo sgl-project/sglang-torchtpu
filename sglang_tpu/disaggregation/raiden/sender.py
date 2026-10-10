@@ -301,6 +301,33 @@ class RaidenSenderMixin:
             or (self._pipeline is not None and room in self._pipeline.replies)
         )
 
+    def _decode_requested_locked(self, room: int) -> bool:
+        """Whether the decode has sent its first request for the room: a pull
+        request, a reshard request, or a pipeline request. Unlike
+        ``_decode_asked_locked`` this counts a reshard request, which arrives
+        before the prefill has anything to announce."""
+        return (
+            room in self._prefill.decode_addr
+            or room in self._prefill.reshard_req
+            or (self._pipeline is not None and room in self._pipeline.replies)
+        )
+
+    def finish_bootstrap_if_decode_requested(self, room: int) -> bool:
+        """Moves ``room`` from Bootstrapping to WaitingForInput once the decode
+        has requested its KV, and reports whether it has.
+
+        The decode sends that request only after reserving the request's KV
+        pages, so a prefill admitted on it never parks KV the decode cannot
+        take. The check and the update are one step under the lock, so a
+        concurrent abort is never overwritten.
+        """
+        with self._state_lock:
+            if room in self._aborted or not self._decode_requested_locked(room):
+                return False
+            if self.request_status.get(room) == KVPoll.Bootstrapping:
+                self.update_status(room, KVPoll.WaitingForInput)
+            return True
+
     def awaiting_decode_since(self, room: int, since: float) -> Optional[float]:
         """When the prefill started waiting on the decode for ``room``.
 
@@ -1026,17 +1053,10 @@ class RaidenKVSender(CommonKVSender):
         self._transfer_start_time: Optional[float] = None
         # Raiden's finish time for this room (perf_counter seconds), set on Success.
         self.transfer_finish_time: Optional[float] = None
+        # The decode's first request for the room (see poll) ends Bootstrapping.
+        # It is sent only after the decode reserved the request's KV pages, so
+        # the prefill never computes KV that no decode can take yet.
         self.init_time = time.time()
-        # Raiden is consumer-pull: the prefill need not wait for any decode
-        # handshake before computing (decode pulls once prefill registers its
-        # blocks). Advance straight to WaitingForInput so the bootstrap queue
-        # releases this request into prefill. Don't override a Failed/dummy state
-        # already set by CommonKVSender.__init__.
-        if (
-            not self.kv_mgr.is_dummy_cp_rank
-            and self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Bootstrapping
-        ):
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         super().init(num_kv_indices, aux_index)
@@ -1115,11 +1135,14 @@ class RaidenKVSender(CommonKVSender):
             self._finalize_transfer_latency()
             self.conclude_state = status
             return status
-        # Raiden is consumer-pull: the prefill computes without waiting for
-        # the decode, so the handshake window is bounded here rather than by
-        # the Bootstrapping status. It closes when the decode asks to pull, or
-        # clears a resharded room to push; a decode that dies before then
-        # would otherwise leave the room (and its KV) waiting forever.
+        if (
+            status == KVPoll.Bootstrapping
+            and self.kv_mgr.finish_bootstrap_if_decode_requested(self.bootstrap_room)
+        ):
+            status = KVPoll.WaitingForInput
+        # The decode owes the room a message until it asks to pull, or clears
+        # a resharded room to push. A decode that dies before then would
+        # otherwise leave the room (and its KV) waiting forever.
         if self.kv_mgr.fail_decode_silence(
             self.bootstrap_room, self.init_time, self.kv_mgr.bootstrap_timeout
         ):
