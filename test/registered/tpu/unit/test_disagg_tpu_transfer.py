@@ -44,8 +44,14 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.tpu import transfer as T
-from sglang.srt.disaggregation.tpu.conn import (
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Range
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.tpu import transfer as T
+from sglang_tpu.disaggregation.tpu.conn import (
     MessageTag,
     PendingChunk,
     PinnedHostPool,
@@ -54,16 +60,10 @@ from sglang.srt.disaggregation.tpu.conn import (
     _KvStats,
     _tcp_endpoint,
 )
-from sglang.srt.disaggregation.tpu.serde import (
+from sglang_tpu.disaggregation.tpu.serde import (
     KVDataChannelHeader,
     Transfer,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Range
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
 
 # Enable Perfetto tracing for tests to exercise tracing code paths
 envs.SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING.set(True)
@@ -1247,7 +1247,7 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
 @_TPU_CONNECTOR_RETIRED
 class TestPinnedHostPool(CustomTestCase):
     def test_acquire_release_reuse_and_budget(self):
-        from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
+        from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool
 
         # Budget holds exactly two 128-byte buffers.
         pool = PinnedHostPool(max_bytes=256)
@@ -1271,7 +1271,7 @@ class TestPinnedHostPool(CustomTestCase):
         self.assertLessEqual(len(pool._free[128]), 2)
 
     def test_munlock_on_evict_and_clear(self):
-        from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
+        from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool
 
         pool = PinnedHostPool(max_bytes=128)  # room for one 128B buffer
         a = pool.acquire(128)
@@ -1284,7 +1284,7 @@ class TestPinnedHostPool(CustomTestCase):
         self.assertEqual(pool._pooled_bytes, 0)
 
     def test_copy_bytes_and_view(self):
-        from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
+        from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool
 
         pool = PinnedHostPool()
         t = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
@@ -1303,7 +1303,7 @@ class TestPinnedHostPool(CustomTestCase):
 @_TPU_CONNECTOR_RETIRED
 class TestTpuTransferOnDevice(CustomTestCase):
     def test_device_gather_scatter_roundtrip(self):
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         kwargs = dict(
             size=64,
@@ -1339,8 +1339,8 @@ class TestTpuTransferOnDevice(CustomTestCase):
     def test_stage_path_roundtrip(self):
         """Zero-copy pinned-staging path (#1/#4): gather_pages_to_stage ->
         memoryview bytes (the wire) -> scatter_stage_from_host, byte-exact."""
-        from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         kwargs = dict(
             size=64,
@@ -1383,8 +1383,8 @@ class TestTpuTransferOnDevice(CustomTestCase):
         straight into pooled StageBufs, and ``scatter_stage_from_host`` consumes
         those StageBufs directly (no second copy), then releases them to the
         pool. Byte-exact, and the buffers return to the pool for reuse."""
-        from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool, StageBuf
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool, StageBuf
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         kwargs = dict(
             size=64,
@@ -1460,8 +1460,8 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
     )
 
     def _make_device_pair(self, async_d2h, n_channels):
-        from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
-        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.disaggregation.tpu.host_staging import PinnedHostPool
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
         src = TpuFusedMHATokenToKVPool(**self.POOL_KWARGS)
         dst = TpuFusedMHATokenToKVPool(**self.POOL_KWARGS)
@@ -1594,7 +1594,7 @@ class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
 
 class TestTpuPagedTokenToKVPoolAllocatorCpuAssertion(CustomTestCase):
     def test_free_cpu_tensor_succeeds(self):
-        from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+        from sglang_tpu.allocator_tpu import (
             TpuPagedTokenToKVPoolAllocator,
         )
 
@@ -1618,7 +1618,7 @@ class TestTpuPagedTokenToKVPoolAllocatorCpuAssertion(CustomTestCase):
         allocator.free_group_end()
 
     def test_free_non_cpu_tensor_converts_to_cpu(self):
-        from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+        from sglang_tpu.allocator_tpu import (
             TpuPagedTokenToKVPoolAllocator,
         )
 

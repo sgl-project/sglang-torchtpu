@@ -1,6 +1,6 @@
 """Correctness tests for the KDA mode of the fused Conv1D + GDN kernel.
 
-The kernel lives in ``sglang.srt.layers.attention.pallas.gdn`` (public entry
+The kernel lives in ``sglang_tpu.attention.pallas.gdn`` (public entry
 ``fused_conv1d_gdn`` with ``attention_mode=AttentionMode.KDA``). The KDA gate is
 per-channel, ``kq_head_dim`` times wider than GDN's per-head scalar, so it takes
 its own BlockSpec, VMEM load and gate activation.
@@ -330,7 +330,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
     KERNEL_SIZE = 4
 
     def _kernel(self):
-        from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
+        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
 
         return fused_conv1d_gdn
 
@@ -394,7 +394,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
         )
 
     def test_kda_matches_the_recurrence(self):
-        from sglang.srt.layers.attention.pallas.gdn import config
+        from sglang_tpu.attention.pallas.gdn import config
 
         kernel = self._kernel()
         for name, query_lens, context_lens, distribution, extra in _SHAPES:
@@ -441,7 +441,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
     def test_speculative_window_checkpoints(self):
         """8-token verify windows: reads resume at ``base + read_offset``, each
         real token checkpoints to ``base + t``, unused window slots stay intact."""
-        from sglang.srt.layers.attention.pallas.gdn import config
+        from sglang_tpu.attention.pallas.gdn import config
 
         num_spec_tokens = 7
         window = num_spec_tokens + 1
@@ -543,7 +543,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
 
     def test_rejects_invalid_gate_bound(self):
         """The entry point's gate guards, which all fail silently if dropped."""
-        from sglang.srt.layers.attention.pallas.gdn import config
+        from sglang_tpu.attention.pallas.gdn import config
 
         n_kq = n_v = 4
         d_k, d_v, kernel_size = self.D_K, self.D_V, self.KERNEL_SIZE

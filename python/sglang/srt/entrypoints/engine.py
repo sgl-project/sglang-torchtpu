@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import types
+from contextlib import ExitStack, contextmanager
 from typing import (
     Any,
     AsyncIterator,
@@ -394,15 +395,15 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = get_parallel().dp_size
-            if dp_size <= 1 and routed_dp_rank == 0:
+            num_dp_ranks = get_parallel().num_dp_ranks
+            if num_dp_ranks <= 1 and routed_dp_rank == 0:
                 logger.debug(
-                    f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
+                    f"routed_dp_rank={routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
                 )
                 return None
-            if routed_dp_rank < 0 or routed_dp_rank >= dp_size:
+            if routed_dp_rank < 0 or routed_dp_rank >= num_dp_ranks:
                 raise ValueError(
-                    f"routed_dp_rank={routed_dp_rank} out of range [0, {dp_size})"
+                    f"routed_dp_rank={routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
 
         logger.debug(f"routed_dp_rank: {routed_dp_rank}")
@@ -886,7 +887,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
         )
 
         if not use_dp_controller:
@@ -1107,7 +1108,7 @@ class Engine(EngineScoreMixin, EngineBase):
             resolve_auto_parsers(server_args)
 
         if resolving_view(server_args).device == "tpu":
-            from sglang.srt.hardware_backend.tpu.node_normalization import (
+            from sglang_tpu.node_normalization import (
                 prepare_tpu_environment,
             )
 
@@ -1205,18 +1206,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
                 signal.signal(signal.SIGTERM, sigterm_handler)
 
-            # A node-local Rust listener owns the health endpoints when present.
-            rust_server_owns_base_port = (
-                envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
-            )
-            if not rust_server_owns_base_port:
-                launch_dummy_health_check_server(
-                    get_serving().host,
-                    get_serving().port,
-                    get_observability().enable_metrics,
-                )
-
-            scheduler_init_result.block_until_scheduler_exits()
+            with cls._worker_serving_listener(server_args):
+                scheduler_init_result.block_until_scheduler_exits()
             return (
                 None,
                 None,
@@ -1304,6 +1295,35 @@ class Engine(EngineScoreMixin, EngineBase):
             subprocess_watchdog,
             weight_cache_daemon_procs,
         )
+
+    @classmethod
+    @contextmanager
+    def _worker_serving_listener(cls, server_args):
+        """Keep the worker's serving endpoint available while schedulers run.
+
+        If TPU normalization displaces input rank zero, forward its HTTP and
+        applicable PD bootstrap ports to normalized rank zero instead of binding
+        a dummy health listener. The forwarder closes its listeners and active
+        connections when this context exits. Existing Rust listeners retain
+        ownership; other workers use the dummy health server.
+        """
+        with ExitStack() as stack:
+            owns_base_port = envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
+            if not owns_base_port and get_device().device == "tpu":
+                from sglang_tpu.leader_forwarding import (
+                    forward_normalized_leader,
+                )
+
+                owns_base_port = stack.enter_context(
+                    forward_normalized_leader(server_args)
+                )
+            if not owns_base_port:
+                launch_dummy_health_check_server(
+                    get_serving().host,
+                    get_serving().port,
+                    get_observability().enable_metrics,
+                )
+            yield
 
     @staticmethod
     def _init_tokenizer_worker(
@@ -1863,7 +1883,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.18",
+                "0.7.0.post1",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1871,7 +1891,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.7",
+                "0.4.9",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 

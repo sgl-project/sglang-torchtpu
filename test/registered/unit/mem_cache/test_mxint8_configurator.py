@@ -52,6 +52,8 @@ def _load_configurator(**dependencies):
         "get_schedule": get_schedule,
         "get_exec": get_exec,
         "get_spec": get_spec,
+        # The QSA pool build reads the indexer dtype off the model namespace.
+        "get_model": lambda: SimpleNamespace(qsa_indexer_dtype="auto"),
         "mambaish_config": lambda _: None,
         "hybrid_gdn_config": lambda _: None,
         "hybrid_kda_config": lambda _: None,

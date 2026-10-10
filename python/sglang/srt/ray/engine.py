@@ -88,7 +88,7 @@ def _actor_options(server_args: ServerArgs) -> dict:
     options = {"num_cpus": 0}
     options.update(_accelerator_actor_options())
     if get_device().device == "tpu":
-        from sglang.srt.hardware_backend.tpu.ray_utils import tpu_actor_runtime_env
+        from sglang_tpu.ray_utils import tpu_actor_runtime_env
 
         options.update(tpu_actor_runtime_env(server_args))
     return options
@@ -166,7 +166,6 @@ def _compute_world_size() -> int:
     will hold the process groups, so there is nothing live to ask.
     """
     return compute_world_size(
-        enable_dp_attention=get_parallel().enable_dp_attention,
         dp_size=get_parallel().dp_size,
         tp_size=get_parallel().tp_size,
         pp_size=get_parallel().pp_size,
@@ -336,7 +335,7 @@ class RayEngine(Engine):
         if get_device().use_ray and get_device().device == "tpu":
             # Lazy TPU import: keeps the GPU Ray path from importing the TPU
             # package (see _actor_options).
-            from sglang.srt.hardware_backend.tpu.ray_utils import (
+            from sglang_tpu.ray_utils import (
                 _forwarded_driver_env,
                 detect_tpu_nnodes,
                 discover_tpu_worker_hostnames,
@@ -398,7 +397,7 @@ class RayEngine(Engine):
             # (host:base_port+i), so the driver only stashes the physically-
             # ordered host list and each actor rebuilds them itself.
             if nnodes <= 1:
-                from sglang.srt.hardware_backend.tpu.patches import (
+                from sglang_tpu.patches import (
                     compute_single_host_tpu_env,
                 )
 
@@ -433,10 +432,10 @@ class RayEngine(Engine):
         pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             parallel = get_parallel()
-            if parallel.enable_dp_attention:
+            if parallel.attn_dp_enabled:
                 total_gpus = parallel.tp_size * parallel.pp_size
             else:
-                total_gpus = parallel.dp_size * parallel.tp_size * parallel.pp_size
+                total_gpus = parallel.num_dp_ranks * parallel.tp_size * parallel.pp_size
 
             gpus_per_node = total_gpus // nnodes
             strategy = "STRICT_PACK" if nnodes == 1 else "SPREAD"
@@ -466,7 +465,7 @@ class RayEngine(Engine):
             # worker id and order bundle_for_node by it. Also verifies rank0
             # (worker 0) is co-located with the Engine; anything inconsistent
             # raises here instead of hanging later at PJRT bind / rendezvous.
-            from sglang.srt.hardware_backend.tpu.ray_utils import (
+            from sglang_tpu.ray_utils import (
                 order_tpu_bundles_by_worker_id,
             )
 
@@ -481,7 +480,7 @@ class RayEngine(Engine):
             ]
             rank0_node_ip = engine_ip
 
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             # Launch tensor parallel scheduler actors
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
@@ -617,18 +616,18 @@ class RayEngine(Engine):
         )
 
         parallel = get_parallel()
-        if parallel.enable_dp_attention:
+        if parallel.attn_dp_enabled:
             # DP attention folds DP into TP — total GPUs = tp_size * pp_size
             total_gpus = parallel.tp_size * parallel.pp_size
         else:
-            total_gpus = parallel.dp_size * parallel.tp_size * parallel.pp_size
+            total_gpus = parallel.num_dp_ranks * parallel.tp_size * parallel.pp_size
         gpus_per_node = total_gpus // nnodes
         logger.info(
             f"Ray DP cluster: {nnodes} nodes, "
             f"{gpus_per_node} {_accelerator_resource_name()}/node, "
             f"dp_size={parallel.dp_size}, "
-            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
-            f"enable_dp_attention={parallel.enable_dp_attention}"
+            f"attn_dp_size={parallel.attn_dp_size}, "
+            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}"
         )
 
         # Declared on the record itself so `PortArgs.init_new()` can compute

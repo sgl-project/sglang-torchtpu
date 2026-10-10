@@ -12,12 +12,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.hardware_backend.tpu import patches
-from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
+from sglang_tpu import patches
+from sglang_tpu.overlap_utils_tpu import (
     flush_direct_handoff_tpu,
     resolve_direct_handoff_tpu,
 )
-from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

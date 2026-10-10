@@ -14,9 +14,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 
 class TestRetractionBackupEligibility(CustomTestCase):

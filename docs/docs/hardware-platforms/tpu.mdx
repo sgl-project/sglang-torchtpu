@@ -476,6 +476,8 @@ See the [Benchmark and Profiling Guide](https://github.com/sgl-project/sglang-ja
 - Gradually increase until you find the optimal balance
 - Increase `--page-size` for better memory locality (1 → 16 → 64 → 128)
 
+**Host memory at weight load (MoE models under EP):** with `--weight-loader-disable-mmap`, models that support it (Kimi-K3) read only their EP rank's routed experts from an indexed safetensors checkpoint instead of every shard. `SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS=1` turns this off; the server logs why it reads whole shards when it does.
+
 ### Throughput Optimization
 
 To maximize tokens per second:

@@ -8,7 +8,7 @@ Run: python -m pytest test/manual/kv_transfer/test_raiden_staging_admission.py
 
 import unittest
 
-from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 
 
 class TestStagingAdmission(unittest.TestCase):

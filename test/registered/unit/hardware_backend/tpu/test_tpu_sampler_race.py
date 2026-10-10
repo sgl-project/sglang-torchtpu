@@ -4,9 +4,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.sampler import sample_exponential_race
 from sglang.srt.layers.sampler import sampling_from_probs_torch
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang_tpu.sampler import sample_exponential_race
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
 

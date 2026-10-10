@@ -11,18 +11,18 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_mla import (
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+from sglang_tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
-from sglang.srt.hardware_backend.tpu.kv_pool import (
+from sglang_tpu.kv_pool import (
     TpuFusedMLATokenToKVPool,
     _zeros_kv_buffer,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

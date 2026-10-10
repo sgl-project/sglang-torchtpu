@@ -36,7 +36,8 @@ RUN cd /workspace/sglang/python && \
     sed -i 's/"torch-tpu==[^"]*"/"torch-tpu"/' pyproject_tpu.toml && \
     sed -i '/\[tool.uv\]/,$d' pyproject_tpu.toml && \
     cp pyproject_tpu.toml pyproject.toml && \
-    uv pip install --system .[all_tpu,ray,runai]
+    uv pip install --system .[all_tpu,ray,runai] && \
+    cd /workspace/sglang && uv pip install --system --no-deps .
 
 # Default command
 CMD ["/bin/bash"]

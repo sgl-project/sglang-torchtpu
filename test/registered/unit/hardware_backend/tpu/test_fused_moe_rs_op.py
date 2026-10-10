@@ -8,9 +8,9 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.layers.moe.pallas import fused_moe_rs_op
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.moe.pallas import fused_moe_rs_op
 
 register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 

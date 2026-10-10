@@ -6,9 +6,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
-from sglang.srt.disaggregation.tpu.conn import TpuKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.tpu.conn import TpuKVSender
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -41,7 +41,7 @@ def _make_sender(statuses):
 
 class TestTpuTransferMetrics(CustomTestCase):
     @patch(
-        "sglang.srt.disaggregation.tpu.base.time.perf_counter",
+        "sglang_tpu.disaggregation.tpu.base.time.perf_counter",
         side_effect=[10.0, 14.0],
     )
     def test_chunked_transfer_uses_full_wall_span(self, _perf_counter):
@@ -64,7 +64,7 @@ class TestTpuTransferMetrics(CustomTestCase):
         self.assertEqual(metric.transfer_latency_s, 4.0)
         self.assertEqual(_perf_counter.call_count, 2)
 
-    @patch("sglang.srt.disaggregation.tpu.base.time.perf_counter", return_value=10.0)
+    @patch("sglang_tpu.disaggregation.tpu.base.time.perf_counter", return_value=10.0)
     def test_failed_transfer_does_not_report_latency(self, _perf_counter):
         sender = _make_sender([KVPoll.Failed])
 
@@ -74,7 +74,7 @@ class TestTpuTransferMetrics(CustomTestCase):
         self.assertIsNone(sender.get_transfer_metric().transfer_latency_s)
 
     @patch(
-        "sglang.srt.disaggregation.tpu.base.time.perf_counter",
+        "sglang_tpu.disaggregation.tpu.base.time.perf_counter",
         side_effect=[10.0, 12.0],
     )
     def test_state_only_send_starts_timer(self, _perf_counter):

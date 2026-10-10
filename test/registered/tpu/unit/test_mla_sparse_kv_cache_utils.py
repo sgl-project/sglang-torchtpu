@@ -39,8 +39,8 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
-from sglang.srt.layers.attention.pallas.mla_sparse import kernel as sparse_mla_kernel
-from sglang.srt.layers.attention.pallas.mla_sparse.kv_cache_utils import (
+from sglang_tpu.attention.pallas.mla_sparse import kernel as sparse_mla_kernel
+from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
     SKIP_ROW,
     WORD_BYTES,
     KVCacheLayout,

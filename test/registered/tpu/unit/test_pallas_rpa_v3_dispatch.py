@@ -3,9 +3,9 @@
 Two TPU attention backends share the ``pallas_tpu_*`` namespace:
 
 * ``pallas_tpu_rpa_v3`` (default) — wraps the vendored
-  :mod:`sglang.srt.layers.attention.pallas.ragged_paged_attention_v3` kernel
+  :mod:`sglang_tpu.attention.pallas.ragged_paged_attention_v3` kernel
   and needs the fused 5D KV layout from
-  :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`.
+  :class:`sglang_tpu.kv_pool.TpuFusedMHATokenToKVPool`.
 * ``pallas_tpu_flash`` — wraps ``flash_attention`` for prefill/extend and
   ``jax.experimental.pallas.ops.tpu.paged_attention`` for decode. Reads
   separate K/V from the standard :class:`MHATokenToKVPool`.
@@ -55,15 +55,15 @@ class TestPallasBackendRegistration(CustomTestCase):
 
 class TestMHAKVPoolSelection(CustomTestCase):
     def _pool_cls_for(self, attention_backend):
-        from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
         from sglang.srt.runtime_context import get_context
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         # get_mha_kv_pool_cls reads the exec bag; publish the backend.
         with get_context().override_server_args(attention_backend=attention_backend):
             return TpuSRTPlatform().get_mha_kv_pool_cls()
 
     def test_fused_pool_for_rpa_backends(self):
-        from sglang.srt.hardware_backend.tpu.kv_pool import (
+        from sglang_tpu.kv_pool import (
             TpuFusedMHATokenToKVPool,
         )
 

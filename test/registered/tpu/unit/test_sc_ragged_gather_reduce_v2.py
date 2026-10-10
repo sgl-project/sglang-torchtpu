@@ -27,7 +27,7 @@ from jax._src import test_util as jtu
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
+from sglang_tpu.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
     ragged_gather_reduce as ragged_gather_reduce_v2,
 )
 

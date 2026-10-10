@@ -1306,10 +1306,10 @@ class TestMixedKVFormats(CustomTestCase):
                 )
 
     def test_mixed_formats_reserve_dummy_pages_and_align_capacity(self):
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # 512 INT8 payload bytes plus 16 exponent rows aligned to 32.
@@ -1415,10 +1415,10 @@ class TestMixedKVFormats(CustomTestCase):
                     )
 
     def test_mxint8_groups_preserve_asymmetric_full_swa_geometry(self):
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # Full: 2048 payload bytes plus 128/64/32 exponent rows.
@@ -1825,6 +1825,124 @@ class TestSWAPoolFloor(CustomTestCase):
         target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
         self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
 
+    def test_dsv4_fp8_pd_refuses_pp_and_hisparse(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            check_dsv4_unified_fp8_pd_supported,
+        )
+
+        base = dict(
+            unified_fp8=True,
+            disaggregation_mode="prefill",
+            pp_size=1,
+            enable_hisparse=False,
+        )
+        check_dsv4_unified_fp8_pd_supported(**base)
+        # bf16 PD keeps both
+        check_dsv4_unified_fp8_pd_supported(
+            **{**base, "unified_fp8": False, "pp_size": 2, "enable_hisparse": True}
+        )
+        # fp8 without PD keeps both
+        check_dsv4_unified_fp8_pd_supported(
+            **{
+                **base,
+                "disaggregation_mode": "null",
+                "pp_size": 2,
+                "enable_hisparse": True,
+            }
+        )
+        for mode in ("prefill", "decode"):
+            for key, value, message in (
+                ("pp_size", 2, "pp_size=2"),
+                ("enable_hisparse", True, "enable-hisparse"),
+            ):
+                with self.subTest(disaggregation_mode=mode, refused=key):
+                    with self.assertRaisesRegex(ValueError, message):
+                        check_dsv4_unified_fp8_pd_supported(
+                            **{**base, "disaggregation_mode": mode, key: value}
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOutOfTreeHybridSwaRouting(CustomTestCase):
+    """Under an OOT platform a hybrid-SWA model must get the full+SWA sub-pools
+    and the generic SWA allocator, not a flat pool and a paged allocator."""
+
+    def _fake_configurator(self):
+        _publish_config(self, page_size=64, disaggregation_mode="null")
+        return SimpleNamespace(
+            device="cpu",
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype_str="auto",
+            is_draft_worker=False,
+            is_hybrid_swa=True,
+            use_mla_backend=False,
+            mambaish_config=None,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            _build_tpu_swa_kv_pool=MagicMock(name="swa_builder"),
+            _build_oot_mha_kv_pool=MagicMock(name="flat_builder"),
+        )
+
+    def _sizes(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import _PoolSizes
+
+        return _PoolSizes(
+            max_total_num_tokens=256,
+            max_running_requests=4,
+            full_max_total_num_tokens=256,
+            swa_max_total_num_tokens=128,
+            c4_max_total_num_tokens=0,
+            c128_max_total_num_tokens=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            c4_state_dtype=None,
+            c128_state_dtype=None,
+        )
+
+    def test_oot_hybrid_swa_builds_full_and_swa_sub_pools(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+        ) as platform:
+            platform.is_out_of_tree.return_value = True
+            platform.is_tpu.return_value = False
+            KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=False,
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+            )
+        fake._build_tpu_swa_kv_pool.assert_called_once_with(
+            full_max_total_num_tokens=256, swa_max_total_num_tokens=128
+        )
+        fake._build_oot_mha_kv_pool.assert_not_called()
+
+    def test_oot_hybrid_swa_uses_generic_swa_allocator(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+            ) as platform,
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.SWATokenToKVPoolAllocator"
+            ) as swa_allocator,
+        ):
+            platform.is_out_of_tree.return_value = True
+            platform.is_tpu.return_value = False
+            KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                fake,
+                sizes=self._sizes(),
+                token_to_kv_pool=MagicMock(),
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=None,
+            )
+        platform.get_paged_allocator_cls.assert_not_called()
+        swa_allocator.assert_called_once()

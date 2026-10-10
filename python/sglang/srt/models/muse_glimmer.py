@@ -424,7 +424,7 @@ class MuseGlimmerModel(nn.Module):
             hidden_states = layer(positions, hidden_states, forward_batch)
 
         hidden_states = self.norm(hidden_states)
-        if aux_hidden_states:
+        if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
 

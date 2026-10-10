@@ -635,7 +635,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.component_attention_backends,
         )
         self.assertEqual(
-            {"text_encoder": "kitchen_int8", "transformer": "fp8"},
+            {"text_encoder": "convrot_int8", "transformer": "fp8"},
             server_args.component_quantizations,
         )
         self.assertEqual(
@@ -3455,7 +3455,7 @@ class TestTpuDistributedArgs(unittest.TestCase):
     def _slice_env(self, **env):
         with (
             patch.dict(os.environ, env, clear=False),
-            patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env") as prep,
+            patch("sglang_tpu.patches._prepare_tpu_env") as prep,
         ):
             yield prep
 

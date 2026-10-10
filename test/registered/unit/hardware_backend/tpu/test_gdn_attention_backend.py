@@ -1,7 +1,7 @@
 """Unit tests for the TPU GDN attention backend's metadata (CPU-runnable).
 
 These cover the pure-Python/torch part of
-``sglang.srt.hardware_backend.tpu.attention_gdn_pallas.TpuGDNAttnBackend`` that
+``sglang_tpu.attention_gdn_pallas.TpuGDNAttnBackend`` that
 needs no JAX / torch_tpu / TPU device: the ``distribution`` dispatch vector the
 fused kernel keys on.
 
@@ -31,8 +31,8 @@ import unittest
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import TpuGDNAttnBackend
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
 
 
 class _BackendNoInit(TpuGDNAttnBackend):
@@ -102,7 +102,7 @@ class TestGDNRequestTilePadding(CustomTestCase):
 
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.gdn.metadata import (
+        from sglang_tpu.attention.pallas.gdn.metadata import (
             compute_batched_seq_metadata,
         )
 
