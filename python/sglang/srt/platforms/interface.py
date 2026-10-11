@@ -195,6 +195,12 @@ class SRTPlatform(DeviceMixin):
         """One-time backend initialization.  Called in each worker."""
         pass
 
+    def on_warmup_complete(self) -> None:
+        """Called once on the scheduler thread, the first time it goes idle after
+        a forward (the server warmup request has drained). Platforms that
+        compile ahead of serving freeze or monitor compilation here."""
+        pass
+
     # ------------------------------------------------------------------
     # BaseFusedOp integration
     # ------------------------------------------------------------------

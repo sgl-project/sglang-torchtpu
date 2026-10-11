@@ -5258,35 +5258,6 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
-    def _maybe_arm_fail_on_recompile(self) -> None:
-        """TPU-only: freeze torch.compile so serving-time recompiles raise."""
-        model_runner = self.tp_worker.model_runner
-        if model_runner.device != "tpu":
-            # Only enable this for tpu
-            return
-        from sglang_tpu.compilation.recompilation_checker import (
-            maybe_enable_site_tracing,
-        )
-
-        maybe_enable_site_tracing()
-        if not get_exec().graph.enable_torch_compile:
-            return
-        if (
-            get_spec().speculative_algorithm is not None
-            and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
-        ):
-            logger.info(
-                "[tpu] Warmup complete; leaving torch.compile recompiles enabled "
-                "for speculative decoding because "
-                "SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
-            )
-            return
-        torch.compiler.set_stance("fail_on_recompile")
-        logger.info(
-            "[tpu] Warmup complete; froze torch.compile via "
-            "set_stance('fail_on_recompile')."
-        )
-
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
@@ -5323,7 +5294,7 @@ class Scheduler(
 
         if self.forward_ct > 0 and not self.recompile_stance_set:
             self.recompile_stance_set = True
-            self._maybe_arm_fail_on_recompile()
+            current_platform.on_warmup_complete()
 
         if self.enable_unified_memory:
             try:

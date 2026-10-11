@@ -972,6 +972,33 @@ class TpuSRTPlatform(SRTPlatform):
         apply_tpu_patches()
         self._backend_initialized = True
 
+    def on_warmup_complete(self) -> None:
+        """Freeze torch.compile so serving-time recompiles raise."""
+        from sglang.srt.runtime_context import get_exec, get_spec
+        from sglang_tpu.compilation.recompilation_checker import (
+            maybe_enable_site_tracing,
+        )
+
+        # Dispatch modes are thread-local; this runs on the scheduler thread.
+        maybe_enable_site_tracing()
+        if not get_exec().graph.enable_torch_compile:
+            return
+        if (
+            get_spec().speculative_algorithm is not None
+            and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
+        ):
+            logger.info(
+                "[tpu] Warmup complete; leaving torch.compile recompiles enabled "
+                "for speculative decoding because "
+                "SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
+            )
+            return
+        torch.compiler.set_stance("fail_on_recompile")
+        logger.info(
+            "[tpu] Warmup complete; froze torch.compile via "
+            "set_stance('fail_on_recompile')."
+        )
+
     # ------------------------------------------------------------------
     # MultiPlatformOp integration
     # ------------------------------------------------------------------

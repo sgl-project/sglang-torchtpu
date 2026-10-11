@@ -110,7 +110,7 @@
     "python/sglang/srt/managers/mm_schedule.py": 1,
     "python/sglang/srt/managers/mm_utils.py": 1,
     "python/sglang/srt/managers/overlap_utils.py": 1,
-    "python/sglang/srt/managers/scheduler.py": 10,
+    "python/sglang/srt/managers/scheduler.py": 9,
     "python/sglang/srt/managers/scheduler_components/profiler_manager.py": 2,
     "python/sglang/srt/managers/scheduler_pp_mixin.py": 4,
     "python/sglang/srt/managers/utils.py": 1,
