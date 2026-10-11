@@ -12,7 +12,7 @@ import numpy as np
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_context
@@ -351,6 +351,7 @@ def _decode_manager_stub(**overrides):
         waiting_timeout=300,
         _state_lock=threading.Lock(),
         _aborted={},
+        _prefill=None,
         _failed=set(),
         _native_failed=set(),
         room_has_active_io=lambda room: False,
@@ -359,11 +360,8 @@ def _decode_manager_stub(**overrides):
         connection_pool={},
     )
     fields.update(overrides)
-    mgr = SimpleNamespace(**fields)
-    mgr._mark_aborted_locked = types.MethodType(
-        RaidenKVManager._mark_aborted_locked, mgr
-    )
-    mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
+    mgr = RaidenKVManager.__new__(RaidenKVManager)
+    vars(mgr).update(fields)
     mgr.check_status = lambda room: mgr.request_status[room]
     mgr.record_failure = lambda room, reason: mgr.failure_records.__setitem__(
         room, reason
@@ -1424,6 +1422,142 @@ class TestReceiverFailureRecords(unittest.TestCase):
 
         self.assertEqual(observed, [True])
         self.assertNotIn(ROOM, mgr.failure_records)
+
+
+def _prefill_sender(mgr):
+    sender = RaidenKVSender.__new__(RaidenKVSender)
+    sender.kv_mgr = mgr
+    sender.bootstrap_room = ROOM
+    sender.conclude_state = None
+    sender.init_time = time.time()
+    return sender
+
+
+class TestAbortKeepsTheFailureReason(unittest.TestCase):
+    """The scheduler handles an AbortReq before it polls, and a failed room
+    reads Transferring while raiden still holds one of its transfers, so an
+    abort can land on a room that already failed."""
+
+    def test_decode_reports_its_timeout_not_the_abort(self):
+        mgr = _decode_manager_stub(
+            waiting_timeout=1, room_has_active_io=lambda room: True
+        )
+        recv = _receiver(mgr)
+        recv.init_time = time.time() - 2
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            self.assertEqual(recv.poll(), KVPoll.Transferring)
+            recv.abort()
+            mgr.room_has_active_io = lambda room: False
+            self.assertEqual(recv.poll(), KVPoll.Failed)
+
+        with self.assertRaisesRegex(Exception, "timed out after"):
+            recv.failure_exception()
+
+    def test_prefill_reports_the_decode_abort_not_the_local_abort(self):
+        mgr = _prefill_manager()
+        _populate_send_state(mgr, ROOM)
+        mgr.attn_tp_rank = 0
+        mgr.is_dummy_cp_rank = False
+        mgr._send_reads[ROOM] = {str(ROOM)}
+        mgr._engine = Mock()
+        # raiden expires the read the decode never pulled on the second poll.
+        mgr._engine.poll_stats_with_details.side_effect = [
+            _polled(),
+            _polled(failed=[str(ROOM)]),
+        ]
+        sender = _prefill_sender(mgr)
+
+        mgr._dispatch(_abort_frame(ROOM))
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        sender.abort()
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+        with self.assertRaisesRegex(Exception, "decode-side abort notification"):
+            sender.failure_exception()
+
+    def test_prefill_reports_its_timeout_not_the_decode_abort(self):
+        mgr = _prefill_manager()
+        mgr.request_status[ROOM] = KVPoll.WaitingForInput
+        self.assertTrue(mgr.fail_decode_silence(ROOM, time.time() - 10, 1))
+        mgr._dispatch(_abort_frame(ROOM))
+
+        with self.assertRaisesRegex(KVTransferError, "waiting for the decode"):
+            _prefill_sender(mgr).failure_exception()
+
+    def test_decode_keeps_a_failure_raiden_reported(self):
+        """raiden records no reason for a transfer it failed."""
+        recv = _receiver(
+            _decode_manager_stub(_failed={str(ROOM)}, _native_failed={str(ROOM)})
+        )
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            recv.quiesce_group_failure()
+            recv.abort()
+
+        with self.assertRaisesRegex(KVTransferError, "Raiden receive failed"):
+            recv.failure_exception()
+
+    def test_prefill_keeps_a_failure_raiden_reported(self):
+        """The prefill drops the room's failed transfer ids each time it
+        quiesces or aborts the room, and the drain gate quiesces it on every
+        step until all ranks have drained."""
+
+        def sender(reads, *polls):
+            mgr = _prefill_manager()
+            _populate_send_state(mgr, ROOM)
+            mgr.attn_tp_rank = 0
+            mgr.is_dummy_cp_rank = False
+            mgr._send_reads[ROOM] = set(reads)
+            mgr._engine = Mock()
+            mgr._engine.poll_stats_with_details.side_effect = polls
+            return _prefill_sender(mgr)
+
+        closing, chunk = str(ROOM), f"{ROOM}#0"
+
+        # Another rank is still draining.
+        quiesced_twice = sender([closing], _polled(failed=[closing]), _polled())
+        self.assertEqual(quiesced_twice.poll(), KVPoll.Failed)
+        quiesced_twice.quiesce_group_failure()
+        self.assertEqual(quiesced_twice.poll(), KVPoll.Failed)
+        quiesced_twice.quiesce_group_failure()
+
+        # An AbortReq lands while the closing read is still out.
+        aborted_while_held = sender(
+            [chunk, closing], _polled(failed=[chunk]), _polled(sent=[closing])
+        )
+        self.assertEqual(aborted_while_held.poll(), KVPoll.Transferring)
+        aborted_while_held.abort()
+        self.assertEqual(aborted_while_held.poll(), KVPoll.Failed)
+        aborted_while_held.quiesce_group_failure()
+
+        aborted_after_quiesce = sender([closing], _polled(failed=[closing]))
+        self.assertEqual(aborted_after_quiesce.poll(), KVPoll.Failed)
+        aborted_after_quiesce.quiesce_group_failure()
+        aborted_after_quiesce.abort()
+
+        for name, end in (
+            ("quiesced twice", quiesced_twice),
+            ("aborted while held", aborted_while_held),
+            ("aborted after quiesce", aborted_after_quiesce),
+        ):
+            with self.subTest(name):
+                with self.assertRaisesRegex(KVTransferError, "Raiden send failed"):
+                    end.failure_exception()
+
+    def test_failure_exception_carries_the_room_and_reason(self):
+        recv = _receiver(_decode_manager_stub())
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            recv.abort()
+        mgr = _prefill_manager()
+        mgr.request_status[ROOM] = KVPoll.Transferring
+        sender = _prefill_sender(mgr)
+        sender.abort()
+
+        for end in (recv, sender):
+            with self.subTest(end=type(end).__name__):
+                with self.assertRaises(KVTransferError) as cm:
+                    end.failure_exception()
+                self.assertEqual(cm.exception.bootstrap_room, ROOM)
+                self.assertEqual(cm.exception.failure_reason, "Aborted by AbortReq.")
 
 
 class TestSendRevalidatesTheSocket(unittest.TestCase):

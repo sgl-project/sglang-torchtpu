@@ -18,7 +18,7 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
@@ -1286,7 +1286,8 @@ class RaidenKVReceiver(CommonKVReceiver):
 
     def abort(self):
         """Explicit local abort: same terminal path as any failure, so active
-        transfers keep the room's pages until they settle."""
+        transfers keep the room's pages until they settle. A room that already
+        failed keeps its reason."""
         self._conclude_failed(reason="Aborted by AbortReq.")
 
     def drained(self) -> bool:
@@ -1301,14 +1302,12 @@ class RaidenKVReceiver(CommonKVReceiver):
         self.conclude_state = None
         self._conclude_failed(
             reason="Raiden transfer failed on another attention TP/CP rank.",
-            preserve_reason=True,
         )
 
     def _conclude_failed(
         self,
         notify: bool = True,
         reason: Optional[str] = None,
-        preserve_reason: bool = False,
     ) -> KVPoll:
         """Terminalize the room: tombstone it so late frames cannot rebuild
         it, and tell the prefill to release it.
@@ -1324,9 +1323,7 @@ class RaidenKVReceiver(CommonKVReceiver):
             # otherwise admission observes the tombstone and does nothing.
             self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
             if reason is not None:
-                self.kv_mgr._fail_room_locked(
-                    self.bootstrap_room, reason, preserve_reason=preserve_reason
-                )
+                self.kv_mgr._fail_room_unless_failed_locked(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         if notify:
             self._notify_prefill_abort()
@@ -1348,7 +1345,7 @@ class RaidenKVReceiver(CommonKVReceiver):
             reason = self.kv_mgr.failure_records.pop(
                 self.bootstrap_room, "Raiden receive failed"
             )
-        raise Exception(reason)
+        raise KVTransferError(self.bootstrap_room, reason)
 
     def clear(self) -> None:
         super().clear()

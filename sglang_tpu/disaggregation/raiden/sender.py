@@ -21,7 +21,7 @@ import numpy.typing as npt
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
@@ -122,7 +122,9 @@ class RaidenSenderMixin:
             self._mark_aborted_locked(room)
             if status is None:
                 return
-            self._fail_room_locked(room, "Aborted by decode-side abort notification.")
+            self._fail_room_unless_failed_locked(
+                room, "Aborted by decode-side abort notification."
+            )
             self.update_status(room, KVPoll.Failed)
         self._drop_room_state(room)
 
@@ -1234,10 +1236,9 @@ class RaidenKVSender(CommonKVSender):
         """Seal this rank before the group snapshots its native drain bit."""
         with self.kv_mgr._state_lock:
             self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
-            self.kv_mgr._fail_room_locked(
+            self.kv_mgr._fail_room_unless_failed_locked(
                 self.bootstrap_room,
                 "Raiden transfer failed on another attention TP/CP rank.",
-                preserve_reason=True,
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         # A local Success may have been cached before a peer contributed the
@@ -1253,11 +1254,13 @@ class RaidenKVSender(CommonKVSender):
         The scheduler may recycle the request's blocks as soon as this sender
         is terminal. Keep ``conclude_state`` unset until every native read /
         stage / push lease has settled; the normal poll path then publishes
-        Failed.
+        Failed. A room that already failed keeps its reason.
         """
         with self.kv_mgr._state_lock:
             self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
-            self.kv_mgr._fail_room_locked(self.bootstrap_room, "Aborted by AbortReq.")
+            self.kv_mgr._fail_room_unless_failed_locked(
+                self.bootstrap_room, "Aborted by AbortReq."
+            )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.kv_mgr._drop_room_state(self.bootstrap_room)
         self.conclude_state = (
@@ -1275,7 +1278,7 @@ class RaidenKVSender(CommonKVSender):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
         self.clear()
-        raise Exception(reason)
+        raise KVTransferError(self.bootstrap_room, reason)
 
     def clear(self) -> None:
         super().clear()
