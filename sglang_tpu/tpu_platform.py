@@ -406,6 +406,17 @@ def _validate_raiden_optimistic_prefill(
     )
 
 
+def _validate_kv_checksum(enable_kv_checksum: bool) -> None:
+    if not enable_kv_checksum:
+        return
+    raise ValueError(
+        "--disaggregation-enable-kv-checksum is not supported on TPU: the KV "
+        "checksum has only a CUDA implementation. On TPU the server would pass "
+        "its health checks and then fail every rank on the first real request. "
+        "Remove the flag from both the prefill and the decode engines."
+    )
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -817,6 +828,7 @@ class TpuSRTPlatform(SRTPlatform):
             disaggregation_mode=cfg.disaggregation_mode,
             max_queued_requests=cfg.max_queued_requests,
         )
+        _validate_kv_checksum(cfg.disaggregation_enable_kv_checksum)
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray
