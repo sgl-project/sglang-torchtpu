@@ -885,6 +885,16 @@ def _patch_pd_decode_async_prefill_info() -> None:
     pd_decode_async_prefill_info.install()
 
 
+def _patch_host_heap_trim() -> None:
+    """Return freed host heap pages once the scheduler is warmed up.
+
+    See ``host_heap_trim``.
+    """
+    from sglang_tpu import host_heap_trim
+
+    host_heap_trim.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -906,3 +916,4 @@ def apply_tpu_patches() -> None:
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
     _patch_pd_decode_async_prefill_info()
+    _patch_host_heap_trim()
