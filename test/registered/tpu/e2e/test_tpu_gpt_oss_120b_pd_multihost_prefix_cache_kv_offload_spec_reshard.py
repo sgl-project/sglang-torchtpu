@@ -668,24 +668,26 @@ def assert_decode_reshard_topology(decode_host: str) -> None:
     url = f"http://{decode_host}:{DECODE_PORT}/server_info"
     with urllib.request.urlopen(url, timeout=60) as resp:
         info = json.loads(resp.read())
-    dp_size = int(info.get("dp_size") or 1)
+    attn_dp_size = int(info.get("attn_dp_size") or 1)
     dp_attention = bool(info.get("enable_dp_attention"))
     tp_size = int(info.get("tp_size") or 0)
-    attn_tp = tp_size // dp_size if dp_size else tp_size
+    attn_tp = tp_size // attn_dp_size
     print(
-        f"decode engine: tp={tp_size} dp={dp_size} dp_attention={dp_attention} "
+        f"decode engine: tp={tp_size} attn_dp={attn_dp_size} dp_attention={dp_attention} "
         f"attn_tp={attn_tp}",
         flush=True,
     )
-    if dp_size != DECODE_DP_SIZE or not dp_attention:
+    if attn_dp_size != DECODE_DP_SIZE or not dp_attention:
         raise AssertionError(
-            f"decode engine reports dp_size={dp_size} "
-            f"enable_dp_attention={dp_attention}; expected dp_size={DECODE_DP_SIZE} "
+            f"decode engine reports attn_dp_size={attn_dp_size} "
+            f"enable_dp_attention={dp_attention}; expected attn_dp_size={DECODE_DP_SIZE} "
             "with DP attention on. The KV would land rank-for-rank and this row "
             "would silently re-run the symmetric gate."
         )
-    if attn_tp <= 0 or tp_size % dp_size:
-        raise AssertionError(f"decode tp={tp_size} is not divisible by dp={dp_size}")
+    if attn_tp <= 0 or tp_size % attn_dp_size:
+        raise AssertionError(
+            f"decode tp={tp_size} is not divisible by attn_dp={attn_dp_size}"
+        )
 
 
 def _assert_concurrent_wave_is_deterministic(
@@ -864,13 +866,15 @@ class TestPdGptOss120bReshardConfiguration(unittest.TestCase):
         real_urlopen = urllib.request.urlopen
         urllib.request.urlopen = lambda *a, **k: _Resp()
         try:
-            served.update(tp_size=16, dp_size=1, enable_dp_attention=False)
-            with self.assertRaisesRegex(AssertionError, "dp_size=1"):
+            served.update(
+                tp_size=16, dp_size=1, attn_dp_size=1, enable_dp_attention=False
+            )
+            with self.assertRaisesRegex(AssertionError, "attn_dp_size=1"):
                 assert_decode_reshard_topology("decode-host")
-            served.update(tp_size=16, dp_size=2, enable_dp_attention=False)
+            served.update(attn_dp_size=2, enable_dp_attention=False)
             with self.assertRaisesRegex(AssertionError, "enable_dp_attention=False"):
                 assert_decode_reshard_topology("decode-host")
-            served.update(tp_size=16, dp_size=2, enable_dp_attention=True)
+            served.update(attn_dp_size=2, enable_dp_attention=True)
             assert_decode_reshard_topology("decode-host")  # must not raise
 
             replies[:] = [_reply("same") for _ in range(CONCURRENT_WAVE_SIZE)]

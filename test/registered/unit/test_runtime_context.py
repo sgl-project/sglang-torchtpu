@@ -1102,6 +1102,40 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(is_tbo_enabled())
         self.assertEqual(get_flags().moe.deepep_config, "")
 
+    def test_dense_model_scheduler_initializes_backend_flags_before_compile(self):
+        import torch
+
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        reset_context()
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        scheduler = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace())
+        )
+        with (
+            patch.object(scheduler_module, "initialize_fp8_gemm_config"),
+            patch.object(scheduler_module, "initialize_fp4_gemm_config"),
+            patch.object(scheduler_module, "initialize_bf16_gemm_config"),
+            patch.object(scheduler_module, "require_mlp_sync", return_value=False),
+        ):
+            scheduler_module.Scheduler.init_moe_gemm_config(scheduler)
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+
+        def forward(x):
+            if get_moe_runner_backend().is_auto() and get_moe_a2a_backend().is_none():
+                return x + 1
+            return x - 1
+
+        compiled = torch.compile(forward, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(torch.ones(2)), torch.full((2,), 2.0))
+
     def test_speculative_swap_and_restore(self):
         from sglang.srt.layers.moe.utils import (
             get_moe_a2a_backend,

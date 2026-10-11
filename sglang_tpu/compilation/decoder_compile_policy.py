@@ -18,7 +18,7 @@ from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import dp_gather_width, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
@@ -1437,8 +1437,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """
         from sglang.srt.layers.dp_attention import DpPaddingMode
 
-        # One entry per attention-DP rank (dp_size counts replicas now).
-        dp_size = get_parallel().attn_dp_size
+        # Draft scopes narrow attention-DP to one but retain the target's
+        # gathered token counts. Match that gather, not the local topology.
+        dp_size = dp_gather_width()
         device = self.model_runner.device
         global_num_tokens = [num_tokens] * dp_size
         forward_batch.dp_padding_mode = DpPaddingMode.MAX_LEN

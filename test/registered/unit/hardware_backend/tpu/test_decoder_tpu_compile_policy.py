@@ -1809,6 +1809,27 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         no_grad.assert_called_once_with()
         cm.__enter__.assert_called_once()
 
+    def test_draft_warmup_keeps_target_dp_gather_width(self):
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.runtime_context import get_flags
+
+        self.publish_config(tp_size=8, attn_dp_size=4)
+        policy = _make_policy()
+        batch = SimpleNamespace()
+        group = SimpleNamespace(world_size=2, rank_in_group=0)
+        with (
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(attn_dp_rank=0),
+            patch.object(parallel_state, "_TP", group),
+            parallel_state.patch_tensor_parallel_group(group, owns_attention=True),
+        ):
+            self.assertEqual(get_parallel().attn_dp_size, 1)
+            policy._set_dp_attention_metadata(batch, 64, 4, ForwardMode.EXTEND)
+
+        self.assertEqual(batch.global_num_tokens_cpu, [64] * 4)
+        self.assertEqual(batch.global_num_tokens_gpu.tolist(), [64] * 4)
+        self.assertEqual(batch.global_num_tokens_for_logprob_gpu.tolist(), [4] * 4)
+
     def test_materialize_out_syncs_global_top_k_and_flagged_kv_side_effects(self):
         global_top_k_logits = torch.zeros(1)
         global_top_k_token_ids = torch.zeros(1, dtype=torch.int32)
