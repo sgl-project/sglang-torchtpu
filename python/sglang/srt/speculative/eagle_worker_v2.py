@@ -819,7 +819,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return tree_outputs
 
     def _should_fuse_draft_steps(self) -> bool:
-        return _is_tpu and self.speculative_num_steps > 1
+        # The fused loop is compiled by the TPU EAGLE3 draft policy; an eager
+        # draft (no --enable-torch-compile) carries NoopCompilePolicy, which has
+        # no fused-loop hooks, so it runs the per-step loop instead.
+        return (
+            _is_tpu
+            and self.speculative_num_steps > 1
+            and hasattr(self.draft_runner.compile_policy, "compile_fused_draft_steps")
+        )
 
     def _fused_draft_steps(
         self,

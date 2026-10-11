@@ -754,7 +754,9 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             compile_policy=SimpleNamespace(
                 precompile_draft=MagicMock(
                     side_effect=lambda *_args: events.append("precompile")
-                )
+                ),
+                # The compiled TPU EAGLE3 draft policy owns the fused loop.
+                compile_fused_draft_steps=MagicMock(),
             ),
         )
         worker.draft_attn_backend = object()

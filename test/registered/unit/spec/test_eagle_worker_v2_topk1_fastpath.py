@@ -220,6 +220,9 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 class TestEagleWorkerV2FusedDraft(CustomTestCase):
     def test_fused_steps_support_both_compile_tracers(self):
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker.draft_runner = SimpleNamespace(
+            compile_policy=SimpleNamespace(compile_fused_draft_steps=lambda *a: None)
+        )
 
         with patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True):
             worker.server_args.tpu_compile_tracer = "dynamo"
@@ -227,6 +230,17 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
 
             worker.server_args.tpu_compile_tracer = "direct"
             self.assertTrue(worker._should_fuse_draft_steps())
+
+    def test_eager_draft_uses_per_step_loop(self):
+        # NoopCompilePolicy (no --enable-torch-compile) has no fused-loop hooks.
+        from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
+
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker.draft_runner = SimpleNamespace(
+            compile_policy=object.__new__(NoopCompilePolicy)
+        )
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True):
+            self.assertFalse(worker._should_fuse_draft_steps())
 
     def test_fused_steps_thread_per_step_inputs(self):
         from sglang_tpu.eagle_utils_tpu import (
@@ -414,6 +428,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             compile_policy=SimpleNamespace(
                 prepare_spec_draft_input=lambda *_args: None,
                 finalize_spec_forward_batch=lambda *, outputs, forward_batch: outputs,
+                compile_fused_draft_steps=lambda *_args: None,
             ),
         )
 

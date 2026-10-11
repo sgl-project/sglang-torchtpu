@@ -72,7 +72,10 @@ class DecoderCompilePolicy(CompilePolicy):
     b_bucketer: Any | None = None
 
     def precompile_draft(
-        self, draft_attn_backend: Any, draft_extend_attn_backend: Any
+        self,
+        draft_attn_backend: Any,
+        draft_extend_attn_backend: Any,
+        fused_draft_forward: Any = None,
     ) -> None:
         """Run warmup after speculative-draft attention backends are available."""
 
