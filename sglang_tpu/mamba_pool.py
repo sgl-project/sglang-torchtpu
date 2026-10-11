@@ -18,10 +18,13 @@ transpose.
 
 
 Slot 0 is a reserved null block (padded / invalid tokens); real slots are
-``1 .. size``. The kernel masks reads on fresh requests via
-``has_initial_state`` (derived from ``seq_lens - query_lens``), so slot reuse
-needs **no** explicit clearing — hence ``clear_slots`` is a no-op here and no
-dynamic in-place scatter is required on device.
+``1 .. size``. With speculative decoding every slot index ``r`` owns a group of
+``spec_window`` consecutive state rows ``[r * W, (r + 1) * W)``, one checkpoint
+per verify position, and ``read_offsets[r]`` names the committed one. The
+kernel masks reads on fresh requests via ``has_initial_state`` (derived from
+``seq_lens - query_lens``), so slot reuse needs **no** explicit clearing — hence
+``clear_slots`` is a no-op here and no dynamic in-place scatter is required on
+device.
 
 Selected by ``TpuSRTPlatform.get_mamba_pool_cls`` and instantiated from
 ``HybridReqToTokenPool._init_mamba_pool``.
@@ -99,9 +102,9 @@ class TpuMambaPool(MambaPool):
         # NOTE: deliberately does NOT call super().__init__ — the base
         # allocator is CUDA/NPU/CPU-specific. We reproduce only the pieces the
         # TPU GDN path needs.
-        if speculative_num_draft_tokens is not None:
+        if speculative_eagle_topk is not None and speculative_eagle_topk > 1:
             raise NotImplementedError(
-                "Speculative decoding is not supported for the TPU GDN state pool yet."
+                "Tree speculative verify is not supported by the TPU GDN state pool."
             )
         if enable_linear_replayssm:
             raise NotImplementedError(
@@ -126,6 +129,11 @@ class TpuMambaPool(MambaPool):
         )
         self.size = size
         self.device = device
+        # Rows per slot: the verify window (anchor + drafts), or 1 without spec.
+        self.spec_window = int(speculative_num_draft_tokens or 1)
+        rows = (size + 1) * self.spec_window
+        # Checkpoint row within the slot's group that the next forward reads.
+        self.read_offsets = torch.zeros(size + 1, dtype=torch.int32, device=device)
         self.num_mamba_layers = num_mamba_layers
         # TPU does not use NVLink custom mem pools.
         self.enable_custom_mem_pool = False
@@ -168,7 +176,7 @@ class TpuMambaPool(MambaPool):
         conv_state = [
             [
                 torch.zeros(
-                    (size + 1, conv_dim_km1[1], 1, conv_dim_km1[0]),
+                    (rows, conv_dim_km1[1], 1, conv_dim_km1[0]),
                     dtype=conv_dtype,
                     device=device,
                 )
@@ -181,7 +189,7 @@ class TpuMambaPool(MambaPool):
         # (GPU stores [..., n_v, d_v, d_k]; we swap the trailing two axes).
         temporal_state = [
             torch.zeros(
-                (size + 1, n_v, d_k, d_v),
+                (rows, n_v, d_k, d_v),
                 dtype=ssm_dtype,
                 device=device,
             )
@@ -191,9 +199,10 @@ class TpuMambaPool(MambaPool):
         self.mamba_cache = TpuPerLayerState(conv=conv_state, temporal=temporal_state)
         self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
         logger.info(
-            "TPU Mamba/GDN state cache allocated: max_size=%d, layers=%d, "
-            "per-layer conv=%s%s, per-layer recurrent=%s (mem=%.3fGB)",
+            "TPU Mamba/GDN state cache allocated: max_size=%d, spec_window=%d, "
+            "layers=%d, per-layer conv=%s%s, per-layer recurrent=%s (mem=%.3fGB)",
             size,
+            self.spec_window,
             num_mamba_layers,
             list(conv_state[0][0].shape),
             "" if len(conv_state) == 1 else f" x{len(conv_state)}",

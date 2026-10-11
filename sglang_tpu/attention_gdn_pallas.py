@@ -35,10 +35,12 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.runtime_context import get_exec
+from sglang_tpu.attention_pallas_rpa_base import PallasForwardMetadata
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -61,8 +63,14 @@ def build_gdn_pallas_op():
             a_log, dt_bias, query_start_loc, state_indices, distribution,
             seq_lens, n_kq, n_v, d_k, d_v, kernel_size, kda=False,
             gate_lower_bound=None, batched_only=False, prefill_only=False,
-            fused_qkvg=False, packed_weights=None,
-            track_indices=None, track_end=None) -> output
+            fused_qkvg=False, packed_weights=None, track_indices=None,
+            track_end=None, read_offsets=None, num_spec_tokens=0,
+            spec_window=1) -> output
+
+    With ``spec_window > 1`` the state pool holds ``spec_window`` checkpoint
+    rows per slot: ``state_indices`` (and ``track_indices``) are slot ids,
+    ``read_offsets`` is the pool's whole per-slot offset table, and the row
+    arithmetic is traced into the graph.
 
     ``conv_state`` and ``recurrent_state`` are updated in place (declared as
     ``mutates_args``); the returned tensor is the fused attention output of
@@ -121,6 +129,9 @@ def build_gdn_pallas_op():
         packed_weights: Optional[jax.Array] = None,
         track_indices: Optional[jax.Array] = None,
         track_end: Optional[jax.Array] = None,
+        read_offsets: Optional[jax.Array] = None,
+        num_spec_tokens: int = 0,
+        spec_window: int = 1,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         conv_dim = n_kq * d_k * 2 + n_v * d_v
         if fused_qkvg:
@@ -133,6 +144,12 @@ def build_gdn_pallas_op():
                 f"qkv is {qkv.shape[1]} wide but the conv dim is {conv_dim}; a "
                 "fused [q, k, v, g] projection needs fused_qkvg=True."
             )
+        if spec_window > 1:
+            if num_spec_tokens > 0:
+                read_offsets = read_offsets[state_indices]
+            state_indices = state_indices * spec_window
+            if track_indices is not None:
+                track_indices = track_indices * spec_window
         # The GDN kernel sizes its tiling from `pltpu.get_tpu_info().num_lanes`
         # (gdn/wrapper.py), but distributed Pallas programs are exported through
         # a logical CPU mesh, so at trace time JAX reports device_kind="cpu" and
@@ -155,6 +172,7 @@ def build_gdn_pallas_op():
                 state_indices,
                 distribution,
                 seq_lens,
+                read_offsets,
                 n_kq=n_kq,
                 n_v=n_v,
                 d_k=d_k,
@@ -167,6 +185,7 @@ def build_gdn_pallas_op():
                 packed_weights=packed_weights,
                 track_indices=track_indices,
                 track_end=track_end,
+                num_spec_tokens=num_spec_tokens,
             )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).
@@ -184,8 +203,8 @@ def build_gdn_pallas_op():
         _wrapped,
         name=f"jax_{op_name}",
         # n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound, batched_only,
-        # prefill_only, fused_qkvg are static.
-        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
+        # prefill_only, fused_qkvg, num_spec_tokens and spec_window are static.
+        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28),
         donate_argnums=(3, 4),
         input_output_aliases={3: 0, 4: 1},
         warn_deprecated=False,
@@ -223,6 +242,9 @@ def build_gdn_pallas_op():
         packed_weights: Optional[torch.Tensor] = None,
         track_indices: Optional[torch.Tensor] = None,
         track_end: Optional[torch.Tensor] = None,
+        read_offsets: Optional[torch.Tensor] = None,
+        num_spec_tokens: int = 0,
+        spec_window: int = 1,
     ) -> torch.Tensor:
         # Second half of the CPU-mesh export guard (see `_wrapped`). Mosaic
         # lowering queries TPU metadata again (`_check_block_mappings` ->
@@ -253,6 +275,7 @@ def build_gdn_pallas_op():
             packed_weights,
             track_indices,
             track_end,
+            read_offsets,
         )
         key = (
             tuple(None if t is None else (tuple(t.shape), t.dtype) for t in tensors),
@@ -266,6 +289,8 @@ def build_gdn_pallas_op():
             batched_only,
             prefill_only,
             fused_qkvg,
+            num_spec_tokens,
+            spec_window,
         )
         if key in _exported_shapes:
             _new_conv, _new_rec, output = jax_kernel(
@@ -295,6 +320,9 @@ def build_gdn_pallas_op():
                 packed_weights,
                 track_indices,
                 track_end,
+                read_offsets,
+                num_spec_tokens,
+                spec_window,
             )
         else:
             with (
@@ -328,6 +356,9 @@ def build_gdn_pallas_op():
                     packed_weights,
                     track_indices,
                     track_end,
+                    read_offsets,
+                    num_spec_tokens,
+                    spec_window,
                 )
             _exported_shapes.add(key)
         return output
@@ -359,6 +390,9 @@ def build_gdn_pallas_op():
         packed_weights: Optional[torch.Tensor] = None,
         track_indices: Optional[torch.Tensor] = None,
         track_end: Optional[torch.Tensor] = None,
+        read_offsets: Optional[torch.Tensor] = None,
+        num_spec_tokens: int = 0,
+        spec_window: int = 1,
     ) -> torch.Tensor:
         num_tokens = qkv.shape[0]
         return qkv.new_empty((num_tokens, n_v, d_v))
@@ -386,6 +420,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
     is irrelevant here (state is always updated).
     """
 
+    commits_verify_by_read_offset = True
+
     def __init__(self, model_runner: "ModelRunner"):
         super().__init__(model_runner)
         # Build (and JAX-export) the custom op eagerly at construction time so
@@ -403,9 +439,16 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._seq_lens: Optional[torch.Tensor] = None
         self._state_indices: Optional[torch.Tensor] = None
         self._query_start_loc: Optional[torch.Tensor] = None
-        # Pure decode has no PER_SEQ rows and extend no BATCHED rows (see
-        # _get_distribution), so each runs one kernel pass instead of both.
+        # Pure decode / verify has no PER_SEQ rows and extend no BATCHED rows
+        # (see _get_distribution), so each runs one kernel pass instead of both.
         self._is_decode = False
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        self._spec_window = mamba_pool.spec_window
+        self._read_offsets_pool = mamba_pool.read_offsets
+        # Per-forward verify state: the window's read offsets and slot ids.
+        self._read_offsets: Optional[torch.Tensor] = None
+        self._num_spec_tokens = 0
+        self._verify_slots: Optional[torch.Tensor] = None
         # Cache the (shape-static) distribution vector across forwards, keyed by
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
@@ -437,14 +480,13 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # (attention_pallas_rpa_base._pre_bucket_padded_batch_size).
         bs = int(getattr(forward_batch, "_tpu_real_b", forward_batch.seq_lens.shape[0]))
         device = forward_batch.seq_lens.device
-        is_decode = forward_batch.forward_mode.is_decode_or_idle()
+        is_verify = forward_batch.forward_mode.is_target_verify()
+        is_decode = forward_batch.forward_mode.is_decode_or_idle() or is_verify
         self._distribution = self._get_distribution(is_decode, bs, device)
         self._is_decode = is_decode
-        # Full per-request sequence length (context + current); the kernel uses
-        # it to derive has_initial_state = (seq_lens - query_lens) > 0. Cast the
-        # per-forward index/length metadata to int32 once here (shared by all
-        # GDN layers) rather than per-layer in _run.
-        self._seq_lens = forward_batch.seq_lens.to(torch.int32)
+        # Full per-request sequence length including this forward's tokens (the
+        # verify window too); the kernel derives has_initial_state from it.
+        self._seq_lens = self._full_attn_kv_lens(forward_batch, is_verify=is_verify)
         # Build only TPU metadata. The GPU base constructs variable-length
         # tracked-row selections and reads device masks on the host. Here every
         # row retains its bucket slot and disabled snapshots use end=-1.
@@ -454,8 +496,10 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         )
         padded_bs = forward_batch.seq_lens.shape[0]
         if is_decode:
+            # One token per request, or the verify window per request.
+            step = self._spec_window if is_verify else 1
             self._query_start_loc = torch.arange(
-                padded_bs + 1, dtype=torch.int32, device=device
+                0, (padded_bs + 1) * step, step, dtype=torch.int32, device=device
             )
         else:
             self._query_start_loc = torch.cat(
@@ -491,6 +535,48 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             mamba_cache_indices=self._state_indices,
             mamba_track_indices=self._track_indices,
         )
+        self._init_spec_metadata(forward_batch)
+
+    def _init_spec_metadata(self, forward_batch: "ForwardBatch") -> None:
+        self._read_offsets = None
+        self._num_spec_tokens = 0
+        self._verify_slots = None
+        if self._spec_window == 1:
+            return
+        mode = forward_batch.forward_mode
+        # Clamped slot ids; index_copy_ / index_fill_ take int64.
+        slots = self._state_indices.long()
+        if mode.is_target_verify():
+            # Checkpoint rows are laid out per pool window; a different verify
+            # width (adaptive spec) would read and commit the wrong rows.
+            assert forward_batch.spec_info.num_tokens_per_req == self._spec_window
+            self._read_offsets = self._read_offsets_pool
+            self._num_spec_tokens = self._spec_window - 1
+            self._verify_slots = slots
+        elif mode.is_extend():
+            # Extend writes its final state to checkpoint row 0 of the group.
+            self._read_offsets_pool.index_fill_(0, slots, 0)
+
+    def _full_attn_kv_lens(self, forward_batch, *, is_verify: bool) -> torch.Tensor:
+        """RPA's int32 kv_lens for this forward, else a fresh cast of seq_lens.
+
+        Relies on HybridLinearAttnBackend initializing the full-attention backend
+        before this one in the same forward."""
+        full = self._model_runner.attn_backend
+        if isinstance(full, HybridLinearAttnBackend) and isinstance(
+            full.full_attn_backend.forward_metadata, PallasForwardMetadata
+        ):
+            return full.full_attn_backend.forward_metadata.kv_lens
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        return seq_lens + self._spec_window if is_verify else seq_lens
+
+    def commit_verify(self, last_correct_step_indices: torch.Tensor) -> None:
+        """Point each verified slot's next read at its last accepted checkpoint."""
+        num_reqs = last_correct_step_indices.shape[0]
+        rows = last_correct_step_indices
+        if rows.dtype != torch.int32:
+            rows = rows.to(torch.int32)
+        self._read_offsets_pool.index_copy_(0, self._verify_slots[:num_reqs], rows)
 
     def _run(
         self,
@@ -537,6 +623,9 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             prefill_only=not self._is_decode,
             track_indices=self._track_indices,
             track_end=self._track_end,
+            read_offsets=self._read_offsets,
+            num_spec_tokens=self._num_spec_tokens,
+            spec_window=self._spec_window,
         )
         # Per-head [num_tokens, n_v, d_v], as the model's output-gate norm expects.
         return out

@@ -20,13 +20,6 @@ if TYPE_CHECKING:
 class TpuKDAAttnBackend(TpuGDNAttnBackend):
     """TPU KDA linear-attention backend backed by the fused Pallas kernel."""
 
-    def init_forward_metadata(self, forward_batch):
-        if forward_batch.forward_mode.is_target_verify():
-            raise NotImplementedError(
-                "TpuKDAAttnBackend does not support speculative target verify"
-            )
-        super().init_forward_metadata(forward_batch)
-
     def _run(
         self,
         layer: "RadixLinearAttention",
@@ -72,6 +65,9 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             fused_qkvg=getattr(layer, "fused_qkvg", False),
             # Kimi-K3 packs conv / dt_bias / A_log into one f32 operand post-load.
             packed_weights=getattr(layer, "packed_kernel_weights", None),
+            read_offsets=self._read_offsets,
+            num_spec_tokens=self._num_spec_tokens,
+            spec_window=self._spec_window,
         )
         # Keep the batch axis: the model squeezes dim 0 after o_norm, which would
         # eat the token axis of a one-token decode.
