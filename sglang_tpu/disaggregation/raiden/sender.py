@@ -40,6 +40,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    RoomFailed,
     decode_text,
     read_aux_blob,
 )
@@ -71,13 +72,20 @@ class RaidenSenderMixin:
         decode_pages = req.decode_pages
         decode_swa_pages = req.decode_swa_pages
         with self._state_lock:
-            if room in self._aborted:
-                return
-            self._prefill.decode_addr[room] = (decode_ip, decode_port)
-            self._prefill.decode_pages[room] = decode_pages
-            self._prefill.decode_swa_pages[room] = decode_swa_pages
-            held = self._prefill.held_chunks.pop(room, [])
-            total_pages = self._prefill.send_total.get(room, 0)
+            failed_reason = self._tombstone_reason_locked(room)
+            if failed_reason is None:
+                self._prefill.decode_addr[room] = (decode_ip, decode_port)
+                self._prefill.decode_pages[room] = decode_pages
+                self._prefill.decode_swa_pages[room] = decode_swa_pages
+                held = self._prefill.held_chunks.pop(room, [])
+                total_pages = self._prefill.send_total.get(room, 0)
+        if failed_reason is not None:
+            self._reply_room_failed(
+                room=room,
+                endpoint=_tcp_endpoint(ip=decode_ip, port=decode_port),
+                reason=failed_reason,
+            )
+            return
         for start, block_ids in held:
             self._announce_chunk(room, start, block_ids, total_pages)
         self._maybe_reply(room)
@@ -117,6 +125,39 @@ class RaidenSenderMixin:
             self._fail_room_locked(room, "Aborted by decode-side abort notification.")
             self.update_status(room, KVPoll.Failed)
         self._drop_room_state(room)
+
+    def _tombstone_reason_locked(self, room: int) -> Optional[str]:
+        """Why a decode asking for ``room`` cannot be served, or None if the
+        room is not tombstoned. The specific cause is in this rank's log."""
+        failed_at = self._aborted.get(room)
+        if failed_at is None:
+            return None
+        return (
+            f"Prefill rank {self.attn_tp_rank} had already failed room {room} "
+            f"{time.time() - failed_at:.1f}s before the decode asked for its KV. "
+            "The prefill log has the cause"
+        )
+
+    def _reply_room_failed(self, *, room: int, endpoint: str, reason: str) -> None:
+        """Tell the decode at ``endpoint`` that this rank failed ``room``.
+
+        Without it the decode holds the room's KV pages until its own waiting
+        timeout. An undeliverable notice leaves the decode to that timeout.
+        """
+        try:
+            self._send_multipart_locked(
+                endpoint, RoomFailed(room=room, reason=reason).to_frames()
+            )
+        except zmq.ZMQError as exc:
+            logger.warning(
+                "RaidenKVManager rank%d room %s: failure notice to %s not "
+                "delivered (errno %s): %s",
+                self.attn_tp_rank,
+                room,
+                endpoint,
+                exc.errno,
+                exc,
+            )
 
     def append_send_blocks(
         self,
@@ -351,8 +392,9 @@ class RaidenSenderMixin:
 
         The deadline check and the failure are one step under the lock, so a
         pull or reshard message that lands concurrently either arrives first
-        (the room stays live) or finds the tombstone and is dropped -- the
-        decode can never be told to pull KV whose room just failed.
+        (the room stays live) or finds the tombstone and is answered with
+        ROOM_FAILED -- the decode can never be told to pull KV whose room just
+        failed.
         """
         with self._state_lock:
             if self._decode_asked_locked(room):
@@ -553,18 +595,25 @@ class RaidenSenderMixin:
         decode_swa_blocks = req.decode_swa_blocks
         swa_push_endpoint = req.swa_push_endpoint
         with self._state_lock:
-            if room in self._aborted:
-                return
-            self._prefill.reshard_req[room] = dict(
-                reply_addr=(decode_ip, decode_port),
-                push_endpoint=push_endpoint,
-                decode_blocks=decode_blocks,
-                dst_attn_tp=dst_attn_tp,
-                decode_swa_blocks=decode_swa_blocks,
-                swa_push_endpoint=swa_push_endpoint,
+            failed_reason = self._tombstone_reason_locked(room)
+            if failed_reason is None:
+                self._prefill.reshard_req[room] = dict(
+                    reply_addr=(decode_ip, decode_port),
+                    push_endpoint=push_endpoint,
+                    decode_blocks=decode_blocks,
+                    dst_attn_tp=dst_attn_tp,
+                    decode_swa_blocks=decode_swa_blocks,
+                    swa_push_endpoint=swa_push_endpoint,
+                )
+                held = self._prefill.held_chunks.pop(room, [])
+                total_pages = self._prefill.send_total.get(room, 0)
+        if failed_reason is not None:
+            self._reply_room_failed(
+                room=room,
+                endpoint=_tcp_endpoint(ip=decode_ip, port=decode_port),
+                reason=failed_reason,
             )
-            held = self._prefill.held_chunks.pop(room, [])
-            total_pages = self._prefill.send_total.get(room, 0)
+            return
         for start, block_ids in held:
             self._announce_reshard_chunk(room, start, block_ids, total_pages)
         self._maybe_reshard_reply(room)

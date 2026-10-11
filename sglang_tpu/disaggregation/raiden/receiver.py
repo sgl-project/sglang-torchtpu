@@ -31,6 +31,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    RoomFailed,
     write_aux_blob,
 )
 
@@ -160,6 +161,26 @@ class RaidenReceiverMixin:
                 self._decode.final_seen.add(room)
         if self._listener_start_read and self.chunked_transfer:
             self._start_chunked_pull(room)
+
+    def _on_room_failed(self, msg: List[bytes]) -> None:
+        """Fail a room its prefill has already failed, so its KV pages free on
+        the next poll instead of after SGLANG_DISAGGREGATION_WAITING_TIMEOUT.
+        A transfer the room already started keeps them until raiden settles it,
+        as for any failure."""
+        note = RoomFailed.from_frames(msg)
+        room = note.room
+        with self._state_lock:
+            if room in self._aborted:
+                return
+            try:
+                status = self.check_status(room)
+            except KeyError:
+                return  # already cleared
+            if status == KVPoll.Success:
+                return
+            self._mark_aborted_locked(room)
+            self._fail_room_locked(room, note.reason, preserve_reason=True)
+            self.update_status(room, KVPoll.Failed)
 
     # ----- decode side -------------------------------------------------------
 
@@ -1137,7 +1158,7 @@ class RaidenKVReceiver(CommonKVReceiver):
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self._started = False
-        # Bounds the Bootstrapping window; see _check_handshake_timeout.
+        # Bounds the wait before send_metadata, see _check_handshake_timeout.
         self._handshake_start = time.time()
         self._handshake_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
 
@@ -1221,23 +1242,36 @@ class RaidenKVReceiver(CommonKVReceiver):
         return self.kv_mgr.check_status(self.bootstrap_room)
 
     def _check_handshake_timeout(self, status: KVPoll) -> Optional[str]:
-        """Failure reason once the room has stayed in Bootstrapping too long.
+        """Failure reason once the room has waited too long to ask the prefill
+        for its KV: in Bootstrapping for the handshake, or in WaitingForInput
+        for KV pages on this decode.
 
-        Nothing else bounds a handshake that never completes. The prefill
-        bounds the same window with the bootstrap timeout, so the decode uses
-        it too. A room in WaitingForInput is not bounded here: it may only be
-        waiting for KV room on this decode, which frees as requests finish.
+        The prefill fails a room whose decode has not asked within the
+        bootstrap timeout, so past it the room can no longer be served, and
+        preallocating it would only hold KV pages for a pull the prefill
+        refuses.
         """
-        if self.init_time is not None or status != KVPoll.Bootstrapping:
+        if self.init_time is not None or status not in (
+            KVPoll.Bootstrapping,
+            KVPoll.WaitingForInput,
+        ):
             return None
         elapsed = time.time() - self._handshake_start
         if elapsed < self._handshake_timeout:
             return None
+        if status == KVPoll.Bootstrapping:
+            stage = (
+                "KVPoll.Bootstrapping before its KV metadata was sent to the prefill"
+            )
+        else:
+            stage = (
+                "KVPoll.WaitingForInput for KV pages on the decode. The prefill "
+                "gives up on a request the decode has not asked for by then"
+            )
         return (
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in "
-            "KVPoll.Bootstrapping before its KV metadata was sent to the "
-            "prefill. Raise SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT to wait "
-            "longer."
+            f"{stage}. Raise SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT on both "
+            "the prefill and the decode to wait longer."
         )
 
     def abort(self):

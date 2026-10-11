@@ -18,6 +18,13 @@ The decode sends the pull request only after it reserved the request's KV
 pages, and the prefill holds the request in its bootstrap queue until that
 request (or a reshard or pipeline request) arrives, so prefill KV is never
 computed for a decode that has no pages for it.
+Both sides bound that wait with `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`, each
+counted from when it received the request: the prefill fails a room the decode
+has not asked for, and the decode fails a room still waiting for the handshake
+or for KV pages. Set it the same on both. A prefill that receives a pull,
+reshard, or pipeline request for a room it has already failed answers with
+`RAIDEN_ROOM_FAILED`, and the decode fails the room at once instead of holding
+its pages until `SGLANG_DISAGGREGATION_WAITING_TIMEOUT`.
 Both sides drain `poll_stats_with_details()` in `poll()` — prefill frees on
 `sent`, decode runs on `received`. Each settled transfer carries raiden's finish
 time; on TPU the prefill's `prefill_transfer_kv_cache` stage ends there, not at

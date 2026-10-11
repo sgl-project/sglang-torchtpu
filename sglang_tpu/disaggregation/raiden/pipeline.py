@@ -763,8 +763,15 @@ class PipelineTransfer:
             # Producer frames call the controller, so they run outside the
             # manager's state lock.
             with self.lock:
-                if not mgr.is_aborted(room):
+                with mgr._state_lock:
+                    failed_reason = mgr._tombstone_reason_locked(room)
+                if failed_reason is None:
                     self._on_producer_message(room, msg)
+            if failed_reason is not None and msg[0] == MessageTag.PIPELINE_REQ:
+                mgr._require_frames(msg, MessageTag.PIPELINE_REQ, 4)
+                mgr._reply_room_failed(
+                    room=room, endpoint=msg[2].decode(), reason=failed_reason
+                )
             return
         with self.lock, mgr._state_lock:
             if room in mgr._aborted:

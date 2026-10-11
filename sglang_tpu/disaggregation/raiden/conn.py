@@ -70,6 +70,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    RoomFailed,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 
@@ -125,6 +126,7 @@ class RaidenKVManager(
             Chunk.TAG: self._on_chunk,
             ReshardChunk.TAG: self._on_reshard_chunk,
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
+            RoomFailed.TAG: self._on_room_failed,
         }
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
