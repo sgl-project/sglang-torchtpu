@@ -83,13 +83,18 @@ def _estimate_hicache_bytes(
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
 ):
-    """Reduce the default HiCache ratio until this machine's host pools fit.
+    """Budget host pools together and reduce the default HiCache ratio to fit.
 
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
     """
     fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    if not enabled:
         yield
+        return
+    if fraction is None:
+        # Explicit sizing opts out of shrinking, not aggregate admission.
+        with host_memory_budget_scope(host_memory_budget_bytes()):
+            yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)

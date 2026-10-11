@@ -90,6 +90,57 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
 
+    def test_explicit_sizing_keeps_aggregate_admission(self):
+        """Explicit sizing must reject combined pools that exceed one host budget."""
+        pool = MHATokenToKVPool(
+            size=128,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        for config in ({"hicache_ratio": 2.0}, {"hicache_size": 16_384 / 1e9}):
+            with (
+                self.subTest(config=config),
+                get_context().override_server_args(
+                    enable_hierarchical_cache=True,
+                    hicache_host_memory_fraction=None,
+                    **config,
+                ),
+                patch.object(base, "ranks_per_host", return_value=4),
+                patch.object(
+                    base,
+                    "available_host_memory_bytes",
+                    return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 20_000 * 4,
+                ),
+                sizing.auto_size_hicache(None, None, enabled=True),
+            ):
+                memory = get_memory()
+                host = MHATokenToKVPoolHost(
+                    pool,
+                    memory.hicache_ratio,
+                    memory.hicache_size,
+                    2,
+                    "layer_first",
+                    pin_memory=False,
+                    device="cpu",
+                )
+                self.assertEqual(host.size, 258)
+                with self.assertRaisesRegex(ValueError, "Not enough host memory"):
+                    MHATokenToKVPoolHost(
+                        pool,
+                        memory.hicache_ratio,
+                        memory.hicache_size,
+                        2,
+                        "layer_first",
+                        pin_memory=False,
+                        device="cpu",
+                    )
+            self.assertIsNone(base._host_memory_budget.get())
+
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):
         """With only --enable-hierarchical-cache the default ratio shrinks to the
         per-rank budget, pools book one snapshot, and an explicit ratio opts out."""
