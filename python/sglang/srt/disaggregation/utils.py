@@ -346,6 +346,7 @@ def poll_and_all_reduce_with_staging(
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
     additional_groups: Optional[Iterable[dist.ProcessGroup]] = None,
+    pollers=None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -355,8 +356,9 @@ def poll_and_all_reduce_with_staging(
             staging_handler.advance_scatter(decode_req)
 
     # allow test injection of failure probability at runtime
-    receivers = [dr.kv_receiver for dr in decode_reqs]
-    raw_polls = _poll_with_failure_injection(receivers)
+    if pollers is None:
+        pollers = [dr.kv_receiver for dr in decode_reqs]
+    raw_polls = _poll_with_failure_injection(pollers)
     for i, decode_req in enumerate(decode_reqs):
         if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
             decode_req
@@ -374,7 +376,7 @@ def poll_and_all_reduce_with_staging(
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
     groups = [gloo_group, *(additional_groups or [])]
-    return _reduce_status_and_gate_group_failure(raw_polls, receivers, groups)
+    return _reduce_status_and_gate_group_failure(raw_polls, pollers, groups)
 
 
 #########################

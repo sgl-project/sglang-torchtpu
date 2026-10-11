@@ -2736,15 +2736,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
+    def _pollers(self) -> list:
+        if self.scheduler.enable_decode_hicache:
+            return [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
+        return [dr.kv_receiver for dr in self.queue]
+
     def _poll_with_metadata_gate(self) -> List[int]:
-        pollers = (
-            [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
-            if self.scheduler.enable_decode_hicache
-            else [dr.kv_receiver for dr in self.queue]
-        )
         attn_cp_cpu_group = getattr(self, "attn_cp_cpu_group", None)
         return poll_and_all_reduce(
-            pollers,
+            self._pollers(),
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
@@ -2763,6 +2763,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             additional_groups=(
                 [attn_cp_cpu_group] if attn_cp_cpu_group is not None else None
             ),
+            pollers=self._pollers(),
         )
 
     def _init_staging_handler(self, kv_manager):
@@ -2810,22 +2811,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
-            hicache_restore_status = decode_req.hicache_restore_status
-            if (
-                poll == KVPoll.Failed
-                or hicache_restore_status == HiCacheRestoreResult.FAILED
-            ):
+            if poll == KVPoll.Failed:
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
-                if poll == KVPoll.Failed:
-                    try:
-                        decode_req.kv_receiver.failure_exception()
-                    except Exception as e:
-                        error_message += f" with exception {e}"
-                        is_propagated = getattr(e, "is_from_another_rank", False)
+                try:
+                    decode_req.kv_receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+                if decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED:
+                    is_propagated = False
+                    error_message += " (HiCache local restore failed on this rank)"
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -2894,11 +2893,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req
                     ):
                         continue
-                if (
-                    self.scheduler.enable_decode_hicache
-                    and hicache_restore_status == HiCacheRestoreResult.PENDING
-                ):
-                    continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
