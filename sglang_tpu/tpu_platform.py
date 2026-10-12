@@ -1165,6 +1165,9 @@ class TpuSRTPlatform(SRTPlatform):
         os.environ.setdefault(
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
         )
+        # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
+        # synchronize) called by SGLang's generic runtime bootstrap.
+        os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
 
         # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
         # read by libtpu at init, so it MUST be set before `import torch_tpu`.

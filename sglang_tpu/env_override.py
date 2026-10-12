@@ -119,6 +119,7 @@ def _set_renamed_compilation_cache_envs() -> list[str]:
 
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
+    os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
     added = _set_renamed_compilation_cache_envs()
     if added:
         logger.info(
