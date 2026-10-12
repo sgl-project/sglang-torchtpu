@@ -23,6 +23,7 @@ from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     derive_attn_tp_size,
@@ -162,7 +163,10 @@ def handle_context_parallelism(server_args: Any):
         assert view.ep_size * cfg.moe_dp_size <= cfg.tp_size, (
             "ep_size * moe_dp_size must be less than or equal to tp_size"
         )
-        assert cfg.pp_size == 1, "PP is not supported with context parallelism"
+        # A platform may let a pipeline stage replicate experts over its own devices.
+        assert cfg.pp_size == 1 or current_platform.supports_moe_dp_pipeline_stages(), (
+            "moe_dp_size > 1 is not supported with pp_size > 1 on this platform"
+        )
 
         if view.ep_size > 1:
             assert view.ep_size * cfg.moe_dp_size == cfg.tp_size, (

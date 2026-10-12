@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HookRegistry entries (``sglang.srt.plugins`` entry point). Empty by design.
+"""HookRegistry entries (``sglang.srt.plugins`` entry point). TPU worker initialization hooks.
 
 Every hook is tracked debt and carries a header: Why / How (hook type and
 target) / Upstream PR or issue / Remove when. A REPLACE on a method longer than
@@ -10,10 +10,20 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+
 logger = logging.getLogger(__name__)
 
 # (target, hook, hook_type) triples.
-HOOKS: list[tuple] = []
+
+HOOKS: list[tuple] = [
+    (
+        "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
+        initialize_dense_moe_config,
+        HookType.AFTER,
+    ),
+]
 
 _registered = False
 

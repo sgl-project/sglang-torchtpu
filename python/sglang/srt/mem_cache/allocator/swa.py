@@ -450,27 +450,46 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
+        out_indices_cpu: Optional[torch.Tensor] = None,
     ):
+        """``out_indices_cpu``: optional caller-owned host (bs,) buffer filled
+        with the returned full-attention locations. Requires a host-resident
+        ``last_loc`` and inner allocators that accept it (TPU)."""
         assert self.page_size > 1
+        full_alloc_kwargs = {}
+        if out_indices_cpu is not None:
+            full_alloc_kwargs["out_indices_cpu"] = out_indices_cpu
         if self._swa_req_ring:
             # See alloc_extend: slot-addressed ring, so full-attention KV only.
             return self.full_attn_allocator.alloc_decode(
-                seq_lens, seq_lens_cpu, last_loc
+                seq_lens, seq_lens_cpu, last_loc, **full_alloc_kwargs
             )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+        # Host copy of the SWA locations as well, so the mapping update below
+        # reads neither result back from the device.
+        swa_indices_cpu = None
+        swa_alloc_kwargs = {}
+        if out_indices_cpu is not None:
+            swa_indices_cpu = torch.empty_like(out_indices_cpu)
+            swa_alloc_kwargs["out_indices_cpu"] = swa_indices_cpu
 
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
+            seq_lens, seq_lens_cpu, last_loc, **full_alloc_kwargs
         )
         alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, swa_last_loc
+            seq_lens, seq_lens_cpu, swa_last_loc, **swa_alloc_kwargs
         )
 
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        if _is_npu:
+        if out_indices_cpu is not None:
+            mapping = self.full_to_swa_index_mapping
+            mapping[out_indices_cpu.to(mapping.device, torch.int64)] = (
+                swa_indices_cpu.to(mapping.device, torch.int64)
+            )
+        elif _is_npu:
             indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
             torch_npu.npu_scatter_nd_update_(
                 self.full_to_swa_index_mapping,

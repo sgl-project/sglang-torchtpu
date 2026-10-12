@@ -28,7 +28,7 @@ class TestUnquantTpuMoe(CustomTestCase):
         )
         torch.testing.assert_close(
             masked_ids,
-            torch.tensor([[1, 0], [0, 0]], dtype=torch.int32),
+            torch.tensor([[1, -1], [-1, 0]], dtype=torch.int32),
         )
         # Inputs are not mutated.
         torch.testing.assert_close(
@@ -66,7 +66,21 @@ class TestUnquantTpuMoe(CustomTestCase):
             masked_weights, torch.tensor([[0.0, 0.5]], dtype=torch.float32)
         )
         torch.testing.assert_close(
-            masked_ids, torch.tensor([[0, 0]], dtype=torch.int32)
+            masked_ids, torch.tensor([[-1, 0]], dtype=torch.int32)
+        )
+
+    def test_padded_slots_stay_dropped(self):
+        # TopK marks padded tokens -1; they stay -1 with zero weight on rank 0.
+        topk_weights = torch.tensor([[0.0, 0.0], [0.3, 0.7]], dtype=torch.float32)
+        topk_ids = torch.tensor([[-1, -1], [1, 0]], dtype=torch.int32)
+
+        masked_weights, masked_ids = mask_tpu_moe_non_local_experts(
+            topk_weights, topk_ids, num_local_experts=2, moe_ep_rank=0
+        )
+
+        torch.testing.assert_close(masked_weights, topk_weights)
+        torch.testing.assert_close(
+            masked_ids, torch.tensor([[-1, -1], [1, 0]], dtype=torch.int32)
         )
 
 

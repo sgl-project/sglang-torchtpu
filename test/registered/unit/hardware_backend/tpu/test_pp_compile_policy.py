@@ -434,11 +434,14 @@ class TestShimProxyCheck(CustomTestCase):
         self.assertIs(compiled.call_args.kwargs["pp_proxy_tensors"], proxy)
 
     def test_shim_rejects_a_proxy_from_another_bucket_before_compiling(self):
+        """The rejection leaves the batch as the caller passed it."""
         shim, compiled = _shim(_pp_group(first=False, last=False))
         fb = _forward_batch(64)
+        fb.is_prefill_only = True
         with self.assertRaisesRegex(ValueError, "different token buckets"):
             shim(fb.input_ids, None, fb, pp_proxy_tensors=_proxy(32))
         compiled.assert_not_called()
+        self.assertIs(fb.is_prefill_only, True)
 
     def test_first_stage_drops_a_proxy(self):
         shim, compiled = _shim(_pp_group(first=True, last=False))
@@ -452,6 +455,26 @@ class TestShimProxyCheck(CustomTestCase):
         proxy = _proxy(64)
         shim(fb.input_ids, None, fb, pp_proxy_tensors=proxy)
         self.assertIs(compiled.call_args.kwargs["pp_proxy_tensors"], proxy)
+
+    def _cp_layout(self, local_rows: int):
+        return SimpleNamespace(
+            host=SimpleNamespace(cp_size=2, local_rows_padded=local_rows),
+            local_rows=torch.arange(local_rows),
+        )
+
+    def test_later_stages_take_local_rows_and_fit_the_proxy_to_them(self):
+        shim, compiled = _shim(_pp_group(first=False, last=False))
+        shim._attn_cp_size = 2
+        fb = _forward_batch(48)
+        fb.positions = torch.arange(48)
+        fb._tpu_cp_layout = self._cp_layout(32)
+        shim(fb.input_ids, fb.positions, fb, pp_proxy_tensors=_proxy(64))
+        args, kwargs = compiled.call_args
+        self.assertEqual(args[0].shape[0], 32)
+        self.assertNotIn("cp_local_rows", kwargs)
+        self.assertEqual(
+            kwargs["pp_proxy_tensors"].tensors["hidden_states"].shape[0], 32
+        )
 
     def test_default_none_proxy_is_still_dropped(self):
         shim, compiled = _shim(_pp_group(first=False, last=False))

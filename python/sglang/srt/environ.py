@@ -1970,7 +1970,9 @@ class Envs:
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there.
+    # and tune from there. Below it, batches of up to 2048 routed rows also
+    # take the sort-free dense rank route, and one-token batches the
+    # route-meta kernel.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).

@@ -16,7 +16,7 @@ import unittest
 import torch
 
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.pp_wave import PPWave
+from sglang_tpu.pp_wave import PPWave, pipeline_permutation
 
 ROWS, HIDDEN = 8, 4
 
@@ -286,6 +286,35 @@ class TestWaveGuards(CustomTestCase):
         wave = _wave(2, 3)
         wave._launcher = wrong
         self.assertFalse(wave.probe())
+
+    def test_probe_tells_the_device_columns_apart(self):
+        def from_device(index):
+            return lambda x: torch.full_like(x, float(index + 1))
+
+        # Stage 2, column 1 of 2 receives from stage 1: device 3 is its column.
+        wave = _wave(2, 3)
+        wave._launcher = from_device(3)
+        self.assertTrue(wave.probe(column=1, columns=2))
+        wave = _wave(2, 3)
+        wave._launcher = from_device(2)
+        self.assertFalse(wave.probe(column=1, columns=2))
+
+    def test_permutation_forms_one_cycle_per_column(self):
+        # Column 0: ranks 0,2,4,6; column 1: ranks 1,3,5,7.
+        cycles = ((0, 2), (2, 4), (4, 6), (6, 0), (1, 3), (3, 5), (5, 7), (7, 1))
+        for stage in range(4):
+            for column in range(2):
+                with self.subTest(stage=stage, column=column):
+                    perm = pipeline_permutation(
+                        pp_ranks=tuple(range(column, 8, 2)),
+                        stage_ranks=(2 * stage, 2 * stage + 1),
+                        column=column,
+                    )
+                    self.assertEqual(perm, cycles)
+        self.assertEqual(
+            pipeline_permutation(pp_ranks=(2, 0, 1), stage_ranks=(2,), column=0),
+            ((2, 0), (0, 1), (1, 2)),
+        )
 
 
 if __name__ == "__main__":

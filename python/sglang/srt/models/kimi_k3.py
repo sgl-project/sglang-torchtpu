@@ -104,6 +104,9 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    mla_absorbed_weight_layout,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
@@ -1078,6 +1081,7 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1198,7 +1202,11 @@ class KimiK3MoE(nn.Module):
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+            )
         if not (_is_npu and self._sbo_shared_overlap):
             issue_shared()
 
@@ -1503,7 +1511,17 @@ class KimiK3MoE(nn.Module):
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_unfused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                # TopK marks padded rows -1 for the TPU fused MoE to drop. Off
+                # TPU, K3's MoE paths are not validated with -1 ids.
+                num_token_non_padded=(
+                    forward_batch.moe_num_token_non_padded()
+                    if _is_tpu and forward_batch is not None
+                    else None
+                ),
+            )
         if use_dp:
             global_out = out
             out = get_local_dp_buffer(_dp_local_buffer_group())
@@ -1551,7 +1569,8 @@ class KimiK3DeltaAttention(nn.Module):
         self.num_k_heads = config.linear_attn_config["num_heads"]
         self.num_v_heads = config.linear_attn_config["num_heads"]
         self.head_k_dim = config.linear_attn_config["head_dim"]
-        self.head_v_dim = config.v_head_dim
+        # KDA value heads use the linear-attention head dim, as in kimi_linear.
+        self.head_v_dim = config.linear_attn_config["head_dim"]
         self.layer_idx = layer_idx
         self.prefix = prefix
         assert self.num_heads % self.attn_tp_size == 0
@@ -1826,6 +1845,10 @@ class KimiK3DeltaAttention(nn.Module):
         )
         # KDA safe gate: checkpoint trained with gate_lower_bound=-5.0
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+        if _is_tpu and self.use_full_rank_gate:
+            # forward_qkvbfg_fused hands the TPU KDA op the whole [q, k, v, g]
+            # projection; the op reads q/k/v from its leading columns.
+            self.attn.fused_qkvg = True
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
@@ -1882,15 +1905,36 @@ class KimiK3DeltaAttention(nn.Module):
         self._bfa_fa_size, self._bfa_b_size = sizes
 
     def _bind_tpu_attn_weights(self) -> None:
-        # TPU weight materialization re-creates these parameters after __init__
-        # bound them; rebind once post-load, never inside the compiled forward.
-        self.attn.conv_weights = self.qkv_conv1d.weight.squeeze(1)
+        # Bound post-load, not inside the compiled forward. The conv weight is
+        # the [dim, 1, K] parameter itself: torch_tpu would re-materialize a
+        # view of it on every call. A_log is an [n_v] copy, one reason
+        # post_load_weights rejects online weight updates on TPU.
+        self.attn.conv_weights = self.qkv_conv1d.weight
         self.attn.bias = self.qkv_conv1d.bias
-        # The kernel takes A_log as [n_v].
         self.attn.A_log = nn.Parameter(
             self.A_log.detach().reshape(-1).clone(), requires_grad=False
         )
         self.attn.dt_bias = self.dt_bias
+        # The kernel reads one packed f32 copy of conv / dt_bias / A_log, so
+        # dt_bias is copied too. The packed operand has no conv bias, and
+        # qkv_conv1d is built without one.
+        assert self.attn.bias is None, "packed KDA weights carry no conv bias"
+        self.attn.packed_kernel_weights = self._pack_tpu_kda_weights()
+
+    def _pack_tpu_kda_weights(self) -> torch.Tensor:
+        """conv, dt_bias and A_log in one f32 operand (kda_layout): XLA stages
+        every small kernel operand with its own copy."""
+        from sglang_tpu.kda_layout import pack_kda_weights
+
+        attn = self.attn
+        packed = pack_kda_weights(
+            attn.conv_weights,
+            attn.dt_bias,
+            attn.A_log,
+            attn.num_v_heads,
+            attn.head_k_dim,
+        )
+        return packed.to(attn.conv_weights.device)
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -2113,6 +2157,11 @@ class KimiK3DeltaAttention(nn.Module):
             else:
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+                if _is_tpu:
+                    # The TPU KDA op reads q/k/v as the leading columns of the
+                    # fused [q, k, v, g] output (attn.fused_qkvg); a split view
+                    # would be copied whole at the op boundary.
+                    qkv = fused_states
                 beta = self.b_proj(hidden_states)[0]
                 f_a = self.f_a_proj(hidden_states)[0]
                 forget_gate = f_a if defer_f_b else self.f_b_proj(f_a)[0]
@@ -3527,8 +3576,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            self_attn.w_kc, self_attn.w_vc = mla_absorbed_weight_layout(w_kc, w_vc)
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
             if _is_hip and (
                 scale_folded_into_weight
@@ -3584,6 +3632,18 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _is_tpu:
                     layer.self_attn._bind_tpu_attn_weights()
                 layer.self_attn._prepare_fused_decode()
+        if _is_tpu and self.config.linear_layer_ids:
+            # The TPU KDA kernel reads copies of the conv weight, dt_bias and
+            # A_log made by _bind_tpu_attn_weights (packed_kernel_weights);
+            # writes that skip post-load (load_format="direct", custom loaders)
+            # would leave them stale. The updater's derived-cache guard rejects
+            # every update path. Published on the model from the config so every
+            # PP stage rejects alike, with or without KDA layers.
+            self._derived_weight_cache_error = (
+                "Online weight updates are not supported for Kimi-K3 on TPU: the "
+                "KDA kernel reads conv weight / dt_bias / A_log copies built at "
+                "load time. Restart the server to change weights."
+            )
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

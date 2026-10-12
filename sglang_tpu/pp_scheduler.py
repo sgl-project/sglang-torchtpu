@@ -33,7 +33,9 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
     policy = model_runner.compile_policy
     assert isinstance(policy, DecoderTpuCompilePolicy), type(policy)
     return build_pp_wave(
-        scheduler.pp_group,
+        pp_group=scheduler.pp_group,
+        stage_group=scheduler.tp_group,
+        world_group=scheduler.world_group,
         rows=policy.max_padded_tokens(),
         hidden=int(model_runner.model_config.hidden_size),
         dtype=model_runner.dtype,

@@ -28,6 +28,19 @@ class TpuAsyncCopyEvent:
         self.submitted.result()
         self.event.synchronize()
 
+    def query(self) -> bool:
+        """Return whether synchronize() would return without blocking.
+
+        The worker records the event last and an unrecorded event reports
+        done, so the event counts only once the submission has finished. A
+        failed submission reports done so synchronize() raises its error.
+        """
+        if not self.submitted.done():
+            return False
+        if self.submitted.exception() is not None:
+            return True
+        return self.event.query()
+
 
 class TPUAsyncCopyWorker:
     """Keep TPU buffer-materialization waits off the scheduler thread.

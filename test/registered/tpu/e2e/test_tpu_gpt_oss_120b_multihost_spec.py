@@ -8,15 +8,14 @@ from sglang.test.tpu import model_config_main
 
 register_tpu_ci(
     est_time=3600,
-    suite="nightly-tpu-multihost",
+    suite="external-nightly-2x2x2",
     nightly=True,
     labels=["multihost", "gpt-oss-120b", "spec"],
 )
 
 MULTIHOST_LAUNCH = {
-    "hosts": 2,
     "launch_script": "recipe/gpt_120b_spec_mh.sh",
-    "weights_pvc": "model-weights",
+    "weights": "gpt-oss-120b",
 }
 
 SERVED_MODEL_NAME = "gpt-oss-120b"

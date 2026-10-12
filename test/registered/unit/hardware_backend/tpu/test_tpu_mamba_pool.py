@@ -12,8 +12,9 @@ layout and slot bookkeeping that the fused Pallas GDN kernel depends on:
   lower to slice + dynamic-update-slice against a view of a stacked pool. On
   Qwen3.5-397B that view cost ~0.70 ms per decode step — 1.4x the GDN kernel
   itself — while producing byte-identical output;
-* conv buffer is ``[size+1, K-1, conv_dim]`` per layer (trailing axes
-  swapped vs. the GPU pool's ``[..., conv_dim, K-1]``);
+* conv buffer is ``[size+1, K-1, 1, conv_dim]`` per layer (the kernel's
+  rank-4 form; any other shape is re-tiled on every call), for both GDN
+  ``(conv_dim, K-1)`` and Kimi ``(K-1, conv_dim)`` cache shapes;
 * recurrent buffer is ``[size+1, n_v, d_k, d_v]`` per layer (swapped vs.
   the GPU ``[..., n_v, d_v, d_k]``);
 * slot 0 is reserved; ``alloc``/``free`` cycle real slots ``1..size``;
@@ -32,6 +33,8 @@ import unittest
 import torch
 
 from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
@@ -126,12 +129,37 @@ class TestTpuMambaPool(CustomTestCase):
         for layer in range(num_layers):
             self.assertEqual(
                 list(pool.mamba_cache.conv[0][layer].shape),
-                [self.SIZE + 1, self.K - 1, conv_dim],
+                [self.SIZE + 1, self.K - 1, 1, conv_dim],
             )
             self.assertEqual(
                 list(pool.mamba_cache.temporal[layer].shape),
                 [self.SIZE + 1, self.N_V, self.D_K, self.D_V],
             )
+
+    def test_kimi_conv_layout(self):
+        # KimiLinearStateShape stores (K-1, conv_dim), not (conv_dim, K-1).
+        shape = KimiLinearStateShape.create(
+            tp_world_size=1,
+            num_heads=self.N_V,
+            head_dim=self.D_V,
+            conv_kernel_size=self.K,
+        )
+        cp = KimiLinearCacheParams(
+            dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
+            layers=self.LAYERS,
+            shape=shape,
+        )
+        pool = TpuMambaPool(
+            size=self.SIZE,
+            spec_state_size=0,
+            cache_params=cp,
+            mamba_layer_ids=self.LAYERS,
+            device="cpu",
+        )
+        self.assertEqual(
+            list(pool.mamba_cache.conv[0][0].shape),
+            [self.SIZE + 1, self.K - 1, 1, 3 * self.N_V * self.D_V],
+        )
 
     def test_layers_are_independent_allocations(self):
         """Every layer's state must own its buffer.
@@ -154,7 +182,9 @@ class TestTpuMambaPool(CustomTestCase):
         conv_dim = self.N_KQ * self.D_K * 2 + self.N_V * self.D_V
         # dense layer index 0 corresponds to global layer id LAYERS[0].
         per = pool.mamba2_layer_cache(0)
-        self.assertEqual(list(per.conv[0].shape), [self.SIZE + 1, self.K - 1, conv_dim])
+        self.assertEqual(
+            list(per.conv[0].shape), [self.SIZE + 1, self.K - 1, 1, conv_dim]
+        )
         self.assertEqual(
             list(per.temporal.shape), [self.SIZE + 1, self.N_V, self.D_K, self.D_V]
         )

@@ -666,6 +666,8 @@ class TestBootstrapQueueAdmission(unittest.TestCase):
                 "sglang.srt.disaggregation.prefill.get_disagg",
                 return_value=SimpleNamespace(
                     optimistic_prefill_attempts=0,
+                    max_queued_requests=None,
+                    enable_priority_scheduling=False,
                     disaggregation_decode_allocation_policy="early",
                 ),
             ),

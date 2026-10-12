@@ -8,7 +8,7 @@ expected by the Triton GDN kernels. This subclass reallocates the two state
 buffers on the TPU device in the layout expected by the fused Pallas kernel
 :func:`sglang_tpu.attention.pallas.gdn.fused_conv1d_gdn`:
 
-* ``conv``:      ``[size + 1, kernel_size - 1, conv_dim]``    (one per layer)
+* ``conv``:      ``[size + 1, kernel_size - 1, 1, conv_dim]`` (one per layer)
 * ``recurrent``: ``[size + 1, num_v_heads, d_k, d_v]``        (one per layer)
 
 versus the GPU layouts ``[..., conv_dim, kernel_size - 1]`` and
@@ -33,7 +33,10 @@ from typing import List, Optional
 import msgspec
 import torch
 
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.configs.mamba_utils import (
+    BaseLinearStateParams,
+    KimiLinearStateShape,
+)
 from sglang.srt.mem_cache.memory_pool import MambaPool, get_tensor_size_bytes
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -110,7 +113,10 @@ class TpuMambaPool(MambaPool):
                 "Page-major envelope mamba layout is CUDA-only; not supported on TPU."
             )
 
-        conv_state_shapes = cache_params.shape.conv  # list of (conv_dim, K-1)
+        # (conv_dim, K-1) per conv kind; Kimi already stores (K-1, conv_dim).
+        conv_state_shapes = cache_params.shape.conv
+        if isinstance(cache_params.shape, KimiLinearStateShape):
+            conv_state_shapes = [(dim, km1) for km1, dim in conv_state_shapes]
         # temporal (GPU layout): (num_v_heads, head_dim=d_v, state_size=d_k)
         n_v, d_v, d_k = cache_params.shape.temporal
 
@@ -155,12 +161,14 @@ class TpuMambaPool(MambaPool):
         # each layer's state owns its storage, so the Pallas bridge's write-back
         # aliases in place instead of lowering to slice + dynamic-update-slice.
         #
-        # conv: kernel-native [size+1, K-1, conv_dim] per layer
-        # (GPU stores [..., conv_dim, K-1]; we swap the trailing two axes).
+        # conv: kernel-native [size+1, K-1, 1, conv_dim] per layer (GPU stores
+        # [..., conv_dim, K-1]). The kernel reshapes the pool to this rank-4
+        # form, which on TPU re-tiles the whole pool twice per layer call
+        # unless it is stored so. Same bytes as [size+1, K-1, conv_dim].
         conv_state = [
             [
                 torch.zeros(
-                    (size + 1, conv_dim_km1[1], conv_dim_km1[0]),
+                    (size + 1, conv_dim_km1[1], 1, conv_dim_km1[0]),
                     dtype=conv_dtype,
                     device=device,
                 )

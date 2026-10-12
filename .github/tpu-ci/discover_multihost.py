@@ -32,7 +32,11 @@ def _literal(node):
         return None
 
 
-def _scan(root, suite, nightly_only):
+def _scan(root, suite, nightly_only, launch_var="MULTIHOST_LAUNCH"):
+    """{path: launch dict} for files registered to `suite` that declare `launch_var`.
+
+    launch_var=None keeps every registered file, with an empty dict as its spec.
+    """
     found = {}
     for path in glob.glob(f"{root}/**/*.py", recursive=True):
         try:
@@ -59,9 +63,11 @@ def _scan(root, suite, nightly_only):
                     registered = True
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
-                    if isinstance(t, ast.Name) and t.id == "MULTIHOST_LAUNCH":
+                    if isinstance(t, ast.Name) and t.id == launch_var:
                         launch = _literal(node.value)
-        if registered and isinstance(launch, dict):
+        if registered and launch_var is None:
+            found[path] = {}
+        elif registered and isinstance(launch, dict):
             found[path] = launch
     return found
 

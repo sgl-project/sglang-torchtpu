@@ -149,6 +149,8 @@ class TestWaveRows(CustomTestCase):
     def _rows(self, compile_policy):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace()
+        scheduler.tp_group = SimpleNamespace()
+        scheduler.world_group = SimpleNamespace()
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
                 compile_policy=compile_policy,

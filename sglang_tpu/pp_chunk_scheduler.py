@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prefill admission using a profiled TPU pipeline step budget."""
 
+from __future__ import annotations
+
 import logging
+from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
     MAX_PREFIX_MATCHED_WAITING_REQS,
     AddReqResult,
@@ -26,10 +31,13 @@ from sglang_tpu.pp_chunks import (
     uses_dynamic_chunks,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
+
 logger = logging.getLogger(__name__)
 
 
-def pending_step_limit(scheduler):
+def pending_step_limit(scheduler: Scheduler) -> int:
     """Spread outstanding prefill work over stages, rounded up to a bucket.
 
     Outstanding work is the unscheduled tokens of waiting and partial
@@ -78,7 +86,7 @@ def pending_step_limit(scheduler):
     return min(cost.buckets[-1], max(granule, -(-share // granule) * granule))
 
 
-def _prefill_tokens(batch):
+def _prefill_tokens(batch: ScheduleBatch) -> int:
     """Prefill tokens of a launched batch. A decode batch keeps the token
     count of the prefill it was built from, and a mixed batch counts one
     token per decode row."""
@@ -90,7 +98,9 @@ def _prefill_tokens(batch):
 class TpuPipelinePrefillAdder(PrefillAdder):
     """Apply time and attention limits alongside the allocator's KV budgets."""
 
-    def __init__(self, *args, cost, step_limit, **kwargs):
+    def __init__(
+        self, *args: Any, cost: StepCostModel, step_limit: int, **kwargs: Any
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.cost = cost
         self.step_limit = step_limit
@@ -104,14 +114,16 @@ class TpuPipelinePrefillAdder(PrefillAdder):
             for req in self.running_batch.reqs[:mixed]:
                 self._account(1, len(req.origin_input_ids) + len(req.output_ids) - 1)
 
-    def _account(self, tokens, prefix):
+    def _account(self, tokens: int, prefix: int) -> None:
         self.step_tokens += tokens
         self.step_pairs += tokens * prefix
         self.step_squares += tokens * tokens
         self.step_schedule += self.cost.pairs(tokens, prefix)
 
     @contextmanager
-    def _request_budget(self, req, *, include_pending_host_load=True):
+    def _request_budget(
+        self, req: Req, *, include_pending_host_load: bool = True
+    ) -> Iterator[int]:
         original = self.rem_chunk_tokens
         prefix = len(req.prefix_indices)
         if include_pending_host_load and req.needs_host_load_back():
@@ -155,15 +167,19 @@ class TpuPipelinePrefillAdder(PrefillAdder):
             if len(self.can_run_list) > before:
                 self._account(req.extend_range.length, len(req.prefix_indices))
 
-    def add_chunked_req(self, req):
+    def add_chunked_req(self, req: Req) -> Optional[Req]:
         with self._request_budget(req, include_pending_host_load=False) as cap:
             if cap <= 0:
                 return req
             return super().add_chunked_req(req)
 
     def add_one_req(
-        self, req, has_chunked_req, truncation_align_size, chunk_tokens_cap=None
-    ):
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        chunk_tokens_cap: Optional[int] = None,
+    ) -> AddReqResult:
         before = len(self.can_run_list)
         with self._request_budget(req) as cap:
             if cap <= 0:
@@ -184,7 +200,7 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         return self.budget_state() if len(self.can_run_list) > before else result
 
 
-def profile_and_install_cost_model(scheduler):
+def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     """Profile every stage after compilation and share the slowest cost curve."""
     runner = scheduler.tp_worker.model_runner
     if not uses_dynamic_chunks():
@@ -212,7 +228,7 @@ def profile_and_install_cost_model(scheduler):
         )
     from sglang_tpu.pp_profile import profile_cache
 
-    samples = []
+    samples: list[tuple[int, int, float]] = []
     with profile_cache(policy, buckets[-1]):
         for tokens, prefix in profile_points(
             buckets, buckets[-1], runner.model_config.context_len, schedule
@@ -223,9 +239,13 @@ def profile_and_install_cost_model(scheduler):
             policy._run_one(**kwargs)
             elapsed = min(policy._run_one(**kwargs) for _ in range(2))
             samples.append((tokens, prefix, elapsed))
-    reports = [None] * get_parallel().pp_size
+    # Every rank fits one model from every rank's samples, so the devices of a
+    # multi-device stage admit the same chunks.
+    # TODO(yinlin09): all schedulers of a stage must pick identical chunks each step;
+    # let the stage leader decide and broadcast, or check agreement in the stage.
+    reports = [None] * scheduler.world_group.world_size
     torch.distributed.all_gather_object(
-        reports, (samples, schedule), group=scheduler.pp_group.cpu_group
+        reports, (samples, schedule), group=scheduler.world_group.cpu_group
     )
     schedules = [report[1] for report in reports if report[1] is not None]
     cost = StepCostModel.fit(

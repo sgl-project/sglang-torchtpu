@@ -30,7 +30,7 @@ register_tpu_ci(
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "qwen3-0.6b", "logprob"],
 )
-register_tpu_ci(est_time=300, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(est_time=300, suite="external-nightly-1host", nightly=True)
 
 MODEL = "Qwen/Qwen3-0.6B"
 PROMPT = "The capital of France is Paris, and the capital of Italy is"

@@ -63,7 +63,8 @@ class TestMlaBf16Weights(unittest.TestCase):
         )
         for name in ["block_quant_dequant", "block_quant_to_tensor_quant"]:
             exec(extract(utils, name), g)
-        exec(extract(loader, "post_load_weights"), g)
+        for name in ["mla_absorbed_weight_layout", "post_load_weights"]:
+            exec(extract(loader, name), g)
         torch.manual_seed(91011)
         w = (torch.randn(1024, 512) * 25).to(torch.float8_e4m3fn)
         scales = torch.logspace(-4, -1, 32).reshape(8, 4)
@@ -100,6 +101,9 @@ class TestMlaBf16Weights(unittest.TestCase):
         )
         assert torch.equal(treatment.w_kc, k)
         assert torch.equal(treatment.w_vc, v.transpose(1, 2))
+        # TPU: owned contiguous storage, no strided view graph inputs.
+        for t in (treatment.w_kc, treatment.w_vc):
+            assert t._base is None and t.is_contiguous()
         assert torch.equal(treatment.w_kc, results["cuda_reference"].w_kc)
         assert torch.equal(treatment.w_vc, results["cuda_reference"].w_vc)
 

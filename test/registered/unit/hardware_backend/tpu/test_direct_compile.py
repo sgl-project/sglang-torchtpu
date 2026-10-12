@@ -269,6 +269,30 @@ class TestDirectCompile(CustomTestCase):
 
         compile_fn.assert_called_once()
 
+    def test_compiled_op_keyword_call_reuses_positional_warmup(self):
+        """A keyword-argument call must hit the specialization warmed positionally."""
+        artifact = MagicMock(return_value="output")
+
+        @compiled_op()
+        def op(a, b, scale=2):
+            return a * scale + b
+
+        with (
+            patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+            patch.object(
+                direct_compile.CompiledFunction, "_compile", return_value=artifact
+            ) as compile_fn,
+            get_context().override_server_args(tpu_compile_tracer="direct"),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        ):
+            a, b = torch.ones(16, 6), torch.zeros(16, 6)
+            op(a, b)
+            with torch.compiler.set_stance("fail_on_recompile"):
+                op(a=a, b=b)
+                op(b=b, a=a, scale=2)
+
+        compile_fn.assert_called_once()
+
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):
         def fn(value):

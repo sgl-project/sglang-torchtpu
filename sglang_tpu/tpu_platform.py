@@ -260,14 +260,18 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     """Reject server configurations pipeline parallelism on TPU cannot run,
     and pin the scheduler order the stage hand-off needs.
 
-    Every pipeline stage is one process on one device. Activations move over
+    Every device is one process, and a stage is one device, a tensor-parallel
+    pair (--tp-size 2 with --attn-cp-size 1) or one prefill context-parallel
+    group (--tp-size equal to --attn-cp-size). Activations move over
     ICI as one collective-permute launched by every stage in lockstep, so a
     stage's forward waits on launches the other stages issue at the top of
     their next iteration. The scheduler must therefore receive and forward
     the last stage's outputs before it launches a forward, not after: that is
     the async-batch-depth 1 order (depth 0 does the ring exchange after the
-    forward and the two waits form a cycle). Tensor parallelism inside a stage
-    would need the stages to share a second device collective and is rejected.
+    forward and the two waits form a cycle). A stage of several devices runs
+    its own collectives over the stage's devices (this needs a torch_tpu that
+    compiles a collective for its device group only), while the hand-off
+    stays the one collective every stage launches.
     """
     from sglang.srt.arg_groups.overrides import (
         declare_resolution,
@@ -291,12 +295,48 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         declare_resolution(
             server_args, "tpu.apply_server_args_defaults", pp_async_batch_depth=1
         )
-    if cfg.tp_size > 1:
+    stage_is_tp_pair = (
+        cfg.tp_size == 2
+        and cfg.attn_cp_size == 1
+        and not cfg.enable_dp_attention
+        and cfg.ep_size == 1
+    )
+    if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size and not stage_is_tp_pair:
         raise NotImplementedError(
-            "Pipeline parallelism on TPU requires --tp-size 1 "
-            f"(got --tp-size {cfg.tp_size} with --pp-size {pp}): "
-            "tensor parallelism inside a pipeline stage is not supported."
+            "Pipeline parallelism on TPU requires --tp-size 1, a tensor-parallel "
+            "pair (--tp-size 2 with --attn-cp-size 1, no DP attention or expert "
+            "parallelism) or --attn-cp-size equal to --tp-size (got --tp-size "
+            f"{cfg.tp_size} with --attn-cp-size {cfg.attn_cp_size} and --pp-size "
+            f"{pp})."
         )
+    if cfg.dcp_size > 1:
+        raise NotImplementedError(
+            f"Decode context parallelism (--dcp-size {cfg.dcp_size}) is not "
+            f"supported with pipeline parallelism on TPU (--pp-size {pp})."
+        )
+    if cfg.attn_cp_size > 1:
+        if cfg.nnodes > 1:
+            # Only because no multi-host run has validated it with standalone
+            # stage groups; no technical limit is known.
+            raise NotImplementedError(
+                "Pipeline stages made of a context-parallel group run on one host "
+                f"(got --nnodes {cfg.nnodes})."
+            )
+        if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+            raise NotImplementedError(
+                "Pipeline stages made of a context-parallel group support only a "
+                "bf16 KV cache (--kv-cache-dtype auto, bf16 or bfloat16): with an "
+                "fp8 KV cache, Qwen3 served wrong tokens that changed from run to "
+                f"run. Got --kv-cache-dtype {cfg.kv_cache_dtype}."
+            )
+        if cfg.kv_cache_dtype == "auto":
+            logger.info(
+                "Pipeline stages made of a context-parallel group run with "
+                "--kv-cache-dtype bfloat16."
+            )
+            declare_resolution(
+                server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="bfloat16"
+            )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(
             "Speculative decoding "
@@ -316,6 +356,21 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             f"(--pp-size {pp}): only the compiled forward trims the received "
             "activations to the batch's padded token count."
         )
+
+
+def _validate_pd_queue_limit(
+    *, disaggregation_mode: str, max_queued_requests: int | None
+) -> None:
+    """Fail the server when a queue length limit is set and PD is enabled."""
+    if disaggregation_mode == "null" or max_queued_requests is None:
+        return
+    raise ValueError(
+        "--max-queued-requests is not supported with --disaggregation-mode "
+        f"{disaggregation_mode}: the prefill and the decode admit requests "
+        "independently, so a queue cap on one side cannot be enforced "
+        "consistently (a decode-side refusal would discard a finished "
+        "prefill). Remove the flag and shed load at the router."
+    )
 
 
 def _validate_raiden_optimistic_prefill(
@@ -653,6 +708,10 @@ class TpuSRTPlatform(SRTPlatform):
             transfer_backend=cfg.disaggregation_transfer_backend,
             optimistic_prefill_attempts=cfg.optimistic_prefill_attempts,
         )
+        _validate_pd_queue_limit(
+            disaggregation_mode=cfg.disaggregation_mode,
+            max_queued_requests=cfg.max_queued_requests,
+        )
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray
@@ -965,6 +1024,9 @@ class TpuSRTPlatform(SRTPlatform):
         # location space and replicates K/V heads within a DCP group.
         return True
 
+    def supports_moe_dp_pipeline_stages(self) -> bool:
+        return True
+
     def supports_overlap_streams(self) -> bool:
         # torch_tpu serialises all device work on a single implicit PJRT queue:
         # cross-stream ordering (wait_stream / wait_event) is a no-op and a
@@ -1058,6 +1120,14 @@ class TpuSRTPlatform(SRTPlatform):
             "[tpu] Warmup complete; froze torch.compile via "
             "set_stance('fail_on_recompile')."
         )
+
+    def prepare_model_parallel_groups(self) -> None:
+        from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.pp_stage_groups import (
+            make_stage_groups_standalone,
+        )
+
+        make_stage_groups_standalone(get_parallel())
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration

@@ -58,8 +58,13 @@ def get_write_pages_op():
 
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
+    # Tensors only: custom_jax_kernel traces keyword defaults like `interpret` since
+    # torch_tpu 76284a1fa; register write_pages itself once they reach jax.jit static.
+    def _write_pages(block_ids, pages, kv):
+        return write_pages(block_ids, pages, kv)
+
     jax_kernel = _torch_pallas.custom_jax_kernel(
-        write_pages,
+        _write_pages,
         name="jax_kv_write_pages",
         donate_argnums=(2,),
         input_output_aliases={2: 0},

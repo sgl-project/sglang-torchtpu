@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # est_time covers a cold Hugging Face pull; /weights is used when hydrated.
 register_tpu_ci(
     est_time=2700,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "wan2.2-ti2v-5b", "diffusion"],
 )
