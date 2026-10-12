@@ -1,6 +1,7 @@
 """Tests for direct TPU compilation and artifact dispatch."""
 
 import unittest
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -215,8 +216,8 @@ class TestDirectCompile(CustomTestCase):
         def compile_helper(fn, **kwargs):
             compiled = MagicMock(side_effect=fn)
             compiled.cache = {}
-            compiled.warmup_async.side_effect = lambda *args: PendingCall(
-                lambda: compiled(*args)
+            compiled.precompile.side_effect = lambda *args, **kwargs: PendingCall(
+                lambda: None
             )
             return compiled
 
@@ -238,6 +239,42 @@ class TestDirectCompile(CustomTestCase):
                         self.assertEqual(queue.calls, [])
                     self.assertIsNone(warmup_compiled_op(op, x))
                     self.assertTrue(torch.equal(op(x), x * 3))
+
+    def test_precompile_releases_inputs_and_joins_without_execution(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                compiled = direct_compile.direct_compile(
+                    lambda value: value + 1,
+                    specialization_key=lambda value: tuple(value.shape),
+                )
+                artifact = _make_artifact(((2,),))
+                future = MagicMock()
+                if asynchronous:
+                    artifact.executable = None
+                    artifact.pending_compile = future
+
+                def compile_helper(args, kwargs, *, async_compile):
+                    self.assertEqual(async_compile, asynchronous)
+                    return artifact
+
+                with (
+                    patch.object(compiled, "_compile", compile_helper),
+                    patch.object(
+                        direct_compile.tpu_torch_compile, "execute"
+                    ) as execute,
+                ):
+                    inputs = torch.ones(2)
+                    reference = weakref.ref(inputs)
+                    with collect_warmups() as queue:
+                        queue.calls.append(
+                            compiled.precompile(inputs, async_compile=asynchronous)
+                        )
+                        del inputs
+                        self.assertIsNone(reference())
+                        future.get.assert_not_called()
+                    self.assertIsNone(artifact.pending_compile)
+                    self.assertEqual(future.get.call_count, int(asynchronous))
+                    execute.assert_not_called()
 
     def test_compiled_helper_inlines_inside_outer_dynamo_graph(self):
         @compiled_op()
@@ -433,6 +470,46 @@ class TestDirectCompile(CustomTestCase):
             torch.tpu.set_rng_state(original_state)
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_precompile_first_call_preserves_rng_without_recompilation(self):
+        value = torch.ones((2, 7), device="tpu")
+        original_state = torch.tpu.get_rng_state()
+
+        def draw(x):
+            return x + torch.rand_like(x)
+
+        try:
+            for asynchronous in (False, True):
+                with (
+                    self.subTest(asynchronous=asynchronous),
+                    torch.no_grad(),
+                    get_context().override_server_args(tpu_compile_tracer="direct"),
+                    envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+                    envs.SGLANG_DIRECT_COMPILE_ASYNC.override(asynchronous),
+                ):
+                    op = compiled_op(uses_rng=True)(draw)
+                    before = torch.tpu.get_rng_state()
+                    compiler = direct_compile.tpu_torch_compile
+                    with patch.object(
+                        compiler, "execute", wraps=compiler.execute
+                    ) as execute:
+                        with collect_warmups():
+                            warmup_compiled_op(op, value)
+                        execute.assert_not_called()
+                    self.assertTrue(torch.equal(before, torch.tpu.get_rng_state()))
+                    torch.accelerator.synchronize()
+                    misses = torch.tpu._get_cache_misses()
+                    with torch.compiler.set_stance("fail_on_recompile"):
+                        first = op(value)
+                        torch.accelerator.synchronize()
+                    self.assertEqual(torch.tpu._get_cache_misses(), misses)
+                    after = torch.tpu.get_rng_state()
+                    torch.tpu.set_rng_state(before)
+                    self.assertTrue(torch.equal(first.cpu(), draw(value).cpu()))
+                    self.assertTrue(torch.equal(after, torch.tpu.get_rng_state()))
+        finally:
+            torch.tpu.set_rng_state(original_state)
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_registered_helpers_compile_directly_and_match_eager(self):
         from sglang.srt.compilation.compiled_op import (
             get_compiled_ops,
@@ -469,7 +546,11 @@ class TestDirectCompile(CustomTestCase):
                         lambda x: x.cpu() if isinstance(x, torch.Tensor) else x, args
                     )
                     expected = op.__wrapped__(*cpu_args)
+                    torch.accelerator.synchronize()
+                    misses = torch.tpu._get_cache_misses()
                     actual = op(*args)
+                    torch.accelerator.synchronize()
+                    self.assertEqual(torch.tpu._get_cache_misses(), misses, op.__name__)
                     self.assertEqual(
                         tree_util.tree_structure(actual),
                         tree_util.tree_structure(expected),
@@ -484,6 +565,12 @@ class TestDirectCompile(CustomTestCase):
         artifact.pending_compile = MagicMock()
         artifact.pending_compile.get.side_effect = RuntimeError("native compile failed")
         with patch.object(direct_compile.tpu_torch_compile, "execute") as execute:
+            complete = MagicMock()
+            with self.assertRaisesRegex(RuntimeError, "native compile failed"):
+                with collect_warmups() as queue:
+                    queue.calls.append(PendingCall(artifact.wait_for_compile))
+                    queue.completions.append(complete)
+            complete.assert_not_called()
             with self.assertRaisesRegex(RuntimeError, "native compile failed"):
                 artifact(((torch.ones(2),), {}))
             execute.assert_not_called()
