@@ -1,5 +1,6 @@
 """Shared settings for TPU launch recipes."""
 
+import os
 from copy import deepcopy
 
 CONFIG = {
@@ -31,8 +32,10 @@ _FP8_BASE_CONFIG["server_args"].update(
 )
 _FP8_BASE_CONFIG["runtime_env"].update(
     {
-        "HF_HUB_OFFLINE": "0",
-        "TRANSFORMERS_OFFLINE": "0",
+        # Online unless the caller set it, as common_env.sh does: an offline cluster
+        # reads HF repo ids from a staged cache.
+        "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", "0"),
+        "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE", "0"),
         "TORCH_LOGS": "+recompiles",
         "TPU_ENABLE_DIAGNOSTIC_COORDINATOR": "0",
         "TPU_DISABLE_DIAGNOSTIC_COORDINATOR": "1",

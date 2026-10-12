@@ -130,3 +130,10 @@ def _iter_source_files(source_paths: Iterable[Path]) -> list[Path]:
             if path.is_file() and path.suffix == ".py":
                 files.add(path)
     return sorted(files)
+
+
+def initialize_jax_compile_cache() -> None:
+    """Build JAX's persistent compilation cache now instead of on first compile."""
+    from jax._src import compilation_cache
+
+    compilation_cache._initialize_cache()

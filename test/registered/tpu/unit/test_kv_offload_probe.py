@@ -19,7 +19,7 @@ from sglang.test.tpu.utils.kv_offload_probe import (
     validate_probe,
 )
 
-register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 
 def _read(*, completion_tokens: int = 8, spec_verify_ct: int = 4):

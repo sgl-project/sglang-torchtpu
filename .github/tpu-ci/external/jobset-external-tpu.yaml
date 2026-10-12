@@ -1,4 +1,4 @@
-# External multi-host TPU test workload -- ONE JobSet per launch group. Rendered by
+# External TPU test workload -- ONE JobSet per group, one slice. Rendered by
 # .github/tpu-ci/external/render_external_jobset.py from external-topology.yaml. Render vars (do NOT
 # write them as dollar-brace tokens in these comments -- the renderer would substitute them
 # here too):
@@ -10,18 +10,27 @@
 #   NODEPOOL       cloud.google.com/gke-nodepool -- pins the whole gang to ONE slice
 #   ACCELERATOR    cloud.google.com/gke-tpu-accelerator label (tpu7x)
 #   ACTIVE_DEADLINE JobSet activeDeadlineSeconds
-#   LAUNCH_SCRIPT  the launch group's recipe (relative to benchmark/tpu/)
-#   TEST_FILES     space-separated test files rank-0 runs against the server
+#   MODE           launch | self | exec (see "Launch model" below)
+#   LAUNCH_SCRIPT  launch: the group's recipe (relative to benchmark/tpu/)
+#   SUITE          self: the run_suite suite the files register to
+#   EXEC_CMD       exec: the command every host runs
+#   TEST_FILES     space-separated test files of the group
 #   MODEL_PATH     serve model dir (gcsfuse mount path + weights prefix + model subdir)
 #   TP_SIZE/EP_SIZE  parallelism (== HOSTS x devices_per_host)
 #   EXTRA_ARGS     loader/serve flags appended by the recipe (gcsfuse-tuned; see README)
 #   TIMEOUT_PER_FILE per-file timeout for rank-0's live-server run
 #   WEIGHTS_BUCKET / WEIGHTS_MOUNT_OPTIONS / WEIGHTS_MOUNT_PATH   gcsfuse CSI attributes
+#   WEIGHTS_DIR    the bucket's weights/ dir; linked to /weights, the in-project path
 #   EPHEMERAL_LIMIT  gke-gcsfuse ephemeral-storage-limit (must exceed the file cache size)
 #
-# Launch model mirrors the in-project multi-host template: every host runs the launch
-# group's recipe (it owns model + config); rank 0 runs each TEST_FILES entry in LIVE-SERVER
-# mode against the one server; workers serve until the leader tears down, then exit 0.
+# Launch model, by MODE:
+#   * launch -- mirrors the in-project multi-host template: every host runs the group's
+#     recipe (it owns model + config); rank 0 runs each TEST_FILES entry in LIVE-SERVER mode
+#     against the one server; workers serve until the leader tears down, then exit 0.
+#   * self   -- single-host tests that launch their own server. There is no 1-host slice,
+#     so rank 0 drops the slice-wide TPU env and runs each file through run_suite on its
+#     own host; the other ranks exit 0 and idle.
+#   * exec   -- mirrors the in-project exec mode: every host runs EXEC_CMD; rank 0 gates.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
@@ -63,7 +72,7 @@ spec:
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                    sizeLimit: 16Gi
+                    sizeLimit: 64Gi  # tier-2/3 compile caches, as in-project
                 - name: weights
                   csi:
                     driver: gcsfuse.csi.storage.gke.io
@@ -76,16 +85,6 @@ spec:
                   image: ${IMAGE}
                   imagePullPolicy: IfNotPresent
                   env:
-                    - name: MODEL
-                      value: "${MODEL_PATH}"
-                    - name: TP_SIZE
-                      value: "${TP_SIZE}"
-                    - name: EP_SIZE
-                      value: "${EP_SIZE}"
-                    # Single-quoted so JSON flags survive, e.g.
-                    # --model-loader-extra-config {"num_threads":8}
-                    - name: EXTRA_ARGS
-                      value: '${EXTRA_ARGS}'
                     # HF token for gated datasets; optional -- pods start without it.
                     - name: HF_TOKEN
                       valueFrom:
@@ -99,10 +98,72 @@ spec:
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
+                      # overlay; warmup fills the node disk and the kubelet evicts the pod.
+                      export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
+                      # Tests and recipes hard-code the in-project weights path.
+                      [ -e /weights ] || ln -s "${WEIGHTS_DIR}" /weights
+                      # No internet on this cluster: the GSM8K evals read the cached
+                      # /tmp/test.jsonl, and HF repo ids resolve from the bucket's offline
+                      # hub cache (weights/hf-hub, staged from huggingface.co).
+                      [ -f /tmp/test.jsonl ] || cp /weights/datasets/gsm8k/test.jsonl /tmp/test.jsonl
+                      export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+                      # gpt-oss's harmony encoding loads its tiktoken vocab from here.
+                      export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
                       NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
                       RANK="${TPU_WORKER_ID:-0}"
-                      echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK model=${MODEL} tp=${TP_SIZE}"
+                      echo "run=${RUN_NAME} mode=${MODE} nnodes=$NNODES rank=$RANK"
 
+                      if [ "${MODE}" = "exec" ]; then
+                        # Name the test before anything can fail, as the other modes do.
+                        echo "== test files: ${TEST_FILES} =="
+                        t0=$SECONDS
+                        ${EXEC_CMD}
+                        rc=$?
+                        # Teardown SIGTERMs surviving workers; rank-0 gates real failures.
+                        if [ "$RANK" != "0" ] && [ "$rc" = 143 ]; then
+                          echo "worker rank=$RANK: SIGTERM during teardown; success"; rc=0
+                        fi
+                        # Rank 0 only: every pod runs the same command, and N records
+                        # would be N rows for one test.
+                        if [ "$RANK" = "0" ]; then
+                          passed=true
+                          [ "$rc" -eq 0 ] || passed=false
+                          echo "========== TIMINGS BEGIN =========="
+                          printf '{"file": "%s", "passed": %s, "elapsed": %s}\n' \
+                            "${TEST_FILES}" "$passed" "$((SECONDS - t0))"
+                          echo "========== TIMINGS END =========="
+                        fi
+                        exit $rc
+                      fi
+
+                      if [ "${MODE}" = "self" ]; then
+                        if [ "$RANK" != "0" ]; then
+                          echo "rank $RANK idle for single-host tests; exiting 0"; exit 0
+                        fi
+                        echo "== test files: ${TEST_FILES} =="
+                        # libtpu on GKE is env-driven: the injected TPU_* vars describe the
+                        # whole slice, so a single-host engine would wait for its idle peer.
+                        # Without them, local hardware discovery finds this host alone.
+                        unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES \
+                              TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS \
+                              TPU_ACCELERATOR_TYPE
+                        for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
+                        rc=0
+                        # One run_suite per file: each prints its own TIMINGS record.
+                        for f in ${TEST_FILES}; do
+                          python3 test/run_suite.py --hw tpu --suite ${SUITE} --nightly --continue-on-error \
+                            --test-file "$f" --timeout-per-file ${TIMEOUT_PER_FILE} || rc=1
+                        done
+                        exit $rc
+                      fi
+
+                      # Launch mode only: the other modes' tests read these names themselves.
+                      # EXTRA_ARGS is single-quoted so JSON flags survive, e.g.
+                      # --model-loader-extra-config {"num_threads":8}
+                      export MODEL="${MODEL_PATH}" TP_SIZE="${TP_SIZE}" EP_SIZE="${EP_SIZE}"
+                      export EXTRA_ARGS='${EXTRA_ARGS}'
+                      echo "model=$MODEL tp=$TP_SIZE"
                       # Every host runs the launch group's recipe (owns model+config). Announce
                       # the files BEFORE anything can fail so a bring-up death is still attributed
                       # to the test, not the job.

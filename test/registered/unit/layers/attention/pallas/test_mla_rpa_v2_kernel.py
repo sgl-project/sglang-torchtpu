@@ -18,6 +18,8 @@ What each case checks
    slots, byte-for-byte, with no collateral damage to prefix tokens, to other
    sequences' pages, or to unallocated pages. The one documented exception is
    the sub-word tail past ``kv_len``; see ``_assert_cache_write``.
+3. the ``segments`` the backend passes for this distribution (skipping the
+   passes it leaves empty) is bit-identical to ``segments="all"``.
 
 Metadata mirrors what ``TpuPallasRpaV3AttnBackend._build_metadata`` feeds the
 kernel in production: real (unaligned) ``kv_lens``, a *rectangular*
@@ -45,8 +47,9 @@ Usage:
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
 
+import itertools
 import unittest
 from types import SimpleNamespace
 
@@ -60,6 +63,8 @@ from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
     get_dtype_packing,
     get_kv_cache_shape,
     mla_ragged_paged_attention,
+    prepare_kv_inputs,
+    unsigned_align_to,
 )
 
 _KV_LORA_RANK = 512
@@ -325,26 +330,34 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
                 num_queries_per_block=_NUM_QUERIES_PER_BLOCK,
             )
 
-        out, updated_cache = mla_ragged_paged_attention(
-            jnp.asarray(case.ql_nope),
-            jnp.asarray(case.q_pe),
-            jnp.asarray(case.new_kv_c),
-            jnp.asarray(case.new_k_pe),
-            jnp.asarray(case.cache_before),
-            jnp.asarray(case.kv_lens),
-            jnp.asarray(case.page_indices),
-            jnp.asarray(case.cu_q_lens),
-            jnp.asarray(case.cu_kv_lens),
-            jnp.asarray(distribution),
-            sm_scale=_SM_SCALE,
-            sliding_window=sliding_window,
-            soft_cap=soft_cap,
-            mask_value=_MASK_VALUE,
-            decode_batch_size=decode_batch_size,
-            **({} if s_dtype is None else {"s_dtype": s_dtype}),
-            **block_kwargs,
-        )
+        def call(segments):
+            return mla_ragged_paged_attention(
+                jnp.asarray(case.ql_nope),
+                jnp.asarray(case.q_pe),
+                jnp.asarray(case.new_kv_c),
+                jnp.asarray(case.new_k_pe),
+                jnp.asarray(case.cache_before),
+                jnp.asarray(case.kv_lens),
+                jnp.asarray(case.page_indices),
+                jnp.asarray(case.cu_q_lens),
+                jnp.asarray(case.cu_kv_lens),
+                jnp.asarray(distribution),
+                sm_scale=_SM_SCALE,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                mask_value=_MASK_VALUE,
+                decode_batch_size=decode_batch_size,
+                segments=segments,
+                **({} if s_dtype is None else {"s_dtype": s_dtype}),
+                **block_kwargs,
+            )
+
+        out, updated_cache = call("all")
         jax.block_until_ready((out, updated_cache))
+        # Skipping the passes this distribution leaves empty is bit-identical.
+        out_seg, cache_seg = call("decode" if mode == "decode" else "mixed")
+        np.testing.assert_array_equal(np.asarray(out_seg), np.asarray(out))
+        np.testing.assert_array_equal(np.asarray(cache_seg), np.asarray(updated_cache))
 
         expected = _ref_attention(
             case,
@@ -460,6 +473,35 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
             decode_batch_size=4,
         )
 
+    def test_extend_k3_tp32_tuned_block_sizes(self):
+        """Kimi-K3 at TP32: 3 bf16 heads, page 128, tuned v7 MIXED entry."""
+        self._run(
+            "extend",
+            self.EXTEND_LENS,
+            page_size=128,
+            num_heads=3,
+            tuned_blocks=True,
+        )
+
+    def test_decode_k3_tp32_tuned_block_sizes(self):
+        """Kimi-K3 at TP32 decode, batched + tail passes, tuned v7 entry."""
+        self._run(
+            "decode",
+            self.DECODE_LENS,
+            page_size=128,
+            num_heads=3,
+            tuned_blocks=True,
+        )
+
+    def test_decode_k3_tp32_single_seq(self):
+        """bs=1 decode: segments="decode" skips the batched pass entirely."""
+        self._run("decode", [(1, 8192)], page_size=128, num_heads=3, tuned_blocks=True)
+
+    def test_decode_k3_tp32_tuned_batch_of_8(self):
+        """bs 37 (bucket 64): tuned decode batch 8, so 32 batched + 5 tail rows."""
+        lens = [(1, 100 + 37 * i) for i in range(37)]
+        self._run("decode", lens, page_size=128, num_heads=3, tuned_blocks=True)
+
     def test_decode_page_size_8(self):
         self._run("decode", self.DECODE_LENS, page_size=8)
 
@@ -549,6 +591,41 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
 
     def test_decode_with_tuned_block_sizes(self):
         self._run("decode", self.DECODE_LENS, page_size=64, tuned_blocks=True)
+
+
+class TestPrepareKvInputs(CustomTestCase):
+    """The single-pad KV prep matches the former pad/reshape/pad sequence."""
+
+    @staticmethod
+    def _two_pad_reference(kv, kv_packing):
+        max_num_tokens, actual_head_dim = kv.shape
+        if max_num_tokens % kv_packing != 0:
+            pad = kv_packing - (max_num_tokens % kv_packing)
+            kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
+        head_dim = unsigned_align_to(actual_head_dim, 128)
+        kv = kv.reshape(-1, kv_packing, actual_head_dim)
+        return jnp.pad(
+            kv, ((0, 0), (0, 0), (0, head_dim - actual_head_dim)), constant_values=0
+        )
+
+    def test_bitwise_equal_to_two_pad_reference(self):
+        rng = np.random.default_rng(0)
+        for dtype, num_tokens, head_dim in itertools.product(
+            (jnp.bfloat16, jnp.float8_e4m3fn), (1, 3, 4, 7, 64), (64, 128, 512)
+        ):
+            with self.subTest(dtype=dtype, tokens=num_tokens, dim=head_dim):
+                kv_packing = get_dtype_packing(dtype)
+                kv = jnp.asarray(
+                    rng.standard_normal((num_tokens, head_dim)), dtype=dtype
+                )
+                got = prepare_kv_inputs(kv, kv_packing)
+                ref = self._two_pad_reference(kv, kv_packing)
+                self.assertEqual(got.shape, ref.shape)
+                self.assertEqual(got.dtype, ref.dtype)
+                np.testing.assert_array_equal(
+                    np.asarray(got).view(np.uint8),
+                    np.asarray(ref).view(np.uint8),
+                )
 
 
 if __name__ == "__main__":

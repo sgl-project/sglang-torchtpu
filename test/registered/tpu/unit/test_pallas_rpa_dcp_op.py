@@ -25,7 +25,7 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
     build_dcp_kernel_op,
 )
 
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
 
 # The op's arguments, in order. build_dcp_kernel_op passes the JAX wrapper
 # static_argnums=(11, ..., 18), which are exactly the eight entries after

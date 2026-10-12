@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
@@ -264,6 +264,7 @@ def run_unittest_files(
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
     fork_worker_batch_size: int = 1,
+    prior_results: Optional[List[Tuple[str, bool, float]]] = None,
 ):
     """
     Run a list of test files.
@@ -281,6 +282,11 @@ def run_unittest_files(
         fork_worker_batch_size: Number of files served by one preloaded fork
                                 worker. Each file still runs in a fresh child
                                 process. One keeps the existing exec behavior.
+        prior_results: (filename, passed, elapsed) for files another runner
+                       already executed for this same suite. They are folded
+                       into the summary and the TIMINGS block so one suite
+                       still reports one block covering every file, whichever
+                       runner ran it.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -294,6 +300,13 @@ def run_unittest_files(
     # Per-file elapsed seconds, latest attempt wins. Consumed by the
     # TIMINGS block emitted at the end of this function.
     file_elapsed: Dict[str, float] = {}
+    for prior_name, prior_passed, prior_elapsed in prior_results or ():
+        file_elapsed[prior_name] = prior_elapsed
+        if prior_passed:
+            passed_tests.append(prior_name)
+        else:
+            failed_tests.append((prior_name, "see the chip-pinned phase above"))
+            success = False
     fork_worker = None
     use_fork_worker = fork_worker_batch_size > 1 and not enable_retry
 
@@ -503,7 +516,8 @@ def run_unittest_files(
 
     # Print summary
     logger.info(f"\n{'=' * 60}")
-    logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
+    total_files = len(files) + len(prior_results or ())
+    logger.info(f"Test Summary: {len(passed_tests)}/{total_files} passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
     logger.info(f"{'=' * 60}")

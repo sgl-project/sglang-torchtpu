@@ -24,7 +24,7 @@ from sglang_tpu.fp8_moe_fused_rs import (
     supports_fp8_fused_rs,
 )
 
-register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class TestFp8MoeFusedRs(CustomTestCase):

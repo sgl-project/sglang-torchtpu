@@ -58,11 +58,14 @@ def build_gdn_pallas_op():
         gdn(qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias,
             a_log, dt_bias, query_start_loc, state_indices, distribution,
             seq_lens, n_kq, n_v, d_k, d_v, kernel_size, kda=False,
-            gate_lower_bound=None) -> output
+            gate_lower_bound=None, batched_only=False, prefill_only=False,
+            fused_qkvg=False, packed_weights=None) -> output
 
     ``conv_state`` and ``recurrent_state`` are updated in place (declared as
     ``mutates_args``); the returned tensor is the fused attention output of
-    shape ``[num_tokens, n_v * d_v]``.
+    shape ``[num_tokens, n_v, d_v]``. ``qkv`` is exactly the conv dim wide,
+    unless ``fused_qkvg`` declares it a fused ``[q, k, v, g]`` projection (g
+    ``n_v * d_v`` wide), whose leading conv-dim columns are read.
     """
     global _PALLAS_GDN_OP
     if _PALLAS_GDN_OP is not None:
@@ -102,7 +105,22 @@ def build_gdn_pallas_op():
         kernel_size: int,
         kda: bool,
         gate_lower_bound: Optional[float],
+        batched_only: bool,
+        prefill_only: bool,
+        fused_qkvg: bool,
+        packed_weights: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        conv_dim = n_kq * d_k * 2 + n_v * d_v
+        if fused_qkvg:
+            # Slicing here fuses with the kernel's input prep; a torch split
+            # view would be copied at the op boundary.
+            assert qkv.shape[1] == conv_dim + n_v * d_v, (qkv.shape, conv_dim)
+            qkv = qkv[:, :conv_dim]
+        elif qkv.shape[1] != conv_dim:
+            raise ValueError(
+                f"qkv is {qkv.shape[1]} wide but the conv dim is {conv_dim}; a "
+                "fused [q, k, v, g] projection needs fused_qkvg=True."
+            )
         # The GDN kernel sizes its tiling from `pltpu.get_tpu_info().num_lanes`
         # (gdn/wrapper.py), but distributed Pallas programs are exported through
         # a logical CPU mesh, so at trace time JAX reports device_kind="cpu" and
@@ -132,10 +150,15 @@ def build_gdn_pallas_op():
                 kernel_size=kernel_size,
                 attention_mode=AttentionMode.KDA if kda else AttentionMode.GDN,
                 gate_lower_bound=gate_lower_bound,
+                batched_only=batched_only,
+                prefill_only=prefill_only,
+                packed_weights=packed_weights,
             )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).
-        return new_conv_state, new_recurrent_state, output
+        # [T, n_v, d_v] is the kernel's layout; a flat [T, n_v * d_v] costs a
+        # relayout, and every consumer splits heads again anyway.
+        return new_conv_state, new_recurrent_state, output.reshape(-1, n_v, d_v)
 
     # Buffer donation: the kernel writes the updated state straight back into the
     # caller's conv/recurrent buffers via an input/output alias, no extra copy.
@@ -146,8 +169,9 @@ def build_gdn_pallas_op():
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        # n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound are static.
-        static_argnums=(13, 14, 15, 16, 17, 18, 19),
+        # n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound, batched_only,
+        # prefill_only, fused_qkvg are static.
+        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
         donate_argnums=(3, 4),
         input_output_aliases={3: 0, 4: 1},
         warn_deprecated=False,
@@ -179,6 +203,10 @@ def build_gdn_pallas_op():
         kernel_size: int,
         kda: bool = False,
         gate_lower_bound: Optional[float] = None,
+        batched_only: bool = False,
+        prefill_only: bool = False,
+        fused_qkvg: bool = False,
+        packed_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Second half of the CPU-mesh export guard (see `_wrapped`). Mosaic
         # lowering queries TPU metadata again (`_check_block_mappings` ->
@@ -188,10 +216,39 @@ def build_gdn_pallas_op():
         # Enter it only on the compiling call:
         # `export_ignore_forward_compatibility` is a JAX config context that
         # participates in jit cache keys, so toggling it per forward thrashes
-        # them (pallas_jax_op.py guards the same way). Keyed by shape rather
-        # than a one-shot flag because each token/batch bucket compiles
-        # separately.
-        key = (qkv.shape[0], n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound)
+        # them (pallas_jax_op.py guards the same way). Keyed by every shape,
+        # dtype and static the kernel specializes on rather than a one-shot
+        # flag: each token/batch bucket compiles separately, and MIXED batches
+        # share a token bucket across batch caps.
+        tensors = (
+            qkv,
+            b,
+            a,
+            conv_state,
+            recurrent_state,
+            conv_weight,
+            conv_bias,
+            a_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            seq_lens,
+            packed_weights,
+        )
+        key = (
+            tuple(None if t is None else (tuple(t.shape), t.dtype) for t in tensors),
+            n_kq,
+            n_v,
+            d_k,
+            d_v,
+            kernel_size,
+            kda,
+            gate_lower_bound,
+            batched_only,
+            prefill_only,
+            fused_qkvg,
+        )
         if key in _exported_shapes:
             _new_conv, _new_rec, output = jax_kernel(
                 qkv,
@@ -214,6 +271,10 @@ def build_gdn_pallas_op():
                 kernel_size,
                 kda,
                 gate_lower_bound,
+                batched_only,
+                prefill_only,
+                fused_qkvg,
+                packed_weights,
             )
         else:
             with (
@@ -241,6 +302,10 @@ def build_gdn_pallas_op():
                     kernel_size,
                     kda,
                     gate_lower_bound,
+                    batched_only,
+                    prefill_only,
+                    fused_qkvg,
+                    packed_weights,
                 )
             _exported_shapes.add(key)
         return output
@@ -266,9 +331,13 @@ def build_gdn_pallas_op():
         kernel_size: int,
         kda: bool = False,
         gate_lower_bound: Optional[float] = None,
+        batched_only: bool = False,
+        prefill_only: bool = False,
+        fused_qkvg: bool = False,
+        packed_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens = qkv.shape[0]
-        return qkv.new_empty((num_tokens, n_v * d_v))
+        return qkv.new_empty((num_tokens, n_v, d_v))
 
     custom_op.register_fake(_fake_impl)
 
@@ -305,6 +374,9 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._seq_lens: Optional[torch.Tensor] = None
         self._state_indices: Optional[torch.Tensor] = None
         self._query_start_loc: Optional[torch.Tensor] = None
+        # Pure decode has no PER_SEQ rows and extend no BATCHED rows (see
+        # _get_distribution), so each runs one kernel pass instead of both.
+        self._is_decode = False
         # Cache the (shape-static) distribution vector across forwards, keyed by
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
@@ -339,6 +411,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         device = forward_batch.seq_lens.device
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         self._distribution = self._get_distribution(is_decode, bs, device)
+        self._is_decode = is_decode
         # Full per-request sequence length (context + current); the kernel uses
         # it to derive has_initial_state = (seq_lens - query_lens) > 0. Cast the
         # per-forward index/length metadata to int32 once here (shared by all
@@ -364,7 +437,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
     ) -> torch.Tensor:
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_state = layer_cache.conv[0]  # [size+1, K-1, dim]
+        conv_state = layer_cache.conv[0]  # [size+1, K-1, 1, dim]
         recurrent_state = layer_cache.temporal  # [size+1, n_v, d_k, d_v]
 
         state_indices = self._state_indices
@@ -397,10 +470,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             layer.head_k_dim,
             layer.head_v_dim,
             kernel_size,
+            batched_only=self._is_decode,
+            prefill_only=not self._is_decode,
         )
-        # The op returns a flat [num_tokens, n_v * d_v] tensor; the model's
-        # output-gate norm expects per-head [num_tokens, n_v, d_v].
-        return out.view(out.shape[0], layer.num_v_heads, layer.head_v_dim)
+        # Per-head [num_tokens, n_v, d_v], as the model's output-gate norm expects.
+        return out
 
     def forward_decode(
         self,

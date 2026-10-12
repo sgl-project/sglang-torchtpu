@@ -249,7 +249,13 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        out_indices_cpu: torch.Tensor | None = None,
     ):
+        """``out_indices_cpu``: optional caller-owned host (bs,) buffer filled
+        with the returned locations, so host consumers skip a D2H readback.
+        Requires a host-resident ``last_loc``."""
+        if out_indices_cpu is not None and last_loc.device.type != "cpu":
+            raise ValueError("out_indices_cpu requires a host-resident last_loc")
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
@@ -281,10 +287,12 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if last_loc.device.type == "cpu":
             # Host-resident: last_loc is host, so run the formula on CPU and
             # H2D once (no per-bucket device compile of the allocator formula).
-            out_indices_cpu = (last_loc + 1) * (1 - need_new_pages) + (
+            host_indices = (last_loc + 1) * (1 - need_new_pages) + (
                 per_req_new_page * self.page_size * need_new_pages
             )
-            out_indices = out_indices_cpu.to(self.device, non_blocking=True)
+            if out_indices_cpu is not None:
+                out_indices_cpu.copy_(host_indices)
+            out_indices = host_indices.to(self.device, non_blocking=True)
         else:
             # Device formula on fixed-shape (bs,) inputs (bs is bucketed).
             per_req_new_page_dev = per_req_new_page.to(self.device, non_blocking=True)

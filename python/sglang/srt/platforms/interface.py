@@ -187,6 +187,13 @@ class SRTPlatform(DeviceMixin):
         attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
         return False
 
+    # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
+    # entry until the seam PR merges upstream.
+    def supports_moe_dp_pipeline_stages(self) -> bool:
+        """Whether a pipeline stage may replicate its experts over its own
+        devices (--moe-dp-size > 1 with --pp-size > 1)."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
@@ -199,6 +206,13 @@ class SRTPlatform(DeviceMixin):
         """Called once on the scheduler thread, the first time it goes idle after
         a forward (the server warmup request has drained). Platforms that
         compile ahead of serving freeze or monitor compilation here."""
+        pass
+
+    # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
+    # entry until the seam PR merges upstream.
+    def prepare_model_parallel_groups(self) -> None:
+        """Called on every rank once the model-parallel groups are built,
+        before their first collective."""
         pass
 
     # ------------------------------------------------------------------

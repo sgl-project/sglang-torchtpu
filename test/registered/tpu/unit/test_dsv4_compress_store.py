@@ -22,7 +22,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
 
 assert "jax" not in sys.modules
 os.environ["JAX_PLATFORMS"] = "tpu"
@@ -33,6 +33,7 @@ import numpy as np
 from absl.testing import parameterized
 from jax._src import test_util as jtu
 
+from sglang_tpu.compile_cache import initialize_jax_compile_cache
 from sglang_tpu.dsv4.compress_and_store import (
     compress_store_ref,
     config,
@@ -41,6 +42,8 @@ from sglang_tpu.dsv4.compress_and_store import kernel as compress_store
 from sglang_tpu.dsv4.compress_and_store import (
     project_and_save_state_ref as proj_and_save_state_ref,
 )
+
+initialize_jax_compile_cache()
 
 
 def generate_kv_slot_mapping(

@@ -1,5 +1,7 @@
 # Ported from tpu-inference (https://github.com/vllm-project/tpu-inference)
 #   tpu_inference/kernels/sparse_core/ragged_gather_v2.py @ 4367dcff1 (2026-07-19).
+# Local changes: input rows are padded to the 32-bit packing; an odd row count
+# failed at trace time (neither tpu-inference nor vllm-torchtpu pads).
 
 import functools
 
@@ -231,6 +233,11 @@ def ragged_gather_v2(
     out_size = indices.size
 
     packing = 32 // dtype_bits
+    # The kernel bitcasts x to int32, `packing` rows per word; indices never
+    # reach the pad rows.
+    row_pad = -x.shape[0] % packing
+    if row_pad:
+        x = jnp.pad(x, ((0, row_pad), (0, 0)))
     col_size = calculate_col_size(hidden_size, packing)
 
     aligned_hidden_size = ((hidden_size + col_size - 1) // col_size) * col_size

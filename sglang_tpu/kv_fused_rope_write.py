@@ -207,9 +207,33 @@ def get_fused_rope_write_op(num_layers: int, max_span_len: int) -> Callable[...,
 
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
+    # Tensors only: custom_jax_kernel traces a partial's `max_span_len` since
+    # torch_tpu 76284a1fa; register a functools.partial once it reaches jax.jit static.
+    def _fused_rope_write(
+        dst_starts: jax.Array,
+        src_starts: jax.Array,
+        span_lens: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        cos: jax.Array,
+        sin: jax.Array,
+        *kv_bufs: jax.Array,
+    ) -> list[jax.Array]:
+        return fused_rope_write_kv_jax(
+            dst_starts,
+            src_starts,
+            span_lens,
+            k,
+            v,
+            cos,
+            sin,
+            *kv_bufs,
+            max_span_len=max_span_len,
+        )
+
     aliases = {7 + i: i for i in range(num_layers)}
     jax_kernel = _torch_pallas.custom_jax_kernel(
-        functools.partial(fused_rope_write_kv_jax, max_span_len=max_span_len),
+        _fused_rope_write,
         name=f"jax_kv_fused_rope_write_{num_layers}_{max_span_len}",
         donate_argnums=tuple(aliases),
         input_output_aliases=aliases,

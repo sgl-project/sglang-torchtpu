@@ -23,7 +23,7 @@ the op's missing CPU-export guard reached production.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
@@ -63,6 +63,18 @@ def _has_torch_tpu() -> bool:
         return bool(torch.accelerator.is_available())
     except Exception:  # pragma: no cover
         return False
+
+
+def _poison_freed_device_memory(dev, num_elems, copies=64):
+    """Fill device buffers with NaN, materialize and free them, so an output
+    buffer the kernel never writes reads NaN instead of fresh zeros."""
+    bufs = [
+        torch.full((num_elems,), float("nan"), dtype=torch.bfloat16, device=dev)
+        for _ in range(copies)
+    ]
+    for x in bufs:
+        x[:1].float().cpu()
+    del bufs
 
 
 @unittest.skipUnless(_has_torch_tpu(), _SKIP_REASON)
@@ -147,12 +159,62 @@ class TestGDNAttentionOp(CustomTestCase):
         )
 
         out_np = out.cpu().numpy()
-        self.assertEqual(out_np.shape, (num_tokens, n_v * d_v))
+        self.assertEqual(out_np.shape, (num_tokens, n_v, d_v))
         self.assertTrue(np.isfinite(out_np).all(), "output has NaN/Inf")
         # conv_state / recurrent_state are donated and aliased back, so a
         # lowering that silently dropped the aliasing would leave them zero.
         self.assertTrue((conv_t.cpu().numpy() != 0).any(), "conv_state not written")
         self.assertTrue((rec_t.cpu().numpy() != 0).any(), "recurrent_state not written")
+
+    def test_op_lowers_each_batch_cap_under_cpu_export_pin(self):
+        """MIXED batches share a token bucket across batch caps: two calls with
+        66 tokens, 3 and then 2 sequences, must each lower under the export
+        pin. An export guard keyed by the token count alone runs the second
+        lowering unguarded, which dies on device_kind="cpu"."""
+        from sglang_tpu.attention_gdn_pallas import (
+            build_gdn_pallas_op,
+        )
+
+        n_kq, n_v, d_k, d_v, K = self.N_KQ, self.N_V, self.D_K, self.D_V, self.K
+        conv_dim = n_kq * d_k * 2 + n_v * d_v
+        rng = np.random.default_rng(1)
+
+        def rn(*shape):
+            return rng.standard_normal(shape).astype(np.float32)
+
+        dev = torch.device("tpu")
+
+        def tt(x):
+            return torch.from_numpy(np.ascontiguousarray(x)).to(dev)
+
+        # The same 66 tokens as 2 decode + 1 prefill, then 1 decode + 1 prefill.
+        for lengths in ([1, 1, 64], [1, 65]):
+            with self.subTest(num_seqs=len(lengths)):
+                num_seqs = len(lengths)
+                num_tokens = sum(lengths)
+                out = build_gdn_pallas_op()(
+                    tt(rn(num_tokens, conv_dim)),
+                    tt(rn(num_tokens, n_v)),
+                    tt(rn(num_tokens, n_v)),
+                    tt(np.zeros((num_seqs + 1, K - 1, conv_dim), np.float32)),
+                    tt(np.zeros((num_seqs + 1, n_v, d_k, d_v), np.float32)),
+                    tt(rn(conv_dim, 1, K)),
+                    tt(rn(conv_dim)),
+                    tt(rn(n_v)),
+                    tt(rn(n_v)),
+                    tt(np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)),
+                    tt(np.arange(1, num_seqs + 1, dtype=np.int32)),
+                    tt(np.array([num_seqs - 1, num_seqs, num_seqs], np.int32)),
+                    tt(np.array(lengths, np.int32)),
+                    n_kq,
+                    n_v,
+                    d_k,
+                    d_v,
+                    K,
+                )
+                out_np = out.cpu().numpy()
+                self.assertEqual(out_np.shape, (num_tokens, n_v, d_v))
+                self.assertTrue(np.isfinite(out_np).all(), "output has NaN/Inf")
 
     @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON_JAX_TPU)
     def test_op_matches_kernel_and_mutates_state(self):
@@ -243,7 +305,10 @@ class TestGDNAttentionOp(CustomTestCase):
         )
 
         np.testing.assert_allclose(
-            out_t.cpu().numpy(), np.asarray(out_ref), rtol=2e-2, atol=2e-2
+            out_t.cpu().numpy(),
+            np.asarray(out_ref).reshape(out_t.shape),
+            rtol=2e-2,
+            atol=2e-2,
         )
         # conv_state / recurrent_state were donated + aliased => mutated.
         np.testing.assert_allclose(
@@ -255,6 +320,8 @@ class TestGDNAttentionOp(CustomTestCase):
 
     def _kda_case(self):
         # KDA runs without GQA: n_kq == n_v, per-channel gate and dt_bias.
+        # Conv state in the rank-4 [slots, K-1, 1, dim] layout the TPU pool
+        # allocates.
         n_v, d_k, d_v, K = 4, self.D_K, self.D_V, self.K
         lengths = [1, 1, 64]
         rng = np.random.default_rng(1)
@@ -268,7 +335,7 @@ class TestGDNAttentionOp(CustomTestCase):
             rn(num_tokens, conv_dim),
             rn(num_tokens, n_v),
             rn(num_tokens, n_v * d_k),
-            np.zeros((num_blocks, K - 1, conv_dim), np.float32),
+            np.zeros((num_blocks, K - 1, 1, conv_dim), np.float32),
             np.zeros((num_blocks, n_v, d_k, d_v), np.float32),
             rn(conv_dim, 1, K),
             rn(conv_dim),
@@ -294,8 +361,9 @@ class TestGDNAttentionOp(CustomTestCase):
 
         n_v, d_v = dims[1], dims[3]
         out_np = out.cpu().numpy()
-        self.assertEqual(out_np.shape, (args[0].shape[0], n_v * d_v))
+        self.assertEqual(out_np.shape, (args[0].shape[0], n_v, d_v))
         self.assertTrue(np.isfinite(out_np).all(), "output has NaN/Inf")
+        self.assertEqual(tuple(t[3].shape), args[3].shape)
         self.assertTrue((t[3].cpu().numpy() != 0).any(), "conv_state not written")
         self.assertTrue((t[4].cpu().numpy() != 0).any(), "recurrent_state not written")
 
@@ -325,7 +393,10 @@ class TestGDNAttentionOp(CustomTestCase):
         out_t = build_gdn_pallas_op()(*t, n_kq, n_v, d_k, d_v, K, True, -5.0)
 
         np.testing.assert_allclose(
-            out_t.cpu().numpy(), np.asarray(out_ref), rtol=2e-2, atol=5e-3
+            out_t.cpu().numpy(),
+            np.asarray(out_ref).reshape(out_t.shape),
+            rtol=2e-2,
+            atol=5e-3,
         )
         np.testing.assert_allclose(
             t[3].cpu().numpy(), np.asarray(conv_ref), rtol=2e-2, atol=2e-2
@@ -333,6 +404,200 @@ class TestGDNAttentionOp(CustomTestCase):
         np.testing.assert_allclose(
             t[4].cpu().numpy(), np.asarray(rec_ref), rtol=2e-2, atol=2e-2
         )
+
+    def _k3_decode(self, num_seqs, num_real):
+        """Kimi-K3's TPU decode op call (fused [q, k, v, g] input, packed
+        weights, batched_only) or the plain call it replaces, on `num_seqs`
+        rows of which the first `num_real` are real; the rest are bucket
+        padding pointing at the null slot. Returns run(fast) -> numpy
+        (out, conv_state, recurrent_state) from fresh state copies."""
+        from sglang_tpu.attention_gdn_pallas import (
+            build_gdn_pallas_op,
+        )
+        from sglang_tpu.kda_layout import pack_kda_weights
+
+        n_v, d_k, d_v, K = 4, self.D_K, self.D_V, self.K
+        conv_dim = 2 * n_v * d_k + n_v * d_v
+        rng = np.random.default_rng(2)
+
+        def rn(*shape, scale=1.0):
+            return (scale * rng.standard_normal(shape)).astype(np.float32)
+
+        qkvg = rn(num_seqs, conv_dim + n_v * d_v)
+        b, a = rn(num_seqs, n_v), rn(num_seqs, n_v * d_k)
+        conv_w, dt_bias, a_log = rn(conv_dim, 1, K), rn(n_v, d_k), rn(n_v)
+        packed = pack_kda_weights(
+            *(torch.from_numpy(x) for x in (conv_w, dt_bias, a_log)), n_v, d_k
+        ).numpy()
+        conv0 = rn(num_seqs + 1, K - 1, 1, conv_dim)
+        rec0 = rn(num_seqs + 1, n_v, d_k, d_v, scale=0.1)
+        rows = np.arange(num_seqs, dtype=np.int32)
+
+        dev = torch.device("tpu")
+
+        def tt(x, dtype=None):
+            t = torch.from_numpy(np.ascontiguousarray(x)).to(dev)
+            return t if dtype is None else t.to(dtype)
+
+        # Device inputs are built once; run() only allocates the donated states
+        # and the output, so poisoned freed memory reaches the output buffer.
+        ba = (tt(b, torch.bfloat16), tt(a, torch.bfloat16))
+        weights = (tt(conv_w), None, tt(a_log), tt(dt_bias))
+        metadata = (
+            tt(np.arange(num_seqs + 1, dtype=np.int32)),
+            tt(np.where(rows < num_real, rows + 1, 0).astype(np.int32)),
+            tt(np.array([num_real] * 3, np.int32)),
+            tt(np.full(num_seqs, 6, np.int32)),
+        )
+        qkv_fast = tt(qkvg, torch.bfloat16)
+        qkv_plain = tt(qkvg[:, :conv_dim], torch.bfloat16)
+        fast_kwargs = dict(
+            batched_only=True, fused_qkvg=True, packed_weights=tt(packed)
+        )
+
+        def run(fast):
+            conv_t, rec_t = tt(conv0), tt(rec0)
+            out = build_gdn_pallas_op()(
+                qkv_fast if fast else qkv_plain,
+                *ba,
+                conv_t,
+                rec_t,
+                *weights,
+                *metadata,
+                n_v,
+                n_v,
+                d_k,
+                d_v,
+                K,
+                True,
+                -5.0,
+                **(fast_kwargs if fast else {}),
+            )
+            return [x.float().cpu().numpy() for x in (out, conv_t, rec_t)]
+
+        return run
+
+    def _gdn_decode_padding(self):
+        """TpuGDNAttnBackend's decode call (batched_only) on a one-row bucket
+        whose row is padding. Returns run() -> numpy output."""
+        from sglang_tpu.attention_gdn_pallas import (
+            build_gdn_pallas_op,
+        )
+
+        n_kq, n_v, d_k, d_v, K = self.N_KQ, self.N_V, self.D_K, self.D_V, self.K
+        dim = 2 * n_kq * d_k + n_v * d_v
+        rng = np.random.default_rng(3)
+        dev = torch.device("tpu")
+
+        def tt(x, dtype=None):
+            t = torch.from_numpy(np.ascontiguousarray(x)).to(dev)
+            return t if dtype is None else t.to(dtype)
+
+        def rn(*shape):
+            return rng.standard_normal(shape).astype(np.float32)
+
+        inputs = (
+            tt(rn(1, dim), torch.bfloat16),
+            tt(rn(1, n_v), torch.bfloat16),
+            tt(rn(1, n_v), torch.bfloat16),
+        )
+        weights = (tt(rn(dim, 1, K)), tt(rn(dim)), tt(rn(n_v)), tt(rn(n_v)))
+        metadata = (
+            tt(np.arange(2, dtype=np.int32)),
+            tt(np.zeros(1, np.int32)),
+            tt(np.zeros(3, np.int32)),
+            tt(np.zeros(1, np.int32)),
+        )
+
+        def run():
+            conv_t = torch.zeros(2, K - 1, 1, dim, device=dev)
+            rec_t = torch.zeros(2, n_v, d_k, d_v, device=dev)
+            out = build_gdn_pallas_op()(
+                *inputs,
+                conv_t,
+                rec_t,
+                *weights,
+                *metadata,
+                n_kq,
+                n_v,
+                d_k,
+                d_v,
+                K,
+                batched_only=True,
+            )
+            return out.float().cpu().numpy()
+
+        return run
+
+    def test_kda_op_decode_fast_path_matches_default(self):
+        """Kimi-K3's decode call gives the same bits as the plain op call, for
+        a one-row decode and a multi-row one."""
+        for num_seqs in (1, 3):
+            with self.subTest(num_seqs=num_seqs):
+                run = self._k3_decode(num_seqs, num_seqs)
+                for got, want in zip(run(fast=True), run(fast=False)):
+                    np.testing.assert_array_equal(got, want)
+
+    def test_decode_padding_rows_are_zero(self):
+        """A one-row decode whose row is padding (an idle DP-attention rank run
+        as decode: distribution [0, 0, 0]) returns zeros. The kernel never
+        writes that row, and the row feeds residual / MoE / collectives
+        downstream, so the output must not hold stale memory. Freed device
+        memory is filled with NaN first so an unwritten output shows up."""
+        dev = torch.device("tpu")
+        run_k3, run_gdn = self._k3_decode(1, 0), self._gdn_decode_padding()
+        for name, run in (
+            ("kda_k3", lambda: run_k3(fast=True)[0]),
+            ("gdn", run_gdn),
+        ):
+            run()  # compile before poisoning
+            for num_elems in (1 << 10, 1 << 11, 1 << 19):
+                with self.subTest(op=name, poison=num_elems):
+                    _poison_freed_device_memory(dev, num_elems)
+                    out = run()
+                    np.testing.assert_array_equal(out, np.zeros_like(out))
+
+    def test_wide_qkv_requires_fused_qkvg(self):
+        """Only an explicit fused_qkvg call may pass a qkv wider than the conv
+        dim; any other width fails the op's width check."""
+        from sglang_tpu.attention_gdn_pallas import (
+            build_gdn_pallas_op,
+        )
+
+        n_v, d_k, d_v, K = 4, self.D_K, self.D_V, self.K
+        conv_dim = 2 * n_v * d_k + n_v * d_v
+        dev = torch.device("tpu")
+        with self.assertRaises(Exception) as raised:
+            build_gdn_pallas_op()(
+                torch.zeros(1, conv_dim + n_v * d_v, device=dev),
+                torch.zeros(1, n_v, device=dev),
+                torch.zeros(1, n_v * d_k, device=dev),
+                torch.zeros(2, K - 1, 1, conv_dim, device=dev),
+                torch.zeros(2, n_v, d_k, d_v, device=dev),
+                torch.zeros(conv_dim, 1, K, device=dev),
+                None,
+                torch.zeros(n_v, device=dev),
+                torch.zeros(n_v, d_k, device=dev),
+                torch.arange(2, dtype=torch.int32, device=dev),
+                torch.ones(1, dtype=torch.int32, device=dev),
+                torch.ones(3, dtype=torch.int32, device=dev),
+                torch.full((1,), 6, dtype=torch.int32, device=dev),
+                n_v,
+                n_v,
+                d_k,
+                d_v,
+                K,
+                True,
+                -5.0,
+                batched_only=True,
+            ).cpu()
+        # Whatever type torch_tpu surfaces, the op's own check must be the cause
+        # (the kernel's conv-weight assert carries no message).
+        chain, exc = [], raised.exception
+        while exc is not None and len(chain) < 16:
+            chain.append(exc)
+            exc = exc.__cause__ or exc.__context__
+        self.assertTrue(any("fused_qkvg=True" in str(e) for e in chain), chain)
 
 
 if __name__ == "__main__":

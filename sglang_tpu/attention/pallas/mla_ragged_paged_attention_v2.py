@@ -18,6 +18,9 @@
 # - Auto-lookup of tuned block sizes (tuned_block_sizes_mla) when the caller
 #   does not pass block params; the "decode" entry also overrides
 #   decode_batch_size.
+# - Static `segments` arg: callers whose distribution is known to be decode-only
+#   or mixed-only skip launching the passes it leaves empty.
+# - prepare_kv_inputs pads the token and head dims in one jnp.pad.
 #
 # Copyright 2026 Google LLC
 #
@@ -2236,17 +2239,14 @@ def prepare_q_nope_inputs(
 
 def prepare_kv_inputs(kv: jax.Array, kv_packing: int):
     max_num_tokens, actual_head_dim = kv.shape
-    # Pad to packing
-    if max_num_tokens % kv_packing != 0:
-        pad = kv_packing - (max_num_tokens % kv_packing)
-        kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
-
+    # One pad for the token axis (to the packing) and the head dim (to 128), so
+    # XLA emits a single op ahead of the reshape.
+    token_pad = -max_num_tokens % kv_packing
     head_dim = unsigned_align_to(actual_head_dim, 128)
-    kv = kv.reshape(-1, kv_packing, actual_head_dim)
     kv = jnp.pad(
-        kv, ((0, 0), (0, 0), (0, head_dim - actual_head_dim)), constant_values=0
+        kv, ((0, token_pad), (0, head_dim - actual_head_dim)), constant_values=0
     )
-    return kv
+    return kv.reshape(-1, kv_packing, head_dim)
 
 
 def prepare_kv_inputs_for_transposed_kv_cache(kv: jax.Array):
@@ -2300,6 +2300,7 @@ def prepare_outputs(
         "two_step_flash_attention",
         "p_same_dtype_as_v",
         "debug_mode",
+        "segments",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -2337,6 +2338,10 @@ def mla_ragged_paged_attention(
     p_same_dtype_as_v: bool = True,
     # Debug params.
     debug_mode: bool = False,
+    # Passes the caller's distribution can populate: "decode" ([N, N, N]) or
+    # "mixed" ([0, 0, N]) skips launching the provably empty ones; "all" runs
+    # every pass.
+    segments: str = "all",
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
     jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128) + align_to(r_dim, 128)]
@@ -2716,49 +2721,58 @@ def mla_ragged_paged_attention(
             cache_kv,
         )
 
+    assert segments in ("all", "decode", "mixed"), segments
+    # Fewer rows than one decode batch leaves the batched-decode range empty.
+    # "all" keeps every launch so it stays the reference path.
+    run_batched_decode = segments == "all" or (
+        segments == "decode" and actual_max_num_tokens >= decode_batch_size
+    )
     batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+    updated_kv = cache_kv
     # Batched decode
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        cache_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=jnp.array(0),
-        end_seq_idx=batch_distribution,
-        static_q_len=1,
-        batch_size=decode_batch_size,
-        s_dtype=s_dtype,
-        p_same_dtype_as_v=p_same_dtype_as_v,
-        case=MlaCase.BATCHED_DECODE,
-    )
+    if run_batched_decode:
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=batch_distribution,
+            static_q_len=1,
+            batch_size=decode_batch_size,
+            s_dtype=s_dtype,
+            p_same_dtype_as_v=p_same_dtype_as_v,
+            case=MlaCase.BATCHED_DECODE,
+        )
     # Decode-only
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=batch_distribution,
-        end_seq_idx=distribution[0],
-        static_q_len=1,
-        batch_size=1,
-        s_dtype=s_dtype,
-        p_same_dtype_as_v=p_same_dtype_as_v,
-        case=MlaCase.DECODE,
-    )
+    if segments != "mixed":
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=batch_distribution,
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            batch_size=1,
+            s_dtype=s_dtype,
+            p_same_dtype_as_v=p_same_dtype_as_v,
+            case=MlaCase.DECODE,
+        )
 
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.
@@ -2784,27 +2798,28 @@ def mla_ragged_paged_attention(
         )
 
     # Handle mixed case where the query length per sequence is variable.
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-        num_queries_per_block=num_queries_per_blocks[2],
-        start_seq_idx=distribution[1],
-        end_seq_idx=distribution[2],
-        static_q_len=None,
-        batch_size=1,
-        q_split=mixed_q_split,
-        s_dtype=s_dtype,
-        p_same_dtype_as_v=p_same_dtype_as_v,
-        case=MlaCase.MIXED,
-    )
+    if segments != "decode":
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+            num_queries_per_block=num_queries_per_blocks[2],
+            start_seq_idx=distribution[1],
+            end_seq_idx=distribution[2],
+            static_q_len=None,
+            batch_size=1,
+            q_split=mixed_q_split,
+            s_dtype=s_dtype,
+            p_same_dtype_as_v=p_same_dtype_as_v,
+            case=MlaCase.MIXED,
+        )
     output = prepare_outputs(
         ql_nope,
         actual_num_q_heads,

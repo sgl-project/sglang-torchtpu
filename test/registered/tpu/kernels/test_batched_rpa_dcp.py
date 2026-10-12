@@ -34,8 +34,13 @@ from typing import NamedTuple
 import numpy as np
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import full_matrix
 
-register_tpu_ci(est_time=360, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=240, suite="stage-a-test-tpu-unit", chips=1)
+# Every shard of every (geometry, window, blocks) case is its own compile, and
+# DCP8 runs eight of them per case. The two merge tests below walk the diagonal
+# of window x blocks on the gate; the nightly walks the square.
+register_tpu_ci(est_time=360, suite="nightly-tpu-4-v7", nightly=True)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process. SGLang
 # platform discovery selects CPU-only JAX for export, so select the physical
@@ -385,6 +390,13 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
         for geo in (DCP2, DCP8):
             for window in (None, SLIDING_WINDOW):
                 for blocks in (None, _small_decode_blocks()):
+                    # `window` and `blocks` are independent features: one
+                    # bounds the key range, the other splits the work into
+                    # blocks. The gate walks the diagonal of their cross
+                    # product, which still covers both on and off, and the
+                    # nightly walks the whole square.
+                    if not full_matrix() and (window is None) != (blocks is None):
+                        continue
                     label = f"{geo.name} window={window} blocks={blocks}"
                     with self.subTest(label):
                         out, lse = _merge_by_lse(self._partials(geo, window, blocks))
@@ -498,6 +510,13 @@ class TestBatchedRpaDcpExtendPrefixPass(_CloseAssertions):
         for geo in (DCP2, DCP8):
             for window in (None, SLIDING_WINDOW):
                 for blocks in (None, _small_prefill_blocks()):
+                    # `window` and `blocks` are independent features: one
+                    # bounds the key range, the other splits the work into
+                    # blocks. The gate walks the diagonal of their cross
+                    # product, which still covers both on and off, and the
+                    # nightly walks the whole square.
+                    if not full_matrix() and (window is None) != (blocks is None):
+                        continue
                     label = f"{geo.name} window={window} blocks={blocks}"
                     with self.subTest(label):
                         partials = [

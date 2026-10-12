@@ -79,6 +79,25 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def mla_absorbed_weight_layout(
+    w_kc: torch.Tensor, w_vc: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Lay out ``w_kc`` [heads, qk_nope, kv_lora] and ``w_vc`` [heads, v_head,
+    kv_lora], split from ``kv_b_proj``, for the absorbed-MLA bmm: ``w_kc`` keeps
+    its shape, ``w_vc`` becomes [heads, kv_lora, v_head]."""
+    if _is_tpu:
+        # Owned contiguous storage: torch_tpu re-materializes every view a
+        # compiled graph reads, on every call.
+        return (
+            w_kc.clone(memory_format=torch.contiguous_format),
+            w_vc.transpose(1, 2).clone(memory_format=torch.contiguous_format),
+        )
+    return (
+        w_kc.transpose(1, 2).contiguous().transpose(1, 2),
+        w_vc.contiguous().transpose(1, 2),
+    )
+
+
 def _get_indexer_weight_block_size(
     quant_config: Optional[QuantizationConfig],
 ) -> List[int]:
@@ -755,12 +774,10 @@ class DeepseekV2WeightLoaderMixin:
                 )
 
             if not use_deep_gemm_bmm:
-                self_attn.w_kc = bind_or_assign(
-                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                )
-                w_vc = w_vc.contiguous().transpose(1, 2)
+                w_kc, w_vc = mla_absorbed_weight_layout(w_kc, w_vc)
                 if _is_npu:
                     w_vc = w_vc.contiguous()
+                self_attn.w_kc = bind_or_assign(self_attn.w_kc, w_kc)
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")

@@ -344,6 +344,7 @@ def _init_parallel_groups(
         rank_offset=rank_offset,
         max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
+    current_platform.prepare_model_parallel_groups()
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(server_args=server_args)
     if is_npu():

@@ -1,43 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pipeline-stage hand-off over ICI as a lockstep wave.
 
-torch_tpu has no device send/recv, and a collective over any subset of the
-slice's devices only runs when every device launches it in the same order.
-So every hand-off is one collective-permute over all pipeline stages at once,
-around one closed cycle: stage r hands the sum of its hidden states and
-residual to stage r+1 and receives stage r-1's, and the last stage's block
-lands on stage 0, which ignores it. The stage after a boundary must add
-hidden states and residual before its first norm, as a pre-norm decoder's
-fused add-norm does, so the sum with a zero residual carries the same
-residual stream at half the bytes. That norm reads the sum rounded to the
-model dtype instead of the float32 sum, a small difference at every stage
-boundary. The closed cycle lets XLA lower the permute to a full-bandwidth
-ring transfer. A batch's activations
-leave stage 0 at some launch k and reach stage r at launch k+r-1, so every
-stage issues launches by one count:
-
-- Stage 0 launches once per iteration while the wave is active: after its
-  forward, carrying the batch's activations, or a zero launch while it still
-  owes launches after its last send. It owes 2 * (stages - 2): the last batch
-  needs stages-2 more hops to reach the last stage, and the trailing stages,
-  which run up to stages-2 iterations behind stage 0, need as many again so
-  that every launch they issued ahead of stage 0's count is matched before
-  stage 0 goes quiet.
-- Stage r>0 launches at the start of an iteration until its count is
-  stage 0's count plus min(r-1, launches stage 0 still owes): the last launch
-  of an iteration with a batch receives that batch, and the first launch after
-  its forward carries the forward's output.
-
-Stage 0 launches one hop per iteration, never more, because the schedulers'
-hosts are coupled: the last stage's outputs travel last -> 0 -> 1 -> ... one
-hop per iteration over the host channel, and every stage waits on its device
-when it reads a result (the decode allocation, the forward's metadata, the
-ring's outputs) while the device runs launches in order. A stage that
-launched further ahead than the trailing stages can issue before its next
-device wait would block for good.
-
-Every launch runs the same compiled program: one buffer padded to the largest
-batch a forward can hand on.
+torch_tpu has no device send/recv, so each hand-off is one collective-permute
+that every device of the slice launches in the same order: each device sends
+the sum of its hidden states and residual to its column's device in the next
+stage, one closed cycle per column. Stage 0 launches once per iteration while
+the wave is active and owes 2 * (stages - 2) zero launches after its last send;
+stage r > 0 launches up to stage 0's count plus min(r - 1, launches owed).
 """
 
 import logging
@@ -46,10 +15,28 @@ from typing import Any, Callable
 
 import torch
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator
+
 logger = logging.getLogger(__name__)
 
 _OP_NAME = "sglang_tpu::pp_permute"
 _OPS: dict[tuple[int, ...], Any] = {}
+
+
+def pipeline_permutation(
+    *, pp_ranks: tuple[int, ...], stage_ranks: tuple[int, ...], column: int
+) -> tuple[tuple[int, int], ...]:
+    """Source/target rank pairs of the hand-off: each device sends to its
+    column's device in the next stage, the last stage back to stage 0, one
+    closed cycle per column. ``pp_ranks`` are the ranks of this device's column
+    by stage and ``stage_ranks`` those of its stage by column; every stage
+    orders its columns alike, so each device derives the same pairs."""
+    size = len(pp_ranks)
+    return tuple(
+        (pp_ranks[s] + shift, pp_ranks[(s + 1) % size] + shift)
+        for shift in (r - stage_ranks[column] for r in stage_ranks)
+        for s in range(size)
+    )
 
 
 def build_pp_permute_op(perm: tuple[tuple[int, int], ...]) -> Any:
@@ -270,12 +257,13 @@ class PPWave:
         return x
 
     # -- self-test ------------------------------------------------------------
-    def probe(self) -> bool:
-        """One batch iteration and its full drain on every stage, each stage
-        sending its own number plus one; True when this stage received its
-        number (stage 0 receives the last stage's block and ignores it).
+    def probe(self, *, column: int = 0, columns: int = 1) -> bool:
+        """One batch iteration and its full drain on every stage, each device
+        sending its stage-major index plus one; True when this device received
+        the index of the previous stage's device in its own column (stage 0
+        receives the last stage's block and ignores it).
         Every stage's launch count is level again afterwards."""
-        payload = torch.full_like(self.zero, float(self.rank + 1))
+        payload = torch.full_like(self.zero, float(self.rank * columns + column + 1))
         got = None
         for it in range(1 + 2 * (self.size - 2)):
             has_batch = it == 0
@@ -288,29 +276,42 @@ class PPWave:
             self.end_iteration(tensors)
         if self.rank == 0:
             return True
-        want = float(self.rank)
+        want = float((self.rank - 1) * columns + column + 1)
         x = got[self.KEYS[0]]
         return float(x[0, 0].item()) == want and float(x[-1, -1].item()) == want
 
 
 def build_pp_wave(
-    pp_group: Any, *, rows: int, hidden: int, dtype: torch.dtype, device: torch.device
+    pp_group: GroupCoordinator,
+    *,
+    stage_group: GroupCoordinator,
+    world_group: GroupCoordinator,
+    rows: int,
+    hidden: int,
+    dtype: torch.dtype,
+    device: torch.device,
 ) -> PPWave:
     """Create the stage's wave on the device and verify the hand-off routing.
 
     The permute is routed by mesh position, which follows distributed rank
-    order; the cycle closes from the last stage back to the first.
+    order; each column's cycle closes from the last stage back to the first,
+    and every device of the slice launches the same program.
     """
-    rank = int(pp_group.rank_in_group)
-    size = int(pp_group.world_size)
+    rank = pp_group.rank_in_group
+    size = pp_group.world_size
+    columns = stage_group.world_size
+    column = stage_group.rank_in_group
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if size != world_size:
+    if size * columns != world_size:
         raise ValueError(
-            f"the pipeline wave needs the pipeline group to span the whole slice "
-            f"(pp {size}, world {world_size}); run pipeline stages at tp 1"
+            f"the pipeline wave needs the pipeline stages to cover the whole slice "
+            f"(pp {size} stages of {columns} devices, world {world_size})"
         )
-    ranks = tuple(pp_group.ranks)
-    perm = tuple((ranks[r], ranks[(r + 1) % size]) for r in range(size))
+    perm = pipeline_permutation(
+        pp_ranks=tuple(pp_group.ranks),
+        stage_ranks=tuple(stage_group.ranks),
+        column=column,
+    )
     op = build_pp_permute_op(perm)
     wave = PPWave(
         rank=rank,
@@ -321,20 +322,23 @@ def build_pp_wave(
         device=device,
         launcher=lambda x: launch_now(op, x),
     )
-    ok = wave.probe()
-    # Every stage must agree on the routing, so the verdict is gathered.
-    verdicts: list = [None] * size
-    torch.distributed.all_gather_object(verdicts, bool(ok), group=pp_group.cpu_group)
+    ok = wave.probe(column=column, columns=columns)
+    # Every device must agree on the routing, so the verdict is gathered.
+    verdicts: list = [None] * world_group.world_size
+    torch.distributed.all_gather_object(verdicts, bool(ok), group=world_group.cpu_group)
     if not all(verdicts):
         raise RuntimeError(
-            f"pipeline wave stage {rank}: the hand-off probe failed "
-            f"(stage verdicts {verdicts}, ranks {ranks})"
+            f"pipeline wave stage {rank} column {column}: the hand-off probe "
+            f"failed (rank verdicts {verdicts}, cycles {perm})"
         )
     logger.info(
-        "pipeline wave stage %d/%d: hand-off cycle over ranks %s, buffer [%d, %d] %s",
+        "pipeline wave stage %d/%d column %d/%d: hand-off cycles %s, "
+        "buffer [%d, %d] %s",
         rank,
         size,
-        ranks,
+        column,
+        columns,
+        perm,
         rows,
         hidden,
         dtype,

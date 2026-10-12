@@ -43,19 +43,8 @@ on:
           - feature-validation
           - perf
           - mh
-          - pd-mh-gpt-120b
-          - pd-mh-gpt-120b-pc-offload
-          - pd-mh-gpt-120b-spec
-          - pd-mh-gpt-120b-pc-offload-spec
-          - pd-mh-gpt-120b-pc-offload-spec-reshard
-          - pd-mh-gpt-120b-kvoff-reshard
           - pd-mh-qwen3-480b-kvoff-reshard
           - pd-mh-qwen3-vl-8b-spec
-          - pd-sh-gpt-120b
-          - pd-sh-gpt-120b-spec
-          - pd-sh-gpt-120b-decode-radix
-          - pd-sh-gpt-120b-offload
-          - pd-sh-gpt-120b-offload-spec
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"

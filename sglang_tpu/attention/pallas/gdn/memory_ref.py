@@ -14,6 +14,8 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py
+# SGLang changes: pack_metadata / unpack_metadata (PackedSmemView) and
+# unpack_kda_weights.
 
 import dataclasses
 import functools
@@ -126,6 +128,84 @@ class MetadataRef:
 
     def __len__(self) -> int:
         return len(jax.tree_util.tree_leaves(self))
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class PackedSmemView:
+    """Logical N-D view of an int32 range inside one packed SMEM buffer."""
+
+    data: Any
+    offset: int = dataclasses.field(metadata=dict(static=True))
+    shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
+    is_bool: bool = dataclasses.field(metadata=dict(static=True))
+
+    def __getitem__(self, indices):
+        if indices is Ellipsis:
+            indices = ()
+        elif not isinstance(indices, tuple):
+            indices = (indices,)
+        pos = self.offset
+        if indices:
+            for stride, idx in zip(pl.strides_from_shape(self.shape), indices):
+                pos += stride * idx
+        value = self.data[pos]
+        return value != 0 if self.is_bool else value
+
+
+def pack_metadata(metadata: MetadataRef) -> tuple[jax.Array, tuple]:
+    """Flatten the metadata into one int32 array (one SMEM operand instead of
+    one per field, each of which XLA stages with its own copy) plus its layout.
+
+    Walks every MetadataRef field, so a field added later is packed too rather
+    than dropped; a field left out of the layout must be None, which is what
+    unpack_metadata rebuilds it as.
+    """
+    parts, layout, offset = [], [], 0
+    for field in dataclasses.fields(metadata):
+        value = getattr(metadata, field.name)
+        if value is None:
+            continue
+        if isinstance(value, SmemWrapper):
+            arr, shape = value.data, value.shape
+        else:
+            arr = jnp.asarray(value)
+            shape = arr.shape
+        # Indices, sizes and flags: anything else would not survive int32.
+        assert arr.dtype == jnp.bool_ or jnp.issubdtype(arr.dtype, jnp.integer), (
+            field.name,
+            arr.dtype,
+        )
+        flat = arr.reshape(-1)
+        layout.append((field.name, offset, shape, arr.dtype == jnp.bool_))
+        parts.append(flat.astype(jnp.int32))
+        offset += flat.size
+    return jnp.concatenate(parts), tuple(layout)
+
+
+def unpack_metadata(packed_ref: jax.Array, layout: tuple) -> MetadataRef:
+    """In-kernel MetadataRef whose fields read from the packed SMEM ref; fields
+    absent from the layout were None when packed and stay None."""
+    fields = {
+        name: PackedSmemView(packed_ref, offset, shape, is_bool)
+        for name, offset, shape, is_bool in layout
+    }
+    return MetadataRef(**fields)
+
+
+def unpack_kda_weights(packed_ref: jax.Array, cfg: config.GDNConfig) -> WeightRefs:
+    """WeightRefs viewing the packed f32 array (layout:
+    hardware_backend/tpu/kda_layout.kda_packed_weights_shape)."""
+    k, n_v = cfg.kernel_size, cfg.num_v_heads
+    return WeightRefs(
+        conv=ConvWeightsRef(
+            weight=packed_ref.at[pl.ds(0, k), pl.ds(0, cfg.dim_size)], bias=None
+        ),
+        gdn=GDNWeightsRef(
+            a_log=packed_ref.at[k + n_v, pl.ds(0, n_v)],
+            dt_bias=packed_ref.at[pl.ds(k, n_v), pl.ds(0, cfg.kq_head_dim)],
+        ),
+    )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)

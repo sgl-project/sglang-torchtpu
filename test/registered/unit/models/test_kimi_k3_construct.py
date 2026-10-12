@@ -6,6 +6,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    _unsupported_derived_weight_cache_error,
+)
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
@@ -16,6 +19,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kda_layout import kda_packed_weights_shape
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -62,6 +66,48 @@ def _tiny_config() -> KimiLinearConfig:
 
 @unittest.skipIf(torch.cuda.is_available(), "builds on CPU with the TPU flag set")
 class TestKimiK3ConstructOnTpu(CustomTestCase):
+    def test_post_load_binds_kernel_layout_and_rejects_weight_updates(self):
+        """The KDA kernel reads one packed copy of conv / dt_bias / A_log, so
+        online updates, which could skip the post-load rebind, are rejected."""
+        model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
+        kdas = [
+            layer.self_attn
+            for layer in model.model.layers
+            if isinstance(layer.self_attn, KimiK3DeltaAttention)
+        ]
+        with torch.no_grad():
+            for kda in kdas:
+                for param in (kda.qkv_conv1d.weight, kda.dt_bias, kda.A_log):
+                    param.copy_(torch.randn(param.shape))
+        model.post_load_weights()
+        for kda in kdas:
+            attn = kda.attn
+            # forward_qkvbfg_fused passes the whole [q, k, v, g] projection.
+            self.assertTrue(attn.fused_qkvg)
+            self.assertIs(attn.conv_weights, kda.qkv_conv1d.weight)
+            conv = kda.qkv_conv1d.weight.permute(2, 1, 0)  # [K, 1, dim]
+
+            k, dim = conv.shape[0], conv.shape[-1]
+            n_v, d_k = attn.num_v_heads, attn.head_k_dim
+            packed = attn.packed_kernel_weights
+            self.assertEqual(
+                tuple(packed.shape), kda_packed_weights_shape(k, dim, n_v, d_k)
+            )
+            regions = (
+                ((slice(0, k), slice(0, dim)), conv[:, 0]),
+                ((slice(k, k + n_v), slice(0, d_k)), kda.dt_bias.reshape(n_v, d_k)),
+                ((k + n_v, slice(0, n_v)), kda.A_log.reshape(n_v)),
+            )
+            padding = torch.ones(packed.shape, dtype=torch.bool)
+            for index, want in regions:
+                self.assertTrue(torch.equal(packed[index], want))
+                padding[index] = False
+            self.assertTrue((packed[padding] == 0).all())
+
+        error = _unsupported_derived_weight_cache_error(model) or ""
+        self.assertIn("Kimi-K3 on TPU", error)
+        self.assertIn("dt_bias", error)
+
     @classmethod
     def setUpClass(cls):
         init_single_process_dist()
@@ -71,6 +117,55 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
         tpu_flag = patch.object(kimi_k3, "_is_tpu", True)
         tpu_flag.start()
         cls.addClassCleanup(tpu_flag.stop)
+
+    def test_moe_pad_count_goes_to_topk_not_experts(self):
+        """TopK masks padded rows on TPU; experts keep DeepEPMoE's signature."""
+        import inspect
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        class ExpertsCallSpy(torch.nn.Module):
+            """Routed-experts stand-in: records each call, returns zeros."""
+
+            def __init__(self, out_dim: int):
+                super().__init__()
+                self.out_dim = out_dim
+                self.calls = []
+
+            def forward(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return args[0].new_zeros(args[0].shape[0], self.out_dim)
+
+        model = KimiK3LinearForCausalLM(config=_tiny_config(), quant_config=None)
+        moe = next(
+            layer.mlp
+            for layer in model.model.layers
+            if isinstance(layer.mlp, KimiK3MoE)
+        )
+        moe.experts = ExpertsCallSpy(moe.moe_hidden_size)
+        hidden = torch.zeros(4, 512, dtype=moe.gate.weight.dtype)
+        count = torch.tensor(3, dtype=torch.int32)
+        forward_batch = SimpleNamespace(moe_num_token_non_padded=lambda: count)
+        topk_output = StandardTopKOutput(
+            torch.zeros(4, 2), torch.zeros(4, 2, dtype=torch.int32), torch.zeros(4, 4)
+        )
+        for on_tpu in (True, False):
+            moe.experts.calls.clear()
+            with (
+                self.subTest(on_tpu=on_tpu),
+                patch.object(kimi_k3, "_is_tpu", on_tpu),
+                patch.object(moe.topk, "forward", return_value=topk_output) as topk,
+            ):
+                moe(hidden, forward_batch=forward_batch)
+                self.assertIs(
+                    topk.call_args.kwargs["num_token_non_padded"],
+                    count if on_tpu else None,
+                )
+                ((args, kwargs),) = moe.experts.calls
+                self.assertIs(args[1], topk_output)
+                inspect.signature(DeepEPMoE.forward).bind(moe.experts, *args, **kwargs)
 
     def test_model_builds_without_side_streams(self):
         """No torch.cuda.Stream is created on TPU."""
@@ -144,6 +239,22 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
         for kda in kdas:
             self.assertIsNone(kda._bfa_w)
             self.assertFalse(kda._kda_fused_decode_ready)
+
+    def test_kda_value_head_dim_follows_linear_attn_config(self):
+        """KDA's value head dim follows linear_attn_config, not MLA's v_head_dim."""
+        config = _tiny_config()
+        config.v_head_dim = 32  # MLA value head dim; KDA head_dim stays 64
+        model = KimiK3LinearForCausalLM(config=config, quant_config=None)
+        kdas = [
+            layer.self_attn
+            for layer in model.model.layers
+            if isinstance(layer.self_attn, KimiK3DeltaAttention)
+        ]
+        self.assertTrue(kdas)
+        for kda in kdas:
+            self.assertEqual(kda.head_v_dim, 64)
+            # What the KDA attention backends read.
+            self.assertEqual(kda.attn.head_v_dim, 64)
 
 
 if __name__ == "__main__":

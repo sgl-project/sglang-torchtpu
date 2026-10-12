@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 BLOCK_SIZE = 512
 SUPPORTED_BLOCK_SIZES = (16, 32, 64, 128, 256, BLOCK_SIZE)
@@ -424,7 +424,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         torch.testing.assert_close(
             call["topk_ids"],
-            torch.tensor([[0, 0], [0, 1]], dtype=torch.int32),
+            torch.tensor([[0, -1], [-1, 1]], dtype=torch.int32),
         )
         self.assertEqual(tuple(result.hidden_states.shape), (2, 2, HIDDEN_SIZE))
 
