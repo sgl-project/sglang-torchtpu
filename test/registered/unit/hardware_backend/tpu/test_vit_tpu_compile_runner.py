@@ -224,6 +224,35 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         # ... and its ctx drives unpad_outputs on the way back.
         self.assertEqual(result.tolist(), [0.0, 2.0])
 
+    def test_base_run_sends_inputs_past_the_ladder_to_eager_fn(self):
+        """Any policy reporting a patch count gets the fallback from the base."""
+
+        class _SizedPolicy(_FakeVisionPolicy):
+            def input_patch_count(self, x):
+                return x.shape[0]
+
+        policy = _SizedPolicy()
+        policy.compiled_fn = MagicMock(side_effect=lambda x, extra: x * 2)
+        policy.eager_fn = MagicMock(side_effect=lambda x, extra: x * 3)
+
+        # 4 patches fit the [4] ladder; 5 do not.
+        self.assertEqual(policy.run(torch.arange(4).float()).tolist(), [0.0, 2.0])
+        self.assertEqual(policy.run(torch.arange(5).float()).tolist(), [0.0, 3.0])
+        policy.compiled_fn.assert_called_once()
+        # The eager fn gets prepare_call's arguments, like the compiled one.
+        self.assertEqual(policy.eager_fn.call_args.args[1].tolist(), [1])
+
+    def test_base_run_without_a_patch_count_keeps_the_compiled_fn(self):
+        """A policy that reports no count is unchanged, even past the ladder."""
+        policy = _FakeVisionPolicy()
+        policy.compiled_fn = MagicMock(side_effect=lambda x, extra: x * 2)
+        policy.eager_fn = MagicMock()
+
+        policy.run(torch.arange(5).float())
+
+        policy.eager_fn.assert_not_called()
+        policy.compiled_fn.assert_called_once()
+
     def test_qwen3_vl_patch_buckets_honor_the_env_override(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
         sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
