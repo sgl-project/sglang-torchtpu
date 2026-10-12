@@ -504,6 +504,7 @@ class ModelRunner:
         self.init_weight_exporter()
 
     def init_startup_observability(self) -> None:
+        self.weight_load_start_time = 0.0
         self.weight_load_time = 0.0
         self.graph_memory_usage: dict[str, float] = {}
         self.graph_time_usage: dict[str, float] = {}
@@ -677,6 +678,7 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        self.weight_load_start_time = time.perf_counter()
         self.load_model()
         prepare_moe_topk(model=self.model, model_config=self.model_config)
 

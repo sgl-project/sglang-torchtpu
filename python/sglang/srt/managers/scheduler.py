@@ -726,6 +726,10 @@ class Scheduler(
 
     def init_startup_timing_summary(self) -> None:
         self.startup_time = build_scheduler_startup_time(
+            initialization=(
+                self.tp_worker.model_runner.weight_load_start_time
+                - self.scheduler_startup_begin
+            ),
             target_load_weight=self.tp_worker.weight_load_time,
             draft_load_weight=(
                 0.0 if self.draft_worker is None else self.draft_worker.weight_load_time

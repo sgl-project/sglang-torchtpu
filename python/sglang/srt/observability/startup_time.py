@@ -10,6 +10,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 
 def build_scheduler_startup_time(
     *,
+    initialization: float,
     target_load_weight: float,
     draft_load_weight: float,
     kv_cache_allocation: float,
@@ -20,6 +21,7 @@ def build_scheduler_startup_time(
     draft_compile_steps: Iterable[Mapping] | None = None,
 ) -> dict:
     result = {
+        "initialization": initialization,
         "load_weight": target_load_weight + draft_load_weight,
         "kv_cache_allocation": kv_cache_allocation,
         "scheduler_e2e": scheduler_e2e,
@@ -46,6 +48,7 @@ def aggregate_scheduler_startup_times(
 ) -> dict:
     """Return critical-path startup durations across scheduler ranks."""
     result = {
+        "initialization": 0.0,
         "load_weight": 0.0,
         "kv_cache_allocation": 0.0,
         "scheduler_e2e": 0.0,
@@ -55,6 +58,9 @@ def aggregate_scheduler_startup_times(
     for startup_time in startup_times:
         if not startup_time:
             continue
+        result["initialization"] = max(
+            result["initialization"], float(startup_time.get("initialization", 0.0))
+        )
         result["load_weight"] = max(
             result["load_weight"], float(startup_time.get("load_weight", 0.0))
         )

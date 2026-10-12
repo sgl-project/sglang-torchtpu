@@ -1,4 +1,6 @@
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -31,6 +33,7 @@ def test_compile_timing_is_added_to_scheduler_startup_time() -> None:
     )
 
     startup_time = build_scheduler_startup_time(
+        initialization=2.0,
         target_load_weight=10.0,
         draft_load_weight=1.0,
         kv_cache_allocation=4.0,
@@ -41,11 +44,37 @@ def test_compile_timing_is_added_to_scheduler_startup_time() -> None:
         draft_compile_steps=draft.snapshot(),
     )
 
+    assert startup_time["initialization"] == 2.0
     assert "total_seconds" not in startup_time["compile"]
     assert [step["component"] for step in startup_time["compile"]["steps"]] == [
         "target",
         "draft",
     ]
+
+
+def test_initialization_stops_before_weight_loading() -> None:
+    from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = SimpleNamespace(
+        scheduler_startup_begin=10.0,
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(weight_load_start_time=30.0),
+            weight_load_time=10.0,
+            graph_time_usage={},
+            compile_timing_steps=[],
+        ),
+        draft_worker=None,
+        kv_cache_allocation_time=4.0,
+    )
+    with patch(
+        "sglang.srt.managers.scheduler.time.perf_counter", side_effect=[100.0, 200.0]
+    ):
+        Scheduler.init_startup_timing_summary(scheduler)
+        assert scheduler.startup_time["initialization"] == 20.0
+        assert scheduler.startup_time["scheduler_e2e"] == 90.0
+        Scheduler.init_startup_timing_summary(scheduler)
+        assert scheduler.startup_time["initialization"] == 20.0
+        assert scheduler.startup_time["scheduler_e2e"] == 190.0
 
 
 def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
@@ -63,20 +92,23 @@ def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
     result = aggregate_scheduler_startup_times(
         [
             {
+                "initialization": 2.0,
                 "compile": {
                     "schema_version": 1,
                     "steps": [step, second_step],
-                }
+                },
             },
             {
+                "initialization": 5.0,
                 "compile": {
                     "schema_version": 1,
                     "steps": [slower_step, slower_second_step],
-                }
+                },
             },
         ]
     )
 
+    assert result["initialization"] == 5.0
     assert "total_seconds" not in result["compile"]
     assert [step["duration_seconds"] for step in result["compile"]["steps"]] == [
         4.0,

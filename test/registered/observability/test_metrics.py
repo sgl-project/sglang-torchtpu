@@ -243,6 +243,7 @@ class TestEnableMetrics(CustomTestCase):
                 "sglang:startup_available_gpu_memory_gb",
                 {"model_name": _MODEL_NAME},
             ),
+            ("sglang:startup_time_seconds", {"phase": "initialization"}),
             ("sglang:startup_time_seconds", {"phase": "load_weight"}),
             ("sglang:startup_time_seconds", {"phase": "kv_cache_allocation"}),
             ("sglang:startup_time_seconds", {"phase": "scheduler_e2e"}),
