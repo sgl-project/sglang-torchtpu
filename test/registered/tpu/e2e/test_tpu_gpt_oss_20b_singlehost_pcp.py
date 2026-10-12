@@ -11,8 +11,8 @@ prompts share their examples, checks answers end to end.
 import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.needle_probe import needle_runner
 from sglang.test.tpu import model_config_main
-from sglang.test.tpu.utils.needle_probe import needle_runner
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 # PCP is an attention feature; the checkpoint only has to be good enough for the
