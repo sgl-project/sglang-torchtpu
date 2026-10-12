@@ -20,9 +20,13 @@ if _WORKER_ARG in sys.argv:
     )
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import full_matrix
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=900, suite="stage-a-test-tpu-unit", chips=4)
+register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=4)
+# The latency benchmark below runs only on the nightly full-matrix run, which
+# is where the speed gate lives; see the guard in _run_distributed_worker.
+register_tpu_ci(est_time=900, suite="nightly-tpu-4-v7", nightly=True)
 
 _BATCH_SIZES = (64, 128, 256)
 _SPEED_GATED_BATCH_SIZES = (64, 128, 256)
@@ -495,6 +499,20 @@ def _run_distributed_worker() -> None:
     replica_ids = group.all_gather(tie_ids, dim=0).cpu()
     if not all(torch.equal(replica_ids[0], row) for row in replica_ids[1:]):
         raise AssertionError("the cutoff-tie subset differs across TP ranks")
+
+    # Everything above is correctness: the empty-input contract, exactness
+    # against a full sort over two dtypes and four k values, and the cutoff tie.
+    # What follows is a paired latency benchmark -- 3 batch sizes x (5 warmups +
+    # 5 trials x 2 paths x 20 iterations) -- and a 1.3x speedup assertion. That
+    # is ~85% of this file's 754s and it is a performance gate, which the PR gate
+    # is the wrong place for: the slice is shared, so the measurement is noisy
+    # exactly when the gate is busiest. The nightly runs it.
+    if not full_matrix():
+        if rank == 0:
+            print("speed gate deferred to the nightly full-matrix run")
+            print("DISTRIBUTED_TOP_K_TEST_PASS")
+        dist.destroy_process_group()
+        return
 
     if rank == 0:
         print(f"TP={world_size} vocab={_VOCAB_SIZE} top_k={_TOP_K}")
