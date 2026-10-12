@@ -79,9 +79,7 @@ ${POOL_AFFINITY}
                 - name: tmp
                   emptyDir:
                     sizeLimit: 64Gi
-                # JAX persistent compile cache shared by every CI run. Entries are keyed
-                # by HLO + jax/libtpu version, so a stale one never matches; the bucket's
-                # lifecycle rule deletes objects 7 days after creation.
+                # JAX compile cache shared across CI runs; objects expire after 7 days.
                 - name: compile-cache
                   csi:
                     driver: gcsfuse.csi.storage.gke.io
