@@ -55,6 +55,8 @@ spec:
             metadata:
               labels:
                 app: tpu-ci
+              annotations:
+                gke-gcsfuse/volumes: "true"
             spec:
               restartPolicy: Never
 ${SERVICE_ACCOUNT}
@@ -77,6 +79,15 @@ ${POOL_AFFINITY}
                 - name: tmp
                   emptyDir:
                     sizeLimit: 64Gi
+                # JAX persistent compile cache shared by every CI run. Entries are keyed
+                # by HLO + jax/libtpu version, so a stale one never matches; the bucket's
+                # lifecycle rule deletes objects 7 days after creation.
+                - name: compile-cache
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    volumeAttributes:
+                      bucketName: sglang-torchtpu-ci-compile-cache
+                      mountOptions: "implicit-dirs"
 ${WEIGHTS_VOLUME}
               containers:
                 - name: test
@@ -103,6 +114,7 @@ ${WEIGHTS_VOLUME}
                       # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.
                       export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
+                      export JAX_COMPILATION_CACHE_DIR=/compile-cache/jax
                       NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
                       RANK="${TPU_WORKER_ID:-0}"
                       echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"
@@ -243,6 +255,8 @@ ${WEIGHTS_VOLUME}
                     limits:
                       google.com/tpu: "4"
                   volumeMounts:
+                    - name: compile-cache
+                      mountPath: /compile-cache
                     - name: dshm
                       mountPath: /dev/shm
                     - name: tmp
