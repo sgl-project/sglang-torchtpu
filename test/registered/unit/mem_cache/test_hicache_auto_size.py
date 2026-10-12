@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context, get_memory
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -90,8 +91,8 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
 
-    def test_explicit_sizing_keeps_aggregate_admission(self):
-        """Explicit sizing must reject combined pools that exceed one host budget."""
+    def test_explicit_sizing_preserves_default_per_pool_admission(self):
+        """The default platform keeps independent admission for explicit sizes."""
         pool = MHATokenToKVPool(
             size=128,
             page_size=2,
@@ -105,6 +106,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         for config in ({"hicache_ratio": 2.0}, {"hicache_size": 16_384 / 1e9}):
             with (
                 self.subTest(config=config),
+                patch.object(sizing, "current_platform", SRTPlatform()),
                 get_context().override_server_args(
                     enable_hierarchical_cache=True,
                     hicache_host_memory_fraction=None,
@@ -129,16 +131,17 @@ class TestHiCacheAutoSize(CustomTestCase):
                     device="cpu",
                 )
                 self.assertEqual(host.size, 258)
-                with self.assertRaisesRegex(ValueError, "Not enough host memory"):
-                    MHATokenToKVPoolHost(
-                        pool,
-                        memory.hicache_ratio,
-                        memory.hicache_size,
-                        2,
-                        "layer_first",
-                        pin_memory=False,
-                        device="cpu",
-                    )
+                second = MHATokenToKVPoolHost(
+                    pool,
+                    memory.hicache_ratio,
+                    memory.hicache_size,
+                    2,
+                    "layer_first",
+                    pin_memory=False,
+                    device="cpu",
+                )
+                self.assertEqual(second.size, 258)
+                self.assertIsNone(base._host_memory_budget.get())
             self.assertIsNone(base._host_memory_budget.get())
 
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):

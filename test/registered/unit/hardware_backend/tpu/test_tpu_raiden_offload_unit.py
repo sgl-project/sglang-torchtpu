@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     KVClassType,
     TransferBackend,
 )
+from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.pool_host import base as host_base
 from sglang.srt.runtime_context import get_context
@@ -193,10 +194,45 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
 
     def test_explicit_hybrid_pools_share_one_budget(self):
         """Full and SWA pools must not each spend the same host-memory allowance."""
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+            for host_size in (0, 16_384 / 1e9):
+                self._check_explicit_hybrid_budget(platform_cls(), host_size)
+
+    def test_native_or_disabled_hicache_does_not_reserve_raiden_budget(self):
+        """The Raiden policy must not consume headroom for other cache paths."""
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+            for io_backend, enabled in (("torch_tpu", True), ("raiden", False)):
+                with (
+                    self.subTest(platform=platform_cls.__name__, backend=io_backend),
+                    patch.object(sizing, "current_platform", platform_cls()),
+                    get_context().override_server_args(
+                        hicache_io_backend=io_backend,
+                        hicache_host_memory_fraction=None,
+                    ),
+                    patch.object(
+                        host_base,
+                        "available_host_memory_bytes",
+                        side_effect=AssertionError("unexpected host-memory query"),
+                    ),
+                    auto_size_hicache(None, None, enabled=enabled),
+                ):
+                    self.assertIsNone(host_base._host_memory_budget.get())
+
+    def _check_explicit_hybrid_budget(self, platform, host_size):
         with (
+            self.subTest(platform=type(platform).__name__, host_size=host_size),
+            patch.object(sizing, "current_platform", platform),
             get_context().override_server_args(
                 enable_hierarchical_cache=True,
                 hicache_ratio=2.0,
+                hicache_size=host_size,
+                hicache_io_backend="raiden",
                 hicache_host_memory_fraction=None,
             ),
             patch.object(host_base, "ranks_per_host", return_value=8),
@@ -208,14 +244,16 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
             patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer,
         ):
             with auto_size_hicache(None, None, enabled=True):
-                full = self._host_pool(pool_label="full")
+                full = self._host_pool(host_size=host_size, pool_label="full")
                 self.assertEqual(full.available_size(), 20)
                 with self.assertRaisesRegex(ValueError, "Not enough host memory"):
-                    self._host_pool(pool_label="swa")
+                    self._host_pool(host_size=host_size, pool_label="swa")
                 self.assertEqual(transfer.call_count, 1)
             # A failed startup must not leak its reservations into the next one.
             with auto_size_hicache(None, None, enabled=True):
-                self.assertEqual(self._host_pool().available_size(), 20)
+                self.assertEqual(
+                    self._host_pool(host_size=host_size).available_size(), 20
+                )
         self.assertIsNone(host_base._host_memory_budget.get())
 
 

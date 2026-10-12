@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     ranks_per_host,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 
 if TYPE_CHECKING:
@@ -92,8 +93,7 @@ def auto_size_hicache(
         yield
         return
     if fraction is None:
-        # Explicit sizing opts out of shrinking, not aggregate admission.
-        with host_memory_budget_scope(host_memory_budget_bytes()):
+        with current_platform.get_hicache_explicit_size_context():
             yield
         return
     requested = get_memory().hicache_ratio

@@ -8,7 +8,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
 
 import torch
@@ -984,6 +984,18 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.mamba_pool import TpuMambaPool
 
         return TpuMambaPool
+
+    def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
+        from sglang.srt.mem_cache.pool_host.base import (
+            host_memory_budget_bytes,
+            host_memory_budget_scope,
+        )
+        from sglang.srt.runtime_context import get_memory
+
+        if get_memory().hicache_io_backend != "raiden":
+            return super().get_hicache_explicit_size_context()
+        # Full, SWA, and draft DMA pools must not each spend the same allowance.
+        return host_memory_budget_scope(host_memory_budget_bytes())
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.mem_cache.memory_pool_host import (

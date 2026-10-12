@@ -12,6 +12,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
@@ -116,6 +117,15 @@ class SRTPlatform(DeviceMixin):
         from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 
         return get_mha_host_pool_cls(device_pool)
+
+    def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
+        """Scope host-pool construction for an explicit HiCache ratio or size.
+
+        The context covers target and draft pools. By default, each host pool
+        performs its own admission check; platforms may share a budget instead.
+        Automatic sizing manages its own budget and does not call this hook.
+        """
+        return nullcontext()
 
     def get_mamba_pool_cls(self) -> type:
         """Return the recurrent (GDN / mamba) state pool class for this platform."""
