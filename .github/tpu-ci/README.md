@@ -119,6 +119,13 @@ shape is exec mode. Exec and P/D jobs are hand-wired: in-project in
 nightly feature validation runs, in `external/external-topology.yaml`'s `commands`
 (a single-host test there registers to `external-nightly-1host`; see `external/README.md`).
 
+**Every TPU suite must be declared in `run_suite.py`**, including hand-wired and
+external-cluster ones. TPU is in `_SUITE_CHECKED_BACKENDS`, and `run_suite.main()`
+validates every registration before it filters by `--hw`, so one TPU test registered to
+an undeclared suite fails *every* backend's run_suite job at startup.
+`test/registered/unit/tools/test_run_suite_registrations.py` catches this on the CPU
+pr-gate.
+
 ## Pipelines
 
 ### Nightly — `nightly-test-tpu.yml`

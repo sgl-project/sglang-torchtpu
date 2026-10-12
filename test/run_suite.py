@@ -274,8 +274,9 @@ NIGHTLY_SUITES = {
 
 
 OTHER_SUITES = {
-    # Hand-wired jobs (`files:`) in feature-validation-tpu.yml: P/D gates and
-    # exec-mode probes that no generic suite runner can launch.
+    # Hand-wired jobs (`files:` / `cmd:`) that no generic suite runner launches:
+    # P/D gates and exec-mode probes in external-topology.yaml,
+    # feature-validation-tpu.yml and combo-test-tpu.yml.
     HWBackend.TPU: [
         "tpu-integration",
     ],
