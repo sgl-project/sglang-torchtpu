@@ -26,11 +26,14 @@ from absl.testing import parameterized
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.compile_cache import initialize_jax_compile_cache
 from sglang_tpu.moe.pallas.sparse_core import dense_gather_reduce as dgr_mod
 from sglang_tpu.moe.pallas.sparse_core.dense_gather_reduce import (
     dense_gather_reduce,
     is_compatible,
 )
+
+initialize_jax_compile_cache()
 
 
 def reference_dense_gather_reduce(

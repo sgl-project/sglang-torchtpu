@@ -24,9 +24,12 @@ import numpy as np
 from absl.testing import parameterized
 from jax._src import test_util as jtu
 
+from sglang_tpu.compile_cache import initialize_jax_compile_cache
 from sglang_tpu.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
     ragged_gather_reduce as ragged_gather_reduce_v2,
 )
+
+initialize_jax_compile_cache()
 
 
 def reference_ragged_gather_reduce(
