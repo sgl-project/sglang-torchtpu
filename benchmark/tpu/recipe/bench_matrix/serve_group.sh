@@ -14,6 +14,11 @@
 #                          over raiden. Rank 0 additionally fronts all four
 #                          with the mini-LB on :30000 -- the port the JobSet
 #                          health-gates and rank-0's test files bench.
+#   pd_1p1d_pc             2-host slice, the same shape at 1+1: rank 0
+#                          PREFILL (+ the mini-LB), rank 1 DECODE.
+#
+# In general a P/D recipe runs RECIPE_HOSTS single-host engines: ranks
+# [0, PD_PREFILL_ENGINES) prefill, the rest decode.
 set -uo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -102,10 +107,19 @@ if [[ "$PD_DISAGG" != "1" ]]; then
 fi
 
 # ----------------------------- P/D recipe ------------------------------
-if (( ${#SLICE_HOSTS[@]} < 4 )); then
-    echo "[serve_group] ERROR: pd recipe needs a 4-host slice, got" \
+if (( ${#SLICE_HOSTS[@]} < RECIPE_HOSTS )); then
+    echo "[serve_group] ERROR: $BENCH_RECIPE needs a ${RECIPE_HOSTS}-host slice, got" \
          "TPU_WORKER_HOSTNAMES='${TPU_WORKER_HOSTNAMES:-}'" >&2
     exit 1
+fi
+if (( PD_PREFILL_ENGINES < 1 || PD_PREFILL_ENGINES >= RECIPE_HOSTS )); then
+    echo "[serve_group] ERROR: PD_PREFILL_ENGINES=$PD_PREFILL_ENGINES leaves no" \
+         "prefill or no decode engine on $RECIPE_HOSTS hosts" >&2
+    exit 1
+fi
+if (( WORKER_ID >= RECIPE_HOSTS )); then
+    echo "[serve_group] rank $WORKER_ID idle for $RECIPE_HOSTS-host recipe; exiting 0"
+    exit 0
 fi
 # GKE injects MEGASCALE_* when it treats TPU jobs as one multislice workload;
 # these engines are independent sub-slices (KV moves at application level).
@@ -117,12 +131,16 @@ for v in $(compgen -e | grep '^MEGASCALE' || true); do unset "$v"; done
 echo "[serve_group] injected TPU env:"
 env | grep -E '^TPU_' | sed 's/^/[serve_group]   /' || true
 
-# FOUR single-host tp=8 engines: pods 0-1 prefill, pods 2-3 decode, paired at
-# request time by the mini-LB -- the raiden P/D topology the existing gates
-# validate. (A 2-host tp=16-per-engine variant on a subdivided slice also
-# brings up with a consistently re-scoped libtpu env, but its KV-transfer
-# path is unvalidated; revisit if tp=16 engines are wanted.)
-if (( WORKER_ID < 2 )); then
+# Single-host tp=8 engines: pods [0, PD_PREFILL_ENGINES) prefill, the rest
+# decode, paired at request time by the mini-LB -- the raiden P/D topology the
+# existing gates validate (2P+2D on 4 hosts, 1P+1D on 2). (A 2-host
+# tp=16-per-engine variant on a subdivided slice also brings up with a
+# consistently re-scoped libtpu env, but its KV-transfer path is unvalidated;
+# revisit if tp=16 engines are wanted.)
+# The mini-LB keeps the recipe's front port (:30000); capture it before PORT
+# is re-pointed at this pod's engine port below.
+LB_PORT=${LB_PORT:-$PORT}
+if (( WORKER_ID < PD_PREFILL_ENGINES )); then
     ROLE=prefill
     export PORT=$PD_PREFILL_PORT
 else
@@ -168,22 +186,27 @@ ENGINE_PID=$!
 CHILD_PIDS+=("$ENGINE_PID")
 
 if [[ "$WORKER_ID" == "0" ]]; then
-    # POD 0 fronts all four engines with the mini-LB on :30000 -- the port the
+    # POD 0 fronts every engine with the mini-LB on :30000 -- the port the
     # JobSet health-gates and rank-0's test files bench, both on this pod. The
     # --prefill hostnames are injected into requests as the KV bootstrap
     # addresses the decode engines dial, so they must be the cluster-reachable
     # names, never 127.0.0.1.
-    LB_PORT=${LB_PORT:-$PORT}   # the health-gated/benched port
-    wait_url "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "prefill engine 0" "$HEALTH_TIMEOUT" "$ENGINE_PID" || exit 1
-    wait_url "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "prefill engine 1" "$HEALTH_TIMEOUT" || exit 1
-    wait_url "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" "decode engine 0" "$HEALTH_TIMEOUT" || exit 1
-    wait_url "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" "decode engine 1" "$HEALTH_TIMEOUT" || exit 1
+    router_args=()
+    for (( i = 0; i < RECIPE_HOSTS; i++ )); do
+        if (( i < PD_PREFILL_ENGINES )); then
+            url="http://${SLICE_HOSTS[$i]}:$PD_PREFILL_PORT"
+            watch=""   # this pod's own engine: fail fast if it dies
+            (( i == 0 )) && watch=$ENGINE_PID
+            wait_url "$url" "prefill engine $i" "$HEALTH_TIMEOUT" "$watch" || exit 1
+            router_args+=(--prefill "$url" "$PD_BOOTSTRAP_PORT")
+        else
+            url="http://${SLICE_HOSTS[$i]}:$PD_DECODE_PORT"
+            wait_url "$url" "decode engine $(( i - PD_PREFILL_ENGINES ))" "$HEALTH_TIMEOUT" || exit 1
+            router_args+=(--decode "$url")
+        fi
+    done
     "$PYTHON" -m sglang_router.launch_router \
-        --pd-disaggregation --mini-lb \
-        --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
-        --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
-        --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
-        --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
+        --pd-disaggregation --mini-lb "${router_args[@]}" \
         --host 0.0.0.0 --port "$LB_PORT" > >(sed 's/^/[mini-lb] /') 2>&1 &
     CHILD_PIDS+=("$!")
 fi

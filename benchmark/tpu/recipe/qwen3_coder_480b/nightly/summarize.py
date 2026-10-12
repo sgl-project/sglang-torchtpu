@@ -258,6 +258,10 @@ def _derive(metrics: Dict, counters: Dict, config: Optional[Dict] = None) -> Dic
 
     rows = _request_rows(metrics)
     if rows:
+        # Every attempted request, failures included (bench_serving emits one
+        # output per round even when it fails).
+        derived["requests"] = len(rows)
+        derived["failed_requests"] = sum(1 for row in rows if not row["ok"])
         layout = _session_layout(len(rows), config or {})
         derived["per_request_layout"] = layout["status"]
         if _input_lens_vary(rows, layout):

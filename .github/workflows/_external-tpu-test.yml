@@ -64,6 +64,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 380   # > WAIT_SLACK + 2 files x 8100s (= 350 min) + job setup
+    # Sized for ONE regular group per slice. A "tail" group (render_external_jobset.py)
+    # runs after it: normally ~25 min more, but if the regular group hangs to its
+    # deadline, this timeout cancels the tail group -- by design, the only casualty.
     steps:
       - uses: actions/checkout@v4
         with:

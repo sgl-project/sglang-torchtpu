@@ -34,8 +34,10 @@ if [[ "$PD_DISAGG" == "1" ]]; then
         PROBE_URL="http://${_slice_hosts[0]}:$PD_PREFILL_PORT"
     fi
     PROBE_URL=${PROBE_URL:-http://127.0.0.1:$PD_PREFILL_PORT}
-    if [[ -z "${PROBE_URL_2:-}" && ${#_slice_hosts[@]} -ge 3 ]]; then
-        PROBE_URL_2="http://${_slice_hosts[2]}:$PD_DECODE_PORT"
+    # The first decode engine follows the prefill engines (serve_group.sh's
+    # rank layout): hosts[2] for 2P+2D, hosts[1] for 1P+1D.
+    if [[ -z "${PROBE_URL_2:-}" && ${#_slice_hosts[@]} -gt $PD_PREFILL_ENGINES ]]; then
+        PROBE_URL_2="http://${_slice_hosts[$PD_PREFILL_ENGINES]}:$PD_DECODE_PORT"
     fi
 else
     MODE_LABEL=colocated

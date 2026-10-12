@@ -34,6 +34,11 @@ Modes:
         [{"name","suite","hosts","topology","nodepool_var",["nodepool_var_decode"],"groups"}]
       `nodepool_var` is the NAME of the repo secret holding that slice's nodepool; the
       workflow resolves it so the value never appears in source or the matrix.
+      A launch group whose files all declare "placement": "tail" in MULTIHOST_LAUNCH is a
+      light group: it is dealt only after every other group sharing its slices, and so
+      runs LAST on the slice it lands on. It never moves another group to a different
+      slice, and a hang upstream on that slice can only cost the tail group its run (the
+      per-slice job timeout cancels it), never a regular group.
   render (default)
       Render ONE group's JobSet (the workflow calls this once per group in a row):
       --image <ref> --group '<group json>' --nodepool <value> [--nodepool-decode <value>]
@@ -117,11 +122,15 @@ def _launch_groups(entries):
             )
             continue
         shared.setdefault((suite, ls, weights), []).append(
-            (path, int(spec.get("timeout_per_file", 3600)))
+            (
+                path,
+                int(spec.get("timeout_per_file", 3600)),
+                spec.get("placement") == "tail",
+            )
         )
     groups = []
     for (suite, ls, weights), files in sorted(shared.items()):
-        paths = sorted(path for path, _ in files)
+        paths = sorted(path for path, _, _ in files)
         groups.append(
             {
                 **names_from_path(paths[0]),  # #552: path-derived name + run_name
@@ -133,7 +142,10 @@ def _launch_groups(entries):
                 # The group's per-file budget is the largest any of its files
                 # declares; the workflow passes it back to render so the
                 # JobSet deadline is sized from what actually runs.
-                "timeout_per_file": max(tpf for _, tpf in files),
+                "timeout_per_file": max(tpf for _, tpf, _ in files),
+                "placement": (
+                    "tail" if all(tail for _, _, tail in files) else "regular"
+                ),
             }
         )
     return groups
@@ -211,6 +223,10 @@ def list_groups(cfg, root, nightly_only):
         + _cmd_groups(of("exec"), "exec", hosts)
         + _self_groups(of("self"), cfg)
     )
+    # Tail groups ("placement": "tail") are dealt after every other group: they never
+    # move another group to a different slice, and on the slice they share they run
+    # last. The sort is stable, so every other group keeps its order.
+    groups.sort(key=lambda g: g.get("placement") == "tail")
 
     # Bucket by SLICE, not by suite: suites share the same nodepools, and two matrix jobs on
     # one slice would race for it (the slice-keyed concurrency group keeps only one pending).

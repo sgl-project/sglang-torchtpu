@@ -11,6 +11,10 @@
 #                 pd_2p2d_pc_spec_kvoff  4 hosts: 2 prefill + 2 decode engines
 #                                        (single-host tp=8 each) over raiden
 #                                        P/D, prefix caching + spec + KV offload
+#                 pd_1p1d_pc             2 hosts: 1 prefill + 1 decode engine,
+#                                        prefix caching only, bf16 KV; the
+#                                        long-context P/D stress cell (GPT-OSS,
+#                                        agentic only, ~8k new tokens per turn)
 #   WORKLOAD      agentic  multi-turn agentic (the 480B nightly's shape:
 #                          4k in + 1k out per round, 2 rounds = 8k of input;
 #                          long sessions ramp to LONG_TARGET_CONTEXT)
@@ -35,7 +39,7 @@ REPO_ROOT=$(cd -- "$TPU_BENCH_DIR/../.." && pwd)
 NIGHTLY_TOOLS_DIR="$TPU_BENCH_DIR/recipe/qwen3_coder_480b/nightly"
 
 BENCH_MODEL=${BENCH_MODEL:?set BENCH_MODEL=gpt_oss_120b|qwen3_coder_480b}
-BENCH_RECIPE=${BENCH_RECIPE:?set BENCH_RECIPE=1host_pc|1host_pc_spec_kvoff|pd_2p2d_pc_spec_kvoff}
+BENCH_RECIPE=${BENCH_RECIPE:?set BENCH_RECIPE=1host_pc|1host_pc_spec_kvoff|pd_2p2d_pc_spec_kvoff|pd_1p1d_pc}
 WORKLOAD=${WORKLOAD:-agentic}
 PROFILE=${PROFILE:-ci}
 
@@ -47,7 +51,9 @@ PYTHON=${PYTHON:-python3}
 #   worst-case sweep  <=  SWEEP_TIMEOUT  <  TIMEOUT_PER_FILE  <  JobSet deadline
 #
 # where worst-case sweep = (number of attempted legs) x MAX_LEG_SECONDS.
-# TIMEOUT_PER_FILE (8100) is declared literally in every test file's
+# TIMEOUT_PER_FILE (8100; 5400 for the light "tail" cells such as
+# pd_1p1d_pc, which run last on a slice another group fills) is declared
+# literally in every test file's
 # MULTIHOST_LAUNCH (the CI scanner reads it via AST, so it cannot be computed
 # there); test/registered/unit/test_bench_matrix.py ASSERTS the whole
 # chain, so a change to any link that breaks another fails CI instead of
@@ -74,8 +80,11 @@ LEG_KILL_GRACE=60
 # plumbing check.
 # ---------------------------------------------------------------------------
 # An explicit SWEEP_LONG from the caller must survive the 8k1k long-axis
-# collapse below, so remember it before the profile defaults consume it.
+# collapse below, so remember it before the profile defaults consume it (and
+# likewise SWEEP_BS / KV_CACHE_DTYPE for recipes that override the defaults).
 SWEEP_LONG_FROM_ENV=${SWEEP_LONG:-}
+SWEEP_BS_FROM_ENV=${SWEEP_BS:-}
+_KV_CACHE_DTYPE_FROM_ENV=${KV_CACHE_DTYPE+set}
 case "$PROFILE" in
     ci)
         SWEEP_BS=${SWEEP_BS:-"1 16 32"}
@@ -127,6 +136,10 @@ case "$BENCH_MODEL" in
         LONG_RAMP_DEFAULT=36096
         ;;
 esac
+# The long-context P/D stress recipe studies a fixed shape instead: ~8k of new
+# prefill per turn, so a long session takes ~13 rounds to reach the target and
+# every round re-transfers a larger context P->D.
+[[ "$BENCH_RECIPE" == "pd_1p1d_pc" ]] && LONG_RAMP_DEFAULT=8192
 case "$WORKLOAD" in
     agentic)
         TURN_INPUT_TOKENS=${TURN_INPUT_TOKENS:-4096}
@@ -258,6 +271,35 @@ case "$BENCH_RECIPE" in
         PD_PREFILL_ENGINES=2   # the mini-LB pairs requests with a random one
         PREFIX_CACHE=1; KV_OFFLOAD=1; SPEC_DECODE=1; PD_DISAGG=1
         ;;
+    pd_1p1d_pc)
+        # Long-context P/D stress cell: TWO single-host tp=8 engines (1
+        # prefill + 1 decode, the pairing test_tpu_gpt_oss_120b_pd_singlehost
+        # validates) behind the mini-LB. Plain P/D + prefix caching -- no spec,
+        # no KV offload -- so the P->D KV transfer of a growing context is the
+        # variable under test, and every round of a session lands on the one
+        # prefill cache (reachable hit rate = the single-cache ideal).
+        RECIPE_HOSTS=2; TP_SIZE=8; EP_SIZE=8     # per engine, 1 host each
+        PD_PREFILL_ENGINES=1
+        PREFIX_CACHE=1; KV_OFFLOAD=0; SPEC_DECODE=0; PD_DISAGG=1
+        # bf16 KV: the transfer volume a bf16 deployment moves (2x fp8). An
+        # explicit KV_CACHE_DTYPE in the environment still wins.
+        [[ -z "$_KV_CACHE_DTYPE_FROM_ENV" ]] && KV_CACHE_DTYPE=bfloat16
+        # Same per-rank bytes as the fp8 pool (half the tokens at 2x the
+        # width): ~0.79M tokens. The decode engine holds the whole running
+        # batch here (one decode), and the sweep below peaks at c16-long4
+        # ~= 12 x 10.3k + 4 x 122k ~= 0.61M tokens.
+        MAX_TOTAL_TOKENS_TP8=786432
+        # (Its ~8k-per-turn ramp is set with the workload shape above.)
+        # A smaller grid than the matrix's: one clean single-session leg
+        # (c1-long1 gives exact per-turn costs with nothing else in flight)
+        # plus long sessions under 8- and 16-way load. Explicit SWEEP_* win.
+        if [[ "$PROFILE" == "ci" ]]; then
+            SWEEP_BS=${SWEEP_BS_FROM_ENV:-"1 8 16"}
+            if [[ "$WORKLOAD" == "agentic" ]]; then
+                SWEEP_LONG=${SWEEP_LONG_FROM_ENV:-"1 4"}
+            fi
+        fi
+        ;;
     *)
         echo "ERROR: unknown BENCH_RECIPE='$BENCH_RECIPE'" >&2
         exit 2
@@ -388,7 +430,7 @@ log_config() {
   prefix_caching         = $([[ "$PREFIX_CACHE" == "1" ]] && echo ENABLED || echo disabled)
   kv_offload (hicache)   = $([[ "$KV_OFFLOAD" == "1" ]] && echo "ENABLED (io=$HICACHE_IO_BACKEND ratio=$HICACHE_RATIO)" || echo disabled)
   spec_decode (EAGLE3)   = $([[ "$SPEC_DECODE" == "1" ]] && echo "ENABLED (draft=$DRAFT_MODEL)" || echo disabled)
-  pd_disaggregation      = $([[ "$PD_DISAGG" == "1" ]] && echo "ENABLED (2P+2D raiden, tp=$TP_SIZE/engine)" || echo disabled)
+  pd_disaggregation      = $([[ "$PD_DISAGG" == "1" ]] && echo "ENABLED (${PD_PREFILL_ENGINES}P+$(( RECIPE_HOSTS - PD_PREFILL_ENGINES ))D raiden, tp=$TP_SIZE/engine)" || echo disabled)
   --- workload ---
   turn input / output    = $TURN_INPUT_TOKENS / $TURN_OUTPUT_TOKENS tokens
   target context         = $TARGET_CONTEXT (normal) / $LONG_TARGET_CONTEXT (long)

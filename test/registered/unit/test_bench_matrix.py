@@ -47,6 +47,25 @@ RECIPES = {
     "pd_2p2d_pc_spec_kvoff": "external-nightly-2x2x4",
 }
 WORKLOADS = ("agentic", "8k1k")
+# Cells outside the MODELS x RECIPES x WORKLOADS grid: a recipe that only
+# makes sense for one model / workload (the long-context P/D stress cell is a
+# GPT-OSS multi-turn study). (model, recipe) -> (workloads, suite, sweep).
+STANDALONE_CELLS = {
+    ("gpt_oss_120b", "pd_1p1d_pc"): (
+        ("agentic",),
+        "external-nightly-2x2x2",
+        "BS=1 8 16|LONG=1 4",
+    ),
+}
+
+
+def _recipe_suite(basename):
+    """The suite a cell file must register to, from its file name."""
+    for (model, recipe), (_, suite, _) in STANDALONE_CELLS.items():
+        if basename.startswith(f"test_tpu_bench_{model}_{recipe}_"):
+            return recipe, suite
+    recipe = next(r for r in RECIPES if f"_{r}_" in basename)
+    return recipe, RECIPES[recipe]
 
 
 def _scan_file(path):
@@ -74,12 +93,22 @@ def _scan_file(path):
 class TestBenchMatrix(CustomTestCase):
     def _cell_files(self):
         files = sorted(glob.glob(os.path.join(E2E, "test_tpu_bench_*.py")))
+        expected = {
+            os.path.join(E2E, f"test_tpu_bench_{m}_{r}_{w}.py")
+            for m in MODELS
+            for r in RECIPES
+            for w in WORKLOADS
+        } | {
+            os.path.join(E2E, f"test_tpu_bench_{m}_{r}_{w}.py")
+            for (m, r), (workloads, _, _) in STANDALONE_CELLS.items()
+            for w in workloads
+        }
         self.assertEqual(
-            len(files),
-            len(MODELS) * len(RECIPES) * len(WORKLOADS),
-            "the matrix is 2 models x 3 recipes x 2 workloads; a missing or "
-            "extra test_tpu_bench_* file means a cell was added or dropped "
-            "without updating this inventory",
+            set(files),
+            expected,
+            "the matrix is 2 models x 3 recipes x 2 workloads plus "
+            "STANDALONE_CELLS; a missing or extra test_tpu_bench_* file means "
+            "a cell was added or dropped without updating this inventory",
         )
         return files
 
@@ -117,16 +146,19 @@ class TestBenchMatrix(CustomTestCase):
         fails only at engine rendezvous, an hour into the run."""
         for path in self._cell_files():
             suite, _, _ = _scan_file(path)
-            recipe = next(r for r in RECIPES if f"_{r}_" in os.path.basename(path))
+            recipe, expected = _recipe_suite(os.path.basename(path))
             self.assertEqual(
                 suite,
-                RECIPES[recipe],
-                f"{path}: recipe {recipe} must register to {RECIPES[recipe]}",
+                expected,
+                f"{path}: recipe {recipe} must register to {expected}",
             )
 
     def test_discovery_buckets_one_group_per_slice(self):
         """The even-split contract: 4 single-host groups over the four 2x2x2
-        slices, 2 pd groups over the two 2x2x4 slices, none serialized."""
+        slices, 2 pd groups over the two 2x2x4 slices, none serialized. A
+        light tail group (MULTIHOST_LAUNCH "placement": "tail") may share a
+        slice, but only AFTER that slice's regular group, so a hang upstream
+        costs only the tail group its run."""
         spec = importlib.util.spec_from_file_location(
             "render_external_jobset",
             os.path.join(
@@ -150,19 +182,36 @@ class TestBenchMatrix(CustomTestCase):
                 for g in sl["groups"]
                 if g.get("launch_script", "").startswith("recipe/bench_matrix/")
             ]
+            regular = [g for g in ours if g["placement"] != "tail"]
             self.assertLessEqual(
-                len(ours),
+                len(regular),
                 1,
-                f"{sl['name']}: {len(ours)} bench_matrix groups serialize on "
-                f"one slice -- the matrix is sized to fill each slice exactly "
-                f"once ({[g['name'] for g in ours]})",
+                f"{sl['name']}: {len(regular)} regular bench_matrix groups "
+                f"serialize on one slice -- the matrix is sized to fill each "
+                f"slice exactly once ({[g['name'] for g in regular]})",
+            )
+            # P/D, exec and self-launch groups share these slices and carry no
+            # placement; they count as regular.
+            placements = [g.get("placement", "regular") for g in sl["groups"]]
+            self.assertEqual(
+                placements,
+                sorted(placements, key=lambda p: p == "tail"),
+                f"{sl['name']}: a tail group must run after every regular "
+                f"group on its slice ({[g['name'] for g in sl['groups']]})",
             )
             per_suite.setdefault(sl["suite"], 0)
             per_suite[sl["suite"]] += len(ours)
             for g in ours:
+                recipe, _ = _recipe_suite(os.path.basename(g["files"].split()[0]))
+                self.assertEqual(
+                    g["placement"] == "tail",
+                    recipe in bench_base.TAIL_RECIPES,
+                    f"{g['name']}: placement must be 'tail' exactly for "
+                    "bench_matrix_base.TAIL_RECIPES",
+                )
                 self.assertEqual(
                     g["timeout_per_file"],
-                    bench_base.TIMEOUT_PER_FILE_BUDGET,
+                    bench_base.timeout_per_file_budget(recipe),
                     f"{g['name']}: discovery must carry the files' declared "
                     "timeout_per_file (the JobSet deadline is sized from it)",
                 )
@@ -188,34 +237,41 @@ class TestBenchMatrix(CustomTestCase):
     def test_config_resolves_the_sweep_grid(self):
         """config.sh must keep the CI grid: concurrency {1,16,32}, long
         requests {1,2,4} for agentic and none for 8k1k, for every
-        (model, recipe)."""
+        (model, recipe) -- and each standalone cell its own grid."""
         expected_long = {"agentic": "1 2 4", "8k1k": "0"}
-        for model in MODELS:
-            for recipe in RECIPES:
-                for workload in WORKLOADS:
-                    out = subprocess.run(
-                        [
-                            "bash",
-                            "-c",
-                            'source ./config.sh && echo "BS=$SWEEP_BS|LONG=$SWEEP_LONG"',
-                        ],
-                        cwd=BENCH_MATRIX,
-                        env={
-                            **os.environ,
-                            "BENCH_MODEL": model,
-                            "BENCH_RECIPE": recipe,
-                            "WORKLOAD": workload,
-                            "PROFILE": "ci",
-                        },
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(
-                        out.returncode, 0, f"{model}/{recipe}/{workload}: {out.stderr}"
-                    )
-                    self.assertIn(
-                        f"BS=1 16 32|LONG={expected_long[workload]}", out.stdout
-                    )
+        cells = [
+            (m, r, w, f"BS=1 16 32|LONG={expected_long[w]}")
+            for m in MODELS
+            for r in RECIPES
+            for w in WORKLOADS
+        ] + [
+            (m, r, w, sweep)
+            for (m, r), (workloads, _, sweep) in STANDALONE_CELLS.items()
+            for w in workloads
+        ]
+        for model, recipe, workload, expected_sweep in cells:
+            with self.subTest(cell=f"{model}/{recipe}/{workload}"):
+                out = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'source ./config.sh && echo "BS=$SWEEP_BS|LONG=$SWEEP_LONG"',
+                    ],
+                    cwd=BENCH_MATRIX,
+                    env={
+                        **os.environ,
+                        "BENCH_MODEL": model,
+                        "BENCH_RECIPE": recipe,
+                        "WORKLOAD": workload,
+                        "PROFILE": "ci",
+                    },
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    out.returncode, 0, f"{model}/{recipe}/{workload}: {out.stderr}"
+                )
+                self.assertIn(expected_sweep, out.stdout)
 
     def test_reused_nightly_tools_exist(self):
         """config.sh reaches into recipe/qwen3_coder_480b/nightly/ for the
@@ -239,55 +295,76 @@ class TestBenchMatrix(CustomTestCase):
         base's constants, config.sh's profile) that nothing else cross-checks;
         this is what turns "we changed one number" into a red test instead of
         a silently truncated benchmark."""
-        # Every cell's literal must equal the base's budget constant.
+        # Every cell's literal must equal the base's budget constant for its
+        # recipe (tail cells carry the smaller tail budget).
         for path in self._cell_files():
             _, launch, _ = _scan_file(path)
+            recipe, _ = _recipe_suite(os.path.basename(path))
             self.assertEqual(
                 launch.get("timeout_per_file"),
-                bench_base.TIMEOUT_PER_FILE_BUDGET,
+                bench_base.timeout_per_file_budget(recipe),
                 f"{path}: timeout_per_file literal drifted from "
-                "bench_matrix_base.TIMEOUT_PER_FILE_BUDGET",
+                "bench_matrix_base.timeout_per_file_budget()",
+            )
+            self.assertEqual(
+                launch.get("placement") == "tail",
+                recipe in bench_base.TAIL_RECIPES,
+                f"{path}: MULTIHOST_LAUNCH placement must be 'tail' exactly "
+                "for bench_matrix_base.TAIL_RECIPES",
             )
         # The sweep budget plus the health recheck must fit the file budget.
-        self.assertLess(
-            bench_base.SWEEP_TIMEOUT_DEFAULT + bench_base.HEALTH_RECHECK_BUDGET,
-            bench_base.TIMEOUT_PER_FILE_BUDGET,
-        )
+        for sweep, budget in (
+            (bench_base.SWEEP_TIMEOUT_DEFAULT, bench_base.TIMEOUT_PER_FILE_BUDGET),
+            (
+                bench_base.TAIL_SWEEP_TIMEOUT_DEFAULT,
+                bench_base.TAIL_TIMEOUT_PER_FILE_BUDGET,
+            ),
+        ):
+            self.assertLess(sweep + bench_base.HEALTH_RECHECK_BUDGET, budget)
         # config.sh's ci profile: attempted legs x leg cap must fit the sweep
-        # budget (legs with long > bs are skipped and cost nothing).
-        out = subprocess.run(
-            [
-                "bash",
-                "-c",
-                'source ./config.sh && echo "$SWEEP_BS|$SWEEP_LONG|$MAX_LEG_SECONDS"',
-            ],
-            cwd=BENCH_MATRIX,
-            env={
-                **os.environ,
-                "BENCH_MODEL": "gpt_oss_120b",
-                "BENCH_RECIPE": "1host_pc_spec_kvoff",
-                "WORKLOAD": "agentic",
-                "PROFILE": "ci",
-            },
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(out.returncode, 0, out.stderr)
-        bs_axis, long_axis, leg_cap = out.stdout.strip().split("|")
-        attempted = [
-            (b, l)
-            for b in map(int, bs_axis.split())
-            for l in map(int, long_axis.split())
-            if l <= b
+        # budget (legs with long > bs are skipped and cost nothing). Checked
+        # for the matrix's largest grid and for every standalone cell, which
+        # sets its own.
+        budget_cells = [("gpt_oss_120b", "1host_pc_spec_kvoff", "agentic")] + [
+            (m, r, w)
+            for (m, r), (workloads, _, _) in STANDALONE_CELLS.items()
+            for w in workloads
         ]
-        worst_case = len(attempted) * int(leg_cap)
-        self.assertLessEqual(
-            worst_case,
-            bench_base.SWEEP_TIMEOUT_DEFAULT,
-            f"{len(attempted)} attempted ci legs x MAX_LEG_SECONDS={leg_cap} "
-            f"= {worst_case}s exceeds SWEEP_TIMEOUT "
-            f"{bench_base.SWEEP_TIMEOUT_DEFAULT}s",
-        )
+        for model, recipe, workload in budget_cells:
+            out = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source ./config.sh && echo "$SWEEP_BS|$SWEEP_LONG|$MAX_LEG_SECONDS"',
+                ],
+                cwd=BENCH_MATRIX,
+                env={
+                    **os.environ,
+                    "BENCH_MODEL": model,
+                    "BENCH_RECIPE": recipe,
+                    "WORKLOAD": workload,
+                    "PROFILE": "ci",
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(out.returncode, 0, out.stderr)
+            bs_axis, long_axis, leg_cap = out.stdout.strip().split("|")
+            attempted = [
+                (b, l)
+                for b in map(int, bs_axis.split())
+                for l in map(int, long_axis.split())
+                if l <= b
+            ]
+            worst_case = len(attempted) * int(leg_cap)
+            sweep_timeout = bench_base.sweep_timeout_default(recipe)
+            self.assertLessEqual(
+                worst_case,
+                sweep_timeout,
+                f"{model}/{recipe}/{workload}: {len(attempted)} attempted ci "
+                f"legs x MAX_LEG_SECONDS={leg_cap} = {worst_case}s exceeds "
+                f"SWEEP_TIMEOUT {sweep_timeout}s",
+            )
 
 
 if __name__ == "__main__":

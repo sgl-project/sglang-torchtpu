@@ -289,6 +289,8 @@ class TestSummarizeBreakdowns(CustomTestCase):
         self.assertEqual(last["failed"], 1)
         self.assertNotIn("ttft_ms_mean", last)
         self.assertNotIn(131072, [b["ctx_le"] for b in derived["by_context"]])
+        self.assertEqual(derived["requests"], len(_INPUTS))
+        self.assertEqual(derived["failed_requests"], 1)
 
     def test_shape_mismatch_disables_round_mapping(self):
         derived = summarize._derive(_leg_metrics(_INPUTS[:-1]), {}, _CONFIG)

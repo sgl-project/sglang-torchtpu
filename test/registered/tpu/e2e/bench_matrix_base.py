@@ -38,6 +38,7 @@ is trustworthy at all:
 
 import json
 import os
+import re
 import subprocess
 import time
 import unittest
@@ -67,10 +68,11 @@ MATRIX_SWEEP_SCRIPT = os.path.join(
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 
 # --- The matrix cells' slice of the time-budget chain (see config.sh's "THE
-# TIME-BUDGET CHAIN"). TIMEOUT_PER_FILE_BUDGET is what every cell's
-# MULTIHOST_LAUNCH declares literally as timeout_per_file (the CI scanner
-# reads it via AST, so the files cannot compute it); the matrix ratchet
-# asserts the literals match this constant and that the chain holds.
+# TIME-BUDGET CHAIN"). TIMEOUT_PER_FILE_BUDGET is what every regular cell's
+# MULTIHOST_LAUNCH declares literally as timeout_per_file (tail cells declare
+# TAIL_TIMEOUT_PER_FILE_BUDGET, below; the CI scanner reads it via AST, so the
+# files cannot compute it); the matrix ratchet asserts the literals match
+# these constants and that the chain holds.
 TIMEOUT_PER_FILE_BUDGET = 8100
 # Re-checking a server the JobSet already gated healthy.
 HEALTH_RECHECK_BUDGET = 600
@@ -79,6 +81,29 @@ RESULT_EGRESS_MARGIN = 300
 SWEEP_TIMEOUT_DEFAULT = (
     TIMEOUT_PER_FILE_BUDGET - HEALTH_RECHECK_BUDGET - RESULT_EGRESS_MARGIN
 )
+# Light cells that discovery places LAST on a slice another group already
+# fills (MULTIHOST_LAUNCH "placement": "tail"; see render_external_jobset.py).
+# Their smaller budget bounds how long a hang can hold the shared slice; the
+# chain (worst-case sweep <= sweep timeout < file budget) is the same.
+TAIL_RECIPES = {"pd_1p1d_pc"}
+TAIL_TIMEOUT_PER_FILE_BUDGET = 5400
+TAIL_SWEEP_TIMEOUT_DEFAULT = (
+    TAIL_TIMEOUT_PER_FILE_BUDGET - HEALTH_RECHECK_BUDGET - RESULT_EGRESS_MARGIN
+)
+
+
+def timeout_per_file_budget(bench_recipe: str) -> int:
+    """The timeout_per_file literal a cell of this recipe must declare."""
+    if bench_recipe in TAIL_RECIPES:
+        return TAIL_TIMEOUT_PER_FILE_BUDGET
+    return TIMEOUT_PER_FILE_BUDGET
+
+
+def sweep_timeout_default(bench_recipe: str) -> int:
+    if bench_recipe in TAIL_RECIPES:
+        return TAIL_SWEEP_TIMEOUT_DEFAULT
+    return SWEEP_TIMEOUT_DEFAULT
+
 
 HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", str(HEALTH_RECHECK_BUDGET)))
 # Fraction of the REACHABLE prefix-cache hit rate a gated leg must reach. The
@@ -105,6 +130,10 @@ MODEL_DISPLAY_NAMES = {
     "qwen3_coder_480b": "Qwen3-Coder-480B",
 }
 SPEC_RECIPES = {"1host_pc_spec_kvoff", "pd_2p2d_pc_spec_kvoff"}
+# Recipes whose legs must finish with zero failed requests (bench_serving
+# exits 0 with failed requests, so test_every_leg_completed alone lets them
+# through). Opt-in so existing cells keep their current verdicts.
+REQUEST_ERROR_GATED_RECIPES = {"pd_1p1d_pc"}
 
 
 def _direction(field: str) -> str:
@@ -205,12 +234,15 @@ def _reachable_prefix_hit_rate(config, dp_size):
 def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
     """Where the spec gauges live: the engine that decodes.
 
-    For P/D that is the decode leader (hosts[2] of the slice), never the
-    mini-LB -- the LB serves no /metrics, and a request-level probe through
-    it is not a reliable oracle on this P/D setup. For 1-host recipes the
-    one server is the decode.
+    For P/D that is the decode leader -- the first host after the prefill
+    engines, whose count the recipe name encodes (pd_<P>p<D>d_...: hosts[2]
+    for 2p2d, hosts[1] for 1p1d) -- never the mini-LB: the LB serves no
+    /metrics, and a request-level probe through it is not a reliable oracle
+    on this P/D setup. For 1-host recipes the one server is the decode.
     """
-    if bench_recipe.startswith("pd_"):
+    match = re.match(r"pd_(\d+)p\d+d_", bench_recipe)
+    if match:
+        decode_index = int(match.group(1))
         # Engine leaders follow PHYSICAL host order (serve_group.sh's
         # rendezvous writes the map on this pod), not pod-index order.
         try:
@@ -220,9 +252,9 @@ def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
             hosts = [
                 h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h
             ]
-        if len(hosts) >= 3:
+        if len(hosts) > decode_index:
             port = os.environ.get("PD_DECODE_PORT", "30002")
-            return f"http://{hosts[2]}:{port}"
+            return f"http://{hosts[decode_index]}:{port}"
     return base_url
 
 
@@ -251,6 +283,7 @@ def build_bench_test(
     profile: str,
     sweep_timeout_default: int,
     gate_prefix_hits: bool,
+    gate_request_errors: bool = False,
     spec_metrics_url_fn=None,
     spec_contract: dict | None = None,
     metric_namespace: str | None = None,
@@ -278,6 +311,9 @@ def build_bench_test(
                          file's timeout room for health + result egress.
     gate_prefix_hits     gate hit rate against the reachable floor (multi-turn
                          workloads); the rate is always *recorded*.
+    gate_request_errors  fail any leg with a failed request (derived
+                         failed_requests > 0, from bench_serving's per-request
+                         errors); the count is always *recorded*.
     spec_metrics_url_fn  base_url -> metrics endpoint of the DECODING engine;
                          non-None declares the recipe claims spec decoding
                          and adds the accept-length gate.
@@ -395,6 +431,29 @@ def build_bench_test(
             self.assertEqual(bad, [], f"legs did not complete: {bad}")
             missing = [leg["tag"] for leg in legs if not leg.get("metrics")]
             self.assertEqual(missing, [], f"legs produced no metrics: {missing}")
+
+        if gate_request_errors:
+
+            def test_no_failed_requests(self):
+                """Every request of every leg must succeed. A failed round
+                (rejected over-long prompt, P/D transfer abort, timeout) is
+                dropped from the latency stats, so a leg can look fast exactly
+                because its hardest requests failed."""
+                for leg in self._legs():
+                    derived = leg.get("derived") or {}
+                    self.assertIn(
+                        "failed_requests",
+                        derived,
+                        f"{leg['tag']}: no per-request outcomes recorded (was "
+                        "the bench run with --output-details?)",
+                    )
+                    self.assertEqual(
+                        derived["failed_requests"],
+                        0,
+                        f"{leg['tag']}: {derived['failed_requests']} of "
+                        f"{derived.get('requests')} requests failed (see the "
+                        "leg's errors in its .jsonl)",
+                    )
 
         def test_prefix_cache_hit_rate_reported(self):
             """Every leg must RECORD a hit rate (the metrics endpoint is part
@@ -730,10 +789,11 @@ def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
         },
         run_root_default=f"/tmp/bench-{bench_model}-{bench_recipe}-{workload}",
         profile=os.environ.get("BENCH_PROFILE", "ci"),
-        sweep_timeout_default=SWEEP_TIMEOUT_DEFAULT,
+        sweep_timeout_default=sweep_timeout_default(bench_recipe),
         # A single-turn 8k1k session never re-sees its prefix, so the hit-rate
         # gate only applies to the multi-turn agentic workload.
         gate_prefix_hits=workload == "agentic",
+        gate_request_errors=bench_recipe in REQUEST_ERROR_GATED_RECIPES,
         spec_metrics_url_fn=(
             (lambda base_url: _matrix_spec_metrics_url(bench_recipe, base_url))
             if spec_expected

@@ -126,7 +126,10 @@ The cluster provides **4× `2x2x2`** and **2× `2x2x4`** slices. There is no Kue
 `external-topology.yaml`) and buckets them into **one job per slice**: up to 4 `2x2x2` + 2
 `2x2x4` jobs run in **parallel**, and groups beyond the slice count run **serially inside their
 slice's job** (no Pending race, no dropped work). Cross-run overlap on a slice is held by the
-slice-keyed `concurrency` group (depth-1 — fine until Kueue).
+slice-keyed `concurrency` group (depth-1 — fine until Kueue). A light group whose files declare
+`"placement": "tail"` in `MULTIHOST_LAUNCH` is round-robined only after every regular group of its
+shape, so it never pushes a regular group onto a shared slice and always runs **last** there: if
+the regular group hangs, the slice job's timeout costs only the tail group its run.
 
 Discover nodepools with
 `kubectl get nodes -L cloud.google.com/gke-nodepool,cloud.google.com/gke-tpu-topology`. To add
