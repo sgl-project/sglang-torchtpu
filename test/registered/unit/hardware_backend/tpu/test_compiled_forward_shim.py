@@ -982,6 +982,25 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertTrue(torch.equal(out.next_token_logits, padded_logits[:2]))
         self.assertTrue(torch.equal(out.hidden_states, padded_hidden[:4]))
 
+        # When real_b == pad_b and real_q == pad_q, trim_next_token_outputs
+        # must not materialize a no-op slice view.
+        exact_logits = torch.zeros(4, 10)
+        exact_hidden = torch.zeros(8, 5)
+        shim_exact = CompiledForwardShim(
+            MagicMock(
+                return_value=LogitsProcessorOutput(
+                    next_token_logits=exact_logits,
+                    hidden_states=exact_hidden,
+                )
+            ),
+            policy=DecoderTpuCompilePolicy(),
+        )
+        out_exact = shim_exact(
+            None, None, self._forward_batch(_tpu_real_q=8, _tpu_real_b=4)
+        )
+        self.assertIs(out_exact.next_token_logits, exact_logits)
+        self.assertIs(out_exact.hidden_states, exact_hidden)
+
     def test_defers_output_unpadding_for_chained_forwards(self):
         padded = LogitsProcessorOutput(
             next_token_logits=torch.zeros(4, 10),

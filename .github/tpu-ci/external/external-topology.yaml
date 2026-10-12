@@ -94,6 +94,9 @@ suites:
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_prefix_cache_kv_offload_spec_mxint8.py
         cmd: env PD_KV_CACHE_DTYPE=bfloat16 python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_prefix_cache_kv_offload_spec_mxint8.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_recompile.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_recompile.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
