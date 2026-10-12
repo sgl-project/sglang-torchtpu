@@ -45,7 +45,7 @@ CONFIG["server_args"].update(
         "max_prefill_tokens": INPUT_TOKENS,
         "tpu_compile_tokens": [INPUT_TOKENS],
         "tpu_compile_bs": [CONCURRENCY],
-        "mem_fraction_static": 0.93,
+        "mem_fraction_static": 0.8,
         # Custom config/tokenizer/processor code ships in the checkpoint.
         "trust_remote_code": True,
         # The VL warmup exercises the multimodal embed-merge path.
