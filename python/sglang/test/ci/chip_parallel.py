@@ -29,6 +29,13 @@ from sglang.srt.utils import kill_process_tree
 
 logger = logging.getLogger(__name__)
 
+# Two TPU backend initialisations that start at the same moment collide: one
+# wins and the others block ~30s inside get_c_api_client before succeeding.
+# Workers running equal-length files stay in lockstep and would collide at
+# every file boundary, so launches are spaced by at least this much. Measured
+# at 3s: 20/20 processes clean, against 8/20 stalling unspaced.
+_LAUNCH_SPACING_SECONDS = 3.0
+
 # Env that confines a process to one chip. The bounds vars must agree with the
 # pin or libtpu still tries to build a multi-chip topology.
 _PIN_ENV = {
@@ -123,6 +130,17 @@ def run_files_chip_parallel(
         return True, [], [], {}
     root_dir = root_dir or default_root_dir()
 
+    launch_lock = threading.Lock()
+    last_launch = [0.0]
+
+    def space_launches() -> None:
+        """Block until this process may start its TPU backend init."""
+        with launch_lock:
+            wait = _LAUNCH_SPACING_SECONDS - (time.monotonic() - last_launch[0])
+            if wait > 0:
+                time.sleep(wait)
+            last_launch[0] = time.monotonic()
+
     work: "queue.Queue" = queue.Queue()
     for test in pinned:
         work.put(test)
@@ -147,6 +165,7 @@ def run_files_chip_parallel(
                 if timeout_per_file is not None
                 else derive_timeout(test.est_time)
             )
+            space_launches()
             returncode, elapsed, output = _run_one(
                 test.filename, chip, workdir, timeout
             )
