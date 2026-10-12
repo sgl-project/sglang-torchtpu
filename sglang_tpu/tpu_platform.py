@@ -1123,11 +1123,15 @@ class TpuSRTPlatform(SRTPlatform):
 
     def prepare_model_parallel_groups(self) -> None:
         from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.pp_stage_chips import (
+            validate_chips_for_pp,
+        )
         from sglang_tpu.pp_stage_groups import (
             make_stage_groups_standalone,
         )
 
         make_stage_groups_standalone(get_parallel())
+        validate_chips_for_pp(get_parallel())
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration

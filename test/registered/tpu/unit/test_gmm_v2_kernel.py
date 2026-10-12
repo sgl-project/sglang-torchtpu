@@ -24,8 +24,14 @@ Run as:
 from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import sweep
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+# Every (in_size, out_size, group_offset) case is its own Mosaic compile, so the
+# 192-case grid below costs ~400s. The gate pins the shapes and keeps the code
+# paths (num_groups, has_bias, weight_dtype, zero vs non-zero group_offset);
+# the nightly walks the whole grid.
+register_tpu_ci(est_time=400, suite="nightly-tpu-4-v7", nightly=True)
 
 import unittest
 
@@ -165,11 +171,11 @@ class TestGmmV2Dense(
 
     @parameterized.product(
         batch_size=[128],
-        in_size=[512, 1024],
-        out_size=[512, 1024],
+        in_size=sweep([512, 1024], [512]),
+        out_size=sweep([512, 1024], [1024]),
         num_groups=[16, 32],
         has_bias=[True, False],
-        group_offset=[0, 2, 3],
+        group_offset=sweep([0, 2, 3], [0, 3]),
     )
     def test_gmm(
         self, batch_size, in_size, out_size, num_groups, has_bias, group_offset
@@ -226,12 +232,12 @@ class TestGmmV2WeightQuantized(
 
     @parameterized.product(
         batch_size=[128],
-        in_size=[512, 1024],
-        out_size=[512, 1024],
+        in_size=sweep([512, 1024], [512]),
+        out_size=sweep([512, 1024], [1024]),
         num_groups=[16, 32],
         has_bias=[True, False],
         weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
-        group_offset=[0, 2, 3],
+        group_offset=sweep([0, 2, 3], [0, 3]),
     )
     def test_gmm_weight_quantized(
         self,
@@ -314,11 +320,11 @@ class TestGmmV2ActivationWeightQuantized(
 
     @parameterized.product(
         batch_size=[128],
-        in_size=[512, 1024],
-        out_size=[512, 1024],
+        in_size=sweep([512, 1024], [512]),
+        out_size=sweep([512, 1024], [1024]),
         num_groups=[16, 32],
         weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
-        group_offset=[0, 2, 3],
+        group_offset=sweep([0, 2, 3], [0, 3]),
     )
     def test_gmm_v2_activation_weight_quantized(
         self,

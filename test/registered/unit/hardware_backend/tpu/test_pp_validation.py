@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import declare_resolution, resolution_resul
 from sglang.srt.distributed import parallel_state
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pp_stage_groups
+from sglang_tpu import pp_stage_chips, pp_stage_groups
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
@@ -285,6 +285,41 @@ class TestStandaloneStageGroups(CustomTestCase):
                 RuntimeError, r"torch_tpu with standalone process subgroups"
             ):
                 pp_stage_groups.make_stage_groups_standalone(parallel)
+
+
+def _on(chip, core):
+    return pp_stage_chips.CoreLocation(slice_index=0, coords=chip, core_on_chip=core)
+
+
+class TestPipelineStageChips(CustomTestCase):
+    def test_a_pair_must_hold_every_core_of_its_chip(self):
+        """A pair split over two-device chips all-reduces over ICI and shares
+        each chip with another stage, also when it uses core 0 of both."""
+        chip_a, chip_b = (0, 0, 0), (1, 0, 0)
+        violations = pp_stage_chips._partial_chip_problems
+        self.assertEqual(
+            violations([_on(chip_a, 0), _on(chip_a, 1)], devices_per_chip=2), []
+        )
+        split = [_on(chip_a, 0), _on(chip_b, 0)]
+        self.assertEqual(len(violations(split, devices_per_chip=2)), 2)
+        self.assertEqual(violations(split, devices_per_chip=1), [])
+
+    def test_an_unrecognized_tpu_fails_at_startup(self):
+        # Context-parallel stages (attn_cp_size 2) are checked like TP pairs.
+        for attn_cp_size in (1, 2):
+            parallel = SimpleNamespace(
+                pp_size=4,
+                tp_size=2,
+                attn_cp_size=attn_cp_size,
+                pp_rank=1,
+                tp_group=_group(2, 3),
+            )
+            with (
+                self.subTest(attn_cp_size=attn_cp_size),
+                patch.object(pp_stage_chips, "_devices_per_chip", return_value=None),
+                self.assertRaisesRegex(RuntimeError, "does not recognize"),
+            ):
+                pp_stage_chips.validate_chips_for_pp(parallel)
 
 
 if __name__ == "__main__":
