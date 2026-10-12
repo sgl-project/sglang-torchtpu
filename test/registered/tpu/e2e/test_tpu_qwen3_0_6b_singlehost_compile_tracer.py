@@ -23,7 +23,7 @@ from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
 from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 
 register_tpu_ci(
-    est_time=600,
+    est_time=175,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "qwen3-0.6b", "compile-tracer"],
 )

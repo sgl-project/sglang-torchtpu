@@ -21,7 +21,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=35, suite="stage-a-test-tpu-unit", chips=1)
 
 assert "jax" not in sys.modules
 os.environ["JAX_PLATFORMS"] = "tpu"

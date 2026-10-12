@@ -11,7 +11,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=600, suite="stage-a-test-tpu-unit", chips=4)
+register_tpu_ci(est_time=155, suite="stage-a-test-tpu-unit", chips=4)
 
 
 class TestFp8FusedRsKernel(CustomTestCase):

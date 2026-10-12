@@ -14,7 +14,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=4)
+register_tpu_ci(est_time=85, suite="stage-a-test-tpu-unit", chips=4)
 
 _CACHE_LOGGING = (
     "compilation_cache=2,tier2_compilation_cache=2,tier3_compilation_cache=2"
