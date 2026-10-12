@@ -192,10 +192,11 @@ EP_SIZE_PD=${EP_SIZE_PD:-$PD_TP}
 # hicache_hook.py resolve_layout_io_compatibility) but has no baseline here yet.
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_v3}
 
-# Page size. 128 is the rpa_v3 default in these scripts. Even a 1M-token request
-# is only 8192 pages, so the page table stays small; larger pages waste KV on the
-# short early rounds of a session.
-PAGE_SIZE=${PAGE_SIZE:-128}
+# The 1M context plus the request pool's extra slots needs 8193 pages at size
+# 128. At 32 rows that scalar-prefetched page table exceeds the 1 MiB SMEM
+# budget. Size 512 also covers the full profile's 64-row compile ceiling
+# without reducing context or concurrency.
+PAGE_SIZE=${PAGE_SIZE:-512}
 
 # HBM split. MEASURED on a 2x2x2 tpu7x slice (94.74 GB HBM/rank, weights 30.90 GB
 # at tp=16), not estimated:

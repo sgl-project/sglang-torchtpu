@@ -18,7 +18,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 class TestUnquantGlobalRouting(CustomTestCase):
     def test_sparse_core_permute_gathers_full_sorted_range(self):
-        module_name = "sglang.srt.layers.moe.pallas.fused_moe_op"
+        module_name = "sglang_tpu.moe.pallas.fused_moe_op"
         torch_tpu = ModuleType("torch_tpu")
         torch_tpu_internal = ModuleType("torch_tpu._internal")
         torch_tpu_pallas = ModuleType("torch_tpu._internal.pallas")
@@ -44,16 +44,14 @@ class TestUnquantGlobalRouting(CustomTestCase):
             setattr(jnp, name, getattr(np, name))
         jax.numpy = jnp
 
-        gmm_v2 = ModuleType("sglang.srt.layers.moe.pallas.gmm_v2")
+        gmm_v2 = ModuleType("sglang_tpu.moe.pallas.gmm_v2")
         gmm_v2.TileSizes = object
         gmm_v2.apply_act_fn = Mock()
         gmm_v2.calculate_tiling = Mock()
         gmm_v2.gmm_v2 = Mock()
         gmm_v2.lhs_sublane_tiling = Mock(return_value=16)
 
-        gather_module = ModuleType(
-            "sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2"
-        )
+        gather_module = ModuleType("sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2")
         captured = {}
 
         class GatherCalled(Exception):
@@ -69,10 +67,8 @@ class TestUnquantGlobalRouting(CustomTestCase):
         fake_modules = {
             "jax": jax,
             "jax.numpy": jnp,
-            "sglang.srt.layers.moe.pallas.gmm_v2": gmm_v2,
-            "sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2": (
-                gather_module
-            ),
+            "sglang_tpu.moe.pallas.gmm_v2": gmm_v2,
+            "sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2": (gather_module),
         }
         topk_ids = np.array(
             [
@@ -179,7 +175,7 @@ class TestUnquantGlobalRouting(CustomTestCase):
                         # Test routing independently of the TPU kernel bridge.
                         # Importing the real bridge would require torch_tpu even
                         # though every tensor and the kernel reference are CPU.
-                        module_name = "sglang.srt.layers.moe.pallas.fused_moe_op"
+                        module_name = "sglang_tpu.moe.pallas.fused_moe_op"
                         bridge = ModuleType(module_name)
                         call = bridge.fused_moe_call = Mock(side_effect=kernel)
                         with (

@@ -63,7 +63,7 @@ def _call_production_kernel(
     """
     # Lazy import so the module loads on hosts without JAX (the
     # @skipUnless decorator below will skip the whole class there).
-    from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+    from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
     topk = int(topk_ids.shape[-1])
     return _fused_moe_jax(
@@ -315,7 +315,7 @@ class TestFusedMoEJaxKernelGuards(unittest.TestCase):
         """SGLang spells the GPT-OSS gating ``swiglu_oai``; gmm_v2's
         in-kernel ``fuse_act`` spells it ``swigluoai``. Both spellings must
         map through, since the activation is applied inside GMM1."""
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fuse_act_name
+        from sglang_tpu.moe.pallas.fused_moe_op import _fuse_act_name
 
         self.assertEqual(_fuse_act_name("swiglu_oai"), "swigluoai")
         self.assertEqual(_fuse_act_name("swigluoai"), "swigluoai")
@@ -326,7 +326,7 @@ class TestFusedMoEJaxKernelGuards(unittest.TestCase):
         the offending value, so a model that requests a new activation
         gets a clear failure mode.
         """
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fuse_act_name
+        from sglang_tpu.moe.pallas.fused_moe_op import _fuse_act_name
 
         with self.assertRaises(NotImplementedError) as cm:
             _fuse_act_name("relu2")

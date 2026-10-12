@@ -6,6 +6,7 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import unittest
 
+import numpy as np
 import torch  # noqa: F401
 
 from sglang.test.test_utils import CustomTestCase
@@ -70,8 +71,9 @@ class TestFusedMoEExpertParallel(CustomTestCase):
         no_combine=False,
         global_num_experts=0,
         expert_group_offset=0,
+        topk=None,
     ):
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
         return _fused_moe_jax(
             x,
@@ -83,7 +85,7 @@ class TestFusedMoEExpertParallel(CustomTestCase):
             w2_scale=None,
             w1_bias=None,
             w2_bias=None,
-            topk=self.TOPK,
+            topk=topk or self.TOPK,
             activation_name="silu",
             no_combine=no_combine,
             global_num_experts=global_num_experts,
@@ -289,6 +291,61 @@ class TestFusedMoEExpertParallel(CustomTestCase):
         self.assertGreater(
             float(jnp.max(jnp.abs(contaminated_final - expected_final))), 1e-6
         )
+
+    def test_sc_gather_matches_tensorcore_wide_topk(self):
+        """Per-rank SparseCore EP combine matches the TensorCore gather at
+        top-8 / top-16 and a prefill size (tokens straddle its row blocks)."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        # Kimi-K3 per-chip expert count; hidden/intermediate scaled down.
+        hidden, intermediate, global_experts, ep_size = 1024, 768, 56, 2
+        local = global_experts // ep_size
+        vmem_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        for topk in (8, 16):
+            # Enough tokens to keep the bf16 combine above the kernel's
+            # TensorCore-fallback size, as test_sc_ragged_gather_reduce_v2 does.
+            num_tokens = max(
+                2048, -(-(int(vmem_bytes * 0.6) + 1) // (4 * topk * hidden))
+            )
+            x, w1, w2, _, _ = _make_inputs(
+                jax.random.key(topk),
+                num_tokens,
+                hidden,
+                intermediate,
+                global_experts,
+                topk,
+            )
+            rng = np.random.default_rng(topk)
+            topk_ids = jnp.asarray(
+                np.stack(
+                    [
+                        rng.choice(global_experts, size=topk, replace=False)
+                        for _ in range(num_tokens)
+                    ]
+                ),
+                jnp.int32,
+            )
+            topk_weights = jax.nn.softmax(
+                jnp.asarray(rng.standard_normal((num_tokens, topk)), jnp.float32),
+                axis=-1,
+            ).astype(jnp.bfloat16)
+            for rank in range(ep_size):
+                offset = rank * local
+                kw = dict(
+                    x=x,
+                    w1=w1[offset : offset + local],
+                    w2=w2[offset : offset + local],
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    global_num_experts=global_experts,
+                    expert_group_offset=offset,
+                    topk=topk,
+                )
+                self.assert_close(
+                    self.run_kernel(use_sc_gather=1, **kw),
+                    self.run_kernel(use_sc_gather=0, **kw),
+                    context=f"topk={topk} rank={rank}",
+                )
 
 
 if __name__ == "__main__":

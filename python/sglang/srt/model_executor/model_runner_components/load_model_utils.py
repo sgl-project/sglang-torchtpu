@@ -22,6 +22,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -46,9 +47,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-
-
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
@@ -379,10 +377,12 @@ def dist_barrier_after_load(
         try:
             dist.monitored_barrier(
                 group=get_parallel().tp_group.cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                timeout=datetime.timedelta(
+                    seconds=envs.SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S.get()
+                ),
                 wait_all_ranks=True,
             )
         except RuntimeError:
             raise ValueError(
-                f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                f"TP rank {tp_rank} finished loading, but other ranks did not within SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S. Check their logs for a load failure (e.g. OOM, a missing or truncated checkpoint shard); for slow nodes raise the timeout."
             ) from None

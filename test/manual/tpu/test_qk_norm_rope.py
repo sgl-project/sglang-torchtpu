@@ -89,7 +89,7 @@ class TestQKNormRopeKernel(unittest.TestCase):
     ATOL = 0.02
 
     def _check(self, num_tokens: int, seed: int = 0):
-        from sglang.srt.hardware_backend.tpu.qk_norm_rope import _qk_norm_rope_jax
+        from sglang_tpu.qk_norm_rope import _qk_norm_rope_jax
 
         inputs = _make_inputs(num_tokens, seed)
         got = jax.block_until_ready(
@@ -112,7 +112,7 @@ class TestQKNormRopeKernel(unittest.TestCase):
             )
 
     def test_exact_multiple_of_block(self):
-        from sglang.srt.hardware_backend.tpu.qk_norm_rope import _MAX_BLOCK_TOKENS
+        from sglang_tpu.qk_norm_rope import _MAX_BLOCK_TOKENS
 
         self._check(_MAX_BLOCK_TOKENS * 4)
 
@@ -123,7 +123,7 @@ class TestQKNormRopeKernel(unittest.TestCase):
         self._check(64)
 
     def test_ragged_final_block(self):
-        from sglang.srt.hardware_backend.tpu.qk_norm_rope import _MAX_BLOCK_TOKENS
+        from sglang_tpu.qk_norm_rope import _MAX_BLOCK_TOKENS
 
         # One full block plus a partial one: the padded rows are computed but
         # their writes fall outside the array, so valid rows must be unaffected.
@@ -131,7 +131,7 @@ class TestQKNormRopeKernel(unittest.TestCase):
 
     def test_block_size_does_not_change_results(self):
         """The kernel is per-row, so row blocking must not alter the output."""
-        from sglang.srt.hardware_backend.tpu import qk_norm_rope
+        from sglang_tpu import qk_norm_rope
 
         inputs = _make_inputs(1024, seed=1)
         outputs = []
@@ -174,7 +174,7 @@ class TestQKNormRopeInputContract(unittest.TestCase):
         return args
 
     def _assert_rejected(self, pattern: str, **overrides):
-        from sglang.srt.hardware_backend.tpu.qk_norm_rope import (
+        from sglang_tpu.qk_norm_rope import (
             tpu_fused_qk_norm_rope,
         )
 
@@ -249,7 +249,7 @@ class TestQKNormRopeInputContract(unittest.TestCase):
 
 class TestQKNormRopeRegistration(unittest.TestCase):
     def test_registration_is_idempotent(self):
-        from sglang.srt.hardware_backend.tpu import qk_norm_rope
+        from sglang_tpu import qk_norm_rope
 
         first = qk_norm_rope._get_qk_norm_rope_op()
         qk_norm_rope.register_tpu_qk_norm_rope_op()

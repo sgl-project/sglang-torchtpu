@@ -8,7 +8,7 @@ from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 
 register_tpu_ci(
     est_time=5400,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "prefix-cache", "kv-offload", "spec", "dpa"],
 )

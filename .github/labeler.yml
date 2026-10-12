@@ -94,6 +94,7 @@ npu:
 tpu:
   - changed-files:
     - any-glob-to-any-file:
+      - 'sglang_tpu/**'
       - 'python/sglang/srt/hardware_backend/tpu/**'
       - 'python/sglang/srt/layers/attention/pallas/**'
       - 'python/sglang/srt/layers/moe/pallas/**'

@@ -64,13 +64,19 @@ class MultimodalCache(abc.ABC):
         raise NotImplementedError()
 
 
-def _get_tensor_size(embedding: torch.Tensor):
-    return embedding.untyped_storage().nbytes()
-
-
 @dataclass(kw_only=True)
 class EmbeddingResult:
     embedding: torch.Tensor
+
+    def storage_size(self) -> int:
+        """Bytes retained by this cache entry's backing storage."""
+        return self.embedding.untyped_storage().nbytes()
+
+    def cache_size(self) -> int:
+        """Bytes needed after compacting an admitted entry."""
+        return min(
+            self.storage_size(), self.embedding.element_size() * self.embedding.numel()
+        )
 
 
 class MultiModalStaticCache(MultimodalCache):
@@ -110,18 +116,18 @@ class MultiModalStaticCache(MultimodalCache):
             self.mm_cache.move_to_end(mm_hash)
             return True
         tensor = embedding.embedding
-        storage_size = _get_tensor_size(tensor)
-        data_size = min(storage_size, tensor.element_size() * tensor.numel())
+        storage_size = embedding.storage_size()
+        data_size = embedding.cache_size()
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False
             lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
-            self.current_size -= _get_tensor_size(lru_embedding.embedding)
+            self.current_size -= lru_embedding.storage_size()
 
         if storage_size > data_size:
             # Clone admitted slices so one cached item cannot retain a whole batch.
             embedding = replace(embedding, embedding=tensor.clone())
-        data_size = _get_tensor_size(embedding.embedding)
+        data_size = embedding.storage_size()
         self.mm_cache[mm_hash] = embedding
         self.current_size += data_size
         return True
@@ -142,7 +148,7 @@ class MultiModalStaticCache(MultimodalCache):
         if mm_hash not in self.mm_cache:
             return False
         old_embedding = self.mm_cache.pop(mm_hash)
-        self.current_size -= _get_tensor_size(old_embedding.embedding)
+        self.current_size -= old_embedding.storage_size()
         return True
 
     def clear(self):

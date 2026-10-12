@@ -161,7 +161,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _init_worker_process(cls) -> None:
-        from sglang.srt.hardware_backend.tpu.patches import (
+        from sglang_tpu.patches import (
             _patch_set_device_tolerate_mismatch,
             _prepare_tpu_env,
         )

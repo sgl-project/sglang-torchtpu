@@ -8,17 +8,18 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 import types
 import unittest
 from typing import Optional
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
-    PallasForwardMetadata,
-    TpuPallasRpaBatchedAttnBackend,
-)
-from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_rpa_batched import (
+    PallasForwardMetadata,
+    TpuPallasRpaBatchedAttnBackend,
+)
+from sglang_tpu.host_metadata_cache import HostMetadataCache
 
 
 class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
@@ -41,8 +42,13 @@ class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
         self._distribution_cache = {}
         self.decode_query_size = 1
         self._host_metadata_cache = HostMetadataCache()
+        self._host_page_cols = None
         self._is_hybrid_swa = False
         self.token_to_kv_pool = None
+        # No decode context parallelism: one page covers page_size tokens.
+        self._dcp = 1
+        self._dcp_rank = 0
+        self._page_stride = page_size
 
 
 def _make_forward_batch(
@@ -266,6 +272,36 @@ class TestBatchedRpaNonEmptyBatchSize(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             self._backend()._non_empty_batch_size(fb)
+
+
+class TestBatchedRpaKernelArguments(CustomTestCase):
+    def test_attention_sink_reaches_the_kernel(self):
+        from sglang_tpu import attention_pallas_rpa_batched
+
+        kernel = Mock(return_value="out")
+        sinks = object()
+        with patch.object(
+            attention_pallas_rpa_batched, "kv_layout", return_value="layout"
+        ):
+            attention_pallas_rpa_batched._invoke_batched_kernel(
+                kernel,
+                queries="q",
+                keys="k",
+                values="v",
+                kv_cache_fused="cache",
+                kv_lens="kv_lens",
+                page_indices="pages",
+                cu_q_lens="cu_q_lens",
+                cu_kv_lens="cu_kv_lens",
+                distribution="distribution",
+                attention_sink=sinks,
+                sm_scale=0.125,
+                sliding_window=128,
+                soft_cap=None,
+                k_scale=None,
+                v_scale=None,
+            )
+        self.assertIs(kernel.call_args.kwargs["attention_sink"], sinks)
 
 
 if __name__ == "__main__":

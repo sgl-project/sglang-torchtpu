@@ -172,7 +172,7 @@ class TestTorchTpuIntegration(unittest.TestCase):
     def test_srt_symbols_the_platform_imports_exist(self):
         # tpu.py imports this lazily; a rename on the srt side must fail here,
         # not at worker bootstrap.
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        from sglang_tpu.patches import _prepare_tpu_env
 
         self.assertTrue(callable(_prepare_tpu_env))
 
@@ -192,7 +192,7 @@ class TestTorchTpuIntegration(unittest.TestCase):
     def test_worker_init_selects_cpu_only_jax_before_calling_srt(self):
         # A worker started without srt's entry-point activation in the parent
         # has no JAX_PLATFORMS; _prepare_tpu_env then raises once JAX is imported.
-        from sglang.srt.hardware_backend.tpu import patches
+        from sglang_tpu import patches
 
         seen = {}
 

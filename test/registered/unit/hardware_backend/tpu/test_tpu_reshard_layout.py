@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -38,6 +38,7 @@ class TestTpuReshardLayout(unittest.TestCase):
         source = _layer(dtype, max(1, total_heads // src_tp))
         destination = _layer(dtype, max(1, total_heads // dst_tp))
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._kv_caches = [destination]
         mgr._swa_kv_caches = [destination] if swa else []
         mgr.kv_args = SimpleNamespace(total_kv_head_num=total_heads)

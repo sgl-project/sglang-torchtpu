@@ -6,6 +6,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
 from sglang.srt.mem_cache.pool_host.mha import (
     AsymmetricMHATokenToKVPoolHost,
     MHATokenToKVPoolHost,
@@ -79,6 +80,36 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertIs(
             get_mha_host_pool_cls(asymmetric_pool), AsymmetricMHATokenToKVPoolHost
         )
+
+    def test_builds_over_a_real_device_pool(self):
+        # The asymmetric pool has per-side row widths and no `token_stride_size`,
+        # so building it must not need one for its packed device rows.
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        device = MHATokenToKVPool(
+            size=15,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            v_head_dim=6,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        # Book against a fixed budget, not the runner's (cgroup-limited) RAM.
+        with host_memory_budget_scope(1 << 40):  # 1 TiB
+            host = AsymmetricMHATokenToKVPoolHost(
+                device_pool=device,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=2,
+                layout="page_first",
+                pin_memory=False,
+                device="cpu",
+                allocator_type="default",
+            )
+        self.assertTrue(host.device_rows_packed)
 
     def test_staged_write_back_jit_uses_separate_kv_buffers(self):
         host = _make_host("page_first")

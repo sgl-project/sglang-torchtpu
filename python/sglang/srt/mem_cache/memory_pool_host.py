@@ -6,7 +6,7 @@ import threading
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 import torch
 
@@ -348,6 +348,8 @@ class LogicalHostPool:
     """
 
     shared_allocation_domain = None
+    stores_page_envelope = False
+    storage_format_tag = None
 
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:

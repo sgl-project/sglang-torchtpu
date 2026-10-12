@@ -7,12 +7,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.pp_profile import (
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.pp_profile import (
     profile_cache,
     set_profile_inputs,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -161,8 +161,7 @@ class TestProfileInputs(CustomTestCase):
         with (
             patch.dict(sys.modules, {"torch_tpu._internal.sync.sync": sync_module}),
             patch(
-                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-                "max_extend_tokens",
+                "sglang_tpu.compilation.decoder_compile_policy.max_extend_tokens",
                 return_value=40,
             ) as rows,
         ):

@@ -9,7 +9,7 @@ Run: python -m pytest test/manual/kv_transfer/test_reshard_schedule.py
 
 import unittest
 
-from sglang.srt.disaggregation.raiden import reshard_schedule as rs
+from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
 
 
 # ---- mock protobuf StartTransferRequest --------------------------------------

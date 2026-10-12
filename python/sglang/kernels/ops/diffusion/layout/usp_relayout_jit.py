@@ -7,7 +7,7 @@ import torch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
-from .usp_relayout import _SUPPORTED_DTYPES, can_use_usp_merge_heads
+from .usp_relayout import _SUPPORTED_DTYPES
 from .usp_relayout import usp_merge_heads as usp_merge_heads
 
 if TYPE_CHECKING:
@@ -42,20 +42,9 @@ def _fake_merge_heads(x: torch.Tensor) -> torch.Tensor:
     mutates_args=[],
     fake_impl=_fake_merge_heads,
 )
-def _usp_merge_heads_custom_op(x: torch.Tensor) -> torch.Tensor:
+def _usp_merge_heads_cuda(x: torch.Tensor) -> torch.Tensor:
     world, seq, batch, h_local, head_dim = x.shape
     out = x.new_empty((batch, seq, world, h_local, head_dim))
     module = _jit_usp_relayout_module(x.dtype)
     module.usp_merge_heads(out, x)
     return out
-
-
-def _usp_merge_heads_cuda(x: torch.Tensor) -> torch.Tensor:
-    """[W, S, B, h_local, D] -> [B, S, W, h_local, D] contiguous.
-
-    Bit-exact single-pass replacement for
-    ``x.permute(2, 1, 0, 3, 4).contiguous()`` on the Ulysses output path.
-    """
-    if not can_use_usp_merge_heads(x):
-        raise RuntimeError("unsupported input for usp_merge_heads CUDA")
-    return _usp_merge_heads_custom_op(x)

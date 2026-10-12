@@ -2,17 +2,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import contextlib
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
-from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
-    TpuPipelinePrefillAdder,
-    pending_step_limit,
-    profile_and_install_cost_model,
-)
-from sglang.srt.hardware_backend.tpu.pp_chunks import StepCostModel
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     MAX_PREFIX_MATCHED_WAITING_REQS,
@@ -28,6 +24,13 @@ from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import published_topology
+from sglang_tpu import pp_chunk_scheduler, pp_profile
+from sglang_tpu.pp_chunk_scheduler import (
+    TpuPipelinePrefillAdder,
+    pending_step_limit,
+    profile_and_install_cost_model,
+)
+from sglang_tpu.pp_chunks import StepCostModel
 
 
 @pytest.fixture(autouse=True)
@@ -286,7 +289,7 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     cache = MagicMock()
     cache.disable = False
     cache.supports_mamba.return_value = False
-    cache.is_tree_cache.return_value = False
+    cache.supports_prefix_sharing.return_value = False
     cache.evictable_size.return_value = 0
     cache.full_evictable_size.return_value = 0
     cache.inc_lock_ref.return_value = IncLockRefResult()
@@ -389,6 +392,55 @@ def test_profile_requires_resolved_compiler_setting(monkeypatch):
         get_context().override("test.no_compile", enable_torch_compile=False)
         with pytest.raises(ValueError, match="require --enable-torch-compile"):
             profile_and_install_cost_model(scheduler)
+
+
+def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
+    """The devices of a multi-device stage must size chunks alike even when
+    they time the profile differently; diverging sizes deadlock the stage."""
+    points = [(2048, 0), (2048, 2048), (4096, 0), (4096, 4096)]
+
+    def ms(rank, tokens, prefix):
+        # Ranks 0, 1 form stage 0 and ranks 2, 3 stage 1; odd ranks time slower.
+        return (1 + rank % 2) * (tokens / 100 + tokens * prefix * 1e-6)
+
+    reports = {
+        rank: ([(t, p, ms(rank, t, p)) for t, p in points], None) for rank in range(4)
+    }
+
+    def all_gather_object(out, obj, group):
+        out[:] = [reports[rank] for rank in group]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(pp_chunk_scheduler, "uses_dynamic_chunks", lambda: True)
+    monkeypatch.setattr(
+        pp_chunk_scheduler, "get_exec", lambda: NS(graph=NS(enable_torch_compile=True))
+    )
+    monkeypatch.setattr(
+        pp_chunk_scheduler, "attention_schedule_capacity", lambda runner, policy: None
+    )
+    monkeypatch.setattr(pp_chunk_scheduler, "profile_points", lambda *args: points)
+    monkeypatch.setattr(
+        pp_profile, "profile_cache", lambda policy, max_tokens: contextlib.nullcontext()
+    )
+    models = []
+    for rank in range(4):
+        policy = NS(
+            t_bucketer=NS(buckets=[2048, 4096]),
+            _run_one=lambda rank=rank, **kw: ms(
+                rank, kw["num_tokens"], kw["profile_prefix"]
+            ),
+        )
+        runner = NS(compile_policy=policy, model_config=NS(context_len=32768))
+        scheduler = NS(
+            tp_worker=NS(model_runner=runner),
+            page_size=256,
+            chunked_prefill_size=4096,
+            pp_group=NS(cpu_group=(rank % 2, rank % 2 + 2)),
+            world_group=NS(world_size=4, cpu_group=(0, 1, 2, 3)),
+        )
+        profile_and_install_cost_model(scheduler)
+        models.append(scheduler._tpu_pp_chunk_cost)
+    assert all(model == models[0] for model in models)
 
 
 if __name__ == "__main__":

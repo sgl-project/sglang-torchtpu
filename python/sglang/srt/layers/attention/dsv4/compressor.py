@@ -25,11 +25,15 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.models.deepseek_v2 import _is_hip
+from sglang.srt.models.deepseek_v2 import _is_hip, _use_aiter
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_npu, is_tpu, set_weight_attrs
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -411,7 +415,7 @@ class Compressor(BaseFusedOp):
     def _apply_ape_hotfix(self):
         self.ape_converted = True
 
-        if _is_npu:
+        if _is_npu or _is_tpu:
             return
 
         if self.overlap:
@@ -454,6 +458,9 @@ class Compressor(BaseFusedOp):
     def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
         weight = getattr(self.wkv_gate, "weight", None)
         if weight is not None:
+            if _use_aiter and weight.dtype == torch.bfloat16:
+                # aiter's tuned GEMM for these shapes; kv_score is bf16-rounded
+                return tgemm.mm(x, weight, otype=x.dtype).float()
             return linear_bf16_fp32(x, weight)
 
         from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
@@ -510,3 +517,16 @@ class Compressor(BaseFusedOp):
             )
 
         return get_attn_backend().forward_compress(self, x, forward_batch)
+
+    def forward_tpu(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: Optional[AttentionBackend] = None,
+    ) -> Optional[torch.Tensor]:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        backend = attn_backend if attn_backend is not None else get_attn_backend()
+        return backend.forward_compress(self, x, forward_batch)

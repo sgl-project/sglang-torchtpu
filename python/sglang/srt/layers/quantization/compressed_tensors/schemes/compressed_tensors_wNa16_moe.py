@@ -739,7 +739,7 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+        from sglang_tpu.w4a16_moe import (
             prepare_tpu_w4a16_moe_weights,
         )
 
@@ -759,7 +759,7 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         cfg = self.moe_runner_config
-        from sglang.srt.hardware_backend.tpu.w4a16_moe import apply_tpu_w4a16_moe
+        from sglang_tpu.w4a16_moe import apply_tpu_w4a16_moe
 
         return apply_tpu_w4a16_moe(
             layer=layer,

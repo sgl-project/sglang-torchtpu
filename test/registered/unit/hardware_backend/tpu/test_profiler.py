@@ -8,13 +8,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.profiler import (
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.profiler import (
     _tpu_profile_options,
     start_tpu_profile,
     stop_tpu_profile,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 # Pure-logic tests. torch_tpu is faked via sys.modules, so this runs on the
 # CPU CI runner (no TPU required).

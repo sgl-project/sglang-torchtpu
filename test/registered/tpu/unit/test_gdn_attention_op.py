@@ -3,7 +3,7 @@
 Parallel to :mod:`test.manual.tpu.test_pallas_moe_op_registration` and
 :mod:`test.manual.tpu.test_gdn_attention_v3` (the raw-kernel correctness
 test). This file pins the torch<->JAX bridge in
-:mod:`sglang.srt.hardware_backend.tpu.attention_gdn_pallas`:
+:mod:`sglang_tpu.attention_gdn_pallas`:
 
   * a torch.library custom op ``sglang_tpu_pallas::gdn_attention`` is
     registered and reachable via ``torch.ops.sglang_tpu_pallas``;
@@ -74,7 +74,7 @@ class TestGDNAttentionOp(CustomTestCase):
     K = 4
 
     def test_op_registered_and_idempotent(self):
-        from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+        from sglang_tpu.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -101,7 +101,7 @@ class TestGDNAttentionOp(CustomTestCase):
         it does not need the TPU-backed ``jax.devices()`` the numerics case
         below requires -- that gate is what kept this path untested.
         """
-        from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+        from sglang_tpu.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -156,10 +156,10 @@ class TestGDNAttentionOp(CustomTestCase):
 
     @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON_JAX_TPU)
     def test_op_matches_kernel_and_mutates_state(self):
-        from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
+        from sglang_tpu.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
-        from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
 
         n_kq, n_v, d_k, d_v, K = self.N_KQ, self.N_V, self.D_K, self.D_V, self.K
         # Mixed batch: 2 decode + 1 prefill.
@@ -283,7 +283,7 @@ class TestGDNAttentionOp(CustomTestCase):
 
     def test_kda_op_lowers_under_cpu_export_pin(self):
         """KDA mode through the op, in the server's CPU-pinned export config."""
-        from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+        from sglang_tpu.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -302,11 +302,11 @@ class TestGDNAttentionOp(CustomTestCase):
     @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON_JAX_TPU)
     def test_kda_op_matches_kernel(self):
         """The op forwards KDA mode and the gate bound to the kernel unchanged."""
-        from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
+        from sglang_tpu.attention.pallas.gdn.config import AttentionMode
+        from sglang_tpu.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
-        from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
-        from sglang.srt.layers.attention.pallas.gdn.config import AttentionMode
 
         args, (n_kq, n_v, d_k, d_v, K) = self._kda_case()
         (conv_ref, rec_ref), out_ref = fused_conv1d_gdn(

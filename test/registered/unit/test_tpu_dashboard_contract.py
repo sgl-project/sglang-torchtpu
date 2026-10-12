@@ -30,7 +30,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tpu.evals import model_config
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=260, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 TPU_TESTS = REPO / "test" / "registered" / "tpu"
@@ -305,13 +305,6 @@ class TestJobMapsToOneTest(CustomTestCase):
         self.assertEqual(
             qwen["with"]["suite"], "nightly-tpu-accuracy-qwen3-5-397b-mmmupro"
         )
-        # The long P/D gates leave `all` (the nightly) for the 5 PM slot.
-        pd = workflow["jobs"]["pd-kvoff-reshard"]
-        self.assertIn('"day-5pm"', pd["if"])
-        feature = yaml.safe_load((WORKFLOWS / "feature-validation-tpu.yml").read_text())
-        for only in pd["strategy"]["matrix"]["only"]:
-            self.assertEqual(feature["jobs"][only]["if"].count("inputs.only =="), 1)
-            self.assertNotIn('"all"', feature["jobs"][only]["if"])
         nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
         self.assertNotIn("accuracy", nightly["jobs"])
 

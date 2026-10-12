@@ -17,6 +17,8 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -137,7 +139,14 @@ def is_cp_active(forward_batch) -> bool:
 
 def is_mla_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
-    return is_cp_enabled() and uses_mla_backend()
+    return is_cp_enabled() and _uses_mla_backend()
+
+
+@torch.compiler.assume_constant_result
+def _uses_mla_backend() -> bool:
+    """A compiled forward evaluates this once at trace time: the answer is fixed
+    for the process, and the config view it reads is not traceable."""
+    return uses_mla_backend()
 
 
 def is_mla_cp_active(forward_batch) -> bool:

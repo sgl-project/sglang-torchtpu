@@ -8,12 +8,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.tpu.result_copy_worker import (
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.result_copy_worker import (
     TpuAsyncCopyEvent,
     TPUAsyncCopyWorker,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -31,6 +31,10 @@ class DelayedCopyEvent:
         assert self.recorded.is_set(), "consumer waited on an unrecorded event"
         self.waiting.set()
         assert self.transferred.wait(timeout=5)
+
+    def query(self):
+        # Like a device event, an unrecorded event reports done.
+        return not self.recorded.is_set() or self.transferred.is_set()
 
 
 def test_consumer_waits_for_submission_and_transfer():
@@ -60,6 +64,35 @@ def test_consumer_waits_for_submission_and_transfer():
             if not submitted.done():
                 submitted.set_exception(RuntimeError("test cleanup"))
             event.transferred.set()
+
+
+def test_query_tracks_submission_then_transfer():
+    """The prefill's continuous input polling calls query() on copy_done."""
+    event = DelayedCopyEvent()
+    submitted = Future()
+    completion = TpuAsyncCopyEvent(event, submitted)
+
+    # Not submitted yet: the device event would report done, query must not.
+    assert not completion.query()
+    event.record()
+    assert not completion.query()
+    submitted.set_result(None)
+    assert not completion.query()
+    event.transferred.set()
+    assert completion.query()
+    assert not event.waiting.is_set()
+
+
+def test_query_reports_failed_submission_as_done():
+    event = DelayedCopyEvent()
+    submitted = Future()
+    submitted.set_exception(RuntimeError("copy submission failed"))
+    completion = TpuAsyncCopyEvent(event, submitted)
+
+    assert completion.query()
+    with pytest.raises(RuntimeError, match="copy submission failed"):
+        completion.synchronize()
+    assert not event.waiting.is_set()
 
 
 def test_worker_error_reaches_consumer_before_event_wait():

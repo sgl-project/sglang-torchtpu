@@ -86,7 +86,8 @@ class SGLangTPUServerTestSuite(unittest.TestCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         cls._apply_server_env()
-        os.environ["SGLANG_PLATFORM"] = "tpu"
+        # setdefault: mode B runs these suites with SGLANG_PLATFORM=tpu_oot.
+        os.environ.setdefault("SGLANG_PLATFORM", "tpu")
 
         # A single-host test may run in a pod carrying multihost TPU variables.
         # Remove them before libtpu initializes so it does not wait for peers.

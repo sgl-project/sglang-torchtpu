@@ -34,6 +34,7 @@ MODEL_ENV = "GPT_OSS_MODEL"
 
 PREFILL_ROLE = "prefill"
 DECODE_ROLE = "decode"
+SELF_HOST_ENV = "PD_SELF_HOST"
 
 # Each engine uses one eight-chiplet TPU host.
 HOSTS_PER_ENGINE = 1
@@ -88,6 +89,8 @@ def validate_model_source(model_path: str) -> None:
 def self_hostname(env: Mapping[str, str] | None = None) -> str:
     """This pod's own DNS name."""
     values = os.environ if env is None else env
+    if values.get(SELF_HOST_ENV):
+        return values[SELF_HOST_ENV]
     hostnames = [h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
     return hostnames[0] if hostnames else socket.gethostname()
 

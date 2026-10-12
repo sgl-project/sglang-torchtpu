@@ -19,7 +19,7 @@ def _make_allocator(
     ``kvcache=None`` is fine — the base class only stores the reference and
     never calls into it from the allocator path. ``device`` defaults to CPU
     (host-only logic); the hardware-gated tests pass ``device="tpu"``."""
-    from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+    from sglang_tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
 

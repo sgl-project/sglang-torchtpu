@@ -104,6 +104,16 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
+    def get_zigzag_cp_strategy_cls(self) -> type:
+        """Return the zigzag prefill context-parallel strategy class."""
+        from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+
+        return ZigzagCPStrategy
+
+    def runs_eager_extend_cp(self) -> bool:
+        """Whether the eager runner shards a context-parallel extend itself."""
+        return True
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
 
@@ -166,12 +176,43 @@ class SRTPlatform(DeviceMixin):
         """
         return False
 
+    def supports_decode_context_parallel(self) -> bool:
+        """Whether this platform runs decode context parallelism; CUDA, HIP and
+        NPU are accepted by initialize_model_parallel directly."""
+        return False
+
+    def dcp_shards_every_kv_pool(self) -> bool:
+        """Whether decode context parallelism widens every KV allocator (SWA
+        included) by attn_dcp_size and shards every layer's K/V heads across
+        attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
+        return False
+
+    # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
+    # entry until the seam PR merges upstream.
+    def supports_moe_dp_pipeline_stages(self) -> bool:
+        """Whether a pipeline stage may replicate its experts over its own
+        devices (--moe-dp-size > 1 with --pp-size > 1)."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
         """One-time backend initialization.  Called in each worker."""
+        pass
+
+    def on_warmup_complete(self) -> None:
+        """Called once on the scheduler thread, the first time it goes idle after
+        a forward (the server warmup request has drained). Platforms that
+        compile ahead of serving freeze or monitor compilation here."""
+        pass
+
+    # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
+    # entry until the seam PR merges upstream.
+    def prepare_model_parallel_groups(self) -> None:
+        """Called on every rank once the model-parallel groups are built,
+        before their first collective."""
         pass
 
     # ------------------------------------------------------------------

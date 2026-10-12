@@ -58,6 +58,12 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         page_size = 128
         overrides["prefill_attention_backend"] = "dsv4"
         overrides["decode_attention_backend"] = "dsv4"
+    elif cfg.device == "tpu":
+        overrides["prefill_attention_backend"] = "dsv4"
+        overrides["decode_attention_backend"] = "dsv4"
+        if cfg.dsv4_attn_backend == "auto":
+            overrides["dsv4_attn_backend"] = "tpu_dsv4"
+        overrides["disable_shared_experts_fusion"] = True
     overrides["page_size"] = page_size
     logger.info(
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."

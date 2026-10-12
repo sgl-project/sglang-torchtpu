@@ -216,7 +216,7 @@ def derive_timeout_per_file(est_time: float) -> float:
 def _clear_compilation_caches():
     """Clear compilation caches after each test unit to prevent disk/shm exhaustion."""
     is_tpu_or_ci = (
-        os.environ.get("SGLANG_PLATFORM") == "tpu"
+        os.environ.get("SGLANG_PLATFORM", "").startswith("tpu")
         or os.environ.get("CI") is not None
         or os.environ.get("GITHUB_ACTIONS") is not None
     )

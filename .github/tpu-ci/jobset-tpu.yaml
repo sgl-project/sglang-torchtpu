@@ -175,7 +175,9 @@ ${WEIGHTS_VOLUME}
                                       --working-directory benchmark/tpu) ;;
                         *)    launch=(bash "benchmark/tpu/${LAUNCH_SCRIPT}") ;;
                       esac
-                      ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
+                      # Normalization may move serving to another pod; the input
+                      # leader forwards this port to that pod's reachable listener.
+                      ( HOST=0.0.0.0 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
                           "${launch[@]}" ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!
                       if [ "$RANK" = "0" ]; then
