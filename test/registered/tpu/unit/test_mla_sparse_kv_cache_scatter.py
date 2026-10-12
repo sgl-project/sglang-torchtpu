@@ -26,8 +26,14 @@ import os
 import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import sweep
 
-register_tpu_ci(est_time=420, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=170, suite="stage-a-test-tpu-unit")
+# The DCP writer recompiles per rank at ~7s, so the 30 ranks of the four
+# (dcp_size, interleave_size) pairs are most of this file's 408s. The gate runs
+# the two small ones -- which still check the ownership partition exactly, over
+# every layout -- and the nightly adds dcp 8 and 16.
+register_tpu_ci(est_time=420, suite="nightly-tpu-4-v7", nightly=True)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process: select the
 # physical backend before the first JAX import below.
@@ -70,7 +76,7 @@ _LIVE_SPECS = (
 # (num_seqs, tokens_per_seq, max_seq_len, num_pages). The token counts span
 # `split_plan`'s branches: fewer blocks than subcores (lanes get split across
 # subcores) through more blocks than subcores (several pipeline steps).
-_SCENARIOS = (
+_ALL_SCENARIOS = (
     ("decode_b16", 16, 1, 1024, 64),
     ("decode_b64", 64, 1, 512, 128),
     ("decode_b256", 256, 1, 256, 256),
@@ -79,6 +85,17 @@ _SCENARIOS = (
     ("prefill_b4_t64", 4, 64, 512, 64),
     ("prefill_b16_t16", 16, 16, 1024, 64),
     ("prefill_b64_t16", 64, 16, 512, 128),
+)
+# One per end of each `split_plan` branch: the smallest and largest decode
+# batch, a single long prefill and the many-short-sequences prefill.
+_SCENARIOS = sweep(
+    _ALL_SCENARIOS,
+    (
+        ("decode_b16", 16, 1, 1024, 64),
+        ("decode_b256", 256, 1, 256, 256),
+        ("prefill_b1_t256", 1, 256, 1024, 64),
+        ("prefill_b64_t16", 64, 16, 512, 128),
+    ),
 )
 
 
@@ -369,7 +386,9 @@ class SparseMLAScatterTest(parameterized.TestCase):
             interleave_size=interleave_size,
             layout=layout,
         )
-        for dcp_size, interleave_size in ((2, 4), (4, 64), (8, 16), (16, 4))
+        for dcp_size, interleave_size in sweep(
+            ((2, 4), (4, 64), (8, 16), (16, 4)), ((2, 4), (4, 64))
+        )
         for layout in KVCacheLayout
     )
     def test_dcp_update_matches_the_jnp_writer(self, dcp_size, interleave_size, layout):
