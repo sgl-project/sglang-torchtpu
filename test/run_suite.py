@@ -19,7 +19,8 @@ from sglang.test.ci.ci_register import (
     auto_partition,
     collect_tests,
 )
-from sglang.test.ci.ci_utils import run_unittest_files
+from sglang.test.ci.chip_parallel import run_files_chip_parallel
+from sglang.test.ci.ci_utils import derive_timeout_per_file, run_unittest_files
 
 # Defensive fallback in case sglang is loaded from an external environment missing TPU
 if not hasattr(HWBackend, "TPU"):
@@ -456,9 +457,15 @@ def run_a_suite(args):
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suites, nightly)
 
     if args.test_file:
-        requested = os.path.normpath(os.path.join(repo_root, args.test_file))
+        # Comma-separated, like --suite: one runner can be handed a specific
+        # set of files without inventing a suite for them.
+        requested = {
+            os.path.normpath(os.path.join(repo_root, name.strip()))
+            for name in args.test_file.split(",")
+            if name.strip()
+        }
         ci_tests = [
-            test for test in ci_tests if os.path.normpath(test.filename) == requested
+            test for test in ci_tests if os.path.normpath(test.filename) in requested
         ]
         if not ci_tests:
             raise ValueError(
@@ -490,7 +497,24 @@ def run_a_suite(args):
     if timeout is not None and args.enable_retry:
         timeout += args.retry_timeout_increase
 
-    return run_unittest_files(
+    pinned_ok = True
+    if args.tpu_chip_workers > 1:
+        # Chip-pinned files first; they release their chips before any
+        # whole-node test starts, so the two never share a host.
+        pinned_ok, _, _, _ = run_files_chip_parallel(
+            ci_tests,
+            workers=args.tpu_chip_workers,
+            timeout_per_file=timeout,
+            derive_timeout=derive_timeout_per_file,
+            continue_on_error=args.continue_on_error,
+        )
+        if not pinned_ok and not args.continue_on_error:
+            return -1
+        ci_tests = [test for test in ci_tests if getattr(test, "chips", 0) != 1]
+        if not ci_tests:
+            return 0 if pinned_ok else -1
+
+    rest = run_unittest_files(
         ci_tests,
         timeout_per_file=timeout,
         continue_on_error=args.continue_on_error,
@@ -499,6 +523,7 @@ def run_a_suite(args):
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
     )
+    return rest if pinned_ok else -1
 
 
 def main():
@@ -554,6 +579,16 @@ def main():
         action="store_true",
         default=False,
         help="Continue running remaining tests even if one fails (default: False, useful for nightly tests).",
+    )
+    parser.add_argument(
+        "--tpu-chip-workers",
+        type=int,
+        default=0,
+        help=(
+            "Run `chips=1` TPU tests this many at a time, each pinned to one "
+            "chip of the slice the job already holds. 0 or 1 keeps every test "
+            "on the whole node, which is the default."
+        ),
     )
     parser.add_argument(
         "--auto-partition-id",
