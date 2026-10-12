@@ -4,17 +4,18 @@ with SGLANG_RAIDEN_LISTENER_START_READ an announcement starts its read."""
 import ast
 import inspect
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.raiden import receiver as receiver_module
-from sglang.srt.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
-from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
-from sglang.srt.disaggregation.raiden.serde import Blocks, Chunk
-from sglang.srt.disaggregation.raiden.state import DecodeState
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.disaggregation.raiden import receiver as receiver_module
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
+from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.serde import Blocks, Chunk
+from sglang_tpu.disaggregation.raiden.state import DecodeState
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -110,6 +111,8 @@ def _receiver(mgr):
     recv.bootstrap_infos = [{"rank_ip": "10.0.0.1", "rank_port": 4444}]
     recv._started = False
     recv.init_time = None
+    recv._handshake_start = time.time()
+    recv._handshake_timeout = 300
     return recv
 
 

@@ -98,6 +98,8 @@ class SamplingBatchInfo:
     return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    sampling_mask_top_ks: Optional[List[int]] = None
 
     # Device
     device: str = "cuda"
@@ -122,14 +124,16 @@ class SamplingBatchInfo:
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
+        # Match the [B, 1] device allocation produced by merging/filtering.
+        # A device-side view of [B] gives TorchTPU a different compiled input.
         temperatures = (
             torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
                 dtype=torch.float,
                 pin_memory=_pin,
             )
-            .to(device, non_blocking=True)
             .view(-1, 1)
+            .to(device, non_blocking=True)
         )
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs],
@@ -208,6 +212,9 @@ class SamplingBatchInfo:
                 device,
             )
         )
+        sampling_mask_top_ks = [
+            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
+        ]
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -283,6 +290,7 @@ class SamplingBatchInfo:
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
+            sampling_mask_top_ks=sampling_mask_top_ks,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -447,6 +455,10 @@ class SamplingBatchInfo:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
             ]
+            if self.sampling_mask_top_ks is not None:
+                self.sampling_mask_top_ks = [
+                    self.sampling_mask_top_ks[i] for i in keep_indices
+                ]
             if self.return_sampling_support_logprobs is not None:
                 self.return_sampling_support_logprobs = [
                     self.return_sampling_support_logprobs[i] for i in keep_indices
@@ -549,6 +561,9 @@ class SamplingBatchInfo:
                     self.device,
                 )
             )
+            self.sampling_mask_top_ks = (
+                self.sampling_mask_top_ks or [1] * self_len
+            ) + (other.sampling_mask_top_ks or [1] * other_len)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

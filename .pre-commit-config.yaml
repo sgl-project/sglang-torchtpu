@@ -42,7 +42,7 @@ repos:
         args:
           - --select=F401,F821,F823,UP037
           - --fix
-        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
+        files: ^(benchmark/|docs/|examples/|python/sglang/|sglang_tpu/|sgl-model-gateway/py_*|test/)
         exclude: |
           (?x)^(
           .*/__init__\.py$|
@@ -129,6 +129,12 @@ repos:
         language: system
         files: ^python/sglang/.*\.py$
         pass_filenames: false
+      - id: check-tpu-branches
+        name: TPU debt ratchet (is_tpu branches and sglang_tpu imports in core)
+        # Per-file ceilings in tools/plugin/tpu_debt_baseline.json; --write-baseline to raise them.
+        entry: python3 tools/plugin/check_tpu_branches.py --files
+        language: system
+        files: ^python/sglang/.*\.py$
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
@@ -147,16 +153,16 @@ repos:
         # left (combining --fix with -D warnings can abort the fix phase), then
         # cover sglang-mm's PyO3 bindings + rayon fan-out — both sit behind
         # non-default features, so `--workspace` alone never compiles them. protoc
-        # is not required: sglang-grpc's build.rs falls back to a vendored binary.
+        # is not required: the shared protocol crate falls back to a vendored binary.
         entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings && cargo clippy -p sglang-mm --features python,parallel --lib -- -D warnings && cargo clippy --manifest-path sglang-radix-tree/Cargo.toml --all-targets --no-default-features --features tch/doc-only -- -D warnings'
         language: system
-        files: ^rust/.*\.rs$
+        files: ^(rust/.*\.(rs|toml)|proto/.*\.(rs|proto|toml))$
         pass_filenames: false
       - id: rustfmt-rust-workspace
         name: rustfmt rust/ workspace
         entry: bash -c 'cd rust && cargo fmt && cargo fmt --manifest-path sglang-radix-tree/Cargo.toml'
         language: system
-        files: ^rust/.*\.rs$
+        files: ^(rust/.*\.(rs|toml)|proto/.*\.(rs|proto|toml))$
         pass_filenames: false
       - id: mint-broken-links
         name: check docs links (Mintlify; opt-in, requires `mint` on PATH)

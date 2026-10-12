@@ -1,7 +1,7 @@
 """Correctness tests for the vendored Pallas ragged-paged-attention v3 kernel.
 
 The kernel and its pure-JAX ``ref_ragged_paged_attention`` reference both
-live in ``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``.
+live in ``sglang_tpu.attention.pallas.ragged_paged_attention_v3``.
 These tests build small inputs in both formats (fused/packed for the
 kernel, unpacked pages for the reference) and assert the outputs match
 within bfloat16 tolerance.
@@ -96,7 +96,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.util import get_dtype_packing
+        from sglang_tpu.attention.pallas.util import get_dtype_packing
 
         num_q_heads = num_q_heads if num_q_heads is not None else self.NUM_Q_HEADS
         num_kv_heads = num_kv_heads if num_kv_heads is not None else self.NUM_KV_HEADS
@@ -269,7 +269,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         """Run kernel + reference with matching kwargs and assert close."""
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
             ref_ragged_paged_attention,
         )
@@ -403,7 +403,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         """The decode route keeps masks, sinks, live cache, and inactive rows."""
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
         )
 
@@ -521,7 +521,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         and differs from causal on the earlier rows of the block."""
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
         )
 
@@ -560,7 +560,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
     def test_custom_mask_requires_noncausal(self):
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
         )
 

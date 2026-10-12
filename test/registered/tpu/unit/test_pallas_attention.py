@@ -44,7 +44,7 @@ class TestPallasHelpers(CustomTestCase):
     """Pure logic — no TPU required."""
 
     def test_bucket_kv_len_boundaries(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+        from sglang_tpu.attention_pallas import (
             _PAGE_SIZE,
             _bucket_kv_len,
         )
@@ -65,7 +65,7 @@ class TestPallasHelpers(CustomTestCase):
     def test_maybe_expand_kv_heads(self):
         import torch
 
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+        from sglang_tpu.attention_pallas import (
             _maybe_expand_kv_heads,
         )
 
@@ -88,7 +88,7 @@ class TestSupportTritonPatch(CustomTestCase):
 
     def test_pallas_tpu_is_non_triton_after_patch(self):
         import sglang.srt.utils.common as uc
-        from sglang.srt.hardware_backend.tpu.patches import (
+        from sglang_tpu.patches import (
             _patch_support_triton_for_tpu,
         )
 
@@ -126,10 +126,10 @@ class TestPallasFlashTokenSlotPadding(CustomTestCase):
     def test_padding_uses_reserved_slot_zero(self):
         import torch
 
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+        from sglang_tpu.attention_pallas import (
             _pad_token_slots,
         )
-        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 
         allocator = TokenToKVPoolAllocator(
             size=8,
@@ -151,7 +151,7 @@ class TestPallasFlashTokenSlotPadding(CustomTestCase):
     def test_padding_helper_also_slices(self):
         import torch
 
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+        from sglang_tpu.attention_pallas import (
             _pad_token_slots,
         )
 
@@ -184,7 +184,7 @@ class TestFlashKernelNumerics(CustomTestCase):
     def _check(self, H, Sq, Skv, D, causal, tol=2e-2):
         import torch
 
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+        from sglang_tpu.attention_pallas import (
             _attend,
             _get_flash_op,
         )
@@ -221,7 +221,7 @@ class TestPagedKernelNumerics(CustomTestCase):
         import numpy as np
         import torch
 
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+        from sglang_tpu.attention_pallas import (
             _get_paged_op,
         )
 
@@ -277,7 +277,7 @@ class TestPallasFlashDecodePaddingNumerics(CustomTestCase):
         import numpy as np
         import torch
 
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+        from sglang_tpu.attention_pallas import (
             TpuPallasAttnBackend,
             _bucket_kv_len,
         )

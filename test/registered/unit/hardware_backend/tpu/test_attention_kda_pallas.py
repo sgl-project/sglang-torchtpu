@@ -11,8 +11,8 @@ from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.attention_kda_pallas import TpuKDAAttnBackend
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_kda_pallas import TpuKDAAttnBackend
 
 _N_V, _D_K, _D_V, _K, _T = 2, 4, 4, 4, 3
 _DIM = 2 * _N_V * _D_K + _N_V * _D_V

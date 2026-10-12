@@ -268,7 +268,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
             )
-            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+            from sglang_tpu.compilation.decoder_compile_policy import (
                 Qwen3VLDecoderTpuCompilePolicy,
             )
 

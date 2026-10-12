@@ -20,7 +20,7 @@ except Exception:
 @unittest.skipUnless(_HAS_TPU, "requires a TPU backend")
 class TestInt4Fp8Gmm(CustomTestCase):
     def test_matches_materialized_fp8_compute(self):
-        from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, apply_act_fn, gmm_v2
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, apply_act_fn, gmm_v2
 
         rng = np.random.default_rng(91)
         # Two K tiles exercise partial accumulation and final channel restoration.
@@ -99,7 +99,7 @@ class TestInt4Fp8Gmm(CustomTestCase):
                     self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
 
     def test_rejects_split_activation_quantization_group(self):
-        from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
         with self.assertRaisesRegex(ValueError, "activation quantization"):
             gmm_v2(
@@ -113,7 +113,7 @@ class TestInt4Fp8Gmm(CustomTestCase):
             )
 
     def test_channel_scale_cannot_silently_replace_bias(self):
-        from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
+        from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2
 
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             gmm_v2(

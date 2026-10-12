@@ -13,11 +13,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
-    build_topk1_verify_chain_torch,
-)
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.eagle_utils_tpu import (
+    build_topk1_verify_chain_torch,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

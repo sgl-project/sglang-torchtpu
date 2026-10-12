@@ -23,11 +23,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_tpu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
 def register_attention_backend(name):
@@ -165,7 +167,47 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    if _is_npu:
+    if _is_tpu:
+        pool = runner.token_to_kv_pool
+        alloc = runner.token_to_kv_pool_allocator
+        kv_bytes = pool.get_kv_size_bytes()
+        total_gb = (kv_bytes[0] + kv_bytes[1]) / (1024**3)
+        swa_shape = tuple(pool.get_swa_buffer(0).shape)
+        c4_layer = next(
+            i
+            for i, m in enumerate(pool.layer_mapping)
+            if m is not None and m.compress_ratio == 4
+        )
+        csa_nope_shape = tuple(pool.get_csa_nope_buffer(c4_layer).shape)
+        csa_rope_shape = tuple(pool.get_csa_rope_buffer(c4_layer).shape)
+        indexer_shape = tuple(pool.get_indexer_k_buffer(c4_layer).shape)
+        c128_layer = next(
+            i
+            for i, m in enumerate(pool.layer_mapping)
+            if m is not None and m.compress_ratio == 128
+        )
+        hca_shape = tuple(pool.get_hca_buffer(c128_layer).shape)
+        c4_state_shape = tuple(
+            pool.get_state_buffer(c4_layer, from_indexer=False).shape
+        )
+        c4_idx_state_shape = tuple(
+            pool.get_state_buffer(c4_layer, from_indexer=True).shape
+        )
+        c128_state_shape = tuple(
+            pool.get_state_buffer(c128_layer, from_indexer=False).shape
+        )
+        logger.info(
+            f"[DSV4-TPU Stage 2 Verified] DSV4TPUTokenToKVPool & {type(alloc).__name__} initialized: "
+            f"kv_gb={total_gb:.2f} GiB, swa={swa_shape}, csa_nope={csa_nope_shape}, "
+            f"csa_rope={csa_rope_shape}, indexer={indexer_shape}, hca={hca_shape}, "
+            f"c4_state={c4_state_shape}, c4_idx_state={c4_idx_state_shape}, c128_state={c128_state_shape}"
+        )
+        raise NotImplementedError(
+            f"[DSV4-TPU Stage 2 Verified] DSV4TPUTokenToKVPool & {type(alloc).__name__} initialized "
+            f"({total_gb:.2f} GiB across {len(pool.layer_mapping)} layers). "
+            "Next step (Iteration 3): implement DSV4TPUAttnBackend skeleton & metadata."
+        )
+    elif _is_npu:
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             DeepseekV4AscendAttnBackend,
         )
@@ -439,7 +481,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     # GDN models. In particular, quantized KV recipes use it
                     # to expose an FP8 dequant workspace while a different
                     # backend (for example TRT-LLM GenMHA) owns decode.
-                    allowed = {"triton", "trtllm_mha", "fa4", "flashinfer"}
+                    allowed = HYBRID_GDN_SM100_BACKENDS
                 prefill_be = runner.prefill_attention_backend_str
                 decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (
@@ -454,7 +496,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
                 )
             if is_tpu():
-                from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+                from sglang_tpu.attention_gdn_pallas import (
                     TpuGDNAttnBackend,
                 )
 
@@ -527,7 +569,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 linear_attn_backend = AscendKDAAttnBackend(runner)
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
             elif is_tpu():
-                from sglang.srt.hardware_backend.tpu.attention_kda_pallas import (
+                from sglang_tpu.attention_kda_pallas import (
                     TpuKDAAttnBackend,
                 )
 
@@ -578,14 +620,14 @@ def create_intel_xpu_backend(runner):
 
 @register_attention_backend("pallas_tpu_flash")
 def create_pallas_tpu_flash_backend(runner):
-    from sglang.srt.hardware_backend.tpu.attention_pallas import TpuPallasAttnBackend
+    from sglang_tpu.attention_pallas import TpuPallasAttnBackend
 
     return TpuPallasAttnBackend(runner)
 
 
 @register_attention_backend("pallas_tpu_rpa_v3")
 def create_pallas_tpu_rpa_v3_backend(runner):
-    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+    from sglang_tpu.attention_pallas_rpa_v3 import (
         TpuPallasRpaV3AttnBackend,
     )
 
@@ -594,7 +636,7 @@ def create_pallas_tpu_rpa_v3_backend(runner):
 
 @register_attention_backend("pallas_tpu_rpa_batched")
 def create_pallas_tpu_rpa_batched_backend(runner):
-    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+    from sglang_tpu.attention_pallas_rpa_batched import (
         TpuPallasRpaBatchedAttnBackend,
     )
 
@@ -603,7 +645,7 @@ def create_pallas_tpu_rpa_batched_backend(runner):
 
 @register_attention_backend("pallas_tpu_mla")
 def create_pallas_tpu_mla_backend(runner):
-    from sglang.srt.hardware_backend.tpu.attention_pallas_mla import (
+    from sglang_tpu.attention_pallas_mla import (
         TpuPallasMlaAttnBackend,
     )
 

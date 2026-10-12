@@ -41,10 +41,12 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     get_minimax_sparse_index_dtype,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -56,11 +58,13 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_tpu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 @dataclass
@@ -149,7 +153,7 @@ def _mxint8_draft_per_token(
     kvc, head_num: int, head_dim: int, *, is_swa: bool = False
 ) -> int:
     """Physical bytes/token of a draft layer, before DCP capacity replication."""
-    from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+    from sglang_tpu.kv_mxint8 import (
         cache_bytes_per_token,
     )
 
@@ -215,6 +219,30 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     )
 
 
+def check_dsv4_unified_fp8_pd_supported(
+    *, unified_fp8: bool, disaggregation_mode: str, pp_size: int, enable_hisparse: bool
+) -> None:
+    """PP and HiSparse still index kv_data as one region per layer; fp8 PD adds rope groups."""
+    if not unified_fp8 or disaggregation_mode == "null":
+        return
+    if pp_size > 1:
+        raise ValueError(
+            "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
+            f"with pp_size={pp_size}: the PP re-slicing of the per-stage KV "
+            "regions has no coverage for the extra rope regions. Run PD with "
+            "pp_size=1 or unset the fp8 switch."
+        )
+    if enable_hisparse:
+        # HiSparse appends its device tail to kv_data and locates it as
+        # dst_kv_ptrs[c4_layer_num:] (mooncake/conn.py, decode.py), i.e. the
+        # slice that fp8 fills with the C4 rope regions.
+        raise ValueError(
+            "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
+            "with --enable-hisparse: the host/device split locates its device "
+            "regions by layer count, which the fp8 rope regions shift."
+        )
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -270,6 +298,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._uses_mxint8 = self.kv_cache_dtype_str == "mxint8" or _has_mxint8_draft(
             kvc
         )
+        dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -311,6 +340,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
+                    if _is_npu and dcp_size > 1:
+                        target_indexer_size *= dcp_size
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
@@ -327,6 +358,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
+                    # The draft pool is replicated and consumes the widened
+                    # allocator-global slot space on NPU DCP.
+                    if _is_npu and dcp_size > 1:
+                        draft_kv_size *= dcp_size
+                        draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 elif self._uses_mxint8:
                     self._cell_size += (
@@ -370,7 +406,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+            from sglang_tpu.kv_mxint8 import (
                 cache_bytes_per_token,
             )
 
@@ -442,10 +478,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                cell_size += self._compute_dsa_indexer_cell_size(
+                indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
                 )
+                if _is_npu and not kvc.is_draft_worker and dcp_size > 1:
+                    indexer_cell_size *= dcp_size
+                cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
             from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
@@ -561,6 +600,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
+            resolve_qsa_indexer_dtype,
         )
 
         if num_layers == 0:
@@ -573,6 +613,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             head_dim=qsa_profile.head_dim,
             compress_ratio=qsa_profile.compress_ratio,
             num_layers=num_layers,
+            compressed_dtype=resolve_qsa_indexer_dtype(get_model().qsa_indexer_dtype),
         )
 
     def _compute_dsa_indexer_cell_size(
@@ -696,6 +737,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        # TPU DCP ranks replicate KV, so each rank holds the heads of a
+        # tp // dcp group -- the count _build_tpu_swa_kv_pool allocates.
+        dcp_size = (
+            get_parallel().attn_dcp_size
+            if current_platform.dcp_shards_every_kv_pool()
+            else 1
+        )
 
         self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
         self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
@@ -720,21 +768,21 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._enable_unified_memory = get_memory().enable_unified_memory
 
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+            from sglang_tpu.kv_mxint8 import (
                 cache_bytes_per_token,
             )
 
             # The full pool may use the token-blocked page; the SWA pool is a
             # ring over the window and keeps the merged page.
             self._full_per_token = cache_bytes_per_token(
-                model_config.get_num_kv_heads(tp_size),
+                model_config.get_num_kv_heads(tp_size, dcp_size),
                 model_config.head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
                 layout=getattr(kvc, "kv_full_layout", None) or "merged",
             )
             self._swa_per_token = cache_bytes_per_token(
-                model_config.get_swa_num_kv_heads(tp_size),
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size),
                 model_config.swa_head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
@@ -768,14 +816,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         else:
             # Full layer per-token memory (bytes)
             self._full_per_token = (
-                model_config.get_num_kv_heads(tp_size)
+                model_config.get_num_kv_heads(tp_size, dcp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
                 * kv_size
             )
 
             # SWA layer per-token memory (bytes)
             self._swa_per_token = (
-                model_config.get_swa_num_kv_heads(tp_size)
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
                 * kv_size
             )
@@ -783,11 +831,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
-                model_config.get_num_kv_heads(tp_size)
+                model_config.get_num_kv_heads(tp_size, dcp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
             ) // scale_block_size
             self._swa_per_token += (
-                model_config.get_swa_num_kv_heads(tp_size)
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
@@ -956,8 +1004,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         swa_tokens += ceil_align(self._pipeline_swa_tokens, page_size)
 
         if not self._enable_unified_memory:
+            # The admission floor lives in the allocator's location space, which
+            # TPU DCP widens by dcp_size in both the pool size and the page.
+            widening = (
+                get_parallel().attn_dcp_size
+                if current_platform.dcp_shards_every_kv_pool()
+                else 1
+            )
             self.validate_swa_pool_size(
-                swa_tokens, self._sliding_window_size, self._page_size
+                swa_tokens * widening,
+                self._sliding_window_size,
+                self._page_size * widening,
             )
 
         logger.info(
@@ -1152,6 +1209,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    _is_tpu_dsv4 = False
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1256,6 +1314,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
         self._spec_infl = 1.0
+        self._is_tpu_dsv4 = get_exec().kernel.dsv4_attn_backend == "tpu_dsv4"
 
         # The unified pool ignores --kv-cache-dtype; V4 resolves "auto" to fp8_e4m3
         # (overrides.py _deepseek_v4_kv_cache_dtype), so only bfloat16 is explicit.
@@ -1266,15 +1325,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 "env switch to get a bf16 unified pool."
             )
 
-        # get_contiguous_buf_infos prices a row as buf[0].nbytes, which under fp8
-        # covers the nope pool only; fail at startup rather than at the first transfer.
-        # TODO(danli103): drop this once the transfer ships the rope pool.
-        if self._unified_fp8 and self.disaggregation_mode != "null":
-            raise ValueError(
-                "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
-                f"(disaggregation_mode={self.disaggregation_mode!r}). Unset the fp8 "
-                "switch or run without disaggregation."
-            )
+        check_dsv4_unified_fp8_pd_supported(
+            unified_fp8=self._unified_fp8,
+            disaggregation_mode=self.disaggregation_mode,
+            pp_size=kvc.pp_size,
+            enable_hisparse=get_memory().enable_hisparse,
+        )
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -1419,7 +1475,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
         # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
-        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+        if (
+            self._unified
+            or _is_npu
+            or self._is_tpu_dsv4
+            or get_exec().kernel.dsv4_attn_backend == "trtllm"
+        ):
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
@@ -1438,6 +1499,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
+        if self._is_tpu_dsv4:
+            return 1024.0 * self.num_layers_total
         if self.encoder_replay:
             # Target SWA lives in the request window; only the draft owns paged SWA
             # bytes, and its layers carry no compressed state.
@@ -1473,6 +1536,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
+        if self._is_tpu_dsv4:
+            # TPU uses 4D uint8 Pallas layouts:
+            # - SWA: 1024 B/token (raw bf16)
+            # - CSA (C4): 640 B/compressed token (512 B NoPE + 128 B RoPE)
+            # - HCA (C128): 1024 B/compressed token (raw bf16)
+            # - Indexer: 256 B/compressed token
+            # - Compressor states (C4 & C128) are fixed-size (per-request ring +
+            #   8192-token prefill scratch) and accounted in _fixed_c4_state_bytes
+            #   and _get_c128_state_fixed_bytes.
+            c4_frac = 1 / (4 * self.c4_shrink_factor)
+            return (
+                swa_ratio * self.bytes_per_swa_token
+                + c4_frac * 640 * self.num_layers(4)
+                + 1 / 128 * 1024 * self.num_layers(128)
+                + 1 / 4 * 256 * self.num_layers(4)
+            )
         return swa_ratio * self.bytes_per_swa_token + sum(
             self._compressed_bytes_per_full_token(ratio) * len(layers)
             for ratio, layers in self.stage_owner_layers.items()
@@ -1544,9 +1623,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if num_layers == 0:
             return 0
 
-        _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[128]
+
+        if self._is_tpu_dsv4:
+            ring_tokens = max(ring_size, 256)
+            state_rows = 8 + num_req_slots * ring_tokens + 8192
+            return state_rows * (2 * self.attn_head_dim * 4) * num_layers
+
+        _, c128_state_dtype_size = _get_dsv4_compress_state_dtype_sizes()
 
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
             state_rows = num_req_slots + ring_size + 1
@@ -1582,7 +1667,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _fixed_c4_state_bytes(self, max_running_requests: int) -> int:
         num_layers = self.num_layers(4)
-        if not self._unified or num_layers == 0:
+        if num_layers == 0:
+            return 0
+
+        if self._is_tpu_dsv4:
+            num_req_slots = self._get_num_req_slots(max_running_requests)
+            ring_tokens = max(self.ring_sizes[4], 32)
+            state_rows = 4 + num_req_slots * ring_tokens + 8192
+            core_bytes = 4 * self.attn_head_dim * 4
+            indexer_bytes = 4 * self.indexer_head_dim * 4
+            return state_rows * (core_bytes + indexer_bytes) * num_layers
+
+        if not self._unified:
             return 0
 
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()

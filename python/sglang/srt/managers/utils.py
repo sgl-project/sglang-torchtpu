@@ -24,10 +24,10 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.result_copy_worker import TpuAsyncCopyEvent
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.spec_info import SpecInput
+    from sglang_tpu.result_copy_worker import TpuAsyncCopyEvent
 
 
 logger = logging.getLogger(__name__)
@@ -123,6 +123,9 @@ class GenerationBatchResult:
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
+    prepared_draft_extend_inputs: Optional[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -313,6 +316,11 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "sampling_mask_statuses": (
             None if sampling_mask_output is None else sampling_mask_output.statuses
         ),
+        "sampling_mask_num_accept_tokens": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.num_accept_tokens
+        ),
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -333,6 +341,7 @@ def get_logprob_from_pp_outputs(
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
             support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
             statuses=next_pp_outputs["sampling_mask_statuses"],
+            num_accept_tokens=next_pp_outputs["sampling_mask_num_accept_tokens"],
         )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large

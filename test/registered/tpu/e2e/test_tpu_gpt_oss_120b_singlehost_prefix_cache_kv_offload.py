@@ -2,8 +2,8 @@
 
 Covers the P1 `prefix_caching_kv_offload` requirement (issue #372): one server with
 the radix cache on and HiCache mirroring it into host RAM over the raiden DMA
-backend must show a cache hit, show offloading actually happening, and still clear
-the GSM8K quality bar.
+backend must show a cache hit, show offloading actually happening, return prompt
+and decode KV from host unchanged, and still clear the GSM8K quality bar.
 
 GPT-OSS is hybrid-SWA, which is what makes raiden the backend under test rather
 than torch_tpu: raiden gives each sub-pool its own host pool, while torch_tpu
@@ -24,7 +24,7 @@ from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.
 register_tpu_ci(
     est_time=4200,
-    suite="nightly-tpu-4-v7",
+    suite="external-nightly-1host",
     nightly=True,
     labels=["singlehost", "gpt-oss-120b", "prefix-cache", "kv-offload"],
 )
@@ -57,7 +57,7 @@ LAUNCH_ENV = {
     "PAGE_SIZE": str(PAGE_SIZE),
     "TPU_COMPILE_TOKENS": "512 2048 4096",
     "TPU_COMPILE_BS": "1 2 4 8 16 32 64",
-    # gpt-oss needs RPA v3 (attention sinks), and raiden needs the fused
+    # This gate runs gpt-oss on RPA v3, and raiden needs the fused
     # page-first layout; server_args rejects other offload combinations. Both
     # are already the recipe's default -- pinned here so a recipe change cannot
     # silently take the offload path away from this gate.
@@ -106,6 +106,7 @@ MODEL_CONFIG = {
                 page_size=PAGE_SIZE,
                 probe_tokens=PROBE_TOKENS,
                 hicache_ratio=HICACHE_RATIO,
+                decode_tails=True,
             ),
         },
         {

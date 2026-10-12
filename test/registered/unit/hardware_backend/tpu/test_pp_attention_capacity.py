@@ -6,17 +6,17 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu import pp_attention_capacity as capacity
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import pp_attention_capacity as capacity
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestResolvedPipelineGuard(CustomTestCase):
     def test_resolved_pipeline_enables_capacity_guard(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+        from sglang_tpu.attention_pallas_rpa_batched import (
             BaseTpuPallasRpaAttnBackend,
             TpuPallasRpaBatchedAttnBackend,
         )
@@ -43,7 +43,7 @@ class TestScheduleLengths(CustomTestCase):
 
     def test_decode_uses_its_own_query_and_kv_tiles(self):
         capacity.check_schedule_lengths([1, 1], [9, 17], (5, 1, 8), "decode")
-        with self.assertRaisesRegex(ValueError, "Pipeline decode attention needs 5"):
+        with self.assertRaisesRegex(ValueError, "Batched decode attention needs 5"):
             capacity.check_schedule_lengths([1, 1], [9, 17], (4, 1, 8), "decode")
 
     def test_partial_query_tile_counts_only_its_causal_kv_prefix(self):
@@ -104,7 +104,7 @@ class TestLiveBatchCapacity(CustomTestCase):
         backend = NS(_non_empty_batch_size=lambda batch: 2)
         with (
             patch.object(capacity, "capacity_for_batch", return_value=(1, 1, 8)),
-            self.assertRaisesRegex(ValueError, "Pipeline decode attention needs 3"),
+            self.assertRaisesRegex(ValueError, "Batched decode attention needs 3"),
         ):
             capacity.check_batch_schedule(object(), backend, self._batch(decode=True))
 

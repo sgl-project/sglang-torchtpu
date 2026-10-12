@@ -8,17 +8,17 @@ import unittest
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.fp8_linear import (
-    apply_tpu_fp8_linear,
-    tpu_w8a8_block_fp8_linear,
-)
-from sglang.srt.hardware_backend.tpu.fp8_moe import (
-    _requantize_tpu_fp8_moe_block_to_channelwise,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.fp8_linear import (
+    apply_tpu_fp8_linear,
+    tpu_w8a8_block_fp8_linear,
+)
+from sglang_tpu.fp8_moe import (
+    _requantize_tpu_fp8_moe_block_to_channelwise,
+)
 
 
 class _FakeBlockFp8Config:

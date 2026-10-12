@@ -34,8 +34,10 @@ import torch
 from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
-from sglang.srt.disaggregation.raiden.serde import (
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     MessageTag,
@@ -46,8 +48,6 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.test.test_utils import CustomTestCase
 
 
 def _polled(sent=(), received=(), failed=(), completed_ns=None):
@@ -224,7 +224,7 @@ class RaidenRendezvousTestCase(CustomTestCase):
         ):
             m = RaidenKVManager(kv_args, mode, server_args)
 
-        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+        from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 
         m._engine = _FakeRaidenEngine()
         m._full_engine_max_blocks = 256

@@ -214,6 +214,17 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    qsa_indexer_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Storage dtype of the compressed QSA indexer cache and index query "
+                '(Qwen4-Exp). "fp8_e4m3" stores them as plain e4m3 and scores blocks '
+                "with fp8 GEMMs (CUDA SM90+). The main KV cache is unaffected."
+            ),
+            choices=["auto", "bfloat16", "fp8_e4m3"],
+        ),
+    ] = "auto"
     modelopt_quant: A[
         Optional[Union[str, Dict]],
         (
@@ -282,7 +293,9 @@ class Model(msgspec.Struct):
     ] = None
     weight_loader_disable_mmap: A[
         bool,
-        "Disable mmap while loading weight using safetensors.",
+        "Disable mmap while loading weight using safetensors. On TPU, models that "
+        "support it then read only their EP rank's routed experts "
+        "(SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS=1 reads whole shards).",
     ] = False
     weight_loader_prefetch_checkpoints: A[
         bool,

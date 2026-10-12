@@ -34,14 +34,21 @@ from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
-from sglang.srt.disaggregation.raiden.conn import (
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVClassType,
+    TransferBackend,
+)
+from sglang.srt.runtime_context import get_context
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.raiden.conn import (
     DEFAULT_KV_PORT,
     RaidenKVManager,
     RaidenKVSender,
     get_raiden_kv_caches,
 )
-from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
-from sglang.srt.disaggregation.raiden.serde import (
+from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     MessageTag,
@@ -52,24 +59,17 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
-from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    KVClassType,
-    TransferBackend,
-)
-from sglang.srt.hardware_backend.tpu.kv_pool_host import (
+from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
 )
-from sglang.srt.hardware_backend.tpu.raiden_transfer import (
+from sglang_tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
     RaidenFutureEvent,
     RaidenKVTransfer,
 )
-from sglang.srt.runtime_context import get_context
-from sglang.test.test_utils import CustomTestCase
 
 
 def _polled(sent=(), received=(), failed=(), completed_ns=None):
@@ -151,12 +151,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         )
 
         with (
-            patch(
-                "sglang.srt.hardware_backend.tpu.raiden_transfer.RaidenKVTransfer"
-            ) as transfer_cls,
-            self.assertLogs(
-                "sglang.srt.hardware_backend.tpu.kv_pool_host", level="WARNING"
-            ) as logs,
+            patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer_cls,
+            self.assertLogs("sglang_tpu.kv_pool_host", level="WARNING") as logs,
         ):
             pool = TpuRaidenHostKVCache(
                 device_pool,
@@ -379,6 +375,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -397,6 +394,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -426,6 +424,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
+                mgr.attn_tp_rank = 0
                 mgr._prefill = PrefillState(announce_pages=1)
                 mgr._decode = None
                 mgr._timeout_s = 120.0
@@ -478,6 +477,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr._timeout_s = 120.0
@@ -532,6 +532,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -661,6 +662,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_the_pool_has_room(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -877,6 +879,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -1005,6 +1008,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr._timeout_s = 120.0
@@ -1569,8 +1573,8 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
     )
 
     def test_role_state_is_declared_in_the_record_that_reads_it(self):
-        from sglang.srt.disaggregation.raiden.receiver import RaidenReceiverMixin
-        from sglang.srt.disaggregation.raiden.sender import RaidenSenderMixin
+        from sglang_tpu.disaggregation.raiden.receiver import RaidenReceiverMixin
+        from sglang_tpu.disaggregation.raiden.sender import RaidenSenderMixin
 
         roles = (
             ("_prefill", PrefillState, RaidenSenderMixin, self.PREFILL_SIDE),
@@ -1627,9 +1631,9 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
                 "sglang.srt.disaggregation.common.conn.CommonKVManager.__init__",
                 init_base,
             ),
-            patch("sglang.srt.disaggregation.raiden.conn.threading.Thread"),
+            patch("sglang_tpu.disaggregation.raiden.conn.threading.Thread"),
             patch(
-                "sglang.srt.disaggregation.raiden.conn.concurrent.futures.ThreadPoolExecutor"
+                "sglang_tpu.disaggregation.raiden.conn.concurrent.futures.ThreadPoolExecutor"
             ),
             patch.object(RaidenKVManager, "_start_heartbeat_checker_thread"),
         ):
@@ -1716,7 +1720,7 @@ class TestNoPushLock(CustomTestCase):
         # The per-endpoint send helper replaced the old global push lock; a
         # send site reintroducing it would crash in production while unit
         # fixtures could mask the missing constructor field.
-        from sglang.srt.disaggregation.raiden import conn, receiver, sender
+        from sglang_tpu.disaggregation.raiden import conn, receiver, sender
 
         for module in (conn, sender, receiver):
             with self.subTest(module=module.__name__):
@@ -1793,7 +1797,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     @staticmethod
     def _geometry(src_tp, dst_tp):
-        from sglang.srt.disaggregation.raiden.reshard_schedule import ReshardGeometry
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import ReshardGeometry
 
         return ReshardGeometry(src_tp, dst_tp, 1024, 8)
 
@@ -2663,6 +2667,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
 
     def _make_receiver(self, local_blocks):
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr.chunked_transfer = False

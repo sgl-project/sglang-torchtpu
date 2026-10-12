@@ -3,15 +3,15 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.eagle_utils_tpu import (
     fused_draft_extend_select_argmax_func,
     last_accepted_row_indices,
 )
-from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
+from sglang_tpu.spec_op_warmup import (
     SpecOpWarmupContext,
     make_draft_extend_select_args,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

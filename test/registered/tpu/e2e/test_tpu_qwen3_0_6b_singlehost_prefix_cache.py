@@ -136,7 +136,8 @@ class TestTpuQwen306bSinglehostPrefixCache(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_PLATFORM"] = "tpu"
+        # setdefault: mode B runs these suites with SGLANG_PLATFORM=tpu_oot.
+        os.environ.setdefault("SGLANG_PLATFORM", "tpu")
 
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -289,8 +290,8 @@ class TestTpuQwen306bSinglehostSwaPrefixCache(TestTpuQwen306bSinglehostPrefixCac
     # gpt-oss-120b recipe's 0.60 static budget.
     TP_SIZE = 8
     MEM_FRACTION_STATIC = 0.6
-    # Experts go EP, not TP (MXFP4 block / MXU tile alignment), and only
-    # pallas_tpu_rpa_v3 implements the attention sinks GPT-OSS needs. Both per
+    # Experts go EP, not TP (MXFP4 block / MXU tile alignment), and GPT-OSS
+    # runs on pallas_tpu_rpa_v3, the recipe's default backend. Both per
     # benchmark/tpu/recipe/gpt_oss_120b/server.sh.
     EXTRA_ENGINE_KWARGS = {
         "swa_full_tokens_ratio": SWA_RATIO,

@@ -50,14 +50,28 @@ def _discover(script: str, *args: str) -> list[dict]:
     return json.loads(completed.stdout)
 
 
+def _external_group_files() -> list[str]:
+    """Files of the external-cluster nightly suites, one entry per file."""
+    return [
+        file
+        for row in _discover(
+            "external/render_external_jobset.py", "--list-groups", "--nightly"
+        )
+        for group in row["groups"]
+        for file in group["files"].split()
+    ]
+
+
 def _stage_test_files() -> list[str]:
-    """Every test file the feature-validation stage can run, from all three
-    sources: the single-host matrix, the multi-host launch groups, and the
-    hand-wired static jobs."""
+    """Every test file feature validation can run: the in-project single-host
+    matrix and multi-host groups, the hand-wired static jobs, and the
+    external-cluster suites."""
     rows = _discover("discover_tests.py", "--suite", "nightly-tpu-4-v7", "--nightly")
     rows += _discover("discover_multihost.py", "--suite", "nightly-tpu-multihost")
-    return [_row_path(row) for row in rows] + _STATIC_FILES.findall(
-        FEATURE_VALIDATION.read_text(encoding="utf-8")
+    return (
+        [_row_path(row) for row in rows]
+        + _STATIC_FILES.findall(FEATURE_VALIDATION.read_text(encoding="utf-8"))
+        + _external_group_files()
     )
 
 

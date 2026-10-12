@@ -1443,10 +1443,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
             )
             return self.runner.run(dispatch_output, quant_info)
@@ -2450,6 +2446,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
+        # MegaMoE consumes canonical W13 directly, regardless of the nominal
+        # runner.
+        self.use_flashinfer_trtllm_weight_layout = (
+            self.enable_flashinfer_trtllm_moe and not get_moe_a2a_backend().is_megamoe()
+        )
         self._cache_permute_indices = {}
 
     def _weight_scale_dtype(self) -> torch.dtype:
@@ -2682,6 +2683,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
+        assert not self.use_flashinfer_trtllm_weight_layout, (
+            "MegaMoE NVFP4 weights must use canonical W13 layout"
+        )
         # Activations are quantized per token at dispatch, so w13_input_scale
         # is not used.
         import deep_gemm
@@ -2739,7 +2743,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
-            up_first = self.enable_flashinfer_trtllm_moe
+            up_first = self.use_flashinfer_trtllm_weight_layout
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
             )
@@ -3351,10 +3355,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
             )
             return self.runner.run(dispatch_output, quant_info)
@@ -3447,10 +3447,10 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
 
     def _resolve_fused_rs(self, layer: torch.nn.Module) -> None:
         """Resolve the TPU MoE backend after the model publishes its contract."""
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             unmet_tpu_nvfp4_fused_rs_requirements,
         )
-        from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
+        from sglang_tpu.fused_rs_sequence_parallel import (
             has_tpu_fused_rs_post_expert_norm,
         )
 
@@ -3498,7 +3498,7 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
@@ -3534,7 +3534,7 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.hardware_backend.tpu.fp4_moe import apply_tpu_nvfp4_moe
+        from sglang_tpu.fp4_moe import apply_tpu_nvfp4_moe
 
         return apply_tpu_nvfp4_moe(
             layer=layer,
@@ -3545,4 +3545,5 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             ),
             no_combine=self.moe_runner_config.no_combine,
             use_fused_rs=self.handles_moe_reduction,
+            swiglu_limit=self.moe_runner_config.swiglu_limit,
         )

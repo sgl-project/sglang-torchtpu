@@ -79,6 +79,16 @@ class _SamplingMetadataTestBase(CustomTestCase):
 
 
 class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
+    def test_temperatures_have_column_shaped_device_storage(self):
+        for batch_size in (0, 1, 4):
+            with self.subTest(batch_size=batch_size):
+                batch = _Batch([_req(temperature=0.7)] * batch_size, "meta")
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                self.assertEqual(info.temperatures.shape, (batch_size, 1))
+                self.assertEqual(info.temperatures.dtype, torch.float32)
+                # The copy must allocate [B, 1], not a [B] tensor with a view.
+                self.assertIsNone(info.temperatures._base)
+
     def test_min_tokens_pads_ragged_stop_sets(self):
         reqs = [
             _req(min_new_tokens=2, stop_token_ids=[3]),

@@ -572,7 +572,7 @@ class DraftBackendFactory:
         return ("ascend", AscendAttnBackend(self.draft_model_runner))
 
     def _create_tpu_pallas_rpa_v3_decode_backend(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+        from sglang_tpu.attention_pallas_rpa_v3 import (
             TpuPallasRpaV3MultiStepDraftBackend,
         )
 
@@ -584,7 +584,7 @@ class DraftBackendFactory:
         )
 
     def _create_tpu_pallas_rpa_v3_prefill_backend(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+        from sglang_tpu.attention_pallas_rpa_v3 import (
             TpuPallasRpaV3AttnBackend,
         )
 
@@ -594,7 +594,7 @@ class DraftBackendFactory:
         )
 
     def _create_tpu_pallas_rpa_batched_decode_backend(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+        from sglang_tpu.attention_pallas_rpa_batched import (
             TpuPallasRpaBatchedMultiStepDraftBackend,
         )
 
@@ -606,7 +606,7 @@ class DraftBackendFactory:
         )
 
     def _create_tpu_pallas_rpa_batched_prefill_backend(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+        from sglang_tpu.attention_pallas_rpa_batched import (
             TpuPallasRpaBatchedAttnBackend,
         )
 

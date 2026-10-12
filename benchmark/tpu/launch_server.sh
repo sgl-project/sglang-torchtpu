@@ -55,9 +55,10 @@
 #   HOST=127.0.0.1
 #   PORT=30000
 #   TP_SIZE=8                      # tensor-parallel ranks (= chiplets)
-#   PP_SIZE=1                      # pipeline stages; >1 passes --pp-size N and
-#                                  # requires TP_SIZE=1 (one chiplet per stage,
-#                                  # TP_SIZE*PP_SIZE chiplets in all)
+#   PP_SIZE=1                      # pipeline stages; >1 passes --pp-size N;
+#                                  # TP_SIZE=1 (one chiplet per stage) or the
+#                                  # --attn-cp-size given in EXTRA_ARGS (one CP
+#                                  # group per stage); TP_SIZE*PP_SIZE chiplets
 #   PP_MAX_MICRO_BATCH_SIZE=       # requests per pipeline microbatch; passed
 #                                  # only when set (default MAX_RUNNING/PP_SIZE)
 #   EP_SIZE=                       # expert-parallel ranks; passed only when set.

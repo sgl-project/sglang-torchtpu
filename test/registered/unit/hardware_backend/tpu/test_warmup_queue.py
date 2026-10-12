@@ -2,20 +2,22 @@
 
 import contextvars
 import sys
+import weakref
 
 import pytest
+import torch
 
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
-    collect_warmups,
-    current_warmup_queue,
-)
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.warmup_queue import (
+    collect_warmups,
+    current_warmup_queue,
+)
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -36,6 +38,22 @@ def test_collect_warmups_nests_and_preserves_context():
     assert current_warmup_queue() is None
     assert queue.calls == []
     assert queue.completions == []
+
+
+def test_collect_warmups_releases_inputs_between_calls():
+    events = []
+
+    def enqueue(queue):
+        tensor = torch.ones(8)
+        queue.calls.append(PendingCall(lambda: events.append(tensor.numel())))
+        return weakref.ref(tensor)
+
+    with collect_warmups() as queue:
+        reference = enqueue(queue)
+        queue.calls.append(PendingCall(lambda: events.append(reference() is None)))
+        assert reference() is not None
+
+    assert events == [8, True]
 
 
 def test_collect_warmups_clears_after_failure():
