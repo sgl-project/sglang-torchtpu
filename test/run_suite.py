@@ -322,6 +322,20 @@ def _valid_suites_by_backend() -> dict:
     return result
 
 
+def registered_test_files() -> List[str]:
+    """Every registered test file under test/registered/, as collect_tests sees them."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return [
+        f
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
+    ]
+
+
 def validate_all_suites(all_tests: List[CIRegistry]):
     """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
     valid_by_backend = _valid_suites_by_backend()
@@ -449,16 +463,7 @@ def run_a_suite(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
 
-    # Registered tests under test/registered/
-    files = [
-        f
-        for f in glob.glob(
-            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
-        )
-        # conftest.py / __init__.py are pytest+package structure, never
-        # registered tests, and must not be executed as one.
-        if os.path.basename(f) not in ("conftest.py", "__init__.py")
-    ]
+    files = registered_test_files()
 
     # Strict: all discovered files must have proper registration
     sanity_check = True
