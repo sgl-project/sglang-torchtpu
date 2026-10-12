@@ -26,7 +26,8 @@ class TestTpuSchedulerHook(CustomTestCase):
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
-        self.stack = self.enterContext(ExitStack())
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
         for name in (
             "initialize_fp8_gemm_config",
             "initialize_fp4_gemm_config",
