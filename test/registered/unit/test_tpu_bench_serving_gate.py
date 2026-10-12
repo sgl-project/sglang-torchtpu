@@ -787,6 +787,10 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                 self.assertIsNotNone(entry, f"{path.name}:{label} has no floor")
                 for key in ("floor", "set_on", "hardware", "n_items", "mean"):
                     self.assertIn(key, entry, f"{config['id']}/{label}")
+                # A hand-set lower bound overrides the derivation; say why.
+                if "min_floor" in entry:
+                    self.assertTrue(entry.get("min_floor_reason"), label)
+                    self.assertGreaterEqual(entry["floor"], entry["min_floor"], label)
             for params in model_config.build_gates(config):
                 self.assertIsNotNone(params.floor, path.name)
                 self.assertFalse(params.report_only, path.name)

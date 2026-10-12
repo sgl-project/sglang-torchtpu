@@ -1,5 +1,5 @@
 {
-  "_comment": "Soft quality floors for the nightly accuracy gates, keyed by dashboard series id, then gate label. A score below its floor fails the test file after every gate has run and published its score, so the dashboard still plots the night. Numbers are derived, not hand-edited: n_items, hardware and seed are declared here; .github/tpu-ci/derive_accuracy_floors.py rewrites floor/mean/sigma/runs/set_on from the dashboard (mean - 3 * max(nightly sigma, binomial sigma), last 5 nights). provisional = fewer than 5 nights behind it.",
+  "_comment": "Soft quality floors for the nightly accuracy gates, keyed by dashboard series id, then gate label. A score below its floor fails the test file after every gate has run and published its score, so the dashboard still plots the night. Numbers are derived, not hand-edited: n_items, hardware, seed and min_floor (+ min_floor_reason) are declared here; .github/tpu-ci/derive_accuracy_floors.py rewrites floor/mean/sigma/runs/set_on from the dashboard (mean - 3 * max(nightly sigma, binomial sigma), last 5 nights). provisional = fewer than 5 nights behind it.",
   "floors": {
     "accuracy-deepseek-r1-0528": {
       "gpqa_diamond": {
@@ -27,7 +27,9 @@
       "aime25": {
         "n_items": 30,
         "hardware": "tpu7x 2x2x2, tp16 ep16",
-        "floor": 0.648,
+        "min_floor": 0.675,
+        "min_floor_reason": "30 questions at repeat 1 derive 0.648 (19/30); keep the pre-floors gate (0.875 - 0.20) until it runs repeat 4 like V3.1",
+        "floor": 0.675,
         "mean": 0.8463,
         "sigma": 0.0659,
         "sigma_source": "binomial",
