@@ -510,6 +510,8 @@ def compute_metadata(
     *,
     cfgs: configs.RpaConfigs,
     skip_kv_update: bool = False,
+    cp_rank_ref: jax.Ref | None = None,
+    kv_lens_global_ref: jax.Ref | None = None,
 ) -> LoopCarry:
     """Fill metadata using triple nested loop of seq->q->k loop.
 
@@ -517,6 +519,11 @@ def compute_metadata(
     K/V tokens are NOT pulled from the input k/v tensors, the whole `kv_len` is
     read from the (redirected) cache slot, and `do_writeback` is forced to 0 so
     the kernel doesn't overwrite the source layer's cache contents.
+
+    `cfgs.serve.cache_only` reads the whole `kv_len` from the cache too, but the
+    queries follow every key: no causal bound, and every q block gets at least
+    one k block. `cp_rank_ref` / `kv_lens_global_ref` (with `cp_group_size`)
+    move the sliding window to global positions.
     """
 
     @jax.named_scope("k_loop")
@@ -549,7 +556,12 @@ def compute_metadata(
         kv_len_start = k_idx * cfgs.bkv_sz
         kv_p_start = k_idx * cfgs.bkv_p
         kv_left = k_len - kv_len_start
-        if skip_kv_update:
+        if cfgs.serve.cache_only:
+            # Every key comes from the cache; a guard k block past the end of a
+            # short shard reads none.
+            kv_left = jnp.maximum(kv_left, 0)
+            kv_left_frm_cache = kv_left
+        elif skip_kv_update:
             # KV-share: read everything from cache. The source (target) layer's
             # call ran earlier in this step and already wrote the current-step
             # K/V into the (redirected) cache slot, so this shared layer's
@@ -586,6 +598,8 @@ def compute_metadata(
         q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
 
         do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
+        if cfgs.serve.skip_kv_write:
+            do_writeback = 0
         schedule.do_writeback[step, target_lane] = do_writeback
         src_hbm = q_end - kv_left_frm_new
 
@@ -681,19 +695,46 @@ def compute_metadata(
         )
 
     @jax.named_scope("q_loop")
-    def q_loop(q_idx, carry, *, s_idx, q_start, q_end, k_len, q_len, num_k):
+    def q_loop(
+        q_idx, carry, *, s_idx, q_start, q_end, k_len, q_len, num_k, q_global_start
+    ):
         q_src = q_start + q_idx * cfgs.bq_sz
         q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
 
         start_k_idx = 0
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
-            start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
+            if q_global_start is not None:
+                # First local key j inside the window of the block's first query;
+                # local key j holds global position j * cp_group_size + cp_rank.
+                cp_group_size = cfgs.serve.cp_group_size
+                first_kv_idx = (
+                    jnp.maximum(
+                        q_global_start
+                        + q_idx * cfgs.bq_sz
+                        - sliding_window
+                        - cp_rank_ref[0]
+                        + cp_group_size,
+                        0,
+                    )
+                    // cp_group_size
+                )
+                start_k_idx = first_kv_idx // cfgs.bkv_sz
+            elif cfgs.serve.cache_only:
+                sw_start_idx = k_len + q_idx * cfgs.bq_sz - sliding_window + 1
+                start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
+            else:
+                sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
+                start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-        end_k_idx_causal = (
-            k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1
-        ) // cfgs.bkv_sz + 1
-        end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
+        if cfgs.serve.cache_only:
+            # No causal bound. One k block always runs, so a q block with no key
+            # in range still writes output 0 and LSE -inf.
+            end_k_idx = jnp.maximum(num_k, start_k_idx + 1)
+        else:
+            end_k_idx_causal = (
+                k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1
+            ) // cfgs.bkv_sz + 1
+            end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
 
         k_loop_fn = functools.partial(
             k_loop,
@@ -718,6 +759,10 @@ def compute_metadata(
 
         num_q = pl.cdiv(q_len, cfgs.bq_sz)
         num_k = pl.cdiv(k_len, cfgs.bkv_sz)
+        # Global position of the sequence's first query.
+        q_global_start = None
+        if kv_lens_global_ref is not None:
+            q_global_start = kv_lens_global_ref[s_idx] - q_len
 
         q_loop_fn = functools.partial(
             q_loop,
@@ -727,6 +772,7 @@ def compute_metadata(
             k_len=k_len,
             q_len=q_len,
             num_k=num_k,
+            q_global_start=q_global_start,
         )
 
         return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
@@ -741,6 +787,9 @@ def rpa_metadata_schedule_kernel(
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
+    # Scalar prefetch with cp_group_size, None otherwise.
+    cp_rank_ref: jax.Ref | None,
+    kv_lens_global_ref: jax.Ref | None,
     # Outputs.
     schedule_hbm_ref: RpaSchedule,
     # Scratch.
@@ -787,6 +836,8 @@ def rpa_metadata_schedule_kernel(
         dma_sem,
         cfgs=cfgs,
         skip_kv_update=skip_kv_update,
+        cp_rank_ref=cp_rank_ref,
+        kv_lens_global_ref=kv_lens_global_ref,
     )
     count = loop_carry.count
     hbm_offset = loop_carry.hbm_offset
@@ -812,19 +863,28 @@ def generate_rpa_metadata(
     *,
     interpret=False,
     skip_kv_update: bool = False,
+    cp_rank: jax.Array | None = None,
+    kv_lens_global: jax.Array | None = None,
 ) -> RpaSchedule:
     schedule_shaped_dtype = RpaSchedule.create_shape_dtype(cfgs)
     schedule_hbm = RpaSchedule.create_shape_dtype(
         cfgs, multiplier=cfgs.max_schedule_size_multiplier
     )
 
+    kernel = functools.partial(
+        rpa_metadata_schedule_kernel, cfgs=cfgs, skip_kv_update=skip_kv_update
+    )
+    scalar_prefetches = (cu_q_lens, kv_lens, distribution)
+    if cfgs.serve.cp_group_size is None:
+        kernel = functools.partial(utils.without_cp_refs, kernel, num_scalar_prefetch=3)
+    else:
+        scalar_prefetches += (cp_rank, kv_lens_global)
+
     return pl.pallas_call(
-        functools.partial(
-            rpa_metadata_schedule_kernel, cfgs=cfgs, skip_kv_update=skip_kv_update
-        ),
+        kernel,
         out_shape=schedule_hbm,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=len(scalar_prefetches),
             in_specs=[],
             out_specs=schedule_hbm.out_specs(),
             scratch_shapes=[
@@ -834,4 +894,4 @@ def generate_rpa_metadata(
         ),
         interpret=interpret,
         name="rpa_metadata_schedule",
-    )(cu_q_lens, kv_lens, distribution)
+    )(*scalar_prefetches)

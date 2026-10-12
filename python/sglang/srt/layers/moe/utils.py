@@ -766,7 +766,12 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     This is a property of the MoE configuration. Whether the MoE block or a later
     step runs a sum that is still owed is decided separately.
     """
-    if get_parallel().dwdp_size > 1:
+    parallel = get_parallel()
+    if parallel.dwdp_size > 1:
+        return True
+    # Experts replicated on every device of the TP group hold each token's
+    # full output.
+    if is_tp_path and parallel.tp_size > 1 and parallel.moe_dp_size == parallel.tp_size:
         return True
     if not is_tp_path and _is_tpu and get_moe_runner_backend().is_pallas_tpu_fused_rs():
         # The TPU fused-RS experts kernel runs the EP reduction itself (the

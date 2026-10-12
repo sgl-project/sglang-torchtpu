@@ -859,6 +859,62 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertIs(fb.is_prefill_only, True)
 
 
+class TestContextParallelInputs(CustomTestCase):
+    """Under prefill context parallelism the graph takes the rank's zigzag rows
+    and one extend_seq_lens_cpu per program family."""
+
+    @staticmethod
+    def _call(cp_layout=False, input_embeds=None):
+        seen = {}
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            seen.update(ids=input_ids, kwargs=kwargs, batch_ids=forward_batch.input_ids)
+            seen["lens"] = list(forward_batch.extend_seq_lens_cpu)
+            return SimpleNamespace()
+
+        fb = TestCompiledForwardShim._forward_batch(
+            input_ids=torch.zeros(48, dtype=torch.int64),
+            positions=torch.arange(48),
+            forward_mode=_ForwardModeMock("extend"),
+            extend_seq_lens_cpu=[40, 8],
+            input_embeds=input_embeds,
+        )
+        if cp_layout:
+            fb._tpu_cp_layout = SimpleNamespace(
+                host=SimpleNamespace(cp_size=2, local_rows_padded=32),
+                local_rows=torch.arange(32),
+            )
+        shim = CompiledForwardShim(compiled, policy=_policy(SimpleNamespace()))
+        shim._attn_cp_size = 2
+        shim(fb.input_ids, fb.positions, fb)
+        return fb, seen
+
+    def test_cp_batch_embeds_the_global_ids_and_keeps_the_rows(self):
+        fb, seen = self._call(cp_layout=True)
+        self.assertEqual(seen["ids"].shape[0], 64)  # global ids padded to cp x rows
+        self.assertEqual(seen["kwargs"]["cp_local_rows"].shape[0], 32)
+        self.assertEqual(seen["batch_ids"].shape[0], 32)
+        self.assertEqual(seen["lens"], [4, 4])
+        self.assertEqual(fb.input_ids.shape[0], 48)
+        self.assertEqual(fb.extend_seq_lens_cpu, [40, 8])
+
+    def test_plain_extend_presents_the_plain_stand_in(self):
+        """A plain extend on a context-parallel server must not trace the CP
+        program, whatever its live lengths."""
+        fb, seen = self._call()
+        self.assertEqual(seen["lens"], [0, 0])
+        self.assertNotIn("cp_local_rows", seen["kwargs"])
+        self.assertEqual(fb.extend_seq_lens_cpu, [40, 8])
+
+    def test_supplied_embeddings_skip_the_lookup(self):
+        """Caller embeddings are global; they narrow to the rank's rows and the
+        graph takes local ids, not the global ids plus the row selector."""
+        _, seen = self._call(cp_layout=True, input_embeds=torch.ones(48, 3))
+        self.assertEqual(seen["ids"].shape[0], 32)
+        self.assertNotIn("cp_local_rows", seen["kwargs"])
+        self.assertEqual(seen["kwargs"]["input_embeds"].shape, (32, 3))
+
+
 class TestBuildBucketers(CustomTestCase):
     """tpu_compile_bs is read off exec.graph, so the case publishes its config."""
 

@@ -43,7 +43,7 @@ class TestScheduleLengths(CustomTestCase):
 
     def test_decode_uses_its_own_query_and_kv_tiles(self):
         capacity.check_schedule_lengths([1, 1], [9, 17], (5, 1, 8), "decode")
-        with self.assertRaisesRegex(ValueError, "Pipeline decode attention needs 5"):
+        with self.assertRaisesRegex(ValueError, "Batched decode attention needs 5"):
             capacity.check_schedule_lengths([1, 1], [9, 17], (4, 1, 8), "decode")
 
     def test_partial_query_tile_counts_only_its_causal_kv_prefix(self):
@@ -104,7 +104,7 @@ class TestLiveBatchCapacity(CustomTestCase):
         backend = NS(_non_empty_batch_size=lambda batch: 2)
         with (
             patch.object(capacity, "capacity_for_batch", return_value=(1, 1, 8)),
-            self.assertRaisesRegex(ValueError, "Pipeline decode attention needs 3"),
+            self.assertRaisesRegex(ValueError, "Batched decode attention needs 3"),
         ):
             capacity.check_batch_schedule(object(), backend, self._batch(decode=True))
 

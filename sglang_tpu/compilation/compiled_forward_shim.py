@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -35,6 +36,12 @@ from sglang_tpu.compilation.bucketer import (
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
+)
+from sglang_tpu.cp_forward import (
+    cp_local_embeds,
+    cp_token_inputs,
+    get_tpu_cp_layout,
+    pinned_extend_seq_lens_cpu,
 )
 
 if TYPE_CHECKING:
@@ -134,6 +141,60 @@ def _matches_default(value: Any, default: Any) -> bool:
     if default is None:
         return value is None
     return type(value) is type(default) and value == default
+
+
+def _cp_localize_embeds_in_args(
+    args: tuple[Any, ...], cp_layout: Any
+) -> tuple[Any, ...]:
+    """Narrow a positionally-passed ``input_embeds`` to this rank's rows.
+
+    ``input_embeds`` is the compiled inner forward's 4th parameter, so for a
+    model that fills it positionally rather than by keyword it lands at
+    ``args[0]``, where the keyword lookup at the call site cannot see it.
+    Arity is unchanged.
+    """
+    if not args or not isinstance(args[0], torch.Tensor):
+        return args
+    return (cp_local_embeds(args[0], cp_layout),) + args[1:]
+
+
+def _localize_cp_inputs(
+    forward_batch: Any,
+    *,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    cp_layout: Any,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[Any, ...]]:
+    """Present this rank's zigzag rows to a context-parallel graph call.
+
+    The graph embeds the global ids (identical on every rank) and runs the
+    model on the rank's rows; every token-indexed field on the batch becomes
+    local. Returns the graph's ``input_ids``, ``positions`` and ``args``;
+    ``kwargs`` is updated in place.
+    """
+    input_ids, local_ids, positions = cp_token_inputs(
+        input_ids=input_ids, positions=positions, layout=cp_layout
+    )
+    # Embeddings a caller supplies are global, and the precompile ladder builds
+    # them local like every other token-indexed input; leaving them global is a
+    # serve-time recompile, which `fail_on_recompile` turns into a crash on the
+    # first request.
+    if kwargs.get("input_embeds") is not None:
+        kwargs["input_embeds"] = cp_local_embeds(
+            input_embeds=kwargs["input_embeds"], layout=cp_layout
+        )
+        # A caller that supplies embeddings has no lookup to run; the ids only
+        # size the local rows.
+        input_ids = local_ids
+    else:
+        args = _cp_localize_embeds_in_args(args=args, cp_layout=cp_layout)
+        # The embedding takes the global ids and keeps the rank's rows.
+        kwargs["cp_local_rows"] = cp_layout.local_rows
+    forward_batch.input_ids = local_ids
+    forward_batch.positions = positions
+    return input_ids, positions, args
 
 
 def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
@@ -566,28 +627,32 @@ def _pad_forward_batch_inputs(
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
-    # Opt-in host padding applies only to prefill with arbitrary token counts.
-    # Decode and target verify have a small, fixed set of token counts. The
-    # TPU pad compiles each of those once, and avoids a blocking copy on
-    # every generation step.
-    mode = forward_batch.forward_mode
-    host_pad = (
-        envs.SGLANG_TPU_HOST_PADDING.get()
-        and mode.is_extend()
-        and not mode.is_target_verify()
+    _pad_batch_fields(
+        forward_batch,
+        pad_t=pad_t,
+        pad_b=pad_b,
+        real_b=real_b,
+        is_draft_extend_v2=is_draft_extend_v2,
     )
-    for field in _TOKEN_FIELDS:
-        val = getattr(forward_batch, field, None)
-        dim = _TOKEN_FIELD_DIM.get(field, 0)
-        if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
-            on_host = host_pad and field in _HOST_PAD_TOKEN_FIELDS
-            val = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
-            setattr(forward_batch, field, val)
+    return real_q_out, real_b_out
 
-    if is_draft_extend_v2:
-        out_cache_loc = forward_batch.out_cache_loc
-        if out_cache_loc.shape[0] < pad_t:
-            forward_batch.out_cache_loc = _zero_pad_dim0(out_cache_loc, pad_t)
+
+def _pad_batch_fields(
+    forward_batch: Any,
+    *,
+    pad_t: int | None,
+    pad_b: int,
+    real_b: int,
+    is_draft_extend_v2: bool,
+) -> None:
+    """Pad the batch's tensors and lists in place to ``(pad_t, pad_b)``.
+
+    ``pad_t`` None leaves every token-indexed field at its live row count
+    (context-parallel batches present their local rows to the graph instead);
+    ``real_b`` is the live request count the CPU mirrors must cover.
+    """
+    if pad_t is not None:
+        _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
 
     for field in _BS_FIELDS:
         val = getattr(forward_batch, field, None)
@@ -627,6 +692,33 @@ def _pad_forward_batch_inputs(
     if len(mm_inputs) < pad_b:
         forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
 
+    forward_batch.batch_size = pad_b
+
+
+def _pad_token_fields(forward_batch: Any, pad_t: int, is_draft_extend_v2: bool) -> None:
+    # Opt-in host padding applies only to prefill with arbitrary token counts.
+    # Decode and target verify have a small, fixed set of token counts. The
+    # TPU pad compiles each of those once, and avoids a blocking copy on
+    # every generation step.
+    mode = forward_batch.forward_mode
+    host_pad = (
+        envs.SGLANG_TPU_HOST_PADDING.get()
+        and mode.is_extend()
+        and not mode.is_target_verify()
+    )
+    for field in _TOKEN_FIELDS:
+        val = getattr(forward_batch, field, None)
+        dim = _TOKEN_FIELD_DIM.get(field, 0)
+        if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
+            on_host = host_pad and field in _HOST_PAD_TOKEN_FIELDS
+            val = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
+            setattr(forward_batch, field, val)
+
+    if is_draft_extend_v2:
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc.shape[0] < pad_t:
+            forward_batch.out_cache_loc = _zero_pad_dim0(out_cache_loc, pad_t)
+
     # Pad spec_info tensors whose token dim must match input_ids after padding
     # (spec target verify/extend feeds spec_info.hidden_states through the
     # compiled forward). Guarded so non-spec runs are unaffected.
@@ -638,10 +730,6 @@ def _pad_forward_batch_inputs(
             spec_info.hidden_states = F.pad(
                 hs, (0,) * (2 * (hs.ndim - 1)) + (0, pad_rows)
             )
-
-    forward_batch.batch_size = pad_b
-
-    return real_q_out, real_b_out
 
 
 def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) -> None:
@@ -763,6 +851,11 @@ class CompiledForwardShim:
         self._draft_worker = bool(
             runner is not None and getattr(runner, "is_draft_worker", False)
         )
+        # Prefill context parallelism: above 1, extend batches present their
+        # local zigzag rows to the graph and a batch-independent
+        # extend_seq_lens_cpu (see __call__).
+        cp_strategy = get_cp_strategy()
+        self._attn_cp_size = cp_strategy.cp_size if cp_strategy is not None else 1
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
@@ -996,6 +1089,31 @@ class CompiledForwardShim:
         if mm_embeds is not None:
             saved["mm_input_embeds"] = mm_embeds
             forward_batch.mm_input_embeds = None
+        live_extend_seq_lens_cpu = None
+        if self._attn_cp_size > 1:
+            cp_layout = get_tpu_cp_layout(forward_batch)
+            # The graph tests the extend lengths (cp_strategy) to pick the
+            # context-parallel or the plain program; one constant per
+            # program family keeps that test off the live lengths. The live
+            # list goes back at whatever length the output unpadding leaves.
+            if isinstance(forward_batch.extend_seq_lens_cpu, list):
+                live_extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                forward_batch.extend_seq_lens_cpu = pinned_extend_seq_lens_cpu(
+                    len(live_extend_seq_lens_cpu),
+                    cp_size=self._attn_cp_size,
+                    cp_active=cp_layout is not None,
+                )
+            if cp_layout is not None:
+                saved["input_ids"] = forward_batch.input_ids
+                saved["positions"] = forward_batch.positions
+                input_ids, positions, args = _localize_cp_inputs(
+                    forward_batch,
+                    input_ids=input_ids,
+                    positions=positions,
+                    args=args,
+                    kwargs=kwargs,
+                    cp_layout=cp_layout,
+                )
         try:
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)
             if isinstance(out, PendingCall):
@@ -1015,6 +1133,10 @@ class CompiledForwardShim:
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
+            if live_extend_seq_lens_cpu is not None:
+                forward_batch.extend_seq_lens_cpu = live_extend_seq_lens_cpu[
+                    : len(forward_batch.extend_seq_lens_cpu)
+                ]
         if mm_embeds is not None:
             real_q = getattr(forward_batch, _REAL_Q_KEY, None)
             if real_q is not None and mm_embeds.shape[0] > real_q:

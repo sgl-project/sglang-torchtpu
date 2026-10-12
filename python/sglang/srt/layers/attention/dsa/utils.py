@@ -197,6 +197,18 @@ def is_dsa_enable_prefill_cp():
     if get_parallel().attn_cp_size <= 1:
         return False
 
+    return _dsa_prefill_cp_supported()
+
+
+@torch.compiler.assume_constant_result
+def _dsa_prefill_cp_supported() -> bool:
+    """Whether the platform and the loaded DeepSeek sparse-attention model
+    support prefill CP.
+
+    A compiled forward evaluates this once at trace time: the answer is fixed
+    for the process, and the platform probes and the config view it reads are
+    not traceable.
+    """
     if is_musa():
         return False
 

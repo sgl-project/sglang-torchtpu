@@ -1333,6 +1333,44 @@ class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
         self.assertEqual(forward_batch.input_ids.tolist(), [0])
 
 
+_CP_STRATEGY_PATH = "sglang_tpu.compilation.decoder_compile_policy.get_cp_strategy"
+_CP_STRATEGY = SimpleNamespace(cp_size=2, cp_rank=0)
+
+
+class TestContextParallelWarmupFamily(_PolicyTestCase):
+    """The context-parallel extend family must survive both the order the
+    policy is constructed in and any ``_precompile_extend`` override."""
+
+    def test_cp_strategy_is_resolved_after_construction(self):
+        """The strategy may initialize after the policy is built; a value
+        captured at construction would turn off the CP warmup family, batch
+        bucketing and embedding wrapper for the process's life, silently."""
+        with patch(_CP_STRATEGY_PATH, return_value=None):
+            policy = _make_policy()
+        with patch(_CP_STRATEGY_PATH, return_value=_CP_STRATEGY):
+            self.assertIs(policy._cp_strategy, _CP_STRATEGY)
+
+    def test_extend_warmup_compiles_the_cp_family(self):
+        policy = _make_policy(token_buckets=(8, 64), bs_buckets=(1, 4))
+        policy._run_one = MagicMock()
+        with patch(_CP_STRATEGY_PATH, return_value=_CP_STRATEGY):
+            _run_cases(policy, ForwardMode.EXTEND)
+        variants = [c.kwargs["variant"] for c in policy._run_one.call_args_list]
+        self.assertIn("cp", variants)
+
+    def test_precompile_rejects_an_override_that_drops_the_cp_family(self):
+        """Dropping the family is otherwise silent until the first served batch
+        recompiles, which fail_on_recompile makes fatal mid-run."""
+        policy = _make_policy()
+        policy._precompile_extend = MagicMock(return_value=[])
+        policy._precompile_decode = MagicMock(return_value=[])
+        with (
+            patch(_CP_STRATEGY_PATH, return_value=_CP_STRATEGY),
+            self.assertRaisesRegex(RuntimeError, "context-parallel extend"),
+        ):
+            policy.precompile()
+
+
 class TestPrecompileLoops(_PolicyTestCase):
     """``precompile`` fires one forward per TPU precompile variant:
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs

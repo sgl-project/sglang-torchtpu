@@ -39,6 +39,7 @@ def moe_config(
     tp_size=2,
     tp_rank=0,
     dwdp_size=1,
+    moe_dp_size=1,
     backend=None,
     fp4_allgather=False,
     reduce_scatterv=False,
@@ -48,7 +49,10 @@ def moe_config(
             moe_utils,
             "get_parallel",
             return_value=types.SimpleNamespace(
-                tp_size=tp_size, tp_rank=tp_rank, dwdp_size=dwdp_size
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                dwdp_size=dwdp_size,
+                moe_dp_size=moe_dp_size,
             ),
         ),
         patch.object(moe_utils, "get_moe_a2a_backend", return_value=a2a(backend)),
@@ -104,6 +108,8 @@ class TestReduceMoeOutput(CustomTestCase):
             {"backend": "flashinfer_megamoe"},
             {"dwdp_size": 2},
             {"fp4_allgather": True},
+            # Experts replicated on every TP rank hold each token's full output.
+            {"moe_dp_size": 2},
         ):
             with self.subTest(**config), moe_config(**config):
                 self.assertEqual(self.all_reduces()[0], 0)
@@ -111,6 +117,12 @@ class TestReduceMoeOutput(CustomTestCase):
 
     def test_fp4_allgather_only_completes_the_tp_sum(self):
         with moe_config(fp4_allgather=True):
+            self.assertFalse(post_experts_output_is_complete(is_tp_path=False))
+
+    def test_replication_completes_only_a_whole_tp_sum(self):
+        with moe_config(tp_size=4, moe_dp_size=2):
+            self.assertEqual(self.all_reduces()[0], 1)
+        with moe_config(tp_size=4, moe_dp_size=4):
             self.assertFalse(post_experts_output_is_complete(is_tp_path=False))
 
 

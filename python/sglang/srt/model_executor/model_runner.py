@@ -1441,7 +1441,9 @@ class ModelRunner:
     def effective_logical_max_total_num_tokens(self):
         """Logical request limit, preserving hybrid SWA's separate pool bounds."""
         if self.is_hybrid_swa:
-            return self.effective_max_total_num_tokens
+            return self.kv_cache_configurator.logical_token_capacity(
+                max_total_num_tokens=self.effective_max_total_num_tokens
+            )
         return self.logical_max_total_num_tokens
 
     @property

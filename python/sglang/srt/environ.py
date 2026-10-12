@@ -201,6 +201,10 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class EnvFloatWithAlias(_DeprecatedEnvFallback, EnvFloat):
+    pass
+
+
 class GateGemvMode(IntEnum):
     """Small-batch Inkling gate linear implementation.
 
@@ -740,6 +744,13 @@ class Envs:
     # Raiden: a decode starts a room's next read as soon as the prefill
     # announces it; 0 starts reads only on the next scheduler poll.
     SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
+    # Raiden: deadline of each KV chunk transfer, not of the whole request; the
+    # closing read counts as a chunk, and a non-chunked transfer is one chunk.
+    # Counted from registration on the prefill and from start_read on the
+    # decode. Set the same on both.
+    SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
+        60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
+    )
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )

@@ -1576,18 +1576,21 @@ class ModelConfig:
         kv_tensor_parallel_size = tensor_parallel_size // dcp_size
         return max(1, total_num_kv_heads // kv_tensor_parallel_size)
 
-    def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
+    def get_swa_num_kv_heads(self, tensor_parallel_size, dcp_size: int = 1) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
+        if self.is_draft_model:
+            dcp_size = 1
+        kv_tensor_parallel_size = tensor_parallel_size // dcp_size
         if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
             total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
-            return max(1, total_num_kv_heads // tensor_parallel_size)
+            return max(1, total_num_kv_heads // kv_tensor_parallel_size)
         elif hasattr(self.hf_text_config, "attention_other_setting"):  # For step3p5
             total_num_kv_heads = self.hf_text_config.attention_other_setting.get(
                 "num_attention_groups"
             )
-            return max(1, total_num_kv_heads // tensor_parallel_size)
+            return max(1, total_num_kv_heads // kv_tensor_parallel_size)
         else:
-            return self.get_num_kv_heads(tensor_parallel_size)
+            return self.get_num_kv_heads(tensor_parallel_size, dcp_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):

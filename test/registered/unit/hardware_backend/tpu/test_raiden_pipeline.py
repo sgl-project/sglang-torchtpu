@@ -35,7 +35,7 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
     source_spans,
     warn_if_staging_exceeds_premapped,
 )
-from sglang_tpu.disaggregation.raiden.serde import MessageTag
+from sglang_tpu.disaggregation.raiden.serde import MessageTag, RoomFailed
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -131,7 +131,13 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
         attn_tp_size=attn_tp_size,
         attn_tp_rank=attn_tp_rank,
     )
-    for method in ("_poll_engine_status", "_fail_room_locked", "is_aborted"):
+    for method in (
+        "_poll_engine_status",
+        "_fail_room_locked",
+        "is_aborted",
+        "_tombstone_reason_locked",
+        "_reply_room_failed",
+    ):
         setattr(
             pipe.manager,
             method,
@@ -628,6 +634,23 @@ class TestPipelineLifetimes(unittest.TestCase):
         pipe.finalize_send(8, None)
         self.assertEqual(held, [False, False])
 
+    def test_request_for_a_failed_room_is_answered_with_room_failed(self):
+        """A pipeline request for a room this stage already failed must tell
+        the decode, or the decode holds the room's pages until its waiting
+        timeout."""
+        pipe = transfer(producer=True)
+        pipe.manager._aborted[7] = time.time()
+        pipe.manager._send_multipart_locked = Mock()
+        consumer = b'{"attn_tp_size": 1, "attn_tp_rank": 0}'
+        pipe.on_message(
+            [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000", consumer]
+        )
+        pipe.client.register_request_blocks.assert_not_called()
+        self.assertNotIn(7, pipe.replies)
+        endpoint, frames = pipe.manager._send_multipart_locked.call_args.args
+        self.assertEqual(endpoint, "tcp://decode:31000")
+        self.assertEqual(RoomFailed.from_frames(frames).room, 7)
+
     def test_unrequested_room_expires_without_a_native_cancel(self):
         pipe = transfer(producer=True)
         pipe.sent[7] = sent(expires=0, registered=False)
@@ -646,6 +669,7 @@ class TestPipelineLifetimes(unittest.TestCase):
         pipe.receives[7] = receive(rank=3)
         meta = pipe.receives[7].sources[3] | {"pool_tags": ["fa.l12", "swa.l13"]}
         manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager.attn_tp_rank = 0
         manager._pipeline_enabled = True
         manager._pipeline_init_lock = threading.Lock()
         manager._pipeline = pipe
@@ -1000,6 +1024,7 @@ class TestPipelineInitialization(unittest.TestCase):
         from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 
         manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager.attn_tp_rank = 0
         manager._pipeline_enabled = True
         manager._pipeline_init_lock = threading.Lock()
         manager._pipeline_messages = []

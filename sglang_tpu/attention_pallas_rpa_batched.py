@@ -25,6 +25,7 @@ from sglang_tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
     RpaKernelSpec,
 )
+from sglang_tpu.cp_forward import get_tpu_cp_layout
 
 __all__ = [
     "PallasForwardMetadata",
@@ -144,10 +145,20 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         super().__init__(model_runner, speculative_step_id)
         from sglang.srt.runtime_context import get_parallel
 
-        self._pp_schedule_runner = model_runner if get_parallel().pp_size > 1 else None
+        parallel = get_parallel()
+        self._pp_schedule_runner = model_runner if parallel.pp_size > 1 else None
+        self._cp_schedule_runner = model_runner if parallel.attn_cp_size > 1 else None
 
     def init_forward_metadata(self, forward_batch):
-        if self._pp_schedule_runner is not None:
+        cp_layout = get_tpu_cp_layout(forward_batch)
+        if cp_layout is not None:
+            from sglang_tpu.pp_attention_capacity import (
+                check_cp_schedule,
+            )
+
+            # The kernel runs the context-parallel rows, not the global lengths.
+            check_cp_schedule(self._cp_schedule_runner, self, cp_layout.host)
+        elif self._pp_schedule_runner is not None:
             from sglang_tpu.pp_attention_capacity import (
                 check_batch_schedule,
             )

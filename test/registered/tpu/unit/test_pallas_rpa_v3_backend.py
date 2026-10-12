@@ -78,8 +78,13 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
         self._op = None
         self._distribution_cache = {}
         self._host_metadata_cache = HostMetadataCache()
+        self._host_page_cols = None
         # Non-SWA: skips the hybrid-SWA page remap in _build_metadata(_host).
         self._is_hybrid_swa = False
+        # No decode context parallelism: one page covers page_size tokens.
+        self._dcp = 1
+        self._dcp_rank = 0
+        self._page_stride = page_size
 
 
 def _make_forward_batch(

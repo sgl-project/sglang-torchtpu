@@ -69,15 +69,17 @@ def _capacity_from_config(cfg, pages_per_seq, page_size):
     return max(0, per_lane) * block.batch_size, block.bq_sz, block.bkv_sz
 
 
-def capacity_for_batch(runner, backend, *, mode, num_seqs, total_q_tokens):
+def capacity_for_batch(
+    runner, backend, *, mode, num_seqs, total_q_tokens, attn_tp_size=1
+):
     """Use the kernel's actual padded batch shape, dtype, layout and tile choice."""
     from sglang_tpu.attention_pallas_rpa_batched import kv_layout
 
     config = runner.model_config
     return _capacity_for_shape(
         mode,
-        config.get_num_attention_heads(1),
-        config.get_num_kv_heads(1),
+        config.get_num_attention_heads(attn_tp_size),
+        config.get_num_kv_heads(attn_tp_size),
         config.head_dim,
         num_seqs,
         total_q_tokens,
@@ -110,18 +112,18 @@ def attention_schedule_capacity(runner, policy):
 def check_schedule_lengths(query_lens, kv_lens, capacity, mode):
     """Reject a step whose query/KV block pairs exceed its schedule buffers."""
     if len(query_lens) != len(kv_lens):
-        raise ValueError("Pipeline attention query and KV lengths must align.")
+        raise ValueError("Batched attention query and KV lengths must align.")
     pairs = 0
     for query, kv in zip(query_lens, kv_lens):
         query, kv = int(query), int(kv)
         if query < 0 or kv < query:
             raise ValueError(
-                f"Invalid pipeline attention lengths: query={query}, KV={kv}."
+                f"Invalid batched attention lengths: query={query}, KV={kv}."
             )
         pairs += chunk_pairs(capacity, query, kv - query)
     if pairs > capacity[0]:
         raise ValueError(
-            f"Pipeline {mode} attention needs {pairs} query/KV block pairs, "
+            f"Batched {mode} attention needs {pairs} query/KV block pairs, "
             f"but this compiled batch can schedule {capacity[0]}. "
             "Reduce the prefill chunk, batch size or context length."
         )
@@ -159,3 +161,21 @@ def check_batch_schedule(runner, backend, batch):
         total_q_tokens=int(batch.input_ids.shape[0]),
     )
     check_schedule_lengths(query_lens, kv_lens, capacity, mode)
+
+
+def check_cp_schedule(runner, backend, host):
+    """Check a context-parallel extend's attention rows on this rank."""
+    from sglang.srt.runtime_context import get_parallel
+
+    rows = host.num_rows
+    capacity = capacity_for_batch(
+        runner,
+        backend,
+        mode="mixed",
+        num_seqs=2 * host.pad_b,
+        total_q_tokens=host.local_rows_padded,
+        attn_tp_size=get_parallel().attn_tp_size,
+    )
+    check_schedule_lengths(
+        host.pseudo_q_lens[:rows], host.pseudo_kv_lens[:rows], capacity, "mixed"
+    )

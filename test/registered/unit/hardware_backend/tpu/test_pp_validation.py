@@ -30,6 +30,7 @@ def _args(**overrides):
         tp_size=1,
         pp_size=1,
         dp_size=1,
+        dcp_size=1,
         enable_dp_attention=False,
         attn_dp_size=1,
         enable_dp_lm_head=False,
@@ -46,6 +47,7 @@ def _args(**overrides):
         disaggregation_mode="null",
         disaggregation_transfer_backend="mooncake",
         optimistic_prefill_attempts=0,
+        attn_cp_size=1,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
