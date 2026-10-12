@@ -7,18 +7,21 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation import recompilation_checker
-from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation import recompilation_checker
+from sglang_tpu.compilation.recompilation_checker import (
     RecompilationChecker,
     _build_event,
     _format_event,
     _shared_recompilation_checker,
     install_recompilation_checker,
+    maybe_enable_site_tracing,
     snapshot_recompilation_baseline,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 # Pure logic over injected cache readers, no torch_tpu needed.
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -377,7 +380,7 @@ class TestSharedChecker(CustomTestCase):
         self.assertEqual(checker.check(context_fn=_context).durations_ms, (50,))
 
     def test_speculative_op_warmup_refreshes_shared_baseline(self):
-        from sglang.srt.hardware_backend.tpu import spec_op_precompile
+        from sglang_tpu import spec_op_precompile
 
         def warmup(cache):
             op = SimpleNamespace(
@@ -405,7 +408,7 @@ class TestSharedChecker(CustomTestCase):
         self._assert_late_warmup_is_excluded(warmup)
 
     def test_kv_offload_warmup_refreshes_shared_baseline(self):
-        from sglang.srt.hardware_backend.tpu.compilation import compiled_forward_shim
+        from sglang_tpu.compilation import compiled_forward_shim
 
         def warmup(cache):
             pool = SimpleNamespace(
@@ -478,6 +481,75 @@ class TestSharedChecker(CustomTestCase):
             event = _shared_recompilation_checker().check(context_fn=_context)
             self.assertEqual(event.durations_ms, (25,))
             self.assertIsNone(checker.check(context_fn=_context))
+
+
+# The cache an op "compiles" into, set per test.
+_OP_CACHE: list[_FakeCache] = []
+
+
+@torch.library.custom_op("sglang_test::compiles_once", mutates_args=())
+def _compiles_once(x: torch.Tensor) -> torch.Tensor:
+    _OP_CACHE[0].compile(40)
+    return x.clone()
+
+
+class TestSiteTracing(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.cache = _FakeCache([500])
+        _OP_CACHE[:] = [self.cache]
+        self.addCleanup(_OP_CACHE.clear)
+        self.checker = _checker(self.cache, warn_ms=10)
+        self.checker.snapshot_baseline()
+
+    def _enable(self):
+        self.checker.enable_site_tracing()
+        self.addCleanup(self.checker._site_tracer.__exit__, None, None, None)
+
+    def test_compiling_op_is_attached_to_the_event(self):
+        self._enable()
+        x = torch.ones(3, 2, dtype=torch.int32)
+        x + 1  # cache hit, not a site
+        _compiles_once(x)
+        _compiles_once(x)
+        with self.assertLogs(_LOGGER, level="WARNING") as logs:
+            event = self.checker.check(context_fn=_context)
+        self.assertEqual(len(event.sites), 1)
+        site, n = event.sites[0]
+        self.assertEqual(n, 2)
+        self.assertIn("sglang_test.compiles_once.default((3, 2):int32)", site)
+        self.assertIn("2x sglang_test.compiles_once", logs.output[0])
+        self.assertIsNotNone(_PARSER_RE.match(logs.output[0]))
+
+    def test_sites_do_not_leak_into_the_next_event(self):
+        self._enable()
+        _compiles_once(torch.ones(1))
+        self.checker.check(context_fn=_context)
+        self.cache.compile(40)  # e.g. a compiled graph, invisible to the tracer
+        event = self.checker.check(context_fn=_context)
+        self.assertEqual(event.sites, ())
+
+    def test_sites_are_none_without_tracing(self):
+        _compiles_once(torch.ones(1))
+        event = self.checker.check(context_fn=_context)
+        self.assertIsNone(event.sites)
+        self.assertNotIn("sites", _format_event(event, warn_ms=10))
+
+    def test_enable_requires_both_flags_and_an_installed_checker(self):
+        cases = ((False, True, True), (True, False, True), (True, True, False))
+        for check, sites, installed in cases:
+            checker = MagicMock(has_baseline=installed)
+            with (
+                envs.SGLANG_TPU_CHECK_RECOMPILATION.override(check),
+                envs.SGLANG_TPU_CHECK_RECOMPILATION_SITES.override(sites),
+                patch.object(
+                    recompilation_checker,
+                    "_shared_recompilation_checker",
+                    return_value=checker,
+                ),
+            ):
+                maybe_enable_site_tracing()
+            checker.enable_site_tracing.assert_not_called()
 
 
 if __name__ == "__main__":

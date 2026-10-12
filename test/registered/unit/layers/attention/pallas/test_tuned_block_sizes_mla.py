@@ -31,12 +31,12 @@ from unittest import mock
 
 import jax.numpy as jnp
 
-from sglang.srt.layers.attention.pallas import tuned_block_sizes_mla as tbs
-from sglang.srt.layers.attention.pallas.tuned_block_sizes_mla import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas import tuned_block_sizes_mla as tbs
+from sglang_tpu.attention.pallas.tuned_block_sizes_mla import (
     get_tuned_block_sizes_mla,
 )
-from sglang.srt.layers.attention.pallas.util import next_power_of_2
-from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.util import next_power_of_2
 
 _DECODE_ARGS = ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 128)
 _MIXED_ARGS = ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 512)

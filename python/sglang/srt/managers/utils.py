@@ -24,10 +24,10 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.result_copy_worker import TpuAsyncCopyEvent
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.spec_info import SpecInput
+    from sglang_tpu.result_copy_worker import TpuAsyncCopyEvent
 
 
 logger = logging.getLogger(__name__)

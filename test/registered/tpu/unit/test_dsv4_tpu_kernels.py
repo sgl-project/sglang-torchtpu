@@ -36,18 +36,18 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.dsv4.dsv4_compressor import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.dsv4.dsv4_compressor import (
     _register_csa_compressor_op,
     _register_hca_compressor_op,
     _register_indexer_compressor_op,
     ensure_tpu_compressor_caches,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.dsv4_indexer import (
+from sglang_tpu.dsv4.dsv4_indexer import (
     _register_streamindex_topk_op,
     ensure_tpu_indexer_caches,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.rope import get_or_build_cos_sin_cache
-from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.dsv4.rope import get_or_build_cos_sin_cache
 
 
 def _skip_if_no_tpu() -> bool:

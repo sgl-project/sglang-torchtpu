@@ -1,3 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
+"""Moved to :mod:`sglang_tpu.moe.pallas.fused_rs`; re-export kept for in-flight branches, delete once they merge."""
 
-"""TPU Pallas fused MoE reduce-scatter kernels."""
+from sglang_tpu.moe.pallas.fused_rs import *  # noqa: F401,F403

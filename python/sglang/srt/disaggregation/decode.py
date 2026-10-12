@@ -805,7 +805,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Raiden needs the per-layer device KV tensors (it indexes their major
         # dim as pages). The TPU fused KV pool exposes them via kv_buffer.
         if hasattr(kv_manager, "set_kv_caches"):
-            from sglang.srt.disaggregation.raiden.conn import get_raiden_kv_caches
+            from sglang_tpu.disaggregation.raiden.conn import get_raiden_kv_caches
 
             kv_manager.set_kv_caches(
                 get_raiden_kv_caches(
@@ -3341,9 +3341,9 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
+        # Retracted requests block only new admissions, not pop_transferred:
+        # only it commits or frees transfer rows, whose KV retracted requests may need.
+        admit_new_reqs = len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -3352,7 +3352,10 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            if get_disagg().disaggregation_decode_host_receive_threshold == 0:
+            if (
+                admit_new_reqs
+                and get_disagg().disaggregation_decode_host_receive_threshold == 0
+            ):
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = (
@@ -3363,7 +3366,10 @@ class SchedulerDisaggregationDecodeMixin:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
-            if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+            if (
+                admit_new_reqs
+                and get_disagg().disaggregation_decode_host_receive_threshold > 0
+            ):
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)

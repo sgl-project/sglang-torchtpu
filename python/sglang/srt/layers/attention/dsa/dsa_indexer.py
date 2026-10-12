@@ -1870,9 +1870,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> torch.Tensor:
-        from sglang.srt.hardware_backend.tpu.dsa_indexer_tpu import indexer_forward
-
-        return indexer_forward(
+        # On TPU the attention backend runs the indexer.
+        return get_attn_backend().forward_indexer(
             self, x=x, q_lora=q_lora, positions=positions, layer_id=layer_id
         )
 

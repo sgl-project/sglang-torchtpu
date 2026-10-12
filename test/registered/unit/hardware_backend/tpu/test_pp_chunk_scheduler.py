@@ -7,12 +7,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
-    TpuPipelinePrefillAdder,
-    pending_step_limit,
-    profile_and_install_cost_model,
-)
-from sglang.srt.hardware_backend.tpu.pp_chunks import StepCostModel
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     MAX_PREFIX_MATCHED_WAITING_REQS,
@@ -28,6 +22,12 @@ from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import published_topology
+from sglang_tpu.pp_chunk_scheduler import (
+    TpuPipelinePrefillAdder,
+    pending_step_limit,
+    profile_and_install_cost_model,
+)
+from sglang_tpu.pp_chunks import StepCostModel
 
 
 @pytest.fixture(autouse=True)

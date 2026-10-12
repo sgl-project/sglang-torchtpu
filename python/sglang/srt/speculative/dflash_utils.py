@@ -11,9 +11,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
-    correct_drafts_and_bonus_tpu,
-)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -944,6 +941,8 @@ def compute_dflash_correct_drafts_and_bonus(
         return num_correct_drafts, bonus_tokens
 
     if _is_tpu:
+        from sglang_tpu.dflash_utils_tpu import correct_drafts_and_bonus_tpu
+
         correct_len, bonus = correct_drafts_and_bonus_tpu(
             candidates=candidates, target_predict=target_predict
         )

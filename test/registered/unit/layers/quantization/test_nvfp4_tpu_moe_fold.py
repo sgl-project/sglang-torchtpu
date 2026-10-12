@@ -97,7 +97,7 @@ def _make_block512_layer(
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
 class TestNvfp4Block512Contract(CustomTestCase):
     def test_block512_layout_and_cleanup(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
@@ -133,7 +133,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         detect the alias; ownership must be asserted directly on the helper's
         return value.
         """
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             _to_gmm_v2_scale_layout,
         )
 
@@ -159,7 +159,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     self.assertTrue(torch.equal(out, expected))
 
     def test_rejects_unsupported_blocks_even_with_fused_rs(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
@@ -176,7 +176,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     )
 
     def test_sub512_rejects_stock_pallas_layout(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
@@ -191,7 +191,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 )
 
     def test_scale_storage_dtype(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
@@ -201,7 +201,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertEqual(layer.w2_weight_scale.dtype, torch.bfloat16)
 
     def test_folds_non_unit_global_scales(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
@@ -227,7 +227,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         torch.testing.assert_close(layer.w2_weight_scale, expected_w2)
 
     def test_fused_rs_requires_ep_only_reduced_combined_output(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             can_use_tpu_nvfp4_fused_rs,
         )
 
@@ -327,7 +327,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         The no_combine mismatch below is the shape a model hits when it asks for
         per-expert output without declaring the post-expert-norm contract.
         """
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             TPU_NVFP4_SUPPORTED_GROUP_SIZES,
             unmet_tpu_nvfp4_fused_rs_requirements,
         )
@@ -391,7 +391,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
             )
 
     def test_non_rs_no_combine_passes_masked_routing_to_pallas(self):
-        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang_tpu import fp4_moe
 
         hidden_states = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16)
         topk_weights = torch.tensor([[0.75, 0.25], [0.60, 0.40]], dtype=torch.bfloat16)
@@ -429,7 +429,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertEqual(tuple(result.hidden_states.shape), (2, 2, HIDDEN_SIZE))
 
     def test_fused_backend_prepares_layer_eagerly(self):
-        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang_tpu import fp4_moe
 
         for group_size in SUPPORTED_BLOCK_SIZES:
             with self.subTest(group_size=group_size):
@@ -442,9 +442,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 with (
                     mock.patch.dict(
                         sys.modules,
-                        {
-                            "sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module
-                        },
+                        {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
                     ),
                     mock.patch.object(
                         fp4_moe,
@@ -483,7 +481,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         against the SAME layer object with only the kernel entry point mocked,
         so anything apply reads must have been written by prepare.
         """
-        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang_tpu import fp4_moe
 
         layer = _make_block512_layer()
         layer.moe_ep_size = 1
@@ -516,7 +514,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
             ),
             mock.patch.object(
                 fp4_moe, "_materialize_packed_fp4", side_effect=lambda value: value
@@ -539,7 +537,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertFalse(call["has_post_expert_norm"])
 
     def test_fused_apply_uses_shared_gather_without_fp8_payload(self):
-        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang_tpu import fp4_moe
 
         hidden_states = torch.randn(3, HIDDEN_SIZE, dtype=torch.bfloat16)
         topk_weights = torch.rand(3, 2, dtype=torch.bfloat16)
@@ -552,7 +550,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
         layer.moe_ep_size = 1
-        from sglang.srt.layers.moe.pallas import fused_moe_rs_op
+        from sglang_tpu.moe.pallas import fused_moe_rs_op
 
         # Autospec is intentional: it catches adapter/backend API skew during a
         # rebase instead of letting a permissive Mock accept removed keywords.
@@ -581,7 +579,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
 
     def test_fused_apply_runs_8k_once_and_chunks_only_above_8k(self):
-        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang_tpu import fp4_moe
 
         for num_tokens, expected_call_rows in (
             (8192, [8192]),
@@ -612,7 +610,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
 
                 with mock.patch.dict(
                     sys.modules,
-                    {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                    {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
                 ):
                     result = fp4_moe.apply_tpu_nvfp4_moe(
                         layer=layer,
@@ -643,7 +641,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 torch.testing.assert_close(result.hidden_states, hidden_states)
 
     def test_fused_apply_chunks_sequence_parallel_inputs_by_local_row(self):
-        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang_tpu import fp4_moe
 
         rows_per_partition = 4097
         partition_count = 2
@@ -676,7 +674,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
             ),
             mock.patch.object(
                 fp4_moe,
@@ -723,7 +721,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
 
     def test_fused_backend_caches_declared_post_expert_norm_weight(self):
-        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang_tpu import fp4_moe
 
         layer = _make_block512_layer(include_unused_params=False)
         layer.hidden_size = HIDDEN_SIZE
@@ -735,7 +733,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
             ),
             mock.patch.object(
                 fp4_moe, "_materialize_packed_fp4", side_effect=lambda value: value
@@ -749,7 +747,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertNotIn("_tpu_fused_rs_post_expert_norm_weight", layer._parameters)
 
     def test_fused_backend_rejects_missing_post_expert_norm_weight_hook(self):
-        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang_tpu import fp4_moe
 
         layer = _make_block512_layer(include_unused_params=False)
         layer.hidden_size = HIDDEN_SIZE
@@ -760,7 +758,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                {"sglang_tpu.moe.pallas.fused_moe_rs_op": fused_rs_module},
             ),
             mock.patch.object(
                 fp4_moe, "_materialize_packed_fp4", side_effect=lambda value: value
@@ -770,19 +768,15 @@ class TestNvfp4Block512Contract(CustomTestCase):
             fp4_moe.prepare_tpu_nvfp4_moe_weights(layer, use_fused_rs=True)
 
     def test_fused_rs_group_offset_stays_model_sharded(self):
-        package_root = pathlib.Path(__file__).resolve().parents[5] / "python"
-        wrapper = (
-            package_root / "sglang/srt/layers/moe/pallas/fused_moe_rs_op.py"
-        ).read_text()
-        body = (
-            package_root / "sglang/srt/layers/moe/pallas/fused_rs/fused_moe.py"
-        ).read_text()
+        repo_root = pathlib.Path(__file__).resolve().parents[5]
+        wrapper = (repo_root / "sglang_tpu/moe/pallas/fused_moe_rs_op.py").read_text()
+        body = (repo_root / "sglang_tpu/moe/pallas/fused_rs/fused_moe.py").read_text()
 
         self.assertIn("group_offset_input=group_offset", wrapper)
         self.assertIn("weight_p_spec,  # group_offset", body)
 
     def test_fused_packed_transpose_preserves_codes(self):
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             _transpose_packed_fp4,
         )
 
@@ -798,7 +792,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
     def test_fused_rs_selects_expected_activation_mode_by_group_size(self):
         import jax.numpy as jnp
 
-        from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
+        from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
             get_maybe_quantize_lhs,
         )
 
@@ -833,9 +827,9 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         return {"quant_method": "modelopt", "quantization": quantization}
 
     def test_tpu_platform_factory_selects_tpu_config(self):
-        from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
         from sglang.srt.layers import quantization
         from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         platform = TpuSRTPlatform()
         self.assertIs(
@@ -1333,7 +1327,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 return_value=types.SimpleNamespace(is_none=lambda: True),
             ),
             mock.patch(
-                "sglang.srt.hardware_backend.tpu.fp4_moe.prepare_tpu_nvfp4_moe_weights",
+                "sglang_tpu.fp4_moe.prepare_tpu_nvfp4_moe_weights",
                 _fake_prepare,
             ),
         ):

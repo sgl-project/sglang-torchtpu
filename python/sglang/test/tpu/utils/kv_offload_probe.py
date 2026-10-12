@@ -1,11 +1,13 @@
 """Feature gate for prefix caching, KV offload, and optional speculation.
 
 The runner checks a cold read, a device-cache hit, and a host reload. Optional
-speculation checks use counters returned by the same three requests.
+speculation checks use counters returned by the same three requests. The optional
+decode-tail check replays generated KV from device and from host.
 """
 
 import math
-from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import msgspec
 import requests
@@ -44,6 +46,20 @@ _MAX_NEW_TOKENS = 16
 # Generous: the first probe is a cold prefill on a freshly compiled server.
 _REQUEST_TIMEOUT = 900
 
+# Under overlap scheduling, a request that finishes is still in the next forward's
+# batch, which writes the KV of its last token. When prompt plus output is a page
+# multiple, that slot completes a page that release inserts into the radix tree and
+# write-through backs up to host while the forward may still be writing it. Every
+# tail request is sized that way; whether a given backup reads the page early is
+# timing, so several requests each get a chance.
+_TAIL_REQUESTS = 8
+# A prefix match is capped one token short of the input and floored to a page, so
+# a replay of only the committed tokens would recompute the tail page instead of
+# reading it.
+_TAIL_REPLAY_EXTRA_TOKENS = 2
+# Tokens each replay generates; their ids and logprobs are what the two replays compare.
+_TAIL_REPLAY_NEW_TOKENS = 4
+
 
 class CacheObservation(msgspec.Struct, frozen=True):
     """Response text, cache-tier counts, and speculative decoding counters."""
@@ -53,6 +69,16 @@ class CacheObservation(msgspec.Struct, frozen=True):
     host_tokens: int
     completion_tokens: int
     spec_verify_ct: int
+    output_ids: Tuple[int, ...] = ()
+    output_logprobs: Tuple[float, ...] = ()
+
+
+class TailReplay(msgspec.Struct, frozen=True):
+    """One decode tail's committed tokens, replayed from device and from host."""
+
+    committed_tokens: int
+    device: CacheObservation
+    host: CacheObservation
 
 
 class KvOffloadProbe(msgspec.Struct, frozen=True):
@@ -66,6 +92,7 @@ class KvOffloadProbe(msgspec.Struct, frozen=True):
     cold: CacheObservation
     warm: CacheObservation
     reload: CacheObservation
+    tails: Tuple[TailReplay, ...] = ()
 
 
 class EvictionPlan(msgspec.Struct, frozen=True):
@@ -77,7 +104,11 @@ class EvictionPlan(msgspec.Struct, frozen=True):
 
 
 def plan_eviction(
-    *, device_pool_tokens: int, probe_tokens: int, hicache_ratio: float
+    *,
+    device_pool_tokens: int,
+    probe_tokens: int,
+    hicache_ratio: float,
+    tail_tokens: int = 0,
 ) -> EvictionPlan:
     """Size the filler run, or refuse a config that cannot prove anything.
 
@@ -89,12 +120,12 @@ def plan_eviction(
     """
     num_fillers = math.ceil(_EVICTION_MARGIN * device_pool_tokens / probe_tokens)
     host_pool_tokens = int(device_pool_tokens * hicache_ratio)
-    backed_up_tokens = probe_tokens * (num_fillers + 1)
+    backed_up_tokens = probe_tokens * (num_fillers + 1) + tail_tokens
     if host_pool_tokens < backed_up_tokens:
         raise ValueError(
-            f"host pool holds {host_pool_tokens} tokens but the probe plus "
-            f"{num_fillers} fillers back up {backed_up_tokens}, so the probe would be "
-            f"evicted from host as well. Raise hicache_ratio above "
+            f"host pool holds {host_pool_tokens} tokens but the probe, decode tails "
+            f"and {num_fillers} fillers back up {backed_up_tokens}, so the oldest "
+            f"of them would be evicted from host as well. Raise hicache_ratio above "
             f"{backed_up_tokens / device_pool_tokens:.1f} or shrink the pool."
         )
     return EvictionPlan(
@@ -165,7 +196,7 @@ def validate_probe(
         if plan is not None and probe.reload.host_tokens < probe.warm.device_tokens:
             hint = (
                 f" The host pool holds {plan.host_pool_tokens} tokens against "
-                f"{plan.backed_up_tokens} backed up by the probe plus "
+                f"{plan.backed_up_tokens} backed up by the probe, decode tails and "
                 f"{plan.num_fillers} fillers, so check that sizing before blaming "
                 "the transfer."
             )
@@ -224,6 +255,63 @@ def spec_failures(*, probe: KvOffloadProbe) -> List[str]:
     return failures
 
 
+def tail_shapes(*, page_size: int) -> List[Tuple[int, int]]:
+    """``(prompt_tokens, max_new_tokens)`` for each decode-tail request.
+
+    Each pair sums to a page multiple. The output lengths differ, so the requests
+    finish on different decode steps and their backups are separate exposures.
+    """
+    # Keeps a replay from completing a page of its own, which would add tree and
+    # host state the eviction plan does not count.
+    if page_size <= _TAIL_REPLAY_EXTRA_TOKENS + _TAIL_REPLAY_NEW_TOKENS:
+        raise ValueError(
+            f"page_size {page_size} is too small for the decode-tail replays"
+        )
+    shapes = []
+    for i in range(_TAIL_REQUESTS):
+        max_new_tokens = page_size // 2 + i
+        shapes.append(((2 + i % 2) * page_size - max_new_tokens, max_new_tokens))
+    return shapes
+
+
+def tail_failures(*, tails: Sequence[TailReplay]) -> List[str]:
+    """Require each tail's host replay to match its device replay exactly.
+
+    Both replays run the same extend over the same committed tokens, so their
+    logprobs agree bit for bit unless the host copy differs from the device KV.
+    A fresh prefill is not a valid reference: it differs at epsilon scale.
+    """
+    failures = []
+    for i, tail in enumerate(tails):
+        committed = tail.committed_tokens
+        device, host = tail.device, tail.host
+        if device.device_tokens != committed or device.host_tokens:
+            failures.append(
+                f"decode tail {i}: the device replay matched {device.device_tokens} "
+                f"device and {device.host_tokens} host tokens, expected all "
+                f"{committed} committed tokens on device, so the tail page was not "
+                "in the tree and nothing was checked (is overlap scheduling on?)"
+            )
+        elif host.device_tokens or host.host_tokens != committed:
+            failures.append(
+                f"decode tail {i}: the host replay matched {host.device_tokens} "
+                f"device and {host.host_tokens} host tokens, expected all "
+                f"{committed} committed tokens from host"
+            )
+        elif (
+            not device.output_ids
+            or host.output_ids != device.output_ids
+            or host.output_logprobs != device.output_logprobs
+        ):
+            failures.append(
+                f"decode tail {i}: reloading its {committed} committed tokens from "
+                "host changed the replay: device "
+                f"{list(zip(device.output_ids, device.output_logprobs))}, host "
+                f"{list(zip(host.output_ids, host.output_logprobs))}"
+            )
+    return failures
+
+
 def synthetic_prompt(*, index: int, approx_tokens: int) -> str:
     """A deterministic prompt sharing no radix prefix with any other ``index``."""
     seed = (index + 1) * 2654435761 & 0xFFFFFFFF
@@ -251,9 +339,11 @@ def probe_prompt(*, index: int, approx_tokens: int) -> str:
 def generate_with_cache_report(
     *,
     base_url: str,
-    prompt: str,
+    prompt: Union[str, List[int]],
     max_new_tokens: int,
     routed_dp_rank: Optional[int] = None,
+    ignore_eos: bool = False,
+    return_logprob: bool = False,
 ) -> CacheObservation:
     """Generate greedily and read back which tier served the prefix.
 
@@ -266,14 +356,19 @@ def generate_with_cache_report(
 
     Note --enable-cache-report does not gate any of this. It gates the OpenAI usage
     block, which is the path GSM8K takes, not /generate.
+
+    A list ``prompt`` is sent as token ids.
     """
     payload = {
-        "text": prompt,
+        "input_ids" if isinstance(prompt, list) else "text": prompt,
         "sampling_params": {
             "max_new_tokens": max_new_tokens,
             "temperature": 0.0,
+            "ignore_eos": ignore_eos,
         },
     }
+    if return_logprob:
+        payload["return_logprob"] = True
     if routed_dp_rank is not None:
         payload["routed_dp_rank"] = routed_dp_rank
     response = requests.post(
@@ -305,6 +400,8 @@ def generate_with_cache_report(
                 "them cannot be identified"
             )
         details = {}
+    # Each entry is (logprob, token_id, token_text).
+    token_logprobs = meta_info.get("output_token_logprobs") or []
     return CacheObservation(
         text=output["text"],
         device_tokens=details.get("device", 0),
@@ -312,7 +409,26 @@ def generate_with_cache_report(
         completion_tokens=meta_info.get("completion_tokens", 0),
         # Missing and zero both mean speculative verification did not run.
         spec_verify_ct=meta_info.get("spec_verify_ct") or 0,
+        output_ids=tuple(entry[1] for entry in token_logprobs),
+        output_logprobs=tuple(entry[0] for entry in token_logprobs),
     )
+
+
+def exact_prompt_ids(*, base_url: str, index: int, num_tokens: int) -> List[int]:
+    """Exactly ``num_tokens`` token ids of ``synthetic_prompt(index=index)``."""
+    response = requests.post(
+        base_url.rstrip("/") + "/tokenize",
+        json={"prompt": synthetic_prompt(index=index, approx_tokens=2 * num_tokens)},
+        timeout=60,
+    )
+    response.raise_for_status()
+    tokens = response.json()["tokens"]
+    if len(tokens) < num_tokens:
+        raise RuntimeError(
+            f"synthetic prompt {index} tokenized to {len(tokens)} tokens, fewer "
+            f"than the {num_tokens} needed"
+        )
+    return tokens[:num_tokens]
 
 
 def run_probe(
@@ -323,16 +439,44 @@ def run_probe(
     plan: EvictionPlan,
     routed_dp_rank: Optional[int] = None,
     flush_cache: bool = True,
+    tail_sizes: Sequence[Tuple[int, int]] = (),
 ) -> KvOffloadProbe:
-    """Flush, read the probe cold, warm, and again once the fillers evicted it."""
+    """Flush, read the probe cold, warm, and again once the fillers evicted it.
+
+    With ``tail_sizes``, decode-tail requests run concurrently after the warm read,
+    each replayed from device before the fillers and from host after them.
+    """
     prompt = probe_prompt(index=0, approx_tokens=probe_tokens)
 
-    def generate(text: str, max_new_tokens: int = _MAX_NEW_TOKENS) -> CacheObservation:
+    def generate(
+        text: Union[str, List[int]],
+        max_new_tokens: int = _MAX_NEW_TOKENS,
+        **kwargs,
+    ) -> CacheObservation:
         return generate_with_cache_report(
             base_url=base_url,
             prompt=text,
             max_new_tokens=max_new_tokens,
             routed_dp_rank=routed_dp_rank,
+            **kwargs,
+        )
+
+    def first_turn(i: int, ids: List[int]) -> List[int]:
+        max_new_tokens = tail_sizes[i][1]
+        out = generate(ids, max_new_tokens, ignore_eos=True, return_logprob=True)
+        if len(out.output_ids) != max_new_tokens:
+            raise RuntimeError(
+                f"decode tail {i} generated {len(out.output_ids)} tokens, expected "
+                f"{max_new_tokens}"
+            )
+        return ids + list(out.output_ids)
+
+    def replay(committed: List[int]) -> CacheObservation:
+        return generate(
+            committed + committed[:_TAIL_REPLAY_EXTRA_TOKENS],
+            _TAIL_REPLAY_NEW_TOKENS,
+            ignore_eos=True,
+            return_logprob=True,
         )
 
     if flush_cache:
@@ -347,6 +491,20 @@ def run_probe(
         flush=True,
     )
 
+    committed_tails: List[List[int]] = []
+    if tail_sizes:
+        # Tokenized up front so the requests arrive together and finish on the
+        # steps their output lengths set.
+        prompts = [
+            exact_prompt_ids(base_url=base_url, index=200 + i, num_tokens=n)
+            for i, (n, _) in enumerate(tail_sizes)
+        ]
+        with ThreadPoolExecutor(max_workers=len(tail_sizes)) as pool:
+            committed_tails = list(
+                pool.map(first_turn, range(len(tail_sizes)), prompts)
+            )
+    device_replays = [replay(committed) for committed in committed_tails]
+
     for i in range(plan.num_fillers):
         generate(
             synthetic_prompt(index=100 + i, approx_tokens=probe_tokens),
@@ -360,7 +518,23 @@ def run_probe(
         "device/host cached tokens",
         flush=True,
     )
-    return KvOffloadProbe(cold=cold, warm=warm, reload=reload)
+    tails = tuple(
+        TailReplay(
+            committed_tokens=len(committed), device=device, host=replay(committed)
+        )
+        for committed, device in zip(committed_tails, device_replays)
+    )
+    for i, tail in enumerate(tails):
+        print(
+            f"[kv-offload] {test_name}: decode tail {i} committed="
+            f"{tail.committed_tokens} device=({tail.device.device_tokens},"
+            f"{tail.device.host_tokens}) host=({tail.host.device_tokens},"
+            f"{tail.host.host_tokens}) logprobs device="
+            f"{list(tail.device.output_logprobs)} "
+            f"host={list(tail.host.output_logprobs)}",
+            flush=True,
+        )
+    return KvOffloadProbe(cold=cold, warm=warm, reload=reload, tails=tails)
 
 
 def kv_offload_runner(
@@ -372,16 +546,27 @@ def kv_offload_runner(
     hicache_ratio: float,
     spec_decoding: bool = False,
     dp_size: int = 1,
+    decode_tails: bool = False,
 ):
     """Build a runner that validates device hits and complete host reloads.
 
     ``hicache_ratio`` must leave enough host capacity for the probe and fillers.
     ``spec_decoding`` additionally enables the speculative-decoding checks.
+    ``decode_tails`` additionally checks that host copies of page-aligned decode
+    KV match the device; it needs overlap scheduling.
     """
+    if decode_tails and (spec_decoding or dp_size != 1):
+        raise ValueError(
+            "decode_tails has not been run with speculative decoding or DP "
+            "attention; speculative decoding commits KV in verify steps, so a "
+            "page-aligned output need not leave a page-aligned tail"
+        )
+    shapes = tail_shapes(page_size=page_size) if decode_tails else []
     plan = plan_eviction(
         device_pool_tokens=device_pool_tokens,
         probe_tokens=probe_tokens,
         hicache_ratio=hicache_ratio,
+        tail_tokens=sum(map(sum, shapes)),
     )
 
     if dp_size < 1:
@@ -401,6 +586,7 @@ def kv_offload_runner(
                 plan=plan,
                 routed_dp_rank=routed_dp_rank,
                 flush_cache=False,
+                tail_sizes=shapes,
             )
             probes.append(probe)
             failures += [
@@ -410,6 +596,10 @@ def kv_offload_runner(
                     page_size=page_size,
                     plan=plan,
                 )
+            ]
+            failures += [
+                f"dp_rank={dp_rank}: {failure}"
+                for failure in tail_failures(tails=probe.tails)
             ]
 
             # kind=info: stored and shown in the point's details, charted on no

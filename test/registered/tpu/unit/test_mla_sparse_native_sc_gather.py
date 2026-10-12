@@ -35,7 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 
-from sglang.srt.layers.attention.pallas.mla_sparse import (
+from sglang_tpu.attention.pallas.mla_sparse import (
     native_sc_cache_layout,
     native_sc_gather,
 )

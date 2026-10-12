@@ -49,17 +49,17 @@ import ml_dtypes
 import msgspec
 import numpy as np
 
-from sglang.srt.layers.attention.pallas.mla_sparse import native_sc_cache_layout
-from sglang.srt.layers.attention.pallas.mla_sparse.kernel import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.mla_sparse import native_sc_cache_layout
+from sglang_tpu.attention.pallas.mla_sparse.kernel import (
     sparse_ragged_paged_attention,
 )
-from sglang.srt.layers.attention.pallas.mla_sparse.kv_cache_utils import (
+from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
     SparseMLAKVCacheSpec,
     update_sparse_mla_kv_cache,
 )
-from sglang.test.test_utils import CustomTestCase
 
 # The only geometry the kernel accepts; DeepSeek V3 and GLM-5.2 both have it.
 _KV_LORA_RANK = 512

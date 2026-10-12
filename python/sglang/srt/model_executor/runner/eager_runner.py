@@ -57,6 +57,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -232,7 +233,7 @@ class EagerRunner(BaseRunner):
     def _set_logits_output_mode(self, forward_batch: ForwardBatch) -> None:
         if not _is_tpu:
             return
-        from sglang.srt.hardware_backend.tpu.sampler import (
+        from sglang_tpu.sampler import (
             select_logits_output_mode,
         )
 
@@ -384,7 +385,7 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            elif cp_active:
+            elif cp_active and current_platform.runs_eager_extend_cp():
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(

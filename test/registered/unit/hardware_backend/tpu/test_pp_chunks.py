@@ -4,7 +4,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import pytest
 
-from sglang.srt.hardware_backend.tpu.pp_chunks import (
+from sglang.srt.runtime_context import get_context
+from sglang_tpu.pp_chunks import (
     StepCostModel,
     chunk_buckets,
     chunk_granularity,
@@ -13,7 +14,6 @@ from sglang.srt.hardware_backend.tpu.pp_chunks import (
     profile_points,
     uses_dynamic_chunks,
 )
-from sglang.srt.runtime_context import get_context
 
 BUCKETS = [16, 4096, 8192, 12288, 16384]
 ATTN = 1.5e-7  # ms per token of chunk per token of context

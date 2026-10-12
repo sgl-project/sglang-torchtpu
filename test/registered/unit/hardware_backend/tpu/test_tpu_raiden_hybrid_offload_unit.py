@@ -24,15 +24,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
-from sglang.srt.hardware_backend.tpu.kv_pool_host import (
-    RAIDEN_LAYOUT,
-    TpuRaidenHostKVCache,
-)
-from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
-)
-from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
 from sglang.srt.managers.cache_controller import BatchDoneCounter, LayerDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -42,6 +33,15 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kv_free_fence import KVFreeFence, fence_hicache_backups
+from sglang_tpu.kv_pool_host import (
+    RAIDEN_LAYOUT,
+    TpuRaidenHostKVCache,
+)
+from sglang_tpu.raiden_hybrid_cache_controller import (
+    TpuRaidenHybridCacheController,
+)
+from sglang_tpu.raiden_transfer import RaidenKVTransfer
 
 
 class _FakeFuture:
@@ -211,6 +211,76 @@ class TestHybridWrite(CustomTestCase):
             ack.num_tokens_by_pool,
             {PoolName.KV.value: 8, PoolName.SWA.value: 4},
         )
+
+
+class TestWriteThroughBehindInFlightForward(CustomTestCase):
+    def _setup(self):
+        self.syncs = []
+        self.ctrl = _make_controller()
+        self.full_pool = self.ctrl.mem_pool_host.anchor_entry.host_pool
+        self.fence = KVFreeFence(
+            synchronize_device=lambda: self.syncs.append(len(self.full_pool.backups))
+        )
+        fence_hicache_backups(self.ctrl, self.fence)
+
+    def _launch(self):
+        result = SimpleNamespace(copy_done=None)
+        self.fence.on_batch_formed()
+        self.fence.on_forward_launched(result)
+        return result
+
+    def test_backup_waits_for_the_in_flight_forward(self):
+        """A request that finished at N-1 is still in batch N, so its inserted
+        tail page holds the slot forward N writes; a D2H issued before forward
+        N finishes copies that slot stale."""
+        self._setup()
+        result = self._launch()
+        self.ctrl.write_queue.append(_op())
+        self.ctrl.start_writing()
+
+        (ack,) = self.ctrl.ack_write_queue
+        self.assertEqual(self.full_pool.backups, [])
+        self.assertFalse(ack.finish_event.query())
+
+        self.fence.on_forward_done(result)
+        self.assertEqual(len(self.full_pool.backups), 1)
+        self.full_pool.backup_futures[0].ready = True
+        swa_pool = self.ctrl.mem_pool_host.entry_map[PoolName.SWA].host_pool
+        swa_pool.backup_futures[0].ready = True
+        self.assertTrue(ack.finish_event.query())
+
+    def test_blocking_wait_syncs_the_device_before_issuing(self):
+        """The write-back path blocks on the ack; it must wait for the
+        in-flight forward rather than spin on a backup never issued."""
+        self._setup()
+        self._launch()
+        self.ctrl.write_queue.append(_op())
+        self.ctrl.start_writing()
+
+        (ack,) = self.ctrl.ack_write_queue
+        ack.finish_event.synchronize()
+        self.assertEqual(self.syncs, [0])
+        self.assertEqual(len(self.full_pool.backups), 1)
+        self.assertTrue(self.full_pool.backup_futures[0].synchronized)
+
+    def test_blocking_wait_before_a_formed_batch_launches_still_completes(self):
+        """A device sync cannot cover a batch formed but not launched; a
+        blocking wait in that window must still return, not stall the
+        scheduler."""
+        self._setup()
+        self.fence.on_batch_formed()
+        self.ctrl.write_queue.append(_op())
+        self.ctrl.start_writing()
+        (ack,) = self.ctrl.ack_write_queue
+        ack.finish_event.synchronize()
+        self.assertEqual(len(self.full_pool.backups), 1)
+
+    def test_backup_issues_at_once_without_an_in_flight_forward(self):
+        self._setup()
+        self.ctrl.write_queue.append(_op())
+        self.ctrl.start_writing()
+        self.assertEqual(len(self.full_pool.backups), 1)
+        self.assertEqual(self.syncs, [])
 
 
 class TestHybridLoad(CustomTestCase):

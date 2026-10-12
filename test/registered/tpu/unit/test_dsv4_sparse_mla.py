@@ -33,7 +33,7 @@ import numpy as np
 from absl.testing import parameterized
 
 # Import the kernels
-from sglang.srt.hardware_backend.tpu.dsv4.core_attention import sparse_mla
+from sglang_tpu.dsv4.core_attention import sparse_mla
 
 
 def cdiv(a, b):

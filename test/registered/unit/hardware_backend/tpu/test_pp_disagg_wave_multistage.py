@@ -16,7 +16,6 @@ maybe_stub_sgl_kernel()
 import torch  # noqa: E402
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.hardware_backend.tpu.pp_wave import PPWave  # noqa: E402
 from sglang.srt.managers import scheduler_pp_mixin  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
@@ -25,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     PPProxyTensors,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
+from sglang_tpu.pp_wave import PPWave  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

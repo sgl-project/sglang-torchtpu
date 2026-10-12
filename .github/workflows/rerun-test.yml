@@ -416,6 +416,7 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+          uv pip install --no-deps -e .
 
       - name: Run test
         timeout-minutes: 60

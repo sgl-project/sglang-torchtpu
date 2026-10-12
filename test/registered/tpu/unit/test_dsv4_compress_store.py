@@ -33,14 +33,12 @@ import numpy as np
 from absl.testing import parameterized
 from jax._src import test_util as jtu
 
-from sglang.srt.hardware_backend.tpu.dsv4.compress_and_store import (
+from sglang_tpu.dsv4.compress_and_store import (
     compress_store_ref,
     config,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.compress_and_store import (
-    kernel as compress_store,
-)
-from sglang.srt.hardware_backend.tpu.dsv4.compress_and_store import (
+from sglang_tpu.dsv4.compress_and_store import kernel as compress_store
+from sglang_tpu.dsv4.compress_and_store import (
     project_and_save_state_ref as proj_and_save_state_ref,
 )
 

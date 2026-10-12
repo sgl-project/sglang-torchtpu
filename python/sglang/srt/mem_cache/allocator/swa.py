@@ -25,7 +25,7 @@ if _is_npu:
     )
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+    from sglang_tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
 

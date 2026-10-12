@@ -136,7 +136,8 @@ class TestTpuQwen306bSinglehostPrefixCache(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_PLATFORM"] = "tpu"
+        # setdefault: mode B runs these suites with SGLANG_PLATFORM=tpu_oot.
+        os.environ.setdefault("SGLANG_PLATFORM", "tpu")
 
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [

@@ -8,11 +8,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
-    apply_fp8_fused_rs,
-    fp8_fused_rs_unsupported_reason,
-    supports_fp8_fused_rs,
-)
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
@@ -23,6 +18,11 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.fp8_moe_fused_rs import (
+    apply_fp8_fused_rs,
+    fp8_fused_rs_unsupported_reason,
+    supports_fp8_fused_rs,
+)
 
 register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
@@ -147,7 +147,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            "sglang_tpu.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
             return_value=torch.zeros_like(x),
         ) as fused:
             actual = apply_fp8_fused_rs(
@@ -183,7 +183,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            "sglang_tpu.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
             return_value=torch.zeros_like(x),
         ) as fused:
             apply_fp8_fused_rs(
@@ -195,12 +195,12 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
-        # Upstream's dwdp gate reads the published parallel context, which
-        # unit tests don't have; pin dwdp_size=1 (the no-dwdp default). The
-        # other checks on this path are context-free on TPU.
+        # The dwdp and replicated-expert gates read the published parallel
+        # context, which unit tests don't have; pin a no-dwdp, expert-parallel
+        # layout. The other checks on this path are context-free on TPU.
         with patch(
             "sglang.srt.layers.moe.utils.get_parallel",
-            return_value=SimpleNamespace(dwdp_size=1),
+            return_value=SimpleNamespace(dwdp_size=1, tp_size=8, moe_dp_size=1),
         ):
             self.assertTrue(
                 should_skip_post_experts_all_reduce(

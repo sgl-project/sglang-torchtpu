@@ -14,7 +14,7 @@ It reports two things per shape:
 * **Full MoE** — gather / GMM1(+act) / GMM2 / scatter-reduce, the end-to-end
   per-layer MoE cost.
 
-This runs the real ``sglang.srt.layers.moe.pallas.gmm_v2`` kernel directly with
+This runs the real ``sglang_tpu.moe.pallas.gmm_v2`` kernel directly with
 JAX tensors — no server, no attention, no torch shuttle — so the measured delta
 is the MoE kernel itself, not serving overhead.
 
@@ -34,7 +34,7 @@ import time
 import jax
 import jax.numpy as jnp
 
-from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
+from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2
 
 # gmm_v2 requires the LHS row dim to be a multiple of the sublane tiling; the
 # bridge pads to 32 (a multiple of 16 for bf16 and 8 for f32/i32). Mirror that.

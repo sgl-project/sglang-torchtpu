@@ -16,10 +16,6 @@ from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
-    make_verify_bookkeeping_args,
-    make_verify_tree_greedy_args,
-)
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
@@ -57,7 +53,7 @@ _is_tpu = is_tpu()
 _is_cpu = is_cpu()
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+    from sglang_tpu.eagle_utils_tpu import (
         build_topk1_verify_tree_tpu,
         prepare_device_accept_tpu,
         prepare_verify_cache_locs_tpu,
@@ -429,7 +425,20 @@ def _verify_tree_greedy_torch_inplace(
     accept_token_num[:bs] = num_correct.to(accept_token_num.dtype)
 
 
-@compiled_op(warmup=make_verify_tree_greedy_args)
+def _make_verify_tree_greedy_args(context):
+    # Imported on first call so this module loads without sglang_tpu installed.
+    from sglang_tpu.spec_op_warmup import make_verify_tree_greedy_args
+
+    return make_verify_tree_greedy_args(context)
+
+
+def _make_verify_bookkeeping_args(context):
+    from sglang_tpu.spec_op_warmup import make_verify_bookkeeping_args
+
+    return make_verify_bookkeeping_args(context)
+
+
+@compiled_op(warmup=_make_verify_tree_greedy_args)
 def _verify_tree_greedy_torch(
     next_token_logits: torch.Tensor,
     candidates: torch.Tensor,
@@ -624,7 +633,7 @@ def verify_tree_greedy_func(
     return predicts, accept_index, accept_token_num
 
 
-@compiled_op(warmup=make_verify_bookkeeping_args)
+@compiled_op(warmup=_make_verify_bookkeeping_args)
 def fused_verify_bookkeeping(
     seq_lens: torch.Tensor,
     accept_lens: torch.Tensor,

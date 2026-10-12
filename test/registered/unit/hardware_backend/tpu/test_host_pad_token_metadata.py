@@ -9,21 +9,21 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu import patches
-from sglang.srt.hardware_backend.tpu.compilation import compiled_forward_shim as shim
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    _pad_tensor_on_host,
-)
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-)
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import patches
+from sglang_tpu.compilation import compiled_forward_shim as shim
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.compiled_forward_shim import (
+    _pad_tensor_on_host,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

@@ -225,7 +225,7 @@ def handle_gpu_memory_settings(server_args: Any):
         # Couple the compile-bucket max (torch_compile_max_bs) with the
         # scheduler (max_running_requests) so a decode batch can never fall
         # outside the compiled buckets.
-        from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+        from sglang_tpu.compilation.compiled_forward_shim import (
             reconcile_tpu_batch_limits,
         )
 

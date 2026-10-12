@@ -1344,8 +1344,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         w1_scale: Optional[torch.Tensor] = None,
         w2_scale: Optional[torch.Tensor] = None,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         moe_runner_config = self.moe_runner_config
         if moe_runner_config.apply_router_weight_on_input:

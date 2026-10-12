@@ -14,16 +14,16 @@ import torch
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu import ep_local_expert_reader
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import ep_local_expert_reader
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
-_MOD = "sglang.srt.hardware_backend.tpu.ep_local_expert_reader"
+_MOD = "sglang_tpu.ep_local_expert_reader"
 _LOADER = "sglang.srt.model_loader.loader"
 _ITERATORS = ("single", "buffered")
 

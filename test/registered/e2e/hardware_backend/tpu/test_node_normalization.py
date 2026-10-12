@@ -26,8 +26,8 @@ class TestNodeNormalization(unittest.TestCase):
         import torch.distributed as dist
 
         from sglang.srt.arg_groups.overrides import resolving_view
-        from sglang.srt.hardware_backend.tpu import node_normalization as normalization
         from sglang.srt.server_args import ServerArgs
+        from sglang_tpu import node_normalization as normalization
 
         hosts = tuple(
             filter(None, os.environ.get("TPU_WORKER_HOSTNAMES", "").split(","))

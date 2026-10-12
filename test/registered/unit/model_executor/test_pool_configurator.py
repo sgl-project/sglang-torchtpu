@@ -126,7 +126,9 @@ def _make_model_runner(
     mc.swa_head_dim = swa_head_dim or head_dim
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
     mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
-    mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
+    mc.get_swa_num_kv_heads = lambda tp_size, dcp_size=1: (
+        swa_num_kv_heads or num_kv_heads
+    )
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.model_type = "llama"
     mc.hf_config.get_text_config = lambda: mc.hf_config
@@ -351,6 +353,34 @@ class TestHybridSWAConfigurator(CustomTestCase):
         used = _actual_memory_used(mr, config)
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
+
+    def test_dcp_leaves_non_tpu_geometry_unchanged(self):
+        """Only TPU widens the hybrid-SWA pool under DCP; another platform keeps
+        its per-rank KV heads and the physical page of the SWA admission floor."""
+        from sglang.srt.model_executor import pool_configurator
+
+        def geometry(dcp_size):
+            mr = self._make_swa_runner(page_size=16)
+            mc = mr.model_config
+            mc.get_num_kv_heads = lambda tp_size, dcp_size=1: 8 // (tp_size // dcp_size)
+            mc.get_swa_num_kv_heads = mc.get_num_kv_heads
+            with (
+                mock_cpu_env(tp_size=8),
+                get_parallel().override(attn_dcp_size=dcp_size),
+                patch.object(
+                    pool_configurator.current_platform,
+                    "dcp_shards_every_kv_pool",
+                    return_value=False,
+                ),
+                patch.object(
+                    pool_configurator.MemoryPoolConfigurator, "validate_swa_pool_size"
+                ) as floor,
+            ):
+                cfg = pool_configurator.create_memory_pool_configurator(mr)
+                cfg.calculate_pool_sizes(10_000_000, 16)
+            return cfg._full_per_token, cfg._swa_per_token, floor.call_args
+
+        self.assertEqual(geometry(2), geometry(1))
 
     def test_draft_does_not_inherit_target_shared_byte_budget(self):
         """A separate draft pool must not allocate the target's byte envelope again."""
@@ -1306,10 +1336,10 @@ class TestMixedKVFormats(CustomTestCase):
                 )
 
     def test_mixed_formats_reserve_dummy_pages_and_align_capacity(self):
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # 512 INT8 payload bytes plus 16 exponent rows aligned to 32.
@@ -1415,10 +1445,10 @@ class TestMixedKVFormats(CustomTestCase):
                     )
 
     def test_mxint8_groups_preserve_asymmetric_full_swa_geometry(self):
-        from sglang.srt.hardware_backend.tpu.kv_mxint8 import cache_bytes_per_token
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
+        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # Full: 2048 payload bytes plus 128/64/32 exponent rows.
@@ -1860,6 +1890,161 @@ class TestSWAPoolFloor(CustomTestCase):
                         check_dsv4_unified_fp8_pd_supported(
                             **{**base, "disaggregation_mode": mode, key: value}
                         )
+
+
+class TestOutOfTreeHybridSwaRouting(CustomTestCase):
+    """Under an OOT platform a hybrid-SWA model must get the full+SWA sub-pools
+    and the generic SWA allocator, not a flat pool and a paged allocator."""
+
+    def _fake_configurator(self):
+        _publish_config(self, page_size=64, disaggregation_mode="null")
+        return SimpleNamespace(
+            device="cpu",
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype_str="auto",
+            is_draft_worker=False,
+            is_hybrid_swa=True,
+            use_mla_backend=False,
+            mambaish_config=None,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            _build_tpu_swa_kv_pool=MagicMock(name="swa_builder"),
+            _build_oot_mha_kv_pool=MagicMock(name="flat_builder"),
+        )
+
+    def _sizes(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import _PoolSizes
+
+        return _PoolSizes(
+            max_total_num_tokens=256,
+            max_running_requests=4,
+            full_max_total_num_tokens=256,
+            swa_max_total_num_tokens=128,
+            c4_max_total_num_tokens=0,
+            c128_max_total_num_tokens=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            c4_state_dtype=None,
+            c128_state_dtype=None,
+        )
+
+    def test_oot_hybrid_swa_builds_full_and_swa_sub_pools(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+        ) as platform:
+            platform.is_out_of_tree.return_value = True
+            platform.is_tpu.return_value = False
+            KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=False,
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+            )
+        fake._build_tpu_swa_kv_pool.assert_called_once_with(
+            full_max_total_num_tokens=256, swa_max_total_num_tokens=128
+        )
+        fake._build_oot_mha_kv_pool.assert_not_called()
+
+    def test_oot_hybrid_swa_uses_generic_swa_allocator(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+            ) as platform,
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.SWATokenToKVPoolAllocator"
+            ) as swa_allocator,
+        ):
+            platform.is_out_of_tree.return_value = True
+            platform.is_tpu.return_value = False
+            KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                fake,
+                sizes=self._sizes(),
+                token_to_kv_pool=MagicMock(),
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=None,
+            )
+        platform.get_paged_allocator_cls.assert_not_called()
+        swa_allocator.assert_called_once()
+
+
+class TestTpuDsaRouting(CustomTestCase):
+    """On TPU a DSA model must get the TPU DSA pool. The generic DSA builder
+    allocates the GPU layout, which the TPU kernels cannot read."""
+
+    _fake_configurator = TestOutOfTreeHybridSwaRouting._fake_configurator
+    _sizes = TestOutOfTreeHybridSwaRouting._sizes
+
+    def test_tpu_dsa_model_builds_the_tpu_dsa_pool(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        fake.is_hybrid_swa = False
+        fake.use_mla_backend = True
+        fake._build_tpu_dsa_kv_pool = MagicMock(name="tpu_dsa_builder")
+        fake._build_dsa_kv_pool = MagicMock(name="generic_dsa_builder")
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+        ) as platform:
+            platform.is_out_of_tree.return_value = False
+            platform.is_tpu.return_value = True
+            KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=True,
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+            )
+        fake._build_tpu_dsa_kv_pool.assert_called_once_with(max_total_num_tokens=256)
+        fake._build_dsa_kv_pool.assert_not_called()
+
+
+class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
+    """The core OOT MLA builder passes index_head_dim, which no TPU MLA pool took,
+    so every MLA model failed to build its KV pool under SGLANG_PLATFORM=tpu_oot."""
+
+    def test_oot_mla_builder_kwargs_reach_the_tpu_mla_pools(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        _publish_config(self, page_size=64, disaggregation_mode="null")
+        fake = SimpleNamespace(
+            device="cpu",
+            pool_page_size=64,
+            kv_cache_dtype=torch.bfloat16,
+            model_config=SimpleNamespace(
+                kv_lora_rank=512, qk_rope_head_dim=64, index_head_dim=None
+            ),
+            layer_info=SimpleNamespace(
+                num_effective_layers=2, start_layer=0, end_layer=2
+            ),
+        )
+        for pool_cls in (TpuFusedMLATokenToKVPool, MLATokenToKVPool):
+            with (
+                self.subTest(pool=pool_cls.__name__),
+                patch.object(
+                    TpuSRTPlatform, "get_mla_kv_pool_cls", lambda _, c=pool_cls: c
+                ),
+                # autospec raises TypeError on a keyword the real __init__ lacks.
+                patch.object(pool_cls, "__init__", autospec=True, return_value=None),
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                    TpuOOTPlatform(),
+                ),
+            ):
+                pool = KVCacheConfigurator._build_oot_mla_kv_pool(
+                    fake, max_total_num_tokens=256, is_dsa_model=False
+                )
+                self.assertIsInstance(pool, pool_cls)
 
 
 if __name__ == "__main__":

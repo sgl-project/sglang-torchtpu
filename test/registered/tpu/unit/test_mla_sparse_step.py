@@ -47,16 +47,16 @@ import ml_dtypes
 import msgspec
 import numpy as np
 
-from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
     mla_ragged_paged_attention,
 )
-from sglang.srt.layers.attention.pallas.mla_sparse_step import (
+from sglang_tpu.attention.pallas.mla_sparse_step import (
     NOPE_DIM,
     ROPE_DIM,
     sparse_mla_attention,
     split_cache_specs,
 )
-from sglang.test.test_utils import CustomTestCase
 
 _PAGE_SIZE = 128
 _NUM_HEADS = 8

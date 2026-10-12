@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -140,15 +141,24 @@ class TestDcpLogicalCapacity(CustomTestCase):
         self.assertGreater(runner.token_to_kv_pool_allocator.size, 64 * 8)
         self.assertEqual(runner.logical_max_total_num_tokens, 64 * 8)
 
-        # Draft sizes already carry loc_space_scale; SWA never widens.
+        # Draft sizes already carry loc_space_scale; only TPU widens SWA.
         runner.kv_cache_configurator = make_configurator(is_draft_worker=True)
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
         runner.is_hybrid_swa = True
         runner.kv_cache_configurator = make_configurator(is_hybrid_swa=True)
         runner.full_max_total_num_tokens = 32
         runner.swa_max_total_num_tokens = 16
-        self.assertEqual(runner.logical_max_total_num_tokens, 64)
-        self.assertEqual(runner.effective_logical_max_total_num_tokens, 32)
+        for on_tpu, widening in ((False, 1), (True, 8)):
+            with (
+                self.subTest(on_tpu=on_tpu),
+                patch.object(
+                    current_platform, "dcp_shards_every_kv_pool", return_value=on_tpu
+                ),
+            ):
+                self.assertEqual(runner.logical_max_total_num_tokens, 64 * widening)
+                self.assertEqual(
+                    runner.effective_logical_max_total_num_tokens, 32 * widening
+                )
 
 
 if __name__ == "__main__":

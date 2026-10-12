@@ -186,12 +186,12 @@ class TestNativeMxfp4FusedMoE(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            from sglang.srt.hardware_backend.tpu.patches import apply_tpu_patches
+            from sglang_tpu.patches import apply_tpu_patches
 
             apply_tpu_patches()
         except Exception:  # pragma: no cover
             pass
-        from sglang.srt.layers.moe.pallas.fused_moe_op import (
+        from sglang_tpu.moe.pallas.fused_moe_op import (
             _build_fused_moe_op,
         )
 
@@ -209,10 +209,10 @@ class TestNativeMxfp4FusedMoE(unittest.TestCase):
 
     def _run_native(self, layer, hs, topk_ids, topk_w):
         """Run the native MXFP4 fused MoE call (uint8 packed + fp32 scales)."""
-        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.quantization.mxfp4_tpu_util import (
             process_mxfp4_moe_weights_native,
         )
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         w13, w13_s, w13_b, w2, w2_s, w2_b = process_mxfp4_moe_weights_native(
             layer["gate_up_proj_blocks"],
@@ -246,7 +246,7 @@ class TestNativeMxfp4FusedMoE(unittest.TestCase):
         Layout transformations (deinterleave, N-pad, transpose) mirror
         the native path so the two are directly comparable.
         """
-        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         # Dequant
         w13_bf16 = _dequant_hf_mxfp4(

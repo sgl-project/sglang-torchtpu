@@ -45,12 +45,12 @@ import ml_dtypes
 import msgspec
 import numpy as np
 
-from sglang.srt.layers.attention.pallas.dsa_index_topk import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.dsa_index_topk import (
     dsa_indexer_step,
     index_key_cache_shape,
 )
-from sglang.srt.layers.attention.pallas.util import quantize_fp8_ue8m0
-from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.util import quantize_fp8_ue8m0
 
 INDEX_HEAD_DIM = 128
 _PAGE_SIZE = 128
