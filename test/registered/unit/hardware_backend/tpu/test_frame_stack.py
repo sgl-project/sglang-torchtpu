@@ -4,11 +4,11 @@ import resource
 import sys
 import unittest
 
-from sglang.srt.hardware_backend.tpu.compilation.frame_stack import (
-    call_with_reserved_frame_stack,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation.frame_stack import (
+    call_with_reserved_frame_stack,
+)
 
 # Pure Python, no torch_tpu needed.
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

@@ -611,7 +611,7 @@ def dispatch_w8a8_block_fp8_linear(
     2. Auto-detection based on hardware capabilities
     """
     if _is_tpu:
-        from sglang.srt.hardware_backend.tpu.fp8_linear import (
+        from sglang_tpu.fp8_linear import (
             tpu_w8a8_block_fp8_linear,
         )
 

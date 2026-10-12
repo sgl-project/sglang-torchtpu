@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Kimi Delta Attention (KDA) linear-attention backend for the TPU torch_tpu platform.
+
+Runs Kimi-K3's KDA layers on the fused Conv1D + gated-delta-rule Pallas kernel in
+``AttentionMode.KDA`` (per-channel gate, in-kernel gate activation and beta
+sigmoid). Metadata, state donation and the export guard are shared with
+:class:`TpuGDNAttnBackend`; only the per-layer call differs.
+"""
+
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+
+
+class TpuKDAAttnBackend(TpuGDNAttnBackend):
+    """TPU KDA linear-attention backend backed by the fused Pallas kernel."""
+
+    def init_forward_metadata(self, forward_batch):
+        if forward_batch.forward_mode.is_target_verify():
+            raise NotImplementedError(
+                "TpuKDAAttnBackend does not support speculative target verify"
+            )
+        super().init_forward_metadata(forward_batch)
+
+    def _run(
+        self,
+        layer: "RadixLinearAttention",
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        num_tokens = mixed_qkv.shape[0]
+        n_v, d_k, d_v = layer.num_v_heads, layer.head_k_dim, layer.head_v_dim
+        # The kernel takes the raw forget gate [T, n_v * d_k] and raw beta [T, n_v];
+        # the model hands them over with leading batch / per-head axes.
+        out = self._op(
+            mixed_qkv,
+            b.reshape(num_tokens, n_v),
+            a.reshape(num_tokens, n_v * d_k),
+            layer_cache.conv[0],
+            layer_cache.temporal,
+            # [dim, K] -> the kernel's depthwise [dim, 1, K].
+            layer.conv_weights.unsqueeze(1),
+            layer.bias,
+            layer.A_log,
+            # Per-channel under KDA; Mosaic rejects the flat [n_v * d_k] form.
+            layer.dt_bias.reshape(n_v, d_k),
+            self._query_start_loc,
+            self._state_indices,
+            self._distribution,
+            self._seq_lens,
+            layer.num_k_heads,
+            n_v,
+            d_k,
+            d_v,
+            layer.conv_weights.shape[-1],
+            True,
+            layer.lower_bound,
+        )
+        # Keep the batch axis: the model squeezes dim 0 after o_norm, which would
+        # eat the token axis of a one-token decode.
+        return out.view(1, num_tokens, n_v, d_v)

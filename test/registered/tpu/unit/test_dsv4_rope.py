@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
-from sglang.srt.hardware_backend.tpu.dsv4.rope import qnorm_rope, rope, rope_quant
+from sglang_tpu.dsv4.rope import qnorm_rope, rope, rope_quant
 
 # DeepSeek-V4-Flash: head_dim 512, qk_rope_head_dim 64, 64 attention heads.
 HEAD_DIM = 512

@@ -31,8 +31,8 @@ class TestMaskedScatterTpu(CustomTestCase):
         try:
             import torch_tpu  # noqa: F401
 
-            from sglang.srt.hardware_backend.tpu import patches
-            from sglang.srt.hardware_backend.tpu.env_override import (
+            from sglang_tpu import patches
+            from sglang_tpu.env_override import (
                 apply_tpu_env_overrides,
             )
 

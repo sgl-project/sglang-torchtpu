@@ -712,7 +712,7 @@ def get_kv_class(
             KVClassType.BOOTSTRAP_SERVER: AscendKVBootstrapServer,
         }
     elif transfer_backend == TransferBackend.RAIDEN:
-        from sglang.srt.disaggregation.raiden import (
+        from sglang_tpu.disaggregation.raiden import (
             RaidenKVBootstrapServer,
             RaidenKVManager,
             RaidenKVReceiver,
@@ -740,7 +740,7 @@ def get_kv_class(
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
     elif transfer_backend == TransferBackend.TPU:
-        from sglang.srt.disaggregation.tpu import (
+        from sglang_tpu.disaggregation.tpu import (
             TpuKVBootstrapServer,
             TpuKVManager,
             TpuKVReceiver,

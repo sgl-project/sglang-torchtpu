@@ -144,7 +144,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     ):
         # torch_tpu's HiCache data plane (TpuHiCacheController) lives on HiRadixCache;
         # the unified tree's HybridCacheController has a TPU variant for raiden only.
-        from sglang.srt.hardware_backend.tpu.hiradix_cache import HiRadixCache
+        from sglang_tpu.hiradix_cache import HiRadixCache
 
         cache = HiRadixCache(params=params, server_args=ctx.server_args)
         ctx.tp_worker.register_hicache_layer_transfer_counter(

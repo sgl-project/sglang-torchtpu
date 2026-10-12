@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
-from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk import metadata
+from sglang_tpu.dsv4.streamindex_topk import metadata
 
 
 class MetadataTest(parameterized.TestCase):

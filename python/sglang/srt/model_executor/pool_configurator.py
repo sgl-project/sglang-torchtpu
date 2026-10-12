@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     get_minimax_sparse_index_dtype,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -152,7 +153,7 @@ def _mxint8_draft_per_token(
     kvc, head_num: int, head_dim: int, *, is_swa: bool = False
 ) -> int:
     """Physical bytes/token of a draft layer, before DCP capacity replication."""
-    from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+    from sglang_tpu.kv_mxint8 import (
         cache_bytes_per_token,
     )
 
@@ -405,7 +406,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+            from sglang_tpu.kv_mxint8 import (
                 cache_bytes_per_token,
             )
 
@@ -640,7 +641,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if not is_npu_arch35():
                 allocate_all_layers = True
         if _is_tpu:
-            from sglang.srt.hardware_backend.tpu.kv_pool import (
+            from sglang_tpu.kv_pool import (
                 TpuFusedDSATokenToKVPool,
             )
 
@@ -746,6 +747,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        # TPU DCP ranks replicate KV, so each rank holds the heads of a
+        # tp // dcp group -- the count _build_tpu_swa_kv_pool allocates.
+        dcp_size = (
+            get_parallel().attn_dcp_size
+            if current_platform.dcp_shards_every_kv_pool()
+            else 1
+        )
 
         self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
         self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
@@ -770,21 +778,21 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._enable_unified_memory = get_memory().enable_unified_memory
 
         if self.kv_cache_dtype_str == "mxint8":
-            from sglang.srt.hardware_backend.tpu.kv_mxint8 import (
+            from sglang_tpu.kv_mxint8 import (
                 cache_bytes_per_token,
             )
 
             # The full pool may use the token-blocked page; the SWA pool is a
             # ring over the window and keeps the merged page.
             self._full_per_token = cache_bytes_per_token(
-                model_config.get_num_kv_heads(tp_size),
+                model_config.get_num_kv_heads(tp_size, dcp_size),
                 model_config.head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
                 layout=getattr(kvc, "kv_full_layout", None) or "merged",
             )
             self._swa_per_token = cache_bytes_per_token(
-                model_config.get_swa_num_kv_heads(tp_size),
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size),
                 model_config.swa_head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
@@ -818,14 +826,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         else:
             # Full layer per-token memory (bytes)
             self._full_per_token = (
-                model_config.get_num_kv_heads(tp_size)
+                model_config.get_num_kv_heads(tp_size, dcp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
                 * kv_size
             )
 
             # SWA layer per-token memory (bytes)
             self._swa_per_token = (
-                model_config.get_swa_num_kv_heads(tp_size)
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
                 * kv_size
             )
@@ -833,11 +841,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
-                model_config.get_num_kv_heads(tp_size)
+                model_config.get_num_kv_heads(tp_size, dcp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
             ) // scale_block_size
             self._swa_per_token += (
-                model_config.get_swa_num_kv_heads(tp_size)
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
@@ -1006,8 +1014,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         swa_tokens += ceil_align(self._pipeline_swa_tokens, page_size)
 
         if not self._enable_unified_memory:
+            # The admission floor lives in the allocator's location space, which
+            # TPU DCP widens by dcp_size in both the pool size and the page.
+            widening = (
+                get_parallel().attn_dcp_size
+                if current_platform.dcp_shards_every_kv_pool()
+                else 1
+            )
             self.validate_swa_pool_size(
-                swa_tokens, self._sliding_window_size, self._page_size
+                swa_tokens * widening,
+                self._sliding_window_size,
+                self._page_size * widening,
             )
 
         logger.info(

@@ -32,7 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
-from sglang.srt.hardware_backend.tpu.dsv4.core_attention.csa_gather import csa_gather
+from sglang_tpu.dsv4.core_attention.csa_gather import csa_gather
 
 
 def gather_nope_ref_impl(cache, indices):

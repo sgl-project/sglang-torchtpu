@@ -8,11 +8,16 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_context, get_exec
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+from sglang_tpu.compilation.compiled_forward_shim import (
     _BS_FIELDS,
     _PINNED_LOGPROB_FIELDS,
     _TOKEN_FIELDS,
@@ -33,19 +38,14 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     needs_input_logprob,
     reconcile_tpu_batch_limits,
 )
-from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _DummyForwardBatchFields,
 )
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.runtime_context import get_context, get_exec
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
 # torch_tpu-free, so this runs on the CPU CI runner (no TPU required).
@@ -670,8 +670,7 @@ class TestCompiledForwardShim(CustomTestCase):
         shim.set_recompilation_checker(checker, model_label="M")
         fb = self._forward_batch(input_ids=torch.arange(8, dtype=torch.int32))
         with patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "compiled_forward_shim.torch.compiler.is_compiling",
+            "sglang_tpu.compilation.compiled_forward_shim.torch.compiler.is_compiling",
             return_value=True,
         ):
             shim(None, None, fb)
@@ -858,6 +857,62 @@ class TestCompiledForwardShim(CustomTestCase):
         shim(None, None, fb)
         self.assertIs(seen["during"], False)
         self.assertIs(fb.is_prefill_only, True)
+
+
+class TestContextParallelInputs(CustomTestCase):
+    """Under prefill context parallelism the graph takes the rank's zigzag rows
+    and one extend_seq_lens_cpu per program family."""
+
+    @staticmethod
+    def _call(cp_layout=False, input_embeds=None):
+        seen = {}
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            seen.update(ids=input_ids, kwargs=kwargs, batch_ids=forward_batch.input_ids)
+            seen["lens"] = list(forward_batch.extend_seq_lens_cpu)
+            return SimpleNamespace()
+
+        fb = TestCompiledForwardShim._forward_batch(
+            input_ids=torch.zeros(48, dtype=torch.int64),
+            positions=torch.arange(48),
+            forward_mode=_ForwardModeMock("extend"),
+            extend_seq_lens_cpu=[40, 8],
+            input_embeds=input_embeds,
+        )
+        if cp_layout:
+            fb._tpu_cp_layout = SimpleNamespace(
+                host=SimpleNamespace(cp_size=2, local_rows_padded=32),
+                local_rows=torch.arange(32),
+            )
+        shim = CompiledForwardShim(compiled, policy=_policy(SimpleNamespace()))
+        shim._attn_cp_size = 2
+        shim(fb.input_ids, fb.positions, fb)
+        return fb, seen
+
+    def test_cp_batch_embeds_the_global_ids_and_keeps_the_rows(self):
+        fb, seen = self._call(cp_layout=True)
+        self.assertEqual(seen["ids"].shape[0], 64)  # global ids padded to cp x rows
+        self.assertEqual(seen["kwargs"]["cp_local_rows"].shape[0], 32)
+        self.assertEqual(seen["batch_ids"].shape[0], 32)
+        self.assertEqual(seen["lens"], [4, 4])
+        self.assertEqual(fb.input_ids.shape[0], 48)
+        self.assertEqual(fb.extend_seq_lens_cpu, [40, 8])
+
+    def test_plain_extend_presents_the_plain_stand_in(self):
+        """A plain extend on a context-parallel server must not trace the CP
+        program, whatever its live lengths."""
+        fb, seen = self._call()
+        self.assertEqual(seen["lens"], [0, 0])
+        self.assertNotIn("cp_local_rows", seen["kwargs"])
+        self.assertEqual(fb.extend_seq_lens_cpu, [40, 8])
+
+    def test_supplied_embeddings_skip_the_lookup(self):
+        """Caller embeddings are global; they narrow to the rank's rows and the
+        graph takes local ids, not the global ids plus the row selector."""
+        _, seen = self._call(cp_layout=True, input_embeds=torch.ones(48, 3))
+        self.assertEqual(seen["ids"].shape[0], 32)
+        self.assertNotIn("cp_local_rows", seen["kwargs"])
+        self.assertEqual(seen["kwargs"]["input_embeds"].shape, (32, 3))
 
 
 class TestBuildBucketers(CustomTestCase):

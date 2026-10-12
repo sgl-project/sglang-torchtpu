@@ -6,11 +6,11 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestBucketer(CustomTestCase):

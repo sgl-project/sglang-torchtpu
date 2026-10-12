@@ -605,7 +605,7 @@ class Qwen3MoeAttention(nn.Module):
             and _is_tpu
             and self.compatible_with_fused_qk_norm_rope
         ):
-            from sglang.srt.hardware_backend.tpu.qk_norm_rope import (
+            from sglang_tpu.qk_norm_rope import (
                 can_use_tpu_fused_qk_norm_rope,
                 register_tpu_qk_norm_rope_op,
             )
@@ -754,7 +754,7 @@ class Qwen3MoeAttention(nn.Module):
                 )
             self._used_fused_qk_norm_rope_last_call = True
         elif self.use_tpu_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
-            from sglang.srt.hardware_backend.tpu.qk_norm_rope import (
+            from sglang_tpu.qk_norm_rope import (
                 tpu_fused_qk_norm_rope,
             )
 

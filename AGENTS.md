@@ -89,3 +89,22 @@ Apply the checks relevant to the changed execution paths.
 - Call out points for manual review if ambiguous or risky or have considerable blast radius
 - Call out verified non-issues
 - High-level comments should be split into sections, each having a title. Low-level comments should be inline
+
+## Where TPU code goes
+
+`sglang_tpu/` at the repo root is the TPU backend, installed as the plugin
+`sglang-tpu` next to the fork in `python/` (`sglang_tpu/README.md`).
+
+- New TPU-only modules go in `sglang_tpu/`, never under `python/sglang/srt/`.
+  The vacated paths hold re-export shims; do not add code to them.
+- Core must not import `sglang_tpu` or grow new `is_tpu()` branches.
+  `tools/plugin/check_tpu_branches.py` (a pre-commit hook) ratchets both
+  counts per file; raising the baseline needs a linked upstream seam issue.
+- Reach core from the plugin, in order: an existing platform method or
+  capability flag; a registry filled from `init_backend()`; a
+  `register_resolution_hook`; a subclass handed back through a `get_*_cls()`
+  factory; a seam PR upstream, carried as a `sglang_tpu/hooks/` entry until it
+  merges.
+- `test/registered/unit/plugins/test_tpu_oot_platform_contract.py` must stay
+  green: every platform method an `is_out_of_tree()` gate reaches needs an
+  answer on `TpuOOTPlatform`.

@@ -18,12 +18,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
-    DeviceVerifyBlockSelector,
-    build_tpu_draft_extend_metadata,
-    dflash_verify_argmax_torch,
-    dflash_verify_bookkeeping_torch,
-)
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -105,6 +99,12 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu, is_xpu
+from sglang_tpu.dflash_utils_tpu import (
+    DeviceVerifyBlockSelector,
+    build_tpu_draft_extend_metadata,
+    dflash_verify_argmax_torch,
+    dflash_verify_bookkeeping_torch,
+)
 
 _is_npu = is_npu()
 _is_tpu = is_tpu()
@@ -2194,7 +2194,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_hidden=(10, 14400), ctx_hidden=(10, 2880), positions=(10,),
             cache_loc=(10,), cache_loc_2d=(1, 10), commit_lens=(1,)
         """
-        from sglang.srt.hardware_backend.tpu.dflash_draft_kv_write import (
+        from sglang_tpu.dflash_draft_kv_write import (
             dflash_write_draft_kv,
         )
 

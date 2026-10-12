@@ -14,8 +14,7 @@ _REPO_ROOT = next(
     if (parent / "python" / "sglang").is_dir()
 )
 _TABLE_PATH = (
-    _REPO_ROOT
-    / "python/sglang/srt/layers/moe/pallas/fused_rs/v2_fused_rs_tuned_block_sizes.py"
+    _REPO_ROOT / "sglang_tpu/moe/pallas/fused_rs/v2_fused_rs_tuned_block_sizes.py"
 )
 _SPEC = importlib.util.spec_from_file_location("fused_rs_tuned_table", _TABLE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None

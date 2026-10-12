@@ -214,6 +214,11 @@ vsa = ["setuptools", "torch"]
 [project.entry-points."sglang.srt.platforms"]
 tpu = "sglang.srt.hardware_backend.tpu:activate"
 
+# The plugin's hooks under the in-tree tpu platform, whose selection skips the
+# sglang-tpu dist; mode B loads the same function from sglang-tpu.
+[project.entry-points."sglang.srt.plugins"]
+tpu_hooks = "sglang_tpu.hooks:register"
+
 [project.scripts]
 sglang = "sglang.cli.main:main"
 killall_sglang = "sglang.cli.killall:main"

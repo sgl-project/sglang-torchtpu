@@ -62,7 +62,7 @@ from torch.distributed import barrier
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
-    from sglang.srt.hardware_backend.tpu.kv_free_fence import KVFreeFence
+    from sglang_tpu.kv_free_fence import KVFreeFence
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
@@ -1104,7 +1104,7 @@ class Scheduler(
 
         warmup_scope = nullcontext()
         if current_platform.is_tpu() and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
-            from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+            from sglang_tpu.compilation.warmup_queue import (
                 collect_warmups,
             )
 
@@ -1372,7 +1372,7 @@ class Scheduler(
         self._tpu_pp_chunk_cost = None
         self._tpu_pp_cached_prefix = {}
         if current_platform.is_tpu() and get_parallel().pp_size > 1:
-            from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
+            from sglang_tpu.pp_chunk_scheduler import (
                 profile_and_install_cost_model,
             )
 
@@ -1667,7 +1667,7 @@ class Scheduler(
             and self.enable_overlap
             and envs.SGLANG_TPU_ASYNC_COPY_WORKER.get()
         ):
-            from sglang.srt.hardware_backend.tpu.result_copy_worker import (
+            from sglang_tpu.result_copy_worker import (
                 TPUAsyncCopyWorker,
             )
 
@@ -1775,7 +1775,8 @@ class Scheduler(
         """Hold KV pages freed under overlap back from DMA write targets."""
         if not self._needs_kv_free_fence():
             return
-        from sglang.srt.hardware_backend.tpu.kv_free_fence import (
+        from sglang_tpu.kv_free_fence import (
+            fence_hicache_backups,
             install_kv_free_fence,
             kv_free_fence_unsupported_reason,
         )
@@ -1807,12 +1808,19 @@ class Scheduler(
             synchronize_device=self.device_module.synchronize,
             **fence_kwargs,
         )
+        # A PD prefill server releases requests after their prefill forward,
+        # whose copy_done precedes the backup, so its backups need no deferral.
+        if (
+            self._uses_raiden_hicache()
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
 
     def precompile_tpu_spec_ops(self) -> None:
-        from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+        from sglang_tpu.compilation.spec_decode_compile_policy import (
             BaseSpecDecodeCompilePolicyMixin,
         )
-        from sglang.srt.hardware_backend.tpu.spec_op_precompile import (
+        from sglang_tpu.spec_op_precompile import (
             precompile_spec_v2_ops,
         )
 
@@ -2547,6 +2555,11 @@ class Scheduler(
         )
 
     def init_pool_stats_observer(self) -> None:
+        widening = (
+            get_parallel().attn_dcp_size
+            if current_platform.dcp_shards_every_kv_pool()
+            else 1
+        )
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -2556,8 +2569,18 @@ class Scheduler(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             enable_hisparse=self.enable_hisparse,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
+            # Pool counters count allocator locations, which TPU DCP widens by
+            # attn_dcp_size.
+            full_tokens_per_layer=(
+                self.full_tokens_per_layer * widening
+                if self.full_tokens_per_layer is not None
+                else None
+            ),
+            swa_tokens_per_layer=(
+                self.swa_tokens_per_layer * widening
+                if self.swa_tokens_per_layer is not None
+                else None
+            ),
             # Match the allocator and radix counters' logical units.
             max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
         )
@@ -4178,7 +4201,7 @@ class Scheduler(
         adder_cls = PrefillAdder
         adder_kwargs = {}
         if self._tpu_pp_chunk_cost is not None:
-            from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
+            from sglang_tpu.pp_chunk_scheduler import (
                 TpuPipelinePrefillAdder,
                 pending_step_limit,
             )
@@ -4190,7 +4213,12 @@ class Scheduler(
             }
 
         adder = adder_cls(
-            self.page_size,
+            # TPU DCP cuts prefill chunks at whole widened pages.
+            (
+                self.page_size * get_parallel().attn_dcp_size
+                if current_platform.dcp_shards_every_kv_pool()
+                else self.page_size
+            ),
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             running_batch,
@@ -4397,7 +4425,7 @@ class Scheduler(
                 and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
                 and adder.host_load_indices
             ):
-                from sglang.srt.hardware_backend.tpu.prefill_early_send import (
+                from sglang_tpu.prefill_early_send import (
                     tpu_hicache_load_page_ids,
                 )
 
@@ -5230,30 +5258,6 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
-    def _maybe_arm_fail_on_recompile(self) -> None:
-        """TPU-only: freeze torch.compile so serving-time recompiles raise."""
-        model_runner = self.tp_worker.model_runner
-        if model_runner.device != "tpu":
-            # Only enable this for tpu
-            return
-        if not get_exec().graph.enable_torch_compile:
-            return
-        if (
-            get_spec().speculative_algorithm is not None
-            and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
-        ):
-            logger.info(
-                "[tpu] Warmup complete; leaving torch.compile recompiles enabled "
-                "for speculative decoding because "
-                "SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
-            )
-            return
-        torch.compiler.set_stance("fail_on_recompile")
-        logger.info(
-            "[tpu] Warmup complete; froze torch.compile via "
-            "set_stance('fail_on_recompile')."
-        )
-
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
@@ -5290,7 +5294,7 @@ class Scheduler(
 
         if self.forward_ct > 0 and not self.recompile_stance_set:
             self.recompile_stance_set = True
-            self._maybe_arm_fail_on_recompile()
+            current_platform.on_warmup_complete()
 
         if self.enable_unified_memory:
             try:

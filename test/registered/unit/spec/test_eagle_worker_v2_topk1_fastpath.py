@@ -229,7 +229,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             self.assertTrue(worker._should_fuse_draft_steps())
 
     def test_fused_steps_thread_per_step_inputs(self):
-        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        from sglang_tpu.eagle_utils_tpu import (
             build_topk1_verify_chain_torch,
         )
 

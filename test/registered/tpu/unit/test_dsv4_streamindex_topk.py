@@ -39,11 +39,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk import (
+from sglang_tpu.dsv4.streamindex_topk import (
     KVLayout,
     streamindex_topk,
 )
-from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk.streamindex_topk import (
+from sglang_tpu.dsv4.streamindex_topk.streamindex_topk import (
     convert_cache_to_seq_along_lane,
 )
 
@@ -775,7 +775,7 @@ def test_streamindex_topk_early_exit_keeps_causal_mask():
 
 def test_pallas_smem_oom_when_unclamped(monkeypatch):
     """Verifies that Pallas compilation of _scores_kernel fails with SMEM OOM"""
-    from sglang.srt.hardware_backend.tpu.dsv4.streamindex_topk import metadata
+    from sglang_tpu.dsv4.streamindex_topk import metadata
 
     orig_compute_metadata = metadata.compute_metadata
 

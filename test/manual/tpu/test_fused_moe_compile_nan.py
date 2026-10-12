@@ -59,7 +59,7 @@ class TestFusedMoeCompileNaN(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            from sglang.srt.hardware_backend.tpu.patches import apply_tpu_patches
+            from sglang_tpu.patches import apply_tpu_patches
 
             apply_tpu_patches()
         except Exception:
@@ -96,7 +96,7 @@ class TestFusedMoeCompileNaN(unittest.TestCase):
         return hs, ti, tw
 
     def _check(self, m):
-        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         w = self._weights()
 

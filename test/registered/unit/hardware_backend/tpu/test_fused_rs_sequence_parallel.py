@@ -8,7 +8,11 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
+from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.fused_rs_sequence_parallel import (
     DISABLED_FUSED_MOE_SEQUENCE_PARALLEL_PLAN,
     FusedMoeSequenceParallelPlan,
     get_fused_moe_sequence_parallel_plan,
@@ -17,10 +21,6 @@ from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
     prepare_tpu_fused_rs_post_expert_norm,
     use_fused_moe_sequence_parallel_plan,
 )
-from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
@@ -89,8 +89,7 @@ class TestFusedRsSequenceParallel(CustomTestCase):
         with (
             use_fused_moe_sequence_parallel_plan(plan),
             patch(
-                "sglang.srt.hardware_backend.tpu."
-                "fused_rs_sequence_parallel.get_parallel",
+                "sglang_tpu.fused_rs_sequence_parallel.get_parallel",
                 return_value=SimpleNamespace(attn_tp_group=group, tp_group=group),
             ),
         ):

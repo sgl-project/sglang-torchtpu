@@ -69,8 +69,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sglang.srt.hardware_backend.tpu.dsv4 import sparsecore_topk as sc_module
-from sglang.srt.hardware_backend.tpu.dsv4.sparsecore_topk import (
+from sglang_tpu.dsv4 import sparsecore_topk as sc_module
+from sglang_tpu.dsv4.sparsecore_topk import (
     LANES,
     MAX_SLICE_WORDS,
     _align_to,
