@@ -78,9 +78,10 @@ class TestCollectiveCompileCache(unittest.TestCase):
 
         if hardware.get_tpu_device_count() < 2:
             self.skipTest("requires at least two TPU devices")
+
         source = Path(__file__).resolve().parents[5] / "sglang_tpu/compile_cache.py"
         python = shlex.quote(sys.executable)
-        wrapper = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+        wrapper = "torch.tpu.distributed"
         with tempfile.TemporaryDirectory(prefix="tpu-collective-cache-") as cache:
             env = {
                 **os.environ,

@@ -1,6 +1,7 @@
 """CPU coverage of coordinate discovery and rank-consistent launch plans."""
 
 import argparse
+import io
 import itertools
 import json
 import os
@@ -8,9 +9,9 @@ import socket
 import subprocess
 import sys
 import threading
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from dataclasses import asdict, replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -20,22 +21,6 @@ from sglang.test.test_utils import enter_scope
 from sglang_tpu import node_normalization as normalization
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
-
-
-def _cpu_node_rank(local_rank, config, host_index, timeout, writer):
-    if local_rank == 0:
-        writer.send(1)
-    writer.close()
-
-
-def _cpu_probe_failure(local_rank, config, host_index, timeout, writer):
-    if local_rank == 0:
-        raise RuntimeError("probe failed")
-    time.sleep(60)
-
-
-def _cpu_probe_timeout(local_rank, config, host_index, timeout, writer):
-    time.sleep(60)
 
 
 class TestNodeNormalization(unittest.TestCase):
@@ -88,137 +73,129 @@ class TestNodeNormalization(unittest.TestCase):
             with self.subTest(ranks=ranks), self.assertRaises(ValueError):
                 normalization.canonical_host_order(ranks)
 
-    def test_coordinate_worker_sets_rank_metadata_before_native_discovery(self):
+    def test_print_and_query_local_device_coords(self):
         distributed = ModuleType("torch_tpu._internal.distributed")
         distributed.tpu_distributed = SimpleNamespace(
-            local_device_coords=Mock(return_value=[0, 0, 1])
+            local_device_coords=Mock(return_value=(0, 0, 1))
         )
-        wrapper = ModuleType(
-            "torch_tpu._internal.distributed.launchers.multihost_wrapper"
-        )
-        wrapper.calculate_topological_node_rank = Mock(return_value=1)
+        stdout = io.StringIO()
         with (
-            patch.dict(os.environ, RANK="stale", LOCAL_RANK="stale"),
+            patch.dict(sys.modules, {distributed.__name__: distributed}),
+            redirect_stdout(stdout),
+        ):
+            normalization._print_local_device_coords()
+        self.assertEqual(
+            stdout.getvalue(),
+            "TORCH_TPU_LOCAL_DEVICE_COORDS=[0, 0, 1]\n",
+        )
+
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="noisy log line\nTORCH_TPU_LOCAL_DEVICE_COORDS=[0, 0, 1]\ntrailing line\n",
+            stderr="",
+        )
+        with (
+            patch.object(sys, "path", ["/first", "", "/second"]),
+            patch("subprocess.run", return_value=completed) as run,
+        ):
+            coords = normalization._query_local_device_coords(timeout=15)
+        self.assertEqual(coords, [0, 0, 1])
+        run.assert_called_once()
+        cmd = run.call_args.args[0]
+        self.assertEqual(
+            cmd,
+            [
+                sys.executable,
+                "-m",
+                "sglang_tpu.node_normalization",
+                "--print_local_device_coords",
+            ],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["env"]["PYTHONPATH"],
+            os.pathsep.join(["/first", "/second"]),
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 15)
+
+        with (
+            patch(
+                "subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="probe", timeout=5),
+            ),
+            self.assertRaisesRegex(TimeoutError, "timed out"),
+        ):
+            normalization._query_local_device_coords(timeout=5)
+
+        with (
+            patch(
+                "subprocess.run",
+                side_effect=subprocess.CalledProcessError(
+                    returncode=1, cmd="probe", stderr="probe failed\n"
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "probe failed"),
+        ):
+            normalization._query_local_device_coords(timeout=5)
+
+        with (
+            patch(
+                "subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="unrelated output\n", stderr=""
+                ),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "Could not find local TPU device coordinates"
+            ),
+        ):
+            normalization._query_local_device_coords(timeout=5)
+
+        for invalid_payload in ("not-json", '{"a": 1}', "[true, 0, 0]"):
+            with (
+                self.subTest(invalid_payload=invalid_payload),
+                patch(
+                    "subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout=f"TORCH_TPU_LOCAL_DEVICE_COORDS={invalid_payload}\n",
+                        stderr="",
+                    ),
+                ),
+                self.assertRaises(ValueError),
+            ):
+                normalization._query_local_device_coords(timeout=5)
+
+    def test_query_node_rank_validates_coordinates_and_rank(self):
+        distributed = ModuleType("torch_tpu._internal.distributed")
+        dist_mod = ModuleType("torch_tpu._internal.distributed.distributed")
+        dist_mod._calculate_topological_node_rank = Mock(return_value=1)
+        with (
             patch.dict(
                 sys.modules,
-                {distributed.__name__: distributed, wrapper.__name__: wrapper},
+                {distributed.__name__: distributed, dist_mod.__name__: dist_mod},
             ),
-            patch("torch.distributed.init_process_group") as init,
-            patch("torch.distributed.barrier"),
-            patch("torch.distributed.destroy_process_group"),
-            patch("sglang.srt.utils.kill_itself_when_parent_died"),
+            patch.object(
+                normalization,
+                "_query_local_device_coords",
+                return_value=[0, 0, 1],
+            ) as query_coords,
         ):
-            for local_rank in (0, 1):
-                writer = Mock()
-                normalization._coordinate_worker(local_rank, self.config, 1, 10, writer)
-                self.assertEqual(os.environ["RANK"], str(8 + local_rank))
-                self.assertEqual(os.environ["LOCAL_RANK"], str(local_rank))
-                self.assertEqual(os.environ["WORLD_SIZE"], "16")
-                self.assertEqual(os.environ["MASTER_ADDR"], "source")
-                if local_rank == 0:
-                    writer.send.assert_called_once_with(1)
-                else:
-                    writer.send.assert_not_called()
-            self.assertEqual(init.call_count, 2)
-            wrapper.calculate_topological_node_rank.assert_called_once_with(
+            self.assertEqual(normalization.query_node_rank(self.config, 1, 10), 1)
+            query_coords.assert_called_once_with(timeout=10)
+            dist_mod._calculate_topological_node_rank.assert_called_once_with(
                 [0, 0, 1], "2,2,2,2", fallback_index=None, chips_per_host=(2, 2, 1)
             )
             for coords in ([], [0, 1], [0, 0, 2], [-1, 0, 0], [True, 0, 0]):
                 with self.subTest(coords=coords), self.assertRaises(ValueError):
-                    distributed.tpu_distributed.local_device_coords.return_value = (
-                        coords
-                    )
-                    normalization._coordinate_worker(0, self.config, 1, 10, Mock())
-
-    def _probe_result(self, returncode=0, stdout=""):
-        return subprocess.CompletedProcess([], returncode, stdout)
-
-    def test_public_launch_env_gives_the_node_rank(self):
-        # torch_tpu 0.1.2+: set_tpu_launch_env derives NODE_RANK; sglang must
-        # neither preset it nor let it fall back to the pod index.
-        run = Mock(
-            return_value=self._probe_result(stdout="log\nSGLANG_TPU_NODE_RANK=1\n")
-        )
-        with (
-            patch.dict(os.environ, NODE_RANK="0", JOB_COMPLETION_INDEX="0"),
-            patch.object(normalization.subprocess, "run", run),
-            patch("torch.multiprocessing.spawn") as spawn,
-        ):
-            self.assertEqual(normalization.query_node_rank(self.config, 0, 10), 1)
-        spawn.assert_not_called()
-        argv, env = run.call_args.args[0], run.call_args.kwargs["env"]
-        self.assertEqual(argv[-2:], ["2", "8"])
-        self.assertNotIn("NODE_RANK", env)
-        self.assertNotIn("JOB_COMPLETION_INDEX", env)
-        self.assertEqual(env["TORCH_TPU_TOPOLOGY"], "2,2,2,2")
-        self.assertEqual(env["TPU_WORKER_HOSTNAMES"], "source,destination")
-
-    def test_without_the_public_api_discovery_uses_the_spawn_workers(self):
-        # The 2026.9.22 release has no set_tpu_launch_env.
-        probe = self._probe_result(stdout="SGLANG_TPU_NODE_RANK=unavailable\n")
-        with (
-            patch.object(normalization.subprocess, "run", return_value=probe),
-            patch("torch.multiprocessing.spawn", side_effect=RuntimeError("spawned")),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "spawned"):
-                normalization.query_node_rank(self.config, 0, 10)
-
-    def test_public_launch_env_failure_is_an_error_not_a_fallback(self):
-        probe = self._probe_result(returncode=1)
-        with (
-            patch.object(normalization.subprocess, "run", return_value=probe),
-            patch("torch.multiprocessing.spawn") as spawn,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "set_tpu_launch_env.*exit 1"):
-                normalization.query_node_rank(self.config, 0, 10)
-        spawn.assert_not_called()
-
-    def test_other_chip_layouts_skip_the_public_api(self):
-        # set_tpu_launch_env assumes 2x2x1 chips per host.
-        config = replace(self.config, topology=(2, 2, 2, 2), chips_per_host=(2, 1, 2))
-        with patch.object(normalization.subprocess, "run") as run:
-            self.assertIsNone(normalization._query_public_node_rank(config, 10))
-        run.assert_not_called()
-
-    def test_spawn_probe_returns_rank_and_cleans_up_on_failure(self):
-        import torch.multiprocessing as mp
-
-        spawn = mp.spawn
-        contexts = []
-
-        def record_spawn(*args, **kwargs):
-            context = spawn(*args, **kwargs)
-            contexts.append(context)
-            return context
-
-        # Two CPU workers test process lifetime, not TPU topology correctness.
-        config = replace(
-            self.config,
-            topology=(1, 1, 2, 2),
-            chips_per_host=(1, 1, 1),
-            devices_per_host=2,
-        )
-        # Failures must keep the worker's traceback even though the worker
-        # exits without running the native teardown.
-        for worker, timeout, error, message in (
-            (_cpu_node_rank, 30, None, None),
-            (_cpu_probe_failure, 30, RuntimeError, "worker 0:(.|\n)*probe failed"),
-            (_cpu_probe_timeout, 0.1, TimeoutError, "timed out"),
-        ):
-            with (
-                self.subTest(worker=worker.__name__),
-                patch.object(normalization, "_coordinate_worker", worker),
-                patch.object(mp, "spawn", side_effect=record_spawn),
-            ):
-                if error is None:
-                    self.assertEqual(
-                        normalization.query_node_rank(config, 0, timeout),
-                        1,
-                    )
-                else:
-                    with self.assertRaisesRegex(error, message):
-                        normalization.query_node_rank(config, 0, timeout)
-                self.assertTrue(all(not p.is_alive() for p in contexts[-1].processes))
+                    query_coords.return_value = coords
+                    normalization.query_node_rank(self.config, 1, 10)
+            query_coords.return_value = [0, 0, 1]
+            for bad_rank in (-1, 2, True, None):
+                with self.subTest(bad_rank=bad_rank), self.assertRaises(ValueError):
+                    dist_mod._calculate_topological_node_rank.return_value = bad_rank
+                    normalization.query_node_rank(self.config, 1, 10)
 
     def test_hosts_agree_before_launch_using_real_cpu_store(self):
 
