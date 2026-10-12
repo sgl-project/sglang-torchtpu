@@ -165,6 +165,15 @@ def main():
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
+    ap.add_argument(
+        "--tpu-chip-workers",
+        type=int,
+        default=0,
+        help=(
+            "Run this many `chips=1` tests at once, each pinned to one chip of "
+            "the slice the job already holds. 0 or 1 keeps the whole node per test."
+        ),
+    )
     ap.add_argument("--partition-id", type=int, default=-1)
     ap.add_argument("--partition-size", type=int, default=0)
     ap.add_argument(
@@ -383,6 +392,9 @@ def main():
             else ""
         ),
         "TEST_FILE_FLAG": f"--test-file {a.test_file}" if a.test_file else "",
+        "CHIP_WORKERS_FLAG": (
+            f"--tpu-chip-workers {a.tpu_chip_workers}" if a.tpu_chip_workers > 1 else ""
+        ),
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",

@@ -53,6 +53,13 @@ on:
         required: false
         type: number
         default: 3600
+      # Chip sharing: run this many `chips=1` tests at once on the slice the job
+      # already holds, instead of giving every test all four chips. Whole-node
+      # tests still run alone, after the shared ones have released their chips.
+      tpu_chip_workers:
+        required: false
+        type: number
+        default: 0
       partition_id:
         required: false
         type: number
@@ -152,6 +159,7 @@ jobs:
             --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --timeout-per-file '${{ inputs.timeout_per_file }}' \
+            --tpu-chip-workers '${{ inputs.tpu_chip_workers }}' \
             --partition-id '${{ inputs.partition_id }}' \
             --partition-size '${{ inputs.partition_size }}' \
             --name '${{ inputs.run_name }}' \

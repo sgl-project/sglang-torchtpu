@@ -22,7 +22,7 @@ if _WORKER_ARG in sys.argv:
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=900, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=900, suite="stage-a-test-tpu-unit", chips=4)
 
 _BATCH_SIZES = (64, 128, 256)
 _SPEED_GATED_BATCH_SIZES = (64, 128, 256)

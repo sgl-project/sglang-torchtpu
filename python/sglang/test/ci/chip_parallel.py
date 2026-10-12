@@ -15,6 +15,7 @@ on /dev/vfio and /tmp/libtpu_lockfile. Each worker also gets private TMPDIR and
 compilation-cache roots, since the shared ones would race.
 """
 
+import json
 import logging
 import os
 import queue
@@ -111,6 +112,33 @@ def _run_one(
         return returncode, time.perf_counter() - tic, log.read()
 
 
+def _flush_metrics(filename: str, passed: bool, elapsed: float) -> None:
+    """Append this file's verdict to SGLANG_TEST_METRICS_FILE.
+
+    Same per-file flush run_unittest_files does, for the same reason: a
+    SIGKILL mid-suite still leaves the finished files recorded. Appends are
+    whole lines, so concurrent workers do not interleave.
+    """
+    metrics_path = os.environ.get("SGLANG_TEST_METRICS_FILE")
+    if not metrics_path:
+        return
+    try:
+        with open(metrics_path, "a") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "kind": "file",
+                        "test_file": os.path.basename(filename),
+                        "status": "pass" if passed else "fail",
+                        "duration": round(elapsed, 2),
+                    }
+                )
+                + "\n"
+            )
+    except OSError:
+        pass
+
+
 def run_files_chip_parallel(
     files: List,
     *,
@@ -169,6 +197,7 @@ def run_files_chip_parallel(
             returncode, elapsed, output = _run_one(
                 test.filename, chip, workdir, timeout
             )
+            _flush_metrics(test.filename, returncode == 0, elapsed)
             with results_lock:
                 elapsed_by_file[test.filename] = elapsed
                 if returncode == 0:

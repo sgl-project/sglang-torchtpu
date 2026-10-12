@@ -162,6 +162,9 @@ jobs:
       # Unit suite (kernels/backends; each test self-contained, no model server) runs
       # first so a broken kernel fails before the serving suite claims the slice.
       suite: stage-a-test-tpu-unit
+      # Most unit tests are registered chips=1 and run four at a time, each
+      # pinned to one chip of the slice. Whole-node tests follow sequentially.
+      tpu_chip_workers: 4
     permissions:
       contents: read
       id-token: write

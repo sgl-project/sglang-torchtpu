@@ -24,7 +24,7 @@ from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     _Qwen3VLRunContext,
 )
 
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 
 @contextlib.contextmanager

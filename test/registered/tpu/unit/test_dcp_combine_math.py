@@ -29,7 +29,7 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
     sink_fold,
 )
 
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
 
 try:
     # The layers.dcp package init pulls in the Triton DCP kernels and Triton is

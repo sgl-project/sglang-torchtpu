@@ -13,13 +13,13 @@ _PYTHON_DIR = os.path.join(_REPO_ROOT, "python")
 if _PYTHON_DIR not in sys.path:
     sys.path.insert(0, _PYTHON_DIR)
 
+from sglang.test.ci.chip_parallel import run_files_chip_parallel
 from sglang.test.ci.ci_register import (
     CIRegistry,
     HWBackend,
     auto_partition,
     collect_tests,
 )
-from sglang.test.ci.chip_parallel import run_files_chip_parallel
 from sglang.test.ci.ci_utils import derive_timeout_per_file, run_unittest_files
 
 # Defensive fallback in case sglang is loaded from an external environment missing TPU
@@ -498,24 +498,32 @@ def run_a_suite(args):
         timeout += args.retry_timeout_increase
 
     pinned_ok = True
+    pinned_results = []
     if args.tpu_chip_workers > 1:
         # Chip-pinned files first; they release their chips before any
         # whole-node test starts, so the two never share a host.
-        pinned_ok, _, _, _ = run_files_chip_parallel(
+        pinned_ok, pinned_passed, _, pinned_elapsed = run_files_chip_parallel(
             ci_tests,
             workers=args.tpu_chip_workers,
             timeout_per_file=timeout,
             derive_timeout=derive_timeout_per_file,
             continue_on_error=args.continue_on_error,
         )
+        # Handed to run_unittest_files so the suite still ends with one
+        # TIMINGS block covering every file; the est_time model and the
+        # dashboard both read that block.
+        passed_set = set(pinned_passed)
+        pinned_results = [
+            (name, name in passed_set, elapsed)
+            for name, elapsed in pinned_elapsed.items()
+        ]
         if not pinned_ok and not args.continue_on_error:
             return -1
         ci_tests = [test for test in ci_tests if getattr(test, "chips", 0) != 1]
-        if not ci_tests:
-            return 0 if pinned_ok else -1
 
     rest = run_unittest_files(
         ci_tests,
+        prior_results=pinned_results,
         timeout_per_file=timeout,
         continue_on_error=args.continue_on_error,
         enable_retry=args.enable_retry,

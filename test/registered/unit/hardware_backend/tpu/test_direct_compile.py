@@ -36,7 +36,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.warmup_queue import collect_warmups
 
-register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 _COMPILE_RESULT = SimpleNamespace(executable="executable")
 _TPU_AVAILABLE = hasattr(torch, "accelerator") and torch.accelerator.is_available()

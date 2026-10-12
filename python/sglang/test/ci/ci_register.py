@@ -64,9 +64,10 @@ class CIRegistry:
     # shared disk its lane mounts by default.
     weights_pvc: Optional[str] = None
     # TPU chips the test needs. 1 means it runs correctly pinned to a single
-    # chip, so several such tests can share a host. 0 (the default) means
-    # unspecified, which the runner reads as "give it the whole node" -- the
-    # safe reading for a test nobody has checked.
+    # chip, so several such tests can share a host. Anything else -- including
+    # 0, the default, which means nobody has checked -- gets the whole node to
+    # itself, the safe reading. A value above 1 is documentation today: the
+    # runner only dispatches `chips=1` specially.
     chips: int = 0
 
     @property

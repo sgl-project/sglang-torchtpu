@@ -3,7 +3,7 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
 
 # This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
 # Platform discovery above enforces CPU-only JAX for SGLang, but does not import
