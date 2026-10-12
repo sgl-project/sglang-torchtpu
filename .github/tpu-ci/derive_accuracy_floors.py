@@ -16,6 +16,12 @@ fewer nights than asked keeps the same formula and is marked `provisional`; one
 with no nights falls back to its entry's `seed` scores (e.g. a sibling series or
 a one-off run), and fails if it has none.
 
+A night is one dashboard date: a retried or re-dispatched run records the same
+series again, so only the latest score per run_id, then per date, counts. An
+entry may declare `min_floor` (with `min_floor_reason`) when the derived floor
+is too loose for the gate to mean anything -- e.g. a 30-question eval at one
+repeat; the floor is then max(derived, min_floor).
+
 Without --write it prints the table and the diff, and changes nothing.
 """
 
@@ -42,8 +48,13 @@ def _series(metrics_path: Path) -> dict:
             continue
         key = (labels["id"], r["metric_name"])
         out.setdefault(key, []).append((r["timestamp"], r["value"], r["run_id"]))
-    for v in out.values():
+    for key, v in out.items():
         v.sort()
+        # A retry of the same run, or a second dispatch the same night, would
+        # otherwise count as an extra night and shrink sigma_nightly.
+        by_run = {run: (ts, val, run) for ts, val, run in v}
+        by_date = {ts[:10]: (ts, val, run) for ts, val, run in sorted(by_run.values())}
+        out[key] = sorted(by_date.values())
     return out
 
 
@@ -56,9 +67,10 @@ def derive(entry: dict, nights: list, want: int) -> dict:
     sigma_nightly = statistics.stdev(values) if len(values) > 1 else 0.0
     sigma_binomial = math.sqrt(max(mean * (1 - mean), 0.0) / entry["n_items"])
     sigma = max(sigma_nightly, sigma_binomial)
+    # Rounded down so a score printed at 3 decimals never sits on the line.
+    floor = math.floor((mean - 3 * sigma) * 1000) / 1000
     return {
-        # Rounded down so a score printed at 3 decimals never sits on the line.
-        "floor": math.floor((mean - 3 * sigma) * 1000) / 1000,
+        "floor": max(floor, entry.get("min_floor", floor)),
         "mean": round(mean, 4),
         "sigma": round(sigma, 4),
         "sigma_source": "nightly" if sigma_nightly >= sigma_binomial else "binomial",
@@ -90,7 +102,9 @@ def main() -> int:
                 f"(mean {got['mean']:.3f}, sigma {got['sigma']:.4f} "
                 f"[{got['sigma_source']}], nights {got['nights']}){flag}"
             )
-            if old != got["floor"]:
+            # Refresh provenance too: an unchanged floor still has new nights
+            # (runs, window, mean) behind it.
+            if any(entry.get(k) != v for k, v in got.items()):
                 changed = True
                 entry.update(got, set_on=today)
     if args.write and changed:
