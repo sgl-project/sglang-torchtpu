@@ -329,11 +329,21 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             content = f.read()
         self.assertIn('tpu = "sglang.srt.hardware_backend.tpu:activate"', content)
 
-    def test_no_hooks_are_registered(self):
-        """No hooks yet; a hook needs the documented header."""
+    def test_scheduler_initialization_hook_is_declared(self):
+        from sglang.srt.plugins.hook_registry import HookType
         from sglang_tpu.hooks import HOOKS
+        from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 
-        self.assertEqual(HOOKS, [], "a hook was added without updating this test")
+        self.assertEqual(
+            HOOKS,
+            [
+                (
+                    "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
+                    initialize_dense_moe_config,
+                    HookType.AFTER,
+                )
+            ],
+        )
 
     # -- helpers -----------------------------------------------------------
 

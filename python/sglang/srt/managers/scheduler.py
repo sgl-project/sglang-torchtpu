@@ -970,10 +970,23 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        # Dense models also query MoE backend flags at layer boundaries. Seed
-        # them before any compiled forward; lazy defaults would mutate runtime
-        # flags inside Dynamo tracing (notably Qwen3-VL's dense decoder).
-        initialize_moe_config()
+        # Use the language config already normalized by ModelConfig. Multimodal
+        # wrappers expose it under different attributes (for example,
+        # ``text_config`` or ``llm_config``).
+        config_to_check = self.model_config.hf_text_config
+
+        # Different MoE architectures expose the per-token expert count under
+        # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
+        # LongCat-2.0 uses ``moe_topk``).
+        moe_topk_attrs = (
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "top_k_experts",
+            "moe_top_k",
+            "moe_topk",
+        )
+        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+            initialize_moe_config()
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config()
