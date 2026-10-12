@@ -492,7 +492,7 @@ class CompiledFunction:
         with (
             dynamo_timed("direct_compile_trace"),
             execution_mode.set_eager_mode(
-                execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+                execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
             ),
             ExitStack() as stack,
         ):
