@@ -42,8 +42,13 @@ class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
         self._distribution_cache = {}
         self.decode_query_size = 1
         self._host_metadata_cache = HostMetadataCache()
+        self._host_page_cols = None
         self._is_hybrid_swa = False
         self.token_to_kv_pool = None
+        # No decode context parallelism: one page covers page_size tokens.
+        self._dcp = 1
+        self._dcp_rank = 0
+        self._page_stride = page_size
 
 
 def _make_forward_batch(

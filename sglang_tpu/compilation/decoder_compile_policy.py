@@ -16,6 +16,8 @@ from torch.utils._pytree import tree_leaves
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -60,6 +62,12 @@ from sglang_tpu.compilation.frame_stack import (
     call_with_reserved_frame_stack,
 )
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.cp_forward import (
+    install_cp_logits_forward,
+    prepare_tpu_cp_forward_batch,
+    wrap_cp_embedding_forward,
+)
+from sglang_tpu.cp_layout import warmup_request_lengths
 
 logger = get_logger(__name__)
 
@@ -316,6 +324,48 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
             **cls._extend_metadata_fields(True, bs, tokens_per_req, prefix_len, device),
         )
 
+    @classmethod
+    def cp_extend(
+        cls,
+        request_lens: list[int],
+        *,
+        device: str | torch.device,
+        slot: int,
+        out_cache_loc_dtype: torch.dtype,
+    ) -> _DummyForwardBatchFields:
+        """Reserved-slot EXTEND with one prefix-free request per entry of
+        ``request_lens`` (a context-parallel warmup batch)."""
+        bs = len(request_lens)
+        num_tokens = sum(request_lens)
+        lens = torch.tensor(request_lens, dtype=torch.int64)
+        input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+        input_ids[:bs] = 1
+        positions = torch.cat(
+            [torch.arange(length, dtype=torch.int64) for length in request_lens]
+        ).to(device)
+        extend_start_loc = torch.zeros(bs, dtype=torch.int32)
+        extend_start_loc[1:] = torch.cumsum(lens, dim=0)[:-1].to(torch.int32)
+        return cls(
+            input_ids=input_ids,
+            positions=positions,
+            out_cache_loc=torch.full(
+                (num_tokens,), slot, dtype=out_cache_loc_dtype, device=device
+            ),
+            seq_lens=lens.to(device),
+            orig_seq_lens=lens.to(device),
+            seq_lens_cpu=lens.clone(),
+            req_pool_indices=torch.full((bs,), slot, dtype=torch.int64, device=device),
+            req_pool_indices_cpu=torch.full((bs,), slot, dtype=torch.int64),
+            seq_lens_sum=num_tokens,
+            extend_num_tokens=num_tokens,
+            extend_seq_lens=lens.to(torch.int32).to(device),
+            extend_prefix_lens=torch.zeros(bs, dtype=torch.int32, device=device),
+            extend_start_loc=extend_start_loc.to(device),
+            extend_seq_lens_cpu=list(request_lens),
+            extend_prefix_lens_cpu=[0] * bs,
+            extend_logprob_start_lens_cpu=[0] * bs,
+        )
+
 
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
@@ -386,6 +436,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
         self._logged_vl_warmup_variants: set[str] = set()
+        # Variant tags actually warmed, so precompile() can tell a family that
+        # was compiled from one an override dropped.
+        self._compiled_extend_variants: set[str] = set()
+
+    @property
+    def _cp_strategy(self) -> Any:
+        """Prefill context-parallel strategy, or None when not configured; not
+        cached, since the strategy may initialize after this policy is built."""
+        return get_cp_strategy()
 
     def _record_compile_step(
         self,
@@ -470,6 +529,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if num_tokens >= batch_size
         ]
 
+    def _extend_cp_compile_cases(self) -> list[tuple[int, int]]:
+        """(local_tokens, batch_cap) of the context-parallel extend family."""
+        if self._cp_strategy is None:
+            return []
+        assert self.t_bucketer is not None
+        cap = self._extend_compile_cap()
+        return [
+            (num_tokens, cap)
+            for num_tokens in self.t_bucketer.buckets
+            if num_tokens >= cap
+        ]
+
     def _extend_compile_shapes(self) -> list[tuple[int, int]]:
         return list(
             dict.fromkeys(
@@ -507,6 +578,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         compile_fn = compile_owner.forward if is_draft_worker else fn
 
+        cp_logits_installed = False
         if self._compiles_logits_processor():
             logits_processor = getattr(
                 self.model_runner.model, "logits_processor", None
@@ -514,7 +586,21 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if logits_processor is not None:
                 # TPUs don't support returning input logprobs -- this errors elsewhere.
                 logits_processor.compute_input_logprobs = False
+                if self._cp_strategy is not None:
+                    install_cp_logits_forward(logits_processor)
+                    cp_logits_installed = True
 
+        if self._cp_strategy is not None and not is_draft_worker:
+            if not cp_logits_installed:
+                raise NotImplementedError(
+                    "Prefill context parallelism on TPU reduces the last-token rows "
+                    "inside the compiled logits step, but "
+                    f"{type(self.model_runner.model).__name__} runs its logits "
+                    "processor outside the compiled forward."
+                )
+            compile_fn = wrap_cp_embedding_forward(
+                compile_fn, self.model_runner.model.get_input_embeddings()
+            )
         if self.tracer == "direct":
             compiled, warmup_async = self._direct_compile(compile_fn)
         else:
@@ -836,12 +922,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Bucket a normal or target forward before attention planning."""
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
-        real_q, real_b = _pad_forward_batch_inputs(
-            forward_batch,
-            self.t_bucketer,
-            self.b_bucketer,
-            extend_bs=self.extend_bs,
-        )
+        if self._cp_batch_active(forward_batch):
+            real_q, real_b = prepare_tpu_cp_forward_batch(
+                forward_batch,
+                t_bucketer=self.t_bucketer,
+                b_bucketer=self.b_bucketer,
+                extend_bs=self.extend_bs,
+                cp_size=self._cp_strategy.cp_size,
+                cp_rank=self._cp_strategy.cp_rank,
+                device=self.model_runner.device,
+            )
+        else:
+            real_q, real_b = _pad_forward_batch_inputs(
+                forward_batch,
+                self.t_bucketer,
+                self.b_bucketer,
+                extend_bs=self.extend_bs,
+            )
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
         spec_info = forward_batch.spec_info
@@ -852,6 +949,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 logical_num_tokens=real_q,
                 physical_num_tokens=int(forward_batch.input_ids.shape[0]),
             )
+
+    def _cp_batch_active(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this extend batch runs the context-parallel program."""
+        return (
+            self._cp_strategy is not None
+            and forward_batch.attn_cp_metadata is not None
+            and is_cp_active(forward_batch)
+        )
 
     def _install_dp_idle_as_decode(self) -> None:
         """Normalize idle DP batches before model execution.
@@ -973,6 +1078,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         pending = []
         if disagg_mode != "decode":
             pending += self._precompile_extend()
+            self._assert_cp_family_compiled()
         if disagg_mode != "prefill":
             pending += self._precompile_decode()
         logger.info(
@@ -981,9 +1087,33 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         return pending
 
+    def _assert_cp_family_compiled(self) -> None:
+        """Raise if prefill context parallelism is on but warmup compiled no
+        context-parallel extend graphs."""
+        if self._cp_strategy is None or "cp" in self._compiled_extend_variants:
+            return
+        raise RuntimeError(
+            f"{type(self).__name__} compiled no context-parallel extend graphs "
+            "while prefill context parallelism is enabled. A _precompile_extend "
+            "override must add _extend_cp_compile_items() to its warmup grid; "
+            "without it every context-parallel batch recompiles at serve time."
+        )
+
     def _extend_input_variants(self) -> tuple[str, ...]:
         """Input signatures an extend graph must be compiled for."""
         return ("plain",)
+
+    def _extend_cp_compile_items(self) -> list[tuple[int, int, ForwardMode, str, Any]]:
+        """Warmup items of the context-parallel extend family.
+
+        Separate from the plain grid so a ``_precompile_extend`` override can
+        add the family back without restating how it is shaped.
+        """
+        return [
+            (num_tokens, bs, ForwardMode.EXTEND, "cp", logits_output_mode)
+            for num_tokens, bs in self._extend_cp_compile_cases()
+            for logits_output_mode in self._warmup_logits_output_modes(bs)
+        ]
 
     def _precompile_extend(self) -> list[PendingCall]:
         """Compile extend at each token bucket and the fixed batch cap."""
@@ -999,10 +1129,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         compile_items = [
-            (num_tokens, bs, mode, logits_output_mode)
+            (num_tokens, bs, mode, "plain", logits_output_mode)
             for num_tokens, bs, mode in compile_cases
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
+        cp_items = self._extend_cp_compile_items()
+        compile_items += cp_items
         # Input (prompt) logprobs need every prefill row, so they warm the
         # FULL-capture variant instead of the NULL one -- a replacement, not an
         # addition, because the shim then presents FULL on every extend and a
@@ -1015,10 +1147,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         logger.info(
             "[decoder compile policy] EXTEND/MIXED: %d graph variants "
-            "(mode_caps=%s, token_buckets=%s)",
+            "(mode_caps=%s, token_buckets=%s, context_parallel_cases=%d)",
             len(compile_items),
             sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
+            len(cp_items),
         )
         compile_range = (
             tqdm.tqdm(
@@ -1030,13 +1163,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else compile_items
         )
         pending = []
-        for num_tokens, bs, mode, logits_output_mode in compile_range:
+        for num_tokens, bs, mode, variant, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=mode,
+                variant=variant,
                 logits_output_mode=logits_output_mode,
                 capture_hidden_mode=extend_capture_hidden_mode,
             )
@@ -1047,6 +1181,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 duration_seconds=elapsed,
                 batch_size=bs,
                 num_tokens=num_tokens,
+                input_variant=None if variant == "plain" else variant,
                 logits_output_mode=logits_output_mode.name.lower(),
                 capture_hidden_mode=extend_capture_hidden_mode.name.lower(),
             )
@@ -1056,7 +1191,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
                     f"{status} {mode.name} (tokens={num_tokens}, bs={bs}, "
-                    f"logits={logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
+                    f"variant={variant}, logits={logits_output_mode.name}) "
+                    f"in {elapsed:.1f}s{hbm_str}"
                 )
         return pending
 
@@ -1124,17 +1260,53 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         """Build generic text decoder warmup inputs."""
-        forward_batch = self._make_dummy_forward_batch(
-            num_tokens=num_tokens,
-            bs=bs,
-            mode=mode,
-            capture_hidden_mode=capture_hidden_mode,
-            spec_info=spec_info,
-        )
+        if variant == "cp":
+            forward_batch = self._make_cp_dummy_forward_batch(
+                local_tokens=num_tokens, bs=bs, capture_hidden_mode=capture_hidden_mode
+            )
+        else:
+            forward_batch = self._make_dummy_forward_batch(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=mode,
+                capture_hidden_mode=capture_hidden_mode,
+                spec_info=spec_info,
+            )
         return (
             (forward_batch.input_ids, forward_batch.positions, forward_batch),
             self._pp_warmup_kwargs(num_tokens),
         )
+
+    def _make_cp_dummy_forward_batch(
+        self, *, local_tokens: int, bs: int, capture_hidden_mode: CaptureHiddenMode
+    ) -> ForwardBatch:
+        """EXTEND dummy whose zigzag layout fills exactly ``local_tokens``
+        rows on every context-parallel rank, with the CP-v2 metadata built
+        the way serving builds it."""
+        assert self._cp_strategy is not None
+        request_lens = warmup_request_lengths(
+            local_rows=local_tokens, cp_size=self._cp_strategy.cp_size, max_reqs=bs
+        )
+        layout = _DummyForwardBatchFields.cp_extend(
+            request_lens,
+            device=self.model_runner.device,
+            slot=self._dummy_kv_slot(),
+            out_cache_loc_dtype=self._dummy_out_cache_loc_dtype(ForwardMode.EXTEND),
+        )
+        forward_batch = self._forward_batch_from_layout(
+            layout,
+            bs=len(request_lens),
+            mode=ForwardMode.EXTEND,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=None,
+        )
+        if not is_cp_active(forward_batch):
+            raise RuntimeError(
+                "context-parallel warmup batch is not context-parallel active; "
+                "check the zigzag strategy configuration."
+            )
+        prepare_cp_forward(forward_batch)
+        return forward_batch
 
     def _run_one(
         self,
@@ -1150,6 +1322,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         profile_prefix: int | None = None,
     ) -> PendingCall | float | None:
         """Run one warmup, defer async execution, or time synchronous profiling."""
+        self._compiled_extend_variants.add(variant)
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
             bs=bs,
@@ -1330,7 +1503,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Construct a dummy ForwardBatch at the target bucket shape."""
         tokens_per_req = self._dummy_tokens_per_req(mode, spec_info)
         layout = self._dummy_layout(mode, num_tokens, bs, tokens_per_req)
+        return self._forward_batch_from_layout(
+            layout,
+            bs=bs,
+            mode=mode,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
+        )
 
+    def _forward_batch_from_layout(
+        self,
+        layout: _DummyForwardBatchFields,
+        *,
+        bs: int,
+        mode: ForwardMode,
+        capture_hidden_mode: CaptureHiddenMode,
+        spec_info: Any | None,
+    ) -> ForwardBatch:
         # MROPE runtime positions are real [3, num_tokens] tensors. Keep strides
         # identical here so Dynamo does not guard-miss after precompile.
         mrope_positions = None
@@ -1378,6 +1567,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
             from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 
+            num_tokens = int(layout.input_ids.shape[0])
             batch.global_num_token_non_padded = torch.tensor(
                 num_tokens, dtype=torch.int32, device=layout.input_ids.device
             )

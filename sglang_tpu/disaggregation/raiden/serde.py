@@ -43,6 +43,8 @@ class MessageTag(bytes, enum.Enum):
         b"RAIDEN_RESHARD_CHUNK_READY"  # decode -> prefill: chunk registered, push it
     )
 
+    ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
+
     # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
@@ -184,6 +186,22 @@ class ReshardChunkReady(WireMessage):
         require_non_negative(self.room, "room")
         require_non_negative(self.index, "index")
         require_non_negative(self.uuid, "uuid")
+
+
+class RoomFailed(WireMessage):
+    """Tell a decode rank that the prefill rank has already failed a room.
+
+    The prefill sends it when a request for the room's KV (PULL_REQ,
+    RESHARD_REQ or PIPELINE_REQ) finds the room tombstoned. It is the mirror
+    of ABORT.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.ROOM_FAILED
+    room: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
 
 
 def decode_text(frame: bytes, field: str) -> str:

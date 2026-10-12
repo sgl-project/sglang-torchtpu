@@ -15,10 +15,25 @@ logger = logging.getLogger(__name__)
 # (target, hook, hook_type) triples.
 HOOKS: list[tuple] = []
 
+_registered = False
+
 
 def register() -> None:
+    # Two entry points name this function (tpu_hooks in sglang, tpu_oot_hooks in
+    # sglang-tpu); with SGLANG_PLATFORM unset both run in the same process.
+    global _registered
+    if _registered:
+        return
+    _registered = True
+
     if not HOOKS:
         logger.debug("sglang_tpu: no hooks registered.")
+        return
+
+    from sglang.srt.platforms import current_platform
+
+    # Every host installs the plugin, so the entry points also run off TPU.
+    if not current_platform.is_tpu():
         return
 
     from sglang.srt.plugins.hook_registry import HookRegistry

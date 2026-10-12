@@ -13,14 +13,22 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVManager,
     RaidenKVReceiver,
     RaidenKVSender,
 )
-from sglang_tpu.disaggregation.raiden.serde import MessageTag, PullReq, ReshardReq
+from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
+from sglang_tpu.disaggregation.raiden.serde import (
+    MessageTag,
+    PullReq,
+    ReshardReq,
+    RoomFailed,
+)
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -47,6 +55,7 @@ def _abort_frame(room):
 def _prefill_manager():
     """A prefill-mode RaidenKVManager with its room tables, no sockets or engine."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr.attn_tp_rank = 0
     mgr._prefill = PrefillState(announce_pages=1)
     mgr._decode = None
     mgr.disaggregation_mode = DisaggregationMode.PREFILL
@@ -76,10 +85,42 @@ def _prefill_manager():
     mgr._superseded_sender_reads = set()
     mgr._timeout_s = 120.0
     mgr._reshard_pushes_pending = {}
+    mgr.attn_tp_rank = 0
+    mgr._send_multipart_locked = Mock()
     mgr._message_handlers = {
         PullReq.TAG: mgr._on_pull_req,
+        ReshardReq.TAG: mgr._on_reshard_req,
     }
     return mgr
+
+
+def _decode_manager():
+    """A decode-mode RaidenKVManager with its room tables, no sockets or engine."""
+    mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr._prefill = None
+    mgr._decode = DecodeState()
+    mgr._engine = None
+    mgr._swa_engine = None
+    mgr._pulling = None
+    mgr.attn_tp_rank = 0
+    mgr.request_status = {}
+    mgr.failure_records = {}
+    mgr.failure_lock = threading.Lock()
+    mgr._state_lock = threading.Lock()
+    mgr._status_lock = threading.Lock()
+    mgr._aborted = {}
+    mgr._failed = set()
+    mgr._native_failed = set()
+    mgr._completed_recv = set()
+    mgr.chunked_transfer = False
+    mgr.waiting_timeout = 300
+    mgr._message_handlers = {RoomFailed.TAG: mgr._on_room_failed}
+    return mgr
+
+
+def _sent_frames(mgr):
+    """(endpoint, frames) of every message the manager sent."""
+    return [call.args[:2] for call in mgr._send_multipart_locked.call_args_list]
 
 
 def _populate_send_state(mgr, room):
@@ -149,9 +190,13 @@ class TestPrefillAbortHandling(unittest.TestCase):
         self.assertEqual(mgr.failure_records, {})
         self.assertTrue(mgr.is_aborted(ROOM))
 
-        # The delayed pull request finds the tombstone and is dropped.
+        # The delayed pull request finds the tombstone and is answered with
+        # ROOM_FAILED instead of admitting the room.
         mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
         self.assertNotIn(ROOM, mgr._prefill.decode_addr)
+        [(endpoint, frames)] = _sent_frames(mgr)
+        self.assertEqual(endpoint, "tcp://10.0.0.2:5555")
+        self.assertEqual(RoomFailed.from_frames(frames).room, ROOM)
 
     def test_malformed_abort_is_ignored(self):
         mgr = _prefill_manager()
@@ -272,6 +317,8 @@ def _receiver(mgr):
     recv._connection_pool_entries = {}
     recv._started = False
     recv.init_time = None
+    recv._handshake_start = time.time()
+    recv._handshake_timeout = 300
     return recv
 
 
@@ -297,6 +344,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
 
         engine.start_read.side_effect = blocking_start
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
@@ -365,6 +413,44 @@ class TestReceiverFailurePaths(unittest.TestCase):
         recv = _receiver(mgr)
         self.assertEqual(recv.poll(), KVPoll.WaitingForInput)
 
+    def test_poll_fails_when_stuck_bootstrapping(self):
+        mgr = _decode_manager_stub(request_status={ROOM: KVPoll.Bootstrapping})
+        recv = _receiver(mgr)
+        del recv.bootstrap_infos  # init() never ran
+        recv._handshake_timeout = 1
+        recv._handshake_start = time.time() - 2
+        with patch.object(RaidenKVReceiver, "_send_abort_notification") as send_abort:
+            self.assertEqual(recv.poll(), KVPoll.Failed)
+        send_abort.assert_not_called()
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+        self.assertIn("KVPoll.Bootstrapping", mgr.failure_records[ROOM])
+
+    def test_handshake_deadline_fails_room_still_waiting_for_kv_pages(self):
+        """A room still waiting for decode KV pages past the bootstrap timeout
+        fails, since the prefill has given up on it by then."""
+        mgr = _decode_manager_stub()
+        recv = _receiver(mgr)
+        recv._handshake_timeout = 1
+        recv._handshake_start = time.time() - 2
+        with patch.object(RaidenKVReceiver, "_send_abort_notification") as send_abort:
+            self.assertEqual(recv.poll(), KVPoll.Failed)
+        send_abort.assert_called_once()
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+        self.assertIn("KVPoll.WaitingForInput", mgr.failure_records[ROOM])
+
+    def test_handshake_deadline_stops_once_metadata_is_sent(self):
+        mgr = _decode_manager_stub()
+        recv = _receiver(mgr)
+        recv._handshake_timeout = 1
+        recv._handshake_start = time.time() - 2
+        recv.init_time = time.time()
+        self.assertEqual(recv.poll(), KVPoll.WaitingForInput)
+
+    def test_handshake_keeps_waiting_before_deadline(self):
+        mgr = _decode_manager_stub(request_status={ROOM: KVPoll.Bootstrapping})
+        recv = _receiver(mgr)
+        self.assertEqual(recv.poll(), KVPoll.Bootstrapping)
+
     def test_engine_failure_notifies_prefill_once(self):
         mgr = _decode_manager_stub(is_failed=lambda room: True)
         recv = _receiver(mgr)
@@ -389,7 +475,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
             is_dummy_cp_rank=False,
             is_failed=lambda room: False,
             is_send_done=lambda room: False,
-            request_status={ROOM: KVPoll.WaitingForInput},
+            request_status={ROOM: KVPoll.Bootstrapping},
             failure_records={},
             failure_lock=threading.Lock(),
             bootstrap_timeout=bootstrap_timeout,
@@ -408,6 +494,12 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
         mgr._decode_asked_locked = types.MethodType(
             RaidenKVManager._decode_asked_locked, mgr
+        )
+        mgr._decode_requested_locked = types.MethodType(
+            RaidenKVManager._decode_requested_locked, mgr
+        )
+        mgr.finish_bootstrap_if_decode_requested = types.MethodType(
+            RaidenKVManager.finish_bootstrap_if_decode_requested, mgr
         )
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr
@@ -440,9 +532,164 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         sender, _ = self._sender(has_decode_request=True, bootstrap_timeout=1, age=2)
         self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
 
-    def test_poll_keeps_waiting_before_timeout(self):
+    def test_poll_stays_bootstrapping_before_timeout(self):
         sender, _ = self._sender(has_decode_request=False, bootstrap_timeout=300, age=0)
+        self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
+
+
+def _gate_manager():
+    """A prefill manager a real RaidenKVSender can be constructed on."""
+    mgr = _prefill_manager()
+    mgr.is_dummy_cp_rank = False
+    mgr._engine = None
+    mgr.bootstrap_timeout = 300
+    mgr._deferred_ack_targets = {}
+    mgr._deferred_ack_poisoned_rooms = set()
+    mgr._staging_outstanding = {}
+    mgr.req_to_decode_prefix_len = {}
+    return mgr
+
+
+def _gate_sender(mgr, room):
+    with get_context().override_server_args(dp_size=1):
+        return RaidenKVSender(mgr, "unused", room)
+
+
+def _producer_pipeline(mgr):
+    """A prefill-side PipelineTransfer that records requests but never replies."""
+    pipe = PipelineTransfer.__new__(PipelineTransfer)
+    pipe.manager = mgr
+    pipe.producer = True
+    pipe.lock = threading.RLock()
+    pipe.replies = {}
+    pipe.sent = {}
+    pipe.failed = set()
+    pipe.poll = lambda: (set(), set(), set())
+    return pipe
+
+
+class TestSenderBootstrapGate(unittest.TestCase):
+    """A sender must report Bootstrapping until the decode's first request for
+    the room arrives. Reporting WaitingForInput earlier lets the bootstrap
+    queue compute a prefill whose decode has not reserved KV pages yet."""
+
+    def _sender(self):
+        mgr = _gate_manager()
+        return _gate_sender(mgr, ROOM), mgr
+
+    def test_sender_stays_bootstrapping_without_a_decode_request(self):
+        sender, mgr = self._sender()
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Bootstrapping)
+        self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
+
+    def test_pull_request_ends_bootstrapping(self):
+        sender, mgr = self._sender()
+        mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
         self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.WaitingForInput)
+
+    def test_reshard_request_ends_bootstrapping(self):
+        # A resharding decode sends RESHARD_READY only after the prefill has
+        # announced its blocks, so the request itself must open the gate.
+        sender, mgr = self._sender()
+        mgr._dispatch(
+            ReshardReq(ROOM, "10.0.0.2", 5555, "push", [1, 2], 2, [], "").to_frames()
+        )
+        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+
+    def test_pipeline_request_ends_bootstrapping(self):
+        sender, mgr = self._sender()
+        mgr._pipeline = _producer_pipeline(mgr)
+        self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
+        mgr._pipeline.on_message(
+            [
+                MessageTag.PIPELINE_REQ,
+                str(ROOM).encode(),
+                b"tcp://10.0.0.2:31000",
+                b'{"attn_tp_size": 1, "attn_tp_rank": 0}',
+            ]
+        )
+        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+
+    def test_tombstoned_room_is_not_admitted_on_a_late_request(self):
+        sender, mgr = self._sender()
+        with mgr._state_lock:
+            mgr._mark_aborted_locked(ROOM)
+        mgr._prefill.decode_addr[ROOM] = ("10.0.0.2", 5555)
+        self.assertFalse(mgr.finish_bootstrap_if_decode_requested(ROOM))
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Bootstrapping)
+
+
+class TestBootstrapQueueAdmission(unittest.TestCase):
+    """The prefill bootstrap queue releases a raiden request only after its
+    decode asked for it, whatever the arrival order: an earlier request the
+    decode has not reserved pages for keeps waiting behind a later one it has."""
+
+    def _request(self, mgr, room):
+        return SimpleNamespace(
+            rid=f"req-{room}",
+            bootstrap_room=room,
+            disagg_kv_sender=_gate_sender(mgr, room),
+            origin_input_ids=list(range(64)),
+            metadata_buffer_index=0,
+            prefill_attempt_count=0,
+            is_retracted=False,
+            swa_branching_seqlen=None,
+            kv=SimpleNamespace(cache_protected_len=0),
+            pending_bootstrap=True,
+            time_stats=Mock(),
+        )
+
+    def _queue(self, reqs):
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.scheduler_stage_metrics = None
+        queue.pp_size = 1
+        queue.scheduler = SimpleNamespace(
+            attn_cp_cpu_group=None,
+            attn_tp_cpu_group=None,
+            tree_cache=None,
+            processed_tokens_counter=0,
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=32),
+        )
+        queue.ensure_metadata_buffer = Mock(return_value=True)
+        queue.queue = list(reqs)
+        return queue
+
+    def _pop(self, queue):
+        # Single rank: the group reduction is the senders' own polls.
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
+                side_effect=lambda senders, *_: [s.poll() for s in senders],
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.get_disagg",
+                return_value=SimpleNamespace(
+                    optimistic_prefill_attempts=0,
+                    disaggregation_decode_allocation_policy="early",
+                ),
+            ),
+        ):
+            return queue.pop_bootstrapped()
+
+    def test_only_the_decode_requested_request_is_released(self):
+        mgr = _gate_manager()
+        first = self._request(mgr, ROOM)
+        second = self._request(mgr, OTHER_ROOM)
+        queue = self._queue([first, second])
+
+        self.assertEqual(self._pop(queue), [])
+
+        mgr._dispatch(PullReq(OTHER_ROOM, "10.0.0.2", 5555, 2).to_frames())
+        self.assertEqual(self._pop(queue), [second])
+        self.assertEqual(queue.queue, [first])
+        self.assertTrue(first.pending_bootstrap)
+        self.assertFalse(second.pending_bootstrap)
+
+        mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 2).to_frames())
+        self.assertEqual(self._pop(queue), [first])
+        self.assertEqual(queue.queue, [])
+        self.assertFalse(first.pending_bootstrap)
 
 
 class TestReshardHandshakeWindow(unittest.TestCase):
@@ -504,14 +751,19 @@ class TestAbortIsTerminal(unittest.TestCase):
         mgr._ensure_engine.assert_not_called()
         mgr._send_multipart_locked.assert_not_called()
 
-    def test_decode_silence_failure_drops_a_racing_pull_request(self):
+    def test_decode_silence_failure_answers_a_racing_pull_request(self):
         mgr = self._mgr()
         self.assertTrue(mgr.fail_decode_silence(ROOM, time.time() - 10, 1))
         self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+        # The decode's address is unknown until it asks, so nothing is sent yet.
+        mgr._send_multipart_locked.assert_not_called()
         # The pull request that raced the deadline finds the tombstone.
         mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
         self.assertNotIn(ROOM, mgr._prefill.decode_addr)
         mgr._ensure_engine.assert_not_called()
+        [(endpoint, frames)] = _sent_frames(mgr)
+        self.assertEqual(endpoint, "tcp://10.0.0.2:5555")
+        self.assertEqual(RoomFailed.from_frames(frames).room, ROOM)
 
     def test_frames_after_clear_do_not_rebuild_the_room(self):
         mgr = self._mgr()
@@ -525,7 +777,42 @@ class TestAbortIsTerminal(unittest.TestCase):
         )
         self.assertNotIn(ROOM, mgr._prefill.decode_addr)
         self.assertNotIn(ROOM, mgr._prefill.reshard_req)
-        mgr._send_multipart_locked.assert_not_called()
+        # Each request is answered with ROOM_FAILED and nothing else.
+        sent = _sent_frames(mgr)
+        self.assertEqual(len(sent), 2)
+        for _, frames in sent:
+            self.assertEqual(RoomFailed.from_frames(frames).room, ROOM)
+
+
+class TestDecodeHonorsRoomFailed(unittest.TestCase):
+    def test_pull_for_a_room_the_prefill_dropped_fails_the_decode_room(self):
+        """A decode that asks for a room its prefill already failed must fail
+        the room on its next poll, not hold its KV pages until the waiting
+        timeout."""
+        prefill = _prefill_manager()
+        prefill.request_status[ROOM] = KVPoll.Bootstrapping
+        self.assertTrue(prefill.fail_decode_silence(ROOM, time.time() - 10, 1))
+        prefill._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
+        [(_, reply)] = _sent_frames(prefill)
+
+        decode = _decode_manager()
+        decode.request_status[ROOM] = KVPoll.WaitingForInput
+        recv = _receiver(decode)
+        recv.init_time = time.time()
+        self.assertEqual(recv.poll(), KVPoll.WaitingForInput)
+
+        decode._dispatch(reply)
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            self.assertEqual(recv.poll(), KVPoll.Failed)
+        with self.assertRaisesRegex(Exception, "had already failed room"):
+            recv.failure_exception()
+
+    def test_notice_for_a_cleared_room_recreates_nothing(self):
+        decode = _decode_manager()
+        decode._dispatch(RoomFailed(room=ROOM, reason="gone").to_frames())
+        self.assertEqual(decode.request_status, {})
+        self.assertEqual(decode.failure_records, {})
+        self.assertFalse(decode.is_failed(ROOM))
 
 
 class TestSenderTerminalPrecedence(unittest.TestCase):
@@ -1071,6 +1358,7 @@ class TestSendRevalidatesTheSocket(unittest.TestCase):
     def test_sender_that_lost_the_eviction_race_uses_a_fresh_socket(self):
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._socket_lock = threading.Lock()
         old_sock, new_sock = Mock(), Mock()
         mgr._socket_cache = {endpoint: old_sock}
@@ -1119,6 +1407,7 @@ class TestConnectDefersStaleSocketClose(unittest.TestCase):
 
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._socket_lock = threading.Lock()
         stale, monitor = FakeSocket(), FakeMonitor()
         mgr._socket_cache = {endpoint: stale}
@@ -1149,6 +1438,7 @@ class TestHeartbeatPrunesRoomTracker(unittest.TestCase):
         a prefill dies; without the heartbeat prune it grows for the process
         lifetime."""
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr.addr_to_rooms_tracker = {"10.0.0.1:8998": {ROOM, OTHER_ROOM}}
         mgr.request_status = {ROOM: KVPoll.Transferring}
 
@@ -1196,6 +1486,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
 
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
@@ -1236,6 +1527,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
 
     def test_heartbeat_failure_serializes_with_native_progress_publication(self):
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
@@ -1290,6 +1582,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
                 return value
 
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._status_lock = threading.Lock()
         mgr.request_status = PausingStatus({ROOM: KVPoll.Bootstrapping})
 
@@ -1330,6 +1623,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
                 return value
 
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._status_lock = threading.Lock()
         mgr.request_status = PausingStatus({ROOM: KVPoll.Bootstrapping})
 

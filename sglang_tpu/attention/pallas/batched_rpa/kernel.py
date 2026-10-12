@@ -94,6 +94,56 @@ def add_attention_sink(l: jax.Array, m: jax.Array, sink_ref: jax.Ref) -> jax.Arr
     return l_sink.astype(l.dtype)
 
 
+def store_lse(
+    lse_vref: jax.Ref,
+    b_idx: jax.Array,
+    m: jax.Array,
+    l: jax.Array,
+    stage_ref: jax.Ref | None,
+    sink_ref: jax.Ref | None,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    """Stores one lane's lse = log(sum exp(s)) in f32, natural log.
+
+    m, l: [KV, bq * G, lanes], rows (token, aligned q head) with the value
+    repeated over the lanes. Token t of KV head h lands in the row
+    lse_vref[b_idx, h, t, 0] with q head g in lane g. Without a sink, l == 0
+    gives -inf; a sink adds exp(sink) to the sum.
+    """
+    num_heads = cfgs.aligned_num_q_heads_per_kv_head
+    num_lanes = m.shape[-1]
+    lane = lax.broadcasted_iota(jnp.int32, (cfgs.bq_sz, num_lanes), 1)
+
+    def pack(rows: jax.Array) -> jax.Array:
+        # Lane g of token t takes row t * num_heads + g.
+        if rows.shape[0] == num_heads:
+            row = lax.broadcasted_iota(jnp.int32, rows.shape, 0)
+            own = lax.broadcasted_iota(jnp.int32, rows.shape, 1) == row
+            masked = jnp.where(own, rows.astype(jnp.float32), 0.0)
+            return jnp.sum(masked, axis=0, keepdims=True)
+        stage_ref[...] = rows.astype(jnp.float32)
+        packed = jnp.zeros((cfgs.bq_sz, num_lanes), jnp.float32)
+        for head in range(num_heads):
+            head_rows = stage_ref[pl.ds(head, cfgs.bq_sz, num_heads)]
+            packed += jnp.where(lane == head, head_rows, 0.0)
+        return packed
+
+    for kv_head in range(m.shape[0]):
+        m_packed = pack(m[kv_head])
+        l_packed = pack(l[kv_head])
+        if sink_ref is None:
+            lse = m_packed + jnp.log(l_packed)
+        else:
+            # log(l * e^m + e^sink), finite also for a row that attended no key.
+            sink = pack(sink_ref[kv_head, :num_heads])
+            top = jnp.maximum(m_packed, sink)
+            lse = top + jnp.log(
+                l_packed * jnp.exp(m_packed - top) + jnp.exp(sink - top)
+            )
+        lse_vref.at[b_idx, kv_head].reshape(cfgs.bq_sz, num_lanes)[...] = lse
+
+
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
@@ -103,6 +153,8 @@ def calculate_and_store_out(
     *,
     m_list: jax.Array | None,
     sink_ref: jax.Ref | None,
+    lse_vref: jax.Ref | None,
+    lse_stage_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
 ):
 
@@ -112,8 +164,15 @@ def calculate_and_store_out(
         batch_l: jax.Array,
         batch_m: jax.Array | None,
     ):
+        if cfgs.serve.return_lse:
+            store_lse(
+                lse_vref, b_idx, batch_m, batch_l, lse_stage_ref, sink_ref, cfgs=cfgs
+            )
         if cfgs.model.has_attention_sink:
             batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
+        if cfgs.serve.cache_only:
+            # A row that attended no key keeps l == 0 and outputs 0.
+            batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
@@ -159,16 +218,20 @@ def rpa_body(
     kv_in_vref: jax.Ref,
     # Outputs
     o_vref: jax.Ref,
+    lse_vref: jax.Ref | None,
     # Scratches.
     schedule_ref: schedule.RpaSchedule,
     m_scratch_ref: jax.Ref,
     l_scratch_ref: jax.Ref,
     acc_scratch_ref: jax.Ref,
+    lse_stage_ref: jax.Ref | None,
     *,
     # Passed refs
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
     sink_ref: jax.Ref | None,
+    cp_rank_ref: jax.Ref | None,
+    kv_lens_global_ref: jax.Ref | None,
     # Configs.
     cfgs: configs.RpaConfigs,
 ):
@@ -177,6 +240,10 @@ def rpa_body(
     # Step 1: Fetch metadata.
     processed_q_len = []
     processed_kv_len = []
+    kv_len_left = [] if cfgs.serve.cache_only else None
+    global_q_k_gap = None
+    if cfgs.serve.cp_group_size is not None and cfgs.model.sliding_window is not None:
+        global_q_k_gap = []
     # Lists to hold the 2 variables needed for stitching
     bkv_sz_frm_cache_list = []
     new_kv_len_start_list = []
@@ -195,10 +262,18 @@ def rpa_body(
         q_start = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx], 0)
         q_end = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx + 1], 0)
         q_len = q_end - q_start
-        offset = kv_len - q_len
+        # cache_only queries follow every one of the kv_len keys.
+        offset = kv_len if cfgs.serve.cache_only else kv_len - q_len
 
         processed_q_len.append((q_idx * cfgs.bq_sz + offset))
         processed_kv_len.append(k_id)
+        if kv_len_left is not None:
+            kv_len_left.append(kv_len - k_id)
+        if global_q_k_gap is not None:
+            kv_len_global = jnp.where(is_valid, kv_lens_global_ref[safe_s_idx], 0)
+            q_global = kv_len_global - q_len + q_idx * cfgs.bq_sz
+            k_global = k_id * cfgs.serve.cp_group_size + cp_rank_ref[0]
+            global_q_k_gap.append(q_global - k_global)
 
         # Stitching metadata
         kv_left = jnp.maximum(kv_len - k_id, 0)
@@ -334,6 +409,8 @@ def rpa_body(
                 processed_kv_len=processed_kv_len,
                 cfgs=cfgs,
                 bq_start=bq_start,
+                kv_len_left=kv_len_left,
+                global_q_k_gap=global_q_k_gap,
             )
         )
         m_scratch_ref[:, q_slice] = m_next
@@ -370,7 +447,7 @@ def rpa_body(
     l_next = jnp.concatenate(l_new_list, axis=2)
     acc_next = jnp.concatenate(acc_new_list, axis=2)
     m_lanes = None
-    if cfgs.model.has_attention_sink:
+    if cfgs.model.has_attention_sink or cfgs.serve.return_lse:
         m_lanes = jnp.concatenate(m_new_list, axis=2)
 
     # Step 4: Write back outputs.
@@ -382,6 +459,8 @@ def rpa_body(
         o_vref,
         m_list=m_lanes,
         sink_ref=sink_ref,
+        lse_vref=lse_vref,
+        lse_stage_ref=lse_stage_ref,
         cfgs=cfgs,
     )
 
@@ -390,12 +469,16 @@ def rpa_body(
 
 
 def create_allocs(
-    kv_cache_hbm_ref: jax.Ref, o_hbm_ref: jax.Ref, cfgs: configs.RpaConfigs
+    kv_cache_hbm_ref: jax.Ref,
+    o_hbm_ref: jax.Ref,
+    lse_hbm_ref: jax.Ref | None,
+    cfgs: configs.RpaConfigs,
 ) -> tuple[
     bref_override.BatchingQRef,
     bref_override.KVBufferedRefSeqAlongLane
     | bref_override.KVBufferedRefHeadAlongSublane,
     bref_override.BatchingORef,
+    bref_override.BatchingLSERef | None,
 ]:
     kv_cache_spec = pl.BlockSpec(
         block_shape=cfgs.kv_vmem_shape,
@@ -442,8 +525,22 @@ def create_allocs(
         use_lookahead=False,
         cfgs=cfgs,
     )
+    lse_alloc = None
+    if lse_hbm_ref is not None:
+        lse_alloc = bref_override.BatchingLSERef.output(
+            spec=pl.BlockSpec(
+                block_shape=cfgs.lse_vmem_shape,
+                memory_space=pltpu.VMEM,
+                index_map=lambda i: (i,),
+                pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
+            ),
+            dtype_or_type=lse_hbm_ref,
+            buffer_count=2,
+            use_lookahead=False,
+            cfgs=cfgs,
+        )
 
-    return q_alloc, kv_cache_alloc, o_alloc
+    return q_alloc, kv_cache_alloc, o_alloc, lse_alloc
 
 
 def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
@@ -453,6 +550,14 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += f"-sw{cfgs.model.sliding_window}"
     if cfgs.model.has_attention_sink:
         name += "-sink"
+    if cfgs.serve.cache_only:
+        name += "-co"
+    if cfgs.serve.skip_kv_write:
+        name += "-nowb"
+    if cfgs.serve.return_lse:
+        name += "-lse"
+    if cfgs.serve.cp_group_size is not None:
+        name += f"-cp{cfgs.serve.cp_group_size}"
     return name
 
 
@@ -480,7 +585,10 @@ def rpa_kernel(
     attention_sink: jax.Array | None,
     *,
     cfgs: configs.RpaConfigs,
-) -> tuple[jax.Array, jax.Array]:
+    lse_hbm: jax.Array | None = None,
+    cp_rank: jax.Array | None = None,
+    kv_lens_global: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
 
     Args:
@@ -504,12 +612,17 @@ def rpa_kernel(
         attention_sink: [num_kv_heads, period, 128] f32 or None. Per-row sink
             logits from `wrapper.prepare_attention_sink`.
         cfgs: Configuration of the kernel.
+        lse_hbm: [num_kv_heads, max_num_tokens, 1, num_lanes] f32 with
+            return_lse, else None. Lane g holds aligned q head g.
+        cp_rank: [1] with cp_group_size, else None.
+        kv_lens_global: [max_num_seqs] with cp_group_size, else None.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
         new_kv_cache: [num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
             head_dim]. Result of new kv cache where k & vs are
             concatenated along num kv heads dim.
+        lse: the updated lse_hbm, or None.
     """
 
     def ragged_paged_attention_pipeline(
@@ -517,28 +630,35 @@ def rpa_kernel(
         cu_q_lens_ref: jax.Ref,
         kv_lens_ref: jax.Ref,
         page_indices_ref: jax.Ref,
+        # Scalar prefetch with cp_group_size, None otherwise.
+        cp_rank_ref: jax.Ref | None,
+        kv_lens_global_ref: jax.Ref | None,
         # Inputs.
         schedule_hbm_ref: schedule.RpaSchedule,
         q_hbm_ref: jax.Ref,
         new_kv_hbm_ref: jax.Ref,
         kv_cache_hbm_ref: jax.Ref,
         sink_ref: jax.Ref | None,
+        lse_hbm_ref: jax.Ref | None,
         # Outputs.
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
+        o_lse_hbm_ref: jax.Ref | None,
     ):
 
-        del o_kv_cache_hbm_ref
+        del o_kv_cache_hbm_ref, o_lse_hbm_ref
 
-        q_alloc, kv_cache_alloc, o_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, cfgs
+        q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
+            kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
         )
+        # The LSE output exists only with return_lse; None adds no buffer.
+        lse_spec = None if lse_alloc is None else lse_alloc.spec
 
         actual_steps = schedule_hbm_ref.actual_steps[0]
         num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
 
         @pl.with_scoped(
-            final_allocs=(q_alloc, kv_cache_alloc, o_alloc),
+            final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
             schedule_ref=schedule.RpaSchedule.create_shape_dtype(cfgs).scratch_shapes(),
             dma_sem=pltpu.SemaphoreType.DMA((1,)),
             scratches=(
@@ -555,8 +675,13 @@ def rpa_kernel(
                     dtype=cfgs.serve.dtype_out,
                 ),  # acc
             ),
+            lse_stage=(
+                pltpu.VMEM(cfgs.lse_stage_shape, dtype=jnp.float32)
+                if cfgs.serve.return_lse and cfgs.bq_sz > 1
+                else None
+            ),
         )
-        def _run(final_allocs, schedule_ref, dma_sem, scratches):
+        def _run(final_allocs, schedule_ref, dma_sem, scratches, lse_stage):
             # Initialize KV cache to zeros.
             # When performing p * v, we perform causal masking on lhs (p) by zeroing
             # out columns that should not be processed for a given row. Even if we
@@ -616,16 +741,19 @@ def rpa_kernel(
                         cu_q_lens_ref=cu_q_lens_ref,
                         kv_lens_ref=kv_lens_ref,
                         sink_ref=sink_ref,
+                        cp_rank_ref=cp_rank_ref,
+                        kv_lens_global_ref=kv_lens_global_ref,
                     ),
                     grid=(num_steps + prefix_steps,),
                     in_specs=(q_alloc.spec, kv_cache_alloc.spec),
-                    out_specs=(o_alloc.spec,),
+                    out_specs=(o_alloc.spec, lse_spec),
                 )
                 pipeline_func(
                     (q_hbm_ref, schedule_ref),
                     (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref, page_indices_ref),
                     (o_hbm_ref, schedule_ref),
-                    scratches=(schedule_ref,) + scratches,
+                    None if lse_alloc is None else (lse_hbm_ref, schedule_ref),
+                    scratches=(schedule_ref,) + scratches + (lse_stage,),
                     allocations=final_allocs,
                 )
 
@@ -641,16 +769,30 @@ def rpa_kernel(
 
         _run()
 
-    num_pre_leaves = 3  # cu_q_lens, kv_lens, page_indices
+    scalar_prefetches = (cu_q_lens, kv_lens, page_indices)
+    kernel = ragged_paged_attention_pipeline
+    if cfgs.serve.cp_group_size is None:
+        kernel = functools.partial(utils.without_cp_refs, kernel, num_scalar_prefetch=3)
+    else:
+        scalar_prefetches += (cp_rank, kv_lens_global)
+
+    num_pre_leaves = len(scalar_prefetches)
     num_sched_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
     q_hbm_idx = num_pre_leaves + num_sched_leaves
     kv_cache_hbm_idx = q_hbm_idx + 2
+    input_output_aliases = {q_hbm_idx: 0, kv_cache_hbm_idx: 1}
+    lse_hbm_spec = None
+    if lse_hbm is not None:
+        lse_hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+        # The optional sink table sits between kv_cache_hbm and lse_hbm.
+        lse_hbm_idx = kv_cache_hbm_idx + 1 + int(attention_sink is not None)
+        input_output_aliases[lse_hbm_idx] = 2
 
     return pl.pallas_call(
-        ragged_paged_attention_pipeline,
-        out_shape=[q_hbm, kv_cache_hbm],
+        kernel,
+        out_shape=[q_hbm, kv_cache_hbm, lse_hbm],
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=num_pre_leaves,
             in_specs=[
                 schedule_hbm.in_specs(),
                 pl.BlockSpec(memory_space=pltpu.HBM),  # q_hbm_ref
@@ -661,26 +803,27 @@ def rpa_kernel(
                     if attention_sink is None
                     else pl.BlockSpec(memory_space=pltpu.VMEM)
                 ),  # sink_ref
+                lse_hbm_spec,  # lse_hbm_ref
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
+                lse_hbm_spec,  # aliased_lse_hbm_ref
             ],
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=cfgs.vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        input_output_aliases={q_hbm_idx: 0, kv_cache_hbm_idx: 1},
+        input_output_aliases=input_output_aliases,
         name=get_kernel_name(cfgs),
         metadata=get_kernel_metadata(cfgs),
     )(
-        cu_q_lens,
-        kv_lens,
-        page_indices,
+        *scalar_prefetches,
         schedule_hbm,
         q_hbm,
         new_kv_hbm,
         kv_cache_hbm,
         attention_sink,
+        lse_hbm,
     )

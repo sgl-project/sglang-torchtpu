@@ -4,6 +4,7 @@ with SGLANG_RAIDEN_LISTENER_START_READ an announcement starts its read."""
 import ast
 import inspect
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -110,6 +111,8 @@ def _receiver(mgr):
     recv.bootstrap_infos = [{"rank_ip": "10.0.0.1", "rank_port": 4444}]
     recv._started = False
     recv.init_time = None
+    recv._handshake_start = time.time()
+    recv._handshake_timeout = 300
     return recv
 
 

@@ -38,6 +38,7 @@ class TestTpuReshardLayout(unittest.TestCase):
         source = _layer(dtype, max(1, total_heads // src_tp))
         destination = _layer(dtype, max(1, total_heads // dst_tp))
         mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
         mgr._kv_caches = [destination]
         mgr._swa_kv_caches = [destination] if swa else []
         mgr.kv_args = SimpleNamespace(total_kv_head_num=total_heads)

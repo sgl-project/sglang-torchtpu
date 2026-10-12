@@ -80,6 +80,11 @@ class ServingConfigs:
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
+    # Context-parallel modes; see `wrapper.ragged_paged_attention`.
+    cache_only: bool = False
+    skip_kv_write: bool = False
+    return_lse: bool = False
+    cp_group_size: int | None = None
 
     @property
     def pages_per_seq(self) -> int:
@@ -178,6 +183,8 @@ class RpaConfigs:
         fixed_bytes += 3  # distribution
         fixed_bytes += self.block.batch_size  # lane_lengths
         fixed_bytes += 1  # actual_steps
+        if self.serve.cp_group_size is not None:
+            fixed_bytes += self.serve.num_seqs + 1  # kv_lens_global, cp_rank
 
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
@@ -339,6 +346,24 @@ class RpaConfigs:
         )
 
     @property
+    def lse_vmem_shape(self):
+        # One f32 row of lanes per (KV head, token); lane g is aligned q head g.
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (
+            self.block.batch_size,
+            self.model.num_kv_heads,
+            self.block.bq_sz,
+            1,
+            num_lanes,
+        )
+
+    @property
+    def lse_stage_shape(self):
+        # One KV head's (token, aligned q head) rows of `lm_scratch_shape`.
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (self.block.bq_sz * self.aligned_num_q_heads_per_kv_head, num_lanes)
+
+    @property
     def acc_scratch_shape(self):
         return (
             self.model.num_kv_heads,
@@ -361,6 +386,8 @@ class RpaConfigs:
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         distribution: jax.Array,
+        cp_rank: jax.Array | None = None,
+        kv_lens_global: jax.Array | None = None,
     ):
         """Validate inputs to the RPA kernel statically."""
 
@@ -447,3 +474,34 @@ class RpaConfigs:
             )
         if distribution.shape != (3,):
             raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+
+        if (
+            self.serve.cache_only
+            and self.serve.kv_layout != KVLayout.HEAD_ALONG_SUBLANE
+        ):
+            # SEQ_ALONG_LANE fetches whole pages, so the stale tail of a shard's
+            # last page would reach p * v unmasked.
+            raise NotImplementedError("cache_only requires HEAD_ALONG_SUBLANE.")
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        if self.serve.return_lse and self.aligned_num_q_heads_per_kv_head > num_lanes:
+            raise ValueError(
+                f"return_lse packs {self.aligned_num_q_heads_per_kv_head=} q heads"
+                f" into {num_lanes} lanes."
+            )
+        if self.serve.cp_group_size is not None:
+            if self.serve.cp_group_size < 1:
+                raise ValueError(f"Expected {self.serve.cp_group_size=} >= 1.")
+            if not self.serve.cache_only:
+                raise ValueError("cp_group_size requires cache_only.")
+            if cp_rank is None or kv_lens_global is None:
+                raise ValueError("cp_group_size requires cp_rank and kv_lens_global.")
+            if cp_rank.shape != (1,) or cp_rank.dtype != jnp.int32:
+                raise ValueError(f"Expected int32 {cp_rank.shape=} to be (1,).")
+            if kv_lens_global.shape != kv_lens.shape or (
+                kv_lens_global.dtype != jnp.int32
+            ):
+                raise ValueError(
+                    f"Expected int32 {kv_lens_global.shape=} to be {kv_lens.shape}."
+                )
+        elif cp_rank is not None or kv_lens_global is not None:
+            raise ValueError("cp_rank and kv_lens_global require cp_group_size.")

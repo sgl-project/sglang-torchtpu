@@ -7,6 +7,7 @@ identity and the methods the core tree's ``is_out_of_tree()`` gates call.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -29,6 +30,22 @@ _DEFAULT_DRAFT_ATTENTION_BACKEND = "pallas_tpu_rpa_v3"
 # Set by patch_torch.monkey_patch_torch_tpu_env in the scheduler worker;
 # unlike WORLD_SIZE, no launcher exports it into the parent environment.
 _WORKER_BOOTSTRAP_MARKER = "SGLANG_TPU_CACHE_DP_SCOPE"
+
+
+@functools.cache
+def _with_index_head_dim(pool_cls: type) -> type:
+    """``pool_cls`` taking the ``index_head_dim`` the core OOT MLA builder passes."""
+
+    class _Pool(pool_cls):
+        def __init__(self, *args, index_head_dim=None, **kwargs):
+            # Only DSA pools take an indexer; TPU has none (see get_dsa_kv_pool_cls).
+            if index_head_dim is not None:
+                raise NotImplementedError("TPU has no DSA indexer KV pool.")
+            super().__init__(*args, **kwargs)
+
+    _Pool.__name__ = pool_cls.__name__
+    _Pool.__qualname__ = pool_cls.__qualname__
+    return _Pool
 
 
 class TpuOOTPlatform(TpuSRTPlatform):
@@ -55,6 +72,10 @@ class TpuOOTPlatform(TpuSRTPlatform):
             "DSA / sparse attention (DeepSeek V3.2 family) has no KV pool "
             "implementation on TPU. Run this model on a platform that supports DSA."
         )
+
+    def get_mla_kv_pool_cls(self) -> type:
+        # kv_cache_configurator._build_oot_mla_kv_pool passes index_head_dim=None.
+        return _with_index_head_dim(super().get_mla_kv_pool_cls())
 
     def get_full_graph_backend_cls(self) -> None:
         # The upstream default; TPU compiles whole graphs through TpuGraphRunner.

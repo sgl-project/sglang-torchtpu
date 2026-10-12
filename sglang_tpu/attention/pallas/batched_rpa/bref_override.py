@@ -432,6 +432,92 @@ class BatchingORef(pltpu.BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class BatchingLSERef(pltpu.BufferedRef):
+    """Stores the f32 LSE rows of every q block whose last k block ran: one
+    row of lanes per (KV head, token), so tokens index an untiled axis."""
+
+    cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
+
+    @classmethod
+    def create(
+        cls,
+        spec: pl.BlockSpec,
+        dtype_or_type: jax.Array,
+        buffer_type,  # pltpu.BufferType,
+        buffer_count: int,
+        use_lookahead: bool,
+        cfgs: configs.RpaConfigs,
+    ):
+        standard_ref = pltpu.BufferedRef.create(
+            spec=spec,
+            dtype_or_type=dtype_or_type,
+            buffer_type=buffer_type,
+            buffer_count=buffer_count,
+            grid_rank=1,
+            use_lookahead=use_lookahead,
+        )
+        return cls(
+            cfgs=cfgs,
+            **{
+                f.name: getattr(standard_ref, f.name)
+                for f in dataclasses.fields(pltpu.BufferedRef)
+            },
+        )
+
+    def _written_q_sizes(
+        self, schedule_ref: schedule.RpaSchedule, block_idx: jax.Array
+    ) -> list[tuple[jax.Array, jax.Array]]:
+        sizes = []
+        for b in range(self.cfgs.batch_size):
+            is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
+            q_src, q_sz = schedule_ref.get_dma_q(block_idx, b)
+            sizes.append((q_src, jnp.where(is_last_k, q_sz, 0)))
+        return sizes
+
+    def copy_out(
+        self,
+        dst_ref: tuple[jax.Ref, schedule.RpaSchedule],
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        # dst_ref: (lse_hbm, schedule_ref)
+        lse_hbm, schedule_ref = dst_ref
+        slot = self.current_copy_out_slot
+        sem = self.sem_sends.at[slot]
+        vmem_src = self.window_ref.at[slot]
+
+        q_sizes = self._written_q_sizes(schedule_ref, grid_indices[0])
+        for b, (q_src, q_sz) in enumerate(q_sizes):
+            pltpu.make_async_copy(
+                vmem_src.at[b, :, pl.ds(0, q_sz)],
+                lse_hbm.at[:, pl.ds(q_src, q_sz)],
+                sem,
+            ).start()
+
+    def wait_out(
+        self,
+        dst_ref: tuple[jax.Ref, schedule.RpaSchedule],
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        # dst_ref: (lse_hbm, schedule_ref)
+        lse_hbm, schedule_ref = dst_ref
+        slot = self.current_wait_out_slot
+        sem = self.sem_sends.at[slot]
+
+        num_tokens = 0
+        for _, q_sz in self._written_q_sizes(schedule_ref, grid_indices[0]):
+            num_tokens += q_sz
+        # One row of 128 f32 lanes (512 bytes) per (KV head, token).
+        wait_rows = num_tokens * self.cfgs.model.num_kv_heads
+        flat_ref = lse_hbm.bitcast(jnp.uint32).reshape((-1, 128))
+        pltpu.make_async_copy(
+            flat_ref.at[pl.ds(0, wait_rows), :],
+            flat_ref.at[pl.ds(0, wait_rows), :],
+            sem,
+        ).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class BatchingQRef(pltpu.BufferedRef):
     """Handles fetching Q blocks using precomputed metadata."""
 

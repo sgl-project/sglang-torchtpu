@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     get_minimax_sparse_index_dtype,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -736,6 +737,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        # TPU DCP ranks replicate KV, so each rank holds the heads of a
+        # tp // dcp group -- the count _build_tpu_swa_kv_pool allocates.
+        dcp_size = (
+            get_parallel().attn_dcp_size
+            if current_platform.dcp_shards_every_kv_pool()
+            else 1
+        )
 
         self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
         self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
@@ -767,14 +775,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             # The full pool may use the token-blocked page; the SWA pool is a
             # ring over the window and keeps the merged page.
             self._full_per_token = cache_bytes_per_token(
-                model_config.get_num_kv_heads(tp_size),
+                model_config.get_num_kv_heads(tp_size, dcp_size),
                 model_config.head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
                 layout=getattr(kvc, "kv_full_layout", None) or "merged",
             )
             self._swa_per_token = cache_bytes_per_token(
-                model_config.get_swa_num_kv_heads(tp_size),
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size),
                 model_config.swa_head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
@@ -808,14 +816,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         else:
             # Full layer per-token memory (bytes)
             self._full_per_token = (
-                model_config.get_num_kv_heads(tp_size)
+                model_config.get_num_kv_heads(tp_size, dcp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
                 * kv_size
             )
 
             # SWA layer per-token memory (bytes)
             self._swa_per_token = (
-                model_config.get_swa_num_kv_heads(tp_size)
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
                 * kv_size
             )
@@ -823,11 +831,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
-                model_config.get_num_kv_heads(tp_size)
+                model_config.get_num_kv_heads(tp_size, dcp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
             ) // scale_block_size
             self._swa_per_token += (
-                model_config.get_swa_num_kv_heads(tp_size)
+                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
@@ -996,8 +1004,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         swa_tokens += ceil_align(self._pipeline_swa_tokens, page_size)
 
         if not self._enable_unified_memory:
+            # The admission floor lives in the allocator's location space, which
+            # TPU DCP widens by dcp_size in both the pool size and the page.
+            widening = (
+                get_parallel().attn_dcp_size
+                if current_platform.dcp_shards_every_kv_pool()
+                else 1
+            )
             self.validate_swa_pool_size(
-                swa_tokens, self._sliding_window_size, self._page_size
+                swa_tokens * widening,
+                self._sliding_window_size,
+                self._page_size * widening,
             )
 
         logger.info(

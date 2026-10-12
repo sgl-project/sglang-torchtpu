@@ -125,6 +125,15 @@ def convert_to_target_bitwidth(val, target_bitwidth: int, kv_dtype: jnp.dtype):
         return left_out + right_out
 
 
+def without_cp_refs(kernel, *refs, num_scalar_prefetch: int):
+    """Calls `kernel` with None for the cp_rank / kv_lens_global scalar refs.
+
+    Those two refs follow the other scalar prefetches and are passed only with
+    cp_group_size, so every other program keeps its operands.
+    """
+    return kernel(*refs[:num_scalar_prefetch], None, None, *refs[num_scalar_prefetch:])
+
+
 def has_bank_conflicts(stride: int, distance=24, num_banks=32) -> bool:
     banks = set()
     for i in range(distance):

@@ -31,6 +31,8 @@ def flash_attention_qk_softmax(
     processed_kv_len: list[jax.Array],  # [B]
     cfgs: configs.RpaConfigs,
     bq_start: int,
+    kv_len_left: list[jax.Array] | None = None,  # [B]
+    global_q_k_gap: list[jax.Array] | None = None,  # [B]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, h_size = q.shape
@@ -72,11 +74,15 @@ def flash_attention_qk_softmax(
         qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)
 
     qk_masked = []
+    masks = []
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
     q_iota //= cfgs.aligned_num_q_heads_per_kv_head
     q_kv_diff = q_iota - kv_iota
+    if global_q_k_gap is not None:
+        # Local key j holds global position j * cp_group_size + cp_rank.
+        q_kv_diff_global = q_iota - cfgs.serve.cp_group_size * kv_iota
 
     for b_idx in range(cfgs.block.batch_size):
         # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
@@ -96,7 +102,11 @@ def flash_attention_qk_softmax(
         #   q_kv_delta = q_iota - kv_iota
         #   offset = processed_kv_len - (bq_start + processed_q_len)
         offset = processed_kv_len[b_idx] - (bq_start + processed_q_len[b_idx])
-        mask_b = q_kv_diff >= offset
+        if kv_len_left is None:
+            mask_b = q_kv_diff >= offset
+        else:
+            # Every cached key precedes every query; keys past kv_len are stale.
+            mask_b = kv_iota < kv_len_left[b_idx]
 
         if (sliding_window := cfgs.model.sliding_window) is not None:
             # NOTE: Goal is to compute q_len < sliding_window + kv_len. And similar
@@ -111,8 +121,15 @@ def flash_attention_qk_softmax(
             #   < sliding_window + processed_kv_len - (bq_start + processed_q_len)
             # Step 4:
             #   q_kv_diff < sliding_window + offset
-            mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+            if global_q_k_gap is None:
+                mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+            else:
+                # Same in global positions, with gap = q_global - k_global at
+                # q_iota = kv_iota = 0 of the block.
+                window_offset = sliding_window - (bq_start + global_q_k_gap[b_idx])
+                mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
 
+        masks.append(mask_b)
         qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
 
@@ -131,6 +148,10 @@ def flash_attention_qk_softmax(
 
     m_next = jnp.stack(m_next_list, axis=0)
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    if kv_len_left is not None:
+        # A row with no key in range keeps l == 0 rather than weighting masked
+        # keys by exp(mask_value - mask_value).
+        p = jnp.where(jnp.stack(masks, axis=0), p, 0)
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
@@ -142,7 +163,7 @@ def flash_attention_qk_softmax(
     l_next = jnp.stack(l_next_list, axis=0)
 
     # m_prev is the carry into the next step (reset after a last k block);
-    # m_next is each lane's running max, which the sink term is scaled by.
+    # m_next is each lane's running max, used by the sink term and the LSE.
     return p, alpha_list, m_prev, l_next, m_next
 
 

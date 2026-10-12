@@ -266,9 +266,9 @@ def init_cp_strategy(
 
     kind = ContextParallelStrategyKind.from_string(cp_strategy)
     if kind == ContextParallelStrategyKind.ZIGZAG:
-        from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+        from sglang.srt.platforms import current_platform
 
-        _STRATEGY = ZigzagCPStrategy(cp_size=cp_size)
+        _STRATEGY = current_platform.get_zigzag_cp_strategy_cls()(cp_size=cp_size)
     elif kind == ContextParallelStrategyKind.INTERLEAVE:
         from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 

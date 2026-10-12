@@ -104,6 +104,16 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
+    def get_zigzag_cp_strategy_cls(self) -> type:
+        """Return the zigzag prefill context-parallel strategy class."""
+        from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+
+        return ZigzagCPStrategy
+
+    def runs_eager_extend_cp(self) -> bool:
+        """Whether the eager runner shards a context-parallel extend itself."""
+        return True
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
 
@@ -166,12 +176,29 @@ class SRTPlatform(DeviceMixin):
         """
         return False
 
+    def supports_decode_context_parallel(self) -> bool:
+        """Whether this platform runs decode context parallelism; CUDA, HIP and
+        NPU are accepted by initialize_model_parallel directly."""
+        return False
+
+    def dcp_shards_every_kv_pool(self) -> bool:
+        """Whether decode context parallelism widens every KV allocator (SWA
+        included) by attn_dcp_size and shards every layer's K/V heads across
+        attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
         """One-time backend initialization.  Called in each worker."""
+        pass
+
+    def on_warmup_complete(self) -> None:
+        """Called once on the scheduler thread, the first time it goes idle after
+        a forward (the server warmup request has drained). Platforms that
+        compile ahead of serving freeze or monitor compilation here."""
         pass
 
     # ------------------------------------------------------------------

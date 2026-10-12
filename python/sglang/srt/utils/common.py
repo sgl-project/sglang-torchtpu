@@ -955,8 +955,9 @@ def get_mtgpu_memory_capacity():
 
 
 def get_device_memory_capacity(device: str = None):
-    # OOT platforms provide their own memory query via the platform class.
-    if current_platform.is_out_of_tree():
+    # OOT platforms provide their own memory query via the platform class. TPU
+    # reports none in both platform modes; HBM would raise the pre-capture reserve.
+    if current_platform.is_out_of_tree() and not current_platform.is_tpu():
         mem_bytes = current_platform.get_device_total_memory()
         if mem_bytes:
             return mem_bytes / (1 << 20)  # bytes -> MiB
@@ -2737,8 +2738,9 @@ def broadcast_pyobj(
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
-        serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        # Unpickle directly from the contiguous buffer to avoid a full bytes copy.
+        # The NumPy view keeps the CPU tensor alive until deserialization finishes.
+        data = pickle.loads(tensor_data.cpu().numpy())
         return data
 
 

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang_tpu._logging import get_logger
@@ -90,6 +91,139 @@ def _uses_seq_along_lane_kv() -> bool:
     )
 
     return uses_seq_along_lane_kv()
+
+
+# Text-only decoders with softmax attention in every layer and no tensor-parallel
+# shared expert: the layer types the context-parallel path covers.
+_PREFILL_CP_ARCHITECTURES = ("Qwen3MoeForCausalLM", "GptOssForCausalLM")
+
+
+def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
+    """Reject configurations the TPU prefill context-parallel path cannot run.
+
+    The path shards extend batches by zigzag blocks over the attention
+    context-parallel group (= the TP group), all-gathers K/V per layer into
+    every rank's own batched RPA pool and reduces the last-token rows before
+    the logits step; it exists only inside the compiled forward.
+    """
+    from sglang.srt.arg_groups.overrides import (
+        declare_resolution,
+        resolving_view,
+    )
+
+    cfg = resolving_view(server_args)
+    attn_cp_size = cfg.attn_cp_size
+    if attn_cp_size <= 1:
+        return
+    feature = f"Prefill context parallelism on TPU (--attn-cp-size {attn_cp_size})"
+    if not cfg.enable_prefill_cp:
+        raise NotImplementedError(f"{feature} requires --enable-prefill-cp.")
+    if cfg.cp_strategy != "zigzag":
+        raise NotImplementedError(
+            f"{feature} requires --cp-strategy zigzag, got {cfg.cp_strategy!r}."
+        )
+    from sglang.srt.utils.hf_transformers.config import get_config
+
+    hf_config = get_config(
+        cfg.model_path, trust_remote_code=cfg.trust_remote_code, revision=cfg.revision
+    )
+    architectures = list(hf_config.architectures or [])
+    if not set(architectures) & set(_PREFILL_CP_ARCHITECTURES):
+        raise NotImplementedError(
+            f"{feature} supports {' and '.join(_PREFILL_CP_ARCHITECTURES)} models, "
+            f"got {architectures}: multimodal, M-RoPE, linear-attention and "
+            "state-space models, and MoE layers with a tensor-parallel shared "
+            "expert, do not run on the context-parallel path."
+        )
+    # TODO(yinlin09): lift once gpt-oss with a bf16 KV cache gets through warmup
+    # above attention CP 2; on libtpu 0.0.47 a core halts at CP 4 and the first
+    # extend stalls at CP 8 (CP 2 and the fp8 cache run).
+    if (
+        "GptOssForCausalLM" in architectures
+        and cfg.kv_cache_dtype in ("bf16", "bfloat16")
+        and attn_cp_size > 2
+    ):
+        raise NotImplementedError(
+            f"{feature} with a bf16 KV cache fails in warmup for gpt-oss above "
+            "--attn-cp-size 2; keep the default fp8 KV cache or lower the CP size."
+        )
+    backend = cfg.attention_backend
+    if backend is None:
+        declare_resolution(
+            server_args,
+            "tpu.apply_server_args_defaults",
+            attention_backend="pallas_tpu_rpa_batched",
+        )
+    elif backend != "pallas_tpu_rpa_batched":
+        raise NotImplementedError(
+            f"{feature} requires --attention-backend pallas_tpu_rpa_batched, "
+            f"got {backend!r}."
+        )
+    if _uses_seq_along_lane_kv():
+        raise NotImplementedError(
+            f"{feature} writes K/V in the token-major fused layout; unset "
+            "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise NotImplementedError(f"{feature} does not support speculative decoding.")
+    if cfg.enable_dp_attention:
+        raise NotImplementedError(f"{feature} does not support DP attention.")
+    if cfg.moe_dp_size != attn_cp_size:
+        raise NotImplementedError(
+            f"{feature} requires --moe-dp-size {attn_cp_size} (replicated experts "
+            "on each rank's own tokens); expert-parallel MoE over the gathered "
+            f"tokens (--ep-size) is not supported, got {cfg.moe_dp_size}."
+        )
+    if not cfg.enable_torch_compile:
+        raise NotImplementedError(f"{feature} requires --enable-torch-compile.")
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise NotImplementedError(
+            f"{feature} requires --tpu-compile-tracer dynamo, got "
+            f"{cfg.tpu_compile_tracer!r}."
+        )
+    if cfg.sampling_backend is None:
+        declare_resolution(
+            server_args, "tpu.apply_server_args_defaults", sampling_backend="pytorch"
+        )
+    elif cfg.sampling_backend != "pytorch":
+        raise NotImplementedError(
+            f"{feature} requires --sampling-backend pytorch (the logits step runs on "
+            f"the reduced last-token rows), got {cfg.sampling_backend!r}."
+        )
+    if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
+        raise NotImplementedError(
+            f"{feature} does not support input (prompt) logprobs; unset "
+            "SGLANG_TPU_ENABLE_PROMPT_LOGPROB."
+        )
+    # The layout and the KV slot table are built from the host req_to_token.
+    _pin_req_to_token_on_host("prefill context parallelism")
+    # TODO(yinlin09): drop once libtpu is fixed. Next to the per-layer K/V
+    # all-gathers, the fused MoE's SparseCore gather gives wrong tokens (seen on
+    # libtpu 0.0.47; this forward's SparseCore regressions start with 0.0.46).
+    _pin_fused_moe_tensorcore_gather("prefill context parallelism")
+
+
+def _pin_req_to_token_on_host(reason: str) -> None:
+    """Force SGLANG_TPU_REQ_TO_TOKEN_ON_HOST on, warning if it was turned off."""
+    if not envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get():
+        logger.warning(
+            "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: "
+            f"{reason} requires host-resident req_to_token."
+        )
+    envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.set(True)
+
+
+def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
+    """Force SGLANG_TPU_FUSED_MOE_SC_GATHER off, warning if it was turned on."""
+    if (
+        envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.is_set()
+        and envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
+    ):
+        logger.warning(
+            "Overriding SGLANG_TPU_FUSED_MOE_SC_GATHER=1 -> 0: "
+            f"{reason} gathers the fused-MoE rows on the TensorCore."
+        )
+    envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
 
 
 def _mha_kv_pool_cls(backend: str | None) -> type:
@@ -284,6 +418,151 @@ def _resolve_num_hidden_layers(server_args) -> int:
         return 0
 
 
+# The attention backend TPU decode context parallelism runs on.
+_DCP_ATTENTION_BACKEND = "pallas_tpu_rpa_batched"
+
+# The chunk handle_gpu_memory_settings declares later for an unset
+# --chunked-prefill-size on TPU, whose device memory capacity it does not know.
+_UNSET_CHUNKED_PREFILL_SIZE = 4096
+
+
+def _validate_decode_context_parallel(server_args) -> None:
+    """Refuse the server-arg combinations TPU decode context parallelism does
+    not implement.
+
+    DCP shards each request's KV by absolute token position across a slice of
+    the TP group and merges the per-rank partial attention by log-sum-exp. It
+    runs on the batched RPA backend with a host-resident ``req_to_token`` and a
+    KV cache no other component reads -- every other attention backend,
+    parallelism mode and KV consumer is refused.
+    """
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.environ import envs
+
+    cfg = resolving_view(server_args)
+    dcp_size = cfg.dcp_size
+    if dcp_size <= 1:
+        return
+
+    if cfg.attention_backend != _DCP_ATTENTION_BACKEND:
+        raise ValueError(
+            "--decode-context-parallel-size > 1 on TPU requires "
+            f"--attention-backend {_DCP_ATTENTION_BACKEND}, got "
+            f"{cfg.attention_backend!r}."
+        )
+    if cfg.tp_size % dcp_size != 0:
+        raise ValueError(
+            f"--tensor-parallel-size ({cfg.tp_size}) must be divisible by "
+            f"--decode-context-parallel-size ({dcp_size})."
+        )
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--pipeline-parallel-size > 1 is not supported with "
+            f"--decode-context-parallel-size > 1 on TPU (got pp_size={cfg.pp_size})."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--speculative-algorithm is not supported with "
+            "--decode-context-parallel-size > 1 on TPU (got "
+            f"{cfg.speculative_algorithm!r})."
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            "--enable-mixed-chunk is not supported with "
+            "--decode-context-parallel-size > 1 on TPU: the DCP attention runs "
+            "plain decode and extend batches only."
+        )
+    if cfg.enable_dp_attention:
+        raise ValueError(
+            "--enable-dp-attention is not supported with "
+            "--decode-context-parallel-size > 1 on TPU."
+        )
+    if cfg.attn_cp_size > 1:
+        raise ValueError(
+            "--attention-context-parallel-size > 1 is not supported with "
+            "--decode-context-parallel-size > 1 on TPU (got "
+            f"attn_cp_size={cfg.attn_cp_size})."
+        )
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "--enable-prefill-cp is not supported with "
+            "--decode-context-parallel-size > 1 on TPU."
+        )
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--disaggregation-mode is not supported with "
+            "--decode-context-parallel-size > 1 on TPU (got "
+            f"{cfg.disaggregation_mode!r})."
+        )
+    if cfg.enable_hierarchical_cache:
+        raise ValueError(
+            "--enable-hierarchical-cache is not supported with "
+            "--decode-context-parallel-size > 1 on TPU."
+        )
+    if cfg.dcp_comm_backend != "ag_rs":
+        raise ValueError(
+            "--dcp-comm-backend must be 'ag_rs' with "
+            "--decode-context-parallel-size > 1 on TPU: the merge gathers the "
+            "LSEs and sums the outputs with zero-padded all-reduces, got "
+            f"{cfg.dcp_comm_backend!r}."
+        )
+    if cfg.dcp_replicate_q_proj:
+        raise ValueError(
+            "--dcp-replicate-q-proj is not supported with "
+            "--decode-context-parallel-size > 1 on TPU: it only applies to the "
+            "a2a/fi_a2a exchange on MLA attention."
+        )
+    if not cfg.enable_torch_compile:
+        raise ValueError(
+            "--enable-torch-compile is required with "
+            "--decode-context-parallel-size > 1 on TPU."
+        )
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise ValueError(
+            "--tpu-compile-tracer must be 'dynamo' with "
+            "--decode-context-parallel-size > 1 on TPU (got "
+            f"{cfg.tpu_compile_tracer!r})."
+        )
+    if not envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get():
+        raise ValueError(
+            "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 is not supported with "
+            "--decode-context-parallel-size > 1 on TPU: the DCP attention "
+            "metadata is built from a host-resident req_to_token."
+        )
+    if _uses_seq_along_lane_kv():
+        raise ValueError(
+            "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 is not supported with "
+            "--decode-context-parallel-size > 1 on TPU: the DCP KV write "
+            "targets the token-major fused KV cache."
+        )
+    if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+        raise ValueError(
+            "--decode-context-parallel-size > 1 on TPU supports only a bf16 KV "
+            "cache (--kv-cache-dtype bfloat16), got --kv-cache-dtype "
+            f"{cfg.kv_cache_dtype}."
+        )
+    chunk = cfg.chunked_prefill_size
+    if chunk is None:
+        chunk = _UNSET_CHUNKED_PREFILL_SIZE
+    if 0 < chunk < cfg.page_size * dcp_size:
+        raise ValueError(
+            f"--chunked-prefill-size ({chunk}) must be at least --page-size x "
+            f"--decode-context-parallel-size ({cfg.page_size} x {dcp_size} = "
+            f"{cfg.page_size * dcp_size}) on TPU: the DCP allocator hands out "
+            "pages of that many tokens and the scheduler cuts prefill chunks at "
+            "page boundaries, so a smaller chunk is never scheduled."
+        )
+    # TODO(yinlin09): lift once DCP4/DCP8 pass the e2e gate on the pinned stack;
+    # DCP8 served on torch_tpu 0.1.1.dev20260914 with libtpu 0.0.47.
+    if dcp_size > 2:
+        raise ValueError(
+            "--decode-context-parallel-size must be 1 or 2 on TPU, got "
+            f"{dcp_size}: with more ranks the forward stalls in warmup with the "
+            "SparseCore gather offloads off and returns wrong first tokens with "
+            "them on."
+        )
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -332,6 +611,8 @@ class TpuSRTPlatform(SRTPlatform):
         _prepare_tpu_env(cfg.tp_size * cfg.pp_size, setup_slicebuilder=not cfg.use_ray)
 
         from sglang_tpu.env_override import (
+            apply_decode_cp_sparse_core_override,
+            apply_prefill_cp_sparse_core_override,
             apply_small_kv_pool_vmem_prefetch_override,
         )
 
@@ -339,12 +620,32 @@ class TpuSRTPlatform(SRTPlatform):
             max_total_tokens=cfg.max_total_tokens,
             num_hidden_layers=_resolve_num_hidden_layers(cfg),
         )
+        apply_decode_cp_sparse_core_override(dcp_size=cfg.dcp_size)
 
         if cfg.dtype is None or cfg.dtype == "auto":
             declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", dtype="bfloat16"
             )
 
+        _validate_prefill_context_parallel(server_args)
+        apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
+
+        # Decode context parallelism runs on one backend only, so an unset
+        # backend resolves to it instead of the platform default.
+        if cfg.attention_backend is None and cfg.dcp_size > 1:
+            declare_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                attention_backend=_DCP_ATTENTION_BACKEND,
+            )
+        # Decode context parallelism supports only a bf16 KV cache, so an unset
+        # KV dtype resolves to it instead of the RPA backends' fp8 default.
+        if cfg.dcp_size > 1 and cfg.kv_cache_dtype == "auto":
+            declare_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                kv_cache_dtype="bfloat16",
+            )
         if cfg.attention_backend is None:
             declare_resolution(
                 server_args,
@@ -392,13 +693,7 @@ class TpuSRTPlatform(SRTPlatform):
         # nodes' prefix indices on device and mix devices in the prefix cat. Pin
         # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for raiden.
         if cfg.hicache_io_backend == "raiden":
-            if os.environ.get("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST") == "0":
-                logger.warning(
-                    "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: the "
-                    "raiden KV-offload backend requires host-resident "
-                    "req_to_token."
-                )
-            os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
+            _pin_req_to_token_on_host("the raiden KV-offload backend")
 
         # There is no CUDA coredump on TPU: on a crash the handler would trigger
         # a no-op dump, then sleep SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS
@@ -452,6 +747,8 @@ class TpuSRTPlatform(SRTPlatform):
                 )
 
         _apply_page_size_default(server_args)
+        # After the page-size default: the DCP chunk check reads the page size.
+        _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
 
     # ------------------------------------------------------------------
@@ -560,6 +857,15 @@ class TpuSRTPlatform(SRTPlatform):
     def get_nsa_kv_pool_cls(self) -> type:
         raise NotImplementedError("NSA is not supported on TPU.")
 
+    def get_zigzag_cp_strategy_cls(self) -> type:
+        from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
+
+        return TpuZigzagCPStrategy
+
+    def runs_eager_extend_cp(self) -> bool:
+        # The compiled forward shards the context-parallel extend.
+        return False
+
     def get_paged_allocator_cls(self) -> type:
         from sglang_tpu.allocator_tpu import (
             TpuPagedTokenToKVPoolAllocator,
@@ -591,6 +897,14 @@ class TpuSRTPlatform(SRTPlatform):
 
     def support_piecewise_cuda_graph(self) -> bool:
         return False
+
+    def supports_decode_context_parallel(self) -> bool:
+        return True
+
+    def dcp_shards_every_kv_pool(self) -> bool:
+        # The batched RPA DCP path addresses every pool through the widened
+        # location space and replicates K/V heads within a DCP group.
+        return True
 
     def supports_overlap_streams(self) -> bool:
         # torch_tpu serialises all device work on a single implicit PJRT queue:
@@ -657,6 +971,33 @@ class TpuSRTPlatform(SRTPlatform):
 
         apply_tpu_patches()
         self._backend_initialized = True
+
+    def on_warmup_complete(self) -> None:
+        """Freeze torch.compile so serving-time recompiles raise."""
+        from sglang.srt.runtime_context import get_exec, get_spec
+        from sglang_tpu.compilation.recompilation_checker import (
+            maybe_enable_site_tracing,
+        )
+
+        # Dispatch modes are thread-local; this runs on the scheduler thread.
+        maybe_enable_site_tracing()
+        if not get_exec().graph.enable_torch_compile:
+            return
+        if (
+            get_spec().speculative_algorithm is not None
+            and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
+        ):
+            logger.info(
+                "[tpu] Warmup complete; leaving torch.compile recompiles enabled "
+                "for speculative decoding because "
+                "SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
+            )
+            return
+        torch.compiler.set_stance("fail_on_recompile")
+        logger.info(
+            "[tpu] Warmup complete; froze torch.compile via "
+            "set_stance('fail_on_recompile')."
+        )
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration
