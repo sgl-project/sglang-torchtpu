@@ -270,7 +270,14 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             ),
         )
 
+        # Test the sizing warning independently of the CI runner's free RAM.
         with (
+            patch.object(host_base, "ranks_per_host", return_value=1),
+            patch.object(
+                host_base,
+                "available_host_memory_bytes",
+                return_value=host_base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1024,
+            ),
             patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer_cls,
             self.assertLogs("sglang_tpu.kv_pool_host", level="WARNING") as logs,
         ):
