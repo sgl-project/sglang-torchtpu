@@ -943,6 +943,13 @@ class TpuSRTPlatform(SRTPlatform):
 
     supports_mamba_extra_buffer = True
 
+    def supports_mamba_prefix_cache(self, model_config) -> bool:
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+        # KDA shares GDN metadata setup, but does not pass snapshot tracking
+        # to its kernel yet. Only the GDN backend writes reusable checkpoints.
+        return hybrid_gdn_config(model_config) is not None
+
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
         # Lazy slot allocation/release has not been validated with TPU snapshots.
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":

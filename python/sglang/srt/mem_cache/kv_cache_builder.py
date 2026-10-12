@@ -305,16 +305,11 @@ def build_kv_cache(
 
     from sglang.srt.platforms import current_platform
 
-    # Only GDN writes the checkpoints consumed by native TPU prefix caching.
-    # KDA shares its metadata setup, but does not yet pass tracking to its kernel.
-    if (
-        current_platform.is_tpu()
-        and is_hybrid_ssm
-        and hybrid_gdn_config(model_config) is None
-    ):
+    if is_hybrid_ssm and not current_platform.supports_mamba_prefix_cache(model_config):
         disable_radix_cache = True
         logger.warning(
-            "TPU recurrent-state prefix caching currently supports GDN only."
+            "Radix cache is disabled because the platform does not support "
+            "prefix checkpoints for this model's recurrent backend."
         )
 
     # Decode-side radix cache supports SWA only through the unified tree, whose

@@ -10,17 +10,20 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.arg_groups import mamba_hook, overrides
+from sglang.srt.configs import Qwen3NextConfig
 from sglang.srt.mem_cache import kv_cache_builder as builder
-from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.platform import TpuOOTPlatform
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
-class TestTpuPrefixCachePolicy(unittest.TestCase):
+class TestTpuPrefixCachePolicy(CustomTestCase):
     def test_lazy_strategy_is_rejected_only_on_tpu(self):
-        for tpu in (True, False):
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform, SRTPlatform):
+            tpu = platform_cls is not SRTPlatform
             for strategy in ("extra_buffer", "extra_buffer_lazy"):
-                with self.subTest(tpu=tpu, strategy=strategy):
+                with self.subTest(platform=platform_cls.__name__, strategy=strategy):
                     platform = SimpleNamespace(
                         is_tpu=tpu,
                         is_cuda=not tpu,
@@ -46,7 +49,7 @@ class TestTpuPrefixCachePolicy(unittest.TestCase):
                         patch.object(
                             mamba_hook,
                             "current_platform",
-                            TpuSRTPlatform() if tpu else SRTPlatform(),
+                            platform_cls(),
                         ),
                         patch.object(overrides, "get_platform", return_value=platform),
                         self.assertRaisesRegex(
@@ -62,18 +65,34 @@ class TestTpuPrefixCachePolicy(unittest.TestCase):
                         )
 
     def test_backend_guard_preserves_other_devices_and_explicit_disable(self):
-        for tpu, recurrent, gdn, disabled, expected in (
+        cases = (
             (True, True, False, False, True),  # KDA / other recurrent backends
             (True, True, True, False, False),
             (True, True, True, True, True),
             (True, False, False, False, False),  # Ordinary attention
             (False, True, False, False, False),  # GPU KDA remains supported
+        )
+        for platform_cls, recurrent, gdn, disabled, expected in (
+            (platform_cls, recurrent, gdn, disabled, expected)
+            for tpu, recurrent, gdn, disabled, expected in cases
+            for platform_cls in (
+                (TpuSRTPlatform, TpuOOTPlatform) if tpu else (SRTPlatform,)
+            )
         ):
-            with self.subTest(tpu=tpu, recurrent=recurrent, gdn=gdn, disabled=disabled):
+            with self.subTest(
+                platform=platform_cls.__name__,
+                recurrent=recurrent,
+                gdn=gdn,
+                disabled=disabled,
+            ):
                 worker = MagicMock()
                 worker.is_hybrid_swa = False
                 worker.get_memory_pool.return_value = (MagicMock(), MagicMock())
-                model = SimpleNamespace(is_multimodal=False, hf_config=object())
+                text_config = Qwen3NextConfig() if gdn else object()
+                model = SimpleNamespace(
+                    is_multimodal=False,
+                    hf_config=SimpleNamespace(get_text_config=lambda: text_config),
+                )
                 memory = MagicMock(disable_radix_cache=disabled)
                 parallel = MagicMock(dcp_enabled=False, enable_dp_attention=False)
                 with contextlib.ExitStack() as stack:
@@ -96,7 +115,7 @@ class TestTpuPrefixCachePolicy(unittest.TestCase):
                             patch.object(builder, name, return_value=value)
                         )
                     stack.enter_context(
-                        patch.object(current_platform, "is_tpu", return_value=tpu)
+                        patch("sglang.srt.platforms.current_platform", platform_cls())
                     )
                     stack.enter_context(
                         patch.object(
