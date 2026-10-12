@@ -6,7 +6,7 @@ import time
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 import zmq
@@ -1482,6 +1482,10 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         class FakeSocket:
             def __init__(self):
                 self.closed = False
+                self.monitored = True
+
+            def disable_monitor(self):
+                self.monitored = False
 
             def close(self, linger=None):
                 self.closed = True
@@ -1518,6 +1522,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
                 t.join(0.2)
                 self.assertTrue(t.is_alive())
                 self.assertFalse(sock.closed)
+                self.assertTrue(sock.monitored)
             t.join(2)
 
         self.assertEqual(seen["addr"], "10.0.0.1:8998")
@@ -1649,6 +1654,92 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         self.assertFalse(waiting.is_alive())
         self.assertFalse(clear.is_alive())
         self.assertNotIn(ROOM, mgr.request_status)
+
+
+# Contexts whose I/O thread a failing case blocked. Terminating one never
+# returns, so it is parked here rather than hanging the run.
+_BLOCKED_CONTEXTS = []
+
+
+class _MonitorWhosePeerDropsOnClose:
+    """A socket monitor whose monitored peer disconnects right after it closes."""
+
+    def __init__(self, *, monitor, peer):
+        self._monitor = monitor
+        self._peer = peer
+
+    def close(self):
+        self._monitor.close()
+        self._peer.close(linger=0)
+        # Measured: libzmq sees the drop within 50 ms, doubled for a loaded host.
+        time.sleep(0.1)
+
+
+class TestDisconnectLeavesOtherPeersReachable(unittest.TestCase):
+    """Dropping one prefill must not stop this rank's sends to the others.
+
+    libzmq reports a peer drop with a blocking send to the socket's monitor,
+    on the one I/O thread its context has. A drop reported to a closed monitor
+    blocks that thread for good: every socket of the context keeps accepting
+    messages and delivers none.
+    """
+
+    @staticmethod
+    def _bound_peer(ctx):
+        peer = ctx.socket(zmq.PULL)
+        port = peer.bind_to_random_port("tcp://127.0.0.1")
+        return peer, f"tcp://127.0.0.1:{port}"
+
+    def test_peer_dropping_during_disconnect_does_not_stall_other_sends(self):
+        peer_ctx = zmq.Context()
+        self.addCleanup(peer_ctx.destroy, linger=0)
+        dropped_peer, dropped_endpoint = self._bound_peer(peer_ctx)
+        live_peer, live_endpoint = self._bound_peer(peer_ctx)
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
+        mgr.defer_decode_allocation = False
+        mgr._zmq_ctx = zmq.Context()
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {}
+        mgr._monitor_cache = {}
+        mgr._socket_send_locks = {}
+        for endpoint, peer in (
+            (dropped_endpoint, dropped_peer),
+            (live_endpoint, live_peer),
+        ):
+            mgr._send_multipart_locked(endpoint, [b"connect"])
+            self.assertTrue(peer.poll(5000), "peer never connected")
+            peer.recv_multipart()
+        mgr._monitor_cache[dropped_endpoint] = _MonitorWhosePeerDropsOnClose(
+            monitor=mgr._monitor_cache[dropped_endpoint], peer=dropped_peer
+        )
+
+        mgr._disconnect_endpoint(dropped_endpoint)
+        mgr._send_multipart_locked(live_endpoint, [b"after the drop"])
+        delivered = bool(live_peer.poll(5000))
+
+        if delivered:
+            mgr._disconnect_endpoint(live_endpoint)
+            mgr._zmq_ctx.term()
+        else:
+            _BLOCKED_CONTEXTS.append(mgr._zmq_ctx)
+        self.assertTrue(delivered, "the send to the live peer was never delivered")
+
+    def test_monitor_is_detached_before_either_end_closes(self):
+        """Closing the socket ahead of its monitor is not enough: a drop that
+        races the close is still reported to the closed monitor. The socket
+        has to stop reporting first."""
+        endpoint = "tcp://10.0.0.1:4444"
+        zmq_calls = Mock()
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {endpoint: zmq_calls.sock}
+        mgr._monitor_cache = {endpoint: zmq_calls.monitor}
+        mgr._socket_send_locks = {endpoint: threading.Lock()}
+
+        mgr._disconnect_endpoint(endpoint)
+
+        self.assertEqual(zmq_calls.mock_calls[0], call.sock.disable_monitor())
 
 
 ANNOUNCE_ROOM = 21

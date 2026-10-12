@@ -796,10 +796,15 @@ class RaidenKVManager(
         if sock is None and monitor is None:
             return
         with send_lock if send_lock is not None else contextlib.nullcontext():
+            if sock is not None:
+                # libzmq's I/O thread reports a peer drop with a blocking send
+                # to the monitor. Once the monitor is closed that send never
+                # returns, and no socket of this context delivers again, so
+                # the socket stops reporting before either end is closed.
+                sock.disable_monitor()
+                sock.close(linger=0)
             if monitor is not None:
                 monitor.close()
-            if sock is not None:
-                sock.close(linger=0)
 
     def register_to_bootstrap(self):
         # Topology/handshake registration is backend-agnostic; raiden adds no
