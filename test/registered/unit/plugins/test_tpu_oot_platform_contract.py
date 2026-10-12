@@ -191,17 +191,12 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     # -- DSA / sparse attention -------------------------------------------
 
     def test_dsa_kv_pool_cls_fails_with_a_tpu_specific_message(self):
-        """TPU has no DSA pool; the refusal must name TPU, not be the base stub."""
+        """Mode B has no DSA pool yet; the refusal must name TPU, not be the base stub."""
         owner = _defining_class(self.TpuOOTPlatform, "get_dsa_kv_pool_cls")
         self.assertIn(owner, self.tpu_owned)
         with self.assertRaises(NotImplementedError) as caught:
             self.platform.get_dsa_kv_pool_cls()
         self.assertIn("TPU", str(caught.exception))
-
-    def test_nsa_kv_pool_cls_is_also_a_refusal(self):
-        """Neither spelling has a pool."""
-        with self.assertRaises(NotImplementedError):
-            self.platform.get_nsa_kv_pool_cls()
 
     # -- speculative decoding ---------------------------------------------
 

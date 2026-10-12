@@ -404,6 +404,58 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     )
 
 
+def _validate_dsa(server_args) -> None:
+    """Reject the sparse-attention (DSA) setups that TPU cannot serve correctly."""
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.utils.hf_transformers.config import get_config
+
+    cfg = resolving_view(server_args)
+    try:
+        hf_config = get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
+        )
+    except Exception:
+        # A model that cannot be loaded here fails later with its real error.
+        return
+    if not is_deepseek_dsa(hf_config):
+        return
+    if cfg.attention_backend != "pallas_tpu_mla_sparse":
+        raise ValueError(
+            "Sparse attention (DSA) on TPU needs --attention-backend "
+            f"pallas_tpu_mla_sparse, got {cfg.attention_backend!r}."
+        )
+    # With these two settings the GPU indexer always keeps the first
+    # index_init_tokens and the last index_local_tokens positions. The TPU
+    # top-k kernel cannot do that yet, and ignoring them would change the
+    # selection without any error.
+    # TODO(sglang-torchtpu#1072): support them on TPU.
+    init_tokens = getattr(hf_config, "index_init_tokens", 0)
+    local_tokens = getattr(hf_config, "index_local_tokens", 0)
+    if init_tokens or local_tokens:
+        raise ValueError(
+            "DSA on TPU does not support index_init_tokens or index_local_tokens "
+            f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
+        )
+
+
+def _register_attention_backends() -> None:
+    """Add the attention backends that only this package knows to the registry."""
+    from sglang.srt.layers.attention.attention_registry import (
+        register_attention_backend,
+    )
+
+    @register_attention_backend("pallas_tpu_mla_sparse")
+    def create_pallas_tpu_mla_sparse_backend(runner):
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+
+        return TpuPallasSparseMlaAttnBackend(runner)
+
+
 def _resolve_num_hidden_layers(server_args) -> int:
     """Layer count from the model's HF config (lru-cached load), 0 when
     unresolvable — an unloadable model fails later with its real error, and
@@ -632,6 +684,8 @@ class TpuSRTPlatform(SRTPlatform):
 
         _validate_prefill_context_parallel(server_args)
         apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
+        # Before the default backend below, so the error names what was passed.
+        _validate_dsa(server_args)
 
         # Decode context parallelism runs on one backend only, so an unset
         # backend resolves to it instead of the platform default.
@@ -975,6 +1029,7 @@ class TpuSRTPlatform(SRTPlatform):
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        _register_attention_backends()
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:

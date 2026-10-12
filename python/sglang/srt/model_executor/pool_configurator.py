@@ -640,16 +640,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(dtype)
             if not is_npu_arch35():
                 allocate_all_layers = True
-        if _is_tpu:
-            from sglang_tpu.kv_pool import (
-                TpuFusedDSATokenToKVPool,
-            )
-
-            # On TPU each token's index key is one padded uint8 record.
-            indexer_size_per_token = TpuFusedDSATokenToKVPool.index_key_record_bytes(
-                index_head_dim
-            )
-            element_size = 1
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

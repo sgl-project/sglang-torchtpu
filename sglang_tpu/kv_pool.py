@@ -930,6 +930,11 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
 
     Like the KV cache, these buffers are written only by the op that uses them
     (the indexer op), which updates them in place.
+
+    TODO(sglang-torchtpu#1072): the core pool sizer counts 132 bytes per index
+    key, not this pool's 256, so a pool sized from free memory comes out too
+    large (about 2.5% for GLM-5.2). Pass --max-total-tokens until the sizer can
+    ask the pool for its bytes per token.
     """
 
     # The index-key cache stores this many tokens per row of a page.

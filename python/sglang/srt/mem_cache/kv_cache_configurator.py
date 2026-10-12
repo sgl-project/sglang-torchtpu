@@ -1393,16 +1393,21 @@ class KVCacheConfigurator:
                 )
         elif (
             current_platform.is_tpu()
-            and not self.use_mla_backend
             and not self.mambaish_config
+            and (not self.use_mla_backend or is_dsa_model)
         ):
-            # TPU MHA pools (mirrors the ascend branch above). TPU is in-tree
-            # (PlatformEnum.TPU), so the is_out_of_tree() branch never fires;
-            # build via the same platform hooks the OOT path uses.
+            # TPU MHA and DSA pools (mirrors the ascend branch above). TPU is
+            # in-tree (PlatformEnum.TPU), so the is_out_of_tree() branch never
+            # fires; build via the same platform hooks the OOT path uses.
             # get_mha_kv_pool_cls() returns the fused (RPA v3) or flat
             # (torch_native / pallas_tpu_flash) pool per the resolved backend.
-            # TPU MLA models fall through to the shared MLA branch below.
-            if self.is_hybrid_swa:
+            # TPU MLA models without DSA fall through to the shared MLA branch
+            # below.
+            if self.use_mla_backend:
+                token_to_kv_pool = self._build_tpu_dsa_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
+            elif self.is_hybrid_swa:
                 token_to_kv_pool = self._build_tpu_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -1905,11 +1910,6 @@ class KVCacheConfigurator:
     def _build_dsa_kv_pool(
         self, *, max_total_num_tokens: int, max_running_requests: int
     ) -> KVCache:
-        if current_platform.is_tpu():
-            return self._build_tpu_dsa_kv_pool(
-                max_total_num_tokens=max_total_num_tokens
-            )
-
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
         (

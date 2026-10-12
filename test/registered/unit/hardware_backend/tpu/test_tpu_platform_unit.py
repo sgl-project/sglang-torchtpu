@@ -594,6 +594,43 @@ class TestPrefillContextParallelValidation(CustomTestCase):
         )
 
 
+class TestDsaValidation(CustomTestCase):
+    """apply_server_args_defaults rejects the DSA setups TPU would serve wrongly."""
+
+    _args = TestTpuPlatformServerDefaults._args
+    _apply = TestTpuPlatformServerDefaults._apply
+
+    def _apply_dsa(self, *, attention_backend, **config_fields):
+        args = self._args(
+            attention_backend=attention_backend,
+            model_path="model",
+            trust_remote_code=False,
+            revision=None,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048, **config_fields
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers.config.get_config",
+            return_value=hf_config,
+        ):
+            self._apply(args)
+
+    def test_dsa_needs_the_sparse_backend_and_a_plain_top_k(self):
+        """TPU has one DSA backend, and its top-k kernel cannot force the
+        init/local positions in. Either mismatch must stop the launch: served
+        anyway, the model would attend over a different selection."""
+        self._apply_dsa(attention_backend="pallas_tpu_mla_sparse")
+        with self.assertRaisesRegex(ValueError, "pallas_tpu_mla_sparse"):
+            self._apply_dsa(attention_backend="pallas_tpu_mla")
+        for field in ("index_init_tokens", "index_local_tokens"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    self._apply_dsa(
+                        attention_backend="pallas_tpu_mla_sparse", **{field: 4}
+                    )
+
+
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     """Decode context parallel is admitted only for the configuration the TPU
     batched RPA backend implements; every other combination is refused by name."""

@@ -30,13 +30,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
-from sglang_tpu.dsa_indexer_tpu import build_dsa_index_topk_op
+from sglang_tpu.dsa_indexer_tpu import build_dsa_index_topk_op, indexer_forward
 from sglang_tpu.pallas_export import (
     argnums,
     tpu_info_for_cpu_export,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -178,6 +179,25 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     def _build_kernel_op(self):
         # The base class constructor calls this to set self._op.
         return _build_pallas_sparse_mla_kernel_op()
+
+    def forward_indexer(
+        self,
+        indexer: "Indexer",
+        *,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Run one layer's indexer. ``Indexer.forward_tpu`` calls this."""
+        return indexer_forward(
+            indexer,
+            backend=self,
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            layer_id=layer_id,
+        )
 
     def index_topk(
         self,

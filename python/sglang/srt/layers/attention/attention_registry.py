@@ -650,12 +650,3 @@ def create_pallas_tpu_mla_backend(runner):
     )
 
     return TpuPallasMlaAttnBackend(runner)
-
-
-@register_attention_backend("pallas_tpu_mla_sparse")
-def create_pallas_tpu_mla_sparse_backend(runner):
-    from sglang_tpu.attention_pallas_mla_sparse import (
-        TpuPallasSparseMlaAttnBackend,
-    )
-
-    return TpuPallasSparseMlaAttnBackend(runner)

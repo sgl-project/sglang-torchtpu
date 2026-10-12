@@ -1974,6 +1974,37 @@ class TestOutOfTreeHybridSwaRouting(CustomTestCase):
         swa_allocator.assert_called_once()
 
 
+class TestTpuDsaRouting(CustomTestCase):
+    """On TPU a DSA model must get the TPU DSA pool. The generic DSA builder
+    allocates the GPU layout, which the TPU kernels cannot read."""
+
+    _fake_configurator = TestOutOfTreeHybridSwaRouting._fake_configurator
+    _sizes = TestOutOfTreeHybridSwaRouting._sizes
+
+    def test_tpu_dsa_model_builds_the_tpu_dsa_pool(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        fake.is_hybrid_swa = False
+        fake.use_mla_backend = True
+        fake._build_tpu_dsa_kv_pool = MagicMock(name="tpu_dsa_builder")
+        fake._build_dsa_kv_pool = MagicMock(name="generic_dsa_builder")
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+        ) as platform:
+            platform.is_out_of_tree.return_value = False
+            platform.is_tpu.return_value = True
+            KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=True,
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+            )
+        fake._build_tpu_dsa_kv_pool.assert_called_once_with(max_total_num_tokens=256)
+        fake._build_dsa_kv_pool.assert_not_called()
+
+
 class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
     """The core OOT MLA builder passes index_head_dim, which no TPU MLA pool took,
     so every MLA model failed to build its KV pool under SGLANG_PLATFORM=tpu_oot."""

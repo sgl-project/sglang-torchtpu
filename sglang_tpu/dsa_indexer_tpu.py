@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DSA indexer on TPU.
 
-``Indexer.forward_tpu`` calls ``indexer_forward`` in this module. It has two
-parts:
+``Indexer.forward_tpu`` asks the attention backend to run the indexer, and the
+backend calls ``indexer_forward`` in this module. It has two parts:
 
 * In torch: the indexer's linear layers and the rotary embedding.
 * In one custom op per layer: quantize the queries and keys, store the keys in
@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang_tpu.pallas_export import (
     argnums,
     tpu_info_for_cpu_export,
@@ -28,6 +27,7 @@ from sglang_tpu.pallas_export import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+    from sglang_tpu.attention_pallas_mla_sparse import TpuPallasSparseMlaAttnBackend
 
 _PALLAS_DSA_INDEX_TOPK_OP = None
 
@@ -148,6 +148,7 @@ def build_dsa_index_topk_op():
 def indexer_forward(
     indexer: "Indexer",
     *,
+    backend: "TpuPallasSparseMlaAttnBackend",
     x: torch.Tensor,
     q_lora: torch.Tensor,
     positions: torch.Tensor,
@@ -177,7 +178,7 @@ def indexer_forward(
     key = torch.cat([k_rope.to(key.dtype), key[..., rope_dim:]], dim=-1)
 
     head_weights, _ = indexer.weights_proj(x)
-    return get_attn_backend().index_topk(
+    return backend.index_topk(
         layer_id=layer_id,
         query=query,
         key=key,
