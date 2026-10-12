@@ -13,6 +13,7 @@
 #   TIMEOUT_PER_FILE per-file timeout (run_suite.py single-host; `timeout` per live-server file)
 #   PARTITION_FLAGS single-host run_suite partition arguments (empty when unsharded)
 #   TEST_FILE_FLAG single-host exact-file selection (empty when running a whole suite)
+#   FULL_MATRIX   1 on nightly runs: tests that trim their sweep for the gate run it whole
 #   SERVICE_ACCOUNT  indented serviceAccountName line (empty -> namespace default KSA)
 # The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
 # literal. Gating is handled by the kind-aware _tpu-test.
@@ -109,6 +110,7 @@ ${WEIGHTS_VOLUME}
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      export SGLANG_TPU_FULL_MATRIX=${FULL_MATRIX}
                       # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.
                       export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3

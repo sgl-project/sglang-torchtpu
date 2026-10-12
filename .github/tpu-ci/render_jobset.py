@@ -383,6 +383,9 @@ def main():
             else ""
         ),
         "TEST_FILE_FLAG": f"--test-file {a.test_file}" if a.test_file else "",
+        # Sweeps trimmed for the gate run whole on the nightly; see
+        # python/sglang/test/ci/gate_matrix.py.
+        "FULL_MATRIX": "1" if a.nightly else "0",
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
