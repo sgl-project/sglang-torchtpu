@@ -30,14 +30,16 @@ Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
        render_jobset.py --suite <name> --print-wait-seconds
 """
 
+from __future__ import annotations
+
 import argparse
-import glob
 import os
 import re
 import sys
 
 import yaml
 from ci_register_loader import ci_register as _ci_register
+from plan_partitions import suite_tests
 
 _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
@@ -95,34 +97,28 @@ def single_test_name(files):
 
 
 def suite_wait_seconds(
-    suite,
-    tests_dir="test/registered",
+    suite: str,
+    tests_dir: str = "test/registered",
     *,
-    nightly=False,
-    test_file="",
-    partition_id=None,
-    partition_size=None,
-):
-    files = [
-        path
-        for path in glob.glob(os.path.join(tests_dir, "**", "*.py"), recursive=True)
-        if os.path.basename(path) not in ("conftest.py", "__init__.py")
-    ]
-    tests = [
-        test
-        for test in _ci_register.collect_tests(files, sanity_check=False)
-        if test.backend == _ci_register.HWBackend.TPU
-        and test.effective_suite == suite
-        and test.nightly == nightly
-        and test.disabled is None
-    ]
-    if test_file:
-        requested = os.path.normpath(os.path.abspath(test_file))
-        tests = [
-            test
-            for test in tests
-            if os.path.normpath(os.path.abspath(test.filename)) == requested
-        ]
+    nightly: bool = False,
+    test_file: str = "",
+    partition_id: int | None = None,
+    partition_size: int | None = None,
+) -> int:
+    """Returns the poll budget (s) for a suite or one of its shards.
+
+    Args:
+      suite: Registered suite name.
+      tests_dir: Root scanned recursively for registered test files.
+      nightly: Budget the suite's nightly registrations.
+      test_file: If set, budget only this file.
+      partition_id: Shard index; required when partition_size is set.
+      partition_size: Shard count, or None for the whole suite.
+
+    Returns:
+      max(sum(est_time) * _WAIT_MARGIN, _WAIT_FLOOR_SECONDS).
+    """
+    tests = suite_tests(suite, tests_dir, nightly=nightly, test_file=test_file)
     if partition_size is not None:
         tests = _ci_register.auto_partition(tests, partition_id, partition_size)
     total = sum(test.est_time for test in tests)

@@ -244,7 +244,11 @@ poll budget, so an inflated value pushes a serialized run toward the next day's 
 
 ### PR gate — `pr-test-tpu.yml`
 
-_TODO._
+`stage-a-test-tpu-unit` runs as a matrix of single-host shards. `plan-unit` fixes the
+shard count once (`plan_partitions.py`: registered `est_time` / `--target-seconds`,
+capped by `--max-partitions`); each leg runs `run_suite.py --auto-partition-*` on the
+pinned head SHA. "Re-run failed jobs" keeps `plan-unit`'s output, so a re-run leg runs
+the same files. Keep the count out of the legs.
 
 ### Combo — `combo-test-tpu.yml`
 
@@ -264,11 +268,12 @@ _TODO._
 | `.github/tpu-ci/jobset-tpu.yaml` | **Unified** JobSet template (any host count); rendered by `render_jobset.py` |
 | `.github/tpu-ci/render_jobset.py` | Renders the JobSet — single-host suite mode or multi-host group mode |
 | `.github/tpu-ci/reconcile_quota.py` | Sets each ClusterQueue's `nominalQuota` from live allocatable chips; refuses to run if a multi-host pool holds more than one slice. Run by `_tpu-test.yml` before every submission; `--dry-run` locally |
+| `.github/tpu-ci/plan_partitions.py` | Fixes the shard count of a single-host suite once and emits the matrix JSON; shard file lists go to the step summary |
 | `.github/tpu-ci/discover_multihost.py` | Scans `MULTIHOST_LAUNCH` decls, groups files by launch spec → matrix JSON |
 | `benchmark/tpu/recipe/*_mh.sh` | Per-model multi-host launch recipes (own `MODEL`/`EP_SIZE`/…, exec `launch_server.sh`) |
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
-| `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated, on demand: runs only on a `/tag-and-rerun-ci` re-run); decide → build → single-host test |
+| `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated, on demand: runs only on a `/tag-and-rerun-ci` re-run); decide → build → sharded unit + e2e single-host tests |
 | `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build once → feature validation and perf stages in parallel |
 | `.github/workflows/feature-validation-tpu.yml` | Feature-validation stage, also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
 | `.github/workflows/accuracy-test-tpu.yml` | Accuracy stage, on its own 10 AM / 5 PM schedule and dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |

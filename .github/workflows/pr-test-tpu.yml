@@ -149,10 +149,34 @@ jobs:
       contents: read
       id-token: write
 
-  # Per-commit TPU suite on a single-host 2x2x1 slice (sized from topology.yaml).
+  # Shard count is fixed here once: "Re-run failed jobs" keeps this output, so a
+  # re-run leg recomputes the same auto_partition on the same pinned ref.
+  plan-unit:
+    needs: decide
+    if: >-
+      needs.decide.outputs.run == 'true'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Plan shards
+        id: plan
+        run: |
+          set -euo pipefail
+          echo "matrix=$(python3 .github/tpu-ci/plan_partitions.py --suite stage-a-test-tpu-unit --max-partitions 3)" >> "$GITHUB_OUTPUT"
+
+  # Per-commit TPU suite on single-host 2x2x1 slices (sized from topology.yaml).
   unit:
-    name: unit-test
-    needs: build
+    name: unit-test (${{ matrix.label }})
+    needs: [build, plan-unit]
+    strategy:
+      # Let the other shards finish so a re-run only repeats the failed one.
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan-unit.outputs.matrix) }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       # PR head SHA (immutable, matches the pushed code) rather than the test-merge
@@ -162,6 +186,11 @@ jobs:
       # Unit suite (kernels/backends; each test self-contained, no model server) runs
       # first so a broken kernel fails before the serving suite claims the slice.
       suite: stage-a-test-tpu-unit
+      partition_id: ${{ matrix.id }}
+      partition_size: ${{ matrix.size }}
+      # Distinct per shard: _tpu-test's concurrency group keys on it, and a shared
+      # group would cancel all but one pending shard.
+      run_name: stage-a-test-tpu-unit-${{ matrix.label }}
     permissions:
       contents: read
       id-token: write
@@ -183,7 +212,7 @@ jobs:
   # If tests are skipped (non-TPU PR), this finishes green immediately.
   # If tests are run, it blocks until all TPU stages finish and fails if any fail.
   pr-test-tpu-finish:
-    needs: [decide, build, unit, e2e]
+    needs: [decide, build, plan-unit, unit, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
