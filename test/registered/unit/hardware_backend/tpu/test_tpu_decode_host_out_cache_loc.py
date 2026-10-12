@@ -21,7 +21,7 @@ from sglang_tpu.allocator_tpu import (
 )
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
 PAGE = 4
 # Requests A and B: req_to_token rows and prefill lengths.

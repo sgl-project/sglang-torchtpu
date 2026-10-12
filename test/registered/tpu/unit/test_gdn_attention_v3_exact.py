@@ -14,7 +14,7 @@ rows, including the only row of an idle DP-attention rank's bucket, stay zero.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 import dataclasses
 import unittest

@@ -169,7 +169,7 @@ def run_files_chip_parallel(
                 time.sleep(wait)
             last_launch[0] = time.monotonic()
 
-    work: "queue.Queue" = queue.Queue()
+    work: queue.Queue = queue.Queue()
     for test in pinned:
         work.put(test)
 

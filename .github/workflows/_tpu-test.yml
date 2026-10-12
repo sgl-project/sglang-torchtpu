@@ -224,6 +224,7 @@ jobs:
             wait_s=$(( $(python3 .github/tpu-ci/render_jobset.py \
               --suite "$suite" \
               --test-file '${{ inputs.test_file }}' \
+              --tpu-chip-workers '${{ inputs.tpu_chip_workers }}' \
               --partition-id '${{ inputs.partition_id }}' \
               --partition-size '${{ inputs.partition_size }}' \
               ${{ inputs.nightly && '--nightly' || '' }} \
