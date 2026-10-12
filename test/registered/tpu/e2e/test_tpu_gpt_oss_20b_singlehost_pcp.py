@@ -9,61 +9,47 @@ prompts share their examples, checks answers end to end.
 """
 
 import os
+import tempfile
+import unittest
+from typing import ClassVar
+from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.needle_probe import needle_runner
-from sglang.test.tpu import model_config_main
+from sglang.test.tpu import run_model_config
+from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 # PCP is an attention feature; the checkpoint only has to be good enough for the
-# probe's assertions. GPT-OSS-20B loads in a fraction of the 30B's time, which is
-# what made test_tpu_qwen3_30b_a3b_singlehost_pcp.py the most expensive launch in
-# the e2e gate. That one now runs nightly and keeps the 30B FP8 configuration.
+# probe's assertions. test_tpu_qwen3_30b_a3b_singlehost_pcp.py keeps the 30B
+# FP8 configuration on the nightly.
 register_tpu_ci(
     est_time=600,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "gpt-oss-20b", "pcp"],
 )
 
-SERVED_MODEL_NAME = "gpt-oss-20b"
 MODEL_PATH = resolve_tpu_model_path("openai/gpt-oss-20b")
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
-# The floor the other GPT-OSS-20B gates use; this model scores ~0.775 on GSM8K
-# where Qwen3-30B-A3B scored 0.915, so the 0.86 floor of the nightly PCP test
-# does not transfer.
-GSM8K_ACCURACY = 0.60
-
-LAUNCH_ENV = {
-    "MODEL": MODEL_PATH,
-    # CP batches bucket their local rows (1/8 of the tokens) here too: 512 and
-    # 1024 hold the needles, 2048 a full chunk; 8192 covers non-CP batches.
-    "TPU_COMPILE_TOKENS": "512 1024 2048 8192",
-    "TPU_COMPILE_BS": "8 16 32",
-    "MAX_RUNNING": "32",
-    "TORCH_COMPILE_MAX_BS": "32",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "DISABLE_RADIX_CACHE": "0",
-    "EXTRA_ARGS": f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}",
-}
+SERVER_LOG = os.path.join(tempfile.mkdtemp(prefix="gpt-oss-20b-pcp-"), "server.log")
+# gpt-oss-20b scores 0.52-0.59 on these 200 questions (PP4xPCP2, TP8, PP8, and
+# 0.54 here); broken output scores near zero. Same floor as pp4_pcp2.
+GSM8K_ACCURACY = 0.45
+# GPT-OSS reasons before answering; 48 tokens cut a found word off mid-answer.
+NEEDLE_MAX_NEW_TOKENS = 128
 
 MODEL_CONFIG = {
-    "model": SERVED_MODEL_NAME,
+    "model": "gpt-oss-20b",
     "test_name": "gpt-oss-20b-pcp",
     "variant": "PCP8+MoE-DP8",
-    "launch": {
-        "recipe": "recipe/gpt_oss_20b_pcp.sh",
-        "env": LAUNCH_ENV,
-        "health_timeout": HEALTH_TIMEOUT,
-        "tag": "gpt-oss-20b-pcp-e2e",
-    },
     "gates": [
         {
             "dataset": "needle",
             "label": "needle-recall",
-            # GPT-OSS can open with reasoning text, so the answer needs
-            # more room than the 12 tokens the Qwen checkpoint needed.
-            "runner": lambda base_url: needle_runner(base_url, max_new_tokens=48),
+            "runner": lambda base_url: needle_runner(
+                base_url, max_new_tokens=NEEDLE_MAX_NEW_TOKENS
+            ),
         },
         {
             "dataset": "gsm8k",
@@ -73,13 +59,30 @@ MODEL_CONFIG = {
             "num_threads": 32,
             "max_tokens": 512,
             "temperature": 0.0,
-            # Few-shot completion prompts: the checkpoint's chat template would
-            # spend the token budget on thinking.
+            # Few-shot completion prompts: the chat template would spend the
+            # token budget on reasoning.
             "api": "completion",
         },
     ],
 }
 
 
+class TestGptOss20bSingleHostPcp(TPULauncherTestCase):
+    config_module = "recipe/configs/gpt_oss_20b/pcp.py"
+    base_url = BASE_URL
+    health_timeout = HEALTH_TIMEOUT
+    health_endpoint = "/health_generate"
+    log_path = SERVER_LOG
+    tag = "gpt-oss-20b-pcp-e2e"
+    runtime_envs: ClassVar[dict[str, str | None]] = {
+        "MODEL": MODEL_PATH,
+        "HOST": urlsplit(BASE_URL).hostname,
+        "PORT": str(urlsplit(BASE_URL).port),
+    }
+
+    def test_accuracy(self):
+        run_model_config(MODEL_CONFIG, base_url=self.base_url)
+
+
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    unittest.main()
