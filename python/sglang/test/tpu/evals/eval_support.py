@@ -330,7 +330,20 @@ def lm_eval_runner(config_path: str, report_only: bool = False):
         except requests.RequestException:
             pass
 
-        results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
+        # lm_eval.simple_evaluate() calls torch.manual_seed(), which triggers
+        # torch.tpu.manual_seed_all() -> PjrtBackend::EnsureInitialized() if
+        # torch_tpu was autoloaded in this HTTP client process while the server
+        # process owns /dev/vfio/*.
+        import torch
+
+        tpu_mod = getattr(torch, "tpu", None)
+        if tpu_mod is not None and not tpu_mod.is_initialized():
+            from unittest.mock import patch
+
+            with patch.object(tpu_mod, "is_available", return_value=False):
+                results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
+        else:
+            results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
 
         # Threshold fields are ignored when this runner is report-only.
         rtol = cfg.get("rtol", LMEvalMixin.default_rtol)
