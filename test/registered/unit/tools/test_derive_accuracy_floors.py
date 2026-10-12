@@ -64,6 +64,19 @@ class TestDeriveAccuracyFloors(unittest.TestCase):
         tight = derive_floors.derive({"n_items": 30, "min_floor": 0.1}, nights, 5)
         self.assertGreater(tight["floor"], 0.1)
 
+    def test_one_night_still_gates_but_wider_than_five(self):
+        def floor(values):
+            nights = [
+                (f"2026-10-0{i}T03:00:00", v, str(i)) for i, v in enumerate(values, 1)
+            ]
+            return derive_floors.derive({"n_items": 865}, nights, 5)
+
+        one, five = floor([0.75]), floor([0.75] * 5)
+        self.assertTrue(one["provisional"])
+        # sigma_binomial ~= 0.0147: 3 * sqrt(2) * sigma vs 3 * sqrt(1.2) * sigma.
+        self.assertAlmostEqual(one["floor"], 0.687, places=3)
+        self.assertAlmostEqual(five["floor"], 0.701, places=3)
+
     def test_new_nights_refresh_provenance_even_if_the_floor_holds(self):
         floors = self.tmp / "floors.json"
         entry = {

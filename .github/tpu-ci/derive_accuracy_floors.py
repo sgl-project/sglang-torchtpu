@@ -8,13 +8,15 @@ Every entry in accuracy_floors.json names one dashboard series (`id`, gate label
 and how many graded items one night scores (`n_items`: questions x repeats). This
 script takes the last `--nights` scores of each series and sets
 
-    floor = mean - 3 * max(sigma_nightly, sigma_binomial)
+    floor = mean - 3 * max(sigma_nightly, sigma_binomial) * sqrt(1 + 1/n)
 
 sigma_binomial = sqrt(p (1 - p) / n_items) keeps a short, lucky streak of nights
-from producing a floor tighter than the eval's own sampling noise. A series with
-fewer nights than asked keeps the same formula and is marked `provisional`; one
-with no nights falls back to its entry's `seed` scores (e.g. a sibling series or
-a one-off run), and fails if it has none.
+from producing a floor tighter than the eval's own sampling noise. sqrt(1 + 1/n)
+widens it for the error in a mean of n nights, so a series with a single night
+is gated too, just more loosely (1.41x vs 1.10x at 5). A series with fewer
+nights than asked is marked `provisional`; one with no nights falls back to its
+entry's `seed` scores (e.g. a sibling series or a one-off run), and fails if it
+has none.
 
 A night is one dashboard date: a retried or re-dispatched run records the same
 series again, so only the latest score per run_id, then per date, counts. An
@@ -67,8 +69,10 @@ def derive(entry: dict, nights: list, want: int) -> dict:
     sigma_nightly = statistics.stdev(values) if len(values) > 1 else 0.0
     sigma_binomial = math.sqrt(max(mean * (1 - mean), 0.0) / entry["n_items"])
     sigma = max(sigma_nightly, sigma_binomial)
+    # Prediction interval: the next night's noise plus the error in the mean.
+    width = 3 * sigma * math.sqrt(1 + 1 / len(values))
     # Rounded down so a score printed at 3 decimals never sits on the line.
-    floor = math.floor((mean - 3 * sigma) * 1000) / 1000
+    floor = math.floor((mean - width) * 1000) / 1000
     return {
         "floor": max(floor, entry.get("min_floor", floor)),
         "mean": round(mean, 4),
