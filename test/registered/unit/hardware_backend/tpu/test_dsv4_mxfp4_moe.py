@@ -22,7 +22,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.quantization.fp8 import cast_e2m1fn_to_e4m3fn
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.fp8_moe import (
     _FP4_E2M1_LUT,
     _FP4_E2M1_THRESHOLDS,
@@ -140,7 +140,7 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
     def setUp(self):
         from sglang.srt.runtime_context import get_parallel
 
-        self.enterContext(get_parallel().override(tp_size=1))
+        enter_scope(self, get_parallel().override(tp_size=1))
 
     def test_e2m1_threshold_quantization_matches_lut_argmin(self):
         lut = torch.tensor(_FP4_E2M1_LUT, dtype=torch.float32)
