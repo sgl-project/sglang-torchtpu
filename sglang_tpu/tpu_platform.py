@@ -358,21 +358,6 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         )
 
 
-def _validate_pd_queue_limit(
-    *, disaggregation_mode: str, max_queued_requests: int | None
-) -> None:
-    """Fail the server when a queue length limit is set and PD is enabled."""
-    if disaggregation_mode == "null" or max_queued_requests is None:
-        return
-    raise ValueError(
-        "--max-queued-requests is not supported with --disaggregation-mode "
-        f"{disaggregation_mode}: the prefill and the decode admit requests "
-        "independently, so a queue cap on one side cannot be enforced "
-        "consistently (a decode-side refusal would discard a finished "
-        "prefill). Remove the flag and shed load at the router."
-    )
-
-
 def _validate_raiden_optimistic_prefill(
     *,
     disaggregation_mode: str,
@@ -707,10 +692,6 @@ class TpuSRTPlatform(SRTPlatform):
             disaggregation_mode=cfg.disaggregation_mode,
             transfer_backend=cfg.disaggregation_transfer_backend,
             optimistic_prefill_attempts=cfg.optimistic_prefill_attempts,
-        )
-        _validate_pd_queue_limit(
-            disaggregation_mode=cfg.disaggregation_mode,
-            max_queued_requests=cfg.max_queued_requests,
         )
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
