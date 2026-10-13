@@ -12,9 +12,11 @@ Covers:
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
   - _handle_batch_output takes non-streaming first_token_time from the scheduler
+  - An abort that arrives before dispatch finishes the request undispatched
 """
 
 import asyncio
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -34,11 +36,20 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
+    TokenizedGenerateReqInput,
     wrap_as_pickle,
+)
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
+    CudaIpcTensorTransportProxy,
 )
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
@@ -1063,6 +1074,152 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+@patch(
+    "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+    side_effect=lambda obj: obj,
+)
+class TestAbortBeforeDispatch(CustomTestCase):
+    """An abort that arrives before the request is dispatched must not be
+    lost: the scheduler ignores an AbortReq for a rid it has not received, so
+    the request must finish as aborted without being dispatched.
+    """
+
+    def _make_tm(self):
+        tm = _make_tm_for_generate(self)
+        tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        tm._dispatch_to_scheduler = Mock()
+        return tm
+
+    @staticmethod
+    def _requests_sent(tm):
+        return [
+            c.args[0]
+            for c in tm._dispatch_to_scheduler.call_args_list
+            if not isinstance(c.args[0], AbortReq)
+        ]
+
+    @staticmethod
+    def _tokenized(rid, mm_inputs=None):
+        return MagicMock(spec=TokenizedGenerateReqInput, rid=rid, mm_inputs=mm_inputs)
+
+    async def _abort_while_blocked(self, tm, obj, tokenized, blocked_step):
+        """Abort obj while generate_request waits in blocked_step, then resume.
+
+        Returns the first response and the response generator.
+        """
+        blocked, resume = asyncio.Event(), asyncio.Event()
+
+        async def wait_for_abort(result):
+            blocked.set()
+            await resume.wait()
+            return result
+
+        if blocked_step == "tokenize":
+            tm._tokenize_one_request = lambda _req: wait_for_abort(tokenized)
+        else:
+            tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+            tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = (
+                lambda _mm_inputs: wait_for_abort([])
+            )
+        generator = tm.generate_request(obj)
+        response = asyncio.create_task(generator.__anext__())
+        await blocked.wait()
+        tm.abort_request(obj.rid)
+        resume.set()
+
+        done, _ = await asyncio.wait([response], timeout=1)
+        self.assertEqual(self._requests_sent(tm), [], "aborted request dispatched")
+        self.assertTrue(done, "aborted request never finished")
+        return response.result(), generator
+
+    def test_abort_before_dispatch_finishes_without_dispatch(self, _wrap_shm):
+        async def drive(blocked_step, stream):
+            tm = self._make_tm()
+            obj = GenerateReqInput(text="prompt", rid="slow", stream=stream)
+            out, generator = await self._abort_while_blocked(
+                tm, obj, self._tokenized(obj.rid), blocked_step
+            )
+            self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+            self.assertEqual(
+                out["meta_info"]["weight_versions"],
+                [{"version": tm.config_value("weight_version"), "start": 0, "end": 0}],
+            )
+            self.assertNotIn(obj.rid, tm.rid_to_state)
+            with self.assertRaises(StopAsyncIteration):
+                await generator.__anext__()
+
+        # Blocking in dispatch preparation pins the check after its await.
+        for blocked_step in ("tokenize", "prepare_dispatch"):
+            for stream in (False, True):
+                with self.subTest(blocked_step=blocked_step, stream=stream):
+                    asyncio.run(drive(blocked_step, stream))
+
+    def test_aborted_request_releases_features_and_encoder_gate(self, _wrap_shm):
+        tm = self._make_tm()
+        tm.mm_processor = SimpleNamespace(cudaipc_mmfeature_pool=Mock())
+        ipc_proxy = MagicMock(spec=CudaIpcTensorTransportProxy)
+        item = MultimodalDataItem(modality=Modality.IMAGE, feature=ipc_proxy)
+        mm_inputs = MultimodalProcessorOutput(mm_items=[item])
+        encoder_gate = threading.Event()
+        tm.encoder_dispatch_ready["slow"] = encoder_gate
+
+        async def drive():
+            obj = GenerateReqInput(text="prompt", rid="slow")
+            _, generator = await self._abort_while_blocked(
+                tm, obj, self._tokenized(obj.rid, mm_inputs), "tokenize"
+            )
+            # Closing the generator early would also release the encoder gate.
+            with self.assertRaises(StopAsyncIteration):
+                await generator.__anext__()
+
+        asyncio.run(drive())
+
+        ipc_pool = tm.mm_processor.cudaipc_mmfeature_pool
+        ipc_pool.cancel_proxy.assert_called_once_with(ipc_proxy)
+        self.assertIsNone(item.feature)
+        tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_any_call([item])
+        self.assertTrue(encoder_gate.is_set())
+        self.assertNotIn("slow", tm.encoder_dispatch_ready)
+
+    def test_batch_dispatches_only_requests_not_aborted(self, _wrap_shm):
+        async def drive():
+            tm = self._make_tm()
+            tm._should_use_batch_tokenization = Mock(return_value=True)
+            obj = GenerateReqInput(text=["a", "b"], rid=["kept", "aborted"])
+            tokenizing, resume = asyncio.Event(), asyncio.Event()
+
+            async def slow_batch_tokenize(batch_size, req):
+                tokenizing.set()
+                await resume.wait()
+                return [self._tokenized(req[i].rid) for i in range(batch_size)]
+
+            tm._batch_tokenize_and_process = slow_batch_tokenize
+            generator = tm.generate_request(obj)
+            response = asyncio.create_task(generator.__anext__())
+            await tokenizing.wait()
+            tm.abort_request("aborted")
+            resume.set()
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if self._requests_sent(tm):
+                    break
+
+            (batch_req,) = self._requests_sent(tm)
+            self.assertEqual([req.rid for req in batch_req.batch], ["kept"])
+            await tm._handle_batch_output(_make_batch_str_output("kept"))
+            outs = await asyncio.wait_for(response, timeout=1)
+            self.assertEqual(
+                [out["meta_info"]["finish_reason"]["type"] for out in outs],
+                ["length", "abort"],
+            )
+            self.assertFalse(tm.rid_to_state)
+
+        asyncio.run(drive())
 
 
 class TestLoRARequestLifecycle(CustomTestCase):

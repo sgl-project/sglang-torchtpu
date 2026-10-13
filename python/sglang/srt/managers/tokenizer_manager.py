@@ -121,6 +121,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -182,7 +183,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.srt.utils.weight_versions import add_weight_versions_to_meta_info
+from sglang.srt.utils.weight_versions import (
+    WeightVersionSpan,
+    add_weight_versions_to_meta_info,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -1695,6 +1699,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     (tokenized_obj.mm_inputs,)
                 )
             )
+            if not self._finish_aborted_before_dispatch([tokenized_obj]):
+                return
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
@@ -1721,6 +1727,64 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if state is not None:
             state.dispatched = True
 
+    def _finish_aborted_before_dispatch(
+        self,
+        tokenized_objs: List[
+            Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+        ],
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
+        """Finish requests whose abort arrived before dispatch; return the rest.
+
+        The scheduler drops an AbortReq for a rid it has not received, so a
+        request dispatched after its abort would run with nothing left to stop
+        it. Callers must dispatch the returned requests without an intervening
+        await, or an abort could land between this check and the send.
+        """
+        remaining = []
+        for tokenized_obj in tokenized_objs:
+            rid = tokenized_obj.rid
+            state = self.rid_to_state.get(rid)
+            if state is None or not state.abort_sent:
+                remaining.append(tokenized_obj)
+                continue
+            if tokenized_obj.mm_inputs is not None:
+                self._cancel_undispatched_mm_features(tokenized_obj.mm_inputs.mm_items)
+            version = self.config_value("weight_version")
+            abort_req = AbortReq(
+                rid=rid,
+                weight_versions=[WeightVersionSpan(version=version, start=0, end=0)],
+            )
+            # Finish on a later loop turn, as a scheduler reply would: callers
+            # build the response waiter from rid_to_state after this returns.
+            asyncio.get_running_loop().call_soon(self._handle_abort_req, abort_req)
+            dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
+            if dispatch_ready is not None:
+                dispatch_ready.set()
+        return remaining
+
+    def _cancel_undispatched_mm_features(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> None:
+        """Return the GPU pool slices holding features that will not be dispatched.
+
+        The multimodal processor publishes CUDA IPC slices during tokenization,
+        the VMM transport right before dispatch. A pool reclaims a slice only
+        after the scheduler acknowledges it, so an undispatched slice must be
+        cancelled. Cancelling clears the field, so a repeated call is a no-op.
+        """
+        self.cuda_vmm_feature_transport.cancel_for_dispatch(mm_items)
+        ipc_pool = getattr(self.mm_processor, "cudaipc_mmfeature_pool", None)
+        if ipc_pool is None:
+            return
+        for item in mm_items:
+            for field in ("feature", "precomputed_embeddings"):
+                proxy = getattr(item, field)
+                if isinstance(proxy, CudaIpcTensorTransportProxy):
+                    try:
+                        ipc_pool.cancel_proxy(proxy)
+                    finally:
+                        setattr(item, field, None)
+
     async def _send_batch_request(
         self,
         tokenized_objs: List[
@@ -1736,6 +1800,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             )
+            tokenized_objs = self._finish_aborted_before_dispatch(tokenized_objs)
+            if not tokenized_objs:
+                return
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
