@@ -216,6 +216,8 @@ def get_last_loc(
         "torch_native",
         "pallas_tpu_rpa_v3",
         "pallas_tpu_rpa_batched",
+        "pallas_tpu_mla",
+        "pallas_tpu_flash",
     )
     uses_triton_dispatch = (
         prefill_backend not in non_triton and decode_backend not in non_triton

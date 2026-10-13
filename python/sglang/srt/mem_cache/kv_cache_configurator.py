@@ -345,6 +345,12 @@ class KVCacheConfigurator:
         )
 
     def _tpu_mha_pool_class(self):
+        # A draft on its own backend (e.g. an MHA draft beside an MLA target)
+        # needs that backend's pool layout, not the target's.
+        if self.is_draft_worker and self.speculative_draft_attention_backend:
+            from sglang_tpu.tpu_platform import _mha_kv_pool_cls
+
+            return _mha_kv_pool_cls(self.speculative_draft_attention_backend)
         return current_platform.get_mha_kv_pool_cls()
 
     @property

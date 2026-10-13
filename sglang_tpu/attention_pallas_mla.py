@@ -38,6 +38,7 @@ Design notes
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING, Optional
 
@@ -45,9 +46,11 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_rpa_base import (
+    BaseTpuPallasRpaMultiStepDraftBackend,
     _quantize_kv_to_fp8,
 )
 from sglang_tpu.attention_pallas_rpa_v3 import (
+    RPA_V3_SPEC,
     TpuPallasRpaV3AttnBackend,
 )
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
@@ -189,6 +192,10 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     MLA kernel consumes the identical layout — and overrides only the op
     registration and the per-layer forward.
     """
+
+    # The MLA kernel's DECODE range attends one query row per sequence, so
+    # fixed-width target verification must stay on MIXED.
+    kernel_spec = dataclasses.replace(RPA_V3_SPEC, supports_decode_query_size=False)
 
     def _build_kernel_op(self):
         # Hook called by ``super().__init__()`` to populate ``self._op``. Both
@@ -354,3 +361,9 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         """
         # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
         return (self.token_to_kv_pool.get_fused_kv_buffer(layer_id),)
+
+
+class TpuPallasMlaMultiStepDraftBackend(BaseTpuPallasRpaMultiStepDraftBackend):
+    """One MLA backend per EAGLE/NEXTN draft decode step (MLA draft layers)."""
+
+    attn_backend_cls = TpuPallasMlaAttnBackend
