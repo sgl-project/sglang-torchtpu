@@ -739,6 +739,24 @@ QWEN3_5_397B = {
     },
 }
 
+QWEN3_8_27B = {
+    "served_model_name": "Qwen/Qwen3.8-27B",
+    "display_name": "Qwen3.8 27B",
+    "variant": "TP8",
+    "config_module": "recipe/configs/qwen3_8_27b/accuracy.py",
+    # The model card's thinking-mode sampling; its top_k=20 comes from the
+    # checkpoint's generation_config.json, which the server applies by default.
+    "sampling": {
+        # At 32768, 10.8% of AIME26 samples truncated without an answer; at
+        # 81920, 3.3% (measured on tpu7x, 2026-10-12).
+        "max_tokens": 81920,
+        "num_threads": 64,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "chat_template_kwargs": {"enable_thinking": True},
+    },
+}
+
 KIMI_K26 = {
     "served_model_name": "/weights/Kimi-K2.6",
     "display_name": "Kimi K2.6",
