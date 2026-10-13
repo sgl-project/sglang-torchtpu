@@ -17,7 +17,7 @@ register_tpu_ci(
     est_time=120,
     suite="tpu-integration",
     nightly=True,
-    labels=["multihost", "normalization"],
+    labels=["multihost", "infra", "normalization"],
 )
 
 
