@@ -193,6 +193,25 @@ class Observability(msgspec.Struct):
     stat_loggers: Optional[Dict[str, type]] = None
 
     # -------------------------------------------------------------------------
+    # Launch-time profiling
+    # -------------------------------------------------------------------------
+    profile_auto: A[
+        bool,
+        "Capture a profile without /start_profile: each stage in --profile-auto-stages "
+        "is captured once, for --profile-auto-steps forward passes, and the engine stops "
+        "itself. Traces go to SGLANG_TORCH_PROFILER_DIR.",
+    ] = False
+    profile_auto_stages: A[
+        List[str],
+        "Stages --profile-auto captures, in the order they are first seen.",
+    ] = msgspec.field(default_factory=lambda: ["prefill", "decode"])
+    profile_auto_steps: A[
+        int,
+        "Forward passes to capture per stage under --profile-auto. Keep it small: "
+        "a TPU capture cannot be narrowed to fewer chips, so each one is hundreds of MB.",
+    ] = 5
+
+    # -------------------------------------------------------------------------
     # KV canary
     # -------------------------------------------------------------------------
     kv_canary: A[

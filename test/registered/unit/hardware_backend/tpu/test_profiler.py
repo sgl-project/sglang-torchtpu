@@ -2,6 +2,7 @@
 
 import dataclasses
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -191,6 +192,130 @@ class TestStartStopUsesLibtpuTrace(CustomTestCase):
             stop_tpu_profile(None)
 
         self.assertEqual([c[0] for c in calls], ["stop"])
+
+
+# A minimal valid XSpace: just the hostname field.
+_XSPACE = b"\x22\x0adecode-0-0"
+
+
+def _fake_libtpu_writing(host="decode-0-0", payload=_XSPACE):
+    """A fake torch_tpu whose stop_trace writes the file as libtpu lays it out:
+    <dir>/plugins/profile/<timestamp>/<host>.xplane.pb."""
+    modules = _fake_torch_tpu()
+    impl = modules["torch_tpu._internal.profiler._impl"]
+    state = {}
+
+    def _start(output_dir, options=None):
+        state["dir"] = Path(output_dir)
+
+    def _stop():
+        run = state["dir"] / "plugins" / "profile" / "2026_09_25_20_01_51"
+        run.mkdir(parents=True)
+        (run / f"{host}.xplane.pb").write_bytes(payload)
+
+    impl.start_trace = _start
+    impl.stop_trace = _stop
+    return modules
+
+
+class TestPublishIntoSharedSession(CustomTestCase):
+    """Each process traces only its own chip; a combined view needs every
+    rank's file in one XProf session folder, under a name no co-hosted rank
+    shares."""
+
+    def _capture(self, root, rank_tag, **fake_kwargs):
+        with (
+            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(0),
+            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(0),
+            patch.dict(sys.modules, _fake_libtpu_writing(**fake_kwargs)),
+        ):
+            trace = start_tpu_profile(
+                output_dir=root / ".staging" / f"DECODE-{rank_tag}",
+                session_dir=root / "plugins" / "profile" / "DECODE",
+                file_suffix=f"-{rank_tag}",
+            )
+            return stop_tpu_profile(trace)
+
+    def test_co_hosted_ranks_land_side_by_side(self):
+        # Both ranks' files are named after the same host by libtpu.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            published = [self._capture(root, f"TP-{k}") for k in (0, 1)]
+
+            session = root / "plugins" / "profile" / "DECODE"
+            self.assertEqual(
+                published,
+                [
+                    session / "decode-0-0-TP-0.xplane.pb",
+                    session / "decode-0-0-TP-1.xplane.pb",
+                ],
+            )
+            self.assertEqual(
+                sorted(p.name for p in session.iterdir()),
+                ["decode-0-0-TP-0.xplane.pb", "decode-0-0-TP-1.xplane.pb"],
+            )
+            # XProf lists any leftover plugins/profile folder as another run.
+            self.assertFalse((root / ".staging").exists())
+
+    def test_published_file_is_rebased(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "sglang.srt.hardware_backend.tpu.profiler.rebase_to_wall_clock",
+                return_value=(b"rebased", 1),
+            ) as rebase,
+        ):
+            published = self._capture(Path(tmp), "TP-0")
+
+            rebase.assert_called_once_with(_XSPACE)
+            self.assertEqual(published.read_bytes(), b"rebased")
+
+    def test_failed_move_stays_in_staging(self):
+        # A failed publish must not lose the capture or take down the scheduler.
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "sglang.srt.hardware_backend.tpu.profiler.os.replace",
+                side_effect=PermissionError("permission denied"),
+            ),
+        ):
+            root = Path(tmp)
+            published = self._capture(root, "TP-0")
+
+            self.assertIsNone(published)
+            staged = list((root / ".staging").glob("*/plugins/profile/*/*.xplane.pb"))
+            self.assertEqual(len(staged), 1)
+            session = root / "plugins" / "profile" / "DECODE"
+            self.assertEqual(list(session.glob("*.xplane.pb")), [])
+
+    def test_unreadable_trace_stays_in_staging(self):
+        # A trace the rebase cannot parse is kept, not published half-rewritten.
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "sglang.srt.hardware_backend.tpu.profiler.rebase_to_wall_clock",
+                side_effect=ValueError("truncated protobuf message"),
+            ),
+        ):
+            root = Path(tmp)
+            published = self._capture(root, "TP-0")
+
+            self.assertIsNone(published)
+            staged = list((root / ".staging").glob("*/plugins/profile/*/*.xplane.pb"))
+            self.assertEqual(len(staged), 1)
+            self.assertFalse((root / "plugins" / "profile" / "DECODE").exists())
+
+    def test_without_session_dir_the_trace_stays_put(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(sys.modules, _fake_libtpu_writing()),
+        ):
+            trace = start_tpu_profile(output_dir=Path(tmp) / "capture")
+
+            self.assertIsNone(stop_tpu_profile(trace))
+            self.assertEqual(
+                len(list(Path(tmp).glob("capture/plugins/profile/*/*.xplane.pb"))), 1
+            )
 
 
 if __name__ == "__main__":

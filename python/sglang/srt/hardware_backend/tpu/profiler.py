@@ -3,21 +3,37 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import shutil
 from pathlib import Path
+from typing import Optional
 
 import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.xplane import rebase_to_wall_clock
 
 logger = get_logger(__name__)
 
 
-def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
+def start_tpu_profile(
+    *,
+    output_dir: Path,
+    with_cpu: bool = True,
+    session_dir: Optional[Path] = None,
+    file_suffix: str = "",
+) -> _TpuTrace:
     """Start an xprof capture writing to ``output_dir``.
 
     Returns a handle. Pass it to :func:`stop_tpu_profile` to end the session.
     ``with_cpu`` selects the host plane.
+
+    With ``session_dir`` set, ``output_dir`` is only a staging area: on stop the
+    trace moves into ``session_dir`` as ``<host><file_suffix>.xplane.pb``,
+    rebased onto the wall clock. XProf loads every file in a session folder as
+    one multi-host trace, so an engine's ranks publishing into the same
+    ``session_dir`` with distinct suffixes show up on one timeline.
 
     Goes through _impl.start_trace rather than torch_tpu's own profile()
     context manager: profile() takes no options argument, so narrowing a
@@ -31,21 +47,83 @@ def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     tpu_profiler.start_trace(str(output_dir), _tpu_profile_options(with_cpu=with_cpu))
-    return _TpuTrace(output_dir=output_dir)
+    return _TpuTrace(
+        output_dir=output_dir, session_dir=session_dir, file_suffix=file_suffix
+    )
 
 
-def stop_tpu_profile(trace: _TpuTrace) -> None:
-    """Stop an xprof session started by :func:`start_tpu_profile`."""
-    del trace  # the session is process-global; only one may run at a time
+def stop_tpu_profile(trace: Optional[_TpuTrace]) -> Optional[Path]:
+    """Stop an xprof session started by :func:`start_tpu_profile`.
+
+    Returns the published trace file, or None when the capture was not
+    published (no ``session_dir``, or publishing failed and the trace was left
+    in its staging directory).
+    """
     from torch_tpu._internal.profiler import _impl as tpu_profiler
 
+    # The session is process-global; only one may run at a time. stop_trace
+    # returns once the trace file is written.
     tpu_profiler.stop_trace()
+    if trace is None or trace.session_dir is None:
+        return None
+    return _publish_trace(trace)
+
+
+def _publish_trace(trace: _TpuTrace) -> Optional[Path]:
+    """Move a staged trace into its session folder, rebased onto wall clock."""
+    staged = sorted(trace.output_dir.glob("plugins/profile/*/*.xplane.pb"))
+    if len(staged) != 1:
+        logger.warning(
+            "[TPU profiler] expected one trace under %s, found %d; leaving it "
+            "unpublished.",
+            trace.output_dir,
+            len(staged),
+        )
+        return None
+
+    src = staged[0]
+    # libtpu names the file after the host, which every rank on it shares.
+    host = src.name.removesuffix(".xplane.pb")
+    dst = trace.session_dir / f"{host}{trace.file_suffix}.xplane.pb"
+    try:
+        data, start_ns = rebase_to_wall_clock(src.read_bytes())
+        if start_ns is None:
+            logger.warning(
+                "[TPU profiler] %s has no profile_start_time; publishing it "
+                "unrebased, so it will not line up with other ranks.",
+                src,
+            )
+        trace.session_dir.mkdir(parents=True, exist_ok=True)
+        # XProf may be watching the folder; never let it see a partial file.
+        tmp = dst.with_name(f".{dst.name}.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    except (OSError, ValueError, IndexError) as e:
+        logger.warning(
+            "[TPU profiler] could not publish %s to %s (%s); the per-rank trace "
+            "is still at %s.",
+            src,
+            trace.session_dir,
+            e,
+            trace.output_dir,
+        )
+        return None
+
+    shutil.rmtree(trace.output_dir, ignore_errors=True)
+    # Ranks share the staging parent; whichever publishes last removes it.
+    try:
+        trace.output_dir.parent.rmdir()
+    except OSError:
+        pass
+    return dst
 
 
 class _TpuTrace(msgspec.Struct, frozen=True):
     """Handle for an in-flight capture. torch_tpu keeps the session itself."""
 
     output_dir: Path
+    session_dir: Optional[Path] = None
+    file_suffix: str = ""
 
 
 def _tpu_profile_options(*, with_cpu: bool):

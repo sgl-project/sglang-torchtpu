@@ -2400,6 +2400,10 @@ class Scheduler(
         self.profiler_manager = SchedulerProfilerManager(
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
+            auto_profile=self.server_args.profile_auto,
+            auto_profile_stages=self.server_args.profile_auto_stages,
+            auto_profile_steps=self.server_args.profile_auto_steps,
+            disaggregation_mode=self.server_args.disaggregation_mode,
         )
 
     def init_weight_updater(self) -> None:

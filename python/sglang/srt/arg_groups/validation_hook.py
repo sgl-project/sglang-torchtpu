@@ -317,6 +317,26 @@ def check_server_args(server_args: Any):
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
         )
 
+    if cfg.profile_auto:
+        # Each mistake otherwise arms a profile that never captures anything,
+        # and the run looks normal until the traces are missing.
+        if cfg.profile_auto_steps < 1:
+            raise ValueError("--profile-auto-steps must be at least 1")
+        unknown = set(cfg.profile_auto_stages) - {"prefill", "decode"}
+        if unknown or not cfg.profile_auto_stages:
+            raise ValueError(
+                "--profile-auto-stages takes one or more of {prefill, decode}, got "
+                f"{cfg.profile_auto_stages}"
+            )
+        never_run = {"prefill": "decode", "decode": "prefill"}.get(
+            cfg.disaggregation_mode
+        )
+        if set(cfg.profile_auto_stages) == {never_run}:
+            raise ValueError(
+                f"--profile-auto-stages {never_run} never runs on a "
+                f"--disaggregation-mode {cfg.disaggregation_mode} engine"
+            )
+
     check_load_publish_args(server_args)
 
 

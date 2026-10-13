@@ -12,6 +12,7 @@ from typing import (
     Callable,
     List,
     Optional,
+    Set,
 )
 
 import torch
@@ -49,11 +50,26 @@ elif _is_mps:
 
 logger = logging.getLogger(__name__)
 
+_ALL_PROFILE_STAGES = ("prefill", "decode")
+
+# Keyed by --disaggregation-mode. A PD engine never runs the other side's
+# stage, so arming it would keep the run pending and the done marker unwritten.
+_STAGE_NEVER_RUN_BY_PD_ENGINE = {"prefill": "decode", "decode": "prefill"}
+
+
+def _stage_name(stage: ForwardMode) -> str:
+    """Name a staged capture goes by in --profile-auto-stages."""
+    return "prefill" if stage.is_prefill() else "decode"
+
 
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
+    auto_profile: bool = False
+    auto_profile_stages: Optional[List[str]] = None
+    auto_profile_steps: int = 0
+    disaggregation_mode: str = "null"
 
     def __post_init__(self) -> None:
         if envs.SGLANG_PROFILE_V2.get():
@@ -85,6 +101,86 @@ class SchedulerProfilerManager:
 
         # For TPU
         self.tpu_profiler = None
+
+        # Stages an auto-armed capture still owes; empty means the run is done.
+        self.pending_stages: Optional[Set[str]] = None
+
+        self._maybe_arm_auto_profile()
+
+    def _maybe_arm_auto_profile(self) -> None:
+        """Configure a launch-time capture, so no /start_profile is needed.
+
+        Only configures: the first batch of each stage opens its own capture
+        through _profile_batch_predicate, exactly as an API-armed staged
+        profile does.
+        """
+        if not self.auto_profile:
+            return
+
+        never_run = _STAGE_NEVER_RUN_BY_PD_ENGINE.get(self.disaggregation_mode)
+        stages = [
+            stage
+            for stage in self.auto_profile_stages or _ALL_PROFILE_STAGES
+            if stage != never_run
+        ]
+        result = self._init_profile(
+            output_dir=None,
+            start_step=None,
+            num_steps=self.auto_profile_steps,
+            activities=None,
+            with_stack=None,
+            record_shapes=None,
+            profile_by_stage=True,
+            profile_id=self._shared_auto_profile_id(),
+            profile_stages=stages,
+        )
+        if result is not None and not result.success:
+            logger.warning("Auto profiling failed to arm: %s", result.message)
+            return
+
+        logger.info(
+            "Auto profiling armed for %s, %d step(s) each. Traces will be saved to: %s",
+            ", ".join(stages),
+            self.auto_profile_steps,
+            self.torch_profiler_output_dir,
+        )
+
+    def _shared_auto_profile_id(self) -> str:
+        """Rank 0's id on every rank, so the engine's trace files group together.
+
+        /start_profile gets this from the tokenizer manager; nothing sends one
+        at launch. Every rank builds its profiler at the same init step, so the
+        collective lines up.
+        """
+        profile_id = [f"auto-{time.time()}"]
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast_object_list(
+                profile_id, group=self.dp_tp_cpu_group, group_src=0
+            )
+        return profile_id[0]
+
+    def _mark_stage_captured(self, stage: ForwardMode) -> None:
+        """Retire a stage's capture and, once none are left, signal completion."""
+        if not self.auto_profile or not self.pending_stages:
+            return
+
+        # Stays an empty set rather than None: None would read as "every stage"
+        # and re-arm the stage that just finished.
+        self.pending_stages.discard(_stage_name(stage))
+        if self.pending_stages:
+            return
+
+        # Every rank flushes its own trace and they return seconds apart; the
+        # marker must wait for the slowest. Every rank must reach this.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier(self.dp_tp_cpu_group)
+        if not self._is_global_primary_rank():
+            return
+
+        # CI polls for this name to know a capture is safe to copy.
+        done_marker = self.torch_profiler_output_dir / ".xprof-done"
+        done_marker.touch()
+        logger.info("Auto profiling complete. Wrote %s", done_marker)
 
     def _init_profile(
         self,
@@ -135,10 +231,16 @@ class SchedulerProfilerManager:
         if merge_profiles and _is_tpu:
             return ProfileReqOutput(
                 success=False,
-                message="merge_profiles is not supported for TPU profiling.",
+                message=(
+                    "merge_profiles is not supported for TPU profiling: every "
+                    "rank's trace already lands in one XProf session."
+                ),
             )
 
         self.profile_by_stage = profile_by_stage
+        # None means every stage, which is what a staged profile did before
+        # profile_stages reached this path (it was v2-only).
+        self.pending_stages = set(profile_stages) if profile_stages else None
         self.merge_profiles = merge_profiles
         self.torch_profiler_output_dir = Path(output_dir).expanduser()
         self.torch_profiler_with_stack = with_stack
@@ -216,18 +318,22 @@ class SchedulerProfilerManager:
             if _is_tpu:
                 from sglang.srt.hardware_backend.tpu.profiler import start_tpu_profile
 
-                subdir_parts = [self.profile_prefix or "profile"]
+                run_parts = [self.profile_prefix or "profile"]
                 if self.profile_id:
-                    subdir_parts.append(str(self.profile_id))
-                if stage is not None:
-                    subdir_parts.append(stage.name)
-                # xprof names the trace file after the host, so ranks sharing a
-                # host need separate directories or they overwrite each other.
-                subdir_parts.extend(self._rank_parts())
+                    run_parts.append(str(self.profile_id))
+                run_dir = self.torch_profiler_output_dir / "-".join(run_parts)
+                session = stage.name if stage is not None else "ALL"
+                rank_tag = "-".join(self._rank_parts())
+                # Each process traces only its own chip. Every rank publishes
+                # into one XProf session so the engine reads as one timeline;
+                # xprof names the file after the host, so the rank tag keeps
+                # co-hosted ranks from overwriting each other.
                 # "TPU" -> TPU-only. "TPU"+"CPU" -> CPU and TPU.
                 self.tpu_profiler = start_tpu_profile(
-                    output_dir=self.torch_profiler_output_dir / "-".join(subdir_parts),
+                    output_dir=run_dir / ".staging" / f"{session}-{rank_tag}",
                     with_cpu="CPU" in activities,
+                    session_dir=run_dir / "plugins" / "profile" / session,
+                    file_suffix=f"-{rank_tag}",
                 )
             self.profile_in_progress = True
         elif "RPD" in activities:  # for ROCM
@@ -323,6 +429,17 @@ class SchedulerProfilerManager:
         if parallel.moe_ep_size > 1:
             parts.append(f"EP-{parallel.moe_ep_rank}")
         return parts
+
+    def _is_global_primary_rank(self) -> bool:
+        if self.ps.tp_rank != 0:
+            return False
+        if self.ps.dp_size > 1 and self.ps.dp_rank != 0:
+            return False
+        if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+            return False
+        if self.ps.moe_ep_size > 1 and self.ps.moe_ep_rank != 0:
+            return False
+        return True
 
     def _merge_profile_traces(self) -> str:
         if not self.merge_profiles:
@@ -445,7 +562,13 @@ class SchedulerProfilerManager:
         self.profiler_start_forward_ct = None
 
         self._apply_detailed_annotations(False)
+        if stage is not None:
+            self._mark_stage_captured(stage)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
+
+    def _stage_wanted(self, stage: str) -> bool:
+        """Whether a staged profile should still capture ``stage``."""
+        return self.pending_stages is None or stage in self.pending_stages
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
         if envs.SGLANG_PROFILE_V2.get():
@@ -454,6 +577,8 @@ class SchedulerProfilerManager:
 
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
+                if not self._stage_wanted("prefill"):
+                    return
                 if self.profiler_prefill_ct == 0:
                     self._start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
@@ -461,6 +586,8 @@ class SchedulerProfilerManager:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
             elif batch.forward_mode.is_decode():
+                if not self._stage_wanted("decode"):
+                    return
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush (a prefill capture must not absorb decode steps)
