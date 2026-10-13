@@ -352,12 +352,15 @@ class HiRadixCache(RadixCache):
             attn_cp_rank, attn_cp_size = (
                 self.cache_controller.get_attn_cp_rank_and_size()
             )
+            # The controller resolves ranks into storage_config when it attaches
+            # the backend (same source unified_cache/storage_attachment.py uses).
+            config = self.cache_controller.storage_config
             labels = {
                 "storage_backend": storage_backend,
-                "tp_rank": self.cache_controller.tp_rank,
-                "dp_rank": self.cache_controller.dp_rank,
-                "pp_rank": self.cache_controller.pp_rank,
-                "pp_size": self.cache_controller.pp_size,
+                "tp_rank": config.tp_rank,
+                "dp_rank": config.dp_rank,
+                "pp_rank": config.pp_rank,
+                "pp_size": config.pp_size,
                 "attn_cp_rank": attn_cp_rank,
                 "attn_cp_size": attn_cp_size,
             }
