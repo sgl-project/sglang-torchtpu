@@ -731,10 +731,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     if input_size != input_size_per_partition:
                         input_offset = getattr(layer, "tpu_fp8_input_offset", 0)
                         scale_cols = (
-                            input_offset
-                            + input_size_per_partition
-                            + block_k
-                            - 1
+                            input_offset + input_size_per_partition + block_k - 1
                         ) // block_k - input_offset // block_k
                     else:
                         scale_cols = (input_size_per_partition + block_k - 1) // block_k
