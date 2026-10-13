@@ -325,6 +325,85 @@ class TestDSV4TPUPatches(CustomTestCase):
         self.assertIn("dsv4", _PALLAS_TPU_BACKENDS)
         self.assertIn("tpu_dsv4", _PALLAS_TPU_BACKENDS)
 
+    def test_register_dsv4_attention_backend(self):
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
+            create_dsv4_backend,
+        )
+        from sglang_tpu.tpu_platform import _register_dsv4_attention_backend
+
+        original = ATTENTION_BACKENDS.get("dsv4")
+        try:
+            _register_dsv4_attention_backend()
+            self.assertIn("dsv4", ATTENTION_BACKENDS)
+            self.assertIsNot(ATTENTION_BACKENDS["dsv4"], create_dsv4_backend)
+            self.assertEqual(
+                ATTENTION_BACKENDS["dsv4"].__name__, "create_tpu_dsv4_backend"
+            )
+        finally:
+            if original is not None:
+                ATTENTION_BACKENDS["dsv4"] = original
+
+    def test_prepare_mqa_qkv_respects_q_head_norm(self):
+        from unittest.mock import patch
+
+        pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+        backend = object.__new__(DSV4TPUAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.token_to_kv_pool = pool
+
+        def _make_layer(q_head_norm: bool):
+            return SimpleNamespace(
+                n_local_heads=4,
+                head_dim=16,
+                q_lora_rank=8,
+                q_head_norm=q_head_norm,
+                eps=1e-6,
+                freqs_cis=torch.ones((32, 8), dtype=torch.float32),
+                q_norm=lambda x: x,
+                wq_b=lambda x: (torch.ones((x.shape[0], 64), dtype=x.dtype), None),
+                wkv=lambda x: (torch.ones((x.shape[0], 16), dtype=x.dtype), None),
+                kv_norm=lambda x: x,
+            )
+
+        x_linear = torch.ones((2, 32), dtype=torch.bfloat16)
+        q_lora = torch.ones((2, 8), dtype=torch.bfloat16)
+        positions = torch.tensor([0, 1], dtype=torch.int64)
+
+        with (
+            patch(
+                "sglang_tpu.dsv4.dsv4_attention_backend.apply_tpu_dsv4_qnorm_rope",
+                side_effect=lambda q, pos, fc, eps: q * 2,
+            ) as mock_qnorm_rope,
+            patch(
+                "sglang_tpu.dsv4.dsv4_attention_backend.apply_tpu_dsv4_rope",
+                side_effect=lambda x, pos, fc, inverse=False: x * 3,
+            ) as mock_rope,
+        ):
+            _, q_with_norm, kv_with_norm = backend.prepare_mqa_qkv(
+                _make_layer(q_head_norm=True), x_linear, q_lora, None, positions
+            )
+            self.assertEqual(mock_qnorm_rope.call_count, 1)
+            self.assertEqual(mock_rope.call_count, 1)  # Only KV uses plain rope
+            self.assertEqual(tuple(q_with_norm.shape), (2, 4, 16))
+            self.assertEqual(tuple(kv_with_norm.shape), (2, 16))
+
+            mock_qnorm_rope.reset_mock()
+            mock_rope.reset_mock()
+
+            q_out = torch.zeros((2, 4, 16), dtype=torch.bfloat16)
+            _, q_no_norm, _ = backend.prepare_mqa_qkv(
+                _make_layer(q_head_norm=False),
+                x_linear,
+                q_lora,
+                None,
+                positions,
+                q_out=q_out,
+            )
+            self.assertEqual(mock_qnorm_rope.call_count, 0)
+            self.assertEqual(mock_rope.call_count, 2)  # Both Q and KV use plain rope
+            self.assertTrue(torch.equal(q_out, q_no_norm))
+
 
 if __name__ == "__main__":
     unittest.main()

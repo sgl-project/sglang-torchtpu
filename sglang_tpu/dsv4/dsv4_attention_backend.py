@@ -1244,6 +1244,40 @@ class DSV4TPUAttnBackend(
         # (dsv4_attention_swa / dsv4_attention_csa / dsv4_attention_hca).
         pass
 
+    def prepare_mqa_qkv(
+        self,
+        layer,
+        x_linear: torch.Tensor,
+        q_lora: torch.Tensor,
+        qkv_a: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        q_out: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_lora = layer.q_norm(q_lora)
+        q, _ = layer.wq_b(q_lora)
+        q = q.view(-1, layer.n_local_heads, layer.head_dim)
+        if layer.q_head_norm:
+            q = apply_tpu_dsv4_qnorm_rope(q, positions, layer.freqs_cis, eps=layer.eps)
+        else:
+            q = apply_tpu_dsv4_rope(q, positions, layer.freqs_cis, inverse=False)
+        if qkv_a is not None:
+            kv = qkv_a[..., layer.q_lora_rank :]
+        else:
+            kv, _ = layer.wkv(x_linear)
+        kv = layer.kv_norm(kv)
+        kv = apply_tpu_dsv4_rope(kv, positions, layer.freqs_cis, inverse=False)
+        if q_out is not None:
+            q_out.copy_(q)
+        return q_lora, q, kv
+
+    def apply_mqa_inv_rope(
+        self,
+        layer,
+        o: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        return apply_tpu_dsv4_rope(o, positions, layer.freqs_cis, inverse=True)
+
     # =========================================================================
     # Core Attention Forward (Extend & Decode unified in Pallas kernels)
     # =========================================================================

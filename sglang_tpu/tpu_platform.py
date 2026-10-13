@@ -473,6 +473,19 @@ def _resolve_num_hidden_layers(server_args) -> int:
         return 0
 
 
+def _register_dsv4_attention_backend() -> None:
+    """Register the TPU DeepSeek-V4 attention backend in the registry."""
+    from sglang.srt.layers.attention.attention_registry import (
+        register_attention_backend,
+    )
+
+    @register_attention_backend("dsv4")
+    def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.dsv4 import DSV4TPUAttnBackend
+
+        return DSV4TPUAttnBackend(runner)
+
+
 # The attention backend TPU decode context parallelism runs on.
 _DCP_ATTENTION_BACKEND = "pallas_tpu_rpa_batched"
 
@@ -1028,6 +1041,7 @@ class TpuSRTPlatform(SRTPlatform):
         # the inherited launch environment here; any TorchTPU-dependent
         # topology discovery is therefore confined to the worker.
         _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
+        _register_dsv4_attention_backend()
 
         import torch_tpu  # noqa: F401
 

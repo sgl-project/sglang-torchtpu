@@ -255,7 +255,7 @@ def _get_mhc_ops() -> MhcOps:
     )
     from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
-    if _is_tpu:
+    if not (_is_cuda or _is_hip or _is_npu):
         return MhcOps(
             hc_split_sinkhorn=_hc_split_sinkhorn_torch,
             mhc_fused_post_pre=None,
@@ -2031,24 +2031,10 @@ class MQALayer(MqaAttentionBase):
             kv = None
             if q_out is not None:
                 q_out.copy_(q)
-        elif _is_tpu:
-            from sglang.srt.hardware_backend.tpu.dsv4 import (
-                apply_tpu_dsv4_qnorm_rope,
-                apply_tpu_dsv4_rope,
+        elif hasattr(attn_backend, "prepare_mqa_qkv"):
+            q_lora, q, kv = attn_backend.prepare_mqa_qkv(
+                self, x_linear, q_lora, qkv_a, positions, q_out
             )
-
-            q_lora = self.q_norm(q_lora)
-            q, _ = self.wq_b(q_lora)
-            q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = apply_tpu_dsv4_qnorm_rope(q, positions, self.freqs_cis, eps=self.eps)
-            if qkv_a is not None:
-                kv = qkv_a[..., self.q_lora_rank :]
-            else:
-                kv, _ = self.wkv(x_linear)
-            kv = self.kv_norm(kv)
-            kv = apply_tpu_dsv4_rope(kv, positions, self.freqs_cis, inverse=False)
-            if q_out is not None:
-                q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip:
@@ -2514,12 +2500,8 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif _is_tpu:
-                from sglang.srt.hardware_backend.tpu.dsv4 import (
-                    apply_tpu_dsv4_rope,
-                )
-
-                o = apply_tpu_dsv4_rope(o, positions, self.freqs_cis, inverse=True)
+            elif hasattr(attn_backend, "apply_mqa_inv_rope"):
+                o = attn_backend.apply_mqa_inv_rope(self, o, positions)
             elif inv_rope is None and not fuse_rope_wo_a:
                 # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(

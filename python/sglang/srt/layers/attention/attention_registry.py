@@ -167,11 +167,7 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
-    if _is_tpu:
-        from sglang.srt.hardware_backend.tpu.dsv4 import DSV4TPUAttnBackend
-
-        return DSV4TPUAttnBackend(runner)
-    elif _is_npu:
+    if _is_npu:
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             DeepseekV4AscendAttnBackend,
         )
