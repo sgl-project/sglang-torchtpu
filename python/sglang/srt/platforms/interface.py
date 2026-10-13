@@ -125,6 +125,10 @@ class SRTPlatform(DeviceMixin):
         """
         return None
 
+    def enter_spec_decode_batch(self, batch: ScheduleBatch) -> None:
+        """Swap decode-prepared inputs into a speculative decode batch for its
+        forward. The scheduler restores the batch's own fields afterwards."""
+
     def get_vl_decoder_compile_policy_cls(self) -> Optional[type[CompilePolicy]]:
         """Compile policy for VL language backbones; None leaves them unannotated."""
         return None

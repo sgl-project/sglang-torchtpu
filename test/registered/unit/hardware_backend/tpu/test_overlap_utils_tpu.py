@@ -33,7 +33,7 @@ def tpu_future_map():
             "resolve_mixed_spec_tails",
         ):
             stack.enter_context(patch.object(FutureMap, name, getattr(FutureMap, name)))
-        for name in ("tpu_direct_handoff", "tpu_published_seq_lens"):
+        for name in ("tpu_direct_handoff", "tpu_published_seq_lens", "tpu_decode_rows"):
             stack.enter_context(patch.object(FutureMap, name, None, create=True))
         stack.enter_context(
             patch.object(patches, "_future_map_direct_handoff_patched", False)
@@ -83,10 +83,13 @@ def make_case():
         future_indices=indices,
         accept_lens_device=torch.tensor([1, 3]),
         device_accept_candidate_locs=torch.arange(14).reshape(2, 7),
+        # One acceptance behind the published seq_lens: accepted 1 and 3.
+        device_accept_host_base=torch.tensor([100, 200]),
         device_accept_selected_cache_locs=None,
         future_dsa_topk_indices_available=False,
+        decode_bucket=None,
     )
-    batch = SimpleNamespace(spec_info=draft)
+    batch = SimpleNamespace(spec_info=draft, req_pool_indices=indices)
     draft.bonus_tokens = payload.bonus_tokens
     return fm, batch, indices, payload, torch.tensor([101, 203])
 

@@ -610,11 +610,14 @@ def test_device_accept_state_tracks_filtered_and_merged_future_rows():
     from sglang.srt.speculative import eagle_info
 
     candidates = torch.arange(15).reshape(3, 5)
+    accept_lens = torch.tensor([1, 2, 3])
     draft = eagle_info.EagleDraftInput(
         future_indices=torch.tensor([10, 11, 12]),
-        accept_lens_device=torch.tensor([1, 2, 3]),
+        accept_lens_device=accept_lens,
         device_accept_candidate_locs=candidates,
+        device_accept_host_base=torch.tensor([5, 6, 7]),
         device_accept_selected_cache_locs=candidates[:, :3],
+        decode_bucket=object(),
     )
     other = eagle_info.EagleDraftInput(
         future_indices=torch.tensor([13]),
@@ -638,43 +641,44 @@ def test_device_accept_state_tracks_filtered_and_merged_future_rows():
     ):
         draft.filter_batch(torch.tensor([2, 0]))
         torch.testing.assert_close(draft.future_indices, torch.tensor([12, 10]))
-        torch.testing.assert_close(draft.accept_lens_device, torch.tensor([3, 1]))
-        torch.testing.assert_close(
-            draft.device_accept_selected_cache_locs, candidates[[2, 0], :3]
-        )
+        # The acceptance lengths only gate routing; nothing is indexed on
+        # device, and the decode prepare rebuilds the windows for the new rows.
+        assert draft.accept_lens_device is accept_lens
+        assert draft.device_accept_candidate_locs is None
+        assert draft.device_accept_host_base is None
+        assert draft.device_accept_selected_cache_locs is None
+        assert draft.decode_bucket is None
         draft.merge_batch(other)
         torch.testing.assert_close(draft.future_indices, torch.tensor([12, 10, 13]))
-        torch.testing.assert_close(draft.accept_lens_device, torch.tensor([3, 1, 2]))
-        torch.testing.assert_close(
-            draft.device_accept_candidate_locs,
-            torch.cat([candidates[[2, 0]], other.device_accept_candidate_locs]),
-        )
-        assert draft.device_accept_selected_cache_locs is None
+        assert draft.accept_lens_device is accept_lens
+        assert draft.device_accept_candidate_locs is None
         draft.merge_batch(eagle_info.EagleDraftInput(future_indices=torch.tensor([14])))
         assert draft.accept_lens_device is None
         assert draft.device_accept_candidate_locs is None
 
 
-@pytest.mark.parametrize(
-    "candidate_shape,accept_shape",
-    [((5,), (1,)), ((2, 5), (1,)), ((1, 5), (2,)), ((1, 4), (1,))],
-)
-def test_device_accept_rejects_invalid_future_window(candidate_shape, accept_shape):
+@pytest.mark.parametrize("candidate_shape", [(5,), (2, 5), (1, 4)])
+def test_device_accept_rejects_invalid_future_window(candidate_shape):
     from sglang_tpu.overlap_utils_tpu import (
         resolve_spec_extras_tpu,
     )
 
+    future_indices = torch.tensor([0])
     batch = SimpleNamespace(
+        req_pool_indices=future_indices,
         spec_info=SimpleNamespace(
-            future_indices=torch.tensor([0]),
+            future_indices=future_indices,
             device_accept_candidate_locs=torch.zeros(candidate_shape),
             device_accept_selected_cache_locs=None,
-            accept_lens_device=torch.ones(accept_shape),
+            accept_lens_device=torch.ones(1),
             future_dsa_topk_indices_available=False,
+            decode_bucket=None,
         ),
     )
-    future_map = SimpleNamespace(need_topk=True, draft_probs_buf=None)
-    with pytest.raises(AssertionError, match="cache|acceptance"):
+    future_map = SimpleNamespace(
+        need_topk=True, draft_probs_buf=None, new_seq_lens_buf=torch.zeros(8)
+    )
+    with pytest.raises(AssertionError, match="cache"):
         resolve_spec_extras_tpu(future_map, batch)
 
 
@@ -760,13 +764,17 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
     draft = SimpleNamespace(
         future_indices=indices,
         device_accept_candidate_locs=candidates,
+        # The published seq_lens (indices + 20) are one acceptance ahead.
+        device_accept_host_base=indices + 20 - accept_lens,
         device_accept_selected_cache_locs=None,
         accept_lens_device=accept_lens,
         future_dsa_topk_indices_available=False,
+        decode_bucket=None,
     )
     future_map = SimpleNamespace(
         publish_ready=None,
         tpu_direct_handoff=None,
+        tpu_decode_rows=None,
         new_seq_lens_buf=torch.arange(8) + 20,
         need_topk=True,
         need_hidden_states=with_hidden,
@@ -776,7 +784,9 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
         output_tokens_buf=torch.arange(8) + 10,
         hidden_states_buf=torch.arange(16).reshape(8, 2) if with_hidden else None,
     )
-    batch = SimpleNamespace(spec_info=draft, seq_lens_cpu=torch.tensor([99]))
+    batch = SimpleNamespace(
+        spec_info=draft, seq_lens_cpu=torch.tensor([99]), req_pool_indices=indices
+    )
 
     def gather(rows, probs, topk, tokens, hidden):
         return (

@@ -1165,6 +1165,41 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(result.shape, (3, 4))
         self.assertEqual(forward_batch.batch_size, 2)
 
+    def _host_staged_eagle3_finalize(self, capture_hidden_mode):
+        class _SpecPolicy(Eagle3SpecDecodeCompilePolicyMixin, DecoderTpuCompilePolicy):
+            pass
+
+        policy = object.__new__(_SpecPolicy)
+        forward_batch = self._forward_batch()  # real q=3 / b=2, padded b=4
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        forward_batch.capture_hidden_mode = capture_hidden_mode
+        forward_batch.spec_info = None
+        forward_batch._tpu_host_staged = True
+        out = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(4, 8), hidden_states=torch.zeros(5, 6)
+        )
+        with patch(
+            "sglang_tpu.compilation."
+            "spec_decode_compile_policy_eagle3.get_server_return_hidden_states_mode",
+            return_value=CaptureHiddenMode.NULL,
+        ):
+            return policy.finalize_forward_batch(out, forward_batch)
+
+    def test_host_staged_target_prefill_keeps_hidden_states_at_the_bucket(self):
+        # The draft extend runs at the same token bucket; trimming made it pad
+        # the hidden states back on device, one compile per prompt length.
+        result = self._host_staged_eagle3_finalize(CaptureHiddenMode.FULL)
+
+        self.assertEqual(result.hidden_states.shape[0], 5)
+        self.assertEqual(result.next_token_logits.shape[0], 2)
+
+    def test_host_staged_draft_prefill_still_trims_its_seed_hidden_states(self):
+        # The draft's LAST capture seeds the next cycle per request; keeping its
+        # padding would hand bucket-many rows to the overlap future map.
+        result = self._host_staged_eagle3_finalize(CaptureHiddenMode.LAST)
+
+        self.assertEqual(result.hidden_states.shape[0], 2)
+
 
 class TestMakeDummyForwardBatch(_PolicyTestCase):
     """``_make_dummy_forward_batch`` shapes valid + ghost slots correctly."""

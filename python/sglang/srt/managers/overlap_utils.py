@@ -327,10 +327,12 @@ class FutureMap:
                 (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
             )
         else:
-            self.output_tokens_buf = torch.empty(
+            # zeros, not empty: padded batches (req_pool_idx == 0) read slot 0,
+            # so it must hold valid token ids and lengths before any write.
+            self.output_tokens_buf = torch.zeros(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-            self.new_seq_lens_buf = torch.empty(
+            self.new_seq_lens_buf = torch.zeros(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
@@ -373,7 +375,8 @@ class FutureMap:
         from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 
         # Prefill can omit spec extras; initialize each buffer when decode first
-        # carries it instead of fixing the layout from the first payload.
+        # carries it instead of fixing the layout from the first payload. Zeroed
+        # like output_tokens_buf: padded batches read slot 0.
         if not self.need_topk and (
             self.spec_algo.is_some()
             and self.spec_algo.need_topk()
@@ -382,12 +385,12 @@ class FutureMap:
             self.need_topk = True
             topk_p0 = payload.topk_p[0]
             topk_index0 = payload.topk_index[0]
-            self.topk_p_buf = torch.empty(
+            self.topk_p_buf = torch.zeros(
                 (self.req_pool_size, *topk_p0.shape),
                 dtype=topk_p0.dtype,
                 device=self.device,
             )
-            self.topk_index_buf = torch.empty(
+            self.topk_index_buf = torch.zeros(
                 (self.req_pool_size, *topk_index0.shape),
                 dtype=topk_index0.dtype,
                 device=self.device,
@@ -400,7 +403,7 @@ class FutureMap:
         ):
             self.need_hidden_states = True
             hidden_states0 = payload.hidden_states[0]
-            self.hidden_states_buf = torch.empty(
+            self.hidden_states_buf = torch.zeros(
                 (self.req_pool_size, *hidden_states0.shape),
                 dtype=hidden_states0.dtype,
                 device=self.device,
@@ -408,7 +411,7 @@ class FutureMap:
 
         if self.draft_probs_buf is None and payload.draft_probs is not None:
             draft_probs0 = payload.draft_probs[0]
-            self.draft_probs_buf = torch.empty(
+            self.draft_probs_buf = torch.zeros(
                 (self.req_pool_size, *draft_probs0.shape),
                 dtype=draft_probs0.dtype,
                 device=self.device,

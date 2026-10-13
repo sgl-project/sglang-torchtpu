@@ -109,6 +109,8 @@ _BS_CPU_LIST_FIELDS = (
 
 _REAL_Q_KEY = "_tpu_real_q"
 _REAL_B_KEY = "_tpu_real_b"
+# Set when a forward's input_ids arrived host-staged (padded on the host).
+_HOST_STAGED_KEY = "_tpu_host_staged"
 _DEFAULT_KWARG_TYPES = (type(None), bool, int, float, str)
 
 

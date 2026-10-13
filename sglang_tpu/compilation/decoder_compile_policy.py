@@ -51,6 +51,7 @@ from sglang_tpu.compilation.attention_rank_inputs import (
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
     _BS_FIELDS,
+    _HOST_STAGED_KEY,
     _REAL_B_KEY,
     _REAL_Q_KEY,
     _TOKEN_FIELDS,
@@ -962,15 +963,21 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                     # on_done_with_host_buffer callback until H2D completes.
                     value.to(self.model_runner.device, non_blocking=True),
                 )
+                if name == "input_ids":
+                    setattr(forward_batch, _HOST_STAGED_KEY, True)
         mixed_tokens = getattr(forward_batch, "mixed_input_tokens", None)
         if mixed_tokens is not None:
             # Tensor offsets keep the prompt length as data, not an XLA shape.
-            tail_start = real_q - mixed_tokens.numel()
-            indices = torch.arange(tail_start, real_q, dtype=torch.int64).to(
-                forward_batch.input_ids.device, non_blocking=True
+            slots = getattr(forward_batch, "mixed_input_slots", None)
+            if slots is None:
+                tail_start = real_q - mixed_tokens.numel()
+                slots = torch.arange(tail_start, real_q, dtype=torch.int64)
+            indices = slots.to(forward_batch.input_ids.device, non_blocking=True)
+            forward_batch.input_ids.index_copy_(
+                0, indices, mixed_tokens.to(forward_batch.input_ids.dtype)
             )
-            forward_batch.input_ids.index_copy_(0, indices, mixed_tokens)
             forward_batch.mixed_input_tokens = None
+            forward_batch.mixed_input_slots = None
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
         spec_info = forward_batch.spec_info

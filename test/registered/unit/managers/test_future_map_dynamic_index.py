@@ -178,19 +178,35 @@ class TestNonEagleRelay(CustomTestCase):
 class TestDeviceAcceptCacheSelection(CustomTestCase):
     def test_selects_window_from_accepted_length(self):
         # Exercise every acceptance length, including both reservation edges,
-        # for short proposals as well as the original four-token window.
+        # for short proposals as well as the original four-token window. The
+        # device seq_lens is the host shadow plus the accepted length.
         for width in (2, 3, 4):
             with self.subTest(width=width):
                 candidates = torch.arange(2 * width - 1).repeat(width, 1)
+                host_base = torch.arange(10, 10 + width, dtype=torch.int64)
+                accept_lens = torch.arange(1, width + 1, dtype=torch.int32)
                 actual = _select_device_accept_cache_locs(
                     candidates,
-                    torch.arange(1, width + 1, dtype=torch.int32),
+                    host_base + accept_lens,
+                    host_base,
                     width=width,
                 )
                 expected = torch.tensor(
                     [list(range(start, start + width)) for start in range(width)]
                 )
                 self.assertTrue(torch.equal(actual, expected))
+
+    def test_padding_rows_select_the_zero_window(self):
+        # A bucketed decode step pads with seq_lens 0, host_base 0 and an
+        # all-zero candidate row; the start clamps into that row.
+        candidates = torch.tensor([[5, 6, 7, 8, 9, 10, 11], [0] * 7])
+        actual = _select_device_accept_cache_locs(
+            candidates,
+            torch.tensor([42, 0]),
+            torch.tensor([40, 0]),
+            width=4,
+        )
+        self.assertEqual(actual.tolist(), [[6, 7, 8, 9], [0, 0, 0, 0]])
 
 
 if __name__ == "__main__":

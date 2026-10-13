@@ -13,7 +13,11 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+    _rotate_prefill_ids_on_host,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -692,6 +696,24 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
 
         self.assertIs(worker.last_shared_read_runner, target_runner)
         self.assertEqual(worker.spec_v2_attn_backends, (target_runner.attn_backend,))
+
+
+class TestRotatePrefillIdsOnHost(CustomTestCase):
+    def test_matches_per_request_rotation_with_tail_slots_left_open(self):
+        host_ids = torch.tensor([1, 2, 3, 10, 20, 7])
+        rotated, last_slots = _rotate_prefill_ids_on_host(host_ids, [3, 2, 1])
+        # Each request shifts left by one; its last slot awaits the device token.
+        self.assertEqual(rotated.tolist(), [2, 3, 0, 20, 0, 0])
+        self.assertEqual(last_slots.tolist(), [2, 4, 5])
+        self.assertEqual(rotated.device.type, "cpu")
+        tail = torch.tensor([4, 30, 8])
+        rotated[last_slots] = tail
+        expected = []
+        pt = 0
+        for i, n in enumerate([3, 2, 1]):
+            expected += host_ids[pt + 1 : pt + n].tolist() + [int(tail[i])]
+            pt += n
+        self.assertEqual(rotated.tolist(), expected)
 
 
 if __name__ == "__main__":

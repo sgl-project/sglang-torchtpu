@@ -753,7 +753,8 @@ class SchedulerBatchResultProcessor:
         assert result.accept_lens.is_cpu
 
         next_token_ids = result.next_token_ids.tolist()
-        accept_lens = result.accept_lens.tolist()
+        # A TPU decode step can run at its batch bucket; drop the padding rows.
+        accept_lens = result.accept_lens.tolist()[: len(batch.reqs)]
         stride = _get_speculative_output_stride(result)
         num_non_draft = result.num_non_draft_tokens_per_req
         result.num_correct_drafts_per_req_cpu = [

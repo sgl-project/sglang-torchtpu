@@ -743,6 +743,7 @@ def _patch_future_map_direct_handoff() -> None:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang_tpu.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
+        future_rows_tpu,
         publish_tpu,
         stash_tpu,
     )
@@ -753,14 +754,22 @@ def _patch_future_map_direct_handoff() -> None:
     orig_resolve_mixed_spec_tails = FutureMap.resolve_mixed_spec_tails
     FutureMap.tpu_direct_handoff = None
     FutureMap.tpu_published_seq_lens = None
+    # (scheduler future indices, bucket rows) of a bucketed decode step.
+    FutureMap.tpu_decode_rows = None
 
+    # A bucketed decode step hands bucket-sized results to the scheduler's
+    # real-sized future indices; store them through the bucket rows.
     def stash(self, future_indices, payload):
-        if not stash_tpu(self, future_indices, payload):
-            orig_stash(self, future_indices, payload)
+        rows = future_indices
+        if payload.bonus_tokens is not None:
+            rows = future_rows_tpu(self, future_indices, payload.bonus_tokens.shape[0])
+        if not stash_tpu(self, future_indices, payload, rows):
+            orig_stash(self, rows, payload)
 
     def publish(self, future_indices, new_seq_lens, confidence=None):
-        orig_publish(self, future_indices, new_seq_lens, confidence)
-        publish_tpu(self, future_indices, new_seq_lens)
+        rows = future_rows_tpu(self, future_indices, new_seq_lens.shape[0])
+        orig_publish(self, rows, new_seq_lens, confidence)
+        publish_tpu(self, future_indices, new_seq_lens, rows)
 
     # Every other buffer reader or writer must see the pending rows stored first.
     def stash_bonus_tokens(self, indices, bonus_tokens):

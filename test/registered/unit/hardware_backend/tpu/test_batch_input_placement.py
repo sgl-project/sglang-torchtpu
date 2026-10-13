@@ -257,7 +257,7 @@ def test_platform_default_and_tpu_fallbacks():
     ):
         assert platform.get_batch_input_device(batch) is None
     for name, value in (
-        ("spec_algorithm", SpeculativeAlgorithm.EAGLE3),
+        ("spec_algorithm", SpeculativeAlgorithm.EAGLE),
         ("dllm_config", object()),
         ("hisparse_coordinator", object()),
     ):
@@ -620,6 +620,59 @@ def test_decode_allocator_uses_host_request_indices_without_device_read():
         result = allocation.alloc_for_decode(batch, 1)
     assert result.tolist() == [24, 30]
     assert alloc.call_args.kwargs["last_loc"].tolist() == [23, 29]
+
+
+def test_eagle3_prefill_stages_on_host_but_decode_and_multimodal_do_not():
+    platform = TpuSRTPlatform()
+    batch, _ = make_batch(ForwardMode.EXTEND, [2], [0])
+    batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+    assert platform.get_batch_input_device(batch) == "cpu"
+    batch.forward_mode = ForwardMode.MIXED
+    assert platform.get_batch_input_device(batch) == "meta"
+    batch.forward_mode = ForwardMode.EXTEND
+    batch.model_config.is_multimodal = True
+    assert platform.get_batch_input_device(batch) == "meta"
+    decode, _ = make_batch(ForwardMode.DECODE, [3], [0])
+    decode.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+    assert platform.get_batch_input_device(decode) == "meta"
+
+
+def test_eagle3_prefill_staging_follows_the_feature_flag():
+    from sglang_tpu.envs import envs as tpu_envs
+
+    platform = TpuSRTPlatform()
+    batch, _ = make_batch(ForwardMode.EXTEND, [2], [0])
+    batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+    with tpu_envs.SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA.override(False):
+        assert platform.get_batch_input_device(batch) == "meta"
+    assert platform.get_batch_input_device(batch) == "cpu"
+
+
+def test_spec_decode_returns_a_host_staged_prefill_to_the_device():
+    batch, _ = make_batch(ForwardMode.EXTEND, [3, 4], [0, 0])
+    batch._move_inputs_to_device()
+    assert batch.batch_input_device == "meta"
+    for name in ("input_ids", "seq_lens", "orig_seq_lens", "out_cache_loc"):
+        assert getattr(batch, name).device.type == "meta"
+    # Already on the device: nothing moves.
+    batch.input_ids = torch.arange(3)
+    batch._move_inputs_to_device()
+    assert batch.input_ids.device.type == "cpu"
+
+
+def test_draft_prefill_tail_tokens_land_at_explicit_slots_after_bucketing():
+    batch, runner = make_batch(ForwardMode.EXTEND, [3, 2], [0, 0])
+    batch.device = runner.device = "cpu"
+    fb = build(batch, runner)
+    # Host-rotated ids with each request's last slot left for the device token.
+    fb.input_ids = torch.tensor([11, 12, 0, 21, 0])
+    fb.mixed_input_tokens = torch.tensor([13, 22])
+    fb.mixed_input_slots = torch.tensor([2, 4])
+    prepare(fb, runner)
+    assert fb.input_ids.tolist()[:5] == [11, 12, 13, 21, 22]
+    assert fb.input_ids.tolist()[5:] == [0] * (fb.input_ids.numel() - 5)
+    assert fb.mixed_input_tokens is None and fb.mixed_input_slots is None
+    assert fb._tpu_host_staged
 
 
 if __name__ == "__main__":

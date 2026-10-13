@@ -939,6 +939,13 @@ class TpuSRTPlatform(SRTPlatform):
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
+    def enter_spec_decode_batch(self, batch: ScheduleBatch) -> None:
+        """Run an EAGLE3 decode step at its batch bucket when the decode
+        prepare built one (see spec_decode_bucket.py)."""
+        from sglang_tpu.spec_decode_bucket import enter_decode_bucket
+
+        enter_decode_bucket(batch)
+
     def get_batch_input_device(self, batch: ScheduleBatch) -> Optional[str]:
         """Place eligible TPU inputs on CPU until decoder padding/materialization."""
         # Opt-in: off returns None, so batches keep the device-only contract.
@@ -963,7 +970,7 @@ class TpuSRTPlatform(SRTPlatform):
         # and retain their device contract.
         if (
             get_flags().capture.enable_torch_compile
-            and batch.spec_algorithm.is_none()
+            and (batch.spec_algorithm.is_none() or _eagle_prefill_can_stage(batch))
             and batch.dllm_config is None
             and not batch.model_config.is_encoder_decoder
             and not getattr(batch.model_config, "use_ngram_embedding", False)
@@ -1249,3 +1256,23 @@ class TpuSRTPlatform(SRTPlatform):
             np.random.seed(seed)
             torch.manual_seed(seed)
             torch.tpu.manual_seed_all(seed)
+
+
+def _eagle_prefill_can_stage(batch) -> bool:
+    """An EAGLE3 prefill whose host-born inputs can stay on CPU until padding.
+
+    The EAGLE worker rotates the draft's prefill ids on the host and writes its
+    device-produced tail tokens after the upload; spec decode moves the batch
+    back to the device (it consumes device-produced lengths between phases).
+    Multimodal targets rotate their input embeds on the device, so they keep
+    the device contract.
+    """
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return (
+        tpu_envs.SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA.get()
+        and batch.spec_algorithm.is_eagle3()
+        and batch.forward_mode == ForwardMode.EXTEND
+        and not getattr(batch.model_config, "is_multimodal", False)
+    )

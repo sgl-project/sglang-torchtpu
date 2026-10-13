@@ -57,6 +57,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -161,6 +162,27 @@ def _qsa_index_share_requested(hf_config) -> bool:
             getattr(hf_config, "index_share_for_mtp_iteration", False),
         )
     )
+
+
+def _rotate_prefill_ids_on_host(
+    host_ids: torch.Tensor, extend_lens: list[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shift each request's prefill ids left by one, on the host.
+
+    Returns the rotated ids, with each request's last slot left at 0, and
+    those slots. The tail tokens are device-produced, so the caller writes
+    them after the upload; rotating per request on the device instead would
+    compile one program per prompt length.
+    """
+    rotated = torch.zeros_like(host_ids)
+    last_slots = []
+    pt = 0
+    for extend_len in extend_lens:
+        rotated[pt : pt + extend_len - 1] = host_ids[pt + 1 : pt + extend_len]
+        pt += extend_len
+        last_slots.append(pt - 1)
+    assert pt == host_ids.numel()
+    return rotated, torch.tensor(last_slots, dtype=torch.int64)
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -1109,10 +1131,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_token_ids: Next token ids generated from the target forward.
         """
         # Construct input_ids
+        tail_patch = None
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
 
+        if (
+            not batch.forward_mode.is_idle()
+            and mm_input_embeds is None
+            and batch.input_ids.device.type == "cpu"
+        ):
+            # TPU host-staged prefill: rotate on the host and let the compiled
+            # forward write the device tail tokens after its bucketed upload.
+            batch.input_ids, last_slots = _rotate_prefill_ids_on_host(
+                batch.input_ids, batch.extend_lens
+            )
+            # The sampled tokens may carry bucket padding rows.
+            tail_patch = (tail_tokens[: last_slots.shape[0]], last_slots)
+        elif not batch.forward_mode.is_idle():
             new_input_ids = torch.empty_like(batch.input_ids)
             if mm_input_embeds is not None:
                 # Rotate mm embeddings the same way as input_ids: shift left by
@@ -1160,6 +1196,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return_hidden_states_before_norm=False,
         )
         forward_batch.return_logprob = False
+        if tail_patch is not None:
+            (
+                forward_batch.mixed_input_tokens,
+                forward_batch.mixed_input_slots,
+            ) = tail_patch
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
@@ -1578,6 +1619,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            # A backend may run the whole step on decode-prepared inputs (TPU:
+            # the batch bucket); the scheduler restores its own fields.
+            current_platform.enter_spec_decode_batch(batch)
 
             if batch.spec_info is None:
                 capture_mode = (

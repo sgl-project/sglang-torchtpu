@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
@@ -35,6 +36,7 @@ from sglang_tpu.compilation.attention_rank_inputs import (
     use_attention_rank_tensors,
 )
 from sglang_tpu.compilation.compiled_forward_shim import (
+    _HOST_STAGED_KEY,
     _REAL_B_KEY,
     _REAL_Q_KEY,
     _dp_attn_apply_bucket_metadata,
@@ -54,6 +56,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
     _pad_first_dim,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
@@ -226,7 +229,37 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             self._draft_eager_backbone_forward = self.owner.model.forward
             self._draft_eager_model_forward = self.owner.forward
             self._draft_eager_logits_forward = self.owner.logits_processor.forward
-        return super().install()
+        installed = super().install()
+        if installed and not self.is_draft_worker:
+            self._register_decode_batch_bucket()
+        return installed
+
+    def _register_decode_batch_bucket(self) -> None:
+        """Let the decode step run at the batch bucket from scheduling on.
+
+        Not with DP attention, whose phases pad to the widest peer, or PP, or
+        with SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA off.
+        """
+        if (
+            not tpu_envs.SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA.get()
+            or is_dp_attention_enabled()
+            or get_parallel().pp_size > 1
+            or self.speculative_eagle_topk != 1
+            or self.b_bucketer is None
+        ):
+            return
+        from sglang_tpu.spec_decode_bucket import (
+            register_decode_batch_bucket,
+        )
+
+        b_bucketer = self.b_bucketer
+
+        def bucket(num_reqs: int) -> int | None:
+            if num_reqs > b_bucketer.max_val:
+                return None
+            return b_bucketer.next_bucket(num_reqs)
+
+        register_decode_batch_bucket(bucket)
 
     def compile_fused_draft_steps(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Compile the multi-step EAGLE draft loop with the selected tracer."""
@@ -1198,7 +1231,20 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             if logit_rows < next_token_logits.shape[0]:
                 outputs.next_token_logits = next_token_logits[:logit_rows]
 
-        if hidden_states is not None and not preserve_padded_outputs:
+        # A host-staged target prefill's per-token hidden states only feed the
+        # draft extend, which runs at the same token bucket: trimming here made
+        # the draft pad them back on device, one program per prompt length.
+        # Per-request (LAST) captures still trim; they seed the next cycle.
+        keep_padded_hidden = (
+            getattr(forward_batch, _HOST_STAGED_KEY, False)
+            and forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            and get_server_return_hidden_states_mode() == CaptureHiddenMode.NULL
+        )
+        if (
+            hidden_states is not None
+            and not preserve_padded_outputs
+            and not keep_padded_hidden
+        ):
             # Capture-LAST (draft extend) emits one hidden row per
             # sequence (batch-dim), so slice to real_b. Every other capture mode
             # emits one row per token (real_q).

@@ -3637,6 +3637,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_mask_cpu = None
             self.mamba_track_mask_next_cpu = None
             self.mamba_decode_batch_idx_cpu = None
+            # Spec decode consumes device-produced lengths between phases;
+            # a host-staged prefill batch returns to the device contract.
+            self._move_inputs_to_device()
             spec_prepare_for_decode(self)
             return
 
@@ -3854,17 +3857,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ):
             return
         for batch in (self, other):
-            for name in (
-                "input_ids",
-                "input_embeds",
-                "seq_lens",
-                "orig_seq_lens",
-                "out_cache_loc",
-            ):
-                value = getattr(batch, name, None)
-                if isinstance(value, torch.Tensor) and value.device.type == "cpu":
-                    setattr(batch, name, value.to(batch.device, non_blocking=True))
+            batch._move_inputs_to_device()
             batch.batch_input_device = batch.device
+
+    def _move_inputs_to_device(self):
+        """Restore the device contract for host-staged inputs; a no-op for a
+        batch that is not host-staged."""
+        if (self.batch_input_device or self.device) == self.device:
+            return
+        for name in (
+            "input_ids",
+            "input_embeds",
+            "seq_lens",
+            "orig_seq_lens",
+            "out_cache_loc",
+        ):
+            value = getattr(self, name, None)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                setattr(self, name, value.to(self.device, non_blocking=True))
+        self.batch_input_device = self.device
 
     def merge_batch(self, other: ScheduleBatch):
         self._align_input_devices(other)

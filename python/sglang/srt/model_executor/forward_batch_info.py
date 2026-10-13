@@ -546,6 +546,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     orig_seq_lens: Optional[torch.Tensor] = None
     # Device-produced mixed decode tail, written after bucketed input_ids upload.
     mixed_input_tokens: Optional[torch.Tensor] = None
+    # Host token offsets for mixed_input_tokens; None means the trailing rows
+    # (mixed decode tails). The EAGLE draft prefill sets each request's last row.
+    mixed_input_slots: Optional[torch.Tensor] = None
 
     # The write loc before `rebind_write_loc` replaced it with physical
     # ids; a backend re-derives from it into its capture-stable buffer.

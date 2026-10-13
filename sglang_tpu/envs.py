@@ -21,6 +21,10 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # EAGLE3: stage prefill metadata on the host (with host staging enabled)
+    # and run each decode step at the batch bucket, so neither prompt length
+    # nor batch size compiles.
+    SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:

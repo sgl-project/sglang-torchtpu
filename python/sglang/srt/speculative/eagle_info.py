@@ -1,7 +1,7 @@
 import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -728,7 +728,12 @@ class EagleDraftInput(SpecInput):
     # pre-reserved host page-table window without a per-step D2H barrier.
     accept_lens_device: Optional[torch.Tensor] = None
     device_accept_candidate_locs: Optional[torch.Tensor] = None
+    # Host length shadow each candidate window starts after.
+    device_accept_host_base: Optional[torch.Tensor] = None
     device_accept_selected_cache_locs: Optional[torch.Tensor] = None
+    # TPU: bucket-sized inputs when the decode step runs at its batch bucket
+    # (hardware_backend/tpu/spec_decode_bucket.py).
+    decode_bucket: Optional[Any] = None
 
     # TPU RPA KV lengths for the current fused draft step.
     rpa_draft_kv_lens: Optional[torch.Tensor] = None
@@ -869,9 +874,11 @@ class EagleDraftInput(SpecInput):
                 self.device_accept_candidate_locs = (
                     spec_info.device_accept_candidate_locs
                 )
+                self.device_accept_host_base = spec_info.device_accept_host_base
                 self.device_accept_selected_cache_locs = (
                     spec_info.device_accept_selected_cache_locs
                 )
+                self.decode_bucket = spec_info.decode_bucket
             return
         if len(spec_info.topk_index) == 0:
             return
