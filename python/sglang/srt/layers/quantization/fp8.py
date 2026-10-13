@@ -664,9 +664,15 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         if _is_tpu:
-            tp_rank = getattr(layer, "tp_rank", None)
-            if tp_rank is None:
-                tp_rank = get_parallel().tp_rank
+            if (
+                output_size != output_size_per_partition
+                or input_size != input_size_per_partition
+            ):
+                tp_rank = getattr(layer, "tp_rank", None)
+                if tp_rank is None:
+                    tp_rank = get_parallel().tp_rank
+            else:
+                tp_rank = 0
             layer.tpu_fp8_output_tp_rank = (
                 tp_rank if output_size != output_size_per_partition else 0
             )
@@ -715,12 +721,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 if _is_tpu and not use_mxfp8:
-                    tp_rank = getattr(layer, "tp_rank", None)
-                    if tp_rank is None:
-                        tp_rank = get_parallel().tp_rank
-                    output_tp_rank = (
-                        tp_rank if output_size != output_size_per_partition else 0
-                    )
+                    output_tp_rank = getattr(layer, "tpu_fp8_output_tp_rank", 0)
                     scale_rows = sum(
                         (output_tp_rank * partition_size + partition_size + block_n - 1)
                         // block_n
@@ -728,12 +729,13 @@ class Fp8LinearMethod(LinearMethodBase):
                         for partition_size in output_partition_sizes
                     )
                     if input_size != input_size_per_partition:
+                        input_offset = getattr(layer, "tpu_fp8_input_offset", 0)
                         scale_cols = (
-                            tp_rank * input_size_per_partition
+                            input_offset
                             + input_size_per_partition
                             + block_k
                             - 1
-                        ) // block_k - (tp_rank * input_size_per_partition) // block_k
+                        ) // block_k - input_offset // block_k
                     else:
                         scale_cols = (input_size_per_partition + block_k - 1) // block_k
                 else:
@@ -1150,24 +1152,22 @@ class Fp8LinearMethod(LinearMethodBase):
             )
         tp_rank = getattr(layer, "tpu_fp8_output_tp_rank", None)
         if tp_rank is None:
-            raw_tp_rank = getattr(layer, "tp_rank", None)
-            if raw_tp_rank is None:
-                raw_tp_rank = get_parallel().tp_rank
-            tp_rank = (
-                raw_tp_rank
-                if getattr(layer, "output_size", out_size) != out_size
-                else 0
-            )
+            if getattr(layer, "output_size", out_size) != out_size:
+                raw_tp_rank = getattr(layer, "tp_rank", None)
+                if raw_tp_rank is None:
+                    raw_tp_rank = get_parallel().tp_rank
+                tp_rank = raw_tp_rank
+            else:
+                tp_rank = 0
         input_offset = getattr(layer, "tpu_fp8_input_offset", None)
         if input_offset is None:
-            raw_tp_rank = getattr(layer, "tp_rank", None)
-            if raw_tp_rank is None:
-                raw_tp_rank = get_parallel().tp_rank
-            input_offset = (
-                raw_tp_rank * in_size
-                if getattr(layer, "input_size", in_size) != in_size
-                else 0
-            )
+            if getattr(layer, "input_size", in_size) != in_size:
+                raw_tp_rank = getattr(layer, "tp_rank", None)
+                if raw_tp_rank is None:
+                    raw_tp_rank = get_parallel().tp_rank
+                input_offset = raw_tp_rank * in_size
+            else:
+                input_offset = 0
 
         first_k_block = input_offset // block_k
         last_k_block = (input_offset + in_size + block_k - 1) // block_k
