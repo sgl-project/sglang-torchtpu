@@ -131,8 +131,14 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list[Any]:
-    """Describe whole pages in destination byte space for each locally owned layer."""
+def source_spans(
+    pools: Sequence[dict],
+    full: list[int],
+    swa: list[int],
+    dst_unit_ordinal: int | None = None,
+) -> list[Any]:
+    """Describe whole pages in destination byte space for each locally owned
+    layer, routed to every destination or to ``dst_unit_ordinal`` only."""
     result = []
     for pool in pools:
         blocks = swa if pool["tag"].startswith("swa.") else full
@@ -147,6 +153,7 @@ def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list
                 src_stride_bytes=0,
                 dst_stride_bytes=0,
                 count=1,
+                dst_unit_ordinal=dst_unit_ordinal,
             )
             for index in range(len(blocks))
         ]
@@ -162,6 +169,36 @@ def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list
     return result
 
 
+def rank_heads(tp: int, total_kv_heads: int, rank: int) -> range:
+    """Global kv-heads held by attention-TP rank ``rank``; ranks share a head
+    when the model has fewer kv-heads than ranks."""
+    if total_kv_heads >= tp:
+        per_rank = total_kv_heads // tp
+        return range(rank * per_rank, (rank + 1) * per_rank)
+    head = rank // (tp // total_kv_heads)
+    return range(head, head + 1)
+
+
+def head_slice_targets(
+    src_tp: int, dst_tp: int, total_kv_heads: int, src_rank: int
+) -> list[int]:
+    """Destination ranks ``src_rank`` writes to: every destination head is
+    written once, by the lowest source rank holding it."""
+    targets = []
+    for dst_rank in range(dst_tp):
+        writers = {
+            min(
+                r
+                for r in range(src_tp)
+                if head in rank_heads(src_tp, total_kv_heads, r)
+            )
+            for head in rank_heads(dst_tp, total_kv_heads, dst_rank)
+        }
+        if src_rank in writers:
+            targets.append(dst_rank)
+    return targets
+
+
 def head_slice_spans(
     pools: Sequence[dict],
     tensors: Sequence[Any],
@@ -169,14 +206,18 @@ def head_slice_spans(
     swa: list[int],
     dst_attn_tp: int,
     total_kv_heads: int,
+    src_attn_tp: int = 1,
+    src_rank: int = 0,
 ) -> list[Any]:
-    """Describe each destination rank's kv-head slice of every locally owned
-    page: one strided span per page and rank, routed to that rank only."""
+    """Describe the kv-head slices of every locally owned page that this
+    source rank writes: one strided span per page and destination rank,
+    routed to that rank only."""
+    targets = head_slice_targets(src_attn_tp, dst_attn_tp, total_kv_heads, src_rank)
     result = []
     for pool, tensor in zip(pools, tensors):
         blocks = swa if pool["tag"].startswith("swa.") else full
         geometry = ReshardGeometry(
-            src_tp=1,
+            src_tp=src_attn_tp,
             dst_tp=dst_attn_tp,
             hp_bytes=head_bytes(tensor),
             total_kv_heads=total_kv_heads,
@@ -185,9 +226,9 @@ def head_slice_spans(
         )
         page_tokens = int(tensor.shape[1])
         spans = []
-        for rank in range(dst_attn_tp):
+        for rank in targets:
             src_offset, size, src_stride, dst_offset, dst_stride = geometry.entry_bytes(
-                0, rank
+                src_rank, rank
             )
             spans.extend(
                 SimpleNamespace(
@@ -225,6 +266,8 @@ def dcp_token_spans(
     dst_attn_tp: int,
     dcp_size: int,
     total_kv_heads: int,
+    src_attn_tp: int = 1,
+    src_rank: int = 0,
 ) -> list[Any]:
     """Describe a decode-context-parallel decode's share of every locally owned page.
 
@@ -241,6 +284,8 @@ def dcp_token_spans(
             f"Decode attention TP {dst_attn_tp} is not a multiple of DCP {dcp_size}"
         )
     kv_tp = dst_attn_tp // dcp_size
+    # A head-sliced source writes the head groups it is the lowest holder of.
+    groups = head_slice_targets(src_attn_tp, kv_tp, total_kv_heads, src_rank)
     full_count = len(full)
     result = []
     for pool, tensor in zip(pools, tensors):
@@ -253,7 +298,7 @@ def dcp_token_spans(
             )
         rows = page_tokens // dcp_size
         geometry = ReshardGeometry(
-            src_tp=1,
+            src_tp=src_attn_tp,
             dst_tp=kv_tp,
             hp_bytes=head_bytes(tensor),
             total_kv_heads=total_kv_heads,
@@ -273,7 +318,11 @@ def dcp_token_spans(
         spans = []
         for unit in range(dst_attn_tp):
             dcp_rank, group = unit % dcp_size, unit // dcp_size
-            head_src, size, src_row, head_dst, dst_row = geometry.entry_bytes(0, group)
+            if group not in groups:
+                continue
+            head_src, size, src_row, head_dst, dst_row = geometry.entry_bytes(
+                src_rank, group
+            )
             for ordinal, page in fillers + pages:
                 spans.append(
                     SimpleNamespace(
@@ -450,6 +499,7 @@ class Receive(msgspec.Struct):
     swa: list[int]
     aux_index: int | None
     ranks: set[int]
+    # Keyed by the source's transfer rank (pipeline stage x attention TP).
     sources: dict[int, dict]
     future: concurrent.futures.Future | None = None
     accepted: bool = False
@@ -457,6 +507,14 @@ class Receive(msgspec.Struct):
     endpoints: tuple[str, ...] = ()
     next_attempt: float = 0.0
     armed_until: float = 0.0
+    # Sources to hear from; one per pipeline rank unless several attention-TP
+    # ranks of a stage feed this rank.
+    expected: int | None = None
+
+    def ready(self) -> bool:
+        expected = len(self.ranks) if self.expected is None else self.expected
+        stages = {int(meta["rank"]) for meta in self.sources.values()}
+        return len(self.sources) == expected and stages == self.ranks
 
 
 class StagingPlan(msgspec.Struct, frozen=True):
@@ -471,6 +529,8 @@ class PipelineTransfer:
     """One named-pool engine per worker, sharing its pipeline's reshard controller."""
 
     dcp_size = 1
+    replicas = 1
+    passive = False
 
     def __init__(self, manager, groups):
         from tpu_sync.api.torch.reshard_client import ReshardClient
@@ -486,11 +546,20 @@ class PipelineTransfer:
         self.lock = threading.RLock()
         self.pools = pool_manifest(groups)
         self.tensors = list(groups.full) + list(groups.swa)
-        # One worker per pipeline stage or attention-TP rank. Rank 0 hosts the
-        # shared controller and, on a tensor-parallel decode, plans every
-        # transfer for all ranks.
-        self.rank = manager.pp_rank * manager.attn_tp_size + manager.attn_tp_rank
-        self.workers = manager.pp_size * manager.attn_tp_size
+        # A source with more attention-TP ranks than kv heads holds each head on
+        # several ranks, and only the lowest of them writes it (head_slice_targets);
+        # the other replicas push nothing, so they take no part in the transfer.
+        heads = int(manager.kv_args.total_kv_head_num) if self.producer else 0
+        self.replicas = max(1, manager.attn_tp_size // heads) if heads else 1
+        self.passive = manager.attn_tp_rank % self.replicas != 0
+        self.transfer_tp = manager.attn_tp_size // self.replicas
+        # One worker per pipeline stage or writing attention-TP rank. Rank 0
+        # hosts the shared controller and, on a tensor-parallel decode, plans
+        # every transfer for all ranks.
+        self.rank = (
+            manager.pp_rank * self.transfer_tp + manager.attn_tp_rank // self.replicas
+        )
+        self.workers = manager.pp_size * self.transfer_tp
         self.client_type = ReshardClient
         self.clients = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(
@@ -525,6 +594,20 @@ class PipelineTransfer:
             )
             for rank in range(manager.attn_tp_size)
         ]
+        if self.passive:
+            # A replica only answers its consumer's request (_reply); it builds
+            # no engine and registers nothing.
+            self.max_blocks = 0
+            self.admission = StagingAdmission(0)
+            self.engine = None
+            logger.info(
+                "Raiden pipeline rank tp=%d/%d replicates kv heads of rank tp=%d; "
+                "it does not send",
+                manager.attn_tp_rank,
+                manager.attn_tp_size,
+                manager.attn_tp_rank - manager.attn_tp_rank % self.replicas,
+            )
+            return
         full_blocks = manager._max_request_blocks()
         swa_blocks = manager._swa_max_request_blocks() if groups.swa else 0
         self.max_blocks = max(full_blocks, swa_blocks)
@@ -556,12 +639,9 @@ class PipelineTransfer:
                 "Raiden pipeline transfer sends only from prefill CP rank 0, got CP rank "
                 f"{manager.attn_cp_rank}"
             )
-        if self.producer and (manager.attn_tp_size != 1 or manager.pp_size <= 1):
-            raise ValueError(
-                "Raiden pipeline transfer requires a pipeline producer with "
-                "attention TP=1"
-            )
-        if manager.attn_tp_size != 1 and manager.pp_size != 1:
+        # A producer stage may be an attention-TP group; a prefill without
+        # pipeline stages is a one-stage producer.
+        if not self.producer and manager.attn_tp_size != 1 and manager.pp_size != 1:
             raise ValueError(
                 "Raiden pipeline transfer takes attention TP>1 only on a decode "
                 "without pipeline stages"
@@ -595,7 +675,7 @@ class PipelineTransfer:
         manager = self.manager
         self.store = None
         addresses = None
-        if self.rank == 0:
+        if self.rank == 0 and not self.passive:
             self.store = ReshardStore(
                 RaidenId(
                     job_name="sglang",
@@ -821,6 +901,8 @@ class PipelineTransfer:
                     "TP or DCP"
                 )
             dst_attn_tp, dcp_size = widths.pop()
+            src_attn_tp = self.manager.attn_tp_size
+            src_rank = self.manager.attn_tp_rank
             if dcp_size > 1:
                 spans = dcp_token_spans(
                     self.pools,
@@ -830,9 +912,18 @@ class PipelineTransfer:
                     dst_attn_tp,
                     dcp_size,
                     int(self.manager.kv_args.total_kv_head_num),
+                    src_attn_tp=src_attn_tp,
+                    src_rank=src_rank,
                 )
-            elif dst_attn_tp == 1:
-                spans = source_spans(self.pools, item["full"], item["swa"])
+            elif dst_attn_tp == src_attn_tp and self.replicas == 1:
+                # A source rank of the decode's width sends whole pages to the
+                # destination rank of its own index.
+                spans = source_spans(
+                    self.pools,
+                    item["full"],
+                    item["swa"],
+                    dst_unit_ordinal=None if src_attn_tp == 1 else src_rank,
+                )
             else:
                 spans = head_slice_spans(
                     self.pools,
@@ -841,6 +932,8 @@ class PipelineTransfer:
                     item["swa"],
                     dst_attn_tp,
                     int(self.manager.kv_args.total_kv_head_num),
+                    src_attn_tp=src_attn_tp,
+                    src_rank=src_rank,
                 )
             self.client.register_request_blocks(
                 req_id=str(room),
@@ -861,7 +954,7 @@ class PipelineTransfer:
         consumers = self.replies.get(room)
         if item is None or not consumers or room in self.failed:
             return
-        if not item["registered"] and not self._register(room):
+        if not self.passive and not item["registered"] and not self._register(room):
             return
         mgr = self.manager
         metadata = dict(
@@ -869,10 +962,14 @@ class PipelineTransfer:
             unit=self.unit_fields,
             rank=mgr.pp_rank,
             pp_size=mgr.pp_size,
+            attn_tp_size=mgr.attn_tp_size,
             pool_tags=[pool["tag"] for pool in self.pools],
             full=len(item["full"]),
             swa=len(item["swa"]),
         )
+        if self.replicas > 1:
+            # The writing ranks of each stage, which the decode plans from.
+            metadata["transfer_tp"] = mgr.attn_tp_size // self.replicas
         payload = json.dumps(metadata).encode()
         for endpoint in consumers:
             if endpoint in item["replied"]:
@@ -882,15 +979,22 @@ class PipelineTransfer:
                 [MessageTag.PIPELINE_READY, str(room).encode(), payload, item["aux"]],
             )
             item["replied"].add(endpoint)
+        if self.passive:
+            # A replica has sent everything it will once its consumer heard
+            # from it: one consumer per source rank when the decode is no wider.
+            self.done_send.add(room)
+            self.retired.add(room)
 
     def register_decode(self, room, full, swa, aux_index, infos):
         self._validate_room(room)
         mgr = self.manager
         ranks = {int(info["pp_rank"]) for info in infos}
-        if len(ranks) != len(infos):
-            raise ValueError(
-                "Raiden pipeline sources must have distinct pipeline ranks"
-            )
+        endpoints = tuple(
+            NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
+            for info in infos
+        )
+        if len(set(endpoints)) != len(infos):
+            raise ValueError("Raiden pipeline sources must be distinct ranks")
         with self.lock:
             self.receives[room] = Receive(
                 full=list(full),
@@ -899,10 +1003,8 @@ class PipelineTransfer:
                 ranks=ranks,
                 sources={},
                 deadline=time.monotonic() + mgr._timeout_s,
-                endpoints=tuple(
-                    NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
-                    for info in infos
-                ),
+                endpoints=endpoints,
+                expected=len(infos),
             )
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
         consumer = json.dumps(
@@ -964,7 +1066,7 @@ class PipelineTransfer:
                 raise ValueError(
                     "Matching pipelines must own the same layers per stage"
                 )
-            request.sources[rank] = meta
+            request.sources[int(meta["unit"]["data_replica_idx"])] = meta
             if request.aux_index is not None and msg[3]:
                 write_aux_blob(
                     mgr.kv_args.aux_data_ptrs,
@@ -997,13 +1099,14 @@ class PipelineTransfer:
             if room in mgr._aborted:
                 return False
             request = self.receives.get(room)
-            if request is None or set(request.sources) != request.ranks:
+            if request is None or not request.ready():
                 return False
             if request.accepted or request.future is not None:
                 return True
             if time.monotonic() < request.next_attempt:
                 return False
-            sources = [request.sources[rank] for rank in sorted(request.ranks)]
+            sources = [request.sources[rank] for rank in sorted(request.sources)]
+            src_attn_tp = int(sources[0].get("attn_tp_size", 1))
             addresses = {source["controller"] for source in sources}
             geometries = {(source["full"], source["swa"]) for source in sources}
             if len(addresses) != 1 or len(geometries) != 1:
@@ -1026,7 +1129,9 @@ class PipelineTransfer:
                     self.pools, request.full, request.swa, source_full, source_swa
                 )
             if not args["transfer_pool_tags"]:
-                if mgr.attn_tp_rank == 0:
+                # Each source hears the release once: from the lowest of the
+                # destination ranks that share it.
+                if mgr.attn_tp_rank % max(1, mgr.attn_tp_size // src_attn_tp) == 0:
                     for endpoint in request.endpoints:
                         self._send(
                             endpoint,
@@ -1053,7 +1158,12 @@ class PipelineTransfer:
                 client.coordinate_transfer,
                 src_units=[
                     SimpleNamespace(**(sources[0]["unit"] | {"data_replica_idx": rank}))
-                    for rank in range(int(sources[0]["pp_size"]))
+                    # Replicas of a kv head take no part, so the sources are
+                    # each stage's writing ranks.
+                    for rank in range(
+                        int(sources[0]["pp_size"])
+                        * int(sources[0].get("transfer_tp", src_attn_tp))
+                    )
                 ],
                 dst_units=self.dst_units,
                 req_id=str(room),
@@ -1132,7 +1242,11 @@ class PipelineTransfer:
         and failed rooms for the manager to record."""
         mgr = self.manager
         with self.lock:
-            status = mgr._poll_engine_status(name="pipeline", engine=self.engine)
+            status = (
+                None
+                if self.engine is None
+                else mgr._poll_engine_status(name="pipeline", engine=self.engine)
+            )
             if status is not None:
                 sent, received, failed = (
                     {int(mgr._norm_req_id(t.req_id)) for t in rooms} for rooms in status

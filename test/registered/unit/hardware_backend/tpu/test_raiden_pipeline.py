@@ -30,6 +30,7 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
     dcp_token_spans,
     destination_blocks,
     head_slice_spans,
+    head_slice_targets,
     layout_fingerprint,
     legacy_mirror_slots,
     legacy_slot_host_bytes,
@@ -1008,6 +1009,13 @@ class TestPipelineInitialization(unittest.TestCase):
         }
         with patch.dict(sys.modules, native):
             pipe = PipelineTransfer(manager, buffers)
+        if pipe.passive:
+            # A kv-head replica builds no engine and registers nothing.
+            self.assertEqual(events, [])
+            self.assertIsNone(pipe.engine)
+            client.register_work_unit.assert_not_called()
+            pipe.executor.shutdown(wait=False)
+            return None, None
         expected = ["engine", "pools", "layout", "work_unit"]
         if legacy:
             expected = ["materialize", "layout"] + expected
@@ -1042,9 +1050,28 @@ class TestPipelineInitialization(unittest.TestCase):
                 attn_cp_size=2,
                 attn_cp_rank=0,
                 _local_rank=2,
+                kv_args=SimpleNamespace(page_size=128, total_kv_head_num=8),
             )
         self.assertEqual(unit["transfer_rank"], 1)
         self.assertEqual(engine["node_id"], unit["transfer_rank"])
+
+    def test_kv_head_replicas_do_not_send(self):
+        # TP16 prefill of an 8-head model: ranks 2k and 2k+1 hold head k, and
+        # only rank 2k writes it, so the sources are the even ranks, numbered
+        # 0..7 (the planner takes contiguous transfer ranks).
+        addresses = ("10.0.0.1:32000", "10.0.0.1:32001")
+        tp_group = SimpleNamespace(broadcast_object=lambda obj, src: addresses)
+        fields = dict(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            attn_tp_size=16,
+            kv_args=SimpleNamespace(page_size=128, total_kv_head_num=8),
+        )
+        with get_parallel().override(attn_tp_group=tp_group):
+            engine, unit = self._initialize(attn_tp_rank=6, _local_rank=6, **fields)
+            self.assertEqual(unit["transfer_rank"], 3)
+            self.assertEqual(unit["transfer_parallelism"], 8)
+            self.assertEqual(engine["node_id"], unit["transfer_rank"])
+            self.assertEqual(self._initialize(attn_tp_rank=7, **fields), (None, None))
 
     def test_bootstrap_messages_wait_for_pool_initialization(self):
         from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -1117,6 +1144,138 @@ class TestDraftPoolGroups(unittest.TestCase):
         self.assertEqual(len(groups.full), 3)
 
 
+class TestTensorParallelStages(unittest.TestCase):
+    """A pipeline whose stages are attention-TP groups (PP x TP prefill)."""
+
+    def test_every_destination_head_has_exactly_one_writer(self):
+        cases = [
+            # (src_tp, dst_tp, kv_heads) -> destinations of each source rank
+            ((2, 2, 8), [[0], [1]]),
+            ((2, 1, 8), [[0], [0]]),
+            ((1, 8, 8), [list(range(8))]),
+            ((2, 8, 8), [[0, 1, 2, 3], [4, 5, 6, 7]]),
+            ((2, 4, 1), [[0, 1, 2, 3], []]),
+            ((8, 2, 4), [[0], [], [0], [], [1], [], [1], []]),
+        ]
+        for (src_tp, dst_tp, heads), expected in cases:
+            with self.subTest(src_tp=src_tp, dst_tp=dst_tp, heads=heads):
+                self.assertEqual(
+                    [
+                        head_slice_targets(src_tp, dst_tp, heads, rank)
+                        for rank in range(src_tp)
+                    ],
+                    expected,
+                )
+
+    def test_equal_width_source_sends_whole_pages_to_its_own_rank(self):
+        pipe = transfer(
+            producer=True, pp_size=4, pp_rank=1, attn_tp_size=2, attn_tp_rank=1
+        )
+        pipe.manager._prefill.send_blocks[7] = [20, 21]
+        pipe.manager._prefill.send_swa_blocks[7] = [30]
+        self.assertTrue(pipe.finalize_send(7, None))
+        pipe.on_message(
+            [
+                MessageTag.PIPELINE_REQ,
+                b"7",
+                b"tcp://decode:31001",
+                b'{"attn_tp_size": 2, "attn_tp_rank": 1}',
+            ]
+        )
+        kwargs = pipe.client.register_request_blocks.call_args.kwargs
+        spans = kwargs["pool_spans"]
+        self.assertEqual(kwargs["unit"].data_replica_idx, 3)
+        self.assertEqual([len(entry.spans) for entry in spans], [2, 1])
+        self.assertEqual(
+            {span.dst_unit_ordinal for entry in spans for span in entry.spans}, {1}
+        )
+        self.assertEqual(
+            [entry.declared_bytes for entry in spans], [2 * 524288, 524288]
+        )
+        meta = json.loads(pipe._send.call_args.args[1][2])
+        self.assertEqual((meta["rank"], meta["attn_tp_size"]), (1, 2))
+
+    def test_narrower_destination_interleaves_each_source_rank(self):
+        # Two prefill ranks of four kv-heads each into one decode rank of
+        # eight: rank 1's heads land after rank 0's in every token.
+        layers = groups(full=(6,), swa=(), buffer=Bf16Buffer)
+        pools = pool_manifest(layers)
+        (entry,) = head_slice_spans(
+            pools, layers.full, [20, 21], [], 1, 8, src_attn_tp=2, src_rank=1
+        )
+        span = entry.spans[1]
+        self.assertEqual(span.dst_unit_ordinal, 0)
+        self.assertEqual(
+            (span.src_offset_bytes, span.size_bytes, span.src_stride_bytes),
+            (0, 2048, 2048),
+        )
+        self.assertEqual(
+            (span.dst_offset_bytes, span.dst_stride_bytes, span.count),
+            (4096 * 128 + 2048, 4096, 128),
+        )
+        self.assertEqual(entry.declared_bytes, 2 * 2048 * 128)
+
+    def test_destination_enumerates_every_stage_and_tp_rank(self):
+        pipe = transfer(attn_tp_size=2)
+        request = receive(rank=0, pp_size=4)
+        request.ranks = set(range(4))
+        request.sources = {}
+        request.expected = 8
+        pipe.receives[7] = request
+        for unit in range(8):
+            stage = unit // 2
+            meta = dict(
+                receive(rank=stage, pp_size=4).sources[stage],
+                attn_tp_size=2,
+                pool_tags=[],
+            )
+            meta["unit"] = meta["unit"] | {"data_replica_idx": unit}
+            self.assertFalse(pipe.maybe_start_pull(7))
+            pipe.on_message(
+                [MessageTag.PIPELINE_READY, b"7", json.dumps(meta).encode(), b""]
+            )
+        self.assertTrue(pipe.maybe_start_pull(7))
+        args = pipe.executor.submit.call_args.kwargs
+        self.assertEqual(
+            [u.data_replica_idx for u in args["src_units"]], list(range(8))
+        )
+        self.assertEqual([u.data_replica_idx for u in args["dst_units"]], [0, 1])
+
+    def test_several_tp_sources_of_one_stage_feed_a_narrower_rank(self):
+        pipe = transfer()
+        infos = [
+            dict(pp_rank=stage, rank_ip="10.0.0.9", rank_port=30000 + 2 * stage + tp)
+            for stage in range(4)
+            for tp in range(2)
+        ]
+        pipe.register_decode(7, [20, 21], [30], None, infos)
+        request = pipe.receives[7]
+        self.assertEqual((request.ranks, request.expected), (set(range(4)), 8))
+        with self.assertRaisesRegex(ValueError, "distinct ranks"):
+            pipe.register_decode(8, [20], [], None, infos + infos[:1])
+
+    def test_full_prefix_hit_releases_from_every_rank_of_equal_width(self):
+        for rank in range(2):
+            pipe = transfer(attn_tp_size=2, attn_tp_rank=rank)
+            request = receive(full=(), swa=())
+            request.sources[0]["attn_tp_size"] = 2
+            request.endpoints = (f"tcp://prefill-tp{rank}:30002",)
+            pipe.receives[7] = request
+            self.assertTrue(pipe.maybe_start_pull(7))
+            pipe._send.assert_called_once_with(
+                f"tcp://prefill-tp{rank}:30002",
+                [MessageTag.PIPELINE_RELEASE, b"7", b"1"],
+            )
+
+    def test_full_prefix_hit_releases_a_shared_source_once(self):
+        pipe = transfer(attn_tp_size=2, attn_tp_rank=1)
+        request = receive(full=(), swa=())
+        request.endpoints = ("tcp://prefill:30002",)
+        pipe.receives[7] = request
+        self.assertTrue(pipe.maybe_start_pull(7))
+        pipe._send.assert_not_called()
+
+
 class TestDecodeContextParallelSpans(unittest.TestCase):
     """dcp_token_spans + dcp_destination_blocks land each token where a DCP decode
     stores it: DCP rank ``p % D`` of every kv-head group, row ``(p % (P*D)) // D``
@@ -1129,7 +1288,7 @@ class TestDecodeContextParallelSpans(unittest.TestCase):
             shape=(64, self.PAGE, heads, 2, self.HEAD_DIM), element_size=lambda: 2
         )
 
-    def _case(self, tokens, dcp, tp, window=None):
+    def _case(self, tokens, dcp, tp, window=None, src_tp=1):
         import numpy as np
 
         rng = np.random.default_rng(tokens * 131 + dcp * 7 + tp)
@@ -1142,11 +1301,51 @@ class TestDecodeContextParallelSpans(unittest.TestCase):
         swa = full[first:] if window else []
         tags = ["full.0"] + (["swa.1"] if window else [])
         pools = [{"tag": t, "block_stride_bytes": page * dst_row} for t in tags]
-        tensors = [self._tensor(self.HEADS) for _ in tags]
         pages = {
             s: rng.integers(0, 256, page * src_row, dtype=np.uint8) for s in range(n)
         }
-        spans = dcp_token_spans(pools, tensors, full, swa, tp, dcp, self.HEADS)
+        # Each source TP rank holds its kv heads of every token row; with more
+        # ranks than heads, consecutive ranks hold the same head.
+        rep = max(1, src_tp // self.HEADS)
+        slice_row = src_row // (src_tp // rep)
+        tensors = [self._tensor(max(1, self.HEADS // src_tp)) for _ in tags]
+        rank_pages = {
+            rank: {
+                s: data.reshape(page, src_row)[
+                    :, rank // rep * slice_row : (rank // rep + 1) * slice_row
+                ].reshape(-1)
+                for s, data in pages.items()
+            }
+            for rank in range(src_tp)
+        }
+        per_rank = [
+            dcp_token_spans(
+                pools,
+                tensors,
+                full,
+                swa,
+                tp,
+                dcp,
+                self.HEADS,
+                src_attn_tp=src_tp,
+                src_rank=rank,
+            )
+            for rank in range(src_tp)
+        ]
+        for rank in range(src_tp):
+            if rank % rep:
+                # A replica of a head another rank writes sends nothing.
+                self.assertEqual([e.spans for e in per_rank[rank]], [[]] * len(tags))
+        spans = [
+            SimpleNamespace(
+                tag=entries[0].tag,
+                declared_bytes=sum(e.declared_bytes for e in entries),
+                spans=[
+                    (rank, span) for rank, e in enumerate(entries) for span in e.spans
+                ],
+            )
+            for entries in zip(*per_rank)
+        ]
         # The decode holds one more page than the source covers (the next token).
         dst_full = list(range(-(-n // dcp) + 1))
         dst_swa = list(range((n - 1) // dcp - first // dcp + 2)) if window else []
@@ -1159,8 +1358,8 @@ class TestDecodeContextParallelSpans(unittest.TestCase):
             space = counts[pool.tag] * page * dst_row
             got = {u: np.zeros(space, dtype=np.uint8) for u in range(tp)}
             covered = {u: [] for u in range(tp)}
-            for span in pool.spans:
-                src = pages[base + span.src_block_ordinal]
+            for rank, span in pool.spans:
+                src = rank_pages[rank][base + span.src_block_ordinal]
                 for k in range(span.count):
                     s = span.src_offset_bytes + k * span.src_stride_bytes
                     d = span.dst_offset_bytes + k * span.dst_stride_bytes
@@ -1202,12 +1401,37 @@ class TestDecodeContextParallelSpans(unittest.TestCase):
                     with self.subTest(tokens=tokens, dcp=dcp, tp=tp):
                         self._case(tokens, dcp, tp)
 
+    def test_source_with_more_ranks_than_kv_heads(self):
+        # TP16 prefill of an 8-head model into TP16 x DCP8, scaled down: each
+        # head lives on two source ranks and only the first one writes it.
+        for tokens in (1, 9, 17, 40, 65):
+            for dcp in (2, 4):
+                for tp in (dcp, 2 * dcp):
+                    with self.subTest(tokens=tokens, dcp=dcp, tp=tp):
+                        self._case(tokens, dcp, tp, src_tp=2 * self.HEADS)
+
     def test_sliding_window_starting_mid_dcp_page(self):
         for tokens in (9, 17, 30, 41, 64, 70):
             for dcp in (2, 4):
                 for tp in (dcp, 2 * dcp):
                     with self.subTest(tokens=tokens, dcp=dcp, tp=tp):
                         self._case(tokens, dcp, tp, window=6)
+
+    def test_head_sliced_source_feeds_every_dcp_group(self):
+        # e.g. a PCP4 x TP4 prefill (attention TP 4) into TP 16 x DCP 8.
+        for tokens in (9, 40, 65):
+            for dcp, tp, src_tp in (
+                (2, 4, 2),
+                (2, 4, 4),
+                (4, 8, 2),
+                (4, 8, 4),
+                (2, 2, 2),
+            ):
+                for window in (None, 6):
+                    with self.subTest(
+                        tokens=tokens, dcp=dcp, tp=tp, src_tp=src_tp, window=window
+                    ):
+                        self._case(tokens, dcp, tp, window=window, src_tp=src_tp)
 
     def test_page_not_a_multiple_of_dcp_is_rejected(self):
         pools = [{"tag": "full.0", "block_stride_bytes": 0}]

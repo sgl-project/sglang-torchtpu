@@ -136,11 +136,11 @@ class RaidenKVManager(
         self.raiden_endpoint: Optional[str] = None
         self.swa_raiden_endpoint: Optional[str] = None
         self._pipeline = None
-        # Pipeline stages always transfer by named layer pools; a DP or TP
-        # decode opts in to consume from a pipeline prefill.
-        self._pipeline_enabled = self.pp_size > 1 or (
-            disaggregation_mode == DisaggregationMode.DECODE
-            and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+        # Pipeline stages always transfer by named layer pools; a prefill
+        # without stages (a one-stage producer) and a DP, TP or DCP decode opt
+        # in, so both peers of a transfer set SGLANG_RAIDEN_PIPELINE_TRANSFER.
+        self._pipeline_enabled = (
+            self.pp_size > 1 or envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
         )
         self._pipeline_init_lock = threading.Lock()
         self._pipeline_messages = []
