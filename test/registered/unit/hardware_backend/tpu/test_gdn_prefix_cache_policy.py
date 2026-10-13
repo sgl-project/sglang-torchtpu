@@ -34,6 +34,8 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                     )
                     view = SimpleNamespace(
                         mamba_radix_cache_strategy=strategy,
+                        enable_mixed_chunk=False,
+                        disable_radix_cache=False,
                         enable_hierarchical_cache=False,
                         enable_int8_mamba_checkpoint=False,
                         linear_attn_backend="triton",
@@ -64,9 +66,37 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                             view, config, mamba_cache_chunk_size_of=lambda: 64
                         )
 
+    def test_mixed_chunk_prefix_cache_is_rejected_only_on_tpu(self):
+        """Mixed merging drops the plan for a checkpoint the request still claims."""
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform, SRTPlatform):
+            for mixed, disabled in ((True, False), (False, False), (True, True)):
+                with self.subTest(
+                    platform=platform_cls.__name__, mixed=mixed, disabled=disabled
+                ):
+                    view = SimpleNamespace(
+                        enable_mixed_chunk=mixed,
+                        disable_radix_cache=disabled,
+                        mamba_radix_cache_strategy="extra_buffer",
+                        enable_hierarchical_cache=False,
+                        enable_int8_mamba_checkpoint=False,
+                    )
+                    rejects = platform_cls is not SRTPlatform and mixed and not disabled
+                    with (
+                        self.assertRaisesRegex(
+                            ValueError,
+                            "TPU GDN prefix caching.*--enable-mixed-chunk.*"
+                            "--disable-radix-cache",
+                        )
+                        if rejects
+                        else contextlib.nullcontext()
+                    ):
+                        platform_cls().validate_mamba_prefix_cache(view)
+
     def test_backend_guard_preserves_other_devices_and_explicit_disable(self):
+        """Unsupported backends must not silently disable caching after pool sizing."""
         cases = (
-            (True, True, False, False, True),  # KDA / other recurrent backends
+            (True, True, False, False, None),  # Unsupported backend must reject
+            (True, True, False, True, True),  # Explicit disable sizes pools correctly
             (True, True, True, False, False),
             (True, True, True, True, True),
             (True, False, False, False, False),  # Ordinary attention
@@ -130,6 +160,13 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                     stack.enter_context(
                         patch.object(builder, "init_mm_embedding_cache")
                     )
+                    if expected is None:
+                        stack.enter_context(
+                            self.assertRaisesRegex(
+                                ValueError,
+                                "prefix checkpoints.*--disable-radix-cache",
+                            )
+                        )
                     result = builder.build_kv_cache(
                         server_args=MagicMock(),
                         model_config=model,
@@ -140,6 +177,8 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                         enable_kv_cache_events=False,
                         enable_hierarchical_cache=False,
                     )
+                if expected is None:
+                    continue
                 self.assertEqual(result.disable_radix_cache, expected)
                 self.assertEqual(create.call_args.args[0].params.disable, expected)
 

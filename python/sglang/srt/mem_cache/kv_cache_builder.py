@@ -305,11 +305,16 @@ def build_kv_cache(
 
     from sglang.srt.platforms import current_platform
 
-    if is_hybrid_ssm and not current_platform.supports_mamba_prefix_cache(model_config):
-        disable_radix_cache = True
-        logger.warning(
-            "Radix cache is disabled because the platform does not support "
-            "prefix checkpoints for this model's recurrent backend."
+    if (
+        is_hybrid_ssm
+        and not disable_radix_cache
+        and not current_platform.supports_mamba_prefix_cache(model_config)
+    ):
+        # Pool sizing and the Mamba strategy were resolved before this builder.
+        # Disabling only the tree here would retain checkpoint slots and limits.
+        raise ValueError(
+            "The platform does not support prefix checkpoints for this model's "
+            "recurrent backend. Relaunch with --disable-radix-cache."
         )
 
     # Decode-side radix cache supports SWA only through the unified tree, whose

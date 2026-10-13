@@ -951,6 +951,13 @@ class TpuSRTPlatform(SRTPlatform):
         return hybrid_gdn_config(model_config) is not None
 
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
+        # Mixed-batch merging drops the tracking plan while requests retain
+        # checkpoint depths, so the radix tree could cache unwritten states.
+        if view.enable_mixed_chunk and not view.disable_radix_cache:
+            raise ValueError(
+                "TPU GDN prefix caching does not support --enable-mixed-chunk. "
+                "Remove --enable-mixed-chunk or use --disable-radix-cache."
+            )
         # Lazy slot allocation/release has not been validated with TPU snapshots.
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
             raise ValueError(
