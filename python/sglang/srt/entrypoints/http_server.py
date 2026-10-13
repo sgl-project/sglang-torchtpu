@@ -41,6 +41,7 @@ from typing import (
 )
 
 import aiohttp
+import msgspec
 import numpy as np
 import orjson
 import requests
@@ -119,6 +120,7 @@ from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.heartbeat import HeartbeatSlot
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -699,6 +701,13 @@ async def ready() -> Response:
     return Response(status_code=status_code)
 
 
+def stale_heartbeats(tokenizer_manager) -> List[HeartbeatSlot]:
+    reader = tokenizer_manager.heartbeat_reader
+    if reader is None:
+        return []
+    return reader.stale(envs.SGLANG_HEALTH_HEARTBEAT_MAX_AGE_S.get())
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -715,6 +724,20 @@ async def health_generate(request: Request) -> Response:
 
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
+
+    # A process on the request path that stopped iterating is not alive,
+    # whatever a probe request would see; read its heartbeat instead of asking.
+    stale = stale_heartbeats(_global_state.tokenizer_manager)
+    if stale:
+        logger.error(f"Health check failed. Stale heartbeats: {stale}")
+        return ORJSONResponse(
+            status_code=503,
+            content={
+                "reason": "stale_heartbeat",
+                "max_age_s": envs.SGLANG_HEALTH_HEARTBEAT_MAX_AGE_S.get(),
+                "stale": [msgspec.to_builtins(slot) for slot in stale],
+            },
+        )
 
     # Let an external E2E driver establish a balanced DP batch before health traffic.
     if envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE.get() and request.url.path in (

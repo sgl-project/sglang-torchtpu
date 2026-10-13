@@ -32,6 +32,11 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.managers.heartbeat import (
+    DETOKENIZER_SLOT,
+    ROLE_DETOKENIZER,
+    create_heartbeat_writer,
+)
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
@@ -63,6 +68,9 @@ from sglang.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# zmq poll bound between heartbeats while idle; well under the probe's max age.
+HEARTBEAT_POLL_MS = 1000
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
 # oldest request states will be evicted. Default: 65536 (1<<16).
@@ -109,6 +117,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     ):
         # Init inter-process communication
         self.init_ipc_channels(port_args, server_args)
+        self.heartbeat = create_heartbeat_writer(
+            port_args.instance_id,
+            role=ROLE_DETOKENIZER,
+            slot=DETOKENIZER_SLOT,
+            rank=0,
+        )
 
         # Init tokenizer
         self.init_tokenizer(server_args)
@@ -180,7 +194,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
+                # Bounded wait: an idle detokenizer must still beat.
+                while not self.recv_from_scheduler.poll(HEARTBEAT_POLL_MS):
+                    if self.heartbeat is not None:
+                        self.heartbeat.beat()
                 recv_obj = sock_recv(self.recv_from_scheduler)
+            if self.heartbeat is not None:
+                self.heartbeat.beat()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 sock_send(self.send_to_tokenizer, output)

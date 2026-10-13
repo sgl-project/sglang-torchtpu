@@ -68,6 +68,7 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.heartbeat import create_heartbeat_reader
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -647,6 +648,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             port_args,
             caller="TokenizerManager",
         )
+        self.heartbeat_reader = create_heartbeat_reader(port_args.instance_id)
 
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:

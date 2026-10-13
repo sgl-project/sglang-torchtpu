@@ -19,6 +19,7 @@ from torch.distributed import ReduceOp, all_reduce, barrier
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
+from sglang.srt.managers.heartbeat import HeartbeatWriter
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
@@ -70,6 +71,8 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    # Beats once per receive, the one call every scheduler loop makes each pass.
+    heartbeat: Optional[HeartbeatWriter] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -85,6 +88,8 @@ class SchedulerRequestReceiver:
         local_reqs are aborts the caller decided on this rank; they ride the
         same broadcast as the pulled requests.
         """
+        if self.heartbeat is not None:
+            self.heartbeat.beat()
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()

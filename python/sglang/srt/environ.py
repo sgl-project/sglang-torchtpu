@@ -352,6 +352,10 @@ class Envs:
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+    # /health liveness from per-process loop heartbeats in /dev/shm.
+    SGLANG_ENABLE_HEALTH_HEARTBEAT = EnvBool(True)
+    # Longer than the longest legitimate loop iteration (a long prefill chunk).
+    SGLANG_HEALTH_HEARTBEAT_MAX_AGE_S = EnvFloat(60.0)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
 

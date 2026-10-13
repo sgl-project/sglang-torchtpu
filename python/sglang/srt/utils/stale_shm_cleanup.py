@@ -22,6 +22,7 @@ _SGL_SHM_PREFIX = "sgl_shm"
 
 _ORPHAN_PREFIXES = (
     "sglang_loads_",  # managers/load_snapshot.py slot files
+    "sglang_heartbeat_",  # managers/heartbeat.py liveness boards
     "cuda.shm.",  # CUDA IPC segments
     "nccl-",  # NCCL communicator segments
     "sem.loky-",  # loky/joblib semaphores
