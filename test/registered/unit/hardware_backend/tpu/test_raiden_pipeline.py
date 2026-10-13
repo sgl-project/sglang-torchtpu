@@ -11,7 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.runtime_context import get_context
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden.common import (
     RaidenKVCacheGroups,
@@ -1058,8 +1059,9 @@ class TestPipelineInitialization(unittest.TestCase):
             self._initialize(legacy=True)
         self.assertEqual(local_ranks.call_args.args[3], 2)
 
-    def _initialize(self, legacy=False):
+    def _initialize(self, legacy=False, **overrides):
         events = []
+        engines = []
         buffers = groups(full=(0,), swa=())
         manager = SimpleNamespace(
             disaggregation_mode="decode",
@@ -1079,6 +1081,7 @@ class TestPipelineInitialization(unittest.TestCase):
             _max_request_blocks=lambda: 4,
             _num_slots=lambda *args, **kwargs: 2,
         )
+        vars(manager).update(overrides)
 
         def layout(tensor):
             self.assertTrue(tensor.materialized)
@@ -1093,6 +1096,7 @@ class TestPipelineInitialization(unittest.TestCase):
 
         def engine(**kwargs):
             events.append("engine")
+            engines.append(kwargs)
             for tensor in kwargs["kv_caches"]:
                 tensor.materialized = True
             return SimpleNamespace(
@@ -1160,12 +1164,32 @@ class TestPipelineInitialization(unittest.TestCase):
                 pipe.pools, staging_leases=2, staging_blocks_per_pool=[4]
             )
         pipe.executor.shutdown(wait=False)
+        return engines[0], client.register_work_unit.call_args.kwargs
 
     def test_layout_is_measured_after_native_materializes_the_cache(self):
         self._initialize()
 
     def test_legacy_pool_api_uses_checked_full_mirrors(self):
         self._initialize(legacy=True)
+
+    def test_engine_node_id_is_the_transfer_rank_on_a_context_parallel_stage(self):
+        # Stage 1 of PP4 x PCP2: its host rank counts the CP ranks (2), its
+        # transfer rank does not (1). Receivers look a push's schedule up by
+        # the pushing engine's node id, so the two must agree.
+        # Stage 0 hosts the controller and broadcasts its addresses.
+        addresses = ("10.0.0.1:32000", "10.0.0.1:32001")
+        stage_group = SimpleNamespace(broadcast_object=lambda obj, src: addresses)
+        with get_parallel().override(pp_group=stage_group):
+            engine, unit = self._initialize(
+                disaggregation_mode=DisaggregationMode.PREFILL,
+                pp_size=4,
+                pp_rank=1,
+                attn_cp_size=2,
+                attn_cp_rank=0,
+                _local_rank=2,
+            )
+        self.assertEqual(unit["transfer_rank"], 1)
+        self.assertEqual(engine["node_id"], unit["transfer_rank"])
 
     def test_bootstrap_messages_wait_for_pool_initialization(self):
         from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager

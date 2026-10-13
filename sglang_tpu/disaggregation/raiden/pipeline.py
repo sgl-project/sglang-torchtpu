@@ -648,7 +648,12 @@ class PipelineTransfer:
         manager = self.manager
         return KVCacheManager(
             kv_caches=tensors,
-            node_id=manager._local_rank,
+            # A push carries its engine's node id, and the receiver looks the
+            # sender's schedule up under that id, which the planner keys by
+            # transfer_rank. _local_rank also counts context-parallel ranks
+            # (0, 2, 4, 6 for PP4 x PCP2), so stages past the first found no
+            # schedule and their pushes were rejected.
+            node_id=self.rank,
             local_control_port=manager._control_port + port_offset,
             max_blocks=max_blocks,
             num_slots=slots,
