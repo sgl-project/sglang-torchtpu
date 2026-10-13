@@ -5150,6 +5150,7 @@ class Scheduler(
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+        self.maybe_signal_queued_health_checks(batch)
         self.metrics_reporter.update_device_timer()
         if self.kv_free_fence is not None:
             self.kv_free_fence.on_forward_done(result)
@@ -5217,6 +5218,46 @@ class Scheduler(
                     http_worker_ipc=self.return_health_check_ipcs.popleft()
                 )
             )
+
+    def maybe_signal_queued_health_checks(self, batch: ScheduleBatch) -> None:
+        """Answer health probes that are queued behind a prefill doing real work.
+
+        A probe that arrives while the scheduler looks idle is admitted like a
+        normal request, yet it can still land behind a long prompt (e.g. on a
+        PD prefill both leave the bootstrap queue in the same poll, prompt
+        first). Each chunk of that prompt fills the prefill token budget, so
+        the probe is not scheduled until the chain ends, and a prefill server
+        sends the tokenizer nothing meanwhile. A completed prefill batch with
+        real work is the evidence the busy path in process_input_requests
+        relies on, so send the same HealthCheckOutput that
+        maybe_send_health_check_signal sends.
+
+        The queues are the only state: each queued probe is flagged when
+        signaled, so a long chain answers it once, not once per chunk. A
+        scheduler that completes no batch sends nothing, so a hung engine still
+        fails the probe. The probe stays queued and runs its 1-token forward
+        later; the tokenizer drops that late output.
+        """
+        if (
+            not batch.forward_mode.is_extend_without_speculative()
+            or not batch.reqs
+            or all(is_health_check_generate_req(req) for req in batch.reqs)
+        ):
+            return
+        queues = [self.waiting_queue]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            queues.append(self.disagg_prefill_bootstrap_queue.queue)
+        for queue in queues:
+            for req in queue:
+                if not is_health_check_generate_req(req) or getattr(
+                    req, "_health_check_signaled", False
+                ):
+                    continue
+                req._health_check_signaled = True
+                # One per probe rid, so an own-rid probe waiter can match it.
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(rid=req.rid, http_worker_ipc=req.http_worker_ipc)
+                )
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
