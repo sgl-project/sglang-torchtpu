@@ -1377,6 +1377,32 @@ class TestPrefillReshardRefusal(unittest.TestCase):
         self.assertIn(ROOM, mgr._prefill.reshard_req)
         mgr._maybe_reshard_reply.assert_called_once_with(ROOM)
 
+    def test_refused_geometry_tells_the_decode(self):
+        mgr = self._mgr("refused")
+        with patch("sglang_tpu.disaggregation.raiden.conn.logger.error"):
+            mgr._dispatch(self._req())
+        [(endpoint, frames)] = _sent_frames(mgr)
+        self.assertEqual(endpoint, "tcp://10.0.0.2:5555")
+        notice = RoomFailed.from_frames(frames)
+        self.assertEqual((notice.room, notice.reason), (ROOM, "refused"))
+
+    def test_aborted_room_is_answered_once(self):
+        mgr = self._mgr("refused")
+        mgr._dispatch(_abort_frame(ROOM))
+        mgr._dispatch(self._req())
+        mgr.reshard_refusal.assert_not_called()
+        [(endpoint, frames)] = _sent_frames(mgr)
+        self.assertEqual(endpoint, "tcp://10.0.0.2:5555")
+        self.assertEqual(RoomFailed.from_frames(frames).room, ROOM)
+        self.assertNotEqual(RoomFailed.from_frames(frames).reason, "refused")
+
+    def test_servable_geometry_sends_no_failure(self):
+        mgr = self._mgr(None)
+        mgr._dispatch(self._req())
+        mgr.reshard_refusal.assert_called_once_with(8, 4)
+        self.assertEqual(_sent_frames(mgr), [])
+        self.assertFalse(mgr.is_aborted(ROOM))
+
 
 class TestDecodeBoundsViolationFailsTheRoom(unittest.TestCase):
     """A decode plan that would write past a KV block is a staging failure:
