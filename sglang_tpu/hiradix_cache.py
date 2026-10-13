@@ -119,6 +119,21 @@ class HiTreeNode(TreeNode):
         else:
             raise RuntimeError("Host reference counter is already zero.")
 
+    def get_last_hash_value(self) -> Optional[str]:
+        """The node's last page hash, or None when it was never hashed."""
+        if not self.hash_value:
+            return None
+        return self.hash_value[-1]
+
+    @staticmethod
+    def get_prefix_hash_values(node: Optional[TreeNode]) -> List[str]:
+        """Page hashes of ``node`` and its ancestors, root-to-node order."""
+        chunks = []
+        while node is not None and node.hash_value is not None:
+            chunks.append(node.hash_value)
+            node = node.parent
+        return [value for chunk in reversed(chunks) for value in chunk]
+
 
 class HiRadixCache(RadixCache):
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
@@ -834,6 +849,18 @@ class HiRadixCache(RadixCache):
     def is_backuped(self, node: HiTreeNode) -> bool:
         """Whether the node's Full KV is present on host."""
         return node.backuped
+
+    # Node queries the scheduler's storage prefetch path makes on the cache.
+
+    def is_root(self, node: TreeNode) -> bool:
+        return node is self.root_node
+
+    def get_last_hash_value(self, node: HiTreeNode) -> Optional[str]:
+        return node.get_last_hash_value()
+
+    def get_prefix_hash_values(self, node: HiTreeNode) -> List[str]:
+        """Hash chain of the node's ancestors, root-to-parent order."""
+        return HiTreeNode.get_prefix_hash_values(node.parent)
 
     def release_host_resources(self) -> None:
         if self.token_to_kv_pool_host is not None:
