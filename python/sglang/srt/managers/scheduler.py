@@ -5281,6 +5281,11 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+                # The /metrics gauges too: no batch report writes them in this
+                # state, and the fully-idle publish below is skipped, so a stuck
+                # P/D engine would otherwise look idle (#1303). Self-paced to
+                # once per 30 s without a stats log.
+                self.metrics_reporter.maybe_log_stall_metrics()
             if (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
