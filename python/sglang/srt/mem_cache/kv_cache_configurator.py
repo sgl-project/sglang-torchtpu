@@ -1884,8 +1884,8 @@ class KVCacheConfigurator:
         )
 
     def _build_tpu_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        # The KV pool in the layout the sparse MLA kernels read, plus an
-        # index-key cache for each layer that runs its own indexer.
+        # The paged KV pool the TPU MLA kernels use, plus an index-key cache for
+        # each layer that runs its own indexer.
         PoolCls = current_platform.get_dsa_kv_pool_cls()
         return PoolCls(
             max_total_num_tokens,

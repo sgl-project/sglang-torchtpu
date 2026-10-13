@@ -6,7 +6,7 @@
 layout: two buffers per layer instead of one fused buffer. So the tests give
 both kernels the same step, each in its own layout, and check that:
 
-* ``sparse_mla_attention`` returns the same output as
+* ``sparse_mla_attention_fused`` returns the same output as
   ``mla_ragged_paged_attention``, and
 * both leave the same tokens in the cache.
 
@@ -24,7 +24,7 @@ produces, with the MLA backend's ``distribution``. Sizes are GLM-5.2's at TP8:
 8 query heads per rank, 512 latent + 64 rope dimensions, page size 128.
 
 Usage:
-    python test/registered/tpu/unit/test_mla_sparse_step.py
+    python test/registered/tpu/unit/test_mla_sparse_fused.py
 """
 
 import os
@@ -51,11 +51,10 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
     mla_ragged_paged_attention,
 )
-from sglang_tpu.attention.pallas.mla_sparse_step import (
+from sglang_tpu.attention.pallas.mla_sparse_fused import (
     NOPE_DIM,
     ROPE_DIM,
-    sparse_mla_attention,
-    split_cache_specs,
+    sparse_mla_attention_fused,
 )
 
 _PAGE_SIZE = 128
@@ -201,10 +200,11 @@ def _records(cache_fused):
 def _split(cache_fused):
     """The NoPE and RoPE buffers that hold a fused cache's tokens."""
     records = _records(cache_fused)
-    nope_spec, rope_spec = split_cache_specs(records.shape[0] // _PAGE_SIZE, _PAGE_SIZE)
     return (
-        jnp.asarray(records[:, :NOPE_DIM].reshape(nope_spec.shape)),
-        jnp.asarray(records[:, NOPE_DIM:].reshape(rope_spec.shape)),
+        # NoPE: u8[num_pages, page_size, 4, 128], 512 bytes per token.
+        jnp.asarray(records[:, :NOPE_DIM].reshape(-1, _PAGE_SIZE, 4, 128)),
+        # RoPE: u8[num_pages, page_size // 4, 4, 128], 128 bytes per token.
+        jnp.asarray(records[:, NOPE_DIM:].reshape(-1, _PAGE_SIZE // 4, 4, 128)),
     )
 
 
@@ -244,7 +244,7 @@ def _stored_tokens(records, rows):
 @unittest.skipUnless(
     any(d.platform == "tpu" for d in jax.devices()), "needs a TPU device"
 )
-class TestSparseMlaStep(CustomTestCase):
+class TestSparseMlaFused(CustomTestCase):
     def _run(self, lens, **step_kwargs):
         step = _build_step(lens, **step_kwargs)
         new_tokens = [
@@ -274,7 +274,7 @@ class TestSparseMlaStep(CustomTestCase):
             # which is an approximation of its own and four times this gap.
             p_same_dtype_as_v=False,
         )
-        sparse_out, cache_nope, cache_rope = sparse_mla_attention(
+        sparse_out, cache_nope, cache_rope = sparse_mla_attention_fused(
             *new_tokens,
             *_split(step.cache_before),
             *metadata,
