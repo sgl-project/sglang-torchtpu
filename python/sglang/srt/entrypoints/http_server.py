@@ -699,6 +699,23 @@ async def ready() -> Response:
     return Response(status_code=status_code)
 
 
+def _retrieve_health_probe_outcome(task: asyncio.Task) -> None:
+    """Consume the outcome of a health probe task that nobody awaits.
+
+    health_generate decides from last_receive_tstamp and only requests
+    cancellation of its probe. The cancel can lose a race with the probe's own
+    wait_for timeout in _stream_one_response: the task then finishes with the
+    client-disconnect ValueError (the handler has already returned) instead of
+    CancelledError, and asyncio logs "Task exception was never retrieved" when
+    the task is garbage-collected.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("Abandoned health check probe ended with %r", exc)
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -754,6 +771,10 @@ async def health_generate(request: Request) -> Response:
             break
 
     task = asyncio.create_task(gen())
+    # A done callback, not an await: if the cancel below loses its race, the
+    # task runs until the next SGLANG_REQUEST_STATE_WAIT_TIMEOUT tick, and
+    # awaiting it would add that to the probe's latency.
+    task.add_done_callback(_retrieve_health_probe_outcome)
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
     tic = time.time()
