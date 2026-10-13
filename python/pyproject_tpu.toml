@@ -83,7 +83,7 @@ dependencies = [
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
   # Published to PyPI as nightly .dev pre-releases (see [tool.uv.sources]).
   "tpu-sync-torch==0.0.1.dev20261013083150",
-  "libtpu==0.0.47",
+  "libtpu==0.0.50",
   "torch==2.11.0",
   "torchvision==0.26.0",
   "jax==0.10.2",
