@@ -994,7 +994,7 @@ class TpuSRTPlatform(SRTPlatform):
 
         if get_memory().hicache_io_backend != "raiden":
             return super().get_hicache_explicit_size_context()
-        # Full, SWA, and draft DMA pools must not each spend the same allowance.
+        # Full, SWA, and draft pools must fit within one combined RAM budget.
         return host_memory_budget_scope(host_memory_budget_bytes())
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
