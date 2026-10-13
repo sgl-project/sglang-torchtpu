@@ -29,13 +29,30 @@ SAMPLING = {
     "num_threads": 128,
 }
 
+# Baselines: the gpt-oss-20b model card (reasoning high).
 GATES = [
-    {"dataset": "gpqa", "label": "gpqa_diamond_high", "repeat": 1, **SAMPLING},
+    {
+        "dataset": "gpqa",
+        "label": "gpqa_diamond_high",
+        "baseline": 0.715,
+        "atol": 0.1,
+        "repeat": 1,
+        **SAMPLING,
+    },
     # sgl-eval submits all 30 x 4 samples to one shared worker pool.
-    {"dataset": "aime25", "label": "aime25_high", "repeat": 4, **SAMPLING},
+    {
+        "dataset": "aime25",
+        "label": "aime25_high",
+        "baseline": 0.917,
+        "atol": 0.12,
+        "repeat": 4,
+        **SAMPLING,
+    },
     {
         "dataset": "mmlu",
         "label": "mmlu_high",
+        "baseline": 0.853,  # model card
+        "atol": 0.1,
         "repeat": 1,
         "num_examples": 250,
         **SAMPLING,

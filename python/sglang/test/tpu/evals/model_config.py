@@ -71,11 +71,6 @@ gates -- one entry per evaluation
     atol          Tolerance below it: floor = baseline - atol.
     report_only   True -> require and publish a numeric score without comparing it
                   to a baseline. Backend and transport failures still fail the test.
-                  A `dashboard: "accuracy"` gate instead takes its floor from
-                  accuracy_floors.json (keyed by `id`, then label) and must set none
-                  of report_only/baseline/atol: the score is published first, and a
-                  breach fails the file only after every gate has run, so the
-                  dashboard still plots the night.
     label         Name in reports and metrics. Defaults to `dataset`; set it when one
                   dataset is gated more than once.
     repeat        Passes to average. Small datasets need several before a tight
@@ -123,8 +118,6 @@ Unknown keys raise rather than being ignored -- a silently-dropped typo in a
 threshold is the failure mode this shape would otherwise invite.
 """
 
-import functools
-import json
 import re
 import unittest
 from contextlib import nullcontext
@@ -241,15 +234,6 @@ def _smoke_wrapped(runner, smoke_state: dict[str, Any], name: str):
     return run
 
 
-_FLOORS_PATH = Path(__file__).with_name("accuracy_floors.json")
-
-
-@functools.cache
-def accuracy_floors() -> dict[str, dict[str, dict[str, Any]]]:
-    """Nightly accuracy floors: {series id: {gate label: entry}}."""
-    return json.loads(_FLOORS_PATH.read_text(encoding="utf-8"))["floors"]
-
-
 def _build_gate(
     gate: dict[str, Any],
     test_name: str = "",
@@ -259,22 +243,9 @@ def _build_gate(
     series_id: str = "",
     display_name: str = "",
     smoke_state: dict[str, Any] | None = None,
-    floor: dict[str, Any] | None = None,
 ) -> AccuracyTestParams:
     _reject_unknown(gate, _GATE_PASSTHROUGH | _GATE_TRANSLATED, "gate")
     kwargs = {k: v for k, v in gate.items() if k in _GATE_PASSTHROUGH}
-
-    if floor is not None:
-        conflicting = sorted({"baseline", "atol", "report_only"} & set(gate))
-        if conflicting:
-            raise ValueError(
-                f"gate {gate.get('label') or gate['dataset']!r} must not set "
-                f"{conflicting}: its floor lives in {_FLOORS_PATH.name}"
-            )
-        kwargs["baseline_accuracy"] = floor["floor"]
-        kwargs["floor_source"] = (
-            f"{_FLOORS_PATH.name}, set {floor.get('set_on')} on {floor.get('hardware')}"
-        )
 
     if dashboard == "accuracy" and "sweep" not in gate:
         # The dashboard plots only metrics that declare kind=accuracy; the stamp
@@ -319,10 +290,8 @@ def _build_gate(
                 f"{gate['lm_eval_config']} instead, which is the only copy and is "
                 "what run_lm_eval.sh reads"
             )
-        # A file floor replaces the YAML's thresholds, so lm-eval only scores.
         kwargs["runner"] = lm_eval_runner(
-            gate["lm_eval_config"],
-            report_only=gate.get("report_only", False) or floor is not None,
+            gate["lm_eval_config"], report_only=gate.get("report_only", False)
         )
 
     if gate.get("smoke"):
@@ -394,11 +363,6 @@ def build_gates(config: dict[str, Any]) -> list[AccuracyTestParams]:
     # Shared between the smoke legs (writers) and the sweep runners (readers):
     # what withholds a sweep's numbers when a leg has already failed.
     smoke_state: dict[str, Any] = {"failures": []}
-    floors = (
-        accuracy_floors().get(str(config.get("id", "")), {})
-        if dashboard == "accuracy"
-        else {}
-    )
     return [
         _build_gate(
             g,
@@ -409,7 +373,6 @@ def build_gates(config: dict[str, Any]) -> list[AccuracyTestParams]:
             series_id=str(config.get("id", "")),
             display_name=str(config.get("display_name", "")),
             smoke_state=smoke_state,
-            floor=floors.get(g.get("label") or g["dataset"]),
         )
         for g in gates
     ]

@@ -21,6 +21,8 @@ CONFIG_MODULE = QWEN3_5_397B["config_module"]
 GATE = {
     "dataset": "mmmu_pro",
     "label": "mmmu_pro",
+    "baseline": 0.786,  # measured on TPU
+    "atol": 0.1,
     "runner": make_runner(QWEN3_5_397B, "mmmu_pro"),
 }
 

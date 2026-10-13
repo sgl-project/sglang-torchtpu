@@ -55,8 +55,6 @@ class AccuracyTestParams:
     num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
     # Report a completed score without comparing it to a quality floor.
     report_only: bool = False
-    # Where baseline_accuracy came from when it is a floor, not a reference score.
-    floor_source: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.spec_accept_length_threshold is not None and (
@@ -603,9 +601,7 @@ def run_accuracy_test(
     print(f"\n{'=' * 60}")
     print(f"Running ACCURACY test for {model.model_path}")
     print(f"  Eval: {params.name}")
-    if params.floor_source is not None:
-        print(f"  Floor: {params.floor}  ({params.floor_source})")
-    elif params.floor is not None:
+    if params.floor is not None:
         print(f"  Baseline: {params.baseline_accuracy}  atol: {params.atol}")
     if params.spec_accept_length_threshold is not None:
         print(f"  Spec accept-length threshold: {params.spec_accept_length_threshold}")
@@ -686,10 +682,10 @@ def run_accuracy_test(
         if passed:
             print(f"✓ {params.name}: {score:.4f} >= floor {floor:.4f}")
         else:
-            source = params.floor_source or (
-                f"baseline {params.baseline_accuracy} - atol {params.atol}"
+            error = (
+                f"{params.name}: {score:.4f} below floor {floor:.4f} "
+                f"(baseline {params.baseline_accuracy} - atol {params.atol})"
             )
-            error = f"{params.name}: {score:.4f} below floor {floor:.4f} ({source})"
             print(f"✗ {error}")
 
     if params.spec_accept_length_threshold is not None:

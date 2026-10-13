@@ -22,6 +22,8 @@ register_tpu_ci(
 GATE = {
     "dataset": "gsm8k",
     "label": "gsm8k_full",
+    "baseline": 0.946,  # measured on TPU
+    "atol": 0.1,
     "num_examples": 1319,
     "num_threads": 32,
     "max_tokens": 4096,

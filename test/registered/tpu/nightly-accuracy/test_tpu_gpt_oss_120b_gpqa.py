@@ -25,6 +25,8 @@ MAX_TOKENS = 65536
 GATE = {
     "dataset": "gpqa",
     "label": "gpqa_diamond_high",
+    "baseline": 0.801,  # model card
+    "atol": 0.1,
     "runner": gpqa_openai_runner(
         model=GPT_OSS_120B["served_model_name"],
         n_repeats=1,

@@ -444,67 +444,6 @@ class TestGate(CustomTestCase):
         self.assertEqual(env["SERVED_MODEL_NAME"], "openai/gpt-oss-120b")
 
 
-class TestAccuracyFloorTranslation(CustomTestCase):
-    """A dashboard gate takes its floor from accuracy_floors.json."""
-
-    FLOORS = {
-        "accuracy-m": {"gpqa_diamond": {"floor": 0.7, "set_on": "d", "hardware": "h"}}
-    }
-
-    def _gates(self, gate):
-        config = {
-            "model": "m",
-            "id": "accuracy-m",
-            "dashboard": "accuracy",
-            "gates": [gate],
-        }
-        with patch.object(model_config, "accuracy_floors", return_value=self.FLOORS):
-            return model_config.build_gates(config)
-
-    def test_file_floor_becomes_the_gate_floor(self):
-        (params,) = self._gates({"dataset": "gpqa", "label": "gpqa_diamond"})
-        self.assertEqual(params.floor, 0.7)
-        self.assertFalse(params.report_only)
-        self.assertIn("accuracy_floors.json", params.floor_source)
-
-    def test_inline_threshold_next_to_a_file_floor_raises(self):
-        for key, value in (("baseline", 0.8), ("atol", 0.1), ("report_only", True)):
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                self._gates({"dataset": "gpqa", "label": "gpqa_diamond", key: value})
-
-    def test_floored_gate_without_a_score_fails_without_plotting_zero(self):
-        from sglang.test import accuracy_test_runner as runner
-
-        (params,) = self._gates({"dataset": "gpqa", "label": "gpqa_diamond"})
-        model = SimpleNamespace(model_path="m", variant=None)
-        with (
-            patch.object(runner, "served", MagicMock()),
-            patch.object(runner, "_dispatch_eval", return_value=(True, None, {})),
-            patch.object(runner, "dump_metric") as dump,
-        ):
-            result = runner.run_accuracy_test(model, params, "http://x")
-        self.assertFalse(result.passed)
-        dump.assert_not_called()
-
-    def test_breach_is_published_before_it_fails(self):
-        from sglang.test import accuracy_test_runner as runner
-
-        (params,) = self._gates({"dataset": "gpqa", "label": "gpqa_diamond"})
-        model = SimpleNamespace(model_path="m", variant=None)
-        with (
-            patch.object(runner, "served", MagicMock()),
-            patch.object(
-                runner, "_dispatch_eval", return_value=(True, None, {"score": 0.5})
-            ),
-            patch.object(runner, "dump_metric") as dump,
-        ):
-            result = runner.run_accuracy_test(model, params, "http://x")
-        self.assertFalse(result.passed)
-        self.assertIn("below floor 0.7000", result.error)
-        dump.assert_called_once()
-        self.assertEqual(dump.call_args.args[:2], ("gpqa_diamond", 0.5))
-
-
 class TestSweepGateTranslation(CustomTestCase):
     """model_config turns a `sweep` gate into the runner, and rejects a graded one."""
 
@@ -771,31 +710,30 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                 self.assertNotIn(suite, suites, f"{path.name} shares a suite")
                 suites.add(suite)
 
-    def test_every_gate_has_a_soft_floor(self):
-        # Floors live in one file so they are re-derived from the dashboard, not
-        # hand-tuned per test; an inline threshold would be a second copy.
-        floors = model_config.accuracy_floors()
-        declared = set()
+    def test_every_gate_has_a_hardcoded_floor(self):
+        # floor = baseline - atol (an lm_eval gate keeps both in its YAML).
         for path, mod in self._accuracy_modules():
-            config = _model_config(mod)
-            for gate in config["gates"]:
-                label = gate.get("label") or gate["dataset"]
-                declared.add((config["id"], label))
-                for key in ("report_only", "baseline", "atol"):
-                    self.assertNotIn(key, gate, f"{path.name}:{label}")
-                entry = floors.get(config["id"], {}).get(label)
-                self.assertIsNotNone(entry, f"{path.name}:{label} has no floor")
-                for key in ("floor", "set_on", "hardware", "n_items", "mean"):
-                    self.assertIn(key, entry, f"{config['id']}/{label}")
-                # A hand-set lower bound overrides the derivation; say why.
-                if "min_floor" in entry:
-                    self.assertTrue(entry.get("min_floor_reason"), label)
-                    self.assertGreaterEqual(entry["floor"], entry["min_floor"], label)
-            for params in model_config.build_gates(config):
-                self.assertIsNotNone(params.floor, path.name)
-                self.assertFalse(params.report_only, path.name)
-        stale = {(sid, label) for sid, g in floors.items() for label in g} - declared
-        self.assertFalse(stale, f"floors without a gate: {sorted(stale)}")
+            for gate in _model_config(mod)["gates"]:
+                self.assertFalse(gate.get("report_only"), path.name)
+                if "lm_eval_config" not in gate:
+                    self.assertIn("baseline", gate, path.name)
+                    self.assertIn("atol", gate, path.name)
+
+    def test_gated_eval_without_a_score_fails_without_plotting_zero(self):
+        from sglang.test import accuracy_test_runner as runner
+
+        params = runner.AccuracyTestParams(
+            dataset="gpqa", baseline_accuracy=0.8, atol=0.1, metric_labels={}
+        )
+        model = SimpleNamespace(model_path="m", variant=None)
+        with (
+            patch.object(runner, "served", MagicMock()),
+            patch.object(runner, "_dispatch_eval", return_value=(True, None, {})),
+            patch.object(runner, "dump_metric") as dump,
+        ):
+            result = runner.run_accuracy_test(model, params, "http://x")
+        self.assertFalse(result.passed)
+        dump.assert_not_called()
 
     def test_every_gate_reaches_the_dashboard(self):
         # "accuracy" is the literal the dashboard's metric_kind() matches on; a

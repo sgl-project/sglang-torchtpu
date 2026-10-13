@@ -47,6 +47,8 @@ def build_model_config():
             {
                 "dataset": "gpqa",
                 "label": "gpqa_diamond",
+                "baseline": 0.801,  # model card
+                "atol": 0.1,
                 "thinking": True,
                 "repeat": 1,
                 "num_threads": 128,
@@ -57,6 +59,8 @@ def build_model_config():
             {
                 "dataset": "aime25",
                 "label": "aime25",
+                "baseline": 0.884,  # model card
+                "atol": 0.12,
                 "thinking": True,
                 # Mean pass@1 over four passes: one pass of 30 problems swings by 2-3 problems.
                 "repeat": 4,
@@ -69,6 +73,8 @@ def build_model_config():
             {
                 "dataset": "mmlu",
                 "label": "mmlu",
+                "baseline": 0.918,  # measured on TPU
+                "atol": 0.1,
                 "thinking": True,
                 "repeat": 1,
                 # Match the non-DPA test: 250 sampled questions per repeat.

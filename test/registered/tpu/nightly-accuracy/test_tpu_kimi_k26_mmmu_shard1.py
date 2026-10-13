@@ -42,6 +42,8 @@ def build_model_config():
             {
                 "dataset": "mmmu_pro",
                 "label": "mmmu_pro_shard1",
+                "baseline": 0.791,  # measured on TPU
+                "atol": 0.1,
                 "runner": partial(
                     run_shard,
                     shard=1,

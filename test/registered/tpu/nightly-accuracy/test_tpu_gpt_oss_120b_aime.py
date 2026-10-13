@@ -25,6 +25,8 @@ MAX_TOKENS = 65536
 GATE = {
     "dataset": "aime25",
     "label": "aime25_high",
+    "baseline": 0.925,  # model card
+    "atol": 0.12,
     "runner": aime25_openai_runner(
         model=GPT_OSS_120B["served_model_name"],
         n_repeats=3,

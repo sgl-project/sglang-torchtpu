@@ -1,15 +1,16 @@
 # Zero-shot score over 50 examples from each of 14 subtasks.
-# Uses a 900-second per-request timeout. The nightly gate's floor lives in
-# python/sglang/test/tpu/evals/accuracy_floors.json, not in `value` below.
+# Uses a 900-second per-request timeout. Floor = value - atol; value is the
+# TPU-measured score (the model card has no MMLU-Pro).
 model_name: "gpt-oss-120b"
-report_only: true
 backend: "local-chat-completions"
 api: "chat"
 tasks:
 - name: "mmlu_pro"
   metrics:
   - name: "exact_match,custom-extract"
-    value: 0.70
+    value: 0.753
+rtol: 0.0
+atol: 0.10
 limit: 50
 num_fewshot: 0
 num_concurrent: 32
