@@ -624,9 +624,12 @@ class TestDsaValidation(CustomTestCase):
     _args = TestTpuPlatformServerDefaults._args
     _apply = TestTpuPlatformServerDefaults._apply
 
-    def _apply_dsa(self, *, attention_backend, **config_fields):
+    def _apply_dsa(
+        self, *, attention_backend, tpu_compile_tracer="dynamo", **config_fields
+    ):
         args = self._args(
             attention_backend=attention_backend,
+            tpu_compile_tracer=tpu_compile_tracer,
             model_path="model",
             trust_remote_code=False,
             revision=None,
@@ -653,6 +656,16 @@ class TestDsaValidation(CustomTestCase):
                     self._apply_dsa(
                         attention_backend="pallas_tpu_mla_sparse", **{field: 4}
                     )
+
+    def test_dsa_needs_the_dynamo_tracer(self):
+        """The direct tracer reads the KV cache through the pool's get_state,
+        which the split MLA pool does not implement. The launch must say so
+        instead of failing at the first compile."""
+        with self.assertRaisesRegex(ValueError, "tpu-compile-tracer dynamo"):
+            self._apply_dsa(
+                attention_backend="pallas_tpu_mla_sparse",
+                tpu_compile_tracer="direct",
+            )
 
 
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):

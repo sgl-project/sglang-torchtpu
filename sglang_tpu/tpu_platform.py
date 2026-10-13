@@ -494,6 +494,16 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
+    # The direct tracer gets the KV cache buffers from the pool's get_state and
+    # set_state. TpuSplitMLATokenToKVPool does not implement them for its own
+    # buffers, so the first compile would fail.
+    # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
+    # tracer.
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise ValueError(
+            "DSA on TPU needs --tpu-compile-tracer dynamo, got "
+            f"{cfg.tpu_compile_tracer!r}."
+        )
 
 
 def _register_attention_backends() -> None:
