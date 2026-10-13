@@ -5,8 +5,10 @@ These tests mock torch_tpu so they can run on any machine without TPU hardware.
 
 import builtins
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -31,7 +33,7 @@ from sglang_tpu.tpu_platform import (
 )
 
 # CPU suite: mocks torch_tpu, so it runs on the CPU runners -- never a TPU node.
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 
 class TestTpuPlatformIdentity(CustomTestCase):
@@ -1006,6 +1008,63 @@ class TestTpuKvPoolBytesPerToken(CustomTestCase):
             self.assertIsNone(platform.get_mha_kv_bytes_per_token(**shape))
         with get_context().override_server_args(attention_backend="pallas_tpu_rpa_v3"):
             self.assertEqual(platform.get_mha_kv_bytes_per_token(**shape), 4096)
+
+
+class TestTpuPlatformDiscovery(CustomTestCase):
+    def test_discovery_loads_platform_and_hicache_hook(self):
+        """Discovery imports tpu_platform while current_platform is unset, so
+        nothing it imports at module level may read current_platform; if it
+        does, every TPU process fails to import sglang. Runs discovery with
+        each TPU entry point active in a fresh interpreter: the in-tree tpu
+        platform, and the out-of-tree one SGLANG_PLATFORM=tpu_oot selects."""
+        script = textwrap.dedent(
+            """
+            import importlib.machinery
+            import importlib.metadata as md
+            import importlib.util as iu
+            import sys
+
+            ep = md.EntryPoint(sys.argv[1], sys.argv[2], "sglang.srt.platforms")
+            real_eps, real_find = md.entry_points, iu.find_spec
+            md.entry_points = lambda **kw: (
+                [ep] if kw.get("group") == "sglang.srt.platforms" else real_eps(**kw)
+            )
+            iu.find_spec = lambda name, *a, **k: (
+                importlib.machinery.ModuleSpec("torch_tpu", None)
+                if name == "torch_tpu"
+                else real_find(name, *a, **k)
+            )
+
+            import sglang.srt.server_args
+            from sglang.srt.arg_groups import resolution_hooks
+            from sglang.srt.platforms import current_platform
+
+            print(type(current_platform).__name__)
+            print([f.__name__ for f in resolution_hooks._HOOKS["handle_hicache"]])
+            """
+        )
+        cases = (
+            (None, "tpu", "sglang.srt.hardware_backend.tpu:activate", "TpuSRTPlatform"),
+            ("tpu_oot", "tpu_oot", "sglang_tpu:activate", "TpuOOTPlatform"),
+        )
+        for selected, ep_name, ep_value, platform_cls in cases:
+            with self.subTest(platform=ep_name):
+                env = {**os.environ}
+                env.pop("SGLANG_PLATFORM", None)
+                env.pop("SGLANG_PLUGINS", None)
+                if selected is not None:
+                    env["SGLANG_PLATFORM"] = selected
+                result = subprocess.run(
+                    [sys.executable, "-c", script, ep_name, ep_value],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=300,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+                platform, hooks = result.stdout.splitlines()[-2:]
+                self.assertEqual(platform, platform_cls)
+                self.assertIn("handle_tpu_hicache", hooks)
 
 
 if __name__ == "__main__":

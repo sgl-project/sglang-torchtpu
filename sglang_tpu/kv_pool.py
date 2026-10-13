@@ -96,8 +96,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
 
     HEAD_DIM_ALIGNMENT = 128
     # HiCache io backends (--hicache-io-backend) that can offload this pool to
-    # host; hicache_hook refuses the rest at startup. raiden copies whole pages
-    # by their dim-0 block id, so it serves any block-major pool exposing
+    # host; hicache_resolution refuses the rest at startup. raiden copies whole
+    # pages by their dim-0 block id, so it serves any block-major pool exposing
     # get_fused_kv_buffer; torch_tpu's host pool stores this 5D row verbatim.
     # A subclass that changes the buffer layout must restate this. Listing an
     # io backend asserts it moves all of the pool's KV state: a pool that keeps

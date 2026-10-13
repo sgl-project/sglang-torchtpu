@@ -16,6 +16,9 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+
+# Registers the TPU io backends' checks on the handle_hicache resolution step.
+from sglang_tpu import hicache_resolution  # noqa: F401
 from sglang_tpu._logging import get_logger
 
 if TYPE_CHECKING:

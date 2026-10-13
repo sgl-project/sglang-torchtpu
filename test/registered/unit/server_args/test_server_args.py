@@ -61,6 +61,7 @@ from sglang.srt.arg_groups.parallel_hook import (
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.platform_hook import handle_tpu_compile_tracer
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.arg_groups.serving_hook import (
     handle_crash_dump_env,
     handle_deprecated_args,
@@ -110,7 +111,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
 )
-from sglang_tpu import tpu_platform
+from sglang_tpu import hicache_resolution, tpu_platform
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 register_cpu_ci(est_time=11, suite="stage-b-test-cpu-intel")
@@ -2264,18 +2265,18 @@ class TestHiCacheArgs(CustomTestCase):
         # instead of failing deep inside pool construction.
         args = self._make_tpu_offload_args("torch_tpu", is_hybrid_swa=True)
         with self.assertRaisesRegex(ValueError, "hybrid sliding-window"):
-            handle_hicache(args)
+            run_hook(handle_hicache, args)
 
     def test_raiden_io_backend_accepts_hybrid_swa(self):
         # raiden builds one host pool + engine per SWAKVPool sub-pool, so the
         # hybrid combination is admitted.
         args = self._make_tpu_offload_args("raiden", is_hybrid_swa=True)
-        handle_hicache(args)
+        run_hook(handle_hicache, args)
         self.assertEqual(args.hicache_io_backend, "raiden")
 
     def test_tpu_io_backend_accepts_non_hybrid(self):
         args = self._make_tpu_offload_args("raiden", is_hybrid_swa=False)
-        handle_hicache(args)
+        run_hook(handle_hicache, args)
         self.assertEqual(args.hicache_io_backend, "raiden")
 
     def test_tpu_io_backend_follows_kv_pool(self):
@@ -2310,11 +2311,11 @@ class TestHiCacheArgs(CustomTestCase):
                     lambda: seq_along_lane,
                 ):
                     if message is None:
-                        handle_hicache(args)
+                        run_hook(handle_hicache, args)
                         self.assertEqual(args.hicache_io_backend, io_backend)
                     else:
                         with self.assertRaisesRegex(ValueError, message):
-                            handle_hicache(args)
+                            run_hook(handle_hicache, args)
 
         with (
             patch.object(
@@ -2372,6 +2373,52 @@ class TestHiCacheArgs(CustomTestCase):
                 message="RaidenOnlyPool",
                 kv_cache_dtype="mxint8",
             )
+
+    def test_tpu_io_backend_checks_live_on_the_tpu_side(self):
+        # The core step knows nothing about TPU pools; the TPU platform adds
+        # its checks by overriding handle_hicache, and they run only while a
+        # host KV pool is in play.
+        from sglang.srt.arg_groups import resolution_hooks
+
+        self.assertIn(
+            hicache_resolution.handle_tpu_hicache,
+            resolution_hooks._HOOKS["handle_hicache"],
+        )
+        args = self._make_tpu_offload_args("raiden", is_hybrid_swa=False)
+        args.hicache_mem_layout = "page_first"
+        handle_hicache(args)
+        with self.assertRaisesRegex(ValueError, "page_first_fused"):
+            run_hook(handle_hicache, args)
+        args.enable_hierarchical_cache = False
+        run_hook(handle_hicache, args)
+
+    def test_tpu_io_backend_checks_follow_host_pool_gate(self):
+        # Decode-side offload and host-pool retraction backup also build a
+        # host pool; the unified cache external linker replaces it.
+        for gate in (
+            dict(disaggregation_decode_enable_offload_kvcache=True),
+            dict(
+                disaggregation_mode="decode",
+                disaggregation_decode_retraction_backup="host_pool",
+            ),
+        ):
+            with self.subTest(**gate):
+                args = self._make_tpu_offload_args(
+                    "raiden", is_hybrid_swa=False, **gate
+                )
+                args.enable_hierarchical_cache = False
+                args.hicache_mem_layout = "page_first"
+                with self.assertRaisesRegex(ValueError, "page_first_fused"):
+                    run_hook(handle_hicache, args)
+                args.enable_unified_cache_external_linker = True
+                run_hook(handle_hicache, args)
+
+    def test_raiden_io_backend_rejects_storage_backend(self):
+        args = self._make_tpu_offload_args(
+            "raiden", is_hybrid_swa=False, hicache_storage_backend="file"
+        )
+        with self.assertRaisesRegex(ValueError, "no L3 storage path"):
+            run_hook(handle_hicache, args)
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(

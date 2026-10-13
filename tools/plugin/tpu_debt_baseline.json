@@ -91,7 +91,6 @@
     "python/sglang/multimodal_gen/runtime/platforms/tpu.py": 1,
     "python/sglang/multimodal_gen/runtime/server_args/server_args.py": 1,
     "python/sglang/multimodal_gen/test/unit/test_tpu_platform.py": 2,
-    "python/sglang/srt/arg_groups/hicache_hook.py": 1,
     "python/sglang/srt/arg_groups/memory_hook.py": 1,
     "python/sglang/srt/compilation/compiled_op.py": 3,
     "python/sglang/srt/disaggregation/decode.py": 1,
