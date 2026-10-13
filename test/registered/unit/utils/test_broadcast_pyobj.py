@@ -26,6 +26,9 @@ def _payload():
     big = torch.arange(_PYOBJ_TENSOR_BUFFER_MIN_BYTES, dtype=torch.bfloat16).view(4, -1)
     tagged = torch.zeros(_PYOBJ_TENSOR_BUFFER_MIN_BYTES, dtype=torch.uint8)
     tagged.tag = "kept"
+    # A contiguous view starting partway into a larger storage.
+    parent = torch.arange(4 * _PYOBJ_TENSOR_BUFFER_MIN_BYTES, dtype=torch.int32) % 251
+    offset_view = parent.to(torch.uint8)[_PYOBJ_TENSOR_BUFFER_MIN_BYTES:]
     return [
         {"rid": "a", "feature": big, "again": big, "small": torch.arange(5)},
         {
@@ -36,6 +39,7 @@ def _payload():
             "rid": "c",
             "mask": torch.ones(_PYOBJ_TENSOR_BUFFER_MIN_BYTES, dtype=torch.bool),
             "tagged": tagged,
+            "offset_view": offset_view,
             "np_empty": np.zeros((0,), dtype=np.float32),
             "np_small": np.arange(4, dtype=np.float32),
             "np_readonly": np.frombuffer(b"\x00" * 16, dtype=np.float32),
@@ -85,13 +89,19 @@ class TestBroadcastPyobj(CustomTestCase):
     def test_large_tensors_travel_out_of_band(self):
         data = _payload()
         stream, buffers = _dumps_with_tensor_buffers(data)
-        # The bf16 feature (once, despite two references) and the bool mask; small,
-        # non-contiguous and attribute-carrying tensors and numpy arrays stay in band.
-        self.assertEqual(len(buffers), 2)
+        # The bf16 feature (once, despite two references), the bool mask and the
+        # offset view; small, non-contiguous and attribute-carrying tensors and
+        # numpy arrays stay in band.
         self.assertEqual(
             [b.numel() for b in buffers],
-            [2 * _PYOBJ_TENSOR_BUFFER_MIN_BYTES, _PYOBJ_TENSOR_BUFFER_MIN_BYTES],
+            [
+                2 * _PYOBJ_TENSOR_BUFFER_MIN_BYTES,
+                _PYOBJ_TENSOR_BUFFER_MIN_BYTES,
+                3 * _PYOBJ_TENSOR_BUFFER_MIN_BYTES,
+            ],
         )
+        # Only the view's bytes are sent, not its whole storage.
+        self.assertTrue(torch.equal(buffers[2], data[2]["offset_view"]))
 
         received = [buffer.clone() for buffer in buffers]
         out = _loads_with_tensor_buffers(bytes(stream), received)

@@ -2697,45 +2697,27 @@ def set_weight_attrs(
 _PYOBJ_TENSOR_BUFFER_MIN_BYTES = 1 << 20
 
 
-def _tensor_from_buffer(buffer, dtype: torch.dtype, shape: torch.Size) -> torch.Tensor:
-    return torch.frombuffer(buffer, dtype=torch.uint8).view(dtype).view(shape)
-
-
 class _TensorBufferPickler(pickle.Pickler):
-    """Pickles large plain CPU tensors as out-of-band uint8 buffers.
+    """Pickles large plain CPU tensors as references to separate buffers.
 
     Default tensor pickling copies a tensor's bytes into a ``torch.save``
     stream and again into the pickle output; unpickling copies them back out.
-    Out of band, the sender broadcasts the tensor's own memory and the receiver
-    rebuilds the tensor on the buffer it received into. Numpy arrays and other
-    protocol-5 buffers stay in band, pickled as before.
+    Here each large tensor is pickled as a ``(buffer index, dtype, shape)``
+    reference, the sender broadcasts the tensor's own memory, and the receiver
+    rebuilds the tensor as a view of the buffer it received into. Everything
+    else is pickled exactly as ``pickle.dumps`` does.
 
-    Each out-of-band tensor arrives with its own storage: a tensor referenced
-    twice is sent once and keeps its identity, but distinct views of one
-    storage (e.g. overlapping slices) no longer share memory on receivers.
+    A tensor referenced twice is sent once and keeps its identity, but distinct
+    views of one storage (e.g. overlapping slices) no longer share memory on
+    receivers.
     """
 
     def __init__(self, file):
-        super().__init__(
-            file,
-            protocol=pickle.HIGHEST_PROTOCOL,
-            buffer_callback=self._buffer_callback,
-        )
-        self.buffers: List[pickle.PickleBuffer] = []
-        # Our tensor buffers, kept alive so their ids cannot be reused mid-dump.
-        self._tensor_buffers: Dict[int, pickle.PickleBuffer] = {}
+        super().__init__(file)
+        self.buffers: List[torch.Tensor] = []
+        self._buffer_index: Dict[int, int] = {}
 
-    def _buffer_callback(self, buffer: pickle.PickleBuffer) -> bool:
-        if id(buffer) not in self._tensor_buffers:
-            return True  # serialize in band
-        self.buffers.append(buffer)
-        return False
-
-    def reducer_override(self, obj):
-        if isinstance(obj, np.ndarray):
-            # Protocol 4 copies the array into the stream, so read-only arrays
-            # still arrive writable (protocol 5 would rebuild them as views).
-            return obj.__reduce_ex__(4)
+    def persistent_id(self, obj):
         if (
             type(obj) is not torch.Tensor
             or obj.__dict__
@@ -2748,25 +2730,43 @@ class _TensorBufferPickler(pickle.Pickler):
             or not obj.is_contiguous()
             or obj.numel() * obj.element_size() < _PYOBJ_TENSOR_BUFFER_MIN_BYTES
         ):
-            return NotImplemented
-        flat = obj.reshape(-1).view(torch.uint8)
-        buffer = pickle.PickleBuffer(flat.numpy())
-        self._tensor_buffers[id(buffer)] = buffer
-        return _tensor_from_buffer, (buffer, obj.dtype, obj.shape)
+            return None
+        index = self._buffer_index.get(id(obj))
+        if index is None:
+            index = len(self.buffers)
+            self._buffer_index[id(obj)] = index
+            self.buffers.append(obj.reshape(-1).view(torch.uint8))
+        return index, obj.dtype, obj.shape
+
+
+class _TensorBufferUnpickler(pickle.Unpickler):
+    """Inverse of ``_TensorBufferPickler``; tensors are views of ``buffers``."""
+
+    def __init__(self, file, buffers: List[torch.Tensor]):
+        super().__init__(file)
+        self._buffers = buffers
+        self._tensors: Dict[int, torch.Tensor] = {}
+
+    def persistent_load(self, pid):
+        index, dtype, shape = pid
+        tensor = self._tensors.get(index)
+        if tensor is None:
+            tensor = self._buffers[index].view(dtype).view(shape)
+            self._tensors[index] = tensor
+        return tensor
 
 
 def _dumps_with_tensor_buffers(data: Any) -> Tuple[memoryview, List[torch.Tensor]]:
-    """Pickle ``data``, returning the stream and its out-of-band tensor buffers."""
+    """Pickle ``data``, returning the stream and its large tensors' flat uint8 views."""
     stream = io.BytesIO()
     pickler = _TensorBufferPickler(stream)
     pickler.dump(data)
-    buffers = [torch.frombuffer(b, dtype=torch.uint8) for b in pickler.buffers]
-    return stream.getbuffer(), buffers
+    return stream.getbuffer(), pickler.buffers
 
 
 def _loads_with_tensor_buffers(stream, buffers: List[torch.Tensor]) -> Any:
-    """Inverse of ``_dumps_with_tensor_buffers``; tensors share ``buffers``' memory."""
-    return pickle.loads(stream, buffers=[b.numpy() for b in buffers])
+    """Inverse of ``_dumps_with_tensor_buffers``."""
+    return _TensorBufferUnpickler(io.BytesIO(stream), buffers).load()
 
 
 def broadcast_pyobj(
