@@ -38,9 +38,10 @@ def _with_index_head_dim(pool_cls: type) -> type:
 
     class _Pool(pool_cls):
         def __init__(self, *args, index_head_dim=None, **kwargs):
-            # Only DSA pools take an indexer; TPU has none (see get_dsa_kv_pool_cls).
+            # Only the DSA pool takes an indexer, and mode B does not build it
+            # (see get_dsa_kv_pool_cls).
             if index_head_dim is not None:
-                raise NotImplementedError("TPU has no DSA indexer KV pool.")
+                raise NotImplementedError("The TPU MLA KV pool has no DSA indexer.")
             super().__init__(*args, **kwargs)
 
     _Pool.__name__ = pool_cls.__name__
@@ -67,10 +68,13 @@ class TpuOOTPlatform(TpuSRTPlatform):
         super().init_backend()
 
     def get_dsa_kv_pool_cls(self) -> type:
-        # Reached from kv_cache_configurator._build_oot_dsa_kv_pool; TPU has no DSA pool.
+        # Reached from kv_cache_configurator._build_oot_dsa_kv_pool. That builder
+        # does not say which layers run their own indexer, which the TPU DSA pool
+        # needs, so sparse attention is served under SGLANG_PLATFORM=tpu only.
+        # TODO(sglang-torchtpu#1072): build the DSA pool in this mode as well.
         raise NotImplementedError(
-            "DSA / sparse attention (DeepSeek V3.2 family) has no KV pool "
-            "implementation on TPU. Run this model on a platform that supports DSA."
+            "DSA / sparse attention (DeepSeek V3.2 family) is not available on "
+            "TPU with SGLANG_PLATFORM=tpu_oot yet. Use SGLANG_PLATFORM=tpu."
         )
 
     def get_mla_kv_pool_cls(self) -> type:

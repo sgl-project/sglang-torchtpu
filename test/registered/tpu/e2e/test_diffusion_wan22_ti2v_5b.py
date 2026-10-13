@@ -91,11 +91,12 @@ class TestWan22TI2V5BTPU(DiffusionServerBase):
             sampling_params=case.sampling_params,
         )
 
-        perf_record, content = self.run_and_collect(
-            diffusion_server, case.id, generate_fn
+        # This smoke test has no TPU latency baseline or load-time measurement.
+        # Performance validation requires both even with run_perf_check=False.
+        _, content = self.run_and_collect(
+            diffusion_server, case.id, generate_fn, collect_perf=False
         )
 
-        self._validate_and_record(case, perf_record)
         self._test_v1_models_endpoint(diffusion_server, case)
 
         frames = _decoded_frame_count(content)

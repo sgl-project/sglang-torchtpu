@@ -27,7 +27,7 @@ from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
 )
 from sglang_tpu.patches import _register_aten_fallbacks
 
-register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
 
 @contextmanager

@@ -160,7 +160,9 @@ A tensor-parallel consumer receives every source page split by kv-head:
 each rank's engine lands its own head slice of every token, and rank 0
 plans the one transfer that fills all ranks. A slice must be whole 32-bit
 packs of the fused page, so BF16 KV takes any head count per rank and FP8
-KV needs an even head count per rank.
+KV needs an even head count per rank. The rank-4 RPA-seq pool
+(`[blocks, 2 * kv_heads, head_dim, page]`) keeps a head's K and V rows
+adjacent, so each rank's slice is one contiguous run per page.
 
 This path requires a tpu-sync with PP pool resharding: per-layer pool
 pairing, sender-local pool indices on the wire, registered transfer ranks,
@@ -174,9 +176,28 @@ RPCs ([tpu-sync main 6b3e8206](https://github.com/google/tpu-sync/commit/6b3e820
 a transfer coordinates every source stage, and on asyncio's default
 executor concurrent transfers queue behind each other.
 Each engine registers the full-attention and sliding-window layers it owns
-as `fa.lN` and `swa.lN`. A single native transfer moves both namespaces after
-the prefill finishes. Full-attention and window page lists remain independent,
-and a cached decode prefix is clipped from each layer's transfer.
+as `fa.lN` and `swa.lN`. By default a single native transfer moves both
+namespaces after the prefill finishes. Full-attention and window page lists
+remain independent, and a cached decode prefix is clipped from each layer's
+transfer.
+
+Two opt-in modes overlap the hand-off with the prefill; both are set on the
+prefill (`SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` on the decode):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SGLANG_RAIDEN_PIPELINE_EARLY_PARTS` | `0` | full-attention pages final before the prefill ends (a cached prefix, finished chunks) move as their own transfers (`<room>.p<i>`) while the pipeline computes |
+| `SGLANG_RAIDEN_PIPELINE_PART_PAGES` | `16` | minimum pages per early part; fewer ride the closing transfer |
+| `SGLANG_RAIDEN_PIPELINE_STAGE_PARTS` | `0` | each group of stages moves its layers (`<room>.s<g>`) once its forwards of the final chunk complete, instead of after the last stage samples; the first token follows from the last stage |
+| `SGLANG_RAIDEN_PIPELINE_STAGE_GROUP` | `1` | consecutive stages per group transfer |
+| `SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` | `1` | decode threads coordinating transfers, one controller client each |
+
+A stage group is fenced on a host copy of one element of its forward's
+output: torch_tpu reports a tensor materialized once its buffer exists, before
+the execution that writes the KV completes. Stage groups other than the first
+name non-contiguous source ranks, which needs a tpu-sync planner that accepts
+any subset of a controller's registered transfer ranks. Each early part and
+stage group holds its own decode staging reservation.
 
 Each worker owns one Raiden engine. Pipeline stages share one controller hosted
 by stage zero; independent attention-DP workers each own one. Pool geometry and
@@ -202,4 +223,5 @@ source pages remain reserved until the unclaimed registration expires
 (`SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S`, 60 seconds by default).
 
 The pipeline unit tests are in
-`test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py`.
+`test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py`,
+`test_raiden_pipeline_overlap.py` and `test_raiden_pipeline_rank4.py`.

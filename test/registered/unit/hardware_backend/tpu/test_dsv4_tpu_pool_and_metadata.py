@@ -330,11 +330,11 @@ class TestDSV4TPUPatches(CustomTestCase):
             ATTENTION_BACKENDS,
             create_dsv4_backend,
         )
-        from sglang_tpu.tpu_platform import _register_dsv4_attention_backend
+        from sglang_tpu.tpu_platform import _register_attention_backends
 
         original = ATTENTION_BACKENDS.get("dsv4")
         try:
-            _register_dsv4_attention_backend()
+            _register_attention_backends()
             self.assertIn("dsv4", ATTENTION_BACKENDS)
             self.assertIsNot(ATTENTION_BACKENDS["dsv4"], create_dsv4_backend)
             self.assertEqual(

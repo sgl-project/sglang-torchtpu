@@ -67,10 +67,15 @@ def get_pallas_kernel_sources() -> tuple[str, ...]:
         "attention/pallas",
         "moe/pallas",
         "attention_pallas.py",
+        "attention_pallas_mla.py",
+        "attention_pallas_mla_sparse.py",
         "attention_pallas_rpa_base.py",
         "attention_pallas_rpa_batched.py",
         "attention_pallas_rpa_v3.py",
         "distributed_topk_pallas.py",
+        "dsa_indexer_tpu.py",
+        "dsv4/sparsecore_topk.py",
+        "dsv4/streamindex_topk",
         "kernels",
         "pallas_export.py",
         "pallas_jax_op.py",
@@ -125,3 +130,10 @@ def _iter_source_files(source_paths: Iterable[Path]) -> list[Path]:
             if path.is_file() and path.suffix == ".py":
                 files.add(path)
     return sorted(files)
+
+
+def initialize_jax_compile_cache() -> None:
+    """Build JAX's persistent compilation cache now instead of on first compile."""
+    from jax._src import compilation_cache
+
+    compilation_cache._initialize_cache()

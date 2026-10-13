@@ -276,8 +276,11 @@ def handle_model_specific_adjustments(server_args: Any):
 
             _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
+            # TPU resolves DSA in its platform hook (apply_server_args_defaults).
             if (
-                not get_platform().is_npu and not get_platform().is_xpu
+                not get_platform().is_npu
+                and not get_platform().is_xpu
+                and not get_platform().is_tpu
             ):  # CUDA or ROCm GPU
                 if cfg.enable_prefill_cp:
                     # The DSA CP field declarations moved to the override

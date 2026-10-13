@@ -277,6 +277,37 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
+    def test_padding_platform_budget_covers_the_padded_pool(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while
+        the built pool padded, so the allocation outgrew the HBM budget."""
+        available = 10_000_000
+        pad_to = 128
+
+        def padded_bytes(*, num_kv_heads, head_dim, v_head_dim, kv_cache_dtype):
+            del kv_cache_dtype
+            del v_head_dim  # the fused layout gives V a slot of K's padded width
+            return num_kv_heads * 2 * max(head_dim, pad_to) * KV_SIZE
+
+        with patch(
+            "sglang.srt.model_executor.pool_configurator.current_platform",
+            SimpleNamespace(get_mha_kv_bytes_per_token=padded_bytes),
+        ):
+            mr, _, config = self._run(available)
+
+        mc = mr.model_config
+        used = (
+            config.max_total_num_tokens
+            * mr.layer_info.num_effective_layers
+            * padded_bytes(
+                num_kv_heads=mc.get_num_kv_heads(1),
+                head_dim=mc.head_dim,
+                v_head_dim=mc.v_head_dim,
+                kv_cache_dtype=None,
+            )
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         side_effect=(576, 656),
@@ -578,6 +609,55 @@ class TestHybridSWAConfigurator(CustomTestCase):
             config.swa_max_total_num_tokens,
             int(config.full_max_total_num_tokens * 0.5),
         )
+
+    def test_padding_platform_budget_covers_the_padded_pool(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while
+        the built pool padded, so the allocation outgrew the HBM budget."""
+        available = 10_000_000
+        pad_to = 128
+
+        def padded_bytes(*, num_kv_heads, head_dim, v_head_dim, kv_cache_dtype):
+            del kv_cache_dtype
+            del v_head_dim  # the fused layout gives V a slot of K's padded width
+            return num_kv_heads * 2 * max(head_dim, pad_to) * KV_SIZE
+
+        mr = self._make_swa_runner(page_size=1)
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.current_platform",
+                SimpleNamespace(
+                    get_mha_kv_bytes_per_token=padded_bytes,
+                    dcp_shards_every_kv_pool=lambda: False,
+                ),
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            config = create_memory_pool_configurator(mr).calculate_pool_sizes(
+                available, get_schedule().page_size
+            )
+
+        mc = mr.model_config
+        used = config.full_max_total_num_tokens * len(
+            mc.full_attention_layer_ids
+        ) * padded_bytes(
+            num_kv_heads=mc.get_num_kv_heads(1),
+            head_dim=mc.head_dim,
+            v_head_dim=mc.v_head_dim,
+            kv_cache_dtype=None,
+        ) + config.swa_max_total_num_tokens * len(
+            mc.swa_attention_layer_ids
+        ) * padded_bytes(
+            num_kv_heads=mc.get_swa_num_kv_heads(1),
+            head_dim=mc.swa_head_dim,
+            v_head_dim=mc.swa_v_head_dim,
+            kv_cache_dtype=None,
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
 
     def test_chunk_cache_cap_accounts_for_spec_topk_page_rounding(self):
         available = 1_000_000
@@ -1972,6 +2052,37 @@ class TestOutOfTreeHybridSwaRouting(CustomTestCase):
             )
         platform.get_paged_allocator_cls.assert_not_called()
         swa_allocator.assert_called_once()
+
+
+class TestTpuDsaRouting(CustomTestCase):
+    """On TPU a DSA model must get the TPU DSA pool. The generic DSA builder
+    allocates the GPU layout, which the TPU kernels cannot read."""
+
+    _fake_configurator = TestOutOfTreeHybridSwaRouting._fake_configurator
+    _sizes = TestOutOfTreeHybridSwaRouting._sizes
+
+    def test_tpu_dsa_model_builds_the_tpu_dsa_pool(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        fake.is_hybrid_swa = False
+        fake.use_mla_backend = True
+        fake._build_tpu_dsa_kv_pool = MagicMock(name="tpu_dsa_builder")
+        fake._build_dsa_kv_pool = MagicMock(name="generic_dsa_builder")
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+        ) as platform:
+            platform.is_out_of_tree.return_value = False
+            platform.is_tpu.return_value = True
+            KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=True,
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+            )
+        fake._build_tpu_dsa_kv_pool.assert_called_once_with(max_total_num_tokens=256)
+        fake._build_dsa_kv_pool.assert_not_called()
 
 
 class TestOutOfTreeMlaPoolConstruction(CustomTestCase):

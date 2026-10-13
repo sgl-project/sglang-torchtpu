@@ -427,7 +427,7 @@ def _apply_page_size_default(server_args) -> None:
 
 
 def _apply_kv_cache_dtype_default(server_args) -> None:
-    """Default the KV cache to fp8 for the Pallas RPA backends.
+    """Default the KV cache to fp8 for the Pallas RPA/DSA backends.
 
     Those kernels dequantize KV on read, and at the head counts TPU serving
     runs (tensor parallel leaves one KV head per rank) fp8 halves KV bytes per
@@ -449,11 +449,72 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "auto":
         return
-    if _rpa_kernel_spec(cfg.attention_backend) is None:
+    if (
+        _rpa_kernel_spec(cfg.attention_backend) is None
+        and cfg.attention_backend != "pallas_tpu_mla_sparse"
+    ):
         return
     declare_resolution(
         server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
     )
+
+
+def _validate_dsa(server_args) -> None:
+    """Reject the sparse-attention (DSA) setups that TPU cannot serve correctly."""
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.utils.hf_transformers.config import get_config
+
+    cfg = resolving_view(server_args)
+    try:
+        hf_config = get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
+        )
+    except Exception:
+        # A model that cannot be loaded here fails later with its real error.
+        return
+    if not is_deepseek_dsa(hf_config):
+        return
+    if cfg.attention_backend != "pallas_tpu_mla_sparse":
+        raise ValueError(
+            "Sparse attention (DSA) on TPU needs --attention-backend "
+            f"pallas_tpu_mla_sparse, got {cfg.attention_backend!r}."
+        )
+    # With these two settings the GPU indexer always keeps the first
+    # index_init_tokens and the last index_local_tokens positions. The TPU
+    # top-k kernel cannot do that yet, and ignoring them would change the
+    # selection without any error.
+    # TODO(sglang-torchtpu#1072): support them on TPU.
+    init_tokens = getattr(hf_config, "index_init_tokens", 0)
+    local_tokens = getattr(hf_config, "index_local_tokens", 0)
+    if init_tokens or local_tokens:
+        raise ValueError(
+            "DSA on TPU does not support index_init_tokens or index_local_tokens "
+            f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
+        )
+
+
+def _register_attention_backends() -> None:
+    """Add the attention backends that only this package knows to the registry."""
+    from sglang.srt.layers.attention.attention_registry import (
+        register_attention_backend,
+    )
+
+    @register_attention_backend("pallas_tpu_mla_sparse")
+    def create_pallas_tpu_mla_sparse_backend(runner):
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+
+        return TpuPallasSparseMlaAttnBackend(runner)
+
+    @register_attention_backend("dsv4")
+    def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.dsv4 import DSV4TPUAttnBackend
+
+        return DSV4TPUAttnBackend(runner)
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
@@ -471,19 +532,6 @@ def _resolve_num_hidden_layers(server_args) -> int:
         return int(getattr(hf_config, "num_hidden_layers", 0))
     except Exception:
         return 0
-
-
-def _register_dsv4_attention_backend() -> None:
-    """Register the TPU DeepSeek-V4 attention backend in the registry."""
-    from sglang.srt.layers.attention.attention_registry import (
-        register_attention_backend,
-    )
-
-    @register_attention_backend("dsv4")
-    def create_tpu_dsv4_backend(runner):
-        from sglang_tpu.dsv4 import DSV4TPUAttnBackend
-
-        return DSV4TPUAttnBackend(runner)
 
 
 # The attention backend TPU decode context parallelism runs on.
@@ -701,6 +749,8 @@ class TpuSRTPlatform(SRTPlatform):
 
         _validate_prefill_context_parallel(server_args)
         apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
+        # Before the default backend below, so the error names what was passed.
+        _validate_dsa(server_args)
 
         # Decode context parallelism runs on one backend only, so an unset
         # backend resolves to it instead of the platform default.
@@ -877,6 +927,26 @@ class TpuSRTPlatform(SRTPlatform):
 
         return _mha_kv_pool_cls(get_exec().kernel.attention_backend)
 
+    def get_mha_kv_bytes_per_token(
+        self,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        pool_cls = self.get_mha_kv_pool_cls()
+        if not issubclass(pool_cls, TpuFusedMHATokenToKVPool):
+            return None
+        return pool_cls.kv_bytes_per_token_per_layer(
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            store_dtype=kv_cache_dtype,
+        )
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
@@ -926,8 +996,10 @@ class TpuSRTPlatform(SRTPlatform):
 
         return MLATokenToKVPool
 
-    def get_nsa_kv_pool_cls(self) -> type:
-        raise NotImplementedError("NSA is not supported on TPU.")
+    def get_dsa_kv_pool_cls(self) -> type:
+        from sglang_tpu.kv_pool import TpuFusedDSATokenToKVPool
+
+        return TpuFusedDSATokenToKVPool
 
     def get_zigzag_cp_strategy_cls(self) -> type:
         from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
@@ -979,6 +1051,11 @@ class TpuSRTPlatform(SRTPlatform):
         return True
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
+        return True
+
+    def keeps_swa_index_mapping_on_host(self) -> bool:
+        # SWATokenToKVPoolAllocator keeps the mapping on the host, and the
+        # host-resident req_to_token table hands its segment frees host indices.
         return True
 
     def supports_overlap_streams(self) -> bool:
@@ -1041,11 +1118,11 @@ class TpuSRTPlatform(SRTPlatform):
         # the inherited launch environment here; any TorchTPU-dependent
         # topology discovery is therefore confined to the worker.
         _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
-        _register_dsv4_attention_backend()
 
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        _register_attention_backends()
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:

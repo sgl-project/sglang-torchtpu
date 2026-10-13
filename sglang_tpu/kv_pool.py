@@ -64,6 +64,23 @@ def _zeros_kv_buffer(shape, dtype: torch.dtype, device) -> torch.Tensor:
     return buf
 
 
+def _seq_along_lane_head_dim(*, head_dim: int, kv_packing: int) -> int:
+    """Head-dim width of the SEQ_ALONG_LANE layout, rounded to a sublane tile."""
+    # Under TorchTPU, JAX is initialised CPU-only so Pallas can export
+    # without a competing TPU client; `tpu_info_for_cpu_export` swaps in the
+    # physical device's metadata for the duration of the query.
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.pallas_export import (
+        tpu_info_for_cpu_export,
+    )
+
+    with tpu_info_for_cpu_export():
+        num_sublanes = pltpu.get_tpu_info().num_sublanes
+    tile = num_sublanes * kv_packing
+    return _cdiv(head_dim, tile) * tile
+
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -86,6 +103,27 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # io backend asserts it moves all of the pool's KV state: a pool that keeps
     # quantization scales outside get_fused_kv_buffer must not list it.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+
+    @classmethod
+    def kv_bytes_per_token_per_layer(
+        cls,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        store_dtype: torch.dtype,
+    ) -> int:
+        """Bytes one token occupies in one layer's buffer; must track
+        ``_create_buffers``, since the KV budget is spent before the pool exists."""
+        del v_head_dim  # V shares K's padded slot; see __init__'s width check.
+        packing = _torch_dtype_packing(store_dtype)
+        num_kv_heads_x2 = _cdiv(num_kv_heads * 2, packing) * packing
+        padded_head_dim = (
+            _cdiv(head_dim, cls.HEAD_DIM_ALIGNMENT) * cls.HEAD_DIM_ALIGNMENT
+        )
+        return (
+            num_kv_heads_x2 * padded_head_dim * torch._utils._element_size(store_dtype)
+        )
 
     def __init__(
         self,
@@ -180,6 +218,17 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         self.num_blocks = self.size // self.page_size + 1
 
         self._create_buffers()
+        # The KV budget was drawn at this per-token price before the pool existed.
+        if self.kv_buffer:
+            priced = self.kv_bytes_per_token_per_layer(
+                num_kv_heads=self.head_num,
+                head_dim=self.head_dim,
+                v_head_dim=self.v_head_dim,
+                store_dtype=self.store_dtype,
+            )
+            assert (
+                self.kv_buffer[0].nbytes == self.num_blocks * self.page_size * priced
+            ), f"KV layer buffer {self.kv_buffer[0].shape} != {priced} B/token"
 
         self.device_module = torch.get_device_module(self.device)
         # No alt_stream on TPU.
@@ -513,20 +562,30 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     # its page shape from get_fused_kv_buffer, so it mirrors this layout too.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
 
-    def _head_dim_lanes(self) -> int:
-        # Under TorchTPU, JAX is initialised CPU-only so Pallas can export
-        # without a competing TPU client; `tpu_info_for_cpu_export` swaps in the
-        # physical device's metadata for the duration of the query.
-        from jax.experimental.pallas import tpu as pltpu
-
-        from sglang_tpu.pallas_export import (
-            tpu_info_for_cpu_export,
+    @classmethod
+    def kv_bytes_per_token_per_layer(
+        cls,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        store_dtype: torch.dtype,
+    ) -> int:
+        """Like the base method, but head_dim rounds to a sublane tile and the
+        ``num_kv_heads * 2`` axis never rounds."""
+        del v_head_dim  # V interleaves into K's axis at the same width.
+        packing = _torch_dtype_packing(store_dtype)
+        return (
+            num_kv_heads
+            * 2
+            * _seq_along_lane_head_dim(head_dim=head_dim, kv_packing=packing)
+            * torch._utils._element_size(store_dtype)
         )
 
-        with tpu_info_for_cpu_export():
-            num_sublanes = pltpu.get_tpu_info().num_sublanes
-        tile = num_sublanes * self.kv_packing
-        return _cdiv(self.head_dim, tile) * tile
+    def _head_dim_lanes(self) -> int:
+        return _seq_along_lane_head_dim(
+            head_dim=self.head_dim, kv_packing=self.kv_packing
+        )
 
     def _create_buffers(self):
         shape = (
@@ -919,3 +978,121 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             "TpuFusedMLATokenToKVPool.set_mla_kv_buffer was called; the Pallas "
             "MLA kernel owns cache writes (see set_kv_buffer)."
         )
+
+
+class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
+    """The fused MLA KV pool, plus the index-key cache the DSA indexer needs.
+
+    Each layer that runs its own indexer gets one ``uint8`` buffer of index
+    keys. It is paged like the KV cache and uses the same page table. A layer
+    that reuses the previous layer's top-k result has no such buffer.
+
+    Like the KV cache, these buffers are written only by the op that uses them
+    (the indexer op), which updates them in place.
+
+    TODO(sglang-torchtpu#1072): the core pool sizer counts 132 bytes per index
+    key, not this pool's 256, so a pool sized from free memory comes out too
+    large (about 2.5% for GLM-5.2). Pass --max-total-tokens until the sizer can
+    ask the pool for its bytes per token.
+    """
+
+    # The index-key cache stores this many tokens per row of a page.
+    INDEX_KEY_TOKENS_PER_ROW = 4
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        *,
+        index_head_dim: int,
+        index_key_layers: list[bool],
+    ):
+        if len(index_key_layers) != layer_num:
+            raise ValueError(
+                f"index_key_layers has {len(index_key_layers)} entries for "
+                f"{layer_num} layers."
+            )
+        # Set these first: the base constructor calls _create_buffers.
+        self._index_head_dim = index_head_dim
+        self._index_key_layers = index_key_layers
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
+    @classmethod
+    def index_key_record_bytes(cls, index_head_dim: int) -> int:
+        """Bytes one token's index key takes in the cache.
+
+        A record is the key's FP8 bytes in whole 128-byte lanes, then one scale
+        byte per lane, rounded up to whole lanes again. A 128-wide key takes
+        256 bytes. The indexer op checks the buffer's shape against what its
+        kernel reads, so a mistake here fails at the first compile.
+        """
+        lane = cls.HEAD_DIM_ALIGNMENT
+        key_bytes = _cdiv(index_head_dim, lane) * lane
+        return _cdiv(key_bytes + key_bytes // lane, lane) * lane
+
+    def _create_buffers(self):
+        super()._create_buffers()
+        tokens_per_row = self.INDEX_KEY_TOKENS_PER_ROW
+        if self.page_size % tokens_per_row != 0:
+            raise ValueError(
+                f"page_size ({self.page_size}) must be divisible by "
+                f"{tokens_per_row} for the TPU index-key cache."
+            )
+        shape = (
+            self.num_pages,
+            self.page_size // tokens_per_row,
+            tokens_per_row,
+            self.index_key_record_bytes(self._index_head_dim),
+        )
+        logger.info(
+            "Allocating TPU DSA index-key buffers: layers=%d of %d, shape per layer=%s",
+            sum(self._index_key_layers),
+            self.layer_num,
+            shape,
+        )
+        # One whole tensor per layer, not a view of a shared one: the indexer
+        # op can only update a whole tensor in place.
+        self.index_key_buffer = [
+            _zeros_kv_buffer(shape, torch.uint8, self.device) if has_indexer else None
+            for has_indexer in self._index_key_layers
+        ]
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        del self.index_key_buffer
+
+    def get_index_key_cache(self, layer_id: int) -> torch.Tensor:
+        buf = self.index_key_buffer[layer_id - self.start_layer]
+        if buf is None:
+            raise ValueError(
+                f"layer {layer_id} reuses the previous layer's top-k result "
+                "and has no index-key cache."
+            )
+        return buf
+
+    def get_kv_size_bytes(self):
+        index_key_bytes = sum(
+            get_tensor_size_bytes(buf)
+            for buf in self.index_key_buffer
+            if buf is not None
+        )
+        return super().get_kv_size_bytes() + index_key_bytes

@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from parameterized import parameterized
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.distributed import parallel_state
 from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
@@ -514,6 +514,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
         )
         scheduler.process_input_requests = Mock()
+        scheduler.transfer_backend = TransferBackend.FAKE
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
             pop_bootstrapped=Mock(return_value=[])
         )

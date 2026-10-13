@@ -2,6 +2,7 @@
 """Emit one GitHub Actions matrix row per enabled TPU test in a suite."""
 
 import argparse
+import functools
 import glob
 import json
 import os
@@ -12,14 +13,25 @@ from test_names import names_from_path
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 
 
-def discover(suite: str, nightly: bool, root: str) -> list[dict]:
+@functools.lru_cache(maxsize=None)
+def _collect(root: str) -> tuple:
+    """Every registered test under ``root``, walked and collected once.
+
+    Collecting imports each test file, so it costs seconds; a caller that asks
+    about several suites (the dashboard contract lint asks about all of them)
+    would otherwise pay that walk per suite.
+    """
     files = [
         path
         for path in glob.glob(os.path.join(root, "**", "*.py"), recursive=True)
         if os.path.basename(path) not in ("conftest.py", "__init__.py")
     ]
+    return tuple(_ci_register.collect_tests(files, sanity_check=False))
+
+
+def discover(suite: str, nightly: bool, root: str) -> list[dict]:
     rows = []
-    for test in _ci_register.collect_tests(files, sanity_check=False):
+    for test in _collect(root):
         if (
             test.backend != _ci_register.HWBackend.TPU
             or test.effective_suite != suite

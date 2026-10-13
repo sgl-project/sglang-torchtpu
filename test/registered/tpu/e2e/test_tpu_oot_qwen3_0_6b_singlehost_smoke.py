@@ -9,7 +9,7 @@ import runpy
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
-    est_time=300,
+    est_time=80,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "qwen3-0.6b", "smoke", "tpu-oot"],
 )

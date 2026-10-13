@@ -12,6 +12,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import torch
 import torch.compiler.config as compiler_config
 
 from sglang.srt.environ import envs
@@ -23,6 +24,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
@@ -140,10 +142,15 @@ class TestTpuCompileCache(CustomTestCase):
                 package_root / "attention/pallas/kernel.py",
                 package_root / "moe/pallas/kernel.py",
                 package_root / "attention_pallas.py",
+                package_root / "attention_pallas_mla.py",
+                package_root / "attention_pallas_mla_sparse.py",
                 package_root / "attention_pallas_rpa_base.py",
                 package_root / "attention_pallas_rpa_batched.py",
                 package_root / "attention_pallas_rpa_v3.py",
                 package_root / "distributed_topk_pallas.py",
+                package_root / "dsa_indexer_tpu.py",
+                package_root / "dsv4/sparsecore_topk.py",
+                package_root / "dsv4/streamindex_topk/kernel.py",
                 package_root / "kernels/distributed_topk.py",
                 package_root / "kernels/kernel.py",
                 package_root / "pallas_export.py",
@@ -380,6 +387,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertEqual(self._resolved(args, "kv_cache_dtype"), "auto")
         self.assertEqual(self._resolved(args, "page_size"), 64)
 
+    def test_sparse_mla_backend_defaults_kv_cache_to_fp8(self):
+        # Its kernels read an FP8 cache and nothing else, so "auto" cannot be
+        # left to mean the model dtype.
+        args = self._args(attention_backend="pallas_tpu_mla_sparse")
+        self._apply(args)
+        self.assertEqual(self._resolved(args, "kv_cache_dtype"), "fp8_e4m3")
+
     def test_batched_rpa_page_size_default_meets_the_kernel_floor(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched")
         self._apply(args)
@@ -604,6 +618,43 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             attn_cp_size=2,
             moe_dp_size=2,
         )
+
+
+class TestDsaValidation(CustomTestCase):
+    """apply_server_args_defaults rejects the DSA setups TPU would serve wrongly."""
+
+    _args = TestTpuPlatformServerDefaults._args
+    _apply = TestTpuPlatformServerDefaults._apply
+
+    def _apply_dsa(self, *, attention_backend, **config_fields):
+        args = self._args(
+            attention_backend=attention_backend,
+            model_path="model",
+            trust_remote_code=False,
+            revision=None,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048, **config_fields
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers.config.get_config",
+            return_value=hf_config,
+        ):
+            self._apply(args)
+
+    def test_dsa_needs_the_sparse_backend_and_a_plain_top_k(self):
+        """TPU has one DSA backend, and its top-k kernel cannot force the
+        init/local positions in. Either mismatch must stop the launch: served
+        anyway, the model would attend over a different selection."""
+        self._apply_dsa(attention_backend="pallas_tpu_mla_sparse")
+        with self.assertRaisesRegex(ValueError, "pallas_tpu_mla_sparse"):
+            self._apply_dsa(attention_backend="pallas_tpu_mla")
+        for field in ("index_init_tokens", "index_local_tokens"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    self._apply_dsa(
+                        attention_backend="pallas_tpu_mla_sparse", **{field: 4}
+                    )
 
 
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):
@@ -855,13 +906,93 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
-    def test_nsa_raises(self):
-        with self.assertRaises(NotImplementedError):
-            self.platform.get_nsa_kv_pool_cls()
+    def test_dsa_pool_is_the_fused_pool_with_index_keys(self):
+        cls = self.platform.get_dsa_kv_pool_cls()
+        self.assertEqual(cls.__name__, "TpuFusedDSATokenToKVPool")
 
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
             self.platform.get_piecewise_backend_cls()
+
+
+def _built_bytes_per_token(pool_cls, *, num_kv_heads, head_dim, v_head_dim, dtype):
+    """Per-token, per-layer bytes of a pool actually built on the CPU."""
+    page_size = 16
+    pool = pool_cls(
+        size=4 * page_size,
+        page_size=page_size,
+        dtype=dtype,
+        head_num=num_kv_heads,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        layer_num=1,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    buf = pool.kv_buffer[0]
+    return buf.numel() * buf.element_size() // (pool.num_blocks * page_size)
+
+
+class TestTpuKvPoolBytesPerToken(CustomTestCase):
+    """The KV budget is spent before any pool exists, so each pool's
+    ``kv_bytes_per_token_per_layer`` must track its ``_create_buffers``."""
+
+    def _check(self, pool_cls, expected, **shape):
+        dtype = shape.pop("dtype")
+        per_token = pool_cls.kv_bytes_per_token_per_layer(**shape, store_dtype=dtype)
+        self.assertEqual(per_token, expected)
+        self.assertEqual(
+            per_token, _built_bytes_per_token(pool_cls, **shape, dtype=dtype)
+        )
+
+    def test_head_dim_64_is_priced_at_the_padded_width(self):
+        """Bug regression: sizing priced heads * (head_dim + v_head_dim) while the
+        fused pool pads head_dim 64 to 128, so the pool was twice its budget."""
+        self._check(
+            TpuFusedMHATokenToKVPool,
+            8 * 2 * 128 * 2,
+            num_kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+            dtype=torch.bfloat16,
+        )
+
+    def test_fp8_rounds_the_head_axis_up_to_the_lane_packing(self):
+        """fp8 packs 4 per 32-bit lane, so one KV head's K/V axis rounds 2 up to 4
+        on top of the head_dim padding."""
+        for heads in (1, 2):
+            self._check(
+                TpuFusedMHATokenToKVPool,
+                4 * 128,
+                num_kv_heads=heads,
+                head_dim=64,
+                v_head_dim=64,
+                dtype=torch.float8_e4m3fn,
+            )
+
+    def test_v_is_stored_at_the_padded_qk_width(self):
+        """The fused pool stores V in a slot of the padded qk width, so the
+        footprint is flat in v_head_dim, unlike head_dim + v_head_dim."""
+        for v_head_dim in (192, 128):
+            self._check(
+                TpuFusedMHATokenToKVPool,
+                8 * 256 * 2,
+                num_kv_heads=4,
+                head_dim=192,
+                v_head_dim=v_head_dim,
+                dtype=torch.bfloat16,
+            )
+
+    def test_platform_prices_only_the_padding_pools(self):
+        """A pool without padding reports None, so sizing keeps the generic formula."""
+        platform = TpuSRTPlatform()
+        shape = dict(
+            num_kv_heads=8, head_dim=64, v_head_dim=64, kv_cache_dtype=torch.bfloat16
+        )
+        with get_context().override_server_args(attention_backend="torch_native"):
+            self.assertIsNone(platform.get_mha_kv_bytes_per_token(**shape))
+        with get_context().override_server_args(attention_backend="pallas_tpu_rpa_v3"):
+            self.assertEqual(platform.get_mha_kv_bytes_per_token(**shape), 4096)
 
 
 if __name__ == "__main__":

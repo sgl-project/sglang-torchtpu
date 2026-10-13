@@ -22,7 +22,7 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     use_fused_moe_sequence_parallel_plan,
 )
 
-register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class TestFusedRsSequenceParallel(CustomTestCase):

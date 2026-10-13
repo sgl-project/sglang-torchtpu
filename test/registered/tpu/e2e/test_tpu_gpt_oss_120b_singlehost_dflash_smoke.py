@@ -14,7 +14,7 @@ from sglang.test.tpu import model_config_main
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
-    est_time=1800,
+    est_time=375,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "gpt-oss-120b", "spec", "dflash"],
 )

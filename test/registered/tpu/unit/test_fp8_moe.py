@@ -18,7 +18,7 @@ from sglang_tpu.moe.pallas.fused_moe_op import (
     fused_moe_call,
 )
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 # Eager and compiled kernels use different BF16 accumulation orders. Retain
 # BF16's default relative tolerance and cover rounding near zero explicitly.

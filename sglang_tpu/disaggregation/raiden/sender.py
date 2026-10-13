@@ -1116,6 +1116,19 @@ class RaidenKVSender(CommonKVSender):
         # It is sent only after the decode reserved the request's KV pages, so
         # the prefill never computes KV that no decode can take yet.
         self.init_time = time.time()
+        # An ABORT that outran this sender only tombstoned the room (_on_abort
+        # saw no status). The status now exists, so _on_abort and this check
+        # are ordered by _state_lock: one of them fails the room.
+        if not self.kv_mgr.is_dummy_cp_rank:
+            with self.kv_mgr._state_lock:
+                if self.bootstrap_room in self.kv_mgr._aborted:
+                    self.kv_mgr._fail_room_locked(
+                        self.bootstrap_room,
+                        "Aborted by decode-side abort notification received "
+                        "before the sender was created.",
+                        preserve_reason=True,
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         super().init(num_kv_indices, aux_index)
@@ -1150,6 +1163,10 @@ class RaidenKVSender(CommonKVSender):
             self.kv_mgr.offer_chunk(
                 self.bootstrap_room, start, blocks, self.num_kv_indices
             )
+        elif not self._last_chunk and self.kv_mgr._pipeline is not None:
+            # A pipeline stage moves pages already final (a cached prefix,
+            # finished chunks) as early parts.
+            self.kv_mgr._pipeline.offer_part(self.bootstrap_room, start, blocks)
         if self._last_chunk and not self._started:
             self._started = True
             # finalize_send turns the room Transferring itself, under the

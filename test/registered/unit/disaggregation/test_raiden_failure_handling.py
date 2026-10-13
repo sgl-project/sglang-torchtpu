@@ -6,7 +6,7 @@ import time
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 import zmq
@@ -243,6 +243,75 @@ class TestPrefillAbortHandling(unittest.TestCase):
         # The tombstone outlives the room: frames still on the wire for it
         # must stay rejected. It ages out on its own.
         self.assertTrue(mgr.is_aborted(ROOM))
+
+    def _sender_manager(self, dummy_cp_rank=False):
+        mgr = _gate_manager()
+        mgr._drain_engine = lambda: None
+        mgr._ensure_engine = lambda: None
+        mgr.is_dummy_cp_rank = dummy_cp_rank
+        return mgr
+
+    @staticmethod
+    def _new_sender(mgr, room=ROOM):
+        return _gate_sender(mgr, room)
+
+    def test_abort_before_sender_fails_the_room_at_creation(self):
+        """The decode can refuse a room before the prefill scheduler creates
+        its sender. That ABORT only tombstones the room; the sender must fail
+        it at once, not after the 300 s decode-silence deadline."""
+        mgr = self._sender_manager()
+        mgr._dispatch(_abort_frame(ROOM))
+
+        sender = self._new_sender(mgr)
+        other = self._new_sender(mgr, OTHER_ROOM)
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        # Untouched by the abort: still waiting for its decode's first request.
+        self.assertEqual(other.poll(), KVPoll.Bootstrapping)
+        with self.assertRaises(Exception) as cm:
+            sender.failure_exception()
+        self.assertIn("before the sender was created", str(cm.exception))
+        self.assertNotIn(ROOM, mgr.request_status)
+        self.assertNotIn(ROOM, mgr.failure_records)
+        self.assertNotIn(str(ROOM), mgr._failed)
+        self.assertTrue(mgr.is_aborted(ROOM))
+
+    def test_abort_after_sender_creation_still_fails_the_room(self):
+        mgr = self._sender_manager()
+        sender = self._new_sender(mgr)
+
+        mgr._dispatch(_abort_frame(ROOM))
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        with self.assertRaises(Exception) as cm:
+            sender.failure_exception()
+        self.assertIn("decode-side abort notification.", str(cm.exception))
+
+    def test_dummy_cp_rank_ignores_an_early_abort(self):
+        mgr = self._sender_manager(dummy_cp_rank=True)
+        mgr._dispatch(_abort_frame(ROOM))
+
+        sender = self._new_sender(mgr)
+
+        self.assertEqual(sender.poll(), KVPoll.Success)
+        self.assertNotIn(ROOM, mgr.failure_records)
+
+    def test_abort_racing_sender_creation_always_fails_the_room(self):
+        for _ in range(200):
+            mgr = self._sender_manager()
+            barrier = threading.Barrier(2)
+
+            def abort():
+                barrier.wait()
+                mgr._dispatch(_abort_frame(ROOM))
+
+            thread = threading.Thread(target=abort)
+            thread.start()
+            barrier.wait()
+            sender = self._new_sender(mgr)
+            thread.join()
+
+            self.assertEqual(sender.poll(), KVPoll.Failed)
 
     def test_abort_is_terminal_for_a_prefill_still_computing(self):
         """A send that lands after the abort must not revive the room."""
@@ -565,6 +634,7 @@ def _producer_pipeline(mgr):
     pipe.sent = {}
     pipe.failed = set()
     pipe.poll = lambda: (set(), set(), set())
+    pipe._init_overlap_state()
     return pipe
 
 
@@ -1482,6 +1552,10 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         class FakeSocket:
             def __init__(self):
                 self.closed = False
+                self.monitored = True
+
+            def disable_monitor(self):
+                self.monitored = False
 
             def close(self, linger=None):
                 self.closed = True
@@ -1518,6 +1592,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
                 t.join(0.2)
                 self.assertTrue(t.is_alive())
                 self.assertFalse(sock.closed)
+                self.assertTrue(sock.monitored)
             t.join(2)
 
         self.assertEqual(seen["addr"], "10.0.0.1:8998")
@@ -1649,6 +1724,92 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         self.assertFalse(waiting.is_alive())
         self.assertFalse(clear.is_alive())
         self.assertNotIn(ROOM, mgr.request_status)
+
+
+# Contexts whose I/O thread a failing case blocked. Terminating one never
+# returns, so it is parked here rather than hanging the run.
+_BLOCKED_CONTEXTS = []
+
+
+class _MonitorWhosePeerDropsOnClose:
+    """A socket monitor whose monitored peer disconnects right after it closes."""
+
+    def __init__(self, *, monitor, peer):
+        self._monitor = monitor
+        self._peer = peer
+
+    def close(self):
+        self._monitor.close()
+        self._peer.close(linger=0)
+        # Measured: libzmq sees the drop within 50 ms, doubled for a loaded host.
+        time.sleep(0.1)
+
+
+class TestDisconnectLeavesOtherPeersReachable(unittest.TestCase):
+    """Dropping one prefill must not stop this rank's sends to the others.
+
+    libzmq reports a peer drop with a blocking send to the socket's monitor,
+    on the one I/O thread its context has. A drop reported to a closed monitor
+    blocks that thread for good: every socket of the context keeps accepting
+    messages and delivers none.
+    """
+
+    @staticmethod
+    def _bound_peer(ctx):
+        peer = ctx.socket(zmq.PULL)
+        port = peer.bind_to_random_port("tcp://127.0.0.1")
+        return peer, f"tcp://127.0.0.1:{port}"
+
+    def test_peer_dropping_during_disconnect_does_not_stall_other_sends(self):
+        peer_ctx = zmq.Context()
+        self.addCleanup(peer_ctx.destroy, linger=0)
+        dropped_peer, dropped_endpoint = self._bound_peer(peer_ctx)
+        live_peer, live_endpoint = self._bound_peer(peer_ctx)
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
+        mgr.defer_decode_allocation = False
+        mgr._zmq_ctx = zmq.Context()
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {}
+        mgr._monitor_cache = {}
+        mgr._socket_send_locks = {}
+        for endpoint, peer in (
+            (dropped_endpoint, dropped_peer),
+            (live_endpoint, live_peer),
+        ):
+            mgr._send_multipart_locked(endpoint, [b"connect"])
+            self.assertTrue(peer.poll(5000), "peer never connected")
+            peer.recv_multipart()
+        mgr._monitor_cache[dropped_endpoint] = _MonitorWhosePeerDropsOnClose(
+            monitor=mgr._monitor_cache[dropped_endpoint], peer=dropped_peer
+        )
+
+        mgr._disconnect_endpoint(dropped_endpoint)
+        mgr._send_multipart_locked(live_endpoint, [b"after the drop"])
+        delivered = bool(live_peer.poll(5000))
+
+        if delivered:
+            mgr._disconnect_endpoint(live_endpoint)
+            mgr._zmq_ctx.term()
+        else:
+            _BLOCKED_CONTEXTS.append(mgr._zmq_ctx)
+        self.assertTrue(delivered, "the send to the live peer was never delivered")
+
+    def test_monitor_is_detached_before_either_end_closes(self):
+        """Closing the socket ahead of its monitor is not enough: a drop that
+        races the close is still reported to the closed monitor. The socket
+        has to stop reporting first."""
+        endpoint = "tcp://10.0.0.1:4444"
+        zmq_calls = Mock()
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {endpoint: zmq_calls.sock}
+        mgr._monitor_cache = {endpoint: zmq_calls.monitor}
+        mgr._socket_send_locks = {endpoint: threading.Lock()}
+
+        mgr._disconnect_endpoint(endpoint)
+
+        self.assertEqual(zmq_calls.mock_calls[0], call.sock.disable_monitor())
 
 
 ANNOUNCE_ROOM = 21

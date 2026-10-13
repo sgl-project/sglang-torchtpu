@@ -74,6 +74,19 @@ class SRTPlatform(DeviceMixin):
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError
 
+    def get_mha_kv_bytes_per_token(
+        self,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        """Per-token, per-layer bytes of this platform's MHA pool; ``None`` means
+        the generic ``num_kv_heads * (head_dim + v_head_dim) * itemsize``."""
+        del num_kv_heads, head_dim, v_head_dim, kv_cache_dtype
+        return None
+
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         """Return the host (L2) MHA KV pool class matching ``device_pool``.
 
@@ -192,6 +205,11 @@ class SRTPlatform(DeviceMixin):
     def supports_moe_dp_pipeline_stages(self) -> bool:
         """Whether a pipeline stage may replicate its experts over its own
         devices (--moe-dp-size > 1 with --pp-size > 1)."""
+        return False
+
+    def keeps_swa_index_mapping_on_host(self) -> bool:
+        """Whether the SWA allocator's full-to-SWA index mapping is host-resident,
+        so SWA segment frees require host indices."""
         return False
 
     # ------------------------------------------------------------------
