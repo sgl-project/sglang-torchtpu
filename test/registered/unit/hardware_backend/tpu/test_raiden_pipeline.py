@@ -26,6 +26,8 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
 from sglang_tpu.disaggregation.raiden.pipeline import (
     PipelineTransfer,
     Receive,
+    dcp_destination_blocks,
+    dcp_token_spans,
     destination_blocks,
     head_slice_spans,
     layout_fingerprint,
@@ -1113,6 +1115,106 @@ class TestDraftPoolGroups(unittest.TestCase):
         groups = get_raiden_kv_caches(self.pool(), draft_pool=self.pool(layers=1))
         self.assertTrue(groups.has_draft_pool)
         self.assertEqual(len(groups.full), 3)
+
+
+class TestDecodeContextParallelSpans(unittest.TestCase):
+    """dcp_token_spans + dcp_destination_blocks land each token where a DCP decode
+    stores it: DCP rank ``p % D`` of every kv-head group, row ``(p % (P*D)) // D``
+    of the DCP page holding ``p``."""
+
+    PAGE, HEADS, HEAD_DIM = 8, 4, 2
+
+    def _tensor(self, heads):
+        return SimpleNamespace(
+            shape=(64, self.PAGE, heads, 2, self.HEAD_DIM), element_size=lambda: 2
+        )
+
+    def _case(self, tokens, dcp, tp, window=None):
+        import numpy as np
+
+        rng = np.random.default_rng(tokens * 131 + dcp * 7 + tp)
+        page, kv_tp = self.PAGE, tp // dcp
+        head = 2 * self.HEAD_DIM * 2
+        src_row, dst_row = self.HEADS * head, self.HEADS // kv_tp * head
+        n = -(-tokens // page)
+        first = max(0, (tokens - window) // page) if window else 0
+        full = list(range(100, 100 + n))
+        swa = full[first:] if window else []
+        tags = ["full.0"] + (["swa.1"] if window else [])
+        pools = [{"tag": t, "block_stride_bytes": page * dst_row} for t in tags]
+        tensors = [self._tensor(self.HEADS) for _ in tags]
+        pages = {
+            s: rng.integers(0, 256, page * src_row, dtype=np.uint8) for s in range(n)
+        }
+        spans = dcp_token_spans(pools, tensors, full, swa, tp, dcp, self.HEADS)
+        # The decode holds one more page than the source covers (the next token).
+        dst_full = list(range(-(-n // dcp) + 1))
+        dst_swa = list(range((n - 1) // dcp - first // dcp + 2)) if window else []
+        blocks = dcp_destination_blocks(pools, dst_full, dst_swa, n, len(swa), dcp)
+        counts = dict(zip(blocks["transfer_pool_tags"], blocks["dst_block_counts"]))
+        for pool in spans:
+            is_swa = pool.tag.startswith("swa.")
+            base = first if is_swa else 0
+            self.assertEqual(blocks["dst_skip_bytes"][tags.index(pool.tag)], 0)
+            space = counts[pool.tag] * page * dst_row
+            got = {u: np.zeros(space, dtype=np.uint8) for u in range(tp)}
+            covered = {u: [] for u in range(tp)}
+            for span in pool.spans:
+                src = pages[base + span.src_block_ordinal]
+                for k in range(span.count):
+                    s = span.src_offset_bytes + k * span.src_stride_bytes
+                    d = span.dst_offset_bytes + k * span.dst_stride_bytes
+                    got[span.dst_unit_ordinal][d : d + span.size_bytes] = src[
+                        s : s + span.size_bytes
+                    ]
+                    covered[span.dst_unit_ordinal].append((d, d + span.size_bytes))
+            self.assertEqual(
+                pool.declared_bytes,
+                sum(e - b for intervals in covered.values() for b, e in intervals),
+            )
+            extents = set()
+            for intervals in covered.values():
+                intervals.sort()
+                self.assertEqual(intervals[0][0], 0)
+                for (_, end), (start, _) in zip(intervals, intervals[1:]):
+                    self.assertEqual(end, start, "gap or overlap in a unit's coverage")
+                extents.add(intervals[-1][1])
+            self.assertEqual(len(extents), 1, "units must cover the same extent")
+            self.assertLessEqual(extents.pop(), space)
+            # Every live position must sit where the DCP decode stores it.
+            live = range(max(0, tokens - window), tokens) if is_swa else range(tokens)
+            for p in live:
+                row = pages[p // page][(p % page) * src_row : (p % page + 1) * src_row]
+                for group in range(kv_tp):
+                    u = group * dcp + p % dcp
+                    j = p // (page * dcp) - (first // dcp if is_swa else 0)
+                    at = j * page * dst_row + (p % (page * dcp)) // dcp * dst_row
+                    np.testing.assert_array_equal(
+                        got[u][at : at + dst_row],
+                        row[group * dst_row : (group + 1) * dst_row],
+                        err_msg=f"{pool.tag} p={p} u={u}",
+                    )
+
+    def test_full_pool_matches_the_dcp_layout(self):
+        for tokens in (1, 7, 8, 9, 15, 16, 17, 40, 64, 65):
+            for dcp in (2, 4, 8):
+                for tp in (dcp, 2 * dcp):
+                    with self.subTest(tokens=tokens, dcp=dcp, tp=tp):
+                        self._case(tokens, dcp, tp)
+
+    def test_sliding_window_starting_mid_dcp_page(self):
+        for tokens in (9, 17, 30, 41, 64, 70):
+            for dcp in (2, 4):
+                for tp in (dcp, 2 * dcp):
+                    with self.subTest(tokens=tokens, dcp=dcp, tp=tp):
+                        self._case(tokens, dcp, tp, window=6)
+
+    def test_page_not_a_multiple_of_dcp_is_rejected(self):
+        pools = [{"tag": "full.0", "block_stride_bytes": 0}]
+        with self.assertRaisesRegex(ValueError, "not a multiple of DCP"):
+            dcp_token_spans(
+                pools, [self._tensor(self.HEADS)], [1], [], 3, 3, self.HEADS
+            )
 
 
 class TestPrefillContextParallel(unittest.TestCase):

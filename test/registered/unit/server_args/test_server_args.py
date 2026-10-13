@@ -1155,7 +1155,9 @@ class TestLoadBalanceMethod(unittest.TestCase):
             dcp_size=4,
         )
         with self.assertRaisesRegex(
-            ValueError, "mooncake, nixl, ascend, or fake for synthetic benchmarking"
+            ValueError,
+            "mooncake, nixl, ascend, raiden with SGLANG_RAIDEN_PIPELINE_TRANSFER=1, "
+            "or fake for synthetic benchmarking",
         ):
             handle_pd_disaggregation(server_args)
 

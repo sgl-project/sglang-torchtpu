@@ -1207,7 +1207,8 @@ class CommonKVManager(BaseKVManager):
                     "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
                 )
 
-        if self.dcp_size > 1:
+        # The Raiden pipeline transfer shards any fused KV pool by token itself.
+        if self.dcp_size > 1 and not getattr(self, "_pipeline_enabled", False):
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
                 raise RuntimeError(
                     "PD decode DCP requires an MLA or hybrid-MLA KV pool."

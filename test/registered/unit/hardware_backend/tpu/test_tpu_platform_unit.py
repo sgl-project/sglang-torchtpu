@@ -812,6 +812,19 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             with self.subTest(mode=mode):
                 self._assert_refused("(?i)disaggregation", disaggregation_mode=mode)
 
+    def test_accepts_a_raiden_pipeline_decode(self):
+        args = self._args(
+            disaggregation_mode="decode", disaggregation_transfer_backend="raiden"
+        )
+        self._validate(args, env={"SGLANG_RAIDEN_PIPELINE_TRANSFER": "1"})
+
+    def test_refuses_raiden_without_the_pipeline_transfer(self):
+        args = self._args(
+            disaggregation_mode="decode", disaggregation_transfer_backend="raiden"
+        )
+        with self.assertRaisesRegex(ValueError, "(?i)disaggregation"):
+            self._validate(args, env={"SGLANG_RAIDEN_PIPELINE_TRANSFER": "0"})
+
     def test_refuses_hierarchical_cache(self):
         self._assert_refused("(?i)hierarchical", enable_hierarchical_cache=True)
 

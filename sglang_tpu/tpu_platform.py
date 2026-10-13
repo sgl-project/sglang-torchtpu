@@ -591,10 +591,18 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--enable-prefill-cp is not supported with "
             "--decode-context-parallel-size > 1 on TPU."
         )
-    if cfg.disaggregation_mode != "null":
+    # A Raiden decode receives each rank's token shard by named layer pools
+    # (disaggregation/raiden/pipeline.py dcp_token_spans).
+    raiden_pipeline_decode = (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_transfer_backend == "raiden"
+        and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+    )
+    if cfg.disaggregation_mode != "null" and not raiden_pipeline_decode:
         raise ValueError(
             "--disaggregation-mode is not supported with "
-            "--decode-context-parallel-size > 1 on TPU (got "
+            "--decode-context-parallel-size > 1 on TPU, except a decode on the "
+            "Raiden pipeline transfer (SGLANG_RAIDEN_PIPELINE_TRANSFER=1) (got "
             f"{cfg.disaggregation_mode!r})."
         )
     if cfg.enable_hierarchical_cache:

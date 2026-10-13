@@ -217,6 +217,129 @@ def head_slice_spans(
     return result
 
 
+def dcp_token_spans(
+    pools: Sequence[dict],
+    tensors: Sequence[Any],
+    full: list[int],
+    swa: list[int],
+    dst_attn_tp: int,
+    dcp_size: int,
+    total_kv_heads: int,
+) -> list[Any]:
+    """Describe a decode-context-parallel decode's share of every locally owned page.
+
+    DCP rank ``r`` of a decode stores token ``p`` iff ``p % dcp == r``, in pages of
+    ``page_tokens`` physical rows that each hold ``dcp * page_tokens`` logical
+    tokens; the kv heads are split over ``dst_attn_tp // dcp`` head groups, and
+    decode TP rank ``u`` is DCP rank ``u % dcp`` of head group ``u // dcp``. So
+    rank ``u`` takes rows ``r, r + dcp, ...`` of source page ``s`` (its head slice
+    of each), and they land as one contiguous run of ``page_tokens // dcp`` rows
+    at row ``(s % dcp) * page_tokens // dcp`` of destination page ``s // dcp``.
+    """
+    if dst_attn_tp % dcp_size:
+        raise ValueError(
+            f"Decode attention TP {dst_attn_tp} is not a multiple of DCP {dcp_size}"
+        )
+    kv_tp = dst_attn_tp // dcp_size
+    full_count = len(full)
+    result = []
+    for pool, tensor in zip(pools, tensors):
+        is_swa = pool["tag"].startswith("swa.")
+        blocks = swa if is_swa else full
+        page_tokens = int(tensor.shape[1])
+        if page_tokens % dcp_size:
+            raise ValueError(
+                f"Page size {page_tokens} is not a multiple of DCP {dcp_size}"
+            )
+        rows = page_tokens // dcp_size
+        geometry = ReshardGeometry(
+            src_tp=1,
+            dst_tp=kv_tp,
+            hp_bytes=head_bytes(tensor),
+            total_kv_heads=total_kv_heads,
+            kv_packing=int(tensor.shape[3]),
+            element_size=tensor.element_size(),
+        )
+        # A window holds the request's last pages; its destination starts at the
+        # DCP page holding the window's first source page.
+        first = full_count - len(blocks) if is_swa else 0
+        base = first // dcp_size
+        # Source pages the window misses but its first destination page also
+        # holds: they sit outside the window, so any rows fill them.
+        pages = [(index, first + index) for index in range(len(blocks))]
+        fillers = (
+            [(0, page) for page in range(base * dcp_size, first)] if blocks else []
+        )
+        spans = []
+        for unit in range(dst_attn_tp):
+            dcp_rank, group = unit % dcp_size, unit // dcp_size
+            head_src, size, src_row, head_dst, dst_row = geometry.entry_bytes(0, group)
+            for ordinal, page in fillers + pages:
+                spans.append(
+                    SimpleNamespace(
+                        src_block_ordinal=ordinal,
+                        src_offset_bytes=dcp_rank * src_row + head_src,
+                        dst_block_index=0,
+                        dst_offset_bytes=(page // dcp_size - base)
+                        * page_tokens
+                        * dst_row
+                        + (page % dcp_size) * rows * dst_row
+                        + head_dst,
+                        size_bytes=size,
+                        src_stride_bytes=dcp_size * src_row,
+                        dst_stride_bytes=dst_row,
+                        count=rows,
+                        dst_unit_ordinal=unit,
+                    )
+                )
+        result.append(
+            SimpleNamespace(
+                tag=pool["tag"],
+                block_ids=list(blocks),
+                declared_bytes=sum(span.size_bytes * span.count for span in spans),
+                dst_space_version=1,
+                spans=spans,
+            )
+        )
+    return result
+
+
+def dcp_destination_blocks(
+    pools: Sequence[dict],
+    full: list[int],
+    swa: list[int],
+    source_full_count: int,
+    source_swa_count: int,
+    dcp_size: int,
+) -> dict:
+    """``destination_blocks`` for a DCP decode, whose pages each hold ``dcp``
+    source pages: clip to the pages the source covers, skip a cached prefix."""
+    tags, blocks, counts, skips = [], [], [], []
+    for pool in pools:
+        is_swa = pool["tag"].startswith("swa.")
+        local = list(swa if is_swa else full)
+        if is_swa:
+            if not source_swa_count:
+                continue
+            first = source_full_count - source_swa_count
+            needed = (source_full_count - 1) // dcp_size - first // dcp_size + 1
+        else:
+            needed = -(-source_full_count // dcp_size)
+        local = local[:needed]
+        if not local:
+            continue
+        tags.append(pool["tag"])
+        blocks.extend(local)
+        counts.append(len(local))
+        skips.append((needed - len(local)) * pool["block_stride_bytes"])
+    return dict(
+        transfer_pool_tags=tags,
+        dst_device_block_ids=blocks,
+        dst_block_counts=counts,
+        dst_skip_bytes=skips,
+    )
+
+
 def destination_blocks(
     pools: Sequence[dict],
     full: list[int],
@@ -347,12 +470,17 @@ class StagingPlan(msgspec.Struct, frozen=True):
 class PipelineTransfer:
     """One named-pool engine per worker, sharing its pipeline's reshard controller."""
 
+    dcp_size = 1
+
     def __init__(self, manager, groups):
         from tpu_sync.api.torch.reshard_client import ReshardClient
         from tpu_sync.rpc import raiden_service_pb2
 
         self.manager = manager
         self.producer = manager.disaggregation_mode == DisaggregationMode.PREFILL
+        # Decode context parallelism shards each request's KV by token position
+        # over a slice of the decode's TP group (dcp_token_spans).
+        self.dcp_size = int(getattr(manager, "dcp_size", 1) or 1)
         self._check_support(raiden_service_pb2, groups)
         self.hbm_mem_type = raiden_service_pb2.MEMORY_TYPE_HBM
         self.lock = threading.RLock()
@@ -415,6 +543,13 @@ class PipelineTransfer:
         if manager.attn_cp_size != 1 and not self.producer:
             raise ValueError(
                 "Raiden pipeline transfer requires attention CP=1 on the decode"
+            )
+        if self.dcp_size > 1 and (
+            self.producer or manager.pp_size != 1 or manager.attn_dp_size != 1
+        ):
+            raise ValueError(
+                "Raiden pipeline transfer takes DCP only on a decode without "
+                "pipeline stages or attention DP"
             )
         if manager.attn_cp_size != 1 and manager.attn_cp_rank != 0:
             raise ValueError(
@@ -676,13 +811,27 @@ class PipelineTransfer:
         TP; a registration that cannot be made fails the room."""
         item = self.sent[room]
         try:
-            widths = {int(meta["attn_tp_size"]) for meta in self.replies[room].values()}
+            widths = {
+                (int(meta["attn_tp_size"]), int(meta.get("dcp_size", 1)))
+                for meta in self.replies[room].values()
+            }
             if len(widths) != 1:
                 raise ValueError(
-                    "Raiden pipeline consumers of one request disagree on attention TP"
+                    "Raiden pipeline consumers of one request disagree on attention "
+                    "TP or DCP"
                 )
-            dst_attn_tp = widths.pop()
-            if dst_attn_tp == 1:
+            dst_attn_tp, dcp_size = widths.pop()
+            if dcp_size > 1:
+                spans = dcp_token_spans(
+                    self.pools,
+                    self.tensors,
+                    item["full"],
+                    item["swa"],
+                    dst_attn_tp,
+                    dcp_size,
+                    int(self.manager.kv_args.total_kv_head_num),
+                )
+            elif dst_attn_tp == 1:
                 spans = source_spans(self.pools, item["full"], item["swa"])
             else:
                 spans = head_slice_spans(
@@ -757,7 +906,11 @@ class PipelineTransfer:
             )
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
         consumer = json.dumps(
-            dict(attn_tp_size=mgr.attn_tp_size, attn_tp_rank=mgr.attn_tp_rank)
+            dict(
+                attn_tp_size=mgr.attn_tp_size,
+                attn_tp_rank=mgr.attn_tp_rank,
+                dcp_size=self.dcp_size,
+            )
         ).encode()
         for info in infos:
             peer = NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
@@ -859,9 +1012,19 @@ class PipelineTransfer:
                 )
             address = addresses.pop()
             source_full, source_swa = geometries.pop()
-            args = destination_blocks(
-                self.pools, request.full, request.swa, source_full, source_swa
-            )
+            if self.dcp_size > 1:
+                args = dcp_destination_blocks(
+                    self.pools,
+                    request.full,
+                    request.swa,
+                    source_full,
+                    source_swa,
+                    self.dcp_size,
+                )
+            else:
+                args = destination_blocks(
+                    self.pools, request.full, request.swa, source_full, source_swa
+                )
             if not args["transfer_pool_tags"]:
                 if mgr.attn_tp_rank == 0:
                     for endpoint in request.endpoints:
