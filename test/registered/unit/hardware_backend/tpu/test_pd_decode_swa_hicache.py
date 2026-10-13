@@ -4,7 +4,8 @@ Decode backs up and restores full-attention KV through host RAM, and the SWA
 window always comes from the prefill transfer. Each wrapper is called with the
 real upstream function (or a fake where upstream needs a full server), so the
 tests pin both the full-only behavior and the pass-through to upstream for
-every other cache. Two tests drive a real unified tree: its host stack attach
+every other cache, except the restore hold, which every raiden PD decode cache
+gets. Two tests drive a real unified tree: its host stack attach
 and its locks.
 """
 
@@ -58,6 +59,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_swa_hicache as tpu
+from sglang_tpu.raiden_hybrid_cache_controller import TpuRaidenHybridCacheController
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
 BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
@@ -81,7 +83,9 @@ def installed_patches():
 
 
 def mark_full_only(cache):
+    # As the full-only host stack builder does.
     tpu._full_only_host_caches.add(cache)
+    tpu._restore_gated_caches.add(cache)
 
 
 def swa_receipt(*, node_id, swa_uuid):
@@ -720,6 +724,76 @@ class TestInflightLoadGate(CustomTestCase):
             upstream, other_controller, host_indices=torch.arange(64), node_id=4
         )
         self.assertNotIn(other_controller, tpu._load_device_pages)
+
+
+class TestDenseRestoreGate(CustomTestCase):
+    """Non-SWA models share the hazard: a restore publishes pages before they land."""
+
+    def dense_cache(self, controller_spec=TpuRaidenHybridCacheController):
+        cache = MagicMock(spec=UnifiedRadixCache)
+        cache.cache_controller = MagicMock(spec=controller_spec)
+        cache.cache_controller.page_size = 64
+        cache.page_size = 64
+        cache.ongoing_load_back = {}
+        return cache
+
+    def build(self, cache, **disagg_overrides):
+        with patch(TPU + ".get_disagg", return_value=disagg(**disagg_overrides)):
+            self.assertIs(
+                tpu._create_tree_cache(MagicMock(return_value=cache), make_ctx()),
+                cache,
+            )
+
+    def test_reuser_of_a_dense_restore_waits_for_the_ack(self):
+        cache = self.dense_cache()
+        self.build(cache)
+        queue = DecodeHiCacheTransferMixin()
+        queue.tree_cache = cache
+        tpu._controller_load(
+            MagicMock(return_value=torch.arange(64, 320)),
+            cache.cache_controller,
+            host_indices=torch.arange(256),
+            node_id=3,
+        )
+        cache.ongoing_load_back[3] = object()
+        reuser = TestInflightLoadGate.request(torch.arange(320))
+
+        def process():
+            tpu._process_hicache_local_restores(
+                DecodeHiCacheTransferMixin._process_hicache_local_restores,
+                queue,
+                [reuser],
+            )
+            return reuser.hicache_restore_status
+
+        self.assertEqual(process(), HiCacheRestoreResult.PENDING)
+        del cache.ongoing_load_back[3]
+        self.assertEqual(process(), HiCacheRestoreResult.READY)
+
+    def test_auxiliary_only_restore_is_not_tracked(self):
+        # A Mamba-state restore returns no KV pages; tracking it must not
+        # break the in-flight page mask for other requests.
+        cache = self.dense_cache()
+        self.build(cache)
+        tpu._controller_load(
+            MagicMock(return_value=torch.empty(0, dtype=torch.int64)),
+            cache.cache_controller,
+            host_indices=torch.empty(0, dtype=torch.int64),
+            node_id=4,
+        )
+        cache.ongoing_load_back[4] = object()
+        self.assertIsNone(tpu._inflight_page_mask(cache))
+
+    def test_only_raiden_decode_prefix_caches_are_gated(self):
+        for name, cache, overrides in (
+            ("prefill", self.dense_cache(), dict(mode="prefill")),
+            ("decode radix off", self.dense_cache(), dict(decode_radix=False)),
+            ("other controller", self.dense_cache(HybridCacheController), {}),
+        ):
+            with self.subTest(name):
+                self.build(cache, **overrides)
+                self.assertNotIn(cache, tpu._restore_gated_caches)
+                self.assertNotIn(cache.cache_controller, tpu._load_device_pages)
 
 
 class TestSwaMatchValidator(CustomTestCase):
