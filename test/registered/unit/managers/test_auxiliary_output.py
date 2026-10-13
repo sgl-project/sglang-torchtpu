@@ -751,6 +751,50 @@ def test_pipeline_parallel_dsa_seed_round_trip(dsa_topk_indices):
         assert torch.equal(batch.spec_info.dsa_topk_indices, dsa_topk_indices)
 
 
+def test_pipeline_wave_draft_state_reaches_the_device_and_relays_unchanged():
+    """The wave relays outputs on the host; draft state stashed into device
+    buffers must move to the batch's device, without changing what is relayed on."""
+    draft_input = EagleDraftInput(
+        topk_p=torch.tensor([[0.8, 0.2]]),
+        topk_index=torch.tensor([[11, 13]]),
+        hidden_states=torch.tensor([[1.0, 2.0]]),
+    )
+    result = GenerationBatchResult(
+        logits_output=None,
+        next_token_ids=torch.tensor([17]),
+        next_draft_input=draft_input,
+    )
+    batch = SimpleNamespace(
+        spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+        return_logprob=False,
+        req_pool_indices=torch.tensor([3]),
+        input_ids=torch.tensor([5]),
+        spec_info=None,
+        device="meta",
+    )
+    tensors = Scheduler._pp_prepare_tensor_dict(
+        object.__new__(Scheduler), result, batch
+    )
+    receiver = object.__new__(Scheduler)
+    receiver.pp_group = SimpleNamespace(is_first_rank=True)
+    receiver.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(sampling_observer=None)
+    )
+    receiver.future_map = SimpleNamespace(stash=Mock())
+    receiver._pp_wave = object()
+    relayed = PPProxyTensors(tensors)
+
+    Scheduler._pp_prep_batch_result(
+        receiver, batch, PPBatchMetadata(can_run_cuda_graph=True), relayed
+    )
+
+    payload = receiver.future_map.stash.call_args.args[1]
+    for value in (payload.bonus_tokens, payload.topk_p, payload.hidden_states):
+        assert value.device.type == "meta"
+    assert batch.spec_info.topk_index.device.type == "meta"
+    assert all(t.device.type == "cpu" for t in relayed.tensors.values())
+
+
 def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
     device_output = DeviceOutput(torch.tensor([1.0]))
     result = GenerationBatchResult(

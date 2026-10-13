@@ -19,8 +19,7 @@ import msgspec
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
@@ -62,21 +61,32 @@ def _kv_rank(tensor) -> int:
     return rank
 
 
+def pool_kind(tag: str) -> str:
+    return tag.rsplit(".l", 1)[0]
+
+
+def is_swa_pool(tag: str) -> bool:
+    return pool_kind(tag).endswith("swa")
+
+
 def pool_manifest(groups: Any) -> list[dict]:
     """Name each local full-attention or sliding-window tensor by model layer."""
     pools = []
-    for kind, tensors, layer_ids in (
-        ("fa", groups.full, groups.full_layer_ids),
-        ("swa", groups.swa, groups.swa_layer_ids),
+    for kind, tensors, layer_ids, num_draft in (
+        ("fa", groups.full, groups.full_layer_ids, groups.num_draft_full),
+        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa),
     ):
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")
-        for tensor, layer in zip(tensors, layer_ids):
+        num_target = len(tensors) - num_draft
+        for index, (tensor, layer) in enumerate(zip(tensors, layer_ids)):
+            # Draft layer IDs restart at 0, so they need their own namespace.
+            tag_kind = kind if index < num_target else f"draft.{kind}"
             _kv_rank(tensor)
             size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
             pools.append(
                 dict(
-                    tag=f"{kind}.l{int(layer)}",
+                    tag=f"{tag_kind}.l{int(layer)}",
                     storage_index=len(pools),
                     base_offset_bytes=0,
                     block_stride_bytes=size,
@@ -148,7 +158,9 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
             tiles=[[int(n) for n in tile] for tile in tiles],
             element_bits=int(bits or tensor.element_size() * 8),
         )
-        kind = pool["tag"].split(".l")[0]
+        # A draft page matches its target class, so a stage without the draft
+        # fingerprints like one with it.
+        kind = pool_kind(pool["tag"]).removeprefix("draft.")
         if kind in classes and classes[kind] != signature:
             raise ValueError(f"Raiden {kind} layers have differing page layouts")
         classes[kind] = signature
@@ -160,7 +172,7 @@ def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list
     """Describe whole pages in destination byte space for each locally owned layer."""
     result = []
     for pool in pools:
-        blocks = swa if pool["tag"].startswith("swa.") else full
+        blocks = swa if is_swa_pool(pool["tag"]) else full
         stride = pool["block_stride_bytes"]
         spans = [
             SimpleNamespace(
@@ -199,7 +211,7 @@ def head_slice_spans(
     page: one strided span per page and rank, routed to that rank only."""
     result = []
     for pool, tensor in zip(pools, tensors):
-        blocks = swa if pool["tag"].startswith("swa.") else full
+        blocks = swa if is_swa_pool(pool["tag"]) else full
         if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             result.append(
                 _head_major_slice_spans(
@@ -263,7 +275,7 @@ def destination_blocks(
     """Clip a cached prefix and omit the decode-only trailing token page."""
     tags, blocks, counts, skips = [], [], [], []
     for pool in pools:
-        is_swa = pool["tag"].startswith("swa.")
+        is_swa = is_swa_pool(pool["tag"])
         local = list(swa if is_swa else full)
         remote_count = source_swa_count if is_swa else source_full_count
         if len(local) > remote_count:
@@ -386,7 +398,7 @@ def part_spans(
     keep = [
         index
         for index, pool in enumerate(pools)
-        if with_swa or not pool["tag"].startswith("swa.")
+        if with_swa or not is_swa_pool(pool["tag"])
     ]
     pools = [pools[i] for i in keep]
     tensors = [tensors[i] for i in keep]
@@ -412,7 +424,7 @@ def part_destination_blocks(
     for pool in pools:
         if only_tags is not None and pool["tag"] not in only_tags:
             continue
-        is_swa = pool["tag"].startswith("swa.")
+        is_swa = is_swa_pool(pool["tag"])
         if is_swa and source_swa_count is None:
             continue
         if is_swa:
@@ -556,7 +568,7 @@ class PipelineTransfer:
 
         self.manager = manager
         self.producer = manager.disaggregation_mode == DisaggregationMode.PREFILL
-        self._check_support(raiden_service_pb2, groups)
+        self._check_support(raiden_service_pb2)
         self.hbm_mem_type = raiden_service_pb2.MEMORY_TYPE_HBM
         self.lock = threading.RLock()
         self.pools = pool_manifest(groups)
@@ -632,7 +644,7 @@ class PipelineTransfer:
             else None
         )
 
-    def _check_support(self, raiden_service_pb2, groups) -> None:
+    def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
         manager = self.manager
         if manager.attn_cp_size != 1:
@@ -646,19 +658,6 @@ class PipelineTransfer:
             raise ValueError(
                 "Raiden pipeline transfer takes attention TP>1 only on a decode "
                 "without pipeline stages"
-            )
-        # The transfer moves target-pool pages and the prefill's aux blob only.
-        # A decode can speculate if its draft keeps no pool of its own and needs
-        # no draft state from the prefill (e.g. NGRAM, or a plugin draft that
-        # writes into the target pool).
-        spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-        if spec.is_speculative() and (
-            self.producer or groups.has_draft_pool or spec.carries_draft_hidden_states()
-        ):
-            raise ValueError(
-                "Raiden pipeline transfer supports speculative decoding only on "
-                "the decode, without a separate draft KV pool or draft hidden "
-                "states from the prefill"
             )
         if (
             "wire_pool_indices"
@@ -713,7 +712,7 @@ class PipelineTransfer:
             options=dict(
                 staging_leases=slots,
                 staging_blocks_per_pool=[
-                    swa_blocks if p["tag"].startswith("swa.") else full_blocks
+                    swa_blocks if is_swa_pool(p["tag"]) else full_blocks
                     for p in self.pools
                 ],
             ),
@@ -1308,7 +1307,10 @@ class PipelineTransfer:
                 part["sources"][rank] = meta
             else:
                 request.sources[rank] = meta
-                self._write_aux(request, msg[3])
+                # A DP/TP decode hears every stage; only the last one holds the
+                # sampled token and the draft hidden states.
+                if mgr.pp_size > 1 or rank == pp_size - 1:
+                    self._write_aux(request, msg[3])
 
     def _write_aux(self, request, blob: bytes) -> None:
         mgr = self.manager

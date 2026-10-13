@@ -18,7 +18,10 @@ from sglang.srt.distributed import parallel_state
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pp_stage_chips, pp_stage_groups
-from sglang_tpu.hooks.pipeline_parallel import check_pipeline_parallel_compat
+from sglang_tpu.hooks.pipeline_parallel import (
+    check_pipeline_parallel_compat,
+    skip_spec_op_precompile_without_draft,
+)
 from sglang_tpu.pp_scheduler import _check_aux_capture_relay
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
@@ -271,6 +274,18 @@ class TestEagle3PipelineParallelCompat(CustomTestCase):
             check_pipeline_parallel_compat(
                 Mock(), _compat_cfg(enable_multi_layer_eagle=True)
             )
+
+    def test_stage_without_draft_skips_spec_op_precompile(self):
+        original = Mock()
+        scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=None))
+        skip_spec_op_precompile_without_draft(original, scheduler)
+        original.assert_not_called()
+
+    def test_stage_with_draft_precompiles_spec_ops(self):
+        original = Mock()
+        scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=object()))
+        skip_spec_op_precompile_without_draft(original, scheduler)
+        original.assert_called_once_with(scheduler)
 
     def test_model_without_relay_rejects_captures_before_the_last_stage(self):
         model = SimpleNamespace(

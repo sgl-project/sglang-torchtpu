@@ -1436,25 +1436,39 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        draft_state = {
+            key: pp_outputs[key]
+            for key in (
+                "draft_topk_p",
+                "draft_topk_index",
+                "draft_hidden_states",
+                "draft_dsa_topk_indices",
+            )
+            if key in pp_outputs.tensors
+        }
         if self._pp_wave is not None:
-            # The relayed outputs stay on the host; decode reads its input IDs
-            # from a device buffer.
+            # The relayed outputs stay on the host, and pp_outputs is relayed on
+            # as is; decode reads its input IDs and the draft state from device.
             next_token_ids = next_token_ids.to(batch.device, non_blocking=True)
+            draft_state = {
+                key: value.to(batch.device, non_blocking=True)
+                for key, value in draft_state.items()
+            }
 
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
         next_draft_input = None
-        if "draft_topk_p" in pp_outputs.tensors:
+        if "draft_topk_p" in draft_state:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
             next_draft_input = EagleDraftInput(
-                topk_p=pp_outputs["draft_topk_p"],
-                topk_index=pp_outputs["draft_topk_index"],
-                hidden_states=pp_outputs["draft_hidden_states"],
+                topk_p=draft_state["draft_topk_p"],
+                topk_index=draft_state["draft_topk_index"],
+                hidden_states=draft_state["draft_hidden_states"],
                 bonus_tokens=next_token_ids,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
-                dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
+                dsa_topk_indices=draft_state.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
         elif batch.spec_algorithm.is_dspark():

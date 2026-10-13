@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.pp_wave import PPWave, pipeline_permutation
+from sglang_tpu.pp_wave import PPAuxWave, PPWave, pipeline_permutation
 
 ROWS, HIDDEN = 8, 4
 
@@ -38,7 +38,9 @@ class _FakeIci:
         def launch(x):
             with self.cond:
                 k = self.count[rank]
-                self.sent[(k, rank)] = x.clone()
+                self.sent[(k, rank)] = (
+                    tuple(t.clone() for t in x) if isinstance(x, tuple) else x.clone()
+                )
                 self.count[rank] += 1
                 self.cond.notify_all()
                 ok = self.cond.wait_for(
@@ -58,15 +60,26 @@ class _FakeIci:
 
 
 def _wave(rank, size, ici=None, num_aux=0):
+    launcher = ici.launcher(rank) if ici else (lambda x: x)
+    if num_aux:
+        return PPAuxWave(
+            rank=rank,
+            size=size,
+            rows=ROWS,
+            hidden=HIDDEN,
+            num_aux=num_aux,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            launcher=launcher,
+        )
     return PPWave(
         rank=rank,
         size=size,
         rows=ROWS,
         hidden=HIDDEN,
-        num_aux=num_aux,
         dtype=torch.float32,
         device=torch.device("cpu"),
-        launcher=ici.launcher(rank) if ici else (lambda x: x),
+        launcher=launcher,
     )
 
 
@@ -381,8 +394,21 @@ class TestWaveAuxSlots(CustomTestCase):
             "residual": torch.zeros((ROWS, HIDDEN)),
             AUX_HIDDEN_STATES_PROXY_KEY: torch.zeros((ROWS, HIDDEN)),
         }
-        with self.assertRaisesRegex(ValueError, "carries 12 columns, got 8"):
-            wave._merge(tensors)
+        with self.assertRaisesRegex(ValueError, "carries 8 aux columns, got 4"):
+            wave.merge(tensors)
+
+    def test_received_pieces_are_their_own_buffers(self):
+        """torch_tpu hands a view of a shared buffer to an executable as the
+        buffer's base, so a piece sliced out of one hand-off buffer fails at the
+        first forward that reads it."""
+        wave = _wave(1, 3, num_aux=2)
+        wave.begin_iteration(True)
+        got = wave.receive()
+        for key, piece in got.items():
+            head = piece[: ROWS // 2]
+            self.assertTrue(head.is_contiguous(), key)
+            self.assertEqual(head.storage_offset(), 0, key)
+        self.assertEqual(got[AUX_HIDDEN_STATES_PROXY_KEY].shape, (ROWS, 2 * HIDDEN))
 
     def test_a_payload_without_the_aux_slots_is_rejected(self):
         wave = _wave(0, 3, num_aux=2)
@@ -391,7 +417,7 @@ class TestWaveAuxSlots(CustomTestCase):
             "residual": torch.zeros((ROWS, HIDDEN)),
         }
         with self.assertRaisesRegex(ValueError, "hands on exactly"):
-            wave._merge(tensors)
+            wave.merge(tensors)
 
 
 if __name__ == "__main__":

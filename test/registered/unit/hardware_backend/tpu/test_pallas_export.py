@@ -68,6 +68,59 @@ class TestPallasExportEnvironment(CustomTestCase):
                 register.call_args.kwargs["output_partition_specs"], (P(),)
             )
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_eagle3_wave_registers_only_the_pair_permute(self):
+        """The Eagle3 slots ride their own two-operand program; the single-operand
+        permute of the wave without them must stay unregistered."""
+        import torch
+        from jax.sharding import PartitionSpec as P
+
+        from sglang.test.cpu_test_utils import get_cpu_export_mesh
+        from sglang_tpu import pp_wave
+
+        mesh = get_cpu_export_mesh(("pp",), (4,), (3, 1, 0, 2))
+        group = SimpleNamespace(
+            rank_in_group=0, world_size=4, ranks=(2, 0, 3, 1), cpu_group=object()
+        )
+
+        def gather_verdicts(values, verdict, group):
+            values[:] = [verdict] * 4
+
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "4"}),
+            patch.object(pp_wave, "_OPS", {}),
+            patch.object(pp_wave, "_PAIR_OPS", {}),
+            patch.object(pp_wave.PPWave, "probe", return_value=True),
+            patch.object(
+                torch.distributed, "all_gather_object", side_effect=gather_verdicts
+            ),
+            patch("torch_tpu._internal.pallas.get_pallas_mesh", return_value=mesh),
+            patch("torch_tpu._internal.pallas.jax_op") as register,
+        ):
+            wave = pp_wave.build_pp_wave(
+                group,
+                stage_group=SimpleNamespace(rank_in_group=0, world_size=1, ranks=(2,)),
+                world_group=group,
+                rows=8,
+                hidden=16,
+                num_aux=3,
+                dtype=torch.float32,
+                device="cpu",
+            )
+            self.assertIsInstance(wave, pp_wave.PPAuxWave)
+            self.assertEqual(pp_wave._OPS, {})
+            self.assertEqual(list(pp_wave._PAIR_OPS), [(2, 0, 0, 3, 3, 1, 1, 2)])
+            register.assert_called_once()
+            self.assertEqual(
+                register.call_args.kwargs["input_partition_specs"], (P(), P())
+            )
+            self.assertEqual(
+                register.call_args.kwargs["output_partition_specs"], (P(), P())
+            )
+
     @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires TorchTPU")
     def test_mesh_builders_use_native_mesh_unchanged(self):
         from sglang_tpu import distributed_topk_pallas
