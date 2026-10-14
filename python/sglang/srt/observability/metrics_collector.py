@@ -966,14 +966,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()),
         )
-        self.prefill_swa_miss_reqs_total = Counter(
-            name="sglang:prefill_swa_miss_reqs_total",
-            documentation=(
-                "Admitted requests with at least one prefix token in "
-                "sglang:prefill_swa_miss_tokens_total."
-            ),
-            labelnames=list(labels.keys()),
-        )
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1395,11 +1387,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     **self.labels, mode=mode
                 ).inc(delta)
 
-    def increment_swa_miss(self, *, tokens: int, reqs: int) -> None:
-        # Zeros are incremented too, so both series exist once a cache that counts
+    def increment_swa_miss_tokens(self, tokens: int) -> None:
+        # Zeros are incremented too, so the series exists once a cache that counts
         # SWA misses has run a prefill batch; ratio panels rely on that.
         self.prefill_swa_miss_tokens_total.labels(**self.labels).inc(tokens)
-        self.prefill_swa_miss_reqs_total.labels(**self.labels).inc(reqs)
 
     def increment_forward_execution_seconds(
         self,

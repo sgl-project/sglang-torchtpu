@@ -105,7 +105,6 @@ class PrefillStats:
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
     log_swa_miss_tokens: int = 0
-    log_swa_miss_reqs: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
 
@@ -127,7 +126,6 @@ class PrefillStats:
             log_host_hit_tokens=adder.log_host_hit_tokens,
             log_storage_hit_tokens=adder.log_storage_hit_tokens,
             log_swa_miss_tokens=adder.log_swa_miss_tokens,
-            log_swa_miss_reqs=adder.log_swa_miss_reqs,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -817,9 +815,8 @@ class SchedulerMetricsReporter:
                 storage_hit_tokens=prefill_stats.log_storage_hit_tokens,
             )
             if self.scheduler.tree_cache.swa_is_only_match_cut():
-                self.metrics_collector.increment_swa_miss(
-                    tokens=prefill_stats.log_swa_miss_tokens,
-                    reqs=prefill_stats.log_swa_miss_reqs,
+                self.metrics_collector.increment_swa_miss_tokens(
+                    prefill_stats.log_swa_miss_tokens
                 )
 
             # Basics

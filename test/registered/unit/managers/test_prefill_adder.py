@@ -555,19 +555,12 @@ class TestPrefillAdder(CustomTestCase):
 
         adder._account_prefill_cache_admission(req, prefix_len=0)
         self.assertEqual(adder.log_swa_miss_tokens, 24)
-        self.assertEqual(adder.log_swa_miss_reqs, 1)
-
-        clean = self.create_mock_req("clean", priority=0, max_new_tokens=1)
-        clean.materialized_host_hit_len.return_value = 0
-        adder._account_prefill_cache_admission(clean, prefix_len=0)
-        self.assertEqual(adder.log_swa_miss_reqs, 1)
 
         retracted = self.create_mock_req("retracted", priority=0, max_new_tokens=1)
         retracted.swa_prefix_match = SwaPrefixMatch(full_kv_hit_length=16)
         retracted.retracted_stain = True
         adder._account_prefill_cache_admission(retracted, prefix_len=0)
         self.assertEqual(adder.log_swa_miss_tokens, 24)
-        self.assertEqual(adder.log_swa_miss_reqs, 1)
 
     def test_swa_miss_excludes_restored_and_declined_load_back(self):
         """Load-back that restores a missing window extends the admitted prefix, so
