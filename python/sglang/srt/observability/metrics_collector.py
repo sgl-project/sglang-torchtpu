@@ -162,6 +162,9 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    # Zero when the cache has no SWA host pool; the gauges are then not exported.
+    hicache_host_swa_used_tokens: int = 0
+    hicache_host_swa_total_tokens: int = 0
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -691,6 +694,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.hicache_host_total_tokens = Gauge(
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_swa_used_tokens = Gauge(
+                name="sglang:hicache_host_swa_used_tokens",
+                documentation="Number of tokens currently used in the host SWA KV cache.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_swa_total_tokens = Gauge(
+                name="sglang:hicache_host_swa_total_tokens",
+                documentation="Logical capacity of the host SWA KV cache in tokens; "
+                "on a page-envelope host backing the bytes are shared with full KV.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1516,6 +1532,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            if stats.hicache_host_swa_total_tokens > 0:
+                self._log_gauge(
+                    self.hicache_host_swa_used_tokens,
+                    stats.hicache_host_swa_used_tokens,
+                )
+                self._log_gauge(
+                    self.hicache_host_swa_total_tokens,
+                    stats.hicache_host_swa_total_tokens,
+                )
 
         # Streaming session metrics
         if self.enable_streaming_session:

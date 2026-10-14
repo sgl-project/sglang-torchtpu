@@ -651,6 +651,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
+    def swa_host_pool(self):
+        """The SWA host KV pool under HiCache, or None."""
+        return None
+
     def release_session(self, session_id: str) -> None:
         pass
 

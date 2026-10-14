@@ -3556,6 +3556,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_mamba(self) -> bool:
         return self.is_mamba_enabled
 
+    def swa_host_pool(self):
+        if not self.tree_core.has_swa_host_pool:
+            return None
+        return self.host_pool_group.get_pool(PoolName.SWA)
+
     # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
 
     def open_radix_session(self, session_id: str) -> Optional[int]:
