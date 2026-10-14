@@ -76,6 +76,7 @@ def get_pallas_kernel_sources() -> tuple[str, ...]:
         "dsa_indexer_tpu.py",
         "dsv4/sparsecore_topk.py",
         "dsv4/streamindex_topk",
+        "gptoss_decode_mk",
         "kernels",
         "pallas_export.py",
         "pallas_jax_op.py",

@@ -164,6 +164,7 @@ class TestTpuCompileCache(CustomTestCase):
                 package_root / "dsa_indexer_tpu.py",
                 package_root / "dsv4/sparsecore_topk.py",
                 package_root / "dsv4/streamindex_topk/kernel.py",
+                package_root / "gptoss_decode_mk/adapter.py",
                 package_root / "kernels/distributed_topk.py",
                 package_root / "kernels/kernel.py",
                 package_root / "pallas_export.py",

@@ -2017,6 +2017,22 @@ class Envs:
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
+    # Opt-in GPT-OSS TP8 decode megakernel on TPU (runs all 36 layers in one Pallas call).
+    SGLANG_TPU_GPTOSS_DECODE_MK = EnvBool(False)
+    SGLANG_TPU_GPTOSS_DECODE_MK_MOE = EnvStr("tp")
+    SGLANG_TPU_GPTOSS_DECODE_MK_KV_WRITE = EnvStr("layers")
+    SGLANG_TPU_GPTOSS_DECODE_MK_TIMING = EnvBool(False)
+    SGLANG_TPU_GPTOSS_DECODE_MK_ABLATE = EnvStr("")
+    SGLANG_TPU_GPTOSS_DECODE_MK_U32 = EnvBool(True)
+    SGLANG_TPU_GPTOSS_DECODE_MK_W_DTYPE = EnvStr("fp8")
+    SGLANG_TPU_GPTOSS_DECODE_MK_AR_MODE = EnvStr("")
+    SGLANG_TPU_GPTOSS_DECODE_MK_AR_FOLD = EnvStr("")
+    SGLANG_TPU_GPTOSS_DECODE_MK_NPB = EnvInt(None)
+    SGLANG_TPU_GPTOSS_DECODE_MK_NPB_SWA = EnvInt(None)
+    SGLANG_TPU_GPTOSS_DECODE_MK_KV_BUFS = EnvInt(None)
+    SGLANG_TPU_GPTOSS_DECODE_MK_W_SLOTS = EnvInt(None)
+    SGLANG_TPU_GPTOSS_DECODE_MK_VMEM_MIB = EnvInt(None)
+    SGLANG_TPU_GPTOSS_DECODE_MK_KERNEL_ABLATE = EnvStr("")
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
