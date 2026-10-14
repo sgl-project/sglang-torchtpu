@@ -89,7 +89,6 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
-    get_exec,
     get_parallel,
     get_platform,
 )
