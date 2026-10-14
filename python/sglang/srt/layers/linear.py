@@ -15,7 +15,6 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
-    split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_quant_all_reduce,
@@ -39,6 +38,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -1766,10 +1766,9 @@ class RowParallelLinear(LinearBase):
         if self.input_is_parallel:
             input_parallel = input_
         else:
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size
+            input_parallel = current_platform.slice_tensor_for_rank(
+                input_, -1, self.tp_size, self.tp_rank
             )
-            input_parallel = splitted_input[self.tp_rank].contiguous()
 
         # Matrix multiply.
         assert self.quant_method is not None

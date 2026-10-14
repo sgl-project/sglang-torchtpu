@@ -166,6 +166,17 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform consumes annotation-driven compile policies."""
         return False
 
+    def get_traced_rank(self, rank: int) -> torch.Tensor | None:
+        """Return the rank input inside a rank-parameterized compilation trace."""
+        return None
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        """Select one evenly divided tensor shard for this rank."""
+        assert tensor.shape[dim] % parts == 0
+        return tensor.split(tensor.shape[dim] // parts, dim=dim)[rank].contiguous()
+
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
