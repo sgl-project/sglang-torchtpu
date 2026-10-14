@@ -873,6 +873,7 @@ class Scheduler(
         try:
             load = self.load_inquirer.get_loads()
             writer.write(load)
+            self.publish_pd_health_metrics()
             return load
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
@@ -1688,6 +1689,18 @@ class Scheduler(
         if self.pd_health.version != self._pd_health_published_version:
             self._pd_health_published_version = self.pd_health.version
             self.publish_load_snapshot(force=True)
+
+    def publish_pd_health_metrics(self) -> None:
+        if self.pd_health is None or not self.metrics_reporter.enable_metrics:
+            return
+        snapshot = self.pd_health.snapshot()
+        self.metrics_collector.set_pd_health(
+            state=snapshot.state,
+            known_peers=snapshot.known_peers,
+            open_peers=snapshot.open_peers,
+            probation_wait_s=snapshot.probation_wait_s,
+            peer_open={p.peer: p.open for p in snapshot.peers},
+        )
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)

@@ -23,6 +23,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
+from sglang.srt.disaggregation.health import PDHealthState
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
@@ -582,6 +583,39 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:num_transfer_failed_reqs_total",
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
+        )
+        # Enum-style: 1 on the label of the current readiness state, 0 on the others.
+        self.pd_health_state = Gauge(
+            name="sglang:pd_health_state",
+            documentation="Decode readiness from real transfer outcomes; 1 on the current state label.",
+            labelnames=list(labels.keys()) + ["state"],
+            multiprocess_mode="mostrecent",
+        )
+        self.pd_health_known_peers = Gauge(
+            name="sglang:pd_health_known_peers",
+            documentation="Prefill peers this decode has exchanged transfers with (or the configured floor).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.pd_health_open_peers = Gauge(
+            name="sglang:pd_health_open_peers",
+            documentation="Peers whose transfers into this decode keep failing (circuit open).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        # One series per prefill address; bounded by the prefills a decode ever
+        # transferred with. 1 while that peer's circuit is open.
+        self.pd_health_peer_open = Gauge(
+            name="sglang:pd_health_peer_open",
+            documentation="1 while real transfers from this prefill peer keep failing into this decode.",
+            labelnames=list(labels.keys()) + ["peer"],
+            multiprocess_mode="mostrecent",
+        )
+        self.pd_health_probation_wait_seconds = Gauge(
+            name="sglang:pd_health_probation_wait_seconds",
+            documentation="Quiet time before an unhealthy decode is readmitted on probation.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
         self.num_prefill_retries_total = Counter(
             name="sglang:num_prefill_retries_total",
@@ -1232,6 +1266,29 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def set_pd_health(
+        self,
+        *,
+        state: str,
+        known_peers: int,
+        open_peers: int,
+        probation_wait_s: float,
+        peer_open: Mapping[str, bool],
+    ) -> None:
+        for candidate in PDHealthState:
+            self.pd_health_state.labels(**self.labels, state=candidate.value).set(
+                1 if candidate.value == state else 0
+            )
+        self.pd_health_known_peers.labels(**self.labels).set(known_peers)
+        self.pd_health_open_peers.labels(**self.labels).set(open_peers)
+        self.pd_health_probation_wait_seconds.labels(**self.labels).set(
+            probation_wait_s
+        )
+        for peer, is_open in peer_open.items():
+            self.pd_health_peer_open.labels(**self.labels, peer=peer).set(
+                1 if is_open else 0
+            )
 
     def increment_decode_host_receive_reqs(self) -> None:
         self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
