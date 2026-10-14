@@ -9,29 +9,35 @@ stays live when the scheduler or the detokenizer stops.
 from __future__ import annotations
 
 import weakref
+from collections import Counter
 from typing import Optional
 
 from fastapi import Request
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang_tpu.disaggregation.health_generate import (
     PDHealthState,
+    PDPeerHealth,
     PDProgressHealth,
     build_pd_health_tracker,
+    build_pd_peer_tracker,
 )
 
 HEALTH_GENERATE_PATH = "/health_generate"
 
 
 class _HttpHealth:
-    """One tokenizer manager's tracker and in-flight rids."""
+    """One tokenizer manager's trackers, in-flight rids and their peers."""
 
-    __slots__ = ("tracker", "in_flight")
+    __slots__ = ("tracker", "peers", "in_flight", "rid_peer")
 
-    def __init__(self, tracker: PDProgressHealth):
+    def __init__(self, tracker: PDProgressHealth, peers: Optional[PDPeerHealth] = None):
         self.tracker = tracker
+        self.peers = peers
         self.in_flight: set[str] = set()
+        self.rid_peer: dict[str, str] = {}
 
 
 _STATE: weakref.WeakKeyDictionary[object, _HttpHealth] = weakref.WeakKeyDictionary()
@@ -51,7 +57,7 @@ def attach_tracker(tokenizer_manager) -> None:
     tracker = build_pd_health_tracker(mode.value)
     if tracker is None:
         return
-    _STATE[tokenizer_manager] = _HttpHealth(tracker)
+    _STATE[tokenizer_manager] = _HttpHealth(tracker, build_pd_peer_tracker(mode.value))
     install_health_generate_route()
 
 
@@ -62,6 +68,26 @@ def _observe(tokenizer_manager, state: _HttpHealth) -> None:
     # Rids whose state core dropped (finish, cancel, disconnect) stop being outstanding.
     state.in_flight.intersection_update(tokenizer_manager.rid_to_state)
     state.tracker.observe(len(state.in_flight))
+    if state.peers is not None:
+        for rid in list(state.rid_peer):
+            if rid not in state.in_flight:
+                del state.rid_peer[rid]
+        state.peers.observe(Counter(state.rid_peer.values()))
+
+
+def _peer_of(tokenizer_manager, rid: str) -> Optional[str]:
+    """The prefill this decode request pairs with, as the router stamped it."""
+    req_state = tokenizer_manager.rid_to_state.get(rid)
+    if req_state is None or not isinstance(req_state.obj, GenerateReqInput):
+        return None
+    host, port = req_state.obj.bootstrap_host, req_state.obj.bootstrap_port
+    if isinstance(host, list):
+        host = host[0] if host else None
+    if isinstance(port, list):
+        port = port[0] if port else None
+    if host is None:
+        return None
+    return f"{host}:{port}" if port is not None else str(host)
 
 
 def track_dispatched(tokenizer_manager, rid: str) -> None:
@@ -70,6 +96,10 @@ def track_dispatched(tokenizer_manager, rid: str) -> None:
     if state is None or rid.startswith(HEALTH_CHECK_RID_PREFIX):
         return
     state.in_flight.add(rid)
+    if state.peers is not None:
+        peer = _peer_of(tokenizer_manager, rid)
+        if peer is not None:
+            state.rid_peer[rid] = peer
     _observe(tokenizer_manager, state)
 
 
@@ -86,13 +116,18 @@ def track_outputs(tokenizer_manager, recv_obj) -> None:
         touched = True
         if finish_reason is not None:
             state.in_flight.discard(rid)
+        peer = state.rid_peer.get(rid) if state.peers is not None else None
         if finish_reason is not None and finish_reason.get("type") == "abort":
             state.tracker.record_failure()
+            if peer is not None:
+                state.peers.record_failure(peer)
         elif finish_reason is not None or decode:
             # A decode streams a chunk per generated token; a prefill's only
             # output is its final one, sent after the KV release that follows
             # a completed transfer.
             state.tracker.record_progress()
+            if peer is not None:
+                state.peers.record_progress(peer)
     if touched:
         _observe(tokenizer_manager, state)
 
@@ -112,23 +147,31 @@ def track_cancelled(tokenizer_manager, *, rid: str, abort_all: bool) -> None:
 # ----- the /health_generate route -----
 
 
-def health_response(tracker: PDProgressHealth):
-    """503 with the record when unhealthy, else a bare 200: no probe request."""
+def health_response(tracker: PDProgressHealth, peers: Optional[PDPeerHealth] = None):
+    """503 with the records when the engine or its peers are unhealthy, else a
+    bare 200: no probe request."""
     import orjson
     from fastapi.responses import ORJSONResponse, Response
 
-    if tracker.health_state() == PDHealthState.UNHEALTHY.value:
-        record = orjson.loads(tracker.health_json())
-        return ORJSONResponse(
-            status_code=503,
-            content={
-                "role": record.get("role"),
-                "state": PDHealthState.UNHEALTHY.value,
-                "reason": record.get("reason"),
-                "pd_health": record,
-            },
-        )
-    return Response(status_code=200)
+    engine_unhealthy = tracker.health_state() == PDHealthState.UNHEALTHY.value
+    peers_unhealthy = (
+        peers is not None and peers.health_state() == PDHealthState.UNHEALTHY.value
+    )
+    if not engine_unhealthy and not peers_unhealthy:
+        return Response(status_code=200)
+    record = orjson.loads(tracker.health_json())
+    peer_record = orjson.loads(peers.health_json()) if peers is not None else None
+    reason = record["reason"] if engine_unhealthy else peer_record["reason"]
+    return ORJSONResponse(
+        status_code=503,
+        content={
+            "role": record.get("role"),
+            "state": PDHealthState.UNHEALTHY.value,
+            "reason": reason,
+            "pd_health": record,
+            "pd_peers": peer_record,
+        },
+    )
 
 
 # Unannotated, FastAPI would read ``request`` as a required query field (422).
@@ -146,7 +189,7 @@ async def health_generate_with_tracker(request: Request):
         return Response(status_code=503)
     if tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
-    return health_response(state.tracker)
+    return health_response(state.tracker, state.peers)
 
 
 def install_health_generate_route() -> bool:

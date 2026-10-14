@@ -20,6 +20,7 @@ from fastapi import Request
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints import http_server
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,8 +30,10 @@ from sglang_tpu.disaggregation.health_generate import (
     PDHealthConfig,
     PDHealthSnapshot,
     PDHealthState,
+    PDPeerHealth,
     PDProgressHealth,
     build_pd_health_tracker,
+    build_pd_peer_tracker,
 )
 from sglang_tpu.envs import envs as tpu_envs
 
@@ -382,8 +385,13 @@ def _attached(role=DisaggregationMode.DECODE):
     return tm, clock
 
 
-def _state():
-    return SimpleNamespace(finished=False)
+def _state(peer=None):
+    """A ReqState double; ``peer`` is the prefill the router stamped on the request."""
+    obj = None
+    if peer is not None:
+        host, _, port = peer.partition(":")
+        obj = GenerateReqInput(text="x", bootstrap_host=host, bootstrap_port=int(port))
+    return SimpleNamespace(finished=False, obj=obj)
 
 
 def _outputs(*pairs):
@@ -632,6 +640,309 @@ class TestBookkeeping(CustomTestCase):
         clock.advance(CFG.window_s)
         hg._observe(tm, hg.state_of(tm))
         self.assertEqual(tracker.health_state(), "unhealthy")
+
+
+# ---------------------------------------------------------------------------
+# Per-peer judgement on a decode
+# ---------------------------------------------------------------------------
+
+P1, P2, P3 = "10.0.0.1:8998", "10.0.0.2:8998", "10.0.0.3:8998"
+
+
+def _peers(ratio=0.5, streak=3, peer_min=1):
+    clock = _Clock()
+    cfg = PDHealthConfig(
+        window_s=100.0,
+        cold_window_s=250.0,
+        peer_failure_ratio=ratio,
+        peer_failure_streak=streak,
+        peer_min=peer_min,
+    )
+    return PDPeerHealth(config=cfg, clock=clock), clock
+
+
+def _fail(peers, peer, n):
+    for _ in range(n):
+        peers.record_failure(peer)
+
+
+class TestPeers(CustomTestCase):
+    def test_no_peers_is_ready(self):
+        peers, _ = _peers()
+        self.assertEqual(peers.health_state(), "ready")
+        self.assertEqual(peers.snapshot().active_peers, 0)
+
+    def test_one_abort_is_noise_but_a_streak_marks_the_peer_failing(self):
+        peers, _ = _peers(streak=3)
+        _fail(peers, P1, 2)
+        self.assertEqual(peers.snapshot().peers[0].state, "ok")
+        _fail(peers, P1, 1)
+        snap = peers.snapshot()
+        self.assertEqual(
+            (snap.peers[0].state, snap.peers[0].failure_streak), ("failing", 3)
+        )
+
+    def test_a_success_resets_the_streak(self):
+        peers, _ = _peers(streak=3)
+        _fail(peers, P1, 2)
+        peers.record_progress(P1)
+        _fail(peers, P1, 2)
+        self.assertEqual(peers.snapshot().peers[0].state, "ok")
+
+    def test_ratio_of_failing_peers_decides(self):
+        peers, _ = _peers(ratio=0.5)
+        peers.record_progress(P1)
+        peers.record_progress(P2)
+        peers.record_progress(P3)
+        _fail(peers, P1, 3)
+        self.assertEqual(peers.health_state(), "ready", "1 of 3 is under 50%")
+        _fail(peers, P2, 3)
+        self.assertEqual(peers.health_state(), "unhealthy", "2 of 3 reaches 50%")
+        snap = peers.snapshot()
+        self.assertEqual((snap.active_peers, snap.failing_peers), (3, 2))
+        self.assertIn(
+            "peers failing: 2 of 3 active (threshold 50%, 3 aborts in a row or 100s in flight with nothing back): 10.0.0.1:8998, 10.0.0.2:8998",
+            snap.reason,
+        )
+
+    def test_threshold_is_inclusive_and_configurable(self):
+        peers, _ = _peers(ratio=1.0)
+        peers.record_progress(P1)
+        _fail(peers, P2, 3)
+        self.assertEqual(peers.health_state(), "ready", "1 of 2 is under 100%")
+        _fail(peers, P1, 3)
+        self.assertEqual(peers.health_state(), "unhealthy")
+
+    def test_single_peer_pair_trips_on_its_own_streak(self):
+        peers, _ = _peers(ratio=0.5, peer_min=1)
+        _fail(peers, P1, 3)
+        self.assertEqual(peers.health_state(), "unhealthy")
+
+    def test_peer_min_withholds_judgement_on_too_few_peers(self):
+        peers, _ = _peers(ratio=0.5, peer_min=2)
+        _fail(peers, P1, 3)
+        self.assertEqual(peers.health_state(), "ready")
+        peers.record_progress(P2)
+        self.assertEqual(peers.health_state(), "unhealthy", "1 of 2 reaches 50%")
+
+    def test_idle_peers_age_out_of_the_active_set(self):
+        peers, clock = _peers()
+        _fail(peers, P1, 3)
+        peers.record_progress(P2)
+        clock.advance(100)
+        self.assertEqual(peers.snapshot().active_peers, 0)
+        self.assertEqual(peers.health_state(), "ready")
+        peers.observe({P1: 1})  # in flight keeps a peer active past the window
+        self.assertEqual(peers.snapshot().active_peers, 1)
+
+    def test_a_failing_peers_last_abort_ages_out(self):
+        peers, clock = _peers()
+        _fail(peers, P1, 3)
+        clock.advance(99)
+        peers.observe({P1: 1})  # a fresh request keeps the peer active
+        self.assertEqual(peers.snapshot().peers[0].state, "failing")
+        clock.advance(1)
+        self.assertEqual(peers.snapshot().peers[0].state, "ok", "abort aged out")
+        self.assertEqual(peers.health_state(), "ready")
+
+    def test_requests_stuck_in_flight_for_a_window_mark_the_peer_failing(self):
+        """Live finding: requests to a broken prefill hung until the client gave up,
+        so no abort was ever recorded and the peer's streak aged out while its
+        requests were still stuck."""
+        peers, clock = _peers()
+        peers.record_progress(P2)
+        peers.observe({P1: 4})
+        clock.advance(99)
+        peers.observe({P1: 4})
+        self.assertEqual(peers.snapshot().peers[0].state, "ok")
+        clock.advance(1)
+        self.assertEqual(peers.snapshot().peers[0].state, "failing")
+        self.assertEqual(peers.health_state(), "unhealthy", "1 of 2 reaches 50%")
+        peers.record_progress(P1)  # something came back from it
+        self.assertEqual(peers.snapshot().peers[0].state, "ok")
+        peers.observe({})  # drained: the in-flight clock resets
+        clock.advance(100)
+        peers.observe({P1: 1})
+        self.assertEqual(peers.snapshot().peers[0].state, "ok", "fresh window")
+
+    def test_ratio_zero_turns_the_rule_off(self):
+        peers, _ = _peers(ratio=0.0)
+        _fail(peers, P1, 10)
+        self.assertEqual(peers.health_state(), "ready")
+
+    def test_snapshot_lists_active_peers_with_their_facts(self):
+        peers, clock = _peers()
+        peers.record_progress(P1)
+        clock.advance(7)
+        _fail(peers, P2, 1)
+        peers.observe({P2: 2})
+        snap = peers.snapshot()
+        self.assertEqual([p.peer for p in snap.peers], [P1, P2])
+        self.assertEqual(
+            (snap.peers[0].last_progress_age_s, snap.peers[0].in_flight), (7.0, 0)
+        )
+        self.assertEqual(
+            (
+                snap.peers[1].last_failure_age_s,
+                snap.peers[1].in_flight,
+                snap.peers[1].failure_streak,
+            ),
+            (0.0, 2, 1),
+        )
+        self.assertEqual(json_roundtrip(snap)["failure_ratio"], 0.5)
+
+    def test_invalid_config_is_rejected(self):
+        for kw in (
+            {"peer_failure_ratio": 1.5},
+            {"peer_failure_streak": 0},
+            {"peer_min": 0},
+        ):
+            with self.assertRaises(ValueError):
+                PDHealthConfig(window_s=1.0, cold_window_s=1.0, **kw).validate()
+
+    def test_build_is_decode_only_and_honours_the_knobs(self):
+        self.assertIsNone(build_pd_peer_tracker("prefill"))
+        self.assertIsNotNone(build_pd_peer_tracker("decode"))
+        with tpu_envs.SGLANG_TPU_PD_HEALTH_PEER_FAILURE_RATIO.override(0.0):
+            self.assertIsNone(build_pd_peer_tracker("decode"))
+        with tpu_envs.SGLANG_TPU_PD_HEALTH_READINESS_ENABLED.override(False):
+            self.assertIsNone(build_pd_peer_tracker("decode"))
+        with (
+            tpu_envs.SGLANG_TPU_PD_HEALTH_PEER_FAILURE_RATIO.override(0.75),
+            tpu_envs.SGLANG_TPU_PD_HEALTH_PEER_FAILURE_STREAK.override(5),
+            tpu_envs.SGLANG_TPU_PD_HEALTH_PEER_MIN.override(2),
+        ):
+            cfg = build_pd_peer_tracker("decode").config
+        self.assertEqual(
+            (cfg.peer_failure_ratio, cfg.peer_failure_streak, cfg.peer_min),
+            (0.75, 5, 2),
+        )
+
+
+def json_roundtrip(snap):
+    return msgspec.json.decode(snap.to_json())
+
+
+def _attached_with_peers(role=DisaggregationMode.DECODE):
+    tm = _tm(role)
+    clock = _Clock()
+    cfg = PDHealthConfig(window_s=100.0, cold_window_s=250.0, peer_failure_streak=2)
+    hg._STATE[tm] = hg._HttpHealth(
+        PDProgressHealth(config=CFG, clock=clock, role=role.value),
+        PDPeerHealth(config=cfg, clock=clock),
+    )
+    return tm, clock
+
+
+class TestPeerBookkeeping(CustomTestCase):
+    def test_dispatch_attributes_the_request_to_the_router_stamped_prefill(self):
+        tm, clock = _attached_with_peers()
+        tm.rid_to_state = {
+            "a": _state(P1),
+            "b": _state(P1),
+            "c": _state(P2),
+            "p": _state(None),
+        }
+        for rid in "abcp":
+            hg.track_dispatched(tm, rid)
+        peers = hg.state_of(tm).peers
+        snap = peers.snapshot()
+        self.assertEqual({p.peer: p.in_flight for p in snap.peers}, {P1: 2, P2: 1})
+        self.assertEqual(hg.state_of(tm).rid_peer, {"a": P1, "b": P1, "c": P2})
+
+    def test_outcomes_land_on_the_right_peer(self):
+        tm, clock = _attached_with_peers()
+        tm.rid_to_state = {r: _state(P1 if r in "ab" else P2) for r in "abcd"}
+        for rid in "abcd":
+            hg.track_dispatched(tm, rid)
+        hg.track_outputs(
+            tm, _outputs(("a", ABORT), ("b", ABORT), ("c", None), ("d", LENGTH))
+        )
+        snap = hg.state_of(tm).peers.snapshot()
+        by = {p.peer: p for p in snap.peers}
+        self.assertEqual(
+            (by[P1].state, by[P1].failure_streak, by[P1].in_flight), ("failing", 2, 0)
+        )
+        self.assertEqual(
+            (by[P2].state, by[P2].failure_streak, by[P2].in_flight), ("ok", 0, 1)
+        )
+        self.assertEqual(hg.state_of(tm).rid_peer, {"c": P2})
+
+    def test_cancel_and_vanished_state_drop_the_peer_mapping(self):
+        tm, clock = _attached_with_peers()
+        tm.rid_to_state = {"a": _state(P1), "b": _state(P2)}
+        hg.track_dispatched(tm, "a")
+        hg.track_dispatched(tm, "b")
+        hg.track_cancelled(tm, rid="a", abort_all=False)
+        del tm.rid_to_state["b"]
+        hg.track_outputs(tm, _outputs(("b", None)))  # any tracked event re-syncs
+        self.assertEqual(hg.state_of(tm).rid_peer, {})
+        self.assertEqual(
+            sum(p.in_flight for p in hg.state_of(tm).peers.snapshot().peers), 0
+        )
+
+    def test_prefill_has_no_peer_tracker(self):
+        tm = _tm(DisaggregationMode.PREFILL)
+        with patch.object(hg, "install_health_generate_route", lambda: True):
+            hg.attach_tracker(tm)
+        self.assertIsNone(hg.state_of(tm).peers)
+        tm.rid_to_state = {"a": _state(P1)}
+        hg.track_dispatched(tm, "a")  # must not touch peers
+        self.assertEqual(hg.state_of(tm).rid_peer, {})
+
+    def test_decode_gets_a_peer_tracker_by_default(self):
+        tm = _tm(DisaggregationMode.DECODE)
+        with patch.object(hg, "install_health_generate_route", lambda: True):
+            hg.attach_tracker(tm)
+        self.assertIsNotNone(hg.state_of(tm).peers)
+
+    def test_failing_peers_give_503_while_the_engine_rule_is_still_ready(self):
+        """Two prefills, one broken: the engine still produces, so the stall rule
+        is ready; the peer rule says half the peers are failing."""
+        tm, clock = _attached_with_peers()
+        tm.rid_to_state = {r: _state(P1 if r in "ab" else P2) for r in "abcd"}
+        for rid in "abcd":
+            hg.track_dispatched(tm, rid)
+        hg.track_outputs(
+            tm, _outputs(("a", ABORT), ("b", ABORT), ("c", LENGTH), ("d", LENGTH))
+        )
+        state = hg.state_of(tm)
+        self.assertEqual(state.tracker.health_state(), "ready")
+        response = hg.health_response(state.tracker, state.peers)
+        self.assertEqual(response.status_code, 503)
+        body = msgspec.json.decode(response.body)
+        self.assertIn("peers failing: 1 of 2 active", body["reason"])
+        self.assertEqual(body["pd_health"]["state"], "ready")
+        self.assertEqual(body["pd_peers"]["failing_peers"], 1)
+        self.assertEqual(
+            [p["peer"] for p in body["pd_peers"]["peers"] if p["state"] == "failing"],
+            [P1],
+        )
+
+    def test_engine_rule_reason_comes_first_when_both_trip(self):
+        tm, clock = _attached_with_peers()
+        tm.rid_to_state = {"a": _state(P1)}
+        hg.track_dispatched(tm, "a")
+        clock.advance(CFG.cold_window_s)
+        hg._observe(tm, hg.state_of(tm))
+        state = hg.state_of(tm)
+        body = msgspec.json.decode(hg.health_response(state.tracker, state.peers).body)
+        self.assertIn("stalled: 1 requests held", body["reason"])
+        self.assertEqual(
+            body["pd_peers"]["state"], "unhealthy", "the peer is stalled too"
+        )
+        self.assertEqual(body["pd_peers"]["peers"][0]["state"], "failing")
+
+    def test_response_without_a_peer_tracker_carries_null_peers(self):
+        tm, clock = _attached(DisaggregationMode.PREFILL)
+        tm.rid_to_state = {"a": _state()}
+        hg.track_dispatched(tm, "a")
+        clock.advance(CFG.cold_window_s)
+        hg._observe(tm, hg.state_of(tm))
+        body = msgspec.json.decode(
+            hg.health_response(hg.state_of(tm).tracker, None).body
+        )
+        self.assertIsNone(body["pd_peers"])
 
 
 # ---------------------------------------------------------------------------

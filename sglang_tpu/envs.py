@@ -8,7 +8,7 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat
+from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -27,6 +27,13 @@ class TpuEnvs:
     SGLANG_TPU_PD_HEALTH_READINESS_ENABLED = EnvBool(True)
     SGLANG_TPU_PD_HEALTH_WINDOW_S = EnvFloat(600.0)
     SGLANG_TPU_PD_HEALTH_COLD_WINDOW_S = EnvFloat(1200.0)
+    # Per-peer judgement on a decode: a prefill peer is failing after STREAK
+    # consecutive engine aborts of its requests with no success in between;
+    # the decode is unhealthy once failing peers reach RATIO of the peers active
+    # within the window, with at least MIN active. RATIO 0 turns it off.
+    SGLANG_TPU_PD_HEALTH_PEER_FAILURE_RATIO = EnvFloat(0.5)
+    SGLANG_TPU_PD_HEALTH_PEER_FAILURE_STREAK = EnvInt(3)
+    SGLANG_TPU_PD_HEALTH_PEER_MIN = EnvInt(1)
 
     @classmethod
     def names(cls) -> list[str]:
