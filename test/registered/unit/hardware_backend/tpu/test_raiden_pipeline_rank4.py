@@ -19,7 +19,12 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 def _groups(full, swa, full_ids, swa_ids):
     return SimpleNamespace(
-        full=full, swa=swa, full_layer_ids=full_ids, swa_layer_ids=swa_ids
+        full=full,
+        swa=swa,
+        full_layer_ids=full_ids,
+        swa_layer_ids=swa_ids,
+        num_draft_full=0,
+        num_draft_swa=0,
     )
 
 

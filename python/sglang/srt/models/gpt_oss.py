@@ -791,6 +791,11 @@ class GptOssModel(nn.Module):
                 aux_hidden_states.append(
                     residual_batch.snapshot(hidden_states, forward_batch)
                 )
+        if self.pp_group.is_first_rank:
+            # A single stage owns every capture; keep the per-layer list.
+            if len(aux_hidden_states) == 0:
+                return hidden_states
+            return hidden_states, aux_hidden_states
         if self.layers_to_capture:
             aux_buffer = self._relay_aux_hidden_states(
                 aux_buffer, aux_hidden_states, hidden_states

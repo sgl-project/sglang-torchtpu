@@ -156,6 +156,7 @@ class TestWaveRows(CustomTestCase):
                 compile_policy=compile_policy,
                 model_config=SimpleNamespace(context_len=4096, hidden_size=16),
                 spec_aux_config=SimpleNamespace(eagle_use_aux_hidden_state=False),
+                model=SimpleNamespace(),
                 dtype=torch.bfloat16,
                 device="cpu",
             )

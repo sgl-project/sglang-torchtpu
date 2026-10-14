@@ -77,6 +77,7 @@ def _model_runner(pp_group=None):
         model_config=SimpleNamespace(model_is_mrope=False, hidden_size=_HIDDEN),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        spec_aux_config=SimpleNamespace(eagle_use_aux_hidden_state=False),
         server_args=SimpleNamespace(page_size=1, dp_size=1, disaggregation_mode="null"),
         prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )

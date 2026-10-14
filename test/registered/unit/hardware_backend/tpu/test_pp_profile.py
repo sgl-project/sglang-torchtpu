@@ -34,6 +34,8 @@ def _policy(table=None):
             vocab_size=128, hidden_size=8, dtype=torch.float32, context_len=48
         ),
         dtype=torch.bfloat16,
+        model=SimpleNamespace(),
+        spec_aux_config=SimpleNamespace(eagle_use_aux_hidden_state=False),
     )
     return SimpleNamespace(model_runner=runner, _dummy_kv_slot=lambda: 0), slots
 
