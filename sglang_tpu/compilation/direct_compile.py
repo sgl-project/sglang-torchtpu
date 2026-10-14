@@ -20,6 +20,7 @@ from torch._dynamo.utils import dynamo_timed
 from torch.nn.utils.stateless import _reparametrize_module
 from torch_tpu._internal import execution_mode
 from torch_tpu._internal.compile import tpu_torch_compile
+from torch_tpu._internal.sync.sync import synchronize
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -285,6 +286,24 @@ class CompiledFunction:
         self, *args: Any, async_compile: bool = False, **kwargs: Any
     ) -> PendingCall:
         """Compile without executing the helper or retaining example inputs."""
+        if async_compile:
+            tensors = [
+                value
+                for value in tree_util.tree_leaves((args, kwargs))
+                if _is_tpu_tensor(value)
+            ]
+            if tensors:
+                # Submit eager input preparation without waiting for buffers.
+                # Symbolic arguments keep layout queries from blocking compilation.
+                synchronize(tensors, wait=False)
+                args, kwargs = tree_util.tree_map(
+                    lambda value: (
+                        tpu_torch_compile.placeholder_like(value)
+                        if _is_tpu_tensor(value)
+                        else value
+                    ),
+                    (args, kwargs),
+                )
         artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
         return PendingCall(artifact.wait_for_compile)
 
