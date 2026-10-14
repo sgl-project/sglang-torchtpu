@@ -212,6 +212,7 @@ class MhcOps(NamedTuple):
     mhc_pre: Optional[Callable[..., Any]]
     mhc_post: Optional[Callable[..., Any]]
     fused_hc_head: Optional[Callable[..., Any]]
+    hc_combine: Optional[Callable[..., Any]] = None
 
 
 @functools.cache
@@ -233,6 +234,8 @@ def _get_mhc_ops() -> MhcOps:
             mhc_pre,
         )
 
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
+
         return MhcOps(
             hc_split_sinkhorn=hc_split_sinkhorn,
             mhc_fused_post_pre=mhc_fused_post_pre,
@@ -240,22 +243,41 @@ def _get_mhc_ops() -> MhcOps:
             mhc_pre=mhc_pre,
             mhc_post=hc_post,
             fused_hc_head=fused_hc_head,
+            hc_combine=hc_combine,
         )
 
     from sglang.kernels.ops.layernorm.mhc import (
         _hc_split_sinkhorn_torch,
+        hc_combine,
         hc_split_sinkhorn,
         mhc_fused_post_pre,
         npu_hc_pre,
     )
+    from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+    if not (_is_cuda or _is_hip or _is_npu):
+        return MhcOps(
+            hc_split_sinkhorn=_hc_split_sinkhorn_torch,
+            mhc_fused_post_pre=None,
+            npu_hc_pre=None,
+            mhc_pre=None,
+            mhc_post=None,
+            fused_hc_head=hc_head_torch,
+            hc_combine=lambda x_flat, pre, hc_mult, out_dtype: (
+                (x_flat.unflatten(-1, (hc_mult, -1)).float() * pre.unsqueeze(-1))
+                .sum(dim=-2)
+                .to(out_dtype)
+            ),
+        )
 
     return MhcOps(
-        hc_split_sinkhorn=_hc_split_sinkhorn_torch if _is_tpu else hc_split_sinkhorn,
+        hc_split_sinkhorn=hc_split_sinkhorn,
         mhc_fused_post_pre=mhc_fused_post_pre,
         npu_hc_pre=npu_hc_pre,
         mhc_pre=None,
         mhc_post=None,
-        fused_hc_head=None,
+        fused_hc_head=fused_hc_head,
+        hc_combine=hc_combine,
     )
 
 
@@ -2009,6 +2031,10 @@ class MQALayer(MqaAttentionBase):
             kv = None
             if q_out is not None:
                 q_out.copy_(q)
+        elif hasattr(attn_backend, "prepare_mqa_qkv"):
+            q_lora, q, kv = attn_backend.prepare_mqa_qkv(
+                self, x_linear, q_lora, qkv_a, positions, q_out
+            )
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip:
@@ -2474,6 +2500,8 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
+            elif hasattr(attn_backend, "apply_mqa_inv_rope"):
+                o = attn_backend.apply_mqa_inv_rope(self, o, positions)
             elif inv_rope is None and not fuse_rope_wo_a:
                 # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(
@@ -3012,19 +3040,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        if _is_tpu:
-            y = (
-                (
-                    x_flat.unflatten(-1, (self.hc_mult, -1)).float()
-                    * pre.squeeze(1).unsqueeze(-1)
-                )
-                .sum(dim=-2)
-                .to(dtype)
-            )
-            return y, post.squeeze(1), comb.squeeze(1), False
-
-        from sglang.kernels.ops.layernorm.mhc import hc_combine
-
         # y is the post-norm activation fed into the MoE. Allocate it in the
         # symmetric memory pool so the downstream all-reduce uses the low-latency
         # NCCL symmetric path: the Triton inplace MoE runner writes the expert
@@ -3034,7 +3049,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
-            y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
+            y = _get_mhc_ops().hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
@@ -3921,9 +3936,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         # all_reduce. tp_size==attn_dp_size required so the global buffer splits
         # evenly into per-rank chunks.
         _use_reduce_scatter = (
-            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
-            and _use_tp_moe_gather
+            _use_tp_moe_gather
             and not _use_reduce_scatterv
+            and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
             and not should_use_dp_reduce_scatterv()
             and forward_batch.dp_padding_mode is not None
             and forward_batch.dp_padding_mode.is_max_len()
@@ -4457,19 +4472,8 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        if x.numel() > 0 and not _is_tpu:
-            if _is_xpu:
-                return _get_mhc_ops().fused_hc_head(
-                    x.contiguous(),
-                    hc_fn,
-                    hc_scale,
-                    hc_base,
-                    norm_eps=self.norm_eps,
-                    hc_eps=self.hc_eps,
-                )
-            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
-
-            return fused_hc_head(
+        if x.numel() > 0:
+            return _get_mhc_ops().fused_hc_head(
                 x.contiguous(),
                 hc_fn,
                 hc_scale,

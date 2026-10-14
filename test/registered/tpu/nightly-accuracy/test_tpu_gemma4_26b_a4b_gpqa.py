@@ -19,8 +19,9 @@ MODEL_PATH = GEMMA4_26B_A4B["served_model_name"]
 GATE = {
     "dataset": "gpqa",
     "label": "gpqa_diamond",
+    "baseline": 0.786,  # measured on TPU
+    "atol": 0.1,
     "runner": make_runner(GEMMA4_26B_A4B, "gpqa", n_repeats=4),
-    "report_only": True,
 }
 
 

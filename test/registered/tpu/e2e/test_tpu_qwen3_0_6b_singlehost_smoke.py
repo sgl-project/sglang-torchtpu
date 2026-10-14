@@ -22,7 +22,12 @@ register_tpu_ci(
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "qwen3-0.6b", "smoke"],
 )
-register_tpu_ci(est_time=300, suite="external-nightly-1host", nightly=True)
+register_tpu_ci(
+    est_time=300,
+    suite="external-nightly-1host",
+    nightly=True,
+    labels=["singlehost", "qwen3-0.6b", "smoke"],
+)
 
 MODEL = "Qwen/Qwen3-0.6B"
 

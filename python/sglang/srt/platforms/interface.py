@@ -12,6 +12,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
@@ -47,6 +48,24 @@ class SRTPlatform(DeviceMixin):
         """Apply platform-specific default values to server arguments.
 
         Called after ServerArgs is parsed.
+        """
+        pass
+
+    supports_mamba_extra_buffer: bool = False
+
+    def supports_mamba_prefix_cache(self, model_config) -> bool:
+        """Whether this model's recurrent backend can reuse prefix checkpoints.
+
+        Called for models with recurrent state. Preserve the shared cache
+        behavior by default; plugins may restrict their supported backends.
+        """
+        return True
+
+    def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
+        """Validate platform-specific recurrent prefix-cache constraints.
+
+        ``hf_config`` is provided for extra-buffer strategies. The default
+        adds no restrictions to the shared backend validation.
         """
         pass
 
@@ -98,6 +117,15 @@ class SRTPlatform(DeviceMixin):
         from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 
         return get_mha_host_pool_cls(device_pool)
+
+    def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
+        """Scope host-pool construction for an explicit HiCache ratio or size.
+
+        The context covers target and draft pools. By default, each host pool
+        performs its own admission check; platforms may share a budget instead.
+        Automatic sizing manages its own budget and does not call this hook.
+        """
+        return nullcontext()
 
     def get_mamba_pool_cls(self) -> type:
         """Return the recurrent (GDN / mamba) state pool class for this platform."""
@@ -225,6 +253,14 @@ class SRTPlatform(DeviceMixin):
         a forward (the server warmup request has drained). Platforms that
         compile ahead of serving freeze or monitor compilation here."""
         pass
+
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return a monotonic platform compilation-cache miss counter.
+
+        A platform may return ``None`` when its runtime exposes no such
+        counter. Implementations should not synchronize device execution.
+        """
+        return None
 
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
     # entry until the seam PR merges upstream.

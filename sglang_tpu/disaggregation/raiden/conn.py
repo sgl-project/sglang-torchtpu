@@ -28,7 +28,17 @@ import math
 import os
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -74,6 +84,9 @@ from sglang_tpu.disaggregation.raiden.serde import (
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 
+if TYPE_CHECKING:
+    from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
+
 # Re-exported so that "from …raiden.conn import X" keeps resolving for the
 # callers and tests that predate the split into common/sender/receiver.
 __all__ = [
@@ -88,6 +101,25 @@ __all__ = [
     "get_raiden_kv_caches",
     "logger",
 ]
+
+
+def _describe_failure(
+    *, side: Literal["send", "receive"], transfer: SettledTransfer
+) -> str:
+    """Why raiden failed ``transfer``, in raiden's field names, leaving out the
+    fields it did not report."""
+    parts = [f"Raiden {side} failed: req_id={transfer.req_id}"]
+    if transfer.code is not None:
+        parts.append(f"code={transfer.code}")
+    if transfer.phase is not None:
+        parts.append(f"phase={transfer.phase}")
+    if transfer.peer is not None:
+        parts.append(f"peer={transfer.peer}")
+    if transfer.elapsed_ns is not None:
+        parts.append(f"elapsed_ms={transfer.elapsed_ns / 1e6:.1f}")
+    if transfer.reason is not None:
+        parts.append(f"reason={transfer.reason}")
+    return " ".join(parts)
 
 
 class RaidenKVManager(
@@ -510,6 +542,14 @@ class RaidenKVManager(
     def _swa_req_id(room: int) -> str:
         return f"swa:{room}"
 
+    @classmethod
+    def _room_of(cls, rid: str) -> Optional[int]:
+        """The room of a whole ("<room>"), sliding-window ("swa:<room>") or
+        chunk ("<room>#<k>") transfer id, resharded or not; None for any other
+        id."""
+        room = cls._norm_req_id(rid).removeprefix("swa:").partition("#")[0]
+        return int(room) if room.isdecimal() else None
+
     @staticmethod
     def _tail_after(blocks: List[int], announced: int) -> Tuple[int, List[int]]:
         """Pages the closing message of a chunked transfer still has to move.
@@ -560,6 +600,9 @@ class RaidenKVManager(
                     superseded -= norm_failed
                     self._native_failed.update(real_failed)
                     self._failed.update(real_failed)
+                    failures, later_failures = self._record_native_failures_locked(
+                        t for t in failed if self._norm_req_id(t.req_id) in real_failed
+                    )
                     self._release_pull_slots_locked()
                     self._settle_sender_reads_locked()
                     settled_plans = self._settled_cleared_plans_locked()
@@ -569,11 +612,13 @@ class RaidenKVManager(
                     sent=[self._norm_req_id(t.req_id) for t in done_send],
                     received=[self._norm_req_id(t.req_id) for t in done_recv],
                 )
-                if real_failed:
+                for failure in failures:
                     logger.error(
-                        "RaidenKVManager rank%d failed=%s",
-                        self.attn_tp_rank,
-                        real_failed,
+                        "RaidenKVManager rank%d %s", self.attn_tp_rank, failure
+                    )
+                for failure in later_failures:
+                    logger.debug(
+                        "RaidenKVManager rank%d %s", self.attn_tp_rank, failure
                     )
         with self._state_lock:
             settled_stale = [e for e in self._stale_plans if e[2].is_ready()]
@@ -581,6 +626,35 @@ class RaidenKVManager(
                 self._stale_plans.remove(entry)
         for uuid, _room, _fut in settled_stale:
             self._unregister_plan(uuid)
+
+    def _record_native_failures_locked(
+        self, failed: Iterable[SettledTransfer]
+    ) -> Tuple[List[str], List[str]]:
+        """Describe each transfer raiden failed, and record each room's
+        earliest description as its failure reason, unless the room was
+        cleared: a later request reusing the room id would adopt the record.
+        Returns the rooms' earliest descriptions, then their later ones."""
+        side = "send" if self._prefill is not None else "receive"
+        earliest: Dict[int | str, str] = {}
+        later = []
+        # A room's later failures may only be symptoms of its first one.
+        ordered = sorted(
+            failed, key=lambda t: (t.completed_ns is None, t.completed_ns or 0)
+        )
+        for transfer in ordered:
+            failure = _describe_failure(side=side, transfer=transfer)
+            room = self._room_of(transfer.req_id)
+            key = transfer.req_id if room is None else room
+            if key in earliest:
+                later.append(failure)
+                continue
+            earliest[key] = failure
+            with self._status_lock:
+                live = room is not None and room in self.request_status
+            if live:
+                with self.failure_lock:
+                    self.failure_records.setdefault(room, failure)
+        return list(earliest.values()), later
 
     def _log_settled_transfers(
         self, *, sent: Iterable[str], received: Iterable[str]
@@ -725,6 +799,20 @@ class RaidenKVManager(
         else:
             self.record_failure(room, reason)
         self._failed.add(str(room))
+
+    def _fail_room_unless_failed_locked(self, room: int, reason: str) -> None:
+        """Fail ``room`` for a local abort or a peer rank's failure, keeping
+        the reason of any failure that came first. A failed pipeline transfer
+        has no recorded reason, and the prefill drops the room's ``_failed``
+        ids right after this call, so such a room gets the reason
+        ``failure_exception`` would fall back to."""
+        if self._is_failed_locked(room):
+            reason = (
+                "Raiden send failed"
+                if self._prefill is not None
+                else "Raiden receive failed"
+            )
+        self._fail_room_locked(room, reason, preserve_reason=True)
 
     def _handle_node_failure(self, failed_bootstrap_addr: str) -> None:
         """Fail the rooms of a prefill the heartbeat declared down and close

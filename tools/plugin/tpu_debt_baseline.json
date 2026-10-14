@@ -21,6 +21,7 @@
     "python/sglang/srt/layers/logits_processor.py": 11,
     "python/sglang/srt/layers/moe/fused_moe_triton/layer.py": 3,
     "python/sglang/srt/layers/moe/hash_topk.py": 6,
+    "python/sglang/srt/layers/moe/mhc_post_fusion.py": 3,
     "python/sglang/srt/layers/moe/token_dispatcher/standard.py": 3,
     "python/sglang/srt/layers/moe/topk.py": 12,
     "python/sglang/srt/layers/moe/utils.py": 4,

@@ -19,7 +19,19 @@ from bench_matrix_base import build_matrix_test
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=5400, suite="external-nightly-2x2x2", nightly=True)
+register_tpu_ci(
+    est_time=5400,
+    suite="external-nightly-2x2x2",
+    nightly=True,
+    labels=[
+        "multihost",
+        "qwen3-coder-480b",
+        "perf",
+        "prefix-cache",
+        "spec",
+        "kv-offload",
+    ],
+)
 
 MULTIHOST_LAUNCH = {
     "launch_script": "recipe/bench_matrix/qwen3_coder_480b_1host_pc_spec_kvoff.sh",

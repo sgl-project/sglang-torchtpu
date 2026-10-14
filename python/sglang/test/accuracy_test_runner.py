@@ -636,7 +636,8 @@ def run_accuracy_test(
         score = metrics.get("mean_score")
     if score is None:
         score = metrics.get("accuracy")
-    if params.report_only and score is None:
+    # A graded gate with no score must not reach the dashboard as a 0.0.
+    if score is None and (params.report_only or params.floor is not None):
         error = f"{params.name}: eval completed without a numeric score"
         print(f"✗ {error}")
         return AccuracyTestResult(

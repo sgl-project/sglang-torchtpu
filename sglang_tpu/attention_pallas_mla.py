@@ -331,15 +331,12 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             k_scale = None
             v_scale = None
 
-        # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
-        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
-
         return (
             ql_nope,
             q_pe,
             new_kv_c,
             new_k_pe,
-            kv_cache,
+            *self._kv_cache_buffers(layer.layer_id),
             self.forward_metadata.kv_lens,
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -349,3 +346,11 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             k_scale,
             v_scale,
         )
+
+    def _kv_cache_buffers(self, layer_id: int) -> tuple:
+        """The layer's KV cache buffers, in the order the op takes them.
+
+        The sparse backend overrides this: its pool has two buffers per layer.
+        """
+        # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
+        return (self.token_to_kv_pool.get_fused_kv_buffer(layer_id),)

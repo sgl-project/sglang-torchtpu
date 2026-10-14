@@ -27,6 +27,15 @@ register_tpu_ci(
     suite="external-nightly-2x2x4",
     nightly=True,
     disabled="raiden P/D terminalization deadlock: one failed KV transfer parks its request forever (the decode withholds KVPoll.Failed while the room still counts active IO), so the leg hangs at the tail and the mini-LB never answers; re-enable once the deadlock is fixed",
+    labels=[
+        "multihost",
+        "gpt-oss-120b",
+        "perf",
+        "pd",
+        "prefix-cache",
+        "spec",
+        "kv-offload",
+    ],
 )
 
 MULTIHOST_LAUNCH = {

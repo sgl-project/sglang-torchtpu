@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     supports_mamba_cache_extra_buffer,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ def handle_int8_mamba_checkpoint(server_args: Any):
 
 def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
 
+    current_platform.validate_mamba_prefix_cache(view, hf_config)
     assert supports_mamba_cache_extra_buffer(view, hf_config), (
         f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     )
@@ -109,7 +111,8 @@ def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_
         or get_platform().is_npu
         or get_platform().is_hip
         or get_platform().is_xpu
-    ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
+        or current_platform.supports_mamba_extra_buffer
+    ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU/TPU."
     if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
         # The PD-disagg decode pool is not wired for lazy slots.
         assert view.disaggregation_mode == "null", (
@@ -144,6 +147,7 @@ def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_
 
 
 def validate_mamba_no_buffer(view, model_arch: str):
+    current_platform.validate_mamba_prefix_cache(view)
     assert view.page_size in (1, None), "no_buffer only supports page_size=1."
     assert view.disable_overlap_schedule, (
         "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."

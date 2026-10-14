@@ -36,6 +36,9 @@ from sglang.srt.compilation.support_torch_compile import (
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.core_compile_annotations import (
+    annotate_core_compile_boundaries,
+)
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
@@ -209,6 +212,9 @@ class TpuGraphRunner:
 
         # TODO: Move policy discovery and installation into a reusable compile
         # runner when a second platform adopts support_torch_compile metadata.
+        # Core classes whose TPU policy the plugin declares (core cannot import
+        # sglang_tpu) get it here, so the discovery below sees them.
+        annotate_core_compile_boundaries()
         modules = (
             self.model.modules()
             if callable(getattr(self.model, "modules", None))

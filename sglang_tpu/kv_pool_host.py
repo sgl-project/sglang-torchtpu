@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -70,10 +71,8 @@ class TpuRaidenHostKVCache(HostKVCache):
             raise NotImplementedError(
                 "MTP draft KV offload is not supported on the TPU raiden path."
             )
-        # Deliberately do NOT call ``HostKVCache.__init__``: it allocates a
-        # torch host buffer via ``init_kv_buffer`` and does a psutil RAM check.
-        # raiden owns (and bounds-checks) the host pool, so we only replicate
-        # the sizing math here, then build the transfer engine.
+        # Raiden owns the DMA-pinned storage, so skip the base allocator setup
+        # but retain its sizing and host-memory admission check.
         self.device_pool = device_pool
         self.pool_label = pool_label
         self.page_size = page_size
@@ -105,6 +104,22 @@ class TpuRaidenHostKVCache(HostKVCache):
                 self.size,
                 device_pool.size,
             )
+
+        requested_bytes = self.size * self.size_per_token
+        available_bytes = host_memory_budget_bytes(requested_bytes)
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
+        logger.info(
+            "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+            pool_label,
+            self.size,
+            requested_bytes / 1e9,
+        )
 
         from sglang_tpu.raiden_transfer import RaidenKVTransfer
 

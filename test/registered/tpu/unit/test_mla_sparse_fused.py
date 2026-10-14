@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compares the sparse MLA step with the dense MLA v2 kernel on TPU.
 
-``pallas_tpu_mla_sparse`` uses the same forward code, metadata and fused FP8
-pool as ``pallas_tpu_mla``. Only the kernel behind the op is different. So the
-tests give both kernels the same step and check that:
+``pallas_tpu_mla_sparse`` uses the same forward code and metadata as
+``pallas_tpu_mla``. The kernel behind the op is different, and so is the cache
+layout: two buffers per layer instead of one fused buffer. So the tests give
+both kernels the same step, each in its own layout, and check that:
 
 * ``sparse_mla_attention_fused`` returns the same output as
   ``mla_ragged_paged_attention``, and
@@ -74,7 +75,11 @@ _MEAN_ABS_DIFF = 0.003
 
 
 class _Step(msgspec.Struct, frozen=True):
-    """One padded serving step on the fused cache, and the cache it must leave."""
+    """Inputs for one step and the cache it must leave.
+
+    The caches are stored in the fused layout, which the dense kernel reads
+    directly. ``_split`` converts one to the two buffers the sparse step reads.
+    """
 
     num_active_tokens: int
     k_scale: float
@@ -187,6 +192,33 @@ def _build_step(
     )
 
 
+def _records(cache_fused):
+    """Token records ``u8[num_tokens, 640]`` of a fused cache."""
+    return np.asarray(cache_fused).view(np.uint8).reshape(-1, _TOKEN_BYTES)
+
+
+def _split(cache_fused):
+    """The NoPE and RoPE buffers that hold a fused cache's tokens."""
+    records = _records(cache_fused)
+    return (
+        # NoPE: u8[num_pages, page_size, 4, 128], 512 bytes per token.
+        jnp.asarray(records[:, :NOPE_DIM].reshape(-1, _PAGE_SIZE, 4, 128)),
+        # RoPE: u8[num_pages, page_size // 4, 4, 128], 128 bytes per token.
+        jnp.asarray(records[:, NOPE_DIM:].reshape(-1, _PAGE_SIZE // 4, 4, 128)),
+    )
+
+
+def _merge(cache_nope, cache_rope):
+    """Token records ``u8[num_tokens, 640]`` of a split cache."""
+    return np.concatenate(
+        [
+            np.asarray(cache_nope).reshape(-1, NOPE_DIM),
+            np.asarray(cache_rope).reshape(-1, _TOKEN_BYTES - NOPE_DIM),
+        ],
+        axis=-1,
+    )
+
+
 def _causal_rows(step):
     """Top-k rows that select every key each token may attend to.
 
@@ -203,10 +235,9 @@ def _causal_rows(step):
     return rows
 
 
-def _stored_tokens(cache, rows):
+def _stored_tokens(records, rows):
     """The nope and rope bytes of ``rows``, without the padding either kernel
     is free to leave as it likes."""
-    records = np.asarray(cache).view(np.uint8).reshape(-1, _TOKEN_BYTES)
     return records[rows, : NOPE_DIM + ROPE_DIM]
 
 
@@ -243,28 +274,28 @@ class TestSparseMlaFused(CustomTestCase):
             # which is an approximation of its own and four times this gap.
             p_same_dtype_as_v=False,
         )
-        sparse_out, sparse_cache = sparse_mla_attention_fused(
+        sparse_out, cache_nope, cache_rope = sparse_mla_attention_fused(
             *new_tokens,
-            jnp.asarray(step.cache_before),
+            *_split(step.cache_before),
             *metadata,
             distribution,
             jnp.asarray(_causal_rows(step)),
             sm_scale=_SM_SCALE,
             k_scale=step.k_scale,
         )
-        dense_out, dense_cache, sparse_out, sparse_cache = jax.block_until_ready(
-            (dense_out, dense_cache, sparse_out, sparse_cache)
+        dense_out, dense_cache, sparse_out, cache_nope, cache_rope = (
+            jax.block_until_ready(
+                (dense_out, dense_cache, sparse_out, cache_nope, cache_rope)
+            )
         )
+        sparse_records = _merge(cache_nope, cache_rope)
 
         # Nothing outside the active tokens moves, padded rows included.
-        np.testing.assert_array_equal(
-            np.asarray(sparse_cache).view(np.uint8),
-            step.cache_after.view(np.uint8),
-        )
+        np.testing.assert_array_equal(sparse_records, _records(step.cache_after))
         # Both kernels leave the same tokens behind for the next step to read.
         np.testing.assert_array_equal(
-            _stored_tokens(sparse_cache, step.live_rows),
-            _stored_tokens(dense_cache, step.live_rows),
+            _stored_tokens(sparse_records, step.live_rows),
+            _stored_tokens(_records(dense_cache), step.live_rows),
         )
         self.assertEqual(sparse_out.shape, dense_out.shape)
         active = slice(0, step.num_active_tokens)

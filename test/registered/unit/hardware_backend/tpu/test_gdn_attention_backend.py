@@ -29,13 +29,10 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 import importlib.util
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-    MambaAttnBackendBase,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
@@ -116,19 +113,20 @@ class TestGDNSinglePassFlags(CustomTestCase):
             conv=[torch.zeros(bs + 1, k - 1, 1, dim)],
             temporal=torch.zeros(bs + 1, n_v, d, d),
         )
-        backend.req_to_token_pool = SimpleNamespace(mamba2_layer_cache=lambda _: cache)
-
-        def base_init(self, forward_batch):
-            self.forward_metadata = SimpleNamespace(
-                mamba_cache_indices=torch.arange(1, bs + 1),
-                query_start_loc=torch.arange(bs + 1),
-            )
-
-        batch = SimpleNamespace(
-            seq_lens=torch.full((bs,), 5), forward_mode=forward_mode
+        backend._extra_buffer_enabled = False
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba2_layer_cache=lambda _: cache,
+            get_mamba_indices=lambda indices: indices,
+            translate_mamba_indices=lambda indices: indices,
         )
-        with patch.object(MambaAttnBackendBase, "init_forward_metadata", base_init):
-            backend.init_forward_metadata(batch)
+        batch = SimpleNamespace(
+            seq_lens=torch.full((bs,), 5),
+            forward_mode=forward_mode,
+            req_pool_indices=torch.arange(1, bs + 1),
+            extend_seq_lens=torch.ones(bs, dtype=torch.int64),
+            mamba_track_mask=None,
+        )
+        backend.init_forward_metadata(batch)
         layer = SimpleNamespace(
             layer_id=0,
             conv_weights=torch.zeros(dim, k),

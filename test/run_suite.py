@@ -244,7 +244,6 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gemma4-31b",
         "nightly-tpu-perf-gemma4-26b-a4b",
         "nightly-tpu-perf-qwen3-5-397b",
-        "nightly-perf-tpu",
         # One suite per quality eval so each gets an independent TPU slice.
         "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gemma4-31b-aime",
@@ -258,6 +257,13 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
         "nightly-tpu-accuracy-gpt-oss-120b-mmlupro",
+        # External tpu7x cluster (nightly-test-external-tpu.yml; see
+        # .github/tpu-ci/external/README.md). 1host: single-host tests that launch
+        # their own server. 2x2x2 / 2x2x4: multi-host jobs wired by hand in
+        # external-topology.yaml, including the bench matrix.
+        "external-nightly-1host",
+        "external-nightly-2x2x2",
+        "external-nightly-2x2x4",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",
@@ -269,6 +275,12 @@ NIGHTLY_SUITES = {
 
 
 OTHER_SUITES = {
+    # Hand-wired jobs (`files:` / `cmd:`) that no generic suite runner launches:
+    # P/D gates and exec-mode probes in external-topology.yaml,
+    # feature-validation-tpu.yml and combo-test-tpu.yml.
+    HWBackend.TPU: [
+        "tpu-integration",
+    ],
     HWBackend.CPU: [
         "default",
         # `stage="weekly"`, dispatched by weekly-test-cpu.yml.
@@ -297,6 +309,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MLX,
     HWBackend.MPS,
     HWBackend.PPU,
+    HWBackend.TPU,
 }
 
 
@@ -309,6 +322,20 @@ def _valid_suites_by_backend() -> dict:
                 result[backend] = set()
             result[backend].update(suites)
     return result
+
+
+def registered_test_files() -> List[str]:
+    """Every registered test file under test/registered/, as collect_tests sees them."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return [
+        f
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
+    ]
 
 
 def validate_all_suites(all_tests: List[CIRegistry]):
@@ -438,16 +465,7 @@ def run_a_suite(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
 
-    # Registered tests under test/registered/
-    files = [
-        f
-        for f in glob.glob(
-            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
-        )
-        # conftest.py / __init__.py are pytest+package structure, never
-        # registered tests, and must not be executed as one.
-        if os.path.basename(f) not in ("conftest.py", "__init__.py")
-    ]
+    files = registered_test_files()
 
     # Strict: all discovered files must have proper registration
     sanity_check = True

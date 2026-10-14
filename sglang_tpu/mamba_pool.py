@@ -201,6 +201,12 @@ class TpuMambaPool(MambaPool):
             self.mem_usage,
         )
 
+    @property
+    def slot_allocator_device(self):
+        # Allocation, radix ownership and COW pair collection are host work.
+        # Keeping IDs here avoids variable-size TPU casts/pads and host readbacks.
+        return "cpu"
+
     def clear_slots(self, indices: torch.Tensor):
         """No-op on TPU.
 
@@ -213,12 +219,70 @@ class TpuMambaPool(MambaPool):
         """
         return
 
+    def _copy_states(self):
+        return [
+            state
+            for states in [*self.mamba_cache.conv, self.mamba_cache.temporal]
+            for state in states
+        ]
+
+    @torch.no_grad()
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
-        raise NotImplementedError(
-            "Recurrent-state copy-on-write (radix/prefix cache) is not "
-            "supported on TPU yet. Radix cache is auto-disabled for hybrid "
-            "GDN models on TPU (see kv_cache_builder.build_kv_cache); reaching "
-            "here means prefix caching was force-enabled for this pool."
+        if src_indices.numel() == 0:
+            return
+        states = self._copy_states()
+        if states[0].device.type == "cpu":
+            # CPU reference for layout and allocator tests.
+            for state in states:
+                state.index_copy_(
+                    0, dst_indices.long(), state.index_select(0, src_indices.long())
+                )
+            return
+        from sglang_tpu.mamba_state_copy import (
+            compiled_state_copy,
+            copy_bucket_size,
+        )
+
+        # The allocator and radix tree retain authoritative CPU IDs. Never read
+        # device IDs back here: only bucketed int32 tensors cross to the TPU.
+        if src_indices.device.type != "cpu" or dst_indices.device.type != "cpu":
+            raise ValueError("TPU state copies require CPU allocator slot IDs")
+        count = src_indices.numel()
+        padding = copy_bucket_size(count) - count
+        src = torch.nn.functional.pad(src_indices.to(torch.int32), (0, padding))
+        dst = torch.nn.functional.pad(dst_indices.to(torch.int32), (0, padding))
+        copy_count = torch.tensor([count], dtype=torch.int32, device=self.device)
+        compiled_state_copy()(
+            states, src.to(self.device), dst.to(self.device), copy_count
+        )
+
+    @torch.no_grad()
+    def warmup_state_copy(self, max_requests: int):
+        if getattr(self, "_state_copy_warmed", False):
+            return
+        from torch_tpu._internal.sync.sync import synchronize
+
+        from sglang_tpu.mamba_state_copy import (
+            compiled_state_copy,
+            copy_bucket_size,
+        )
+
+        states = self._copy_states()
+        # Pool initialization must finish before its buffers are first donated.
+        synchronize(states, wait=True)
+        size = 8
+        copy_count = torch.zeros(1, dtype=torch.int32, device=self.device)
+        while size <= copy_bucket_size(max_requests):
+            # Distinct tensors avoid Dynamo's src-is-dst specialization.
+            src = torch.zeros(size, dtype=torch.int32, device=self.device)
+            dst = torch.zeros(size, dtype=torch.int32, device=self.device)
+            compiled_state_copy()(states, src, dst, copy_count)
+            size *= 4
+        synchronize(states, wait=True)
+        self._state_copy_warmed = True
+        logger.info(
+            "TPU Mamba state copies warmed through bucket %d",
+            copy_bucket_size(max_requests),
         )
 
     # The four below are inherited from MambaPool, which indexes the layer axis

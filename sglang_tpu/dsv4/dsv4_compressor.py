@@ -24,18 +24,14 @@ requires evaluated type objects rather than stringified annotations.
 
 from typing import Optional
 
-import jax
 import torch
 
 from sglang.srt.runtime_context import get_exec
-from sglang_tpu.dsv4.compress_and_store.compressor_v1 import (
-    compressor_forward,
-)
 from sglang_tpu.dsv4.dsv4_memory_pool import (
     DSV4TPUTokenToKVPool,
     TPUCompressStatePool,
+    get_or_build_cos_sin_cache,
 )
-from sglang_tpu.dsv4.rope import get_or_build_cos_sin_cache
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 _CSA_OP_NAME = "sglang_tpu_pallas::dsv4_compressor_csa"
@@ -88,7 +84,12 @@ def _register_csa_compressor_op():
     if _csa_custom_op is not None:
         return _csa_custom_op
 
+    import jax
     from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.dsv4.compress_and_store.compressor_v1 import (
+        compressor_forward,
+    )
 
     _exported_shapes = set()
 
@@ -263,7 +264,12 @@ def _register_csa_compressor_op():
 
 
 def _make_two_buffer_compressor_op(op_name: str, jax_name: str):
+    import jax
     from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.dsv4.compress_and_store.compressor_v1 import (
+        compressor_forward,
+    )
 
     _exported_shapes = set()
 

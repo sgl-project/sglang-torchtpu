@@ -154,6 +154,8 @@ def direct_compile(
 
     ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
     Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
+    ``CompiledFunction.precompile`` only compiles; waiting on its result never
+    executes the graph or retains its example runtime inputs.
 
     This API is specialized for SGLang inference. A more general API adds
     complexity and can be added when needed.
@@ -278,6 +280,13 @@ class CompiledFunction:
     def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
         artifact = self._get_artifact(args, kwargs, async_compile=True)
         return PendingCall(lambda: artifact((args, kwargs)))
+
+    def precompile(
+        self, *args: Any, async_compile: bool = False, **kwargs: Any
+    ) -> PendingCall:
+        """Compile without executing the helper or retaining example inputs."""
+        artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
+        return PendingCall(artifact.wait_for_compile)
 
     def _get_artifact(
         self,
@@ -591,7 +600,7 @@ class _CompiledArtifact:
     pending_compile: Any | None = None
     rng_device: torch.device | None = None
 
-    def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+    def wait_for_compile(self) -> None:
         if self.pending_compile is not None:
             start = time.perf_counter()
             self.executable = self.pending_compile.get()
@@ -600,6 +609,9 @@ class _CompiledArtifact:
                 "[direct_compile] native async resolution %.3fs",
                 time.perf_counter() - start,
             )
+
+    def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+        self.wait_for_compile()
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.

@@ -16,7 +16,11 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
-register_tpu_ci(est_time=550, suite="stage-b-test-tpu-4-v7")
+register_tpu_ci(
+    est_time=550,
+    suite="stage-b-test-tpu-4-v7",
+    labels=["singlehost", "gpt-oss-20b", "spec", "dpa"],
+)
 
 SERVED_MODEL_NAME = "gpt-oss-20b"
 MODEL_PATH = resolve_tpu_model_path("openai/gpt-oss-20b")

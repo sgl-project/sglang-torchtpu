@@ -18,40 +18,21 @@
 
 import dataclasses
 import functools
-from typing import Dict, Tuple
 
 import jax
 import jax.numpy as jnp
-import torch
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from sglang_tpu.dsv4.dsv4_memory_pool import (  # noqa: F401
+    _COS_SIN_CACHE,
+    get_or_build_cos_sin_cache,
+)
 
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
-
-# Cache of `[max_pos, rope_head_dim]` float32 cos_sin tables derived from
-# complex64 `freqs_cis`, keyed by `(id(freqs_cis), freqs_cis.device)`.
-_COS_SIN_CACHE: Dict[Tuple[int, torch.device], torch.Tensor] = {}
-
-
-def get_or_build_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Convert complex64 ``freqs_cis`` ``[max_pos, rope_head_dim // 2]`` into the
-    contiguous ``float32`` ``[max_pos, rope_head_dim]`` ``[cos, sin]`` table
-    consumed by the TPU Pallas compressor and RoPE kernels."""
-    key = (id(freqs_cis), freqs_cis.device)
-    cached = _COS_SIN_CACHE.get(key)
-    if cached is not None:
-        return cached
-    real_imag = torch.view_as_real(freqs_cis)
-    cos_sin = (
-        torch.cat([real_imag[..., 0], real_imag[..., 1]], dim=-1)
-        .to(dtype=torch.float32, device=freqs_cis.device)
-        .contiguous()
-    )
-    _COS_SIN_CACHE[key] = cos_sin
-    return cos_sin
 
 
 def dtype_max(dtype: jnp.dtype) -> float:

@@ -980,15 +980,24 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
         )
 
 
-class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
-    """The fused MLA KV pool, plus the index-key cache the DSA indexer needs.
+class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
+    """MLA KV pool in the layout the sparse MLA kernels read.
 
-    Each layer that runs its own indexer gets one ``uint8`` buffer of index
-    keys. It is paged like the KV cache and uses the same page table. A layer
-    that reuses the previous layer's top-k result has no such buffer.
+    The kernels keep each layer's cache in two paged ``uint8`` buffers:
 
-    Like the KV cache, these buffers are written only by the op that uses them
-    (the indexer op), which updates them in place.
+    * NoPE, ``[num_pages, page_size, 4, 128]``: 512 bytes per token.
+    * RoPE, ``[num_pages, page_size // 4, 4, 128]``: 64 bytes per token, padded
+      to 128.
+
+    The values are FP8, stored as raw bytes.
+
+    Each layer that runs its own DSA indexer also gets an index-key buffer. It
+    uses the same page table. A layer that reuses the previous layer's top-k
+    result has no index-key buffer.
+
+    Only the ops write these buffers, and they update them in place. That is
+    why the accessors of the flat MLA pool, which address tokens by index, are
+    not supported here.
 
     TODO(sglang-torchtpu#1072): the core pool sizer counts 132 bytes per index
     key, not this pool's 256, so a pool sized from free memory comes out too
@@ -996,8 +1005,11 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
     ask the pool for its bytes per token.
     """
 
-    # The index-key cache stores this many tokens per row of a page.
-    INDEX_KEY_TOKENS_PER_ROW = 4
+    NOPE_BYTES = 512
+    # One lane. A token's RoPE bytes are padded to this size.
+    LANE_BYTES = 128
+    # The RoPE and index-key buffers store this many tokens per row of a page.
+    TOKENS_PER_ROW = 4
 
     def __init__(
         self,
@@ -1015,26 +1027,56 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
         index_head_dim: int,
         index_key_layers: list[bool],
     ):
+        # Skip MLATokenToKVPool.__init__: it allocates flat [size, 1, 576]
+        # buffers, which the kernels cannot use. TpuFusedMLATokenToKVPool does
+        # the same.
+        from sglang.srt.mem_cache.memory_pool import (
+            KVCache,  # local import to avoid cycles
+        )
+
         if len(index_key_layers) != layer_num:
             raise ValueError(
                 f"index_key_layers has {len(index_key_layers)} entries for "
                 f"{layer_num} layers."
             )
-        # Set these first: the base constructor calls _create_buffers.
-        self._index_head_dim = index_head_dim
-        self._index_key_layers = index_key_layers
-        super().__init__(
+
+        KVCache.__init__(
+            self,
             size,
             page_size,
             dtype,
-            kv_lora_rank,
-            qk_rope_head_dim,
             layer_num,
             device,
             enable_memory_saver,
             start_layer,
             end_layer,
         )
+        self.store_dtype = torch.uint8
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.use_nsa = False
+        self.nsa_kv_cache_store_fp8 = False
+        self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+        self._index_head_dim = index_head_dim
+        self._index_key_layers = index_key_layers
+
+        if self.size % self.page_size != 0:
+            raise ValueError(
+                f"size ({self.size}) must be divisible by page_size "
+                f"({self.page_size}) for the TPU split MLA pool."
+            )
+        if self.page_size % self.TOKENS_PER_ROW != 0:
+            raise ValueError(
+                f"page_size ({self.page_size}) must be divisible by "
+                f"{self.TOKENS_PER_ROW} for the TPU split MLA pool."
+            )
+        # Allocate one extra page. Token index 0 is the slot used for padded
+        # tokens, and the TPU allocator hands out page IDs starting at 1, so
+        # page 0 is never a real page.
+        self.num_pages = self.size // self.page_size + 1
+
+        self._create_buffers()
+        self._finalize_allocation_log(size)
 
     @classmethod
     def index_key_record_bytes(cls, index_head_dim: int) -> int:
@@ -1045,40 +1087,68 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
         256 bytes. The indexer op checks the buffer's shape against what its
         kernel reads, so a mistake here fails at the first compile.
         """
-        lane = cls.HEAD_DIM_ALIGNMENT
+        lane = cls.LANE_BYTES
         key_bytes = _cdiv(index_head_dim, lane) * lane
         return _cdiv(key_bytes + key_bytes // lane, lane) * lane
 
     def _create_buffers(self):
-        super()._create_buffers()
-        tokens_per_row = self.INDEX_KEY_TOKENS_PER_ROW
-        if self.page_size % tokens_per_row != 0:
-            raise ValueError(
-                f"page_size ({self.page_size}) must be divisible by "
-                f"{tokens_per_row} for the TPU index-key cache."
-            )
-        shape = (
+        rows_per_page = self.page_size // self.TOKENS_PER_ROW
+        nope_shape = (
             self.num_pages,
-            self.page_size // tokens_per_row,
-            tokens_per_row,
+            self.page_size,
+            self.NOPE_BYTES // self.LANE_BYTES,
+            self.LANE_BYTES,
+        )
+        rope_shape = (
+            self.num_pages,
+            rows_per_page,
+            self.TOKENS_PER_ROW,
+            self.LANE_BYTES,
+        )
+        index_key_shape = (
+            self.num_pages,
+            rows_per_page,
+            self.TOKENS_PER_ROW,
             self.index_key_record_bytes(self._index_head_dim),
         )
         logger.info(
-            "Allocating TPU DSA index-key buffers: layers=%d of %d, shape per layer=%s",
-            sum(self._index_key_layers),
+            "Allocating split TPU MLA KV buffers: layers=%d, nope=%s, rope=%s, "
+            "index keys=%s on %d layers",
             self.layer_num,
-            shape,
+            nope_shape,
+            rope_shape,
+            index_key_shape,
+            sum(self._index_key_layers),
         )
-        # One whole tensor per layer, not a view of a shared one: the indexer
-        # op can only update a whole tensor in place.
+        # One whole uint8 tensor per layer and buffer, not views of a shared
+        # tensor: an op can only update a whole tensor in place.
+        self.nope_buffer = [
+            _zeros_kv_buffer(nope_shape, torch.uint8, self.device)
+            for _ in range(self.layer_num)
+        ]
+        self.rope_buffer = [
+            _zeros_kv_buffer(rope_shape, torch.uint8, self.device)
+            for _ in range(self.layer_num)
+        ]
         self.index_key_buffer = [
-            _zeros_kv_buffer(shape, torch.uint8, self.device) if has_indexer else None
+            (
+                _zeros_kv_buffer(index_key_shape, torch.uint8, self.device)
+                if has_indexer
+                else None
+            )
             for has_indexer in self._index_key_layers
         ]
 
     def _clear_buffers(self):
-        super()._clear_buffers()
+        del self.nope_buffer
+        del self.rope_buffer
         del self.index_key_buffer
+
+    def get_nope_cache(self, layer_id: int) -> torch.Tensor:
+        return self.nope_buffer[layer_id - self.start_layer]
+
+    def get_rope_cache(self, layer_id: int) -> torch.Tensor:
+        return self.rope_buffer[layer_id - self.start_layer]
 
     def get_index_key_cache(self, layer_id: int) -> torch.Tensor:
         buf = self.index_key_buffer[layer_id - self.start_layer]
@@ -1090,9 +1160,42 @@ class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
         return buf
 
     def get_kv_size_bytes(self):
-        index_key_bytes = sum(
-            get_tensor_size_bytes(buf)
-            for buf in self.index_key_buffer
-            if buf is not None
+        buffers = [*self.nope_buffer, *self.rope_buffer, *self.index_key_buffer]
+        return sum(get_tensor_size_bytes(buf) for buf in buffers if buf is not None)
+
+    def _unsupported(self, accessor: str):
+        raise NotImplementedError(
+            f"{accessor} is not supported on the TPU split MLA pool. Only the "
+            "sparse MLA ops read and write this cache, and its layout cannot be "
+            "addressed by token index the way the flat MLA pool is."
         )
-        return super().get_kv_size_bytes() + index_key_bytes
+
+    def get_key_buffer(self, *args, **kwargs):
+        self._unsupported("get_key_buffer")
+
+    def get_value_buffer(self, *args, **kwargs):
+        self._unsupported("get_value_buffer")
+
+    def get_kv_buffer(self, *args, **kwargs):
+        self._unsupported("get_kv_buffer")
+
+    def get_contiguous_buf_infos(self, *args, **kwargs):
+        self._unsupported("get_contiguous_buf_infos")
+
+    def get_cpu_copy(self, *args, **kwargs):
+        self._unsupported("get_cpu_copy")
+
+    def load_cpu_copy(self, *args, **kwargs):
+        self._unsupported("load_cpu_copy")
+
+    def get_mla_kv_buffer(self, *args, **kwargs):
+        self._unsupported("get_mla_kv_buffer")
+
+    def move_kv_cache(self, *args, **kwargs):
+        self._unsupported("move_kv_cache")
+
+    def set_kv_buffer(self, *args, **kwargs):
+        self._unsupported("set_kv_buffer")
+
+    def set_mla_kv_buffer(self, *args, **kwargs):
+        self._unsupported("set_mla_kv_buffer")

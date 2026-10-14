@@ -19,7 +19,7 @@ register_tpu_ci(
     est_time=600,
     suite="tpu-integration",
     nightly=True,
-    labels=["multihost", "diffusion", "collectives"],
+    labels=["multihost", "infra", "diffusion", "collectives"],
 )
 
 from sglang.test.test_utils import CustomTestCase, is_in_ci

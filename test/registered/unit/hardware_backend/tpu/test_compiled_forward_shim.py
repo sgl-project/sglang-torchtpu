@@ -264,6 +264,27 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.batch_size, 4)
 
+    def test_mamba_tracking_padding_roundtrip(self):
+        fb = _forward_batch(real_t=10, real_b=3, mode="extend")
+        original = {
+            "mamba_track_indices": _t(7, 8, 9),
+            "mamba_track_mask": _t(True, False, True, dtype=torch.bool),
+            "mamba_track_seqlens": _t(64, -1, 128),
+        }
+        for name, value in original.items():
+            setattr(fb, name, value)
+        q, b = _pad_forward_batch_inputs(
+            fb, _bucketer("Token", [16, 64]), _bucketer("Bs", [1, 4])
+        )
+        for name, value in original.items():
+            padded = getattr(fb, name)
+            torch.testing.assert_close(padded[:3], value)
+            self.assertEqual(padded.shape[0], 4)
+            self.assertEqual(padded[3].item(), 0)
+        _restore_forward_batch_inputs(fb, q, b)
+        for name, value in original.items():
+            torch.testing.assert_close(getattr(fb, name), value)
+
     def test_extend_batch_cap_does_not_exceed_token_ceiling(self):
         fb = _forward_batch(real_t=4, real_b=2, mode="extend")
         _pad_forward_batch_inputs(

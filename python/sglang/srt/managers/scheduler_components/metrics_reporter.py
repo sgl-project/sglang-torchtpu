@@ -1481,7 +1481,29 @@ class SchedulerMetricsReporter:
             and time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
             return
+        self._publish_idle_stats()
 
+    def maybe_log_stall_metrics(self):
+        """Publish the gauges of an engine that has queued work but forms no batch.
+
+        A P/D engine whose queued requests are all parked (KV never arrives, the
+        room is dead, a stuck handoff) runs no batch, so no batch report writes
+        its gauges, and on_idle() skips the idle publish because it is not fully
+        idle. Without this the gauges freeze at their last value and the stall
+        looks like an idle engine. Publishes only once no stats were logged for
+        30 s, so an engine that is merely between batches never reports a zero
+        throughput.
+        """
+        if not self.current_scheduler_metrics_enabled:
+            return
+        if time.perf_counter() <= self.metrics_collector.last_log_time + 30:
+            return
+        # No forward for 30 s: drop the last forward-occupancy sample, as idle does.
+        self._reset_device_timer_window()
+        self._publish_idle_stats()
+
+    def _publish_idle_stats(self):
+        """Write the no-batch gauges: queues, zero throughput, oldest transfer age."""
         self.scheduler.pool_stats_observer.get_pool_stats().update_scheduler_stats(
             self.stats
         )

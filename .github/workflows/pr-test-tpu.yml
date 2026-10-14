@@ -84,6 +84,8 @@ jobs:
               - 'test/registered/unit/hardware_backend/tpu/**'
               - 'test/registered/unit/layers/attention/pallas/**'
               - 'test/registered/unit/layers/moe/pallas/**'
+              - 'test/registered/e2e/tpu/**'
+              - 'test/registered/e2e/hardware_backend/tpu/**'
               - '.github/tpu-ci/**'
               - '.github/workflows/_tpu-build.yml'
               - '.github/workflows/_tpu-test.yml'

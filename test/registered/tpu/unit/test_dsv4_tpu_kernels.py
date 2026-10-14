@@ -11,15 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the DeepSeek-V4 TPU compressor and indexer Pallas custom ops.
+"""Unit tests for the DeepSeek-V4 TPU Pallas custom ops and cache-prep helpers.
 
 Covers:
+  * ``tpu_dsv4`` registration in ``ATTENTION_BACKENDS``;
   * ``get_or_build_cos_sin_cache``, ``ensure_tpu_compressor_caches``, and
     ``ensure_tpu_indexer_caches`` weight/cache preparation helpers (run on CPU
     and TPU);
+  * ``_register_rope_op`` and ``_register_qnorm_rope_op`` Pallas custom ops;
+  * ``_register_attention_swa_op`` sliding-window MLA Pallas custom op;
   * ``_register_csa_compressor_op`` + ``_register_indexer_compressor_op`` +
-    ``_register_streamindex_topk_op`` (C4 compressor + TopK indexer pipeline);
-  * ``_register_hca_compressor_op`` (C128 HCA compressor).
+    ``_register_streamindex_topk_op`` + ``_register_attention_csa_op`` (CSA
+    pipeline);
+  * ``_register_hca_compressor_op`` + ``_register_attention_hca_op`` (HCA
+    pipeline).
 
 The Pallas kernel execution tests require a free TPU device and are skipped
 when ``torch_tpu`` is unavailable.
@@ -58,7 +63,12 @@ def _skip_if_no_tpu() -> bool:
 
 
 class TestDSV4TPUHelpers(CustomTestCase):
-    """Pure tensor/cache preparation helpers — run on CPU or TPU."""
+    """Pure tensor/registry helpers — run on CPU or TPU."""
+
+    def test_dsv4_registered_in_attention_backends(self):
+        import sglang.srt.layers.attention.attention_registry as reg
+
+        self.assertIn("dsv4", reg.ATTENTION_BACKENDS)
 
     def test_cos_sin_and_compressor_indexer_cache_preparation(self):
         from sglang.srt.runtime_context import get_context
@@ -143,8 +153,74 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         ).to(self.device)
         return get_or_build_cos_sin_cache(freqs_cis)
 
-    def test_compressor_and_indexer_ops(self):
+    def test_rope_and_qnorm_rope_ops(self):
+        from sglang_tpu.dsv4.dsv4_attention_backend import (
+            _register_qnorm_rope_op,
+            _register_rope_op,
+        )
+
         num_tokens = 16
+        positions = torch.arange(num_tokens, dtype=torch.int32, device=self.device)
+        cos_sin = self._make_cos_sin(256)
+
+        rope_op = _register_rope_op()
+        k_pe = torch.randn(num_tokens, 1, 512, dtype=torch.bfloat16, device=self.device)
+        k_pe_out = rope_op(k_pe, positions, cos_sin, 0)
+        self.assertEqual(tuple(k_pe_out.shape), (num_tokens, 1, 512))
+        self.assertFalse(torch.isnan(k_pe_out).any().item())
+
+        qnorm_rope_op = _register_qnorm_rope_op()
+        q_raw = torch.randn(
+            num_tokens, 16, 512, dtype=torch.bfloat16, device=self.device
+        )
+        q_out = qnorm_rope_op(q_raw, positions, cos_sin, 1e-6)
+        self.assertEqual(tuple(q_out.shape), (num_tokens, 16, 512))
+        self.assertFalse(torch.isnan(q_out).any().item())
+
+    def test_swa_attention_op(self):
+        from sglang_tpu.dsv4.dsv4_attention_backend import (
+            _register_attention_swa_op,
+        )
+
+        num_tokens = 16
+        num_q_heads = 16
+        head_dim = 512
+        q = torch.randn(
+            num_tokens, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device
+        )
+        k = torch.randn(num_tokens, head_dim, dtype=torch.bfloat16, device=self.device)
+        sw_cache = torch.zeros((4, 512, 4, 128), dtype=torch.uint8, device=self.device)
+        kv_lens = torch.tensor([num_tokens], dtype=torch.int32, device=self.device)
+        page_indices = torch.tensor([1, 0, 0, 0], dtype=torch.int32, device=self.device)
+        cu_q_lens = torch.tensor([0, num_tokens], dtype=torch.int32, device=self.device)
+        distribution = torch.tensor([0, 0, 1], dtype=torch.int32, device=self.device)
+        sinks = torch.zeros(num_q_heads, dtype=torch.float32, device=self.device)
+
+        swa_op = _register_attention_swa_op()
+        out = swa_op(
+            q,
+            k,
+            sw_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sinks,
+            1.0 / math.sqrt(512),
+            512,
+            256,
+        )
+        self.assertEqual(tuple(out.shape), (num_tokens, num_q_heads, head_dim))
+        self.assertFalse(torch.isnan(out).any().item())
+
+    def test_csa_and_hca_pipeline_ops(self):
+        from sglang_tpu.dsv4.dsv4_attention_backend import (
+            _register_attention_csa_op,
+            _register_attention_hca_op,
+        )
+
+        num_tokens = 16
+        num_q_heads = 16
         head_dim = 512
         positions = torch.arange(num_tokens, dtype=torch.int32, device=self.device)
         cos_sin = self._make_cos_sin(256)
@@ -155,12 +231,17 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         idx_k = torch.randn(num_tokens, 128, dtype=torch.bfloat16, device=self.device)
         cu_q_lens = torch.tensor([0, num_tokens], dtype=torch.int32, device=self.device)
         kv_lens = torch.tensor([num_tokens], dtype=torch.int32, device=self.device)
+        c128_kv_lens = torch.tensor([0], dtype=torch.int32, device=self.device)
+        c128_kv_lens_to_attend = torch.zeros(
+            num_tokens, dtype=torch.int32, device=self.device
+        )
         page_indices = torch.tensor([1, 0, 0, 0], dtype=torch.int32, device=self.device)
         distribution = torch.tensor([0, 0, 1], dtype=torch.int32, device=self.device)
         state_bt_flat = torch.tensor(
             [1, 0, 0, 0, 0, 0], dtype=torch.int32, device=self.device
         )
 
+        sw_cache = torch.zeros((4, 512, 4, 128), dtype=torch.uint8, device=self.device)
         csa_nope = torch.zeros((4, 64, 4, 128), dtype=torch.uint8, device=self.device)
         csa_rope = torch.zeros((4, 16, 4, 128), dtype=torch.uint8, device=self.device)
         idx_k_buf = torch.zeros((4, 16, 4, 256), dtype=torch.uint8, device=self.device)
@@ -242,6 +323,31 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         )
         self.assertEqual(tuple(topk_indices.shape), (num_tokens, 512))
 
+        q = torch.randn(
+            num_tokens, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device
+        )
+        sinks = torch.zeros(num_q_heads, dtype=torch.float32, device=self.device)
+        csa_attn_op = _register_attention_csa_op()
+        out_csa = csa_attn_op(
+            q,
+            hidden_states,
+            sw_cache,
+            kv_lens,
+            page_indices,
+            csa_nope,
+            csa_rope,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sinks,
+            1.0 / math.sqrt(512),
+            512,
+            256,
+        )
+        self.assertEqual(tuple(out_csa.shape), (num_tokens, num_q_heads, head_dim))
+        self.assertFalse(torch.isnan(out_csa).any().item())
+
         hca_comp_op = _register_hca_compressor_op()
         hca_comp_op(
             hidden_states,
@@ -263,6 +369,27 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
             1e-6,
             0,
         )
+
+        hca_attn_op = _register_attention_hca_op()
+        out_hca = hca_attn_op(
+            q,
+            hidden_states,
+            sw_cache,
+            kv_lens,
+            page_indices,
+            hca_kv,
+            c128_kv_lens,
+            c128_kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sinks,
+            1.0 / math.sqrt(512),
+            512,
+            256,
+        )
+        self.assertEqual(tuple(out_hca.shape), (num_tokens, num_q_heads, head_dim))
+        self.assertFalse(torch.isnan(out_hca).any().item())
 
 
 if __name__ == "__main__":
