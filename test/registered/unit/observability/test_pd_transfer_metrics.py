@@ -41,6 +41,7 @@ class TestPDTransferMetrics(CustomTestCase):
             disagg_decode_transfer_queue=SimpleNamespace(
                 queue=[], num_pending_deferred_releases=lambda: 0
             ),
+            tree_cache=SimpleNamespace(swa_is_only_match_cut=lambda: False),
         )
 
     def set_queue(self, mode, times):

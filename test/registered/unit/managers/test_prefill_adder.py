@@ -25,6 +25,11 @@ from sglang.srt.mem_cache.prefill_budget import (
     estimate_swa_kv_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.swa_prefix_accounting import (
+    SwaPrefixMatch,
+    swa_miss_len,
+    swa_prefix_match,
+)
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -129,6 +134,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        req.swa_prefix_match = SwaPrefixMatch()
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -540,6 +546,77 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.log_device_hit_tokens, 8)
         self.assertEqual(adder.log_host_hit_tokens, 0)
         self.assertEqual(adder.log_storage_hit_tokens, 12)
+
+    def test_swa_miss_counted_once_per_admitted_req(self):
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req("swa-limited", priority=0, max_new_tokens=1)
+        req.swa_prefix_match = SwaPrefixMatch(full_kv_hit_length=24)
+        req.materialized_host_hit_len.return_value = 0
+
+        adder._account_prefill_cache_admission(req, prefix_len=0)
+        self.assertEqual(adder.log_swa_miss_tokens, 24)
+        self.assertEqual(adder.log_swa_miss_reqs, 1)
+
+        clean = self.create_mock_req("clean", priority=0, max_new_tokens=1)
+        clean.materialized_host_hit_len.return_value = 0
+        adder._account_prefill_cache_admission(clean, prefix_len=0)
+        self.assertEqual(adder.log_swa_miss_reqs, 1)
+
+        retracted = self.create_mock_req("retracted", priority=0, max_new_tokens=1)
+        retracted.swa_prefix_match = SwaPrefixMatch(full_kv_hit_length=16)
+        retracted.retracted_stain = True
+        adder._account_prefill_cache_admission(retracted, prefix_len=0)
+        self.assertEqual(adder.log_swa_miss_tokens, 24)
+        self.assertEqual(adder.log_swa_miss_reqs, 1)
+
+    def test_swa_miss_excludes_restored_and_declined_load_back(self):
+        """Load-back that restores a missing window extends the admitted prefix, so
+        those tokens are reused, not missed; declining a restorable load-back is a
+        capacity loss, not an SWA miss."""
+        cases = [
+            # reusable_length, prefix_len, swa_miss
+            (16, 32, 0),
+            (16, 24, 8),
+            (16, 16, 16),
+            (16, 8, 16),
+            (16, 40, 0),
+            (32, 16, 0),
+        ]
+        for reusable_length, prefix_len, expected in cases:
+            with self.subTest(reusable_length=reusable_length, prefix_len=prefix_len):
+                match = SwaPrefixMatch(
+                    full_kv_hit_length=32, reusable_length=reusable_length
+                )
+                self.assertEqual(
+                    swa_miss_len(match=match, prefix_len=prefix_len), expected
+                )
+
+    def test_swa_prefix_match_reusable_prefix(self):
+        """The reusable prefix is the validators' best match, which covers a window
+        restorable from host; walk-less producers (streaming sessions) report no
+        full-KV length, and their reuse must not read as a miss."""
+        tree_cache = SimpleNamespace(swa_is_only_match_cut=lambda: True)
+        host_restorable = swa_prefix_match(
+            tree_cache=tree_cache,
+            match_result=SimpleNamespace(
+                device_indices=torch.arange(16),
+                host_hit_length=0,
+                full_kv_hit_length=32,
+                best_match_length=32,
+            ),
+        )
+        self.assertEqual(swa_miss_len(match=host_restorable, prefix_len=16), 0)
+        walkless = swa_prefix_match(
+            tree_cache=tree_cache,
+            match_result=SimpleNamespace(
+                device_indices=torch.arange(8),
+                host_hit_length=0,
+                full_kv_hit_length=0,
+                best_match_length=0,
+            ),
+        )
+        self.assertEqual(walkless.full_kv_hit_length, 8)
+        self.assertEqual(swa_miss_len(match=walkless, prefix_len=8), 0)
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())

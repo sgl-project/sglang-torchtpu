@@ -293,6 +293,8 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
+        best_match_length: Prefix length up to `best_match_node` (all component
+                            validators passed, host-restorable components included).
     """
 
     device_indices: torch.Tensor
@@ -306,6 +308,7 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    best_match_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
@@ -329,6 +332,7 @@ def zero_match_result(
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        best_match_length=0,
     )
 
 
@@ -649,6 +653,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def supports_mamba(self) -> bool:
+        return False
+
+    def swa_is_only_match_cut(self) -> bool:
+        """True when a missing SWA window is the only thing that can stop a match
+        short of `full_kv_hit_length`, so the gap is attributable to SWA."""
         return False
 
     def release_session(self, session_id: str) -> None:

@@ -60,6 +60,10 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.swa_prefix_accounting import (
+    swa_miss_len,
+    swa_prefix_match,
+)
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     FreeComponentDeviceSlot,
@@ -6836,6 +6840,48 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(result.full_kv_hit_length, 4)
 
+    def test_swa_miss_len_reports_swa_masked_prefix(self):
+        """Resident FULL under SWA tombstones counts as an SWA miss on Full+SWA;
+        a clean prefix, and any cache with Mamba or without SWA, reports zero."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = list(range(1, 1 + 4 * self.cfg.page_size))
+        value = self._alloc(allocator, len(seq))
+        params = InsertParams(
+            key=RadixKey(array("q", seq)),
+            value=value[: len(seq)],
+            component_evicted_seqlens=(
+                {ComponentType.SWA: len(seq)} if self.cfg.has_swa else {}
+            ),
+        )
+        if self.cfg.has_mamba:
+            req = Req(
+                rid="swa-miss-mamba",
+                origin_input_text="",
+                origin_input_ids=array("q"),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            req_to_token_pool.alloc([req])
+            params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
+        cache.insert(params)
+        masked = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        match = swa_prefix_match(tree_cache=cache, match_result=masked)
+        miss = swa_miss_len(match=match, prefix_len=0)
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.assertEqual(miss, 0)
+            return
+        self.assertEqual(len(masked.device_indices), 0)
+        self.assertEqual(miss, len(seq))
+
+        clean = list(range(1000, 1000 + 4 * self.cfg.page_size))
+        self._insert(cache, allocator, req_to_token_pool, clean)
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", clean))))
+        self.assertEqual(result.best_match_length, len(clean))
+        clean_match = swa_prefix_match(tree_cache=cache, match_result=result)
+        self.assertEqual(
+            swa_miss_len(match=clean_match, prefix_len=len(result.device_indices)),
+            0,
+        )
+
     def test_has_swa_host_pool_flag_matches_attached_pool(self):
         """init_hicache caches SWA host-pool presence on the tree core after
         the pool assembler runs; the flag must agree with the attached handle."""
@@ -7197,6 +7243,29 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, _node_key_length(cache, leaf))
+
+    def test_best_match_length_reaches_host_only_leaf(self):
+        """best_match_length reaches a host-only leaf the validators accept, past the
+        device prefix that device_indices covers."""
+        if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+SWA")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(cache, chain)
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
+        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
+        self.assertEqual(
+            len(result.device_indices), len(tokens) - _node_key_length(cache, leaf)
+        )
+        self.assertEqual(result.best_match_length, len(tokens))
 
     def test_swa_branching_seqlen_uses_device_full_hit(self):
         if (

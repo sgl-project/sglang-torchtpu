@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.swa_prefix_accounting import swa_miss_len
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
@@ -730,6 +731,8 @@ class PrefillAdder:
         self.log_device_hit_tokens = 0
         self.log_host_hit_tokens = 0
         self.log_storage_hit_tokens = 0
+        self.log_swa_miss_tokens = 0
+        self.log_swa_miss_reqs = 0
         self.log_input_tokens = 0
         self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -1013,6 +1016,9 @@ class PrefillAdder:
             self.log_device_hit_tokens += device_hit
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
+        swa_miss = swa_miss_len(match=req.swa_prefix_match, prefix_len=prefix_len)
+        self.log_swa_miss_tokens += swa_miss
+        self.log_swa_miss_reqs += int(swa_miss > 0)
 
         fulfilled_storage_hit = req.fulfilled_storage_hit_len(prefix_len)
         reason = None
