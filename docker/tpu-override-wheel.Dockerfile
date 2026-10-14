@@ -11,7 +11,7 @@ COPY wheel_override/ /tmp/wheel_override/
 
 RUN --mount=type=secret,id=gcp_token \
     TOKEN="$(cat /run/secrets/gcp_token 2>/dev/null || echo '')" && \
-    INDEX_URL="https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" && \
+    INDEX_URL="https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/" && \
     echo "============================================================" && \
     echo "=== BASE CONTAINER: Current installed torch-tpu package ===" && \
     (pip show torch-tpu || pip show torch_tpu || true) && \
@@ -22,7 +22,7 @@ RUN --mount=type=secret,id=gcp_token \
       pip install --no-deps --force-reinstall -v "$LOCAL_WHL" && rm -rf /tmp/wheel_override; \
     else \
       echo "=== PULLING WHEEL '${WHEEL}' FROM VIRTUAL REGISTRY ===" && \
-      echo "Registry URL: https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" && \
+      echo "Registry URL: https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/" && \
       pip install --no-deps --force-reinstall --pre --upgrade -v \
         --index-url "${INDEX_URL}" \
         "${WHEEL}"; \

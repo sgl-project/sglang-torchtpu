@@ -445,11 +445,11 @@ Topology-Aware Scheduling instead.
 ## ⚠️ Required before CI can run (owner actions)
 
 1. **Allowlist `tpu-ci` on the private torch-tpu registry.** The build pulls the
-   pinned `torch-tpu` wheel from `ml-oss-artifacts-transient` (Google-owned). Ask
+   pinned `torch-tpu` wheel from `ml-oss-artifacts-published` (Google-owned). Ask
    Google / the TPU program (duckie or Jetski) to grant:
    > `roles/artifactregistry.reader` to
    > `serviceAccount:tpu-ci@sglang-torchtpu.iam.gserviceaccount.com` on the
-   > `torch-tpu-virtual-registry` Python repo in project `ml-oss-artifacts-transient`.
+   > `torch-tpu-release-virtual-registry` Python repo in project `ml-oss-artifacts-published`.
 
    Until this lands, `gcloud builds submit` (and therefore every CI run) fails at
    the `pip install` step. Validation to date builds once under the owner's own

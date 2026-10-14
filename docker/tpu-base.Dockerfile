@@ -35,7 +35,7 @@ RUN --mount=type=secret,id=gcp_token \
     pip install --upgrade pip && \
     TOKEN="$(cat /run/secrets/gcp_token)" && \
     pip install \
-      --index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
+      --index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/" \
       ".[dev_tpu,diffusion_tpu]" && \
     pip uninstall -y sglang && \
     rm -rf sglang && \
