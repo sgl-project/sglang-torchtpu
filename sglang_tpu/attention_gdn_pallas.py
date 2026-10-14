@@ -37,6 +37,8 @@ import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -59,13 +61,21 @@ def build_gdn_pallas_op():
             a_log, dt_bias, query_start_loc, state_indices, distribution,
             seq_lens, n_kq, n_v, d_k, d_v, kernel_size, kda=False,
             gate_lower_bound=None, batched_only=False, prefill_only=False,
-            fused_qkvg=False, packed_weights=None) -> output
+            fused_qkvg=False, packed_weights=None,
+            track_indices=None, track_end=None) -> output
 
     ``conv_state`` and ``recurrent_state`` are updated in place (declared as
     ``mutates_args``); the returned tensor is the fused attention output of
     shape ``[num_tokens, n_v, d_v]``. ``qkv`` is exactly the conv dim wide,
     unless ``fused_qkvg`` declares it a fused ``[q, k, v, g]`` projection (g
     ``n_v * d_v`` wide), whose leading conv-dim columns are read.
+
+    ``track_indices`` and ``track_end`` are optional int32 tensors of shape
+    ``[num_seqs]``, supplied together in the same order as ``state_indices``.
+    They select physical snapshot destination slots in both state caches and
+    exclusive checkpoint offsets in the packed input, respectively. An end
+    of -1 disables the snapshot for that row; enabled ends must match kernel
+    tile boundaries. Active state slots continue to update independently.
     """
     global _PALLAS_GDN_OP
     if _PALLAS_GDN_OP is not None:
@@ -109,6 +119,8 @@ def build_gdn_pallas_op():
         prefill_only: bool,
         fused_qkvg: bool,
         packed_weights: Optional[jax.Array] = None,
+        track_indices: Optional[jax.Array] = None,
+        track_end: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         conv_dim = n_kq * d_k * 2 + n_v * d_v
         if fused_qkvg:
@@ -153,6 +165,8 @@ def build_gdn_pallas_op():
                 batched_only=batched_only,
                 prefill_only=prefill_only,
                 packed_weights=packed_weights,
+                track_indices=track_indices,
+                track_end=track_end,
             )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).
@@ -207,6 +221,8 @@ def build_gdn_pallas_op():
         prefill_only: bool = False,
         fused_qkvg: bool = False,
         packed_weights: Optional[torch.Tensor] = None,
+        track_indices: Optional[torch.Tensor] = None,
+        track_end: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Second half of the CPU-mesh export guard (see `_wrapped`). Mosaic
         # lowering queries TPU metadata again (`_check_block_mappings` ->
@@ -235,6 +251,8 @@ def build_gdn_pallas_op():
             distribution,
             seq_lens,
             packed_weights,
+            track_indices,
+            track_end,
         )
         key = (
             tuple(None if t is None else (tuple(t.shape), t.dtype) for t in tensors),
@@ -275,6 +293,8 @@ def build_gdn_pallas_op():
                 prefill_only,
                 fused_qkvg,
                 packed_weights,
+                track_indices,
+                track_end,
             )
         else:
             with (
@@ -306,6 +326,8 @@ def build_gdn_pallas_op():
                     prefill_only,
                     fused_qkvg,
                     packed_weights,
+                    track_indices,
+                    track_end,
                 )
             _exported_shapes.add(key)
         return output
@@ -335,6 +357,8 @@ def build_gdn_pallas_op():
         prefill_only: bool = False,
         fused_qkvg: bool = False,
         packed_weights: Optional[torch.Tensor] = None,
+        track_indices: Optional[torch.Tensor] = None,
+        track_end: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens = qkv.shape[0]
         return qkv.new_empty((num_tokens, n_v, d_v))
@@ -367,6 +391,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # Build (and JAX-export) the custom op eagerly at construction time so
         # the heavyweight export does not happen inside a torch.compile trace.
         self._op = build_gdn_pallas_op()
+        self._extra_buffer_enabled = get_exec().mamba.enable_mamba_extra_buffer
+        if self._extra_buffer_enabled:
+            self.req_to_token_pool.mamba_pool.warmup_state_copy(
+                self.req_to_token_pool.size
+            )
         # Per-forward GDN metadata (int32, TPU-native), computed once in
         # init_forward_metadata and read by every GDN layer's forward — not
         # carried by the shared ForwardMetadata dataclass.
@@ -399,7 +428,6 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         return dist
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
-        super().init_forward_metadata(forward_batch)
         # `distribution` bounds which sequences the kernel walks, so give it the
         # pre-bucket row count: `forward_batch.seq_lens` is already padded to the
         # batch bucket here, and in decode `num_tiles = cdiv(distribution[0],
@@ -417,17 +445,52 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # per-forward index/length metadata to int32 once here (shared by all
         # GDN layers) rather than per-layer in _run.
         self._seq_lens = forward_batch.seq_lens.to(torch.int32)
-        md = self.forward_metadata
-        # Keep every state index in bounds. Under DP attention
-        # `hybrid_linear_attn_backend` poisons the padded tail of
-        # mamba_cache_indices with the CUDA/Triton "skip this row" sentinel -1,
-        # which this kernel does not honour -- gdn/metadata.py feeds
-        # state_indices straight to the state load/store, so -1 is an
-        # out-of-bounds pool index rather than a skip. Slot 0 is the reserved
-        # null block (MambaSlotAllocator hands out 1 .. size), which is where
-        # zero-padded rows already point.
-        self._state_indices = md.mamba_cache_indices.to(torch.int32).clamp(min=0)
-        self._query_start_loc = md.query_start_loc.to(torch.int32)
+        # Build only TPU metadata. The GPU base constructs variable-length
+        # tracked-row selections and reads device masks on the host. Here every
+        # row retains its bucket slot and disabled snapshots use end=-1.
+        slots = self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        self._state_indices = (
+            self._translate_mamba_indices(slots).to(torch.int32).clamp(min=0)
+        )
+        padded_bs = forward_batch.seq_lens.shape[0]
+        if is_decode:
+            self._query_start_loc = torch.arange(
+                padded_bs + 1, dtype=torch.int32, device=device
+            )
+        else:
+            self._query_start_loc = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int32, device=device),
+                    torch.cumsum(forward_batch.extend_seq_lens, 0, dtype=torch.int32),
+                )
+            )
+        self._track_indices = self._track_end = None
+        if forward_batch.mamba_track_mask is not None:
+            mask = forward_batch.mamba_track_mask
+            self._track_indices = (
+                self._translate_mamba_indices(forward_batch.mamba_track_indices)
+                .to(torch.int32)
+                .clamp(min=0)
+            )
+            if is_decode:
+                ends = self._query_start_loc[1:]
+            else:
+                # Use the native scheduler's checkpoint grid and its encoding
+                # of forced intermediate branching boundaries.
+                lengths = forward_batch.mamba_track_aligned_lens()
+                ends = self._query_start_loc[:-1] + lengths.to(torch.int32)
+            valid = mask & (torch.arange(padded_bs, device=device) < bs)
+            self._track_end = torch.where(valid, ends, -1).to(torch.int32)
+        elif self._extra_buffer_enabled:
+            # Warmup batches carry no tracking plan. Keep the same optional
+            # tensor signature as live requests to precompile the cache path.
+            self._track_indices = torch.zeros_like(self._state_indices)
+            self._track_end = torch.full_like(self._state_indices, -1)
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=self._query_start_loc,
+            mamba_cache_indices=self._state_indices,
+            mamba_track_indices=self._track_indices,
+        )
 
     def _run(
         self,
@@ -472,6 +535,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             kernel_size,
             batched_only=self._is_decode,
             prefill_only=not self._is_decode,
+            track_indices=self._track_indices,
+            track_end=self._track_end,
         )
         # Per-head [num_tokens, n_v, d_v], as the model's output-gate norm expects.
         return out

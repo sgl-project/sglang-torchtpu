@@ -710,24 +710,30 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                 self.assertNotIn(suite, suites, f"{path.name} shares a suite")
                 suites.add(suite)
 
-    # R1-0528 keeps the two regression floors it was relocated with; its MMLU
-    # subset has no measured baseline, like every other model's.
-    R1_GATED = {
-        ("accuracy-deepseek-r1-0528", "gpqa"),
-        ("accuracy-deepseek-r1-0528", "aime25"),
-    }
-
-    def test_every_gate_declares_its_accuracy_policy(self):
+    def test_every_gate_has_a_hardcoded_floor(self):
+        # floor = baseline - atol (an lm_eval gate keeps both in its YAML).
         for path, mod in self._accuracy_modules():
             for gate in _model_config(mod)["gates"]:
-                if (_model_config(mod)["id"], gate["dataset"]) in self.R1_GATED:
-                    self.assertFalse(gate.get("report_only"), path.name)
+                self.assertFalse(gate.get("report_only"), path.name)
+                if "lm_eval_config" not in gate:
                     self.assertIn("baseline", gate, path.name)
                     self.assertIn("atol", gate, path.name)
-                else:
-                    self.assertTrue(gate.get("report_only"), path.name)
-                    self.assertNotIn("baseline", gate, path.name)
-                    self.assertNotIn("atol", gate, path.name)
+
+    def test_gated_eval_without_a_score_fails_without_plotting_zero(self):
+        from sglang.test import accuracy_test_runner as runner
+
+        params = runner.AccuracyTestParams(
+            dataset="gpqa", baseline_accuracy=0.8, atol=0.1, metric_labels={}
+        )
+        model = SimpleNamespace(model_path="m", variant=None)
+        with (
+            patch.object(runner, "served", MagicMock()),
+            patch.object(runner, "_dispatch_eval", return_value=(True, None, {})),
+            patch.object(runner, "dump_metric") as dump,
+        ):
+            result = runner.run_accuracy_test(model, params, "http://x")
+        self.assertFalse(result.passed)
+        dump.assert_not_called()
 
     def test_every_gate_reaches_the_dashboard(self):
         # "accuracy" is the literal the dashboard's metric_kind() matches on; a

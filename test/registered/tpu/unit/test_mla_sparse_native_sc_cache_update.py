@@ -21,7 +21,7 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=25, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=25, suite="stage-a-test-tpu-unit", chips=1)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process: select the
 # physical backend before the first JAX import below.

@@ -1,4 +1,12 @@
-"""GPT-OSS-20B EAGLE3 + DP-attention PR gate on one TPU host."""
+"""GPT-OSS-20B EAGLE3 + DP-attention PR gate on one TPU host.
+
+This is the only per-commit test that runs a server with DP attention
+(`DP_SIZE` > 1 becomes `--dp-size N --enable-dp-attention`), so it stays on the
+gate. It deliberately does NOT set `--tpu-compile-tracer dynamo`: the tracers
+have their own gate in test_tpu_qwen3_0_6b_singlehost_compile_tracer.py at 150s
+against Qwen3-0.6B, and carrying the flag here made this launch the second most
+expensive in the e2e suite.
+"""
 
 import os
 
@@ -9,7 +17,7 @@ from sglang.test.tpu import model_config_main
 from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
-    est_time=1800,
+    est_time=550,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "gpt-oss-20b", "spec", "dpa"],
 )
@@ -104,7 +112,6 @@ LAUNCH_ENV = {
         "--speculative-num-steps 3 "
         "--speculative-eagle-topk 1 "
         "--speculative-num-draft-tokens 4 "
-        "--tpu-compile-tracer dynamo "
         "--trust-remote-code"
     ),
 }

@@ -52,9 +52,32 @@ materializing defensive copies during `torch.compile`.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
+
+# Cache of `[max_pos, rope_head_dim]` float32 cos_sin tables derived from
+# complex64 `freqs_cis`, keyed by `(id(freqs_cis), freqs_cis.device)`.
+_COS_SIN_CACHE: Dict[Tuple[int, torch.device], torch.Tensor] = {}
+
+
+def get_or_build_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Convert complex64 ``freqs_cis`` ``[max_pos, rope_head_dim // 2]`` into the
+    contiguous ``float32`` ``[max_pos, rope_head_dim]`` ``[cos, sin]`` table
+    consumed by the TPU Pallas compressor and RoPE kernels."""
+    key = (id(freqs_cis), freqs_cis.device)
+    cached = _COS_SIN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    real_imag = torch.view_as_real(freqs_cis)
+    cos_sin = (
+        torch.cat([real_imag[..., 0], real_imag[..., 1]], dim=-1)
+        .to(dtype=torch.float32, device=freqs_cis.device)
+        .contiguous()
+    )
+    _COS_SIN_CACHE[key] = cos_sin
+    return cos_sin
+
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
@@ -245,6 +268,7 @@ class TPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        global_page_size: Optional[int] = None,
     ):
         assert page_size % _TPU_KV_PACKING == 0, (
             f"Indexer compressed page_size ({page_size}) must be divisible by "
@@ -260,6 +284,7 @@ class TPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
             layer_num,
             device,
             enable_memory_saver,
+            global_page_size=global_page_size,
         )
 
     def _create_buffer(self) -> None:
@@ -514,6 +539,7 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         device: str,
         enable_memory_saver: bool,
         force_fp4: bool = False,
+        global_page_size: Optional[int] = None,
     ) -> TPUDeepSeekV4IndexerPool:
         assert not force_fp4, "Low-ratio FP4 indexer pool is not supported on TPU DSV4."
         return TPUDeepSeekV4IndexerPool(
@@ -524,6 +550,7 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            global_page_size=global_page_size,
         )
 
     def _make_compress_state_pool(

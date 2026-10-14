@@ -1861,6 +1861,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # platforms with a dedicated forward below.
         raise NotImplementedError("Indexer has no native (pure-torch) path")
 
+    def forward_tpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> torch.Tensor:
+        # On TPU the attention backend runs the indexer.
+        return get_attn_backend().forward_indexer(
+            self, x=x, q_lora=q_lora, positions=positions, layer_id=layer_id
+        )
+
     def forward_xpu(
         self,
         x: torch.Tensor,

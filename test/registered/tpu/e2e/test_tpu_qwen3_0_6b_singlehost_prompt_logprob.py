@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 )
 
 register_tpu_ci(
-    est_time=300,
+    est_time=110,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "qwen3-0.6b", "logprob"],
 )

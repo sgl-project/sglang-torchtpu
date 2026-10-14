@@ -11,7 +11,7 @@ from sglang.kernels.ops.diffusion import can_use_usp_merge_heads, usp_merge_head
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.utils import is_in_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class TestUspLayoutTpu(unittest.TestCase):

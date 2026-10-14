@@ -8,7 +8,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # The CPU lane has no JAX and skips; the TPU lane runs it.
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
 try:
     import jax

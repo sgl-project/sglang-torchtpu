@@ -49,6 +49,7 @@ from sglang_tpu.ray_utils import (
 register_tpu_ci(
     est_time=30,
     suite="stage-a-test-tpu-unit",
+    chips=1,
 )
 
 

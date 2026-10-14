@@ -20,8 +20,9 @@ GATE = {
     "dataset": "mmmu_pro",
     # sgl-eval's own grader: its own series, apart from the lenient manual re-grades.
     "label": "mmmu_pro_strict",
+    "baseline": 0.707,  # measured on TPU
+    "atol": 0.1,
     "runner": make_runner(GEMMA4_26B_A4B, "mmmu_pro"),
-    "report_only": True,
 }
 
 

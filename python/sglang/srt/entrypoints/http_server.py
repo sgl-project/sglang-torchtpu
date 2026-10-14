@@ -699,6 +699,23 @@ async def ready() -> Response:
     return Response(status_code=status_code)
 
 
+def _retrieve_health_probe_outcome(task: asyncio.Task) -> None:
+    """Consume the outcome of a health probe task that nobody awaits.
+
+    health_generate decides from last_receive_tstamp and only requests
+    cancellation of its probe. The cancel can lose a race with the probe's own
+    wait_for timeout in _stream_one_response: the task then finishes with the
+    client-disconnect ValueError (the handler has already returned) instead of
+    CancelledError, and asyncio logs "Task exception was never retrieved" when
+    the task is garbage-collected.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("Abandoned health check probe ended with %r", exc)
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -754,6 +771,10 @@ async def health_generate(request: Request) -> Response:
             break
 
     task = asyncio.create_task(gen())
+    # A done callback, not an await: if the cancel below loses its race, the
+    # task runs until the next SGLANG_REQUEST_STATE_WAIT_TIMEOUT tick, and
+    # awaiting it would add that to the probe's latency.
+    task.add_done_callback(_retrieve_health_probe_outcome)
 
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
     tic = time.time()
@@ -2438,6 +2459,11 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+# Arbitrary margin: the server listens within a second of the warmup thread starting.
+# A retry window for new attempts; each attempt keeps its own 10 s request timeout.
+_FREEZE_GC_RETRY_SECS = 30.0
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
@@ -2445,16 +2471,38 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
-    try:
-        res = requests.post(
-            server_args.url() + "/freeze_gc",
-            headers=freeze_headers,
-            timeout=10,
-            verify=ssl_verify_of(server_args),
-        )
-        res.raise_for_status()
-    except requests.exceptions.RequestException:
-        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+    start = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            res = requests.post(
+                server_args.url() + "/freeze_gc",
+                headers=freeze_headers,
+                timeout=10,
+                verify=ssl_verify_of(server_args),
+            )
+            res.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # Without the full warmup's wait for /model_info this can run before the
+            # server listens; an SSLError is a ConnectionError that retrying cannot fix.
+            retry = isinstance(
+                e, requests.exceptions.ConnectionError
+            ) and not isinstance(e, requests.exceptions.SSLError)
+            if retry and time.monotonic() - start < _FREEZE_GC_RETRY_SECS:
+                time.sleep(0.5)
+                continue
+            logger.warning("post-warmup freeze_gc failed", exc_info=True)
+            return
+        if attempt > 1:
+            # The endpoint freezes the tokenizer and queues the request for the schedulers,
+            # which forward it to the detokenizer.
+            logger.info(
+                "post-warmup freeze_gc accepted on attempt %d (%.1f s)",
+                attempt,
+                time.monotonic() - start,
+            )
+        return
 
 
 def _wait_and_warmup(

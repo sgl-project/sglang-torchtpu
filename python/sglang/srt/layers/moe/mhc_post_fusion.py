@@ -7,6 +7,10 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.utils import is_tpu
+
+_is_tpu = is_tpu()
+
 
 @dataclass
 class MhcPostFusion:
@@ -45,6 +49,8 @@ _current: ContextVar[Optional[MhcPostFusion]] = ContextVar("moe_mhc_post", defau
 
 
 def current_mhc_post_fusion():
+    if _is_tpu and torch.compiler.is_compiling():
+        return None
     return _current.get()
 
 

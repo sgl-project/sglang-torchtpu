@@ -37,6 +37,10 @@ defers to the worker bootstrap); MLA pool construction (the OOT builder's
 `index_head_dim` kwarg); `get_device_memory_capacity`, which reports nothing
 for TPU in both modes.
 
+Open: sparse attention (DSA) models run in mode A only. Mode B refuses them at
+pool construction (`TpuOOTPlatform.get_dsa_kv_pool_cls`), because the OOT DSA
+builder does not say which layers run their own indexer.
+
 Different arm, same outcome for every configuration that runs:
 
 - `--prefill-only-disable-kv-cache`: the pool-family check refuses OOT pools,

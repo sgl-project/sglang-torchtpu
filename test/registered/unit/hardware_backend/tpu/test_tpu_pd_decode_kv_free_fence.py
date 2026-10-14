@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
@@ -118,6 +119,27 @@ def _scheduler(**overrides):
     return scheduler
 
 
+def _unfenceable_overrides():
+    """(scheduler overrides, text the startup error must name) per case."""
+    return (
+        (
+            dict(token_to_kv_pool_allocator=_generic_allocator()),
+            "PagedTokenToKVPoolAllocator",
+        ),
+        (dict(spec_algorithm=SpeculativeAlgorithm.DFLASH), "DFLASH"),
+        (
+            dict(
+                spec_algorithm=SpeculativeAlgorithm.EAGLE3, tpu_async_copy_worker=None
+            ),
+            "SGLANG_TPU_ASYNC_COPY_WORKER",
+        ),
+        (
+            dict(spec_algorithm=CustomSpecAlgo("PLUGIN", factory=lambda _: None)),
+            "PLUGIN",
+        ),
+    )
+
+
 class TestPdDecodeFenceInstall(CustomTestCase):
     def test_pd_decode_installs_the_fence_without_hicache(self):
         scheduler = _scheduler()
@@ -149,24 +171,30 @@ class TestPdDecodeFenceInstall(CustomTestCase):
                 scheduler.maybe_init_kv_free_fence()
                 self.assertIsNone(scheduler.kv_free_fence)
 
-    def test_unfenceable_pd_decode_warns_instead_of_failing_startup(self):
-        """A PD decode server the fence cannot cover keeps serving, unfenced."""
-        generic = _generic_allocator()
-        for overrides, expected in (
-            (dict(token_to_kv_pool_allocator=generic), "PagedTokenToKVPoolAllocator"),
-            (dict(spec_algorithm=SpeculativeAlgorithm.DFLASH), "DFLASH"),
-        ):
+    def test_unfenceable_pd_decode_fails_startup(self):
+        """Unfenced, a forward's write can land on a new request's received
+        prefix with no error, so a PD decode server the fence cannot cover
+        must not start."""
+        for overrides, expected in _unfenceable_overrides():
             with self.subTest(expected=expected):
                 scheduler = _scheduler(**overrides)
-                with self.assertLogs(
-                    "sglang.srt.managers.scheduler", level="WARNING"
-                ) as logs:
+                with self.assertRaisesRegex(ValueError, "PD decode server") as ctx:
                     scheduler.maybe_init_kv_free_fence()
+                self.assertIn(expected, str(ctx.exception))
+                self.assertIn("--disable-overlap-schedule", str(ctx.exception))
                 self.assertIsNone(scheduler.kv_free_fence)
-                self.assertIn(expected, logs.output[0])
+                self.assertIsNone(scheduler.token_to_kv_pool_allocator.kv_free_fence)
+
+    def test_unfenceable_pd_decode_starts_without_overlap(self):
+        """--disable-overlap-schedule, the error's escape hatch, needs no fence."""
+        for overrides, expected in _unfenceable_overrides():
+            with self.subTest(expected=expected):
+                scheduler = _scheduler(enable_overlap=False, **overrides)
+                scheduler.maybe_init_kv_free_fence()
+                self.assertIsNone(scheduler.kv_free_fence)
 
     def test_unfenceable_raiden_hicache_still_fails_startup(self):
-        """raiden HiCache must not fall back to unfenced serving as PD decode does."""
+        """raiden HiCache keeps failing startup when the fence cannot cover it."""
         generic = _generic_allocator()
         for overrides, mode in (
             (dict(token_to_kv_pool_allocator=generic), DisaggregationMode.NULL),

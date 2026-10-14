@@ -105,6 +105,8 @@ def sent(expires=None, registered=True):
         expires=time.monotonic() + 120 if expires is None else expires,
         registered=registered,
         replied=set(),
+        start=0,
+        parts=0,
     )
 
 
@@ -144,6 +146,7 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
             types.MethodType(getattr(RaidenKVManager, method), pipe.manager),
         )
     pipe.producer = producer
+    pipe._init_overlap_state()
     pipe.lock = threading.RLock()
     pipe.engine = SimpleNamespace(poll_stats_with_details=Mock(return_value=_polled()))
     layers = groups(full=(6,), swa=(7,), buffer=Bf16Buffer)

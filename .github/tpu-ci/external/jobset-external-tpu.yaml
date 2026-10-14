@@ -168,7 +168,9 @@ spec:
                       # the files BEFORE anything can fail so a bring-up death is still attributed
                       # to the test, not the job.
                       echo "== test files: ${TEST_FILES} =="
-                      ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
+                      # Normalization may move serving to another pod; the input
+                      # leader forwards this port to that pod's reachable listener.
+                      ( HOST=0.0.0.0 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
                           bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!
                       if [ "$RANK" = "0" ]; then
@@ -203,10 +205,10 @@ spec:
                       else
                         # A worker is a shard of the same server as rank-0; rank-0's exit code
                         # gates every real failure. Teardown (leader gone -> peer disconnect /
-                        # SIGTERM 143 / SIGKILL 137 on "Connection reset by peer") passes; a
+                        # SIGTERM 143 / SIGKILL 137 on gloo "Connection reset|closed by peer") passes; a
                         # genuine local crash (OOM 137 without that signature, SIGSEGV 139) fails.
                         wait "$spid"; src=$?
-                        if [ "$src" = 137 ] && grep -q "Connection reset by peer" /tmp/server.log; then
+                        if [ "$src" = 137 ] && grep -qE "Connection (reset|closed) by peer" /tmp/server.log; then
                           echo "worker rank=$RANK: leader closed (teardown); success"; exit 0
                         fi
                         case "$src" in

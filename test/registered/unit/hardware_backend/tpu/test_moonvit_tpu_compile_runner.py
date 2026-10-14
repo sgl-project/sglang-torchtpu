@@ -12,7 +12,7 @@ from sglang_tpu.graph_runner.moonvit_tpu_compile_runner import (
     MoonVitTpuCompileRunner,
 )
 
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class _Block(nn.Module):

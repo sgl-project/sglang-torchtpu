@@ -8,6 +8,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu, is_tpu
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
@@ -610,6 +611,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _free_swa_pages(self, free_index: torch.Tensor, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        if current_platform.keeps_swa_index_mapping_on_host():
+            # The mapping is host-resident (see __init__), and so are the kv rows
+            # segment frees are cut from (the host-resident req_to_token table).
+            assert free_index.device.type == "cpu", (
+                "SWA segment frees need host indices; "
+                "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 is not supported with SWA"
+            )
         full_page_representatives = free_index[::ps]
         # torch_npu's transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu.
         if not _is_npu and free_index.is_cuda:

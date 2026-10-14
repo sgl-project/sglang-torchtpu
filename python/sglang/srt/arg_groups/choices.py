@@ -95,6 +95,7 @@ ATTENTION_BACKEND_CHOICES = [
     "pallas_tpu_rpa_v3",
     "pallas_tpu_rpa_batched",
     "pallas_tpu_mla",
+    "pallas_tpu_mla_sparse",
     # Other platforms
     "intel_amx",
     "ascend",

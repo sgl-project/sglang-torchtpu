@@ -1,9 +1,10 @@
 {
   "branches": {
     "python/sglang/srt/arg_groups/kimi_k3_hook.py": 1,
+    "python/sglang/srt/arg_groups/model_hook.py": 1,
+    "python/sglang/srt/arg_groups/model_overrides/deepseek_v2.py": 1,
     "python/sglang/srt/arg_groups/speculative_hook.py": 1,
     "python/sglang/srt/compilation/compiled_op.py": 1,
-    "python/sglang/srt/configs/model_config.py": 1,
     "python/sglang/srt/disaggregation/decode.py": 2,
     "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py": 3,
     "python/sglang/srt/disaggregation/prefill.py": 7,
@@ -20,6 +21,7 @@
     "python/sglang/srt/layers/logits_processor.py": 11,
     "python/sglang/srt/layers/moe/fused_moe_triton/layer.py": 3,
     "python/sglang/srt/layers/moe/hash_topk.py": 6,
+    "python/sglang/srt/layers/moe/mhc_post_fusion.py": 3,
     "python/sglang/srt/layers/moe/token_dispatcher/standard.py": 3,
     "python/sglang/srt/layers/moe/topk.py": 12,
     "python/sglang/srt/layers/moe/utils.py": 4,

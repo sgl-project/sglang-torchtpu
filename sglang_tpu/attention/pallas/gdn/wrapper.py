@@ -18,6 +18,7 @@
 # plain-decode compact path (no f32 copy, no row padding), and the batch
 # padding to lcm(packing, INVERT_BLOCK) with mixed_tile_size capped by it.
 
+import dataclasses
 import functools
 import math
 
@@ -390,6 +391,8 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     batched_only: bool = False,
     prefill_only: bool = False,
+    track_indices: jax.Array | None = None,
+    track_end: jax.Array | None = None,
     zero_initialize_out: bool = True,
     packed_weights: jax.Array | None = None,
     compute_precision: jnp.dtype = jnp.float32.dtype,
@@ -469,6 +472,17 @@ def fused_conv1d_gdn(
         packed_weights: KDA only, no conv bias: conv weight, dt_bias and a_log
             packed into one f32 array (kda_layout.kda_packed_weights_shape),
             used instead of `conv_weight` / `dt_bias` / `a_log`.
+        track_indices: Optional int32 tensor of shape [num_seqs], in the same
+            sequence order as state_indices. Each entry is a physical slot in
+            both dense state caches for a radix-cache snapshot, separate from
+            the request's active state slot. Supply together with track_end;
+            unsupported with state_source or speculative decoding. Disabled
+            rows must still use an in-bounds slot; null slot 0 serves padding.
+        track_end: Optional int32 tensor of shape [num_seqs]. Each entry is the
+            exclusive token offset in the packed qkv input at which to save
+            both convolution and recurrent state into track_indices. Use -1
+            to disable a row. An enabled boundary must coincide with the end
+            of a nonempty kernel tile; it may precede the end of the prefill.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -530,6 +544,10 @@ def fused_conv1d_gdn(
                 "support."
             )
 
+    if (track_indices is None) != (track_end is None):
+        raise ValueError("track_indices and track_end must be supplied together")
+    if track_indices is not None and (state_source is not None or num_spec_tokens):
+        raise ValueError("Radix snapshots require dense, non-speculative states")
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
@@ -715,6 +733,15 @@ def fused_conv1d_gdn(
                 ckpt_indices=ckpt_indices,
             )
 
+        if track_indices is not None:
+            # PER_SEQ rotates sequences past the batched segment; keep the
+            # snapshot routing in exactly the same sequence order.
+            shift = -distribution[0] if mode == config.GDNMode.PER_SEQ else 0
+            metadata_obj = dataclasses.replace(
+                metadata_obj,
+                s_idx_to_track_indices=jnp.roll(track_indices, shift),
+                s_idx_to_track_end=jnp.roll(track_end, shift),
+            )
         # One SMEM operand instead of one per field (each staged by XLA with
         # its own copy), on the only call SGLang makes: dense states, no
         # checkpoints. The pooled and checkpoint paths keep one operand per

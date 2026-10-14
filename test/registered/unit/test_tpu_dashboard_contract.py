@@ -30,7 +30,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tpu.evals import model_config
 
-register_cpu_ci(est_time=260, suite="base-a-test-cpu")
+register_cpu_ci(est_time=70, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 TPU_TESTS = REPO / "test" / "registered" / "tpu"
@@ -51,6 +51,40 @@ ALIASES_FILE = TPU_CI / "dashboard_aliases.json"
 # The dashboard's contract kinds (redesign doc B.5.3): anything else is stored
 # but charted nowhere, which is exactly the silent failure this lint prevents.
 CONTRACT_KINDS = {"accuracy", "performance", "info"}
+
+
+_DISCOVER_MANY = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import discover_tests
+root, suites = sys.argv[2], json.loads(sys.argv[3])
+print(json.dumps({s: discover_tests.discover(s, True, root) for s in suites}))
+"""
+
+
+def _discover_suites(suites: tuple) -> dict:
+    """{suite: rendered rows} for many suites, in one discovery process.
+
+    Same code path as ``discover_tests.py --suite <s> --nightly``, asked once
+    per suite inside a single child: collecting imports every registered test,
+    which the script caches per root, so a call per suite would re-walk the
+    whole tree each time.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _DISCOVER_MANY,
+            str(TPU_CI),
+            str(REPO / "test" / "registered"),
+            json.dumps(list(suites)),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO),
+        check=True,
+    )
+    return json.loads(proc.stdout)
 
 
 def _discover(script: str, *args: str) -> list:
@@ -326,6 +360,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             + list(self.external)
         )
         accuracy_perf_files = []
+        rendered = _discover_suites(tuple(self.registered))
         for suite in self.registered:
             workflow = None
             if suite.startswith("nightly-tpu-perf-"):
@@ -338,7 +373,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
             self.assertIn(suite, text, f"{suite} is not in {workflow}'s matrix")
             # ...and render to exactly one file (one file, one suite, one job).
-            rows = _discover("discover_tests.py", "--suite", suite, "--nightly")
+            rows = rendered[suite]
             self.assertEqual(
                 len(rows), 1, f"{suite} renders {len(rows)} jobs, contract is 1"
             )

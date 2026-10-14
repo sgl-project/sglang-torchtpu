@@ -47,7 +47,7 @@ def build_model_config():
             {
                 "dataset": "gpqa",
                 "label": "gpqa_diamond",
-                "baseline": 0.715,
+                "baseline": 0.810,  # model card
                 "atol": 0.10,
                 "repeat": 1,
                 "num_threads": 128,
@@ -58,8 +58,8 @@ def build_model_config():
             {
                 "dataset": "aime25",
                 "label": "aime25",
-                # Preserve the existing serving-regression threshold.
-                "baseline": 0.875,
+                "baseline": 0.875,  # model card
+                # 30 questions x 1 pass: 0.12 would false-alarm ~1 night in 8.
                 "atol": 0.20,
                 "repeat": 1,
                 "num_threads": 128,
@@ -71,7 +71,8 @@ def build_model_config():
             {
                 "dataset": "mmlu",
                 "label": "mmlu",
-                "report_only": True,
+                "baseline": 0.91,  # measured on TPU
+                "atol": 0.1,
                 "repeat": 1,
                 # The same seeded 250 rows every model and every night: sgl-eval's
                 # mmlu pins the archive revision and samples with sample_seed=0.

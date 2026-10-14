@@ -14,7 +14,7 @@ from sglang_tpu.kv_row_write import (  # noqa: E402
     write_rows,
 )
 
-register_tpu_ci(est_time=3, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=3, suite="stage-a-test-tpu-unit", chips=1)
 
 pytestmark = pytest.mark.skipif(
     not any(d.platform == "tpu" for d in jax.devices()), reason="needs a TPU"

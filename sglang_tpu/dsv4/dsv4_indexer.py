@@ -24,19 +24,13 @@ requires evaluated type objects rather than stringified annotations.
 
 from typing import List, Optional
 
-import jax
-import jax.numpy as jnp
 import torch
 
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang_tpu.dsv4.dsv4_memory_pool import (
     DSV4TPUTokenToKVPool,
-)
-from sglang_tpu.dsv4.rope import (
     get_or_build_cos_sin_cache,
-    rope_quant,
 )
-from sglang_tpu.dsv4.streamindex_topk import streamindex_topk
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 _STREAMINDEX_TOPK_OP_NAME = "sglang_tpu_pallas::dsv4_streamindex_topk"
@@ -72,7 +66,12 @@ def _register_streamindex_topk_op():
     if _streamindex_topk_custom_op is not None:
         return _streamindex_topk_custom_op
 
+    import jax
+    import jax.numpy as jnp
     from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.dsv4.rope import rope_quant
+    from sglang_tpu.dsv4.streamindex_topk import streamindex_topk
 
     _exported_shapes = set()
 

@@ -35,6 +35,7 @@ on:
           - mh
           - pd-mh-qwen3-480b-kvoff-reshard
           - pd-mh-qwen3-vl-8b-spec
+          - pd-sh-qwen3-vl-30b
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"
@@ -99,6 +100,7 @@ jobs:
     outputs:
       single_host: ${{ steps.tests.outputs.single_host }}
       pd_kvoff_reshard_qwen: ${{ steps.tests.outputs.pd_kvoff_reshard_qwen }}
+      pd_singlehost_qwen3_vl_30b: ${{ steps.tests.outputs.pd_singlehost_qwen3_vl_30b }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,6 +129,7 @@ jobs:
           echo "single_host=$single_host" >> "$GITHUB_OUTPUT"
           discover_files='python3 .github/tpu-ci/discover_files.py'
           echo "pd_kvoff_reshard_qwen=$($discover_files --entry test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_qwen3_vl_30b=$($discover_files --entry test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py)" >> "$GITHUB_OUTPUT"
 
   single-host:
     needs: [build, discover-tests]
@@ -204,6 +207,35 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
       weights_pvc: model-weights
       run_name: pd-mh-qwen3-vl-8b-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # Qwen3-VL-30B-A3B MMMU-Pro on the raiden P/D pair: the prefill runs the ViT,
+  # so image-derived KV crosses into a fused-MoE decode. Same serving settings
+  # and gate as the single-host Qwen3-VL-30B-A3B test, which isolates the handoff.
+  # In-project, like pd-mh-qwen3-vl-8b-spec: its weights and the MMMU-Pro dataset
+  # are not staged for the external cluster (no internet egress there).
+  pd-sh-qwen3-vl-30b:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-qwen3-vl-30b"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_qwen3_vl_30b)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py integration
+      files: test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py
+      weights_pvc: model-weights
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_qwen3_vl_30b)[0].run_name }}
     permissions:
       contents: read
       id-token: write

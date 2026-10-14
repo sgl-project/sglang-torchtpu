@@ -92,6 +92,7 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
 
     scheduler.get_new_batch_prefill = plan
     scheduler.get_next_disagg_decode_batch_to_run = plan
+    scheduler._pp_pd_stage_ready = Mock()
     for name in (
         "_pp_pd_get_bootstrapped_ids",
         "_pp_pd_get_prefill_transferred_ids",

@@ -18,7 +18,7 @@ python3 -m pytest test/registered/unit/test_tpu_dashboard_contract.py -q
 | category | where | protocol |
 |---|---|---|
 | **Feature validation** | `test/registered/tpu/e2e/`, `integration/` | Tests a *feature* on some model. `register_tpu_ci(suite=..., nightly=True)` is the whole dashboard contract — pass/fail comes from the TIMINGS record, no metric dump needed. One job ↔ one test file. |
-| **Accuracy** | `test/registered/tpu/nightly-accuracy/` | Model backbone only: basic serving config, **no feature flags**. One file and one suite per **benchmark**, sharing the model's `*_eval_common.py` config module; scores are `report_only` (the trend detects regressions). |
+| **Accuracy** | `test/registered/tpu/nightly-accuracy/` | Model backbone only: basic serving config, **no feature flags**. One file and one suite per **benchmark**, sharing the model's `*_eval_common.py` config module; each gate fails below a lenient hardcoded floor, `baseline - atol` (model card, or the TPU-measured score where the card has none; atol 0.12 for AIME (0.20 for single-pass R1), 0.10 otherwise). |
 | **Perf** | `test/registered/tpu/nightly-perf/` | Specific model + serving config, through `RecipeLauncher` + `bench_serving.sh` **only** (that is what puts the server/bench config panels on the dashboard). Egress order: digest lines → `dump_metric` per number (clean legs only) → the framed `emit_result_payload` summary. |
 
 The nightly (`nightly-test-tpu.yml`) builds once, then fans out the feature-validation

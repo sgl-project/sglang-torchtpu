@@ -1139,6 +1139,11 @@ class MambaPool:
             (time.perf_counter() - started) * 1000,
         )
 
+    @property
+    def slot_allocator_device(self):
+        """Device for authoritative slot IDs, independently of state storage."""
+        return self.device
+
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         for sibling in self._slot_siblings:
@@ -1465,7 +1470,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
-            device=device,
+            device=self.mamba_pool.slot_allocator_device,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
@@ -1624,10 +1629,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert len(select_index) == len(mamba_ping_pong_track_buffers), (
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
-        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
+        mamba_index_tensor = torch.stack(mamba_indices).to(
+            device=self.device, dtype=torch.int32
+        )
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
+            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
+                self.device
+            )
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 ping_pong_tensor
             )
@@ -1793,7 +1802,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         """
         req.kv.mamba_ping_pong_track_buffer[idx] = value
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
-            req.kv.mamba_ping_pong_track_buffer
+            req.kv.mamba_ping_pong_track_buffer.to(self.device)
         )
 
     def donate_mamba_ping_pong_slot(
@@ -1828,11 +1837,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req.kv.mamba_pool_idx = None
 
         if self.enable_mamba_extra_buffer:
-            mamba_ping_pong_track_buffer_to_free = (
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                    req.kv.req_pool_idx
-                ]
-            )
+            # The request owns the authoritative IDs. The mapping is a device
+            # mirror for attention metadata and may live off the allocator device.
+            mamba_ping_pong_track_buffer_to_free = req.kv.mamba_ping_pong_track_buffer
             if mamba_ping_pong_track_buffer_to_keep is not None:
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,

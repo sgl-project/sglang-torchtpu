@@ -76,6 +76,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
     "intel_xpu",
     "pallas_tpu_mla",
+    "pallas_tpu_mla_sparse",
 ]
 
 

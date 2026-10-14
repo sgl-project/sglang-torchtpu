@@ -24,7 +24,7 @@ bucket there, so this key is only ever a hit when a test inserts it.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 from unittest import mock

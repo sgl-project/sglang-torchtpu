@@ -42,6 +42,13 @@ from ci_register_loader import ci_register as _ci_register
 _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
 
+# Fraction of perfect scaling the chip-pinned phase actually achieves. Four
+# workers measured 2.8x, the loss being the 3s launch spacing plus the tail
+# where fewer than four files remain. Used only to size the runtime budget:
+# over-stating it would cut a slow run short, understating it hands the
+# runtime clock seconds that the admission budget needs more.
+_CHIP_PARALLEL_EFFICIENCY = 0.7
+
 # P/D mode: two engines to bring up (weight load + compile warmup on both
 # slices) before the probe + accuracy eval even start. Longest seen: 100 min;
 # kept under 3h so _tpu-test.yml's 6h job cap leaves a 3h admission window.
@@ -102,6 +109,7 @@ def suite_wait_seconds(
     test_file="",
     partition_id=None,
     partition_size=None,
+    chip_workers=0,
 ):
     files = [
         path
@@ -126,6 +134,14 @@ def suite_wait_seconds(
     if partition_size is not None:
         tests = _ci_register.auto_partition(tests, partition_id, partition_size)
     total = sum(test.est_time for test in tests)
+    if chip_workers > 1:
+        # `chips=1` files run several at a time, so their est_time no longer
+        # adds up along the clock. Whole-node files still do. Getting this
+        # wrong is not symmetric: _tpu-test.yml spends what is left of the
+        # runner's 6h on queueing, so an over-booked runtime is why a job
+        # sits behind a busy queue and then reports NOT ADMITTED.
+        pinned = sum(test.est_time for test in tests if test.chips == 1)
+        total -= pinned - pinned / (chip_workers * _CHIP_PARALLEL_EFFICIENCY)
     return max(int(total * _WAIT_MARGIN), _WAIT_FLOOR_SECONDS)
 
 
@@ -165,6 +181,15 @@ def main():
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
+    ap.add_argument(
+        "--tpu-chip-workers",
+        type=int,
+        default=0,
+        help=(
+            "Run this many `chips=1` tests at once, each pinned to one chip of "
+            "the slice the job already holds. 0 or 1 keeps the whole node per test."
+        ),
+    )
     ap.add_argument("--partition-id", type=int, default=-1)
     ap.add_argument("--partition-size", type=int, default=0)
     ap.add_argument(
@@ -191,6 +216,7 @@ def main():
                 a.tests_dir,
                 nightly=a.nightly,
                 test_file=a.test_file,
+                chip_workers=a.tpu_chip_workers,
                 **partition_args,
             )
         )
@@ -339,9 +365,9 @@ def main():
     # Discovered set when --pools is passed (it already unions in topology.yaml's entry).
     pools = a.pools.split() or sl["pools"]
 
-    # Suite mode runs every registered file sequentially, so its deadline scales
-    # with the suite (same est_time formula as _tpu-test's poll budget, keeping the
-    # two in agreement). Exec gets 7200: the combo rows budget WAIT_SECS=2400 for
+    # Suite mode's deadline scales with the suite (same est_time formula as
+    # _tpu-test's poll budget, keeping the two in agreement), discounted for
+    # chip sharing when it is on. Exec gets 7200: the combo rows budget WAIT_SECS=2400 for
     # engine bring-up alone.
     if suite:
         active_deadline = suite_wait_seconds(
@@ -349,6 +375,7 @@ def main():
             a.tests_dir,
             nightly=a.nightly,
             test_file=a.test_file,
+            chip_workers=a.tpu_chip_workers,
             **partition_args,
         )
     elif a.exec_cmd:
@@ -383,6 +410,12 @@ def main():
             else ""
         ),
         "TEST_FILE_FLAG": f"--test-file {a.test_file}" if a.test_file else "",
+        "CHIP_WORKERS_FLAG": (
+            f"--tpu-chip-workers {a.tpu_chip_workers}" if a.tpu_chip_workers > 1 else ""
+        ),
+        # Sweeps trimmed for the gate run whole on the nightly; see
+        # python/sglang/test/ci/gate_matrix.py.
+        "FULL_MATRIX": "1" if a.nightly else "0",
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",

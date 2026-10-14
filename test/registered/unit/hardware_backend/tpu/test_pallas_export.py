@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pallas_export
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class TestPallasExportEnvironment(CustomTestCase):

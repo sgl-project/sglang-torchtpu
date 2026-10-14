@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import receiver as receiver_module
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
@@ -20,13 +21,23 @@ from sglang_tpu.disaggregation.raiden.state import DecodeState
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 ROOM = 53
+# SettledTransfer's failure fields, unset.
+_UNREPORTED = dict(elapsed_ns=None, peer=None, code=None, reason=None, phase=None)
 
 
-def _polled(sent=(), received=(), failed=(), completed_ns=None):
-    """Fake poll_stats_with_details() result for the given req ids."""
+def _polled(sent=(), received=(), failed=(), completed_ns=None, details=None):
+    """Fake poll_stats_with_details() result for the given req ids; ``details``
+    maps a req id to the failure fields raiden reports for it."""
 
     def settled(ids):
-        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+        return [
+            SimpleNamespace(
+                req_id=r,
+                completed_ns=completed_ns,
+                **{**_UNREPORTED, **(details or {}).get(r, {})},
+            )
+            for r in ids
+        ]
 
     return SimpleNamespace(
         sent=settled(sent), received=settled(received), failed=settled(failed)
@@ -131,6 +142,37 @@ class TestStartReadFailure(unittest.TestCase):
         self.assertEqual(len(mgr._pulling), 0)
         with self.assertRaisesRegex(Exception, "injected start_read"):
             recv.failure_exception()
+
+    def test_read_raiden_failed_names_its_cause(self):
+        """A read raiden failed must name raiden's cause in the room's failure."""
+        mgr = _decode_manager(hybrid=False, chunked=False)
+        mgr._on_blocks(_blocks(hybrid=False))
+        recv = _receiver(mgr)
+        rejection = "Remote producer rejected Hybrid Bridge read request"
+
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            recv.poll()
+            mgr._engine.poll_stats_with_details.return_value = _polled(
+                failed=[str(ROOM)],
+                details={
+                    str(ROOM): dict(
+                        code="FAILED_PRECONDITION",
+                        phase="connect",
+                        peer="127.0.0.1:31020",
+                        elapsed_ns=2_000_000,
+                        reason=rejection,
+                    )
+                },
+            )
+            self.assertEqual(recv.poll(), KVPoll.Failed)
+
+        with self.assertRaises(KVTransferError) as cm:
+            recv.failure_exception()
+        self.assertEqual(
+            cm.exception.failure_reason,
+            f"Raiden receive failed: req_id={ROOM} code=FAILED_PRECONDITION "
+            f"phase=connect peer=127.0.0.1:31020 elapsed_ms=2.0 reason={rejection}",
+        )
 
     def test_window_read_failure_holds_the_room_while_the_full_read_runs(self):
         mgr = _decode_manager(hybrid=True, chunked=False)

@@ -1772,7 +1772,8 @@ class Scheduler(
         )
 
     def maybe_init_kv_free_fence(self):
-        """Hold KV pages freed under overlap back from DMA write targets."""
+        """Hold KV pages freed under overlap back from DMA write targets.
+        Raises if the fence cannot cover every KV write of this server."""
         if not self._needs_kv_free_fence():
             return
         from sglang_tpu.kv_free_fence import (
@@ -1790,19 +1791,17 @@ class Scheduler(
             self.token_to_kv_pool_allocator, **fence_kwargs
         )
         if reason is not None:
-            if self._uses_raiden_hicache():
-                raise ValueError(
-                    f"The raiden HiCache backend needs the KV free fence: {reason}"
-                )
-            # Unlike raiden HiCache, a PD decode server can serve unfenced.
-            # TODO(#1213): fail startup here once every PD decode
-            # configuration can be fenced.
-            logger.warning(
-                "KV arriving on this PD decode server is not fenced against "
-                "in-flight forwards: %s",
-                reason,
+            # Unfenced, a DMA into a freed page can land before an in-flight
+            # forward's write to it and be overwritten without any error.
+            needed_by = (
+                "The raiden HiCache backend"
+                if self._uses_raiden_hicache()
+                else "A PD decode server under overlap scheduling"
             )
-            return
+            raise ValueError(
+                f"{needed_by} needs the KV free fence: {reason} "
+                "Pass --disable-overlap-schedule to run without it."
+            )
         self.kv_free_fence = install_kv_free_fence(
             self.token_to_kv_pool_allocator,
             synchronize_device=self.device_module.synchronize,
@@ -5150,6 +5149,7 @@ class Scheduler(
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+        self.maybe_signal_queued_health_checks(batch)
         self.metrics_reporter.update_device_timer()
         if self.kv_free_fence is not None:
             self.kv_free_fence.on_forward_done(result)
@@ -5218,6 +5218,46 @@ class Scheduler(
                 )
             )
 
+    def maybe_signal_queued_health_checks(self, batch: ScheduleBatch) -> None:
+        """Answer health probes that are queued behind a prefill doing real work.
+
+        A probe that arrives while the scheduler looks idle is admitted like a
+        normal request, yet it can still land behind a long prompt (e.g. on a
+        PD prefill both leave the bootstrap queue in the same poll, prompt
+        first). Each chunk of that prompt fills the prefill token budget, so
+        the probe is not scheduled until the chain ends, and a prefill server
+        sends the tokenizer nothing meanwhile. A completed prefill batch with
+        real work is the evidence the busy path in process_input_requests
+        relies on, so send the same HealthCheckOutput that
+        maybe_send_health_check_signal sends.
+
+        The queues are the only state: each queued probe is flagged when
+        signaled, so a long chain answers it once, not once per chunk. A
+        scheduler that completes no batch sends nothing, so a hung engine still
+        fails the probe. The probe stays queued and runs its 1-token forward
+        later; the tokenizer drops that late output.
+        """
+        if (
+            not batch.forward_mode.is_extend_without_speculative()
+            or not batch.reqs
+            or all(is_health_check_generate_req(req) for req in batch.reqs)
+        ):
+            return
+        queues = [self.waiting_queue]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            queues.append(self.disagg_prefill_bootstrap_queue.queue)
+        for queue in queues:
+            for req in queue:
+                if not is_health_check_generate_req(req) or getattr(
+                    req, "_health_check_signaled", False
+                ):
+                    continue
+                req._health_check_signaled = True
+                # One per probe rid, so an own-rid probe waiter can match it.
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(rid=req.rid, http_worker_ipc=req.http_worker_ipc)
+                )
+
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
     ) -> Optional[AddExternalCorpusReqOutput]:
@@ -5281,6 +5321,11 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+                # The /metrics gauges too: no batch report writes them in this
+                # state, and the fully-idle publish below is skipped, so a stuck
+                # P/D engine would otherwise look idle (#1303). Self-paced to
+                # once per 30 s without a stats log.
+                self.metrics_reporter.maybe_log_stall_metrics()
             if (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
