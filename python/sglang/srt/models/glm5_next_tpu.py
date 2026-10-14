@@ -4,7 +4,8 @@
 Projection and checkpoint mappings adapted from SGLang PR #36507. This initial
 implementation supports bounded-context text generation: below index_topk
 tokens DSA selects the entire causal prefix, which can be evaluated exactly using
-ordinary attention. KDA uses the JAX recurrence in hardware_backend/tpu.
+ordinary attention. KDA runs on the fused GDN v3 Pallas kernel in KDA mode
+(sglang_tpu.attention_kda_pallas, shared with Kimi-K3).
 """
 
 from typing import Optional
@@ -209,6 +210,32 @@ class Glm5NextLinearAttention(nn.Module):
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
 
+    def bind_tpu_attn_weights(self) -> None:
+        """Bind the weights the TPU KDA kernel reads, after load (as Kimi-K3 does).
+
+        The conv weight is the depthwise [dim, 1, K] parameter itself: torch_tpu
+        would re-materialize a view of it on every call. A_log is an [n_v] copy,
+        and the kernel reads conv / dt_bias / A_log from one packed f32 operand,
+        so online weight updates are rejected (see the model's load_weights).
+        """
+        from sglang_tpu.kda_layout import pack_kda_weights
+
+        attn = self.attn
+        attn.conv_weights = self.qkv_conv1d.weight
+        attn.A_log = nn.Parameter(
+            self.A_log.detach().reshape(-1).clone(), requires_grad=False
+        )
+        attn.dt_bias = self.dt_bias
+        # The packed operand has no conv bias; qkv_conv1d is built without one.
+        assert attn.bias is None, "packed KDA weights carry no conv bias"
+        attn.packed_kernel_weights = pack_kda_weights(
+            attn.conv_weights,
+            attn.dt_bias,
+            attn.A_log,
+            attn.num_v_heads,
+            attn.head_k_dim,
+        ).to(attn.conv_weights.device)
+
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -248,9 +275,10 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
+        # The TPU backend returns [1, tokens, heads, dim]; drop the batch axis
+        # only, so a one-token decode keeps its token axis.
+        core_attn_out = core_attn_out.reshape(norm_gate.shape)
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        # The TPU backend returns [tokens, heads, dim], including a token axis
-        # for batch-one decode.
         core_attn_out = core_attn_out.flatten(-2)
 
         return self.o_proj(core_attn_out)[0]
@@ -563,12 +591,18 @@ class Glm5NextForConditionalGeneration(nn.Module):
         missing = set(params) - loaded
         if missing:
             raise ValueError(f"Missing GLM-5.3-Flash weights: {sorted(missing)}")
-        # The linear-attention layer holds a view. Refresh after loaders that
-        # rebind storage (the TPU FP8 preparation path uses this convention).
+        # After loaders that rebind storage (the TPU FP8 preparation path uses
+        # this convention), bind what the KDA kernel reads.
         for layer in self.model.layers:
             attn = layer.self_attn
             if isinstance(attn, Glm5NextLinearAttention):
-                attn.attn.conv_weights = attn.qkv_conv1d.weight.squeeze(1)
+                attn.bind_tpu_attn_weights()
+        # Writes that skip load_weights would leave the bound copies stale.
+        self._derived_weight_cache_error = (
+            "Online weight updates are not supported for GLM-5.3-Flash on TPU: "
+            "the KDA kernel reads conv weight / dt_bias / A_log copies built at "
+            "load time. Restart the server to change weights."
+        )
 
 
 # Replaces the upstream glm5_next implementation on TPU.

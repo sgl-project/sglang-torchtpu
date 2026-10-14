@@ -540,10 +540,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 linear_attn_backend = KDAAttnBackend(runner)
         elif glm5_next_config(runner.model_config) is not None:
             if is_tpu():
-                backend_cls = import_backend_class(
-                    "sglang_tpu.attention_kda.TpuKDAAttnBackend"
-                )
-                linear_attn_backend = backend_cls(runner)
+                # Same fused KDA kernel backend as Kimi-K3.
+                from sglang_tpu.attention_kda_pallas import TpuKDAAttnBackend
+
+                linear_attn_backend = TpuKDAAttnBackend(runner)
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:

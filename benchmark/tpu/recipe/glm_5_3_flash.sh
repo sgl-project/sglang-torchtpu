@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Initial GLM-5.3-Flash text-only TP8/EP8 recipe. DSA is exactly dense within
-# the configured context (2048 selected tokens); KDA remains recurrent.
+# the configured context (2048 selected tokens); KDA runs on the fused GDN v3
+# Pallas kernel (shared with Kimi-K3).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 exec env \
