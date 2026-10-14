@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
@@ -16,7 +16,6 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -25,23 +24,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-# Sampling param fields and the neutral value HOST_PADDED mode pads their bucket rows with.
-_SAMPLING_PARAM_PAD_FILLS: Dict[str, float] = {
-    "temperatures": 1.0,
-    "top_ps": 1.0,
-    "top_ks": 1,
-    "min_ps": 0.0,
-    "sampling_seed": 0,
-}
-
-
-def _pad_host_rows(
-    value: torch.Tensor, rows: int, fill: float, pin: bool
-) -> torch.Tensor:
-    out = torch.full((rows, *value.shape[1:]), fill, dtype=value.dtype, pin_memory=pin)
-    out[: value.shape[0]] = value
-    return out
 
 
 def _rows_to_device_indices(
@@ -121,11 +103,6 @@ class SamplingBatchInfo:
 
     # Device
     device: str = "cuda"
-    # HOST_PADDED keeps the sampling param tensors on CPU, padded to host_pad_bs(real_batch_size)
-    # rows so consumers upload one bucket shape; see on_device().
-    tensor_source_of_truth: TensorSourceOfTruth = TensorSourceOfTruth.DEVICE
-    host_pad_bs: Optional[Callable[[int], int]] = None
-    real_batch_size: int = 0
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
@@ -147,12 +124,7 @@ class SamplingBatchInfo:
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
-        tensor_source_of_truth = batch.tensor_source_of_truth
-        param_device = (
-            "cpu"
-            if tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED
-            else device
-        )
+        param_device = cls.parameter_device(batch)
         # Match the [B, 1] device allocation produced by merging/filtering.
         # A device-side view of [B] gives TorchTPU a different compiled input.
         temperatures = (
@@ -307,9 +279,6 @@ class SamplingBatchInfo:
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
-            tensor_source_of_truth=tensor_source_of_truth,
-            host_pad_bs=batch.host_pad_bs,
-            real_batch_size=len(reqs),
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
             uniform_top_k=(
@@ -324,8 +293,6 @@ class SamplingBatchInfo:
             ),
             sampling_mask_top_ks=sampling_mask_top_ks,
         )
-        if tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED:
-            ret._store_host_params(ret._live_host_params(), len(reqs))
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
 
@@ -379,29 +346,38 @@ class SamplingBatchInfo:
             return None
         return _rows_to_device_indices(indices, device)
 
+    @classmethod
+    def parameter_device(cls, batch):
+        """Device on which request sampling parameters are initially materialized."""
+        return batch.device
+
+    def _filter_params(self, keep_indices, keep_indices_device):
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+            "sampling_seed",
+        ]:
+            value = getattr(self, item, None)
+            if value is not None:
+                setattr(self, item, value[keep_indices_device])
+
+    def _merge_params(self, other):
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+            "sampling_seed",
+        ]:
+            self_val = getattr(self, item, None)
+            other_val = getattr(other, item, None)
+            if self_val is not None and other_val is not None:
+                setattr(self, item, torch.cat([self_val, other_val]))
+
     def __len__(self):
-        if self.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED:
-            return self.real_batch_size
         return len(self.temperatures)
-
-    def _live_host_params(self) -> Dict[str, torch.Tensor]:
-        return {
-            name: value[: self.real_batch_size]
-            for name in _SAMPLING_PARAM_PAD_FILLS
-            if (value := getattr(self, name)) is not None
-        }
-
-    def _store_host_params(
-        self, live: Dict[str, torch.Tensor], batch_size: int
-    ) -> None:
-        """Pad live host param rows to the bucket of batch_size, in place."""
-        assert self.host_pad_bs is not None
-        padded_bs = self.host_pad_bs(batch_size)
-        pin = is_pin_memory_available(self.device)
-        for name, value in live.items():
-            fill = _SAMPLING_PARAM_PAD_FILLS[name]
-            setattr(self, name, _pad_host_rows(value, padded_bs, fill, pin))
-        self.real_batch_size = batch_size
 
     def update_regex_vocab_mask(self):
         if not self.grammars:
@@ -493,17 +469,7 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
-        if self.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED:
-            keep = torch.tensor(keep_indices, dtype=torch.long)
-            self._store_host_params(
-                {name: value[keep] for name, value in self._live_host_params().items()},
-                len(keep_indices),
-            )
-        else:
-            for item in _SAMPLING_PARAM_PAD_FILLS:
-                value = getattr(self, item, None)
-                if value is not None:
-                    setattr(self, item, value[keep_indices_device])
+        self._filter_params(keep_indices, keep_indices_device)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -624,22 +590,7 @@ class SamplingBatchInfo:
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
-        assert self.tensor_source_of_truth is other.tensor_source_of_truth
-        if self.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED:
-            other_live = other._live_host_params()
-            self._store_host_params(
-                {
-                    name: torch.cat([value, other_live[name]])
-                    for name, value in self._live_host_params().items()
-                },
-                len(self) + len(other),
-            )
-        else:
-            for item in _SAMPLING_PARAM_PAD_FILLS:
-                self_val = getattr(self, item, None)
-                other_val = getattr(other, item, None)
-                if self_val is not None and other_val is not None:
-                    setattr(self, item, torch.cat([self_val, other_val]))
+        self._merge_params(other)
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
@@ -688,17 +639,6 @@ class SamplingBatchInfo:
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
         return dataclasses.replace(self, penalizer_orchestrator=None)
-
-    def on_device(self) -> SamplingBatchInfo:
-        """This info with the sampling param tensors on self.device; HOST_PADDED keeps its bucket rows."""
-        if self.tensor_source_of_truth is TensorSourceOfTruth.DEVICE:
-            return self
-        moved = {
-            name: value.to(self.device, non_blocking=True)
-            for name in _SAMPLING_PARAM_PAD_FILLS
-            if (value := getattr(self, name)) is not None
-        }
-        return dataclasses.replace(self, **moved)
 
 
 def merge_bias_tensor(

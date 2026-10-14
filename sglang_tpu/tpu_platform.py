@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from contextlib import AbstractContextManager, contextmanager
-from typing import TYPE_CHECKING, Callable, Optional, Type
+from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
@@ -1087,19 +1087,6 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
-
-    def get_host_batch_padder(self, spec_algorithm: str) -> Callable[[int], int] | None:
-        # Plugin load order: spec_info imports platforms, so it cannot be top-level here.
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.experimental import (
-            get_host_batch_padder,
-            is_experimental_dspark,
-        )
-
-        # TpuSpecWorker pads host-born batch tensors to the batch bucket on host.
-        if is_experimental_dspark(SpeculativeAlgorithm[spec_algorithm]):
-            return get_host_batch_padder()
-        return None
 
     def supports_torch_compile(self) -> bool:
         return True

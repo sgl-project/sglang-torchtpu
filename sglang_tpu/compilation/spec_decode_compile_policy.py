@@ -16,7 +16,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
-from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.compiled_forward_shim import (
@@ -31,6 +30,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (
     _warmup_progress,
 )
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.experimental.host_sampling import is_host_padded
 
 logger = get_logger(__name__)
 
@@ -291,10 +291,7 @@ class BaseSpecDecodeCompilePolicyMixin:
 
         fm = getattr(forward_batch, "forward_mode", None)
         sampling_info = forward_batch.sampling_info
-        host_padded = (
-            sampling_info is not None
-            and sampling_info.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED
-        )
+        host_padded = sampling_info is not None and is_host_padded(sampling_info)
         is_verify = fm is not None and fm.is_target_verify()
         if next_token_logits is not None and real_b < next_token_logits.shape[0]:
             if is_verify:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
@@ -44,6 +45,8 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
 ]
+
+HOOKS.extend(hook_specs())
 
 _registered = False
 

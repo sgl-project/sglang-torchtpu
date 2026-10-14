@@ -17,6 +17,7 @@ gamma), MoE/MLA drafts and hybrid (mamba) targets.
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import cast
 
 import torch
@@ -58,6 +59,7 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.experimental.draft_input import HostPaddedDraftInput
 from sglang_tpu.experimental.tpu_dspark_draft_worker import TpuDsparkDraftWorker
 from sglang_tpu.experimental.tpu_spec_ops import (
     build_draft_block_inputs,
@@ -290,8 +292,15 @@ class TpuDsparkWorker(TpuSpecWorker):
         return result
 
     def state_to_spec_info(self, state: SpecState) -> DFlashDraftInputV2:
-        return make_draft_input_v2(
+        draft_input = make_draft_input_v2(
             bonus_tokens=state.bonus_tokens, new_seq_lens=state.seq_lens
+        )
+        return HostPaddedDraftInput(
+            **{
+                field.name: getattr(draft_input, field.name)
+                for field in fields(draft_input)
+                if field.init
+            }
         )
 
     def get_spec_state(self, batch: ScheduleBatch) -> SpecState:

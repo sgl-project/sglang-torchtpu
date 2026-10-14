@@ -14,7 +14,7 @@ import msgspec
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang_tpu.experimental.draft_input import HostPaddedDraftInput
 from sglang_tpu.experimental.tpu_spec_utils import pad_rows
 
 
@@ -162,7 +162,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     ) -> TpuSpecVerifyInput:
         """Convert the algorithm's batch.spec_info; raise for types without a TPU window."""
         draft_input = batch.spec_info
-        if not isinstance(draft_input, DFlashDraftInputV2):
+        if not isinstance(draft_input, HostPaddedDraftInput):
             raise NotImplementedError(
                 f"No TpuSpecVerifyInput conversion from {type(draft_input)}."
             )

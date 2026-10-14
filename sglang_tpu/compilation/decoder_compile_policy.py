@@ -43,7 +43,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.attention_rank_inputs import (
@@ -72,6 +71,7 @@ from sglang_tpu.cp_forward import (
     wrap_cp_embedding_forward,
 )
 from sglang_tpu.cp_layout import warmup_request_lengths
+from sglang_tpu.experimental.host_sampling import is_host_padded
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
@@ -969,11 +969,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _upload_host_padded_inputs(self, forward_batch: ForwardBatch) -> None:
         """HOST_PADDED inputs were padded on host above; upload them at the bucket shape."""
         sampling_info = forward_batch.sampling_info
-        if (
-            sampling_info is None
-            or sampling_info.tensor_source_of_truth
-            is not TensorSourceOfTruth.HOST_PADDED
-        ):
+        if sampling_info is None or not is_host_padded(sampling_info):
             return
         for name in (*_TOKEN_FIELDS, *_BS_FIELDS):
             if name == "req_pool_indices_cpu":

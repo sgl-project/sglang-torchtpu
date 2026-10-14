@@ -334,26 +334,30 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 
-        self.assertEqual(
+        self.assertIn(
+            (
+                "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
+                initialize_dense_moe_config,
+                HookType.AFTER,
+            ),
             HOOKS,
-            [
-                (
-                    "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
-                    initialize_dense_moe_config,
-                    HookType.AFTER,
-                ),
-                (
-                    "sglang.srt.arg_groups.validation_hook."
-                    "check_pipeline_parallel_compat",
-                    check_pipeline_parallel_compat,
-                    HookType.AROUND,
-                ),
-                (
-                    "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
-                    skip_spec_op_precompile_without_draft,
-                    HookType.AROUND,
-                ),
-            ],
+        )
+
+        self.assertIn(
+            (
+                "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",
+                check_pipeline_parallel_compat,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
+                skip_spec_op_precompile_without_draft,
+                HookType.AROUND,
+            ),
+            HOOKS,
         )
 
     # -- helpers -----------------------------------------------------------

@@ -19,7 +19,6 @@ from sglang.srt.sampling.sampling_batch_info import (
     merge_bias_tensor,
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -737,8 +736,6 @@ class TestFromScheduleBatch(CustomTestCase):
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
-        batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        batch.host_pad_bs = None
 
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertEqual(len(info), 1)
@@ -752,8 +749,6 @@ class TestFromScheduleBatch(CustomTestCase):
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
-        batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        batch.host_pad_bs = None
 
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
 
@@ -766,8 +761,6 @@ class TestFromScheduleBatch(CustomTestCase):
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
-        batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        batch.host_pad_bs = None
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertTrue(info.is_all_greedy)
 
@@ -778,8 +771,6 @@ class TestFromScheduleBatch(CustomTestCase):
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
-        batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        batch.host_pad_bs = None
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNotNone(info.logit_bias)
         self.assertAlmostEqual(info.logit_bias[0, 5].item(), 2.0)
@@ -794,8 +785,6 @@ class TestFromScheduleBatch(CustomTestCase):
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
-        batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        batch.host_pad_bs = None
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNotNone(info.sampling_seed)
         self.assertEqual(info.sampling_seed[0].item(), 123)
@@ -808,8 +797,6 @@ class TestFromScheduleBatch(CustomTestCase):
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
-        batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        batch.host_pad_bs = None
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertTrue(info.need_top_p_sampling)  # 0.9 != 1.0
         self.assertTrue(info.need_top_k_sampling)  # 50 != TOP_K_ALL
@@ -827,8 +814,6 @@ class TestFromScheduleBatch(CustomTestCase):
                 batch = MagicMock()
                 batch.reqs = [self._make_req(top_k=top_k) for top_k in top_ks]
                 batch.device = DEVICE
-                batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-                batch.host_pad_bs = None
 
                 info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
 
@@ -841,8 +826,6 @@ class TestFromScheduleBatch(CustomTestCase):
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
-        batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        batch.host_pad_bs = None
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
 
@@ -851,8 +834,6 @@ class TestFromScheduleBatch(CustomTestCase):
         left_batch = MagicMock()
         left_batch.reqs = [self._make_req(), self._make_req()]
         left_batch.device = DEVICE
-        left_batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        left_batch.host_pad_bs = None
         left = SamplingBatchInfo.from_schedule_batch(left_batch, VOCAB_SIZE)
 
         processor_str = DisallowedTokensLogitsProcessor.to_str()
@@ -862,8 +843,6 @@ class TestFromScheduleBatch(CustomTestCase):
         right_batch = MagicMock()
         right_batch.reqs = [req]
         right_batch.device = DEVICE
-        right_batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        right_batch.host_pad_bs = None
         right = SamplingBatchInfo.from_schedule_batch(right_batch, VOCAB_SIZE)
 
         left.merge_batch(right)
@@ -887,8 +866,6 @@ class TestFromScheduleBatch(CustomTestCase):
         batch = MagicMock()
         batch.reqs = [req1, req2]
         batch.device = DEVICE
-        batch.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        batch.host_pad_bs = None
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
 
         self.assertTrue(info.has_custom_logit_processor)

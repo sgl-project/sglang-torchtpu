@@ -29,7 +29,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attention_backends, get_parallel
-from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -531,12 +530,6 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
-            # HOST_PADDED keeps the slots on host until the backend uploads them bucketed.
-            out_cache_loc_host=(
-                torch.empty((batch.extend_num_tokens,), dtype=torch.int32)
-                if batch.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED
-                else None
-            ),
         )
 
     # Write to req_to_token_pool

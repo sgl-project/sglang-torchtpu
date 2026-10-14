@@ -202,10 +202,6 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports a draft backend for an algorithm."""
         return False
 
-    def get_host_batch_padder(self, spec_algorithm: str) -> Callable[[int], int] | None:
-        """Batch size -> bucket rows for TensorSourceOfTruth.HOST_PADDED batches; None keeps DEVICE."""
-        return None
-
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.

@@ -44,7 +44,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
@@ -55,6 +54,7 @@ from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
 from sglang_tpu.experimental import register_host_batch_padder
+from sglang_tpu.experimental.host_sampling import HostPaddedSamplingInfo, is_host_padded
 from sglang_tpu.experimental.tpu_dspark_draft_worker import TpuDsparkDraftWorker
 from sglang_tpu.experimental.tpu_spec_ops import (
     accept_drafts_greedy,
@@ -333,7 +333,7 @@ class TpuSpecWorker(BaseSpecWorker):
         req_pool_indices = verify_input.req_pool_indices
         assert req_pool_indices.dtype == batch.req_pool_indices.dtype
         sampling_info = batch.sampling_info
-        assert sampling_info.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED
+        assert is_host_padded(sampling_info)
         assert sampling_info.temperatures.shape[0] == padded_bs
         sampled = not sampling_info.is_all_greedy
         return BucketState(
@@ -451,7 +451,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self, padded_bs: int, vocab_size: int, *, greedy: bool, top_k: bool
     ) -> SamplingBatchInfo:
         top_k_value = 1 if greedy else 2 if top_k else TOP_K_ALL
-        return SamplingBatchInfo(
+        return HostPaddedSamplingInfo(
             temperatures=torch.ones((padded_bs, 1)),
             top_ps=torch.ones((padded_bs,)),
             top_ks=torch.full((padded_bs,), top_k_value, dtype=torch.int32),
@@ -463,7 +463,6 @@ class TpuSpecWorker(BaseSpecWorker):
             need_min_p_sampling=False,
             vocab_size=vocab_size,
             device=self.device,
-            tensor_source_of_truth=TensorSourceOfTruth.HOST_PADDED,
             host_pad_bs=self._pad_bs,
             real_batch_size=padded_bs,
         )

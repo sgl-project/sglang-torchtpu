@@ -13,7 +13,6 @@ from sglang.srt.sampling.penaltylib import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,8 +26,6 @@ class _Batch:
     def __init__(self, reqs, device):
         self.reqs = reqs
         self.device = device
-        self.tensor_source_of_truth = TensorSourceOfTruth.DEVICE
-        self.host_pad_bs = None
 
 
 def _req(**sampling_params):
@@ -188,50 +185,6 @@ class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
         expected = torch.zeros(len(reqs), VOCAB_SIZE)
         expected[0, 1], expected[0, 31] = 2, -1
         self.assert_device_tensor(info.logit_bias, expected, torch.float32)
-
-
-def _host_padded_batch(reqs):
-    batch = _Batch(reqs, "cpu")
-    batch.tensor_source_of_truth = TensorSourceOfTruth.HOST_PADDED
-    batch.host_pad_bs = lambda bs: 4 if bs <= 4 else 8
-    return batch
-
-
-class TestHostPaddedSamplingMetadata(_SamplingMetadataTestBase):
-    """HOST_PADDED params stay at the batch bucket; padded rows must sample greedily at T=1."""
-
-    def test_filter_keeps_live_rows_and_neutral_pad(self):
-        reqs = [_req(temperature=t, top_k=k) for t, k in ((0.5, 5), (0.6, 6), (0.7, 7))]
-        batch = _host_padded_batch(reqs)
-        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-
-        batch.reqs = [reqs[0], reqs[2]]
-        info.filter_batch([0, 2], torch.tensor([0, 2]))
-
-        self.assertEqual(len(info), 2)
-        torch.testing.assert_close(
-            info.temperatures.view(-1), torch.tensor([0.5, 0.7, 1.0, 1.0])
-        )
-        torch.testing.assert_close(
-            info.top_ks, torch.tensor([5, 7, 1, 1], dtype=torch.int32)
-        )
-
-    def test_merge_places_other_rows_after_self_live_rows(self):
-        left_reqs = [_req(temperature=t) for t in (0.5, 0.6)]
-        right_reqs = [_req(temperature=t) for t in (0.1, 0.2, 0.3)]
-        left_batch = _host_padded_batch(left_reqs)
-        left = SamplingBatchInfo.from_schedule_batch(left_batch, VOCAB_SIZE)
-        # Orchestrators hold their batch weakly; keep it alive through merge.
-        right_batch = _host_padded_batch(right_reqs)
-        right = SamplingBatchInfo.from_schedule_batch(right_batch, VOCAB_SIZE)
-
-        left.merge_batch(right)
-
-        self.assertEqual(len(left), 5)
-        torch.testing.assert_close(
-            left.temperatures.view(-1),
-            torch.tensor([0.5, 0.6, 0.1, 0.2, 0.3, 1.0, 1.0, 1.0]),
-        )
 
 
 if __name__ == "__main__":
