@@ -328,12 +328,13 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     request.host_hit_length = request.swa_host_hit_length = 0
     request.storage_hit_length = request.host_loaded_length = 0
     request.swa_prefix_match = SwaPrefixMatch()
+    request.swa_miss_range = (0, 0)
     request.materialized_host_hit_len.return_value = 0
     request.fulfilled_storage_hit_len.return_value = 0
     request.needs_host_load_back.return_value = False
     request.last_node = None
     request.set_extend_range.side_effect = lambda start, end: setattr(
-        request, "extend_range", NS(length=end - start)
+        request, "extend_range", NS(start=start, end=end, length=end - start)
     )
     # Called the way the scheduler calls every prefill adder.
     assert (

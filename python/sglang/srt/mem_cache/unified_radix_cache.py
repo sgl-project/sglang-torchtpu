@@ -3561,7 +3561,11 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.is_mamba_enabled
 
     def swa_is_only_match_cut(self) -> bool:
-        return self.swa_is_only_match_validator
+        # A re-prefill tail caps the match before the walk, so the recomputed
+        # window would be invisible to the walk's lengths.
+        return (
+            self.swa_is_only_match_validator and self.swa_reprefill_tail_tokens() == 0
+        )
 
     # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
 

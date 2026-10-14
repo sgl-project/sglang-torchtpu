@@ -1192,6 +1192,8 @@ class Req(ReqDllmMixin):
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
         self.swa_prefix_match = SwaPrefixMatch()
+        # Set at first admission; continuation chunks charge their overlap with it.
+        self.swa_miss_range = (0, 0)
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.

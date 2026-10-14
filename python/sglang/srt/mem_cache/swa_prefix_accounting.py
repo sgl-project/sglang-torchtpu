@@ -40,8 +40,12 @@ def swa_prefix_match(
     )
 
 
-def swa_miss_len(*, match: SwaPrefixMatch, prefix_len: int) -> int:
-    """Prefix tokens with full KV cached but recomputed because the SWA window was
-    missing. `prefix_len` is the admitted prefix after load-back, so a window that
-    load-back restored is reused, not missed."""
-    return max(0, match.full_kv_hit_length - max(prefix_len, match.reusable_length))
+def swa_miss_range(*, match: SwaPrefixMatch, prefix_len: int) -> tuple[int, int]:
+    """Token range `[start, end)` with full KV cached but recomputed because the
+    SWA window was missing. `prefix_len` is the admitted prefix after load-back, so
+    a window that load-back restored is reused, not missed. Empty when start >= end."""
+    return max(prefix_len, match.reusable_length), match.full_kv_hit_length
+
+
+def overlap_len(*, start: int, end: int, lo: int, hi: int) -> int:
+    return max(0, min(end, hi) - max(start, lo))

@@ -61,7 +61,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_prefix_accounting import (
-    swa_miss_len,
+    swa_miss_range,
     swa_prefix_match,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -6840,7 +6840,7 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(result.full_kv_hit_length, 4)
 
-    def test_swa_miss_len_reports_swa_masked_prefix(self):
+    def test_swa_miss_range_reports_swa_masked_prefix(self):
         """Resident FULL under SWA tombstones counts as an SWA miss on Full+SWA;
         a clean prefix, and any cache with Mamba or without SWA, reports zero."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -6865,7 +6865,8 @@ class UnifiedRadixCacheSuite:
         cache.insert(params)
         masked = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         match = swa_prefix_match(tree_cache=cache, match_result=masked)
-        miss = swa_miss_len(match=match, prefix_len=0)
+        start, end = swa_miss_range(match=match, prefix_len=0)
+        miss = max(0, end - start)
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.assertEqual(miss, 0)
             return
@@ -6877,10 +6878,10 @@ class UnifiedRadixCacheSuite:
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", clean))))
         self.assertEqual(result.best_match_length, len(clean))
         clean_match = swa_prefix_match(tree_cache=cache, match_result=result)
-        self.assertEqual(
-            swa_miss_len(match=clean_match, prefix_len=len(result.device_indices)),
-            0,
+        start, end = swa_miss_range(
+            match=clean_match, prefix_len=len(result.device_indices)
         )
+        self.assertLessEqual(end, start)
 
     def test_has_swa_host_pool_flag_matches_attached_pool(self):
         """init_hicache caches SWA host-pool presence on the tree core after

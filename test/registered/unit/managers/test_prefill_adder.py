@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.prefill_budget import (
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_prefix_accounting import (
     SwaPrefixMatch,
-    swa_miss_len,
+    swa_miss_range,
     swa_prefix_match,
 )
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
@@ -135,6 +135,11 @@ class TestPrefillAdder(CustomTestCase):
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         req.swa_prefix_match = SwaPrefixMatch()
+        req.swa_miss_range = (0, 0)
+        req.extend_range = Range(0, 0)
+        req.set_extend_range.side_effect = lambda start, end: setattr(
+            req, "extend_range", Range(start, end)
+        )
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -547,22 +552,29 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.log_host_hit_tokens, 0)
         self.assertEqual(adder.log_storage_hit_tokens, 12)
 
-    def test_swa_miss_counted_once_per_admitted_req(self):
+    def test_swa_miss_counted_per_scheduled_chunk(self):
+        """SWA misses are charged as their chunks are scheduled, like input tokens,
+        so a prefill aborted between chunks counts only what it recomputed; a
+        retracted re-admission is not counted again."""
         adder = self.create_adder(self.create_running_batch())
         req = self.create_mock_req("swa-limited", priority=0, max_new_tokens=1)
         req.swa_prefix_match = SwaPrefixMatch(full_kv_hit_length=24)
         req.materialized_host_hit_len.return_value = 0
-
+        req.set_extend_range(0, 8)
         adder._account_prefill_cache_admission(req, prefix_len=0)
+        self.assertEqual(adder.log_swa_miss_tokens, 8)
+        req.set_extend_range(8, 32)
+        adder._account_swa_miss_in_extend(req)
         self.assertEqual(adder.log_swa_miss_tokens, 24)
 
         retracted = self.create_mock_req("retracted", priority=0, max_new_tokens=1)
         retracted.swa_prefix_match = SwaPrefixMatch(full_kv_hit_length=16)
         retracted.retracted_stain = True
+        retracted.set_extend_range(0, 16)
         adder._account_prefill_cache_admission(retracted, prefix_len=0)
         self.assertEqual(adder.log_swa_miss_tokens, 24)
 
-    def test_swa_miss_excludes_restored_and_declined_load_back(self):
+    def test_swa_miss_range_excludes_restored_and_declined_load_back(self):
         """Load-back that restores a missing window extends the admitted prefix, so
         those tokens are reused, not missed; declining a restorable load-back is a
         capacity loss, not an SWA miss."""
@@ -580,9 +592,8 @@ class TestPrefillAdder(CustomTestCase):
                 match = SwaPrefixMatch(
                     full_kv_hit_length=32, reusable_length=reusable_length
                 )
-                self.assertEqual(
-                    swa_miss_len(match=match, prefix_len=prefix_len), expected
-                )
+                start, end = swa_miss_range(match=match, prefix_len=prefix_len)
+                self.assertEqual(max(0, end - start), expected)
 
     def test_swa_prefix_match_reusable_prefix(self):
         """The reusable prefix is the validators' best match, which covers a window
@@ -598,7 +609,8 @@ class TestPrefillAdder(CustomTestCase):
                 best_match_length=32,
             ),
         )
-        self.assertEqual(swa_miss_len(match=host_restorable, prefix_len=16), 0)
+        start, end = swa_miss_range(match=host_restorable, prefix_len=16)
+        self.assertLessEqual(end, start)
         walkless = swa_prefix_match(
             tree_cache=tree_cache,
             match_result=SimpleNamespace(
@@ -609,7 +621,8 @@ class TestPrefillAdder(CustomTestCase):
             ),
         )
         self.assertEqual(walkless.full_kv_hit_length, 8)
-        self.assertEqual(swa_miss_len(match=walkless, prefix_len=8), 0)
+        start, end = swa_miss_range(match=walkless, prefix_len=8)
+        self.assertLessEqual(end, start)
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())

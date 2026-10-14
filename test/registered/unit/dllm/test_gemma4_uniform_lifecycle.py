@@ -224,6 +224,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder._get_dllm_remain_tokens = lambda req=None: 64
         adder._mamba_gap_budget_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
+        adder._account_swa_miss_in_extend = Mock()
 
         req = _Req(context_len=10, block_size=4, prefill=True)
         req.prefix_indices = torch.arange(7)
