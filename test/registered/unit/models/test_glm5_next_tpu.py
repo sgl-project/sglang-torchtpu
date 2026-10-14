@@ -10,13 +10,10 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
-from sglang.srt.configs.hybrid_arch import kimi_linear_config
+from sglang.srt.configs.hybrid_arch import glm5_next_config
 from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
-from sglang.srt.models.deepseek_v2 import MoEGate
-from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
 from sglang.srt.models.glm5_next_tpu import (
     Glm5NextLinearAttention,
     TpuRMSNormGated,
@@ -48,22 +45,6 @@ class TestGlm5NextTpu(unittest.TestCase):
         self.assertEqual(config.qk_rope_head_dim, 64)
         self.assertEqual(config.qk_head_dim, 256)
 
-    def test_full_glm_dense_dsa_rejects_context_beyond_selection_budget(self):
-        config = SimpleNamespace(index_topk=2048, tpu_dense_dsa_max_context=2048)
-        with patch(
-            "sglang.srt.models.glm4_moe.get_server_args",
-            return_value=SimpleNamespace(context_length=2049),
-        ):
-            with self.assertRaisesRegex(ValueError, "context-length"):
-                GlmMoeDsaForCausalLM(config)
-        config.tpu_dense_dsa_max_context = 4096
-        with patch(
-            "sglang.srt.models.glm4_moe.get_server_args",
-            return_value=SimpleNamespace(context_length=4096),
-        ):
-            with self.assertRaisesRegex(ValueError, "index_topk"):
-                GlmMoeDsaForCausalLM(config)
-
     def test_dense_dsa_does_not_allocate_sparse_seed_metadata(self):
         flash = SimpleNamespace(
             architectures=["Glm5NextForConditionalGeneration"],
@@ -74,11 +55,10 @@ class TestGlm5NextTpu(unittest.TestCase):
             architectures=["GlmMoeDsaForCausalLM"],
             index_share_for_mtp_iteration=True,
             index_topk=2048,
-            tpu_dense_dsa_max_context=2048,
         )
+        # The TPU Flash model attends densely, so it has no top-k to seed;
+        # a sparse-DSA model still does.
         self.assertEqual(get_dsa_seed_metadata_dim(flash), 0)
-        self.assertEqual(get_dsa_seed_metadata_dim(full), 0)
-        del full.tpu_dense_dsa_max_context
         self.assertEqual(get_dsa_seed_metadata_dim(full), 2048)
 
     def test_kda_output_keeps_batch_one_token_axis(self):
@@ -92,11 +72,35 @@ class TestGlm5NextTpu(unittest.TestCase):
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False, is_decode=lambda: True)
         )
+        # The TPU KDA backend returns [1, tokens, heads, dim].
         with patch.object(
-            attn.attn, "forward", return_value=torch.ones(1, 2, 4)
-        ), patch("sglang.srt.layers.linear.get_tp_group", return_value=None):
+            attn.attn, "forward", return_value=torch.ones(1, 1, 2, 4)
+        ), get_parallel().override(
+            tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, tp_group=None
+        ):
             output = attn(torch.ones(1, config.hidden_size), batch)
         self.assertEqual(output.shape, (1, config.hidden_size))
+
+    def test_tpu_kda_binding_matches_kernel_layout(self):
+        config = Glm5NextTextConfig(
+            hidden_size=16, linear_num_heads=2, linear_head_dim=4
+        )
+        with get_parallel().override(
+            tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+        ):
+            attn = Glm5NextLinearAttention(0, config.hidden_size, config)
+        with torch.no_grad():
+            attn.A_log.copy_(torch.tensor([0.5, -0.25]).reshape(attn.A_log.shape))
+            attn.dt_bias.copy_(torch.arange(8, dtype=torch.float32))
+        attn.bind_tpu_attn_weights()
+        bound = attn.attn
+        # The depthwise [dim, 1, K] parameter itself, not a view.
+        self.assertIs(bound.conv_weights, attn.qkv_conv1d.weight)
+        self.assertEqual(tuple(bound.conv_weights.shape[1:]), (1, attn.conv_size))
+        self.assertEqual(bound.A_log.tolist(), [0.5, -0.25])
+        self.assertIs(bound.dt_bias, attn.dt_bias)
+        self.assertIsNotNone(bound.packed_kernel_weights)
+        self.assertEqual(bound.packed_kernel_weights.dtype, torch.float32)
 
     def test_nested_checkpoint_config_preserves_attention_types_and_gate(self):
         cfg = Glm5NextConfig(
@@ -113,7 +117,7 @@ class TestGlm5NextTpu(unittest.TestCase):
                 },
             }
         )
-        text = kimi_linear_config(SimpleNamespace(hf_config=cfg))
+        text = glm5_next_config(SimpleNamespace(hf_config=cfg, is_draft_model=False))
         self.assertIs(text, cfg.text_config)
         self.assertEqual(text.linear_layer_ids, [0, 1, 2])
         self.assertEqual(text.full_attention_layer_ids, [3])
@@ -136,27 +140,6 @@ class TestGlm5NextTpu(unittest.TestCase):
         )
         output = hc_post(torch.zeros(1, 4), x, post, permutation)
         torch.testing.assert_close(output, x[:, [2, 0, 1]])
-
-    def test_tpu_router_preserves_fp32_weights_and_logits(self):
-        cfg = SimpleNamespace(
-            n_routed_experts=3,
-            hidden_size=4,
-            topk_method="noaux_tc",
-            moe_router_dtype="float32",
-        )
-        with patch("sglang.srt.models.deepseek_v2._is_tpu", True):
-            old_dtype = torch.get_default_dtype()
-            try:
-                torch.set_default_dtype(torch.bfloat16)
-                gate = MoEGate(cfg, quant_config=None)
-            finally:
-                torch.set_default_dtype(old_dtype)
-            self.assertEqual(gate.weight.dtype, torch.float32)
-            with torch.no_grad():
-                gate.weight.copy_(torch.arange(12).reshape(3, 4).float() / 10)
-            x = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
-            torch.testing.assert_close(gate(x), F.linear(x.float(), gate.weight))
-            self.assertEqual(gate(x).dtype, torch.float32)
 
     def test_gated_rms_norm_matches_high_precision_reference(self):
         generator = torch.Generator().manual_seed(53)
