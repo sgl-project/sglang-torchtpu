@@ -20,6 +20,7 @@ def compile_local(fn, args):
 
 def check_rank_slices(cpu_group, dtype):
     rank, size = dist.get_rank(), dist.get_world_size()
+    group_size = size // 2
     rank_stride = min(4, size)
     # Reverse core order to exercise physical ownership independently of TP rank.
     rank_to_device = tuple(reversed(range(size)))
@@ -33,6 +34,7 @@ def check_rank_slices(cpu_group, dtype):
     def fn(x):
         return (
             current_platform.get_traced_rank(rank),
+            current_platform.get_traced_rank(rank % group_size, group_size=group_size),
             current_platform.slice_tensor_for_rank(x, 0, size, rank),
             current_platform.slice_tensor_for_rank(x, 1, size, rank),
             current_platform.slice_tensor_for_rank(x, 0, 2, rank % 2),
@@ -48,6 +50,7 @@ def check_rank_slices(cpu_group, dtype):
     block_rows, block = rows * rank_stride, rank // rank_stride
     expected = [
         torch.tensor([rank], dtype=torch.int32),
+        torch.tensor([rank % group_size], dtype=torch.int32),
         value_cpu[rank * rows : (rank + 1) * rows],
         value_cpu[:, rank * columns : (rank + 1) * columns],
         value_cpu[(rank % 2) * 16 : (rank % 2 + 1) * 16],

@@ -706,8 +706,10 @@ class TpuSRTPlatform(SRTPlatform):
 
     supported_quantization: list[str] = []
 
-    def get_traced_rank(self, rank: int) -> torch.Tensor | None:
-        return traced_rank(rank)
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        return traced_rank(rank, group_size=group_size)
 
     def slice_tensor_for_rank(
         self, tensor: torch.Tensor, dim: int, parts: int, rank: int

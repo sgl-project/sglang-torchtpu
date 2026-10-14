@@ -166,8 +166,10 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform consumes annotation-driven compile policies."""
         return False
 
-    def get_traced_rank(self, rank: int) -> torch.Tensor | None:
-        """Return the rank input inside a rank-parameterized compilation trace."""
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        """Return the traced rank, optionally within a contiguous parallel group."""
         return None
 
     def slice_tensor_for_rank(

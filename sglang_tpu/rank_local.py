@@ -45,11 +45,19 @@ def _slice_op(rank_to_device: tuple[int, ...] | None):
     return cpu_export_jax_op(f"sglang::rank_local_slice{suffix}", sliced)
 
 
-def traced_rank(expected_rank: int) -> torch.Tensor | None:
-    """Return the rank graph input while tracing with an explicit rank input, else None."""
+def traced_rank(
+    expected_rank: int, *, group_size: int | None = None
+) -> torch.Tensor | None:
+    """Return the rank input, optionally within a contiguous parallel group."""
     rank = _RANK.get()
-    if rank is not None and expected_rank != dist.get_rank():
-        raise ValueError("Rank inputs require full-mesh logical rank order")
+    if rank is None:
+        return None
+    logical_rank = dist.get_rank()
+    if group_size is not None:
+        logical_rank %= group_size
+        rank = rank % group_size
+    if expected_rank != logical_rank:
+        raise ValueError("Rank inputs require contiguous logical rank groups")
     return rank
 
 

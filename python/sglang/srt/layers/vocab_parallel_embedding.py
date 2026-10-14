@@ -498,7 +498,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.shard_indices.added_vocab_start_index,
             self.shard_indices.added_vocab_end_index,
         )
-        rank = current_platform.get_traced_rank(self.tp_rank)
+        rank = current_platform.get_traced_rank(self.tp_rank, group_size=self.tp_size)
         if rank is not None:
             bounds = self._traced_shard_bounds(rank.to(input_.dtype))
         return get_masked_input_and_mask(input_, *bounds)
