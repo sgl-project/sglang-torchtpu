@@ -21,7 +21,11 @@ import numpy.typing as npt
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVSender,
+    KVTransferError,
+    PeerFailureReason,
+)
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
@@ -123,7 +127,7 @@ class RaidenSenderMixin:
             if status is None:
                 return
             self._fail_room_unless_failed_locked(
-                room, "Aborted by decode-side abort notification."
+                room, PeerFailureReason("Aborted by decode-side abort notification.")
             )
             self.update_status(room, KVPoll.Failed)
         self._drop_room_state(room)
@@ -1163,8 +1167,10 @@ class RaidenKVSender(CommonKVSender):
                     self._decode_told = True
                     self.kv_mgr._fail_room_locked(
                         self.bootstrap_room,
-                        "Aborted by decode-side abort notification received "
-                        "before the sender was created.",
+                        PeerFailureReason(
+                            "Aborted by decode-side abort notification received "
+                            "before the sender was created."
+                        ),
                         preserve_reason=True,
                     )
                     self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
@@ -1281,7 +1287,9 @@ class RaidenKVSender(CommonKVSender):
             self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
             self.kv_mgr._fail_room_unless_failed_locked(
                 self.bootstrap_room,
-                "Raiden transfer failed on another attention TP/CP rank.",
+                PeerFailureReason(
+                    "Raiden transfer failed on another attention TP/CP rank."
+                ),
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         # A local Success may have been cached before a peer contributed the

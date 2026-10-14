@@ -1203,6 +1203,7 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             poll=lambda: KVPoll.Success,
             quiesce_group_failure=lambda: events.append("quiesce"),
             drained=lambda: events.append("drained") or True,
+            local_failure_reason=lambda: None,
         )
         reduce_count = 0
 
@@ -1222,6 +1223,13 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             ),
         ):
             dist.all_reduce = all_reduce
+            dist.get_world_size = lambda group: 2
+
+            def all_gather_object(out, obj, group=None):
+                events.append(("gather", group))
+                out[:] = [obj] * len(out)
+
+            dist.all_gather_object = all_gather_object
             polls = poll_and_all_reduce_attn_cp_tp_group([poller], cp_group, tp_group)
 
         self.assertEqual(polls, [KVPoll.Failed])
@@ -1234,6 +1242,8 @@ class TestGroupFailureDrainGate(unittest.TestCase):
                 "drained",
                 ("reduce", tp_group),
                 ("reduce", cp_group),
+                ("gather", tp_group),
+                ("gather", cp_group),
             ],
         )
 
@@ -1247,6 +1257,7 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             poll=lambda: KVPoll.Success,
             quiesce_group_failure=lambda: events.append("quiesce"),
             drained=lambda: events.append("drained") or True,
+            local_failure_reason=lambda: None,
         )
         reduce_count = 0
 
@@ -1269,6 +1280,13 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             ),
         ):
             dist.all_reduce = all_reduce
+            dist.get_world_size = lambda group: 2
+
+            def all_gather_object(out, obj, group=None):
+                events.append(("gather", group))
+                out[:] = [obj] * len(out)
+
+            dist.all_gather_object = all_gather_object
             polls = poll_and_all_reduce(
                 [poller],
                 tp_group,
@@ -1288,6 +1306,8 @@ class TestGroupFailureDrainGate(unittest.TestCase):
                 "drained",
                 ("reduce", tp_group),
                 ("reduce", cp_group),
+                ("gather", tp_group),
+                ("gather", cp_group),
             ],
         )
 
@@ -1320,6 +1340,7 @@ class TestGroupFailureQuiescesRaiden(unittest.TestCase):
         self.assertNotIn(ROOM, mgr._prefill.send_blocks)
         self.assertEqual(set(mgr._send_reads[ROOM]), {f"{ROOM}#0"})
         self.assertFalse(sender.drained())
+        self.assertIsNone(sender.local_failure_reason())
 
     def test_receiver_tombstones_and_overrides_cached_success(self):
         mgr = _decode_manager_stub()
@@ -1333,6 +1354,7 @@ class TestGroupFailureQuiescesRaiden(unittest.TestCase):
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
         self.assertEqual(recv.conclude_state, KVPoll.Failed)
         notify.assert_called_once_with()
+        self.assertIsNone(recv.local_failure_reason())
 
 
 class TestAdmissionRespectsTheTombstone(unittest.TestCase):
@@ -1790,6 +1812,7 @@ class TestNativeFailureReason(CustomTestCase):
                     [r.getMessage() for r in logs.records],
                     [f"RaidenKVManager rank0 {cause}"],
                 )
+                self.assertEqual(sender.local_failure_reason(), cause)
                 with self.assertRaises(KVTransferError) as cm:
                     sender.failure_exception()
                 self.assertEqual(cm.exception.failure_reason, cause)
@@ -1844,6 +1867,41 @@ class TestNativeFailureReason(CustomTestCase):
         with self.assertRaises(KVTransferError) as cm:
             sender.failure_exception()
         self.assertEqual(cm.exception.failure_reason, cause)
+
+    def test_a_decode_abort_names_no_cause(self):
+        """The decode may abort a room because another prefill rank failed it.
+        A prefill rank that recorded only the abort must take its peers' cause
+        rather than answer the client with the abort, and must not log the
+        abort as its own error."""
+        mgr = _prefill_manager()
+        _populate_send_state(mgr, ROOM)
+        sender = _prefill_sender(mgr)
+
+        mgr._dispatch(_abort_frame(ROOM))
+
+        self.assertIn(ROOM, mgr.failure_records)
+        self.assertIsNone(sender.local_failure_reason())
+        with self.assertRaises(KVTransferError) as cm:
+            sender.failure_exception()
+        self.assertTrue(cm.exception.is_from_another_rank)
+
+    def test_a_rank_failed_by_a_peer_raises_the_peers_reason(self):
+        """A rank whose room failed only because a peer's did records no cause.
+        It must raise the reason it takes from that peer, marked as coming from
+        another rank, so that only the rank that failed logs it as an error."""
+        mgr = _prefill_manager()
+        _populate_send_state(mgr, ROOM)
+        sender = _prefill_sender(mgr)
+        peer_reason = "Raiden send failed: req_id=7 (recorded by TP rank 1)"
+
+        sender.quiesce_group_failure()
+        self.assertIsNone(sender.local_failure_reason())
+        sender.record_peer_failure_reason(peer_reason)
+
+        with self.assertRaises(KVTransferError) as cm:
+            sender.failure_exception()
+        self.assertEqual(cm.exception.failure_reason, peer_reason)
+        self.assertTrue(cm.exception.is_from_another_rank)
 
 
 class TestSendRevalidatesTheSocket(unittest.TestCase):

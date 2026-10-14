@@ -60,6 +60,22 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         self.assertIn(8, staging_ctx.prefetched_rooms)
         self.assertIn((8, 0, "session-b"), staging_ctx.prefetch_requested)
 
+    def test_worker_exception_is_this_ranks_failure_reason(self):
+        """A transfer worker exception whose settle timed out is stored only as
+        the exception, with no failure record. It is still this rank's cause:
+        the rank must share it with its peers, not adopt a peer's reason."""
+        room = 7
+        sender = NixlKVSender.__new__(NixlKVSender)
+        sender.bootstrap_room = room
+        sender._send_error = None
+        sender.kv_mgr = SimpleNamespace(
+            exceptions={room: RuntimeError("transfer settle timed out")},
+            failure_records={},
+            failure_lock=threading.Lock(),
+        )
+
+        self.assertEqual(sender.local_failure_reason(), "transfer settle timed out")
+
 
 if __name__ == "__main__":
     unittest.main()

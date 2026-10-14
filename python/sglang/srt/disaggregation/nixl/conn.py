@@ -3261,6 +3261,16 @@ class NixlKVSender(CommonKVSender):
                 if key[0] != self.bootstrap_room
             }
 
+    def local_failure_reason(self) -> Optional[str]:
+        """The cause failure_exception raises: the send error, else the worker
+        exception, else the recorded reason."""
+        if self._send_error is not None:
+            return str(self._send_error)
+        exc = self.kv_mgr.exceptions.get(self.bootstrap_room)
+        if exc is not None:
+            return str(exc)
+        return super().local_failure_reason()
+
     def failure_exception(self):
         exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
         with self.kv_mgr.failure_lock:

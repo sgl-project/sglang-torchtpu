@@ -18,7 +18,11 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVReceiver,
+    KVTransferError,
+    PeerFailureReason,
+)
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
@@ -1301,7 +1305,9 @@ class RaidenKVReceiver(CommonKVReceiver):
         # corresponding prefill rank to stop publishing work for this room.
         self.conclude_state = None
         self._conclude_failed(
-            reason="Raiden transfer failed on another attention TP/CP rank.",
+            reason=PeerFailureReason(
+                "Raiden transfer failed on another attention TP/CP rank."
+            ),
         )
 
     def _conclude_failed(

@@ -55,15 +55,20 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
             group_failure_requires_drain=True,
             quiesce_group_failure=MagicMock(),
             drained=MagicMock(return_value=False),
+            local_failure_reason=MagicMock(return_value="own"),
+            record_peer_failure_reason=MagicMock(),
         )
         wrapper = HiCacheRestoreGatedKVReceiver(SimpleNamespace(kv_receiver=inner))
 
         self.assertTrue(wrapper.group_failure_requires_drain)
         wrapper.quiesce_group_failure()
         self.assertFalse(wrapper.drained())
+        self.assertEqual(wrapper.local_failure_reason(), "own")
+        wrapper.record_peer_failure_reason("peer")
 
         inner.quiesce_group_failure.assert_called_once_with()
         inner.drained.assert_called_once_with()
+        inner.record_peer_failure_reason.assert_called_once_with("peer")
 
     def test_non_drain_backend_keeps_capability_disabled(self):
         wrapper = HiCacheRestoreGatedKVReceiver(

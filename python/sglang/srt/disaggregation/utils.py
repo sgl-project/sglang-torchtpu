@@ -9,9 +9,12 @@ from typing import (
     Iterable,
     List,
     Literal,
+    NamedTuple,
     Optional,
+    Sequence,
     Tuple,
     Type,
+    Union,
     overload,
 )
 
@@ -24,12 +27,18 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+    from sglang.srt.disaggregation.base.conn import (
+        BaseKVReceiver,
+        BaseKVSender,
+        KVArgs,
+        StateType,
+    )
     from sglang.srt.disaggregation.common.conn import (
         CommonKVBootstrapServer,
         CommonKVManager,
@@ -226,6 +235,47 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
     return polls
 
 
+class _RankFailureReason(NamedTuple):
+    tp_rank: int
+    reason: str
+
+
+def _share_failure_reasons(
+    polls: List[int],
+    pollers: Sequence[Union[BaseKVSender, BaseKVReceiver]],
+    groups: List[dist.ProcessGroup],
+) -> None:
+    """Give each rank that recorded no cause for a failed transfer the reason
+    the lowest TP rank of its groups recorded.
+
+    A rank that fails a transfer only because a peer failed it records no
+    cause, and attention TP/CP rank 0 alone answers the client. The reduced
+    polls match on every rank, so all ranks join the gather or none does;
+    a local_failure_reason() that raised would leave its peers in the gather.
+    """
+    failed = [i for i, poll in enumerate(polls) if poll == KVPoll.Failed]
+    if not failed or not groups:
+        return
+    local_reasons = [pollers[i].local_failure_reason() for i in failed]
+    min_reasons = [
+        None if reason is None else _RankFailureReason(get_parallel().tp_rank, reason)
+        for reason in local_reasons
+    ]
+    for group in groups:
+        gathered = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, min_reasons, group=group)
+        min_reasons = [
+            min((peer[k] for peer in gathered if peer[k] is not None), default=None)
+            for k in range(len(failed))
+        ]
+    for i, local_reason, min_reason in zip(failed, local_reasons, min_reasons):
+        if local_reason is None and min_reason is not None:
+            tp_rank, reason = min_reason
+            pollers[i].record_peer_failure_reason(
+                f"{reason} (recorded by TP rank {tp_rank})"
+            )
+
+
 def _reduce_status_and_gate_group_failure(polls, pollers, groups):
     """Reduce transfer status before applying the group-wide drain gate."""
     # A single-rank group has nothing to reduce.
@@ -235,7 +285,9 @@ def _reduce_status_and_gate_group_failure(polls, pollers, groups):
         for group in groups:
             dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
         polls = tensor_to_reduce.tolist()
-    return _gate_group_failure_on_drain(polls, pollers, groups)
+    polls = _gate_group_failure_on_drain(polls, pollers, groups)
+    _share_failure_reasons(polls, pollers, groups)
+    return polls
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:

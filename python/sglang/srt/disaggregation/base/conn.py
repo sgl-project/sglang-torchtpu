@@ -214,6 +214,17 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def local_failure_reason(self) -> Optional[str]:
+        """Why this rank failed the transfer, or None if it failed only because
+        another rank did. Every rank of the group calls it before a collective,
+        so it must not raise."""
+        return None
+
+    def record_peer_failure_reason(self, reason: str) -> None:
+        """Take ``reason``, which another rank recorded, as the failure reason
+        of this rank, which recorded no cause."""
+        pass
+
     def clear(self):
         """
         Clear any internal states.
@@ -278,6 +289,17 @@ class BaseKVReceiver(ABC):
         Raise an exception if the kv cache transfer fails.
         """
         ...
+
+    def local_failure_reason(self) -> Optional[str]:
+        """Why this rank failed the transfer, or None if it failed only because
+        another rank did. Every rank of the group calls it before a collective,
+        so it must not raise."""
+        return None
+
+    def record_peer_failure_reason(self, reason: str) -> None:
+        """Take ``reason``, which another rank recorded, as the failure reason
+        of this rank, which recorded no cause."""
+        pass
 
     def clear(self):
         """

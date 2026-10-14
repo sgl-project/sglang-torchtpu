@@ -10,7 +10,11 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    AckTarget,
+    CommonKVManager,
+    KVTransferError,
+)
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -720,7 +724,13 @@ class TestPollCollectives(CustomTestCase):
                 tp, cp = object(), object()
                 sizes = {tp: tp_size, cp: cp_size}
                 peers = {tp: tp_peers, cp: cp_peers}
-                pollers = [Mock(poll=Mock(return_value=state)) for state in local]
+                pollers = [
+                    Mock(
+                        poll=Mock(return_value=state),
+                        local_failure_reason=Mock(return_value=None),
+                    )
+                    for state in local
+                ]
 
                 def reduce(tensor, op, group):
                     self.assertEqual(op, dist.ReduceOp.MIN)
@@ -742,6 +752,13 @@ class TestPollCollectives(CustomTestCase):
                 with (
                     patch.object(dist, "get_world_size", side_effect=sizes.__getitem__),
                     patch.object(dist, "all_reduce", side_effect=reduce) as all_reduce,
+                    patch.object(
+                        dist,
+                        "all_gather_object",
+                        side_effect=lambda out, obj, group: out.__setitem__(
+                            slice(None), [obj] * len(out)
+                        ),
+                    ),
                 ):
                     result = poll_and_all_reduce_attn_cp_tp_group(pollers, cp, tp)
 
@@ -749,6 +766,55 @@ class TestPollCollectives(CustomTestCase):
                 self.assertEqual(all_reduce.call_args_list, expected_calls)
                 for poller in pollers:
                     poller.poll.assert_called_once_with()
+
+    def test_failed_transfer_takes_the_lowest_ranks_recorded_reason(self):
+        """Only attention TP/CP rank 0 answers the client, and a rank whose
+        transfer failed only because a peer's did records no cause. Such a rank
+        must take the reason the lowest TP rank recorded; a rank with its own
+        reason keeps it, and nothing is gathered when nothing failed."""
+        tp, cp = object(), object()
+        peers = {
+            tp: [(4, "tp peer timed out"), None],
+            cp: [(2, "cp peer was rejected"), (2, "cp peer's own")],
+        }
+        pollers = [
+            SimpleNamespace(
+                poll=lambda: KVPoll.Failed,
+                local_failure_reason=lambda: None,
+                record_peer_failure_reason=Mock(),
+            ),
+            SimpleNamespace(
+                poll=lambda: KVPoll.Failed,
+                local_failure_reason=lambda: "own",
+                record_peer_failure_reason=Mock(),
+            ),
+            SimpleNamespace(poll=lambda: KVPoll.Success),
+        ]
+        with (
+            patch.object(dist, "get_world_size", return_value=2),
+            patch.object(dist, "all_reduce"),
+            patch.object(
+                dist,
+                "all_gather_object",
+                side_effect=lambda out, obj, group: out.__setitem__(
+                    slice(None), [obj, peers[group]]
+                ),
+            ) as all_gather,
+            patch(
+                "sglang.srt.disaggregation.utils.get_parallel",
+                return_value=SimpleNamespace(tp_rank=0),
+            ),
+        ):
+            polls = poll_and_all_reduce_attn_cp_tp_group(pollers, cp, tp)
+            self.assertEqual(polls, [KVPoll.Failed, KVPoll.Failed, KVPoll.Success])
+            pollers[0].record_peer_failure_reason.assert_called_once_with(
+                "cp peer was rejected (recorded by TP rank 2)"
+            )
+            pollers[1].record_peer_failure_reason.assert_not_called()
+
+            all_gather.reset_mock()
+            poll_and_all_reduce_attn_cp_tp_group(pollers[2:], cp, tp)
+            all_gather.assert_not_called()
 
     def test_singleton_polling_needs_no_tensor_or_collective(self):
         """A single rank can poll transfers without allocating a reduction tensor."""
@@ -810,6 +876,29 @@ class TestPollCollectives(CustomTestCase):
             result = poll_and_all_reduce([poller], object())
         self.assertEqual(result, [KVPoll.Failed])
         all_reduce.assert_not_called()
+
+
+class TestPeerFailureReason(CustomTestCase):
+    def test_a_peer_reason_is_propagated_and_never_hides_a_cause(self):
+        """A reason taken from a peer names no cause on this rank: its error
+        must be marked as coming from another rank, the rank must not share it
+        as its own cause, and it must not replace a cause recorded since."""
+        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        peer_reason = "peer timed out (recorded by TP rank 2)"
+
+        mgr.record_peer_failure_reason(7, peer_reason)
+        self.assertIsNone(mgr.local_failure_reason(7))
+        error = KVTransferError(7, mgr.failure_records.pop(7))
+        self.assertTrue(error.is_from_another_rank)
+        self.assertEqual(error.failure_reason, peer_reason)
+
+        mgr.record_failure(8, "own cause")
+        mgr.record_peer_failure_reason(8, peer_reason)
+        self.assertEqual(mgr.local_failure_reason(8), "own cause")
+        error = KVTransferError(8, mgr.failure_records.pop(8))
+        self.assertFalse(error.is_from_another_rank)
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):

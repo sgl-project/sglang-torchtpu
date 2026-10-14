@@ -196,6 +196,12 @@ class HiCacheRestoreGatedKVReceiver:
             raise RuntimeError("The wrapped drain-gated receiver has no drained()")
         return bool(drained())
 
+    def local_failure_reason(self) -> Optional[str]:
+        return self.decode_req.kv_receiver.local_failure_reason()
+
+    def record_peer_failure_reason(self, reason: str) -> None:
+        self.decode_req.kv_receiver.record_peer_failure_reason(reason)
+
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
         if (

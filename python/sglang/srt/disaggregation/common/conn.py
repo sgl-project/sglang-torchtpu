@@ -84,6 +84,11 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
     return session
 
 
+class PeerFailureReason(str):
+    """A failure reason that names no cause on this rank: another rank, or the
+    other side of the transfer, failed it first."""
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -94,7 +99,9 @@ class KVTransferError(Exception):
         super().__init__(failure_reason)
         self.bootstrap_room = bootstrap_room
         self.failure_reason = failure_reason
-        self.is_from_another_rank = is_from_another_rank
+        self.is_from_another_rank = is_from_another_rank or isinstance(
+            failure_reason, PeerFailureReason
+        )
 
     def __str__(self):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
@@ -618,6 +625,19 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def local_failure_reason(self, bootstrap_room: int) -> Optional[str]:
+        with self.failure_lock:
+            reason = self.failure_records.get(bootstrap_room)
+        return None if isinstance(reason, PeerFailureReason) else reason
+
+    def record_peer_failure_reason(self, bootstrap_room: int, reason: str) -> None:
+        """Record another rank's ``reason`` for the room, unless this rank has
+        recorded a cause of its own since it was asked."""
+        with self.failure_lock:
+            recorded = self.failure_records.get(bootstrap_room)
+            if recorded is None or isinstance(recorded, PeerFailureReason):
+                self.failure_records[bootstrap_room] = PeerFailureReason(reason)
 
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
         infos = self.transfer_infos.get(bootstrap_room)
@@ -1982,6 +2002,12 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
+    def local_failure_reason(self) -> Optional[str]:
+        return self.kv_mgr.local_failure_reason(self.bootstrap_room)
+
+    def record_peer_failure_reason(self, reason: str) -> None:
+        self.kv_mgr.record_peer_failure_reason(self.bootstrap_room, reason)
+
     def clear(self) -> None:
         notification = None
         if self.kv_mgr.deferred_bootstrap is not None:
@@ -2398,6 +2424,12 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
         return KVPoll.Failed
+
+    def local_failure_reason(self) -> Optional[str]:
+        return self.kv_mgr.local_failure_reason(self.bootstrap_room)
+
+    def record_peer_failure_reason(self, reason: str) -> None:
+        self.kv_mgr.record_peer_failure_reason(self.bootstrap_room, reason)
 
     def clear(self) -> None:
         with self._lifecycle_lock:
