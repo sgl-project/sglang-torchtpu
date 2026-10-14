@@ -596,6 +596,13 @@ class ExecGraph(msgspec.Struct):
         "Select the TPU compilation tracer. Dynamo provides guards and broader "
         "input support; direct lowers through TorchTPU with less compilation overhead.",
     ] = "dynamo"
+    allow_spmd_safe: A[
+        bool,
+        Arg(
+            action=argparse.BooleanOptionalAction,
+            help="Allow TPU compilation to share executables for policies declared SPMD-safe.",
+        ),
+    ] = False
     unsafe_save_torch_compile_bundle: A[
         Optional[str],
         "Directory in which to save per-rank torch.compile bundles after warmup. "

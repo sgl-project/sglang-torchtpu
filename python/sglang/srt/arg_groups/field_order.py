@@ -261,6 +261,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_torch_compile",
     "enable_torch_compile_debug_mode",
     "tpu_compile_tracer",
+    "allow_spmd_safe",
     "unsafe_save_torch_compile_bundle",
     "unsafe_load_torch_compile_bundle",
     "torch_compile_max_bs",

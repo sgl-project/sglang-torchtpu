@@ -216,16 +216,17 @@ class TpuGraphRunner:
         # sglang_tpu) get it here, so the discovery below sees them.
         annotate_core_compile_boundaries()
         modules = (
-            self.model.modules()
-            if callable(getattr(self.model, "modules", None))
-            else (self.model,)
+            self.model.named_modules()
+            if callable(getattr(self.model, "named_modules", None))
+            else (("", self.model),)
         )
         warmup_start = time.perf_counter()
         installed_any = False
         installed_policies: list[CompilePolicy] = []
         compile_timing_recorder = getattr(model_runner, "compile_timing", None)
         pending_warmups = []
-        for module in modules:
+        role = "draft" if model_runner.is_draft_worker else "target"
+        for module_name, module in modules:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:
                 continue
@@ -263,6 +264,7 @@ class TpuGraphRunner:
                 owner=module,
                 method_name=method_name,
                 method=method,
+                name=f"{role}/{module_name + '.' if module_name else ''}{method_name}",
                 label=type(module).__name__,
                 compile_timing_recorder=compile_timing_recorder,
             )
@@ -289,6 +291,7 @@ class TpuGraphRunner:
                 owner=self.model,
                 method_name="forward",
                 method=getattr(self.model, "forward", None),
+                name=f"{role}/forward",
                 label=type(self.model).__name__,
                 tracer=server_args.tpu_compile_tracer,
                 compile_timing_recorder=compile_timing_recorder,
