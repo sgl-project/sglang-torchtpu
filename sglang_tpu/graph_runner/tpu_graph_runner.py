@@ -57,9 +57,9 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
-from sglang_tpu.experimental import is_experimental_dspark
-from sglang_tpu.experimental.compilation.dspark_compile_policy import (
-    TpuDsparkSpecDecodeCompilePolicyMixin,
+from sglang_tpu.experimental import is_experimental_spec_worker
+from sglang_tpu.experimental.compilation.block_compile_policy import (
+    TpuBlockSpecDecodeCompilePolicyMixin,
 )
 
 if TYPE_CHECKING:
@@ -74,7 +74,7 @@ def _spec_enabled(model_runner: ModelRunner) -> bool:
     return (
         (algo.is_eagle() and not algo.is_frozen_kv_mtp())
         or algo.is_dflash()
-        or is_experimental_dspark(algo)
+        or is_experimental_spec_worker(algo)
     )
 
 
@@ -82,10 +82,11 @@ def _resolve_spec_compile_policy_mixin(
     spec_algorithm: SpeculativeAlgorithm,
 ) -> type[BaseSpecDecodeCompilePolicyMixin]:
     """Resolve speculative compile policy mixin class based on algorithm."""
+    # Checked first: the experimental worker also serves DFLASH.
+    if is_experimental_spec_worker(spec_algorithm):
+        return TpuBlockSpecDecodeCompilePolicyMixin
     if spec_algorithm.is_dflash():
         return DFlashSpecDecodeCompilePolicyMixin
-    if is_experimental_dspark(spec_algorithm):
-        return TpuDsparkSpecDecodeCompilePolicyMixin
     return Eagle3SpecDecodeCompilePolicyMixin
 
 

@@ -880,7 +880,7 @@ class TpuSRTPlatform(SRTPlatform):
             elif spec_algo == "DFLASH":
                 pass
             elif spec_algo == "DSPARK" and _experimental_spec_enabled():
-                # Served by sglang_tpu.experimental.TpuDsparkWorker.
+                # Served by sglang_tpu.experimental.TpuBlockSpecWorker.
                 pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

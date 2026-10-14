@@ -58,9 +58,7 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
 )
-from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
-    TpuDsparkDraftWorker,
-)
+from sglang_tpu.experimental.speculative.block_draft_worker import TpuBlockDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_greedy,
     accept_drafts_sampled,
@@ -93,7 +91,7 @@ class TpuSpecWorker(BaseSpecWorker):
     def __init__(
         self,
         target_worker: TpModelWorker,
-        draft_worker: TpuDsparkDraftWorker,
+        draft_worker: TpuBlockDraftWorker,
         num_drafts: int,
     ) -> None:
         super().__init__()
@@ -401,7 +399,7 @@ class TpuSpecWorker(BaseSpecWorker):
                     torch.nn.functional.pad(
                         torch.zeros((bs,), dtype=dtype).to(self.device), (0, cap - bs)
                     ).cpu()
-                # ModelRunner.sample positions, then the DSpark extend trim.
+                # ModelRunner.sample positions, then the block-draft extend trim.
                 (torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1).cpu()
                 torch.zeros((self._pad_bs(bs),), dtype=torch.int64, device=self.device)[
                     :bs
