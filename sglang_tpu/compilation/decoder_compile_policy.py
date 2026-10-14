@@ -891,7 +891,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         }
         # Serving hands the Eagle3 capture slots on with the activations, so
         # trace them too or the graph signature differs from the real one.
-        num_aux = num_relayed_aux_slots(self.model_runner.spec_aux_config)
+        num_aux = num_relayed_aux_slots(
+            self.model_runner.spec_aux_config, self.model_runner.model
+        )
         if num_aux:
             proxy[AUX_HIDDEN_STATES_PROXY_KEY] = zeros(
                 (num_tokens, hidden_size * num_aux)

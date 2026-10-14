@@ -26,9 +26,7 @@ class PPDecodeTransferStatus(NamedTuple):
 def _check_aux_capture_relay(model: nn.Module) -> None:
     """Raise when Eagle3 capture layers sit before the last stage of a model
     whose forward does not relay them through PPProxyTensors."""
-    from sglang.srt.models.gpt_oss import GptOssForCausalLM
-
-    if isinstance(model, GptOssForCausalLM):
+    if getattr(model, "relays_pp_aux_hidden_states", False):
         return
     layer_model = model.model
     missing = [
@@ -57,9 +55,9 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
     model_runner = scheduler.tp_worker.model_runner
     policy = model_runner.compile_policy
     assert isinstance(policy, DecoderTpuCompilePolicy), type(policy)
-    num_aux = num_relayed_aux_slots(model_runner.spec_aux_config)
-    if num_aux:
+    if model_runner.spec_aux_config.eagle_use_aux_hidden_state:
         _check_aux_capture_relay(model_runner.model)
+    num_aux = num_relayed_aux_slots(model_runner.spec_aux_config, model_runner.model)
     return build_pp_wave(
         pp_group=scheduler.pp_group,
         stage_group=scheduler.tp_group,

@@ -116,7 +116,7 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
         proxy = {"hidden_states": randn(hidden), "residual": randn(hidden)}
         # Serving hands the Eagle3 capture slots on with the activations, so
         # the profiled chunk must carry them too.
-        num_aux = num_relayed_aux_slots(runner.spec_aux_config)
+        num_aux = num_relayed_aux_slots(runner.spec_aux_config, runner.model)
         if num_aux:
             proxy[AUX_HIDDEN_STATES_PROXY_KEY] = randn(hidden * num_aux)
         kwargs["pp_proxy_tensors"] = PPProxyTensors(proxy)

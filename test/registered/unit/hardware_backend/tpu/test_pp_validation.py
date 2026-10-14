@@ -14,6 +14,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
+from sglang.srt.arg_groups.validation_hook import (
+    check_pipeline_parallel_compat as core_check_pipeline_parallel_compat,
+)
 from sglang.srt.distributed import parallel_state
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.test.test_utils import CustomTestCase
@@ -23,6 +26,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.pp_scheduler import _check_aux_capture_relay
+from sglang_tpu.pp_wave import num_relayed_aux_slots
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
@@ -251,10 +255,13 @@ def _compat_cfg(**overrides):
 
 
 class TestEagle3PipelineParallelCompat(CustomTestCase):
-    def test_eagle3_skips_the_core_check(self):
+    def test_eagle3_runs_the_core_check_as_eagle(self):
         original = Mock()
         check_pipeline_parallel_compat(original, _compat_cfg())
-        original.assert_not_called()
+        original.assert_called_once()
+        (cfg,) = original.call_args.args
+        self.assertEqual(cfg.speculative_algorithm, "EAGLE")
+        self.assertTrue(cfg.disable_overlap_schedule)
 
     def test_other_algorithms_run_the_core_check(self):
         for algorithm in (None, "EAGLE", "DSPARK"):
@@ -266,13 +273,15 @@ class TestEagle3PipelineParallelCompat(CustomTestCase):
     def test_eagle3_rejects_overlap_schedule(self):
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
             check_pipeline_parallel_compat(
-                Mock(), _compat_cfg(disable_overlap_schedule=False)
+                core_check_pipeline_parallel_compat,
+                _compat_cfg(disable_overlap_schedule=False),
             )
 
     def test_eagle3_rejects_multi_layer_eagle(self):
-        with self.assertRaisesRegex(AssertionError, "multi-layer EAGLE3"):
+        with self.assertRaisesRegex(AssertionError, "non-multi-layer"):
             check_pipeline_parallel_compat(
-                Mock(), _compat_cfg(enable_multi_layer_eagle=True)
+                core_check_pipeline_parallel_compat,
+                _compat_cfg(enable_multi_layer_eagle=True),
             )
 
     def test_stage_without_draft_skips_spec_op_precompile(self):
@@ -295,6 +304,14 @@ class TestEagle3PipelineParallelCompat(CustomTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, r"layers \[2\]"):
             _check_aux_capture_relay(model)
+
+    def test_model_without_relay_hands_on_no_aux_slots(self):
+        config = SimpleNamespace(
+            eagle_use_aux_hidden_state=True, eagle_aux_hidden_state_layer_ids=[2, 18]
+        )
+        self.assertEqual(num_relayed_aux_slots(config, SimpleNamespace()), 0)
+        relaying = SimpleNamespace(relays_pp_aux_hidden_states=True)
+        self.assertEqual(num_relayed_aux_slots(config, relaying), 2)
 
 
 def _group(*ranks):

@@ -803,6 +803,8 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+    # The forward hands earlier stages' Eagle3 captures on in PPProxyTensors.
+    relays_pp_aux_hidden_states = True
 
     _lora_pattern_moe = re.compile(
         r"^(?:model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"

@@ -18,6 +18,7 @@ import os
 from typing import Any, Callable
 
 import torch
+from torch import nn
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
@@ -430,9 +431,11 @@ class PPAuxWave(PPWave):
         return super().probe_blocks(got) + [got[AUX_HIDDEN_STATES_PROXY_KEY]]
 
 
-def num_relayed_aux_slots(config: SpecAuxHiddenStateConfig) -> int:
+def num_relayed_aux_slots(config: SpecAuxHiddenStateConfig, model: nn.Module) -> int:
     """Eagle3 capture slots a pipeline stage hand-off carries; 0 when none."""
     if not config.eagle_use_aux_hidden_state:
+        return 0
+    if not getattr(model, "relays_pp_aux_hidden_states", False):
         return 0
     layer_ids = config.eagle_aux_hidden_state_layer_ids
     if layer_ids is None:
