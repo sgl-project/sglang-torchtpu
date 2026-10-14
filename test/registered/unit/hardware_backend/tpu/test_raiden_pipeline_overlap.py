@@ -156,6 +156,8 @@ def make(mode, pp_rank, pp_size, controller, bus, name, heads, stage_parts=False
         swa=[Tensor(8, 2 * heads, 8, 4)],
         full_layer_ids=[2 * pp_rank + 1 if mode == DisaggregationMode.PREFILL else 1],
         swa_layer_ids=[2 * pp_rank if mode == DisaggregationMode.PREFILL else 0],
+        num_draft_full=0,
+        num_draft_swa=0,
     )
     if mode == DisaggregationMode.DECODE:  # the decode owns every layer
         groups.full = [Tensor(32, 2 * heads, 8, 4), Tensor(32, 2 * heads, 8, 4)]
