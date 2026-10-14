@@ -2,7 +2,9 @@
 """GLM-5.3-Flash text generation on one TPU host, using the mounted FP8 weights.
 
 This is a functional gate; benchmark accuracy baselines have not been measured.
-Run with Bazel or directly like the other MODEL_CONFIG TPU e2e tests.
+It is a manual test, not registered in any CI suite. Run it on a TPU host with:
+
+    python3 test/manual/tpu/test_tpu_glm_5_3_flash_singlehost.py
 """
 
 import math
@@ -10,15 +12,7 @@ import os
 
 import requests
 
-from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
-
-register_tpu_ci(
-    est_time=3600,
-    suite="stage-b-test-tpu-4-v7",
-    disabled="TPU PR runners are not provisioned yet",
-    labels=["singlehost", "glm-5.3-flash", "smoke"],
-)
 
 MODEL_PATH = os.environ.get("MODEL", "/weights/GLM-5.3-Flash")
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
