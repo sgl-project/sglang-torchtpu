@@ -30,6 +30,7 @@ Sibling to :mod:`sglang_tpu.attention_pallas_rpa_v3`
 # reject them.
 
 import logging
+import weakref
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -458,6 +459,38 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
         self._query_start_loc_cache: dict = {}
+        self._slot_memo: Optional[tuple] = None
+
+    def _slot_indices(
+        self, req_pool_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(slot ids, int32 slot ids) of the batch's requests.
+
+        An unchanged batch reuses the last result: the gather and the cast are
+        two launches per round otherwise. The request-to-slot table is written
+        in place only when a request is allocated, which bumps its version.
+        """
+        pool = self.req_to_token_pool
+        table = pool.req_index_to_mamba_index_mapping
+        memo = self._slot_memo
+        if (
+            memo is not None
+            and memo[0]() is req_pool_indices
+            and memo[1] == req_pool_indices._version
+            and memo[2] == table._version
+        ):
+            return memo[3], memo[4]
+        slots = self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices))
+        slots_i32 = slots.to(torch.int32)
+        if pool.mamba_v2p_table is None:
+            self._slot_memo = (
+                weakref.ref(req_pool_indices),
+                req_pool_indices._version,
+                table._version,
+                slots,
+                slots_i32,
+            )
+        return slots, slots_i32
 
     def _uniform_query_start_loc(
         self, padded_bs: int, step: int, device: torch.device
@@ -511,10 +544,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # tracked-row selections and reads device masks on the host. Here every
         # row retains its bucket slot and disabled snapshots use end=-1.
         # Slot ids; the op clamps the -1 pad in-graph (see build_gdn_pallas_op).
-        slots = self._translate_mamba_indices(
-            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
-        )
-        self._state_indices = slots.to(torch.int32)
+        slots, self._state_indices = self._slot_indices(forward_batch.req_pool_indices)
         padded_bs = forward_batch.seq_lens.shape[0]
         if is_decode:
             # One token per request, or the verify window per request.
