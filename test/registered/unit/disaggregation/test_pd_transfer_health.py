@@ -1,7 +1,8 @@
 """Decode readiness from real transfer outcomes (sglang-torchtpu #1276, fix 1).
 
 Black-box contract that must not come back: a decode whose every KV transfer
-fails keeps answering 200 on /health_generate.
+fails, or a prefill whose every KV push fails, keeps answering 200 on
+/health_generate.
 
 Usage:
     python3 -m pytest test/registered/unit/disaggregation/test_pd_transfer_health.py -v
@@ -379,6 +380,7 @@ class TestSnapshotWire(CustomTestCase):
         restored = PDHealthSnapshot.from_json(back.disaggregation.health_json)
         self.assertEqual(restored, health)
         self.assertEqual(restored.open_peer_names, ["p1", "p2"])
+        self.assertEqual((restored.role, restored.unattributed_failures), ("decode", 0))
 
     def test_default_disaggregation_metrics_carry_no_health(self):
         self.assertEqual(DisaggregationMetrics(mode="prefill").health_json, "")
@@ -440,14 +442,14 @@ class TestQueueWiring(CustomTestCase):
 
         self.assertIsNone(DecodeTransferQueue.__init__.__defaults__[-1]())
 
-    def test_maybe_init_builds_the_tracker_for_decode_only(self):
+    def test_maybe_init_builds_the_tracker_for_pd_engines_only(self):
         from sglang.srt.disaggregation.utils import DisaggregationMode
 
         self.assertIsNone(Scheduler.pd_health, "class default keeps doubles safe")
         with envs.SGLANG_PD_HEALTH_FAILURE_THRESHOLD.override(7):
             for mode, expect in (
                 (DisaggregationMode.DECODE, True),
-                (DisaggregationMode.PREFILL, False),
+                (DisaggregationMode.PREFILL, True),
                 (DisaggregationMode.NULL, False),
             ):
                 scheduler = Scheduler.__new__(Scheduler)
@@ -456,6 +458,7 @@ class TestQueueWiring(CustomTestCase):
                 self.assertEqual(scheduler.pd_health is not None, expect, mode)
                 if expect:
                     self.assertEqual(scheduler.pd_health.config.failure_threshold, 7)
+                    self.assertEqual(scheduler.pd_health.snapshot().role, mode.value)
         with envs.SGLANG_ENABLE_PD_HEALTH_READINESS.override(False):
             scheduler = Scheduler.__new__(Scheduler)
             scheduler.disaggregation_mode = DisaggregationMode.DECODE
@@ -481,6 +484,132 @@ class TestQueueWiring(CustomTestCase):
         untracked.publish_load_snapshot = lambda force=False: published.append("no")
         untracked.maybe_publish_pd_health()
         self.assertEqual(published, [True, True])
+
+
+class TestUnattributedFailures(CustomTestCase):
+    """A failure with no peer to blame is reported but never trips anything."""
+
+    def test_unattributed_failures_never_open_or_trip(self):
+        tracker, clock = _tracker()
+        for _ in range(50):
+            tracker.record_unattributed_failure()
+            clock.advance(10.0)
+        snap = tracker.snapshot()
+        self.assertEqual(snap.unattributed_failures, 50)
+        self.assertEqual(
+            (snap.state, snap.known_peers, snap.open_peers), ("ready", 0, 0)
+        )
+        tracker.record_success(peer="d1")
+        _open_peer(tracker, clock, "d2")
+        self.assertEqual(
+            tracker.state, PDHealthState.READY, "1/2 open, unattributed ignored"
+        )
+
+
+class _FakeSender:
+    def __init__(self, peer):
+        self.kv_mgr = SimpleNamespace(decode_peer_host=lambda room: peer)
+
+
+class TestPrefillWiring(CustomTestCase):
+    def _recorder(self):
+        calls = []
+        fake = SimpleNamespace(
+            record_success=lambda peer: calls.append(("ok", peer)),
+            record_failure=lambda peer: calls.append(("fail", peer)),
+            record_unattributed_failure=lambda: calls.append(("unattributed",)),
+            record_admitted=lambda: calls.append(("admitted",)),
+        )
+        return fake, calls
+
+    def test_outcomes_keyed_by_decode_host_and_probes_skipped(self):
+        from sglang.srt.disaggregation.prefill import (
+            _record_prefill_pd_admission,
+            _record_prefill_pd_outcome,
+        )
+
+        fake, calls = self._recorder()
+        req = SimpleNamespace(
+            bootstrap_host="10.0.0.9",
+            bootstrap_room=7,
+            disagg_kv_sender=_FakeSender("10.0.1.5"),
+        )
+        orphan = SimpleNamespace(
+            bootstrap_host="10.0.0.9",
+            bootstrap_room=8,
+            disagg_kv_sender=_FakeSender(None),
+        )
+        probe = SimpleNamespace(
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            bootstrap_room=0,
+            disagg_kv_sender=_FakeSender(None),
+        )
+        _record_prefill_pd_admission(fake, req)
+        _record_prefill_pd_outcome(fake, req, ok=False)
+        _record_prefill_pd_outcome(fake, req, ok=True)
+        # The decode never registered: nobody to blame, counted only.
+        _record_prefill_pd_outcome(fake, orphan, ok=False)
+        # A success with no registered peer cannot happen; it must not crash or record.
+        _record_prefill_pd_outcome(fake, orphan, ok=True)
+        _record_prefill_pd_admission(fake, probe)
+        _record_prefill_pd_outcome(fake, probe, ok=False)
+        _record_prefill_pd_outcome(None, req, ok=False)
+        _record_prefill_pd_admission(None, req)
+        self.assertEqual(
+            calls,
+            [
+                ("admitted",),
+                ("fail", "10.0.1.5"),
+                ("ok", "10.0.1.5"),
+                ("unattributed",),
+            ],
+        )
+
+    def test_prefill_queue_defaults_to_no_tracker(self):
+        from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
+
+        self.assertIsNone(PrefillBootstrapQueue.get_pd_health())
+        self.assertIsNone(PrefillBootstrapQueue.__init__.__defaults__[-1]())
+
+
+class TestDecodePeerHost(CustomTestCase):
+    """The prefill-side peer key: the host of the decode that registered the room."""
+
+    def _manager(self, mode):
+        from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
+        from sglang.srt.disaggregation.common.conn import CommonKVManager
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr.disaggregation_mode = mode
+        mgr.transfer_infos = {}
+        mgr.deferred_bootstrap = DeferredBootstrap(timeout=60.0)
+        return mgr, DisaggregationMode
+
+    def test_from_transfer_infos_then_deferred_bootstrap_then_none(self):
+        mgr, Mode = self._manager(None)
+        mgr.disaggregation_mode = Mode.PREFILL
+        self.assertIsNone(mgr.decode_peer_host(1), "unknown room")
+        mgr.deferred_bootstrap.register(2, ("10.0.1.7", 31000))
+        self.assertEqual(mgr.decode_peer_host(2), "10.0.1.7")
+        mgr.transfer_infos[3] = {
+            0: SimpleNamespace(is_dummy=True, endpoint="10.0.1.1", dst_port=1),
+            1: SimpleNamespace(is_dummy=False, endpoint="[fd00::9]", dst_port=31000),
+        }
+        self.assertEqual(
+            mgr.decode_peer_host(3), "fd00::9", "dummy skipped, brackets stripped"
+        )
+
+    def test_decode_side_manager_has_no_decode_peers(self):
+        mgr, Mode = self._manager(None)
+        mgr.disaggregation_mode = Mode.DECODE
+        mgr.deferred_bootstrap.register(2, ("10.0.1.7", 31000))
+        self.assertIsNone(mgr.decode_peer_host(2))
+
+    def test_base_manager_default_is_none(self):
+        from sglang.srt.disaggregation.base.conn import BaseKVManager
+
+        self.assertIsNone(BaseKVManager.decode_peer_host(None, 5))
 
 
 class _FakeReader:
@@ -575,13 +704,17 @@ class TestHealthGenerateGate(CustomTestCase):
         finally:
             http_server.get_disagg = prior
 
-    def test_gate_is_inactive_outside_decode_mode(self):
+    def test_gate_covers_prefill_and_is_inactive_outside_pd_mode(self):
         tracker, clock = _tracker()
-        _open_peers(tracker, clock, ["p1", "p2"])
+        _open_peers(tracker, clock, ["d1", "d2"])
         tm = self._tm([_load(tracker.snapshot(), mode="prefill")])
         prior = http_server.get_disagg
-        http_server.get_disagg = lambda: SimpleNamespace(disaggregation_mode="prefill")
         try:
+            http_server.get_disagg = lambda: SimpleNamespace(
+                disaggregation_mode="prefill"
+            )
+            self.assertEqual(len(http_server.pd_health_unready_snapshots(tm)), 1)
+            http_server.get_disagg = lambda: SimpleNamespace(disaggregation_mode="null")
             self.assertEqual(http_server.pd_health_unready_snapshots(tm), [])
         finally:
             http_server.get_disagg = prior

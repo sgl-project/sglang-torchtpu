@@ -25,7 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import numpy as np
 import torch
@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.health import PDTransferHealth
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -122,6 +123,34 @@ if _is_tpu:
     )
 
 
+def _record_prefill_pd_outcome(
+    pd_health: Optional[PDTransferHealth], req: Req, *, ok: bool
+) -> None:
+    """A real request's transfer finished or failed on this prefill.
+
+    The peer is the host of the decode that registered the room. A failure
+    whose decode never registered has nobody to blame and is only counted.
+    Probes (fake sender) never count.
+    """
+    if pd_health is None or req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+        return
+    peer = req.disagg_kv_sender.kv_mgr.decode_peer_host(req.bootstrap_room)
+    if ok:
+        if peer is not None:
+            pd_health.record_success(peer=peer)
+    elif peer is None:
+        pd_health.record_unattributed_failure()
+    else:
+        pd_health.record_failure(peer=peer)
+
+
+def _record_prefill_pd_admission(
+    pd_health: Optional[PDTransferHealth], req: Req
+) -> None:
+    if pd_health is not None and req.bootstrap_host != FAKE_BOOTSTRAP_HOST:
+        pd_health.record_admitted()
+
+
 def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
     retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
@@ -173,6 +202,9 @@ class PrefillBootstrapQueue:
     Store the requests in bootstrapping
     """
 
+    # Class default so fixtures that build a queue without a scheduler keep working.
+    get_pd_health: Callable[[], Optional[PDTransferHealth]] = staticmethod(lambda: None)
+
     def __init__(
         self,
         token_to_kv_pool: KVCache,
@@ -185,8 +217,10 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         transfer_backend: TransferBackend,
+        get_pd_health: Callable[[], Optional[PDTransferHealth]] = lambda: None,
     ):
         parallel = get_parallel()
+        self.get_pd_health = get_pd_health
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
@@ -464,6 +498,7 @@ class PrefillBootstrapQueue:
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.append(req)
+        _record_prefill_pd_admission(self.get_pd_health(), req)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -751,6 +786,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            self.maybe_publish_pd_health()
 
             # Update last_batch
             self.last_batch = batch
@@ -885,6 +921,7 @@ class SchedulerDisaggregationPrefillMixin:
                 tpu_update_inflight_kv_write_pages(self, batch)
 
             self.process_disagg_prefill_inflight_queue()
+            self.maybe_publish_pd_health()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1234,6 +1271,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS
                 )
                 # FIXME: clean up req's data in transfer engine
+                _record_prefill_pd_outcome(self.pd_health, req, ok=True)
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
@@ -1311,6 +1349,7 @@ class SchedulerDisaggregationPrefillMixin:
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
+        _record_prefill_pd_outcome(self.pd_health, req, ok=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
@@ -1379,6 +1418,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
+        _record_prefill_pd_outcome(self.pd_health, req, ok=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)

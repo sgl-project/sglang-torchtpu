@@ -619,6 +619,20 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
+    def decode_peer_host(self, bootstrap_room: int) -> Optional[str]:
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return None
+        for info in list((self.transfer_infos.get(bootstrap_room) or {}).values()):
+            if not info.is_dummy:
+                return NetworkAddress(info.endpoint, info.dst_port).host
+        if self.deferred_bootstrap is not None:
+            with self.deferred_bootstrap.lock:
+                state = self.deferred_bootstrap.rooms.get(bootstrap_room)
+                endpoint = state.endpoint if state is not None else None
+            if endpoint is not None:
+                return NetworkAddress(endpoint[0], endpoint[1]).host
+        return None
+
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
         infos = self.transfer_infos.get(bootstrap_room)
         if not infos:

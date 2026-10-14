@@ -702,9 +702,9 @@ async def ready() -> Response:
 
 
 def pd_health_unready_snapshots(tokenizer_manager) -> List[PDHealthSnapshot]:
-    """Unhealthy decode schedulers from the load snapshot; [] outside P/D decode."""
+    """Unhealthy P/D schedulers from the load snapshot; [] outside P/D mode."""
     reader = tokenizer_manager.load_snapshot_reader
-    if reader is None or get_disagg().disaggregation_mode != "decode":
+    if reader is None or get_disagg().disaggregation_mode not in ("decode", "prefill"):
         return []
     unready = []
     for load in reader.read_all():
@@ -747,8 +747,8 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
-    # A decode whose real transfers keep failing is not ready, whatever the
-    # probe's own forward would say: the probe never performs a transfer.
+    # A P/D engine whose real transfers keep failing is not ready, whatever
+    # the probe's own forward would say: the probe never performs a transfer.
     unready = pd_health_unready_snapshots(_global_state.tokenizer_manager)
     if unready:
         return ORJSONResponse(

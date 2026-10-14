@@ -22,8 +22,11 @@ The rule (sglang-torchtpu #1276, agreed short-term form):
   quiet wait doubled up to ``probation_backoff_cap_s``. Probation ends in
   READY as soon as the open-peer ratio no longer trips.
 
-Peers are the prefill bootstrap addresses named by real requests. Health
-probes (the fake receiver), client aborts and intake rejections are never
+On a decode the peers are the prefill bootstrap addresses named by real
+requests; on a prefill they are the hosts of the decodes that registered a
+room (one peer per decode host). A prefill failure whose decode never
+registered has no peer and is only counted as unattributed. Health probes
+(the fake sender and receiver), client aborts and intake rejections are never
 recorded; the caller filters them. The clock is injected so every rule is
 testable without sleeping.
 """
@@ -99,6 +102,7 @@ class PDPeerSnapshot(msgspec.Struct, kw_only=True):
 class PDHealthSnapshot(msgspec.Struct, kw_only=True):
     """Published by the scheduler; read by the probe and returned in its 503 body."""
 
+    role: str = "decode"
     state: str = PDHealthState.READY.value
     reason: str = "ready"
     known_peers: int = 0
@@ -109,6 +113,9 @@ class PDHealthSnapshot(msgspec.Struct, kw_only=True):
     probation_wait_s: float = 0.0
     probation_deadline_in_s: Optional[float] = None
     since_s: float = 0.0
+    # Failures with no peer to blame: on a prefill, a decode that never
+    # registered its room. Reported, never counted in the ratio.
+    unattributed_failures: int = 0
 
     @property
     def ready(self) -> bool:
@@ -183,12 +190,15 @@ class PDTransferHealth:
         self,
         config: Optional[PDHealthConfig] = None,
         clock: Callable[[], float] = time.monotonic,
+        role: str = "decode",
     ):
         self.config = config or PDHealthConfig()
         self.config.validate()
         self._clock = clock
+        self.role = role
         self.state = PDHealthState.READY
         self.version = 0
+        self._unattributed_failures = 0
         self._peers: Dict[str, _PeerCircuit] = {}
         self._last_failure_ts: Optional[float] = None
         self._state_since: float = clock()
@@ -225,6 +235,11 @@ class PDTransferHealth:
             self._probation_deadline = None
         return self.state
 
+    def record_unattributed_failure(self) -> None:
+        """A failure nobody can be blamed for (no registered peer): counted,
+        never opens a circuit, never trips the ratio."""
+        self._unattributed_failures += 1
+
     def record_admitted(self) -> None:
         if self.state == PDHealthState.PROBATION and self._probation_deadline is None:
             self._probation_deadline = (
@@ -251,6 +266,7 @@ class PDTransferHealth:
         open_count, denom = self._open_and_denominator()
         peers = [c.snapshot(name, now) for name, c in sorted(self._peers.items())]
         return PDHealthSnapshot(
+            role=self.role,
             state=self.state.value,
             reason=self._reason(open_count, denom),
             known_peers=denom,
@@ -265,6 +281,7 @@ class PDTransferHealth:
                 else None
             ),
             since_s=round(now - self._state_since, 1),
+            unattributed_failures=self._unattributed_failures,
         )
 
     # ----- internals -----

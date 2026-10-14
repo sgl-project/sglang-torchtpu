@@ -90,6 +90,11 @@ class RaidenSenderMixin:
             self._announce_chunk(room, start, block_ids, total_pages)
         self._maybe_reply(room)
 
+    def decode_peer_host(self, room: int) -> Optional[str]:
+        with self._state_lock:
+            addr = self._prefill.decode_addr.get(room)
+        return addr[0] if addr is not None else None
+
     def _on_abort(self, msg: List[bytes]) -> None:
         """Fail a room that decode abandoned through the common ABORT message.
 

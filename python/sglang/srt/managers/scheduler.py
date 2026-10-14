@@ -1637,6 +1637,7 @@ class Scheduler(
                 scheduler=self,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
+                get_pd_health=lambda: self.pd_health,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
@@ -1666,13 +1667,20 @@ class Scheduler(
             )
 
     def maybe_init_pd_health(self) -> None:
-        """Decode readiness from real transfer outcomes, published in the load snapshot."""
+        """P/D readiness from real transfer outcomes, published in the load snapshot."""
         self.pd_health = None
         if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
+            self.disaggregation_mode
+            in (
+                DisaggregationMode.DECODE,
+                DisaggregationMode.PREFILL,
+            )
             and envs.SGLANG_ENABLE_PD_HEALTH_READINESS.get()
         ):
-            self.pd_health = PDTransferHealth(config=PDHealthConfig.from_env())
+            self.pd_health = PDTransferHealth(
+                config=PDHealthConfig.from_env(),
+                role=self.disaggregation_mode.value,
+            )
 
     def maybe_publish_pd_health(self) -> None:
         """Publish the load snapshot when readiness changed, including while idle.
