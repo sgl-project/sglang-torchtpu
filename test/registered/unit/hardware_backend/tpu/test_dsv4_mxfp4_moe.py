@@ -469,13 +469,16 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
 
     def test_deepseek_v4_pro_shared_experts_subblock_tp16_sharding(self):
         """Verify DeepSeek-V4-Pro shared_experts sub-block TP=16 sharding (`3072 // 16 = 192`)."""
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
         from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+        from sglang.srt.runtime_context import get_context
+        from sglang_tpu.fp8_linear import (
+            compute_tpu_fp8_linear_scale_shape,
+            prepare_tpu_fp8_linear_weights,
+        )
 
-        class _FakeBlockFp8Config:
-            weight_block_size = [128, 128]
-            is_checkpoint_fp8_serialized = True
-            use_mxfp8 = False
+        override = get_context().override_server_args(tpu_fp8_runtime="blockwise")
+        override.install()
+        self.addCleanup(override.restore)
 
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
 
@@ -492,7 +495,6 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
             )
             return wq, s, block_quant_dequant(wq, s, [128, 128], torch.float32)
 
-        method = Fp8LinearMethod(_FakeBlockFp8Config())
         gate_w, gate_s, gate_deq = _make_block_fp8((384, 256))
         up_w, up_s, up_deq = _make_block_fp8((384, 256))
         down_w, down_s, down_deq = _make_block_fp8((256, 384))
@@ -502,9 +504,19 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
             s_start, s_end = start // 128, (end + 127) // 128
 
             gate_up_layer = torch.nn.Module()
+            gate_up_layer.tp_rank = tp_rank
             gate_up_layer.logical_widths = [192, 192]
-            gate_up_layer.tpu_fp8_output_tp_rank = tp_rank
-            gate_up_layer.tpu_fp8_input_offset = 0
+            scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
+                gate_up_layer,
+                input_size=256,
+                input_size_per_partition=256,
+                output_size=768,
+                output_size_per_partition=384,
+                output_partition_sizes=[192, 192],
+                block_n=128,
+                block_k=128,
+            )
+            self.assertEqual((scale_rows, scale_cols), (2 * (s_end - s_start), 2))
             gate_up_layer.weight = torch.nn.Parameter(
                 torch.cat([gate_w[start:end], up_w[start:end]], dim=0),
                 requires_grad=False,
@@ -514,7 +526,7 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
                 requires_grad=False,
             )
             gate_up_layer.input_scale = None
-            method._requantize_tpu_block_fp8_to_channelwise(gate_up_layer)
+            prepare_tpu_fp8_linear_weights(gate_up_layer, weight_block_size=[128, 128])
             recovered_gu = (
                 gate_up_layer.weight.float() * gate_up_layer.weight_scale.reshape(1, -1)
             ).t()
@@ -522,9 +534,19 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
             torch.testing.assert_close(recovered_gu, expected_gu, rtol=0.1, atol=0.1)
 
             down_layer = torch.nn.Module()
+            down_layer.tp_rank = tp_rank
             down_layer.logical_widths = [256]
-            down_layer.tpu_fp8_output_tp_rank = 0
-            down_layer.tpu_fp8_input_offset = start
+            scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
+                down_layer,
+                input_size=384,
+                input_size_per_partition=192,
+                output_size=256,
+                output_size_per_partition=256,
+                output_partition_sizes=[256],
+                block_n=128,
+                block_k=128,
+            )
+            self.assertEqual((scale_rows, scale_cols), (2, s_end - s_start))
             down_layer.weight = torch.nn.Parameter(
                 down_w[:, start:end].contiguous(), requires_grad=False
             )
@@ -532,7 +554,7 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
                 down_s[:, s_start:s_end].contiguous(), requires_grad=False
             )
             down_layer.input_scale = None
-            method._requantize_tpu_block_fp8_to_channelwise(down_layer)
+            prepare_tpu_fp8_linear_weights(down_layer, weight_block_size=[128, 128])
             recovered_down = (
                 down_layer.weight.float() * down_layer.weight_scale.reshape(1, -1)
             ).t()

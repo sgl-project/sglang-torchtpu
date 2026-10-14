@@ -13,7 +13,10 @@ from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.fp8_linear import (
+    _requantize_tpu_block_fp8_to_channelwise,
     apply_tpu_fp8_linear,
+    compute_tpu_fp8_linear_scale_shape,
+    prepare_tpu_fp8_linear_weights,
     tpu_w8a8_block_fp8_linear,
 )
 from sglang_tpu.fp8_moe import (
@@ -221,8 +224,7 @@ class TestTpuFp8Linear(CustomTestCase):
         layer.input_scale = None
         stale_scale = layer.weight_scale_inv
 
-        method = Fp8LinearMethod(_FakeBlockFp8Config())
-        method._requantize_tpu_block_fp8_to_channelwise(layer)
+        _requantize_tpu_block_fp8_to_channelwise(layer, block_size)
 
         self.assertIsNone(layer.weight_scale_inv)
         self.assertEqual(stale_scale.data.numel(), 0)
@@ -234,7 +236,6 @@ class TestTpuFp8Linear(CustomTestCase):
     def test_deepseek_v4_pro_shared_experts_subblock_tp16_sharding(self):
         """Verify sub-block TP=16 sharding for DeepSeek-V4-Pro shared_experts (3072 // 16 = 192)."""
         block_size = [128, 128]
-        method = Fp8LinearMethod(_FakeBlockFp8Config())
 
         # 1. MergedColumnParallelLinear (gate_up_proj): logical_widths=[192, 192], in_size=256
         gate_w, gate_s = self._make_block_fp8_weight((384, 256), block_size)
@@ -248,9 +249,19 @@ class TestTpuFp8Linear(CustomTestCase):
             s_start = start // 128
             s_end = (end + 127) // 128
             layer = torch.nn.Module()
+            layer.tp_rank = tp_rank
             layer.logical_widths = [192, 192]
-            layer.tpu_fp8_output_tp_rank = tp_rank
-            layer.tpu_fp8_input_offset = 0
+            scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
+                layer,
+                input_size=256,
+                input_size_per_partition=256,
+                output_size=768,
+                output_size_per_partition=384,
+                output_partition_sizes=[192, 192],
+                block_n=128,
+                block_k=128,
+            )
+            self.assertEqual((scale_rows, scale_cols), (2 * (s_end - s_start), 2))
             layer.weight = torch.nn.Parameter(
                 torch.cat([gate_w[start:end], up_w[start:end]], dim=0),
                 requires_grad=False,
@@ -261,7 +272,7 @@ class TestTpuFp8Linear(CustomTestCase):
             )
             layer.input_scale = None
 
-            method._requantize_tpu_block_fp8_to_channelwise(layer)
+            prepare_tpu_fp8_linear_weights(layer, weight_block_size=block_size)
             recovered = (layer.weight.float() * layer.weight_scale.reshape(1, -1)).t()
             expected = torch.cat([gate_deq[start:end], up_deq[start:end]], dim=0)
             torch.testing.assert_close(recovered, expected, rtol=0.1, atol=0.1)
@@ -275,9 +286,19 @@ class TestTpuFp8Linear(CustomTestCase):
             s_start = start // 128
             s_end = (end + 127) // 128
             layer = torch.nn.Module()
+            layer.tp_rank = tp_rank
             layer.logical_widths = [256]
-            layer.tpu_fp8_output_tp_rank = 0
-            layer.tpu_fp8_input_offset = start
+            scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
+                layer,
+                input_size=384,
+                input_size_per_partition=192,
+                output_size=256,
+                output_size_per_partition=256,
+                output_partition_sizes=[256],
+                block_n=128,
+                block_k=128,
+            )
+            self.assertEqual((scale_rows, scale_cols), (2, s_end - s_start))
             layer.weight = torch.nn.Parameter(
                 down_w[:, start:end].contiguous(), requires_grad=False
             )
@@ -286,7 +307,7 @@ class TestTpuFp8Linear(CustomTestCase):
             )
             layer.input_scale = None
 
-            method._requantize_tpu_block_fp8_to_channelwise(layer)
+            prepare_tpu_fp8_linear_weights(layer, weight_block_size=block_size)
             recovered = (layer.weight.float() * layer.weight_scale.reshape(1, -1)).t()
             expected = down_deq[:, start:end]
             torch.testing.assert_close(recovered, expected, rtol=0.1, atol=0.1)
