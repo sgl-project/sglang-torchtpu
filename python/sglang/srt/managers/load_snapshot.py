@@ -170,6 +170,9 @@ class DisaggregationMetrics(msgspec.Struct, array_like=True):
     decode_retracted_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    # PDHealthSnapshot of the decode's transfer outcomes; "" when not tracked.
+    health_state: str = ""
+    health_json: str = ""
 
 
 class QueueMetrics(msgspec.Struct, array_like=True):

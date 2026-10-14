@@ -41,6 +41,7 @@ from typing import (
 )
 
 import aiohttp
+import msgspec
 import numpy as np
 import orjson
 import requests
@@ -67,6 +68,7 @@ from fastapi.routing import APIRoute
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.health import PDHealthSnapshot
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -699,6 +701,22 @@ async def ready() -> Response:
     return Response(status_code=status_code)
 
 
+def pd_health_unready_snapshots(tokenizer_manager) -> List[PDHealthSnapshot]:
+    """Unhealthy decode schedulers from the load snapshot; [] outside P/D decode."""
+    reader = tokenizer_manager.load_snapshot_reader
+    if reader is None or get_disagg().disaggregation_mode != "decode":
+        return []
+    unready = []
+    for load in reader.read_all():
+        disagg = load.disaggregation
+        if disagg is None or not disagg.health_json:
+            continue
+        snap = PDHealthSnapshot.from_json(disagg.health_json)
+        if not snap.ready:
+            unready.append(snap)
+    return unready
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -728,6 +746,21 @@ async def health_generate(request: Request) -> Response:
         and request.url.path == "/health"
     ):
         return Response(status_code=200)
+
+    # A decode whose real transfers keep failing is not ready, whatever the
+    # probe's own forward would say: the probe never performs a transfer.
+    unready = pd_health_unready_snapshots(_global_state.tokenizer_manager)
+    if unready:
+        return ORJSONResponse(
+            status_code=503,
+            content={
+                "state": unready[0].state,
+                "reason": unready[0].reason,
+                "known_peers": unready[0].known_peers,
+                "open_peers": unready[0].open_peer_names,
+                "pd_health": [msgspec.to_builtins(snap) for snap in unready],
+            },
+        )
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can

@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.health import PDTransferHealth
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -141,6 +142,23 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _record_pd_transfer_outcome(
+    pd_health: Optional[PDTransferHealth], req: Req, *, ok: bool
+) -> None:
+    """A real request's transfer finished or failed; health probes never count."""
+    if pd_health is None or _is_fake_transfer(req):
+        return
+    if ok:
+        pd_health.record_success(peer=_bootstrap_addr(req))
+    else:
+        pd_health.record_failure(peer=_bootstrap_addr(req))
+
+
+def _record_pd_admission(pd_health: Optional[PDTransferHealth], req: Req) -> None:
+    if pd_health is not None and not _is_fake_transfer(req):
+        pd_health.record_admitted()
 
 
 def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
@@ -387,6 +405,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     Store the requests that are preallocating.
     """
 
+    # Overridden per instance by __init__; the default keeps __new__-built doubles valid.
+    get_pd_health: Callable[[], Optional[PDTransferHealth]] = staticmethod(lambda: None)
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -403,6 +424,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
         attn_cp_cpu_group: ProcessGroup | None = None,
+        get_pd_health: Callable[[], Optional[PDTransferHealth]] = lambda: None,
     ):
         parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
@@ -413,6 +435,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
+        self.get_pd_health = get_pd_health
         self.transfer_queue = transfer_queue
         self.tree_cache = tree_cache
         self.host_pool = None
@@ -1201,6 +1224,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+                _record_pd_transfer_outcome(
+                    self.get_pd_health(), decode_req.req, ok=False
+                )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
@@ -1497,6 +1523,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if not self._pre_alloc_host(decode_req):
                     break
                 preallocated_reqs.append(decode_req)
+                _record_pd_admission(self.get_pd_health(), decode_req.req)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_lora:
                     running_loras.add(decode_req.req.lora_id)
@@ -1821,6 +1848,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             num_device_preallocated += 1
             preallocated_reqs.append(decode_req)
+            _record_pd_admission(self.get_pd_health(), decode_req.req)
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
@@ -2466,6 +2494,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     Store the requests that is polling kv
     """
 
+    # Overridden per instance by __init__; the default keeps __new__-built doubles valid.
+    get_pd_health: Callable[[], Optional[PDTransferHealth]] = staticmethod(lambda: None)
+
     enable_host_receive: bool = False
 
     def __init__(
@@ -2475,6 +2506,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
         attn_cp_cpu_group: ProcessGroup | None = None,
+        get_pd_health: Callable[[], Optional[PDTransferHealth]] = lambda: None,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
@@ -2483,6 +2515,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.tp_rank = get_parallel().tp_rank
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
+        self.get_pd_health = get_pd_health
         self.enable_host_receive = (
             get_disagg().disaggregation_decode_host_receive_threshold > 0
         )
@@ -2780,6 +2813,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     logger.debug(error_message)
                 else:
                     logger.error(error_message)
+                _record_pd_transfer_outcome(
+                    self.get_pd_health(), decode_req.req, ok=False
+                )
                 prepare_abort(
                     decode_req.req,
                     error_message,
@@ -2861,9 +2897,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         )
                     self._clean_hicache_prefetch_resources(decode_req)
                     self._release_request(decode_req)
+                    _record_pd_transfer_outcome(
+                        self.get_pd_health(), decode_req.req, ok=False
+                    )
                     if self.scheduler.metrics_reporter.enable_metrics:
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
+                    _record_pd_transfer_outcome(
+                        self.get_pd_health(), decode_req.req, ok=True
+                    )
                     transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -3373,3 +3415,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
+
+        # Readiness transitions reached on the clock alone (quiet period over,
+        # probation deadline missed) must reach the probe even when idle.
+        self.maybe_publish_pd_health()

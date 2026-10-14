@@ -710,6 +710,19 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    # Decode readiness from real transfer outcomes (/health_generate; #1276).
+    # A peer opens after THRESHOLD failures in a row spanning WINDOW seconds;
+    # the decode is unhealthy once more than RATIO of its peers are open, and
+    # retries on probation after WINDOW quiet seconds (doubling up to the cap).
+    SGLANG_ENABLE_PD_HEALTH_READINESS = EnvBool(True)
+    SGLANG_PD_HEALTH_FAILURE_THRESHOLD = EnvInt(5)
+    SGLANG_PD_HEALTH_FAILURE_WINDOW_S = EnvFloat(60.0)
+    SGLANG_PD_HEALTH_FAILURE_RATIO = EnvFloat(0.5)
+    SGLANG_PD_HEALTH_PROBATION_OUTPUT_TIMEOUT_S = EnvFloat(60.0)
+    SGLANG_PD_HEALTH_PROBATION_BACKOFF_CAP_S = EnvFloat(1800.0)
+    # Denominator floor for the ratio: the prefill count when the topology is
+    # static, so the first requests from one bad prefill cannot trip a decode.
+    SGLANG_PD_HEALTH_EXPECTED_PEERS = EnvInt(0)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     # Retained only to reject the removed setting during startup.

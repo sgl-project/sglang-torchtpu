@@ -91,6 +91,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
+from sglang.srt.disaggregation.health import PDHealthConfig, PDTransferHealth
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -460,6 +461,8 @@ class Scheduler(
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     kv_free_fence: Optional["KVFreeFence"] = None
+    pd_health: Optional[PDTransferHealth] = None
+    _pd_health_published_version: int = -1
 
     def __init__(
         self,
@@ -668,6 +671,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.maybe_init_pd_health()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1584,6 +1588,7 @@ class Scheduler(
                 scheduler=self,
                 tree_cache=self.tree_cache,
                 attn_cp_cpu_group=decode_attn_cp_cpu_group,
+                get_pd_health=lambda: self.pd_health,
             )
 
             # The decode requests pending for pre-allocation
@@ -1602,6 +1607,7 @@ class Scheduler(
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
                 attn_cp_cpu_group=decode_attn_cp_cpu_group,
+                get_pd_health=lambda: self.pd_health,
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1658,6 +1664,30 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 scheduler=self,
             )
+
+    def maybe_init_pd_health(self) -> None:
+        """Decode readiness from real transfer outcomes, published in the load snapshot."""
+        self.pd_health = None
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_ENABLE_PD_HEALTH_READINESS.get()
+        ):
+            self.pd_health = PDTransferHealth(config=PDHealthConfig.from_env())
+
+    def maybe_publish_pd_health(self) -> None:
+        """Publish the load snapshot when readiness changed, including while idle.
+
+        The regular publish runs with batches or once at the busy-to-idle edge,
+        but a decode taken out of service is idle, and its unhealthy-to-probation
+        transition after the quiet period happens on the clock alone. Without
+        this forced publish the probe would keep reading the stale 503.
+        """
+        if self.pd_health is None:
+            return
+        self.pd_health.tick()
+        if self.pd_health.version != self._pd_health_published_version:
+            self._pd_health_published_version = self.pd_health.version
+            self.publish_load_snapshot(force=True)
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -2669,6 +2699,9 @@ class Scheduler(
             ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_pd_health_snapshot=lambda: (
+                self.pd_health.snapshot() if self.pd_health is not None else None
+            ),
             get_spec_total_num_accept_tokens=lambda: (
                 self.metrics_reporter.spec_total_num_accept_tokens
             ),

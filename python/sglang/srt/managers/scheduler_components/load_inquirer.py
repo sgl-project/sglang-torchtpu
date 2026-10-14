@@ -54,6 +54,7 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_pd_health_snapshot: Callable | None = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -190,8 +191,15 @@ class SchedulerLoadInquirer:
             ]
             decode_prealloc_ready = len(ready_reqs)
             num_prealloc_ready_tokens = sum(req.seqlen for req in ready_reqs)
+        health_state = health_json = ""
+        if self.get_pd_health_snapshot is not None:
+            health = self.get_pd_health_snapshot()
+            if health is not None:
+                health_state, health_json = health.state, health.to_json()
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
+            health_state=health_state,
+            health_json=health_json,
             prefill_bootstrap_queue_reqs=prefill_bootstrap,
             prefill_inflight_queue_reqs=prefill_inflight,
             decode_prealloc_queue_reqs=decode_prealloc,
