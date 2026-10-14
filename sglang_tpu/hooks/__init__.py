@@ -16,6 +16,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
         skip_spec_op_precompile_without_draft,
         HookType.AROUND,
+    ),
+    (
+        "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_worker",
+        select_experimental_spec_worker,
+        HookType.AFTER,
     ),
 ]
 

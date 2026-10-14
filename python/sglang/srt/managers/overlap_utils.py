@@ -11,6 +11,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
 )
+from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
@@ -101,8 +102,13 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     if batch.prefill_input_ids_cpu is not None:
         if _is_tpu and any(batch.multimodal_inputs or ()):
             batch.mm_input_ids_cpu = batch.prefill_input_ids_cpu
-        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        # HOST_PADDED: the backend pads the prompt on host and uploads it at the bucket shape.
+        host_padded = batch.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED
+        prefill_gpu = batch.prefill_input_ids_cpu.to(
+            "cpu" if host_padded else batch.device, non_blocking=True
+        )
         if batch.mix_running_indices is not None:
+            assert not host_padded, "HOST_PADDED batches do not support mixed chunks"
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]

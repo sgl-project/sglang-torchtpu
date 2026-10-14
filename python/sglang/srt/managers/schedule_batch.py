@@ -65,6 +65,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -140,9 +141,11 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -2543,6 +2546,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
+    # HOST_PADDED rebuilds req_pool_indices from req_pool_indices_cpu on filter/merge.
+    tensor_source_of_truth: TensorSourceOfTruth = TensorSourceOfTruth.DEVICE
+    # HOST_PADDED only: bucket rows SamplingBatchInfo pads its host params to.
+    host_pad_bs: Optional[Callable[[int], int]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2614,6 +2621,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return_logprob = any(req.return_logprob for req in reqs)
 
         return_hidden_states_mode = get_batch_return_hidden_states_mode(reqs)
+        host_pad_bs = current_platform.get_host_batch_padder(spec_algorithm.name)
 
         batch = cls(
             reqs=reqs,
@@ -2626,6 +2634,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
+            tensor_source_of_truth=(
+                TensorSourceOfTruth.DEVICE
+                if host_pad_bs is None
+                else TensorSourceOfTruth.HOST_PADDED
+            ),
+            host_pad_bs=host_pad_bs,
             return_hidden_states=return_hidden_states_mode.need_capture(),
             return_hidden_states_mode=return_hidden_states_mode,
             is_prefill_only=all(req.is_prefill_only for req in reqs),
@@ -3758,16 +3772,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
-        self.seq_lens = self.seq_lens[keep_indices_device]
-        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        if self.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED:
+            self._rebuild_host_padded_rows()
+        else:
+            self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+            self.seq_lens = self.seq_lens[keep_indices_device]
+            self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+            if self.input_ids is not None:
+                self.input_ids = self.input_ids[keep_indices_device]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
-
-        if self.input_ids is not None:
-            self.input_ids = self.input_ids[keep_indices_device]
         # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
@@ -3799,10 +3815,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(
-                new_indices=keep_indices_device,
-                new_indices_cpu=keep_indices,
-            )
+            if self.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED:
+                # future_indices equals req_pool_indices; reuse the host-rebuilt rows
+                # instead of a device gather compiled per (old bs, new bs) pair.
+                self.spec_info.filter_batch(
+                    new_indices=keep_indices_device,
+                    new_indices_cpu=keep_indices,
+                    future_indices=self.req_pool_indices,
+                )
+            else:
+                self.spec_info.filter_batch(
+                    new_indices=keep_indices_device,
+                    new_indices_cpu=keep_indices,
+                )
+
+    def _rebuild_host_padded_rows(self) -> None:
+        """HOST_PADDED filter/merge without a device gather/cat compiled per bs pair."""
+        self.req_pool_indices = self.req_pool_indices_cpu.to(
+            self.device, non_blocking=True
+        )
+        # Only the spec overlap worker runs HOST_PADDED: resolve_seq_lens_cpu re-gathers
+        # seq_lens from FutureMap before the next forward, and input_ids are relayed.
+        assert not self.spec_algorithm.is_none() and self.enable_overlap
+        assert self.input_ids is None
+        self.seq_lens = None
+        # Not read on TPU (ignored by direct compile); verify passes None as well.
+        self.orig_seq_lens = None
 
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
@@ -3816,14 +3854,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
-        )
+        assert self.tensor_source_of_truth is other.tensor_source_of_truth
         self.req_pool_indices_cpu = torch.cat(
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
-        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        if self.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED:
+            assert other.input_ids is None
+            self._rebuild_host_padded_rows()
+        else:
+            self.req_pool_indices = torch.cat(
+                [self.req_pool_indices, other.req_pool_indices]
+            )
+            self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+            self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3872,7 +3915,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
-            self.spec_info.merge_batch(other.spec_info)
+            if self.tensor_source_of_truth is TensorSourceOfTruth.HOST_PADDED:
+                # Same as filter_batch: skip the per-(bs1, bs2) device cat.
+                self.spec_info.merge_batch(
+                    other.spec_info, future_indices=self.req_pool_indices
+                )
+            else:
+                self.spec_info.merge_batch(other.spec_info)
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
@@ -3896,6 +3945,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states_mode=self.return_hidden_states_mode,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            tensor_source_of_truth=self.tensor_source_of_truth,
+            host_pad_bs=self.host_pad_bs,
             spec_info=self.spec_info,
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
             dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,

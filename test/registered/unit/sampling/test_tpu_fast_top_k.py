@@ -21,6 +21,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, LogitsOutputMode
 from sglang.srt.model_executor.runner import eager_runner as eager_runner_module
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import sampler as tpu_sampler_module
@@ -60,6 +61,7 @@ def _forward_batch(*, batch_size=1, **info_overrides):
         acc_scaling_penalties=None,
         penalizer_orchestrator=SimpleNamespace(is_required=False),
         sampling_seed=None,
+        tensor_source_of_truth=TensorSourceOfTruth.DEVICE,
         top_ks=torch.tensor([50], dtype=torch.int32),
         top_ps=torch.ones(1),
         min_ps=torch.zeros(1),
@@ -67,6 +69,7 @@ def _forward_batch(*, batch_size=1, **info_overrides):
     )
     for name, value in info_overrides.items():
         setattr(info, name, value)
+    info.on_device = lambda: info
     mode = SimpleNamespace(
         is_decode=lambda: True,
         is_extend_without_speculative=lambda: False,

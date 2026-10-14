@@ -453,6 +453,7 @@ echo "  ENABLE_HLO_DUMP        = $ENABLE_HLO_DUMP  ($HLO_DUMP_DIR)"
 echo "  ENABLE_TORCH_COMPILE_DEBUG = $ENABLE_TORCH_COMPILE_DEBUG  ($TORCH_COMPILE_DEBUG_DIR)"
 echo "  ENABLE_PROFILER_ENDPOINT   = $ENABLE_PROFILER_ENDPOINT  ($PROFILER_DIR)"
 echo "  TORCH_LOGS         = $TORCH_LOGS"
+echo "  CHECK_RECOMPILATION = $SGLANG_TPU_CHECK_RECOMPILATION  (sites=$SGLANG_TPU_CHECK_RECOMPILATION_SITES)"
 echo "======================="
 
 # An absolute MODEL that is not on the mounted disk reaches transformers as an

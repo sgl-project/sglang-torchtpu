@@ -14,6 +14,7 @@ import os
 import torch
 
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,11 @@ class TpuOOTPlatform(TpuSRTPlatform):
         return None
 
     def supports_speculative_algorithm(self, algorithm: str) -> bool:
-        return str(algorithm).upper() in _SUPPORTED_SPEC_ALGORITHMS
+        name = str(algorithm).upper()
+        if name == "DSPARK":
+            # Served by sglang_tpu.experimental.TpuDsparkWorker.
+            return tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.get()
+        return name in _SUPPORTED_SPEC_ALGORITHMS
 
     def supports_speculative_draft_attention_backend(
         self, algorithm: str, backend: str

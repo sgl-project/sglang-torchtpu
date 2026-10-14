@@ -1321,6 +1321,7 @@ class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
             out_cache_loc=torch.empty((0,), dtype=torch.int32),
             req_pool_indices=torch.empty((0,), dtype=torch.int32),
             spec_info=spec_info,
+            sampling_info=None,
         )
 
         with (

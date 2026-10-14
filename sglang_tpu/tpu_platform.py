@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from contextlib import AbstractContextManager, contextmanager
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Callable, Optional, Type
 
 import torch
 
@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang_tpu._logging import get_logger
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -855,6 +856,11 @@ class TpuSRTPlatform(SRTPlatform):
                     )
             elif spec_algo == "DFLASH":
                 pass
+            elif spec_algo == "DSPARK" and (
+                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.get()
+            ):
+                # Served by sglang_tpu.experimental.TpuDsparkWorker.
+                pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -1081,6 +1087,19 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
+
+    def get_host_batch_padder(self, spec_algorithm: str) -> Callable[[int], int] | None:
+        # Plugin load order: spec_info imports platforms, so it cannot be top-level here.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.experimental import (
+            get_host_batch_padder,
+            is_experimental_dspark,
+        )
+
+        # TpuSpecWorker pads host-born batch tensors to the batch bucket on host.
+        if is_experimental_dspark(SpeculativeAlgorithm[spec_algorithm]):
+            return get_host_batch_padder()
+        return None
 
     def supports_torch_compile(self) -> bool:
         return True

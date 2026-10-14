@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.attention_rank_inputs import (
@@ -51,8 +52,10 @@ from sglang_tpu.compilation.attention_rank_inputs import (
 )
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
+    _BS_FIELDS,
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    _TOKEN_FIELDS,
     CompiledForwardShim,
     _extend_batch_cap,
     _pad_forward_batch_inputs,
@@ -951,6 +954,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.b_bucketer,
                 extend_bs=self.extend_bs,
             )
+            self._upload_host_padded_inputs(forward_batch)
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
         spec_info = forward_batch.spec_info
@@ -961,6 +965,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 logical_num_tokens=real_q,
                 physical_num_tokens=int(forward_batch.input_ids.shape[0]),
             )
+
+    def _upload_host_padded_inputs(self, forward_batch: ForwardBatch) -> None:
+        """HOST_PADDED inputs were padded on host above; upload them at the bucket shape."""
+        sampling_info = forward_batch.sampling_info
+        if (
+            sampling_info is None
+            or sampling_info.tensor_source_of_truth
+            is not TensorSourceOfTruth.HOST_PADDED
+        ):
+            return
+        for name in (*_TOKEN_FIELDS, *_BS_FIELDS):
+            if name == "req_pool_indices_cpu":
+                continue
+            value = getattr(forward_batch, name, None)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                setattr(
+                    forward_batch,
+                    name,
+                    value.to(self.model_runner.device, non_blocking=True),
+                )
 
     def _cp_batch_active(self, forward_batch: ForwardBatch) -> bool:
         """Whether this extend batch runs the context-parallel program."""

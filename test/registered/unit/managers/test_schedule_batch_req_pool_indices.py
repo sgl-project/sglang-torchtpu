@@ -45,7 +45,9 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
             is_encoder_decoder=False, vocab_size=32
         )
         scheduler.enable_overlap = False
-        scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)
+        scheduler.spec_algorithm = types.SimpleNamespace(
+            name="NONE", is_none=lambda: True
+        )
         scheduler.future_map = MagicMock()
 
         reqs = [

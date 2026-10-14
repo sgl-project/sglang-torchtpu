@@ -69,6 +69,9 @@ class DFlashDraftInputV2(SpecInput):
     tpu_host_seq_lens_is_committed: bool = False
     tpu_verify_cache_candidates: Optional[torch.Tensor] = None
     tpu_committed_lens: Optional[torch.Tensor] = None
+    # Experimental TPU worker only: [padded_bs] device pool rows; set means the
+    # window rows above are padded to the batch bucket too.
+    tpu_req_pool_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
@@ -281,13 +284,22 @@ class DFlashDraftInputV2(SpecInput):
             plan.verify_cache_candidates if plan is not None else None
         )
         self.tpu_committed_lens = plan.committed_lens if plan is not None else None
+        self.tpu_req_pool_indices = plan.req_pool_indices if plan is not None else None
         self.tpu_host_seq_lens_is_committed = plan is not None
+
+    def _drop_tpu_window(self) -> None:
+        self.tpu_verify_cache_candidates = None
+        self.tpu_committed_lens = None
+        self.tpu_req_pool_indices = None
 
     def filter_batch(
         self,
         new_indices: torch.Tensor,
         new_indices_cpu: Optional[List[int]] = None,
+        *,
+        future_indices: Optional[torch.Tensor] = None,
     ):
+        """future_indices: the caller's already-filtered pool rows, replacing the gather."""
         if self.nxt_kv_lens_cpu is not None:
             if new_indices_cpu is not None:
                 self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices_cpu]
@@ -295,14 +307,21 @@ class DFlashDraftInputV2(SpecInput):
                 self.nxt_kv_lens_cpu = self.nxt_kv_lens_cpu[new_indices.cpu()]
             self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
 
-        if self.tpu_verify_cache_candidates is not None:
+        if self.tpu_req_pool_indices is not None:
+            # Bucket-padded window: prepare_for_decode replans it before the next verify.
+            self._drop_tpu_window()
+        elif self.tpu_verify_cache_candidates is not None:
             self.tpu_verify_cache_candidates = self.tpu_verify_cache_candidates[
                 new_indices
             ]
             self.tpu_committed_lens = self.tpu_committed_lens[new_indices]
 
         if self.future_indices is not None:
-            self.future_indices = self.future_indices[new_indices]
+            self.future_indices = (
+                self.future_indices[new_indices]
+                if future_indices is None
+                else future_indices
+            )
             return
 
         self.topk_p = self.topk_p[new_indices]
@@ -311,7 +330,13 @@ class DFlashDraftInputV2(SpecInput):
         self.new_seq_lens = self.new_seq_lens[new_indices]
         self.hidden_states = self.hidden_states[new_indices]
 
-    def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+    def merge_batch(
+        self,
+        spec_info: "DFlashDraftInputV2",
+        *,
+        future_indices: Optional[torch.Tensor] = None,
+    ):
+        """future_indices: the caller's already-merged pool rows, replacing the cat."""
         if self.nxt_kv_lens_cpu is not None:
             assert spec_info.nxt_kv_lens_cpu is not None
             self.nxt_kv_lens_cpu = torch.cat(
@@ -325,6 +350,8 @@ class DFlashDraftInputV2(SpecInput):
         if (
             self.tpu_verify_cache_candidates is not None
             and spec_info.tpu_verify_cache_candidates is not None
+            and self.tpu_req_pool_indices is None
+            and spec_info.tpu_req_pool_indices is None
         ):
             self.tpu_verify_cache_candidates = torch.cat(
                 [
@@ -336,10 +363,9 @@ class DFlashDraftInputV2(SpecInput):
                 [self.tpu_committed_lens, spec_info.tpu_committed_lens]
             )
         else:
-            # Mismatched generations: drop to the synchronizing addressing path.
+            # Mismatched generations or a bucket-padded window: drop it.
             # The committed-base flag stays so host bounds remain widened.
-            self.tpu_verify_cache_candidates = None
-            self.tpu_committed_lens = None
+            self._drop_tpu_window()
         self.tpu_host_seq_lens_is_committed = (
             self.tpu_host_seq_lens_is_committed
             and spec_info.tpu_host_seq_lens_is_committed
@@ -347,8 +373,10 @@ class DFlashDraftInputV2(SpecInput):
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
-            self.future_indices = torch.cat(
-                [self.future_indices, spec_info.future_indices]
+            self.future_indices = (
+                torch.cat([self.future_indices, spec_info.future_indices])
+                if future_indices is None
+                else future_indices
             )
             return
 

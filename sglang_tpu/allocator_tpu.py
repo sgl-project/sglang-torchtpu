@@ -222,6 +222,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         else:
             free_pages_cpu = torch.empty((0,), dtype=torch.int32, device="cpu")
 
+        # A caller-owned host buffer keeps the slots on host (host-resident
+        # req_to_token writes, HOST_PADDED bucketed upload); skip the variable-length H2D.
+        host_only = out_indices_cpu is not None
         if out_indices_cpu is None:
             out_indices_cpu = torch.empty(
                 (extend_num_tokens,),
@@ -236,7 +239,11 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_indices_cpu,
             self.page_size,
         )
-        out_indices = out_indices_cpu.to(self.device, non_blocking=True)
+        out_indices = (
+            out_indices_cpu
+            if host_only
+            else out_indices_cpu.to(self.device, non_blocking=True)
+        )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

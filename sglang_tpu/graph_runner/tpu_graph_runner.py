@@ -57,6 +57,10 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
+from sglang_tpu.experimental import is_experimental_dspark
+from sglang_tpu.experimental.tpu_dspark_compile_policy import (
+    TpuDsparkSpecDecodeCompilePolicyMixin,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -69,6 +73,7 @@ def _spec_enabled(model_runner: ModelRunner) -> bool:
     return (
         model_runner.spec_algorithm.is_eagle3()
         or model_runner.spec_algorithm.is_dflash()
+        or is_experimental_dspark(model_runner.spec_algorithm)
     )
 
 
@@ -78,6 +83,8 @@ def _resolve_spec_compile_policy_mixin(
     """Resolve speculative compile policy mixin class based on algorithm."""
     if spec_algorithm.is_dflash():
         return DFlashSpecDecodeCompilePolicyMixin
+    if is_experimental_dspark(spec_algorithm):
+        return TpuDsparkSpecDecodeCompilePolicyMixin
     return Eagle3SpecDecodeCompilePolicyMixin
 
 

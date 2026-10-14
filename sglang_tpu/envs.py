@@ -22,6 +22,10 @@ class TpuEnvs:
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
 
+    # Speculative decoding
+    # Route --speculative-algorithm DSPARK to sglang_tpu.experimental.TpuDsparkWorker.
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

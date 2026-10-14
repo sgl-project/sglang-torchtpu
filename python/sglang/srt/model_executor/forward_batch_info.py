@@ -61,6 +61,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     mamba_cache_chunk_size,
 )
+from sglang.srt.sampling.tensor_source_of_truth import TensorSourceOfTruth
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
@@ -1178,12 +1179,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 pin_memory = is_pin_memory_available(device)
+                # HOST_PADDED keeps these (and the positions derived from them) on
+                # host; the backend pads and uploads them at the bucket shape.
+                input_device = (
+                    "cpu"
+                    if batch.sampling_info is not None
+                    and batch.sampling_info.tensor_source_of_truth
+                    is TensorSourceOfTruth.HOST_PADDED
+                    else device
+                )
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
                 ret.extend_seq_lens_cpu = list(extend_seq_lens)
             else:

@@ -21,7 +21,8 @@ from sglang.srt.utils.common import Range  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
-AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
+# tensor_source_of_truth is an enum whose annotation merely contains "Tensor".
+AUTO_FILL_EXCLUDED_FIELDS = ["reqs", "tensor_source_of_truth"]
 
 
 class TestCachedPrefixTierAttribution(unittest.TestCase):
