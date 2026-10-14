@@ -1,7 +1,7 @@
 # TPU accuracy evals -- test/registered/tpu/nightly-accuracy/ via run_suite, ONE
 # JOB PER BENCHMARK so each eval takes its own slice, runs in parallel, and gets
-# its own runtime budget (a slow AIME cannot cost GPQA its score). Scores are
-# emitted for longitudinal tracking without quality thresholds (report_only).
+# its own runtime budget (a slow AIME cannot cost GPQA its score). Each score is
+# published, then checked against a lenient floor (baseline - atol in the test).
 # The accuracy stage: it runs on its own 10 AM / 5 PM schedule below rather
 # than inside the nightly, and is also the isolated trigger, for collecting a
 # datapoint on demand without waiting for a slot:

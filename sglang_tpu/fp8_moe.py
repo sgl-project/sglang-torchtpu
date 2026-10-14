@@ -359,12 +359,8 @@ def apply_tpu_fp8_moe(
     x = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
+    # Padded tokens carry expert id -1, which the kernel drops.
     topk_ids = topk_ids.to(torch.int32)
-    # Padded tokens might have expert index of -1, override the expert
-    # selection to expert 0.
-    valid = topk_ids >= 0
-    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
-    topk_weights = topk_weights * valid.to(topk_weights.dtype)
     if layer.num_fused_shared_experts:
         raise NotImplementedError(
             "Fused shared experts are not supported on the TPU MoE path."

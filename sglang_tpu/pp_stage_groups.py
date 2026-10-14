@@ -4,10 +4,10 @@
 By default torch_tpu compiles the collectives of a process subgroup into
 programs for every device of the slice, which all subgroups launch together.
 Pipeline stages run their forwards at different times, so the collectives
-inside one stage (the context-parallel K/V all-gather and the last-token
-reduce) would wait for the devices of the other stages. A standalone subgroup
-compiles them for its own devices, which launch them alone. The stage hand-off
-stays one collective over the whole slice.
+inside one stage (the tensor-parallel all-reduces, the context-parallel K/V
+all-gather and the last-token reduce) would wait for the devices of the other
+stages. A standalone subgroup compiles them for its own devices, which launch
+them alone. The stage hand-off stays one collective over the whole slice.
 """
 
 from __future__ import annotations

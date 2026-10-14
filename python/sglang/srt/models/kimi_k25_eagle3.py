@@ -37,6 +37,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    mla_absorbed_weight_layout,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, add_prefix
@@ -513,8 +516,7 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         w_kc, w_vc = w.unflatten(
             0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
         ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-        self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+        self_attn.w_kc, self_attn.w_vc = mla_absorbed_weight_layout(w_kc, w_vc)
 
 
 EntryClass = [Eagle3DeepseekV2ForCausalLM]

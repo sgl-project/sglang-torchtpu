@@ -1716,10 +1716,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         Only dispatched requests are aborted (not discarded) by the
         handler-failure cleanup; see _release_req_states_on_failure.
+
+        An abort sent before dispatch matched nothing on the scheduler, and
+        abort_sent turns every later abort for the rid into a no-op, so resend
+        it here. ZMQ ordering delivers it after the request.
         """
         state = self.rid_to_state.get(rid)
-        if state is not None:
-            state.dispatched = True
+        if state is None:
+            return
+        state.dispatched = True
+        if state.abort_sent:
+            try:
+                self._dispatch_to_scheduler(AbortReq(rid=rid))
+            except Exception:
+                # Let a later abort (e.g. client disconnect) try again.
+                state.abort_sent = False
+                logger.exception("Failed to resend abort for request %s", rid)
 
     async def _send_batch_request(
         self,

@@ -1393,16 +1393,21 @@ class KVCacheConfigurator:
                 )
         elif (
             current_platform.is_tpu()
-            and not self.use_mla_backend
             and not self.mambaish_config
+            and (not self.use_mla_backend or is_dsa_model)
         ):
-            # TPU MHA pools (mirrors the ascend branch above). TPU is in-tree
-            # (PlatformEnum.TPU), so the is_out_of_tree() branch never fires;
-            # build via the same platform hooks the OOT path uses.
+            # TPU MHA and DSA pools (mirrors the ascend branch above). TPU is
+            # in-tree (PlatformEnum.TPU), so the is_out_of_tree() branch never
+            # fires; build via the same platform hooks the OOT path uses.
             # get_mha_kv_pool_cls() returns the fused (RPA v3) or flat
             # (torch_native / pallas_tpu_flash) pool per the resolved backend.
-            # TPU MLA models fall through to the shared MLA branch below.
-            if self.is_hybrid_swa:
+            # TPU MLA models without DSA fall through to the shared MLA branch
+            # below.
+            if self.use_mla_backend:
+                token_to_kv_pool = self._build_tpu_dsa_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
+            elif self.is_hybrid_swa:
                 token_to_kv_pool = self._build_tpu_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -1876,6 +1881,30 @@ class KVCacheConfigurator:
             device=self.device,
             token_to_kv_pool_class=PoolCls,
             **mxint8_subpool_kwargs,
+        )
+
+    def _build_tpu_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        # The paged KV pool the TPU MLA kernels use, plus an index-key cache for
+        # each layer that runs its own indexer.
+        PoolCls = current_platform.get_dsa_kv_pool_cls()
+        return PoolCls(
+            max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            kv_lora_rank=self.model_config.kv_lora_rank,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            layer_num=self.layer_info.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+            index_key_layers=[
+                not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                for layer_id in range(
+                    self.layer_info.start_layer, self.layer_info.end_layer
+                )
+            ],
         )
 
     def _build_dsa_kv_pool(

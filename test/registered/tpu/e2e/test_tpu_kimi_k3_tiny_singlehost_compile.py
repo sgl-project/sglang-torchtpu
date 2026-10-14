@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_tpu_ci(
-    est_time=240,
+    est_time=150,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "kimi-k3", "compile", "multimodal"],
 )

@@ -13,6 +13,8 @@
 #   TIMEOUT_PER_FILE per-file timeout (run_suite.py single-host; `timeout` per live-server file)
 #   PARTITION_FLAGS single-host run_suite partition arguments (empty when unsharded)
 #   TEST_FILE_FLAG single-host exact-file selection (empty when running a whole suite)
+#   CHIP_WORKERS_FLAG single-host --tpu-chip-workers (empty when chip sharing is off)
+#   FULL_MATRIX   1 on nightly runs: tests that trim their sweep for the gate run it whole
 #   SERVICE_ACCOUNT  indented serviceAccountName line (empty -> namespace default KSA)
 # The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
 # literal. Gating is handled by the kind-aware _tpu-test.
@@ -55,6 +57,8 @@ spec:
             metadata:
               labels:
                 app: tpu-ci
+              annotations:
+                gke-gcsfuse/volumes: "true"
             spec:
               restartPolicy: Never
 ${SERVICE_ACCOUNT}
@@ -77,6 +81,13 @@ ${POOL_AFFINITY}
                 - name: tmp
                   emptyDir:
                     sizeLimit: 64Gi
+                # JAX compile cache shared across CI runs; objects expire after 7 days.
+                - name: compile-cache
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    volumeAttributes:
+                      bucketName: sglang-torchtpu-ci-compile-cache
+                      mountOptions: "implicit-dirs"
 ${WEIGHTS_VOLUME}
               containers:
                 - name: test
@@ -100,9 +111,11 @@ ${WEIGHTS_VOLUME}
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      export SGLANG_TPU_FULL_MATRIX=${FULL_MATRIX}
                       # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.
                       export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
+                      export JAX_COMPILATION_CACHE_DIR=/compile-cache/jax
                       NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
                       RANK="${TPU_WORKER_ID:-0}"
                       echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"
@@ -156,7 +169,7 @@ ${WEIGHTS_VOLUME}
 
                       if [ "$NNODES" -le 1 ]; then
                         # Single-host: each test self-launches its own server.
-                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
+                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} ${PARTITION_FLAGS} ${TEST_FILE_FLAG} ${CHIP_WORKERS_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
                       fi
 
                       # Multi-host: every host runs the launch group's recipe (owns model+config).
@@ -243,6 +256,8 @@ ${WEIGHTS_VOLUME}
                     limits:
                       google.com/tpu: "4"
                   volumeMounts:
+                    - name: compile-cache
+                      mountPath: /compile-cache
                     - name: dshm
                       mountPath: /dev/shm
                     - name: tmp

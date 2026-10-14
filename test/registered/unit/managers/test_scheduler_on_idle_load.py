@@ -53,6 +53,15 @@ class TestOnIdleStallPublish(CustomTestCase):
             s.on_idle()
         self.assertEqual(s.publish_load_snapshot.call_count, 2)
 
+    def test_stall_offers_the_metrics_gauges_a_publish(self):
+        """A no-batch stall must reach the /metrics gauges too, or a stuck P/D
+        engine reads exactly like an idle one (#1303). The reporter paces the
+        publish itself; on_idle only has to offer it on the stalled path."""
+        s = self._stalled_scheduler()
+        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=100.0):
+            s.on_idle()
+        s.metrics_reporter.maybe_log_stall_metrics.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

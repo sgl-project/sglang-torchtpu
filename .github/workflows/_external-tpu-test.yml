@@ -62,6 +62,8 @@ env:
 
 jobs:
   test:
+    # The Actions sidebar shows only this name under the slice row, so name the tests it runs.
+    name: ${{ join(fromJSON(inputs.groups_json).*.name, ', ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 380   # > WAIT_SLACK + 2 files x 8100s (= 350 min) + job setup
     steps:

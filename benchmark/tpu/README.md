@@ -182,8 +182,9 @@ Supported: chunked prefill, `--kv-cache-dtype fp8_e4m3`, `--max-total-tokens`
 holds one prefill chunk per pipeline slot on top of `--swa-full-tokens-ratio`).
 Rejected at launch with `--pp-size > 1` on TPU: eager mode (without
 `--enable-torch-compile`),
-`--tp-size > 1` (a stage is one device, or one context-parallel group as
-below), speculative decoding, `--dcp-size > 1`, and `--enable-dynamic-chunking`.
+`--tp-size > 1` unless a stage is a tensor-parallel pair or one
+context-parallel group (as below), speculative decoding, `--dcp-size > 1`,
+and `--enable-dynamic-chunking`.
 Input (prompt) logprobs are rejected per request.
 `--dp-size` has not been run with pipeline parallelism on
 TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
@@ -210,6 +211,22 @@ ATTENTION_BACKEND=pallas_tpu_rpa_batched PAGE_SIZE=256 CONTEXT_LEN=33000 CONC=64
 CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
 MAX_TOTAL_TOKENS=524288 MEM_FRACTION_STATIC=0.8 \
 EXTRA_ARGS="--attn-cp-size 2 --enable-prefill-cp --cp-strategy zigzag --moe-dp-size 2 --watchdog-timeout 3600" \
+./launch_server.sh
+```
+
+### Tensor-parallel stages (PP4 x TP2)
+
+`--tp-size 2` with `--attn-cp-size 1` makes each stage a tensor-parallel pair
+that shards the stage's heads and expert weights (no DP attention or
+`--ep-size`); it needs the same torch_tpu as the context-parallel stages.
+
+```bash
+MODEL=openai/gpt-oss-120b QUANTIZATION=unquant SGLANG_TPU_FUSED_MOE_SC_GATHER=0 \
+TP_SIZE=2 PP_SIZE=4 PP_MAX_MICRO_BATCH_SIZE=4 KV_CACHE_DTYPE=bfloat16 \
+ATTENTION_BACKEND=pallas_tpu_rpa_batched PAGE_SIZE=256 CONTEXT_LEN=33000 CONC=64 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 MAX_TOTAL_TOKENS=524288 \
+TPU_COMPILE_TOKENS="2048 4096 8192 16384" \
+EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
 ./launch_server.sh
 ```
 

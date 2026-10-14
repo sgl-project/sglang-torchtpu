@@ -219,6 +219,7 @@ def stage(fabric, rank, mode, schedule):
 
         return get
 
+    scheduler._pp_pd_stage_ready = Mock()
     scheduler._pp_pd_get_bootstrapped_ids = votes("bootstrap")
     scheduler._pp_pd_get_prefill_transferred_ids = votes("transfer")
     scheduler._pp_pd_get_retract_ids = votes("retract")

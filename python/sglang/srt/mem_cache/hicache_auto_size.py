@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     ranks_per_host,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 
 if TYPE_CHECKING:
@@ -83,13 +84,17 @@ def _estimate_hicache_bytes(
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
 ):
-    """Reduce the default HiCache ratio until this machine's host pools fit.
+    """Budget host pools together and reduce the default HiCache ratio to fit.
 
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
     """
     fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    if not enabled:
         yield
+        return
+    if fraction is None:
+        with current_platform.get_hicache_explicit_size_context():
+            yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)

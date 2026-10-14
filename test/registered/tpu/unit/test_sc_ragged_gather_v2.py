@@ -3,7 +3,7 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
 
 # This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
 # Platform discovery above enforces CPU-only JAX for SGLang, but does not import
@@ -24,7 +24,10 @@ import numpy as np
 from absl.testing import parameterized
 from jax._src import test_util as jtu
 
+from sglang_tpu.compile_cache import initialize_jax_compile_cache
 from sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2 import ragged_gather_v2
+
+initialize_jax_compile_cache()
 
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")

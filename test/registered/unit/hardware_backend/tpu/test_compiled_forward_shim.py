@@ -2,6 +2,8 @@
 
 import inspect
 import unittest
+from array import array
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,10 +11,14 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.runtime_context import get_context, get_exec
+from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import patches
 from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
@@ -257,6 +263,27 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_prefix_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.batch_size, 4)
+
+    def test_mamba_tracking_padding_roundtrip(self):
+        fb = _forward_batch(real_t=10, real_b=3, mode="extend")
+        original = {
+            "mamba_track_indices": _t(7, 8, 9),
+            "mamba_track_mask": _t(True, False, True, dtype=torch.bool),
+            "mamba_track_seqlens": _t(64, -1, 128),
+        }
+        for name, value in original.items():
+            setattr(fb, name, value)
+        q, b = _pad_forward_batch_inputs(
+            fb, _bucketer("Token", [16, 64]), _bucketer("Bs", [1, 4])
+        )
+        for name, value in original.items():
+            padded = getattr(fb, name)
+            torch.testing.assert_close(padded[:3], value)
+            self.assertEqual(padded.shape[0], 4)
+            self.assertEqual(padded[3].item(), 0)
+        _restore_forward_batch_inputs(fb, q, b)
+        for name, value in original.items():
+            torch.testing.assert_close(getattr(fb, name), value)
 
     def test_extend_batch_cap_does_not_exceed_token_ceiling(self):
         fb = _forward_batch(real_t=4, real_b=2, mode="extend")
@@ -1382,6 +1409,79 @@ class TestNeedsInputLogprob(CustomTestCase):
 
     def test_false_when_metadata_is_none(self):
         self.assertFalse(needs_input_logprob(self._fb(starts=None, lens=None)))
+
+
+class TestPromptLogprobRejection(CustomTestCase):
+    """One answer on prompt logprobs, shared by the shim (per batch) and intake (per request)."""
+
+    def test_flag_off_names_the_flag(self):
+        self.assertIn(
+            "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1",
+            CompiledForwardShim._prompt_logprob_rejection(False),
+        )
+
+    def test_flag_on_plain_server_serves(self):
+        with get_context().override_server_args():
+            self.assertIsNone(CompiledForwardShim._prompt_logprob_rejection(True))
+
+    def test_flag_on_dp_attention_rejects(self):
+        with get_context().override_server_args(tp_size=2, attn_dp_size=2):
+            self.assertIn(
+                "DP attention", CompiledForwardShim._prompt_logprob_rejection(True)
+            )
+
+    def test_flag_on_pipeline_parallel_rejects(self):
+        with get_context().override_server_args(pp_size=2):
+            self.assertIn(
+                "pipeline parallelism",
+                CompiledForwardShim._prompt_logprob_rejection(True),
+            )
+
+
+class TestPromptLogprobIntakeGate(CustomTestCase):
+    """The TPU patch finishes an unservable prompt-logprob request with 400 at
+    scheduler intake; everything else reaches the queue untouched."""
+
+    def _enqueue(self, *, logprob_start_len, flag, return_logprob=True):
+        req = Req("r", "", array("q", [1, 2, 3, 4]), SamplingParams(), return_logprob)
+        req.logprob_start_len = logprob_start_len
+        queue = MagicMock()
+        with (
+            patch.object(Scheduler, "_add_request_to_queue", queue),
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(flag),
+            get_context().override_server_args(),
+            get_parallel().override(tp_rank=0),
+        ):
+            patches._patch_scheduler_reject_prompt_logprob()
+            Scheduler._add_request_to_queue(SimpleNamespace(), req)
+        queue.assert_called_once()
+        return req
+
+    def test_prompt_logprobs_refused_with_the_flag_off(self):
+        # -2 is not validated upstream and batch prep clamps it to 0: prompt logprobs.
+        for start in (0, 2, -2):
+            with self.subTest(logprob_start_len=start):
+                req = self._enqueue(logprob_start_len=start, flag=False)
+                self.assertIsInstance(req.to_finish, FINISH_ABORT)
+                self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+                self.assertIn(
+                    "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1", req.to_finish.message
+                )
+
+    def test_output_only_logprobs_pass(self):
+        for start in (-1, 4):
+            with self.subTest(logprob_start_len=start):
+                self.assertIsNone(
+                    self._enqueue(logprob_start_len=start, flag=False).to_finish
+                )
+        self.assertIsNone(
+            self._enqueue(
+                logprob_start_len=0, flag=False, return_logprob=False
+            ).to_finish
+        )
+
+    def test_prompt_logprobs_pass_with_the_flag_on(self):
+        self.assertIsNone(self._enqueue(logprob_start_len=0, flag=True).to_finish)
 
 
 class TestPinFields(CustomTestCase):

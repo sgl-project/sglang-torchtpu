@@ -67,6 +67,9 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     batch.seq_lens = torch.tensor([2], dtype=torch.int64)
     batch.seq_lens_cpu = torch.tensor([2], dtype=torch.int64)
     batch.orig_seq_lens = torch.tensor([2], dtype=torch.int32)
+    batch.req_to_token_pool = SimpleNamespace(
+        mamba_pool=SimpleNamespace(slot_allocator_device="cpu")
+    )
     return req, batch
 
 
@@ -240,7 +243,8 @@ class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
                     ],
                     req_pool_indices=torch.arange(2),
                     req_to_token_pool=SimpleNamespace(
-                        req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+                        mamba_pool=SimpleNamespace(slot_allocator_device="cuda"),
+                        req_index_to_mamba_ping_pong_track_buffer_mapping=mapping,
                     ),
                 )
                 _set_mamba_track_indices_on_cpu(batch, positions)

@@ -8,7 +8,7 @@ expected by the Triton GDN kernels. This subclass reallocates the two state
 buffers on the TPU device in the layout expected by the fused Pallas kernel
 :func:`sglang_tpu.attention.pallas.gdn.fused_conv1d_gdn`:
 
-* ``conv``:      ``[size + 1, kernel_size - 1, conv_dim]``    (one per layer)
+* ``conv``:      ``[size + 1, kernel_size - 1, 1, conv_dim]`` (one per layer)
 * ``recurrent``: ``[size + 1, num_v_heads, d_k, d_v]``        (one per layer)
 
 versus the GPU layouts ``[..., conv_dim, kernel_size - 1]`` and
@@ -33,7 +33,10 @@ from typing import List, Optional
 import msgspec
 import torch
 
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.configs.mamba_utils import (
+    BaseLinearStateParams,
+    KimiLinearStateShape,
+)
 from sglang.srt.mem_cache.memory_pool import MambaPool, get_tensor_size_bytes
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -110,7 +113,10 @@ class TpuMambaPool(MambaPool):
                 "Page-major envelope mamba layout is CUDA-only; not supported on TPU."
             )
 
-        conv_state_shapes = cache_params.shape.conv  # list of (conv_dim, K-1)
+        # (conv_dim, K-1) per conv kind; Kimi already stores (K-1, conv_dim).
+        conv_state_shapes = cache_params.shape.conv
+        if isinstance(cache_params.shape, KimiLinearStateShape):
+            conv_state_shapes = [(dim, km1) for km1, dim in conv_state_shapes]
         # temporal (GPU layout): (num_v_heads, head_dim=d_v, state_size=d_k)
         n_v, d_v, d_k = cache_params.shape.temporal
 
@@ -155,12 +161,14 @@ class TpuMambaPool(MambaPool):
         # each layer's state owns its storage, so the Pallas bridge's write-back
         # aliases in place instead of lowering to slice + dynamic-update-slice.
         #
-        # conv: kernel-native [size+1, K-1, conv_dim] per layer
-        # (GPU stores [..., conv_dim, K-1]; we swap the trailing two axes).
+        # conv: kernel-native [size+1, K-1, 1, conv_dim] per layer (GPU stores
+        # [..., conv_dim, K-1]). The kernel reshapes the pool to this rank-4
+        # form, which on TPU re-tiles the whole pool twice per layer call
+        # unless it is stored so. Same bytes as [size+1, K-1, conv_dim].
         conv_state = [
             [
                 torch.zeros(
-                    (size + 1, conv_dim_km1[1], conv_dim_km1[0]),
+                    (size + 1, conv_dim_km1[1], 1, conv_dim_km1[0]),
                     dtype=conv_dtype,
                     device=device,
                 )
@@ -193,6 +201,12 @@ class TpuMambaPool(MambaPool):
             self.mem_usage,
         )
 
+    @property
+    def slot_allocator_device(self):
+        # Allocation, radix ownership and COW pair collection are host work.
+        # Keeping IDs here avoids variable-size TPU casts/pads and host readbacks.
+        return "cpu"
+
     def clear_slots(self, indices: torch.Tensor):
         """No-op on TPU.
 
@@ -205,12 +219,70 @@ class TpuMambaPool(MambaPool):
         """
         return
 
+    def _copy_states(self):
+        return [
+            state
+            for states in [*self.mamba_cache.conv, self.mamba_cache.temporal]
+            for state in states
+        ]
+
+    @torch.no_grad()
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
-        raise NotImplementedError(
-            "Recurrent-state copy-on-write (radix/prefix cache) is not "
-            "supported on TPU yet. Radix cache is auto-disabled for hybrid "
-            "GDN models on TPU (see kv_cache_builder.build_kv_cache); reaching "
-            "here means prefix caching was force-enabled for this pool."
+        if src_indices.numel() == 0:
+            return
+        states = self._copy_states()
+        if states[0].device.type == "cpu":
+            # CPU reference for layout and allocator tests.
+            for state in states:
+                state.index_copy_(
+                    0, dst_indices.long(), state.index_select(0, src_indices.long())
+                )
+            return
+        from sglang_tpu.mamba_state_copy import (
+            compiled_state_copy,
+            copy_bucket_size,
+        )
+
+        # The allocator and radix tree retain authoritative CPU IDs. Never read
+        # device IDs back here: only bucketed int32 tensors cross to the TPU.
+        if src_indices.device.type != "cpu" or dst_indices.device.type != "cpu":
+            raise ValueError("TPU state copies require CPU allocator slot IDs")
+        count = src_indices.numel()
+        padding = copy_bucket_size(count) - count
+        src = torch.nn.functional.pad(src_indices.to(torch.int32), (0, padding))
+        dst = torch.nn.functional.pad(dst_indices.to(torch.int32), (0, padding))
+        copy_count = torch.tensor([count], dtype=torch.int32, device=self.device)
+        compiled_state_copy()(
+            states, src.to(self.device), dst.to(self.device), copy_count
+        )
+
+    @torch.no_grad()
+    def warmup_state_copy(self, max_requests: int):
+        if getattr(self, "_state_copy_warmed", False):
+            return
+        from torch_tpu._internal.sync.sync import synchronize
+
+        from sglang_tpu.mamba_state_copy import (
+            compiled_state_copy,
+            copy_bucket_size,
+        )
+
+        states = self._copy_states()
+        # Pool initialization must finish before its buffers are first donated.
+        synchronize(states, wait=True)
+        size = 8
+        copy_count = torch.zeros(1, dtype=torch.int32, device=self.device)
+        while size <= copy_bucket_size(max_requests):
+            # Distinct tensors avoid Dynamo's src-is-dst specialization.
+            src = torch.zeros(size, dtype=torch.int32, device=self.device)
+            dst = torch.zeros(size, dtype=torch.int32, device=self.device)
+            compiled_state_copy()(states, src, dst, copy_count)
+            size *= 4
+        synchronize(states, wait=True)
+        self._state_copy_warmed = True
+        logger.info(
+            "TPU Mamba state copies warmed through bucket %d",
+            copy_bucket_size(max_requests),
         )
 
     # The four below are inherited from MambaPool, which indexes the layer axis

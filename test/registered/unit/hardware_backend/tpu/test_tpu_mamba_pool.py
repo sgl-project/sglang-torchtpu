@@ -12,13 +12,14 @@ layout and slot bookkeeping that the fused Pallas GDN kernel depends on:
   lower to slice + dynamic-update-slice against a view of a stacked pool. On
   Qwen3.5-397B that view cost ~0.70 ms per decode step — 1.4x the GDN kernel
   itself — while producing byte-identical output;
-* conv buffer is ``[size+1, K-1, conv_dim]`` per layer (trailing axes
-  swapped vs. the GPU pool's ``[..., conv_dim, K-1]``);
+* conv buffer is ``[size+1, K-1, 1, conv_dim]`` per layer (the kernel's
+  rank-4 form; any other shape is re-tiled on every call), for both GDN
+  ``(conv_dim, K-1)`` and Kimi ``(K-1, conv_dim)`` cache shapes;
 * recurrent buffer is ``[size+1, n_v, d_k, d_v]`` per layer (swapped vs.
   the GPU ``[..., n_v, d_v, d_k]``);
 * slot 0 is reserved; ``alloc``/``free`` cycle real slots ``1..size``;
 * ``clear_slots`` is a no-op (kernel masks stale slots via
-  ``has_initial_state``) and ``copy_from`` raises (radix CoW unsupported);
+  ``has_initial_state``) and ``copy_from`` clones every layer for radix CoW;
 * ReplaySSM is disabled here, but its flags must still be *present* --
   the shared req-slot alloc path reads them without a hasattr guard.
 """
@@ -28,10 +29,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
@@ -126,12 +131,37 @@ class TestTpuMambaPool(CustomTestCase):
         for layer in range(num_layers):
             self.assertEqual(
                 list(pool.mamba_cache.conv[0][layer].shape),
-                [self.SIZE + 1, self.K - 1, conv_dim],
+                [self.SIZE + 1, self.K - 1, 1, conv_dim],
             )
             self.assertEqual(
                 list(pool.mamba_cache.temporal[layer].shape),
                 [self.SIZE + 1, self.N_V, self.D_K, self.D_V],
             )
+
+    def test_kimi_conv_layout(self):
+        # KimiLinearStateShape stores (K-1, conv_dim), not (conv_dim, K-1).
+        shape = KimiLinearStateShape.create(
+            tp_world_size=1,
+            num_heads=self.N_V,
+            head_dim=self.D_V,
+            conv_kernel_size=self.K,
+        )
+        cp = KimiLinearCacheParams(
+            dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
+            layers=self.LAYERS,
+            shape=shape,
+        )
+        pool = TpuMambaPool(
+            size=self.SIZE,
+            spec_state_size=0,
+            cache_params=cp,
+            mamba_layer_ids=self.LAYERS,
+            device="cpu",
+        )
+        self.assertEqual(
+            list(pool.mamba_cache.conv[0][0].shape),
+            [self.SIZE + 1, self.K - 1, 1, 3 * self.N_V * self.D_V],
+        )
 
     def test_layers_are_independent_allocations(self):
         """Every layer's state must own its buffer.
@@ -154,7 +184,9 @@ class TestTpuMambaPool(CustomTestCase):
         conv_dim = self.N_KQ * self.D_K * 2 + self.N_V * self.D_V
         # dense layer index 0 corresponds to global layer id LAYERS[0].
         per = pool.mamba2_layer_cache(0)
-        self.assertEqual(list(per.conv[0].shape), [self.SIZE + 1, self.K - 1, conv_dim])
+        self.assertEqual(
+            list(per.conv[0].shape), [self.SIZE + 1, self.K - 1, 1, conv_dim]
+        )
         self.assertEqual(
             list(per.temporal.shape), [self.SIZE + 1, self.N_V, self.D_K, self.D_V]
         )
@@ -191,10 +223,74 @@ class TestTpuMambaPool(CustomTestCase):
         # Kernel handles fresh-slot masking; pool must not touch the buffer.
         self.assertTrue(all(torch.all(t == 7.0) for t in pool.mamba_cache.temporal))
 
-    def test_copy_from_unsupported(self):
+    def test_copy_from_preserves_sources_and_other_slots(self):
         pool = self._pool()
-        with self.assertRaises(NotImplementedError):
-            pool.copy_from(torch.tensor([1]), torch.tensor([2]))
+        states = [*pool.mamba_cache.conv[0], *pool.mamba_cache.temporal]
+        for layer, state in enumerate(states):
+            state[1].fill_(layer + 1)
+            state[2].fill_(layer + 10)
+        pool.copy_from(torch.tensor([1, 1, 2]), torch.tensor([3, 4, 5]))
+        for layer, state in enumerate(states):
+            for slot in (1, 3, 4):
+                self.assertTrue(torch.all(state[slot] == layer + 1))
+            for slot in (2, 5):
+                self.assertTrue(torch.all(state[slot] == layer + 10))
+            self.assertTrue(torch.all(state[0] == 0))
+            self.assertTrue(torch.all(state[6:] == 0))
+
+    def test_tracking_ids_snapshot_request_state_before_overlap(self):
+        from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+
+        buffers = [torch.tensor([7, 8]), torch.tensor([9, 10])]
+        reqs = [
+            SimpleNamespace(
+                kv=SimpleNamespace(
+                    mamba_ping_pong_track_buffer=buf,
+                    mamba_next_track_idx=i,
+                )
+            )
+            for i, buf in enumerate(buffers)
+        ]
+        for allocator_device in ("cpu", "cuda"):
+            with self.subTest(allocator_device=allocator_device):
+                batch = SimpleNamespace(
+                    reqs=reqs,
+                    req_pool_indices=torch.tensor([0, 1]),
+                    req_to_token_pool=SimpleNamespace(
+                        mamba_pool=SimpleNamespace(
+                            slot_allocator_device=allocator_device
+                        ),
+                        req_index_to_mamba_ping_pong_track_buffer_mapping=torch.stack(
+                            buffers
+                        ),
+                    ),
+                )
+                # Exercise both the host-ID path and the existing device-gather
+                # path with CPU tensors; hardware lowering is tested separately.
+                tensor = torch.tensor
+
+                def unpinned_tensor(*args, **kwargs):
+                    kwargs.pop("pin_memory", None)
+                    return tensor(*args, **kwargs)
+
+                with patch("torch.tensor", side_effect=unpinned_tensor):
+                    set_mamba_track_indices_from_reqs(batch)
+                    self.assertEqual(batch.mamba_track_indices.tolist(), [7, 10])
+                    set_mamba_track_indices_from_reqs(batch, track_positions=[1, 0])
+                self.assertEqual(batch.mamba_track_buffer_indices, [1, 0])
+                self.assertEqual(batch.mamba_track_indices.tolist(), [8, 9])
+                saved = batch.mamba_track_indices.clone()
+                buffers[0][1] = 99
+                torch.testing.assert_close(batch.mamba_track_indices, saved)
+                buffers[0][1] = 8
+                reqs[0].kv.mamba_next_track_idx = None
+                reqs[0].kv.mamba_ping_pong_track_buffer = None
+                with patch("torch.tensor", side_effect=unpinned_tensor):
+                    for positions in (None, [1, 1]):
+                        set_mamba_track_indices_from_reqs(batch, positions)
+                        self.assertEqual(batch.mamba_track_indices.tolist(), [-1, 10])
+                reqs[0].kv.mamba_next_track_idx = 0
+                reqs[0].kv.mamba_ping_pong_track_buffer = buffers[0]
 
     def test_speculative_unsupported(self):
         cp = _make_cache_params(

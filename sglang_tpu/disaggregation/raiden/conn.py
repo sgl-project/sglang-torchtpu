@@ -726,6 +726,20 @@ class RaidenKVManager(
             self.record_failure(room, reason)
         self._failed.add(str(room))
 
+    def _fail_room_unless_failed_locked(self, room: int, reason: str) -> None:
+        """Fail ``room`` for a local abort or a peer rank's failure, keeping
+        the reason of any failure that came first. A transfer raiden failed
+        has no recorded reason, and the prefill drops the room's ``_failed``
+        ids right after this call, so such a room gets the reason
+        ``failure_exception`` would fall back to."""
+        if self._is_failed_locked(room):
+            reason = (
+                "Raiden send failed"
+                if self._prefill is not None
+                else "Raiden receive failed"
+            )
+        self._fail_room_locked(room, reason, preserve_reason=True)
+
     def _handle_node_failure(self, failed_bootstrap_addr: str) -> None:
         """Fail the rooms of a prefill the heartbeat declared down and close
         this rank's sockets to it, so later sends open fresh ones instead of
@@ -796,10 +810,15 @@ class RaidenKVManager(
         if sock is None and monitor is None:
             return
         with send_lock if send_lock is not None else contextlib.nullcontext():
+            if sock is not None:
+                # libzmq's I/O thread reports a peer drop with a blocking send
+                # to the monitor. Once the monitor is closed that send never
+                # returns, and no socket of this context delivers again, so
+                # the socket stops reporting before either end is closed.
+                sock.disable_monitor()
+                sock.close(linger=0)
             if monitor is not None:
                 monitor.close()
-            if sock is not None:
-                sock.close(linger=0)
 
     def register_to_bootstrap(self):
         # Topology/handshake registration is backend-agnostic; raiden adds no

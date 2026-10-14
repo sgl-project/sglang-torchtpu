@@ -130,6 +130,30 @@ def _has_mxint8_draft(kvc: KVCacheConfigurator) -> bool:
     )
 
 
+def _mha_bytes_per_token_per_layer(
+    *,
+    num_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    kv_cache_dtype: torch.dtype,
+) -> int:
+    """Bytes one token occupies in one MHA layer of the pool that will be built;
+    the generic K-plus-V product under-counts a pool that pads its geometry."""
+    exact = current_platform.get_mha_kv_bytes_per_token(
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    if exact is not None:
+        return exact
+    return (
+        num_kv_heads
+        * (head_dim + v_head_dim)
+        * torch._utils._element_size(kv_cache_dtype)
+    )
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds, 0 if none; replicated across DCP
     ranks because the draft pool spans the widened virtual location space."""
@@ -550,10 +574,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (
-                n
-                * (model_config.head_dim + model_config.v_head_dim)
+                _mha_bytes_per_token_per_layer(
+                    num_kv_heads=n,
+                    head_dim=model_config.head_dim,
+                    v_head_dim=model_config.v_head_dim,
+                    kv_cache_dtype=kv_cache_dtype,
+                )
                 * effective_num_layers
-                * kv_size
             )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
@@ -815,17 +842,19 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             ) * kv_size
         else:
             # Full layer per-token memory (bytes)
-            self._full_per_token = (
-                model_config.get_num_kv_heads(tp_size, dcp_size)
-                * (model_config.head_dim + model_config.v_head_dim)
-                * kv_size
+            self._full_per_token = _mha_bytes_per_token_per_layer(
+                num_kv_heads=model_config.get_num_kv_heads(tp_size, dcp_size),
+                head_dim=model_config.head_dim,
+                v_head_dim=model_config.v_head_dim,
+                kv_cache_dtype=kv_cache_dtype,
             )
 
             # SWA layer per-token memory (bytes)
-            self._swa_per_token = (
-                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
-                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-                * kv_size
+            self._swa_per_token = _mha_bytes_per_token_per_layer(
+                num_kv_heads=model_config.get_swa_num_kv_heads(tp_size, dcp_size),
+                head_dim=model_config.swa_head_dim,
+                v_head_dim=model_config.swa_v_head_dim,
+                kv_cache_dtype=kv_cache_dtype,
             )
 
         if self.kv_cache_dtype_str == "mxfp8":

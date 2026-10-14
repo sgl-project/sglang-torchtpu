@@ -97,6 +97,7 @@ def _build_pallas_mla_kernel_op():
         sm_scale: float = 1.0,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        segments: str = "all",
     ) -> tuple[jax.Array, jax.Array]:
         return _jax_mla(
             ql_nope,
@@ -113,12 +114,13 @@ def _build_pallas_mla_kernel_op():
             k_scale=k_scale,
             v_scale=v_scale,
             decode_batch_size=_MLA_DECODE_BATCH_SIZE,
+            segments=segments,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=(10, 11, 12),
+        static_argnums=(10, 11, 12, 13),
         donate_argnums=(4,),
         input_output_aliases={4: 1},
         warn_deprecated=False,
@@ -143,6 +145,7 @@ def _build_pallas_mla_kernel_op():
         sm_scale: float = 1.0,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        segments: str = "all",
     ) -> torch.Tensor:
         # JAX is CPU-only here, so Mosaic needs the TPU generation patched in.
         # Inside the custom op like the RPA base: Dynamo can't trace the patch's lock.
@@ -161,6 +164,7 @@ def _build_pallas_mla_kernel_op():
                 sm_scale,
                 k_scale,
                 v_scale,
+                segments,
             )
         return output
 
@@ -195,6 +199,17 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     # ------------------------------------------------------------------ #
     # Metadata
     # ------------------------------------------------------------------ #
+
+    def _kernel_segments(self, forward_batch: ForwardBatch, is_decode: bool) -> str:
+        """MLA v2 passes the ``distribution`` built from ``is_decode`` can
+        populate: decode ``[N, N, N]`` leaves MIXED empty, extend ``[0, 0, N]``
+        both decode ranges. Spec servers keep every pass outside DECODE: which
+        distribution verify / draft-extend build is not part of the
+        compiled-graph key.
+        """
+        if self.decode_query_size > 1 and not forward_batch.forward_mode.is_decode():
+            return "all"
+        return "decode" if is_decode else "mixed"
 
     @staticmethod
     def _make_rpa_distribution_cpu(is_decode: bool, real_bs: int) -> torch.Tensor:
@@ -252,6 +267,27 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         k_rope: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        out = self._op(
+            *self._mla_kernel_args(q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope),
+            # Only this dense kernel takes ``segments``. The sparse op does not.
+            segments=self.forward_metadata.segments,
+        )
+        # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
+        # views it back to 3D and folds W_UV.
+        # TODO(sglang-torchtpu#1072): avoid this reshape. The model undoes it
+        # right away, and it adds latency.
+        return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
+    def _mla_kernel_args(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        layer: "RadixAttention",
+        q_rope: Optional[torch.Tensor],
+        k_rope: Optional[torch.Tensor],
+    ) -> tuple:
+        """The MLA op's positional arguments for one layer."""
         assert self.forward_metadata is not None, (
             "Pallas MLA attention backend was not initialised for this forward "
             "pass; did you forget to call init_forward_metadata()?"
@@ -295,15 +331,12 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             k_scale = None
             v_scale = None
 
-        # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
-        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
-
-        out = self._op(
+        return (
             ql_nope,
             q_pe,
             new_kv_c,
             new_k_pe,
-            kv_cache,
+            *self._kv_cache_buffers(layer.layer_id),
             self.forward_metadata.kv_lens,
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -314,6 +347,10 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             v_scale,
         )
 
-        # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
-        # views it back to 3D and folds W_UV.
-        return out.reshape(num_tokens, layer.tp_q_head_num * kv_lora_rank)
+    def _kv_cache_buffers(self, layer_id: int) -> tuple:
+        """The layer's KV cache buffers, in the order the op takes them.
+
+        The sparse backend overrides this: its pool has two buffers per layer.
+        """
+        # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
+        return (self.token_to_kv_pool.get_fused_kv_buffer(layer_id),)

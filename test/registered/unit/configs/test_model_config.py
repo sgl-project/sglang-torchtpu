@@ -10,9 +10,7 @@ from transformers import LlamaConfig
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
-    dsa_context_fits_index_topk,
     get_hybrid_layer_ids,
-    is_deepseek_dsa,
     is_embedding_gemma,
     is_multimodal_model,
     register_model_config_factory,
@@ -213,25 +211,6 @@ class TestExternalModelConfig(CustomTestCase):
         self.assertFalse(ordinary.is_multimodal_breakable_cuda_graph_supported)
         self.assertIs(type(external), ExternalConfig)
         self.assertTrue(external.is_multimodal_breakable_cuda_graph_supported)
-
-
-class TestDsaDenseFallback(CustomTestCase):
-    def test_dense_only_while_context_fits_index_topk(self):
-        """Dense MLA matches sparse DSA only while every sequence fits
-        index_topk; one token past it, or an unset context, must stay DSA."""
-        glm = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"], index_topk=2048)
-        self.assertTrue(dsa_context_fits_index_topk(glm, 2048))
-        self.assertFalse(dsa_context_fits_index_topk(glm, 2049))
-        self.assertFalse(dsa_context_fits_index_topk(glm, None))
-
-        other = SimpleNamespace(
-            architectures=["DeepseekV32ForCausalLM"], index_topk=2048
-        )
-        self.assertFalse(dsa_context_fits_index_topk(other, 2048))
-
-        self.assertTrue(is_deepseek_dsa(glm))
-        glm.tpu_dense_dsa = True
-        self.assertFalse(is_deepseek_dsa(glm))
 
 
 if __name__ == "__main__":

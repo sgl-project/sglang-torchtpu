@@ -18,7 +18,7 @@ from sglang_tpu.moe.pallas.fused_moe_op import (
     fused_moe_call,
 )
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 # Eager and compiled kernels use different BF16 accumulation orders. Retain
 # BF16's default relative tolerance and cover rounding near zero explicitly.
@@ -200,12 +200,10 @@ class TestTpuFp8MoE(CustomTestCase):
         self.assertEqual(captured["activation"], "silu")
         self.assertEqual(captured["global_num_experts"], 0)
         self.assertEqual(captured["expert_group_offset"], 0)
+        # Padded slots (-1) reach the kernel, which drops them.
+        torch.testing.assert_close(captured["topk_weights"], topk_weights)
         torch.testing.assert_close(
-            captured["topk_weights"],
-            torch.tensor([[0.75, 0.0], [1.0, 0.5]], dtype=torch.bfloat16),
-        )
-        torch.testing.assert_close(
-            captured["topk_ids"], torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
+            captured["topk_ids"], torch.tensor([[0, -1], [1, 0]], dtype=torch.int32)
         )
 
     def test_fp8_moe_forwards_ep_metadata_multi_rank(self):

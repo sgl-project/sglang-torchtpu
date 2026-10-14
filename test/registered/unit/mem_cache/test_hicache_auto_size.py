@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context, get_memory
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -89,6 +90,59 @@ class TestHiCacheAutoSize(CustomTestCase):
             page_size=2,
         )
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
+
+    def test_explicit_sizing_preserves_default_per_pool_admission(self):
+        """The default platform keeps independent admission for explicit sizes."""
+        pool = MHATokenToKVPool(
+            size=128,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        for config in ({"hicache_ratio": 2.0}, {"hicache_size": 16_384 / 1e9}):
+            with (
+                self.subTest(config=config),
+                patch.object(sizing, "current_platform", SRTPlatform()),
+                get_context().override_server_args(
+                    enable_hierarchical_cache=True,
+                    hicache_host_memory_fraction=None,
+                    **config,
+                ),
+                patch.object(base, "ranks_per_host", return_value=4),
+                patch.object(
+                    base,
+                    "available_host_memory_bytes",
+                    return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 20_000 * 4,
+                ),
+                sizing.auto_size_hicache(None, None, enabled=True),
+            ):
+                memory = get_memory()
+                host = MHATokenToKVPoolHost(
+                    pool,
+                    memory.hicache_ratio,
+                    memory.hicache_size,
+                    2,
+                    "layer_first",
+                    pin_memory=False,
+                    device="cpu",
+                )
+                self.assertEqual(host.size, 258)
+                second = MHATokenToKVPoolHost(
+                    pool,
+                    memory.hicache_ratio,
+                    memory.hicache_size,
+                    2,
+                    "layer_first",
+                    pin_memory=False,
+                    device="cpu",
+                )
+                self.assertEqual(second.size, 258)
+                self.assertIsNone(base._host_memory_budget.get())
+            self.assertIsNone(base._host_memory_budget.get())
 
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):
         """With only --enable-hierarchical-cache the default ratio shrinks to the

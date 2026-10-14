@@ -9,10 +9,13 @@ export shim.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 import types
 import unittest
+from unittest.mock import patch
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
@@ -54,6 +57,45 @@ class TestKvLayoutSelection(CustomTestCase):
             with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
                 self.assertIs(
                     TpuSRTPlatform().get_mha_kv_pool_cls(), TpuSeqAlongLaneKVPool
+                )
+
+
+class TestPoolBytesPerToken(CustomTestCase):
+    """The KV budget is spent before the pool exists, at this layout's price."""
+
+    def test_head_dim_rounds_to_a_sublane_tile_only(self):
+        """SEQ_ALONG_LANE rounds head_dim to num_sublanes * packing, not to 128,
+        and never rounds the K/V head axis, so the fused formula over-counts it."""
+        from sglang_tpu import pallas_export
+        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+
+        page_size = 16
+        with patch.object(
+            pallas_export, "get_pallas_tpu_device_kind", return_value="TPU7x"
+        ):
+            for head_dim, dtype, expected in (
+                (64, torch.bfloat16, 1 * 2 * 64 * 2),
+                (80, torch.float8_e4m3fn, 1 * 2 * 96),
+            ):
+                per_token = TpuSeqAlongLaneKVPool.kv_bytes_per_token_per_layer(
+                    num_kv_heads=1,
+                    head_dim=head_dim,
+                    v_head_dim=head_dim,
+                    store_dtype=dtype,
+                )
+                self.assertEqual(per_token, expected)
+                pool = TpuSeqAlongLaneKVPool(
+                    size=4 * page_size,
+                    page_size=page_size,
+                    dtype=dtype,
+                    head_num=1,
+                    head_dim=head_dim,
+                    layer_num=1,
+                    device="cpu",
+                    enable_memory_saver=False,
+                )
+                self.assertEqual(
+                    pool.kv_buffer[0].nbytes, pool.num_blocks * page_size * per_token
                 )
 
 

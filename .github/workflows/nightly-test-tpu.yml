@@ -45,6 +45,7 @@ on:
           - mh
           - pd-mh-qwen3-480b-kvoff-reshard
           - pd-mh-qwen3-vl-8b-spec
+          - pd-sh-qwen3-vl-30b
           - sh
       test_filter:
         description: "Substring of a test file path; runs only matching tests"

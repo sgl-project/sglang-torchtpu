@@ -751,6 +751,16 @@ class Envs:
     SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
         60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
     )
+    # Pipeline prefill: move pages final before the prefill ends (cached prefix,
+    # finished chunks) as early transfers of at least PART_PAGES pages each.
+    SGLANG_RAIDEN_PIPELINE_EARLY_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_PART_PAGES = EnvInt(16)
+    # Pipeline prefill: each group of STAGE_GROUP consecutive stages moves its
+    # layers once its forwards of the final chunk complete, before sampling.
+    SGLANG_RAIDEN_PIPELINE_STAGE_PARTS = EnvBool(False)
+    SGLANG_RAIDEN_PIPELINE_STAGE_GROUP = EnvInt(1)
+    # Decode: threads coordinating pipeline transfers, one client each.
+    SGLANG_RAIDEN_PIPELINE_COORD_WORKERS = EnvInt(1)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )
@@ -1970,7 +1980,9 @@ class Envs:
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there.
+    # and tune from there. Below it, batches of up to 2048 routed rows also
+    # take the sort-free dense rank route, and one-token batches the
+    # route-meta kernel.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).

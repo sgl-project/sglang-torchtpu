@@ -1065,6 +1065,120 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestAbortBeforeDispatchIsResent(CustomTestCase):
+    """An abort that arrives before dispatch must still reach the scheduler."""
+
+    def _make_tm(self):
+        tm = _make_tokenizer_manager(self)
+        tm.server_args.tokenizer_worker_num = 1
+        tm._dispatch_to_scheduler = Mock()
+        tm.enable_metrics = True
+        tm.metrics_collector = MagicMock()
+        return tm
+
+    def _sent(self, tm):
+        return [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+
+    def test_abort_before_dispatch_is_resent_on_dispatch(self):
+        tm = self._make_tm()
+        rid = "early_abort"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+
+        tm.abort_request(rid)
+        tm._mark_state_dispatched(rid)
+        # Later aborts for the rid stay no-ops.
+        tm.abort_request(rid)
+
+        sent = self._sent(tm)
+        self.assertEqual([type(m) for m in sent], [AbortReq, AbortReq])
+        self.assertTrue(all(m.rid == rid for m in sent))
+        self.assertTrue(tm.rid_to_state[rid].dispatched)
+        tm.metrics_collector.observe_one_aborted_request.assert_called_once()
+
+    def test_dispatch_without_abort_sends_nothing(self):
+        tm = self._make_tm()
+        rid = "no_abort"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        tm._mark_state_dispatched(rid)
+        self.assertEqual(self._sent(tm), [])
+        self.assertTrue(tm.rid_to_state[rid].dispatched)
+
+    def test_resend_failure_lets_a_later_abort_retry(self):
+        tm = self._make_tm()
+        rid = "resend_fails"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        tm.abort_request(rid)
+
+        tm._dispatch_to_scheduler.side_effect = RuntimeError("send failed")
+        with self.assertLogs(level="ERROR"):
+            tm._mark_state_dispatched(rid)
+        self.assertTrue(state.dispatched)
+        self.assertFalse(state.abort_sent)
+
+        tm._dispatch_to_scheduler.side_effect = None
+        tm.abort_request(rid)
+        self.assertEqual(
+            [type(m) for m in self._sent(tm)], [AbortReq, AbortReq, AbortReq]
+        )
+        self.assertTrue(state.abort_sent)
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        side_effect=lambda obj: obj,
+    )
+    def test_abort_during_tokenization_follows_the_request(self, _wrap_shm):
+        tm = _make_tm_for_generate(self)
+        tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        tm._dispatch_to_scheduler = Mock()
+        rid = "abort_while_tokenizing"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.return_prompt_token_ids = False
+        tokenized = MagicMock()
+        tokenized.rid = rid
+        tokenized.mm_inputs = None
+
+        async def drive():
+            release_tokenizer = asyncio.Event()
+
+            async def slow_tokenize(*args, **kwargs):
+                await release_tokenizer.wait()
+                return tokenized
+
+            tm._tokenize_one_request = slow_tokenize
+            task = asyncio.create_task(tm.generate_request(obj).__anext__())
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if rid in tm.rid_to_state:
+                    break
+            self.assertIn(rid, tm.rid_to_state)
+
+            tm.abort_request(rid)
+            release_tokenizer.set()
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if tm.rid_to_state[rid].dispatched:
+                    break
+            self.assertTrue(tm.rid_to_state[rid].dispatched)
+
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(drive())
+
+        sent = self._sent(tm)
+        dispatch_idx = sent.index(tokenized)
+        self.assertIsInstance(sent[0], AbortReq)
+        self.assertLess(0, dispatch_idx)
+        resent = [m for m in sent[dispatch_idx + 1 :] if isinstance(m, AbortReq)]
+        self.assertTrue(resent, "the early abort must be resent after the request")
+        self.assertEqual(resent[0].rid, rid)
+
+
 class TestLoRARequestLifecycle(CustomTestCase):
     def test_abort_waiter_preserves_reused_rid(self):
         """An old abort must neither erase a new request nor release its reference."""

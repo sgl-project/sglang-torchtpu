@@ -28,9 +28,12 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 import importlib.util
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
 
@@ -95,11 +98,74 @@ class TestGDNDistribution(CustomTestCase):
         self.assertIsNot(a, d)
 
 
+class TestGDNSinglePassFlags(CustomTestCase):
+    """init_forward_metadata derives the kernel's single-pass flags from the
+    same forward mode as the distribution: decode runs batched_only over
+    [bs, bs, bs], extend runs prefill_only over [0, 0, bs]. A mismatch would run
+    one pass over an empty range: zero output, no state update, no error."""
+
+    def _run(self, forward_mode, bs=3):
+        n_kq, n_v, d, k = 1, 2, 4, 4
+        dim = 2 * n_kq * d + n_v * d
+        backend = _BackendNoInit()
+        backend._op = Mock(return_value=torch.zeros(bs, n_v, d))
+        cache = SimpleNamespace(
+            conv=[torch.zeros(bs + 1, k - 1, 1, dim)],
+            temporal=torch.zeros(bs + 1, n_v, d, d),
+        )
+        backend._extra_buffer_enabled = False
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba2_layer_cache=lambda _: cache,
+            get_mamba_indices=lambda indices: indices,
+            translate_mamba_indices=lambda indices: indices,
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.full((bs,), 5),
+            forward_mode=forward_mode,
+            req_pool_indices=torch.arange(1, bs + 1),
+            extend_seq_lens=torch.ones(bs, dtype=torch.int64),
+            mamba_track_mask=None,
+        )
+        backend.init_forward_metadata(batch)
+        layer = SimpleNamespace(
+            layer_id=0,
+            conv_weights=torch.zeros(dim, k),
+            bias=None,
+            A_log=torch.zeros(n_v),
+            dt_bias=torch.zeros(n_v),
+            num_k_heads=n_kq,
+            num_v_heads=n_v,
+            head_k_dim=d,
+            head_v_dim=d,
+        )
+        backend._run(
+            layer,
+            mixed_qkv=torch.zeros(bs, dim),
+            a=torch.zeros(bs, n_v),
+            b=torch.zeros(bs, n_v),
+        )
+        kwargs = backend._op.call_args.kwargs
+        distribution = backend._op.call_args.args[11].tolist()
+        return distribution, kwargs["batched_only"], kwargs["prefill_only"]
+
+    def test_flags_follow_the_distribution(self):
+        bs = 3
+        for mode, decode in (
+            (ForwardMode.DECODE, True),
+            (ForwardMode.IDLE, True),
+            (ForwardMode.EXTEND, False),
+            (ForwardMode.MIXED, False),
+        ):
+            with self.subTest(mode=mode.name):
+                distribution, batched_only, prefill_only = self._run(mode, bs)
+                self.assertEqual(distribution, [bs, bs, bs] if decode else [0, 0, bs])
+                self.assertEqual(batched_only, decode)
+                self.assertEqual(prefill_only, not decode)
+
+
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
 class TestGDNRequestTilePadding(CustomTestCase):
     def test_partial_verify_tiles_have_inert_metadata_rows(self):
-        from types import SimpleNamespace
-
         import jax.numpy as jnp
 
         from sglang_tpu.attention.pallas.gdn.metadata import (

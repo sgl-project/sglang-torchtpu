@@ -14,7 +14,11 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
+# SGLang changes: packed SMEM metadata and packed KDA weights operands, the
+# plain-decode compact path (no f32 copy, no row padding), and the batch
+# padding to lcm(packing, INVERT_BLOCK) with mixed_tile_size capped by it.
 
+import dataclasses
 import functools
 import math
 
@@ -32,6 +36,7 @@ from sglang_tpu.attention.pallas.gdn import (
     metadata,
     vmem_ldst,
 )
+from sglang_tpu.kda_layout import kda_packed_weights_shape
 
 
 def inner_kernel(
@@ -82,6 +87,8 @@ def inner_kernel(
 
     if p_id is None:
         p_id = pl.program_id(0)
+    if cfg.packed_weights:
+        weights_ref = memory_ref.unpack_kda_weights(weights_ref, cfg)
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -262,9 +269,12 @@ def outer_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
+    metadata_layout: tuple | None = None,
 ):
     """Setup memory allocations and emit pipeline for running inner_kernel."""
     del conv_state_out_ref, recurrent_state_out_ref
+    if metadata_layout is not None:
+        metadata_ref = memory_ref.unpack_metadata(metadata_ref, metadata_layout)
 
     if cfg.state_plan is not None:
         # Both state regions stream from the single external source ref,
@@ -356,7 +366,7 @@ def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
-    conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, dim_size]
+    conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, (1,) dim_size]
     recurrent_state: jax.Array | None,  # [num_seqs + 1, nv, dk, dv]
     conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
@@ -381,7 +391,10 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     batched_only: bool = False,
     prefill_only: bool = False,
+    track_indices: jax.Array | None = None,
+    track_end: jax.Array | None = None,
     zero_initialize_out: bool = True,
+    packed_weights: jax.Array | None = None,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
@@ -391,14 +404,19 @@ def fused_conv1d_gdn(
 
     Args:
         qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
-            where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
+            where `dim_size = n_kq * d_k * 2 + n_v * d_v`. `qkv`, `b` and `a`
+            may differ in dtype: they are upcast to f32 up front, except on a
+            plain decode (`batched_only`, no spec tokens, dense states) with
+            one shared dtype, whose compact load path upcasts in-kernel.
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
-            kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
-            from the last sequence invocation. The first slot is a null block used for
-            padded or invalid tokens. It may contain garbage data if it is a first
-            invocation of a sequence. None when `state_source` carries the states.
+            kernel_size - 1, dim_size], or the kernel-native rank-4 [num_seqs + 1,
+            kernel_size - 1, 1, dim_size] that skips a pool relayout, containing
+            the last (kernel_size - 1) tokens from the last sequence invocation.
+            The first slot is a null block used for padded or invalid tokens. It
+            may contain garbage data if it is a first invocation of a sequence.
+            None when `state_source` carries the states.
         recurrent_state: Recurrent state cache tensor of shape [num_seqs + 1, n_v,
             d_k, d_v]. The first slot is a null block used for padded or invalid
             tokens. It may contain garbage data if it is a first invocation of a
@@ -451,6 +469,20 @@ def fused_conv1d_gdn(
         batched_only: Run only the leading decode/verify segment.
         prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
             untouched. Mutually exclusive with batched_only.
+        packed_weights: KDA only, no conv bias: conv weight, dt_bias and a_log
+            packed into one f32 array (kda_layout.kda_packed_weights_shape),
+            used instead of `conv_weight` / `dt_bias` / `a_log`.
+        track_indices: Optional int32 tensor of shape [num_seqs], in the same
+            sequence order as state_indices. Each entry is a physical slot in
+            both dense state caches for a radix-cache snapshot, separate from
+            the request's active state slot. Supply together with track_end;
+            unsupported with state_source or speculative decoding. Disabled
+            rows must still use an in-bounds slot; null slot 0 serves padding.
+        track_end: Optional int32 tensor of shape [num_seqs]. Each entry is the
+            exclusive token offset in the packed qkv input at which to save
+            both convolution and recurrent state into track_indices. Use -1
+            to disable a row. An enabled boundary must coincide with the end
+            of a nonempty kernel tile; it may precede the end of the prefill.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -481,9 +513,17 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    qkv = qkv.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
+    # Plain decode only reads activations on the compact path, which upcasts
+    # on load; skipping the f32 copy (for one shared input dtype) and the row
+    # padding is bit-identical. The output zero fill stays: the kernel writes
+    # only the first distribution[0] rows, and padding rows (even the only
+    # row, e.g. an idle DP-attention rank run as a one-row decode) feed
+    # residual / MoE / collectives downstream, so they must be finite.
+    decode_only = batched_only and num_spec_tokens == 0 and not pooled
+    if not (decode_only and qkv.dtype == b.dtype == a.dtype):
+        qkv = qkv.astype(jnp.float32)
+        b = b.astype(jnp.float32)
+        a = a.astype(jnp.float32)
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
@@ -504,6 +544,10 @@ def fused_conv1d_gdn(
                 "support."
             )
 
+    if (track_indices is None) != (track_end is None):
+        raise ValueError("track_indices and track_end must be supplied together")
+    if track_indices is not None and (state_source is not None or num_spec_tokens):
+        raise ValueError("Radix snapshots require dense, non-speculative states")
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
@@ -537,7 +581,7 @@ def fused_conv1d_gdn(
     packing = 4 // act_in_dtype.itemsize
     # Preserve SGLang's ragged-prefill fix: the triangular inverse operates
     # on whole blocks. Packing alignment alone truncates a 40-token chunk.
-    batch_align = math.lcm(packing, compute_gdn.INVERT_BLOCK)
+    batch_align = 1 if decode_only else math.lcm(packing, compute_gdn.INVERT_BLOCK)
     padded_batch_size = pl.cdiv(batch_size, batch_align) * batch_align
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, padded_batch_size)
@@ -605,9 +649,17 @@ def fused_conv1d_gdn(
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.
-    conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
-    gdn_weights = memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias)
-    weights = memory_ref.WeightRefs(conv=conv_weights, gdn=gdn_weights)
+    if packed_weights is not None:
+        # One operand instead of three: XLA stages each small operand separately.
+        assert is_kda and conv_bias is None
+        assert packed_weights.shape == kda_packed_weights_shape(
+            kernel_size, dim, n_v, d_k
+        ), packed_weights.shape
+        weights = packed_weights.astype(jnp.float32)
+    else:
+        conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
+        gdn_weights = memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias)
+        weights = memory_ref.WeightRefs(conv=conv_weights, gdn=gdn_weights)
 
     # Step 5: Create specs.
     smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
@@ -654,6 +706,7 @@ def fused_conv1d_gdn(
                 conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
             ),
             state_plan=state_plan,
+            packed_weights=packed_weights is not None,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
@@ -680,16 +733,33 @@ def fused_conv1d_gdn(
                 ckpt_indices=ckpt_indices,
             )
 
+        if track_indices is not None:
+            # PER_SEQ rotates sequences past the batched segment; keep the
+            # snapshot routing in exactly the same sequence order.
+            shift = -distribution[0] if mode == config.GDNMode.PER_SEQ else 0
+            metadata_obj = dataclasses.replace(
+                metadata_obj,
+                s_idx_to_track_indices=jnp.roll(track_indices, shift),
+                s_idx_to_track_end=jnp.roll(track_end, shift),
+            )
+        # One SMEM operand instead of one per field (each staged by XLA with
+        # its own copy), on the only call SGLang makes: dense states, no
+        # checkpoints. The pooled and checkpoint paths keep one operand per
+        # field, as upstream.
+        metadata_layout = None
+        if not pooled and metadata_obj.s_idx_to_ckpt_indices is None:
+            metadata_obj, metadata_layout = memory_ref.pack_metadata(metadata_obj)
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
+        num_metadata = len(jax.tree_util.tree_leaves(metadata_obj))
 
         # Step 7: Handle case where write needs to be done in existing out.
         # Flat aliasing indices account for the absent recurrent-state
         # input in source mode (None contributes no leaves).
         in_out_spec = None
         num_state_inputs = 1 if pooled else 2
-        input_output_aliases = {len(metadata_obj) + 3: 1}
+        input_output_aliases = {num_metadata + 3: 1}
         if not pooled:
-            input_output_aliases[len(metadata_obj) + 4] = 2
+            input_output_aliases[num_metadata + 4] = 2
         out_shape = cfg.get_out_shape()
 
         if in_act is None and zero_initialize_out:
@@ -697,10 +767,10 @@ def fused_conv1d_gdn(
         if in_act is not None:
             out_shape = in_act
             in_out_spec = hbm_spec
-            input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
+            input_output_aliases[num_metadata + 3 + num_state_inputs] = 0
 
         return pl.pallas_call(
-            functools.partial(outer_kernel, cfg=cfg),
+            functools.partial(outer_kernel, cfg=cfg, metadata_layout=metadata_layout),
             out_shape=(out_shape, in_conv_state, in_recurrent_state),
             in_specs=(
                 metadata_spec,
