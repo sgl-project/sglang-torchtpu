@@ -7,6 +7,8 @@ the warmup needs model config.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op
@@ -15,6 +17,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     DraftBlockInputs,
     VerifyRows,
+    map_carry,
 )
 from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
 
@@ -31,6 +34,30 @@ def sample_tokens(
     temps = temperatures.float().clamp_min(1e-5)[:, None]
     probs = torch.softmax(logits.float() / temps, dim=-1)
     return torch.where(top_ks <= 1, greedy, _exponential_race(probs))
+
+
+@compiled_op()
+def pad_state_rows(
+    bonus_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    draft_carry: Any,
+    padded_bs: int,
+) -> tuple[torch.Tensor, torch.Tensor, Any]:
+    """Live [bs] decode state zero-padded to the [padded_bs] bucket in one program.
+
+    seq_lens become int64; draft_carry is a NamedTuple of row-aligned tensors or
+    None. The owning worker warms each (bs, padded_bs) pair it can serve.
+    """
+
+    def pad(rows: torch.Tensor) -> torch.Tensor:
+        pad_rows = padded_bs - rows.shape[0]
+        return torch.nn.functional.pad(rows, [0, 0] * (rows.dim() - 1) + [0, pad_rows])
+
+    return (
+        pad(bonus_tokens),
+        pad(seq_lens.to(torch.int64)),
+        map_carry(draft_carry, pad),
+    )
 
 
 @compiled_op(warmup=lambda ctx: _verify_rows_warmup_args(ctx))
@@ -131,16 +158,50 @@ def accept_drafts_sampled(
     """
     bs, n = draft_tokens.shape
     target_logits = target_logits.view(bs, n + 1, -1)
+    temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
+    p = torch.softmax(target_logits.float() / temps, dim=-1)
+    q = torch.softmax(draft_logits.float() / temps, dim=-1)
+    return _leviathan_accept(p, q, draft_tokens, num_verify_drafts, top_ks)
+
+
+@compiled_op(uses_rng=True)
+def accept_drafts_sampled_filtered(
+    target_probs: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    draft_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """accept_drafts_sampled against the filtered target probs [pbs * (N + 1), V].
+
+    Filtering only p keeps the rule lossless for the filtered target: q is the
+    distribution the draft actually sampled from. The owning worker warms it.
+    """
+    bs, n = draft_tokens.shape
+    temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
+    q = torch.softmax(draft_logits.float() / temps, dim=-1)
+    return _leviathan_accept(
+        target_probs.view(bs, n + 1, -1), q, draft_tokens, num_verify_drafts, top_ks
+    )
+
+
+def _leviathan_accept(
+    p: torch.Tensor,
+    q: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    top_ks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Leviathan acceptance over p [bs, N + 1, V] and q [bs, N, V]; greedy rows where top_k <= 1."""
+    n = draft_tokens.shape[1]
     verify_mask = _verify_mask(num_verify_drafts, n)
 
-    target_argmax = torch.argmax(target_logits, dim=-1)
+    target_argmax = torch.argmax(p, dim=-1)
     greedy_ok = (draft_tokens == target_argmax[:, :n]) & verify_mask
     greedy_num_correct = _leading_true(greedy_ok)
     greedy_bonus = _pick(target_argmax, greedy_num_correct)
 
-    temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
-    p = torch.softmax(target_logits.float() / temps, dim=-1)
-    q = torch.softmax(draft_logits.float() / temps, dim=-1)
     vocab_onehot = draft_tokens[..., None] == torch.arange(
         p.shape[-1], device=draft_tokens.device
     )
@@ -158,6 +219,82 @@ def accept_drafts_sampled(
     residual = torch.where(residual.sum(-1, keepdim=True) > 0, residual, p_at)
     rejected = (sample_num_correct < num_verify_drafts)[:, None]
     sample_bonus = _exponential_race(torch.where(rejected, residual, p_at))
+
+    greedy = (top_ks <= 1).view(-1)
+    return (
+        torch.where(greedy, greedy_num_correct, sample_num_correct),
+        torch.where(greedy, greedy_bonus, sample_bonus),
+    )
+
+
+@compiled_op()
+def target_sampling_probs(
+    target_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    num_verify_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Temperature-scaled target probs [pbs * (N + 1), V] and the per-row top-k/top-p/min-p.
+
+    The filters are applied to these rows outside the op (the sort-free TPU
+    filter is its own exported program); the owning worker warms this op.
+    """
+    temps = temperatures.view(-1).float().clamp_min(1e-5)
+    temps = temps.repeat_interleave(num_verify_rows)[:, None]
+    return (
+        torch.softmax(target_logits.float() / temps, dim=-1),
+        top_ks.repeat_interleave(num_verify_rows),
+        top_ps.repeat_interleave(num_verify_rows),
+        min_ps.repeat_interleave(num_verify_rows),
+    )
+
+
+@compiled_op(uses_rng=True)
+def accept_drafts_target_only(
+    target_probs: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_verify_drafts: torch.Tensor,
+    top_ks: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lossless acceptance of a deterministic draft chain against the filtered target p.
+
+    With a one-hot draft q, Leviathan's rule reduces to: accept d_j with prob
+    p_j(d_j); at the first rejection k the bonus is drawn from p_k with d_k
+    zeroed, else from p_k. This is TPU EAGLE's target-only rule, including the
+    speculative_accept_threshold_{single,acc} relaxations (1.0 disables them).
+    target_probs are the flat [pbs * (N + 1), V] rows after temperature, top-k
+    and top-p. Rows with top_k <= 1 take the greedy rule.
+    Returns num_correct_drafts and bonus_tokens, [pbs] each.
+    """
+    bs, n = draft_tokens.shape
+    p = target_probs.view(bs, n + 1, -1)
+    verify_mask = _verify_mask(num_verify_drafts, n)
+
+    target_argmax = torch.argmax(p, dim=-1)
+    greedy_ok = (draft_tokens == target_argmax[:, :n]) & verify_mask
+    greedy_num_correct = _leading_true(greedy_ok)
+    greedy_bonus = _pick(target_argmax, greedy_num_correct)
+
+    vocab = torch.arange(p.shape[-1], device=draft_tokens.device)
+    p_draft = torch.where(draft_tokens[..., None] == vocab, p[:, :n], 0).sum(-1)
+    u = torch.rand_like(p_draft)
+    sample_ok = (
+        (u * threshold_acc <= p_draft) | (p_draft >= threshold_single)
+    ) & verify_mask
+    sample_num_correct = _leading_true(sample_ok)
+
+    p_at = _pick(p, sample_num_correct)
+    rejected = sample_num_correct < num_verify_drafts
+    rejected_token = _pick(draft_tokens, sample_num_correct.clamp_max(n - 1))
+    rejected_mask = rejected[:, None] & (vocab[None, :] == rejected_token[:, None])
+    residual = torch.where(rejected_mask, 0, p_at)
+    # All-zero residual only arises from rounding when p_k(d_k) == 1.
+    residual = torch.where(residual.sum(-1, keepdim=True) > 0, residual, p_at)
+    sample_bonus = _exponential_race(residual)
 
     greedy = (top_ks <= 1).view(-1)
     return (

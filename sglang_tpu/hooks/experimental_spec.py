@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang_tpu.experimental import get_host_batch_padder, is_experimental_spec_worker
+from sglang_tpu.experimental import get_host_batch_padder, is_experimental_spec
 
 
 def uses_host_batch(batch):
@@ -19,7 +19,7 @@ def uses_host_batch(batch):
 
 
 def initialize_host_batch(result, *args, **kwargs):
-    if is_experimental_spec_worker(result.spec_algorithm):
+    if is_experimental_spec(result.spec_algorithm):
         if not result.enable_overlap:
             raise ValueError(
                 "The experimental TPU spec worker requires overlap scheduling"
@@ -95,6 +95,18 @@ def merge_spec_input(original, batch, other):
     batch.spec_info.merge_batch(other.spec_info, future_indices=batch.req_pool_indices)
 
 
+def prepare_spec_decode(original, batch):
+    # Core routes only DFlash-family decode prep to the stateful draft input.
+    # Host-padded EAGLE3 carries the same HostPaddedDraftInput, which reserves
+    # KV and plans the bucketed verify window; mamba targets are rejected.
+    if not uses_host_batch(batch) or batch.spec_algorithm.is_dflash_family():
+        return original(batch)
+    from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
+
+    assert isinstance(batch.spec_info, HostPaddedDraftInput)
+    batch.spec_info.prepare_for_decode(batch)
+
+
 def stage_prefill_tokens(original, batch):
     if not uses_host_batch(batch):
         return original(batch)
@@ -145,6 +157,27 @@ def alloc_extend(
     )
 
 
+def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
+    # finalize_forward_batch left HOST_PADDED extend logits at the batch bucket
+    # and hidden at the token bucket; DP attention's unpadding would trim them
+    # to the live rows, which the samplers and the draft prefill do not take.
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+
+    sampling_info = forward_batch.sampling_info
+    if (
+        logits_output is None
+        or sampling_info is None
+        or not is_host_padded(sampling_info)
+        or forward_batch.forward_mode != ForwardMode.EXTEND
+    ):
+        return original(forward_batch, logits_output)
+    logits, hidden = logits_output.next_token_logits, logits_output.hidden_states
+    result = original(forward_batch, logits_output)
+    logits_output.next_token_logits, logits_output.hidden_states = logits, hidden
+    return result
+
+
 def sample_draft_tokens(original, model, hidden_states, input_ids):
     from sglang_tpu.experimental import experimental_spec_enabled
 
@@ -177,6 +210,11 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
+            "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",
+            prepare_spec_decode,
+            HookType.AROUND,
+        ),
+        (
             "sglang.srt.managers.overlap_utils._stage_prefill_tokens",
             stage_prefill_tokens,
             HookType.AROUND,
@@ -184,6 +222,12 @@ def hook_specs():
         (
             "sglang.srt.model_executor.forward_batch_info._extend_metadata_device",
             extend_metadata_device,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.forward_batch_info.ForwardBatch."
+            "post_forward_mlp_sync_batch",
+            keep_host_padded_extend_outputs,
             HookType.AROUND,
         ),
         (

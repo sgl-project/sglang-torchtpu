@@ -613,15 +613,19 @@ class FutureMap:
             return
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if (
-            _is_tpu
-            and self.spec_algo.is_dflash_family()
-            and draft_input.tpu_host_seq_lens_is_committed
-        ):
-            # DFLASH pre-gathered its verify window from the committed base, so
-            # the host mirror prepare_for_decode seeded must survive: reading the
-            # published length back would reintroduce the sync this avoids.
-            return
+        if _is_tpu:
+            from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+            if (
+                isinstance(draft_input, DFlashDraftInputV2)
+                and draft_input.tpu_host_seq_lens_is_committed
+            ):
+                # DFLASH pre-gathered its verify window from the committed base,
+                # so the host mirror prepare_for_decode seeded must survive:
+                # reading the published length back would reintroduce the sync
+                # this avoids. Plugin draft inputs reuse the window, whatever
+                # their algorithm.
+                return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);

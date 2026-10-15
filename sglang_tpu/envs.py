@@ -50,7 +50,8 @@ class TpuEnvs:
     SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
 
     # Speculative decoding
-    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
+    # to TpuEagle3Worker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
 
     @classmethod

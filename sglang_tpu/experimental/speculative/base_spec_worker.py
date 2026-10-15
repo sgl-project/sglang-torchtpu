@@ -12,8 +12,8 @@ to s' through:
 TPU only runs chains (no draft trees). EAGLE3 (autoregressive, topk 1), DFlash
 (block-parallel) and DSpark (DFlash plus Markov correction and confidence
 budget) differ only in how they realize these three maps. All tensors keep
-static shapes; raggedness is a mask. Data types live in tpu_spec_types, shared
-device ops in tpu_spec_ops; p and phi are the target's LogitsProcessorOutput.
+static shapes; raggedness is a mask. Data types live in spec_types, shared
+device ops in spec_ops; p and phi are the target's LogitsProcessorOutput.
 
 TpuSpecWorker plugs into the scheduler as a BaseSpecWorker: decode batches go
 through ScheduleBatch -> SpecState -> step -> GenerationBatchResult. verify is
@@ -26,11 +26,15 @@ when the batch composition changes; only the scheduler-facing result is live bs.
 
 from __future__ import annotations
 
+import contextlib
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.compilation.compiled_op import warmup_compiled_op
+from sglang.srt.layers.dp_attention import get_dp_tp_group, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -39,9 +43,10 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -52,13 +57,16 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
+    gather_spec_extras_func,
     sample_simulated_acc_len,
 )
+from sglang.srt.utils.common import ceil_align
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.eagle_utils_tpu import top_k_renorm_prob_tpu, top_p_renorm_prob_tpu
 from sglang_tpu.experimental import register_host_batch_padder
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
@@ -68,9 +76,13 @@ from sglang_tpu.experimental.speculative.block_draft_worker import TpuBlockDraft
 from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_greedy,
     accept_drafts_sampled,
+    accept_drafts_sampled_filtered,
+    accept_drafts_target_only,
     build_verify_tokens,
     finalize_accept,
+    pad_state_rows,
     select_verify_rows,
+    target_sampling_probs,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -79,11 +91,16 @@ from sglang_tpu.experimental.speculative.spec_types import (
     SpecState,
     TpuSpecVerifyInput,
     VerifyRows,
+    map_carry,
 )
 from sglang_tpu.experimental.speculative.spec_utils import (
     apply_verify_logits_adjustments,
-    pad_rows,
+    min_p_renorm_prob_tpu,
 )
+from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 # apply_dflash_simulated_acceptance's fixed_token_id, so both paths emit the same tokens.
 _SIMULATED_TOKEN = 100
@@ -100,13 +117,11 @@ class TpuSpecWorker(BaseSpecWorker):
     def __init__(
         self,
         target_worker: TpModelWorker,
-        draft_worker: TpuBlockDraftWorker,
+        draft_worker: TpuBlockDraftWorker | EagleDraftWorker,
         num_drafts: int,
     ) -> None:
         super().__init__()
         parallel = get_parallel()
-        if parallel.attn_dp_size > 1:
-            raise NotImplementedError("TpuSpecWorker does not support DP attention.")
         if parallel.pp_size > 1:
             raise NotImplementedError("TpuSpecWorker does not support PP.")
         self._target_worker = target_worker
@@ -114,8 +129,23 @@ class TpuSpecWorker(BaseSpecWorker):
         self.num_drafts = num_drafts
         self.num_verify_rows = num_drafts + 1
         self.device = target_worker.device
-        self._tp_sync = SpecTpSync(parallel.tp_group)
+        # Ranks that share one batch: the attention-TP group under DP attention.
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
+        self._dp_attention = is_dp_attention_enabled()
+        self._attn_tp_size = parallel.attn_tp_size
+        if self._dp_attention and self._tp_sync.enabled(
+            SpecTpSyncSite.SPEC_ACCEPT_GREEDY
+        ) != self._tp_sync.enabled(SpecTpSyncSite.SPEC_ACCEPT_SAMPLE):
+            # An idle DP rank cannot tell which accept its peers ran.
+            raise ValueError(
+                "SGLANG_SPEC_TP_SYNC must enable both or neither spec-accept site "
+                "under DP attention."
+            )
         self._bucket: BucketState | None = None
+        self._accept_threshold_single = get_spec().speculative_accept_threshold_single
+        self._accept_threshold_acc = get_spec().speculative_accept_threshold_acc
+        # Filled per batch bucket once the target compile policy exists.
+        self._all_drafts: dict[int, torch.Tensor] = {}
         # Benchmark knob: force the accept length (SGLANG_SIMULATE_ACC_LEN), as core DFlash does.
         self._simulate_acc_len = SIMULATE_ACC_LEN
         if self._simulate_acc_len > 0 and SIMULATE_ACC_TOKEN_MODE != "fixed":
@@ -129,8 +159,15 @@ class TpuSpecWorker(BaseSpecWorker):
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
+        self._all_drafts = {
+            padded_bs: torch.full(
+                (padded_bs,), self.num_drafts, dtype=torch.int32, device=self.device
+            )
+            for padded_bs in self._b_bucketer().buckets
+        }
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
+        self._warmup_filtered_target()
         self._warmup_relay_and_results()
         if self._simulate_acc_len > 0:
             self._simulated_drafts = {
@@ -148,7 +185,8 @@ class TpuSpecWorker(BaseSpecWorker):
             self._b_bucketer().max_val,
         )
         live_sizes = range(1, max_bs + 1)
-        bucket_sizes = sorted({self._pad_bs(bs) for bs in live_sizes})
+        # Every bucket: DP attention can run any bucket above a rank's own.
+        bucket_sizes = list(self._b_bucketer().buckets)
         # Live bs: HOST_PADDED req_pool_indices re-uploaded after filter/merge.
         # Bucket: host-padded sampling params and the plan's padded verify window.
         h2d_shapes = (
@@ -163,11 +201,15 @@ class TpuSpecWorker(BaseSpecWorker):
         )
         with torch.no_grad():
             for bs in live_sizes:
-                # _bucket_state pads device-born bonus_tokens/seq_lens to the bucket.
-                pad_rows(
-                    torch.zeros((bs,), dtype=torch.int64, device=self.device),
-                    self._pad_bs(bs),
-                ).cpu()
+                # _bucket_state pads the relayed live state to each bucket it can run.
+                for padded_bs in self._decode_buckets_for(bs):
+                    warmup_compiled_op(
+                        pad_state_rows,
+                        torch.zeros((bs,), dtype=torch.int64, device=self.device),
+                        torch.zeros((bs,), dtype=torch.int64, device=self.device),
+                        self.make_dummy_carry(bs),
+                        padded_bs,
+                    )
             for shape, dtype in h2d_shapes:
                 torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True).cpu()
             for pbs in bucket_sizes:
@@ -195,6 +237,7 @@ class TpuSpecWorker(BaseSpecWorker):
         batch: ScheduleBatch,
         state: SpecState,
         rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
     ) -> SpecState:
@@ -234,6 +277,14 @@ class TpuSpecWorker(BaseSpecWorker):
         Noop: never.
         """
 
+    def make_dummy_carry(self, rows: int) -> Any:
+        """A zero draft_carry of rows rows on device, shaped and typed like serving.
+
+        Why: warmup and idle results must hand the relay the carry's real
+        layout. Noop (None) for drafts that keep their context in draft KV.
+        """
+        return None
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -247,9 +298,11 @@ class TpuSpecWorker(BaseSpecWorker):
         The returned LogitsProcessorOutput holds [pbs * (N + 1), ...] verify rows:
         next_token_logits is p, hidden_states is the target feature phi.
         """
-        verify_tokens = build_verify_tokens(
-            bucket.state.bonus_tokens, draft_result.draft_tokens
-        )
+        verify_tokens = draft_result.verify_tokens
+        if verify_tokens is None:
+            verify_tokens = build_verify_tokens(
+                bucket.state.bonus_tokens, draft_result.draft_tokens
+            )
         logits_output = self._forward_target_verify(
             batch=batch,
             bucket_state=bucket.state,
@@ -266,9 +319,28 @@ class TpuSpecWorker(BaseSpecWorker):
                 target_logits, draft_result.draft_tokens, draft_result.num_verify_drafts
             )
             site = SpecTpSyncSite.SPEC_ACCEPT_GREEDY
+        elif draft_result.draft_logits is None:
+            # A deterministic draft is a one-hot q: TPU EAGLE's target-only rule.
+            num_correct_drafts, bonus_tokens = accept_drafts_target_only(
+                self._filtered_target_probs(target_logits, bucket),
+                draft_result.draft_tokens,
+                draft_result.num_verify_drafts,
+                bucket.top_ks,
+                self._accept_threshold_single,
+                self._accept_threshold_acc,
+            )
+            site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
+        elif bucket.need_filters:
+            num_correct_drafts, bonus_tokens = accept_drafts_sampled_filtered(
+                self._filtered_target_probs(target_logits, bucket),
+                draft_result.draft_tokens,
+                draft_result.num_verify_drafts,
+                draft_result.draft_logits.float(),
+                bucket.temperatures,
+                bucket.top_ks,
+            )
+            site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
         else:
-            if draft_result.draft_logits is None:
-                raise ValueError("Sampling acceptance requires draft_logits.")
             num_correct_drafts, bonus_tokens = accept_drafts_sampled(
                 target_logits,
                 draft_result.draft_tokens,
@@ -312,6 +384,32 @@ class TpuSpecWorker(BaseSpecWorker):
         )
         return num_correct_drafts, bonus_tokens, self._simulated_drafts[padded_bs]
 
+    def _filtered_target_probs(
+        self, target_logits: torch.Tensor, bucket: BucketState
+    ) -> torch.Tensor:
+        """Target p [pbs * (N + 1), V]: temperature, then top-k, top-p, min-p renorms.
+
+        top-k then top-p follows TPU EAGLE's verify; min-p is relative to the max
+        probability, which the renorms scale away, so applying it last is exact.
+        """
+        assert bucket.temperatures is not None and bucket.top_ks is not None
+        assert bucket.top_ps is not None and bucket.min_ps is not None
+        probs, top_ks_rows, top_ps_rows, min_ps_rows = target_sampling_probs(
+            target_logits,
+            bucket.temperatures,
+            bucket.top_ks,
+            bucket.top_ps,
+            bucket.min_ps,
+            self.num_verify_rows,
+        )
+        if bucket.need_top_k:
+            probs = top_k_renorm_prob_tpu(probs, top_ks_rows)
+        if bucket.need_top_p:
+            probs = top_p_renorm_prob_tpu(probs, top_ps_rows)
+        if bucket.need_min_p:
+            probs = min_p_renorm_prob_tpu(probs, min_ps_rows)
+        return probs
+
     def step(
         self,
         batch: ScheduleBatch,
@@ -323,7 +421,9 @@ class TpuSpecWorker(BaseSpecWorker):
         logits_output, accept = self.verify(
             batch, bucket, rows, draft_result, verify_input
         )
-        next_state = self.commit(batch, bucket.state, rows, logits_output, accept)
+        next_state = self.commit(
+            batch, bucket.state, rows, verify_input, logits_output, accept
+        )
         return next_state, logits_output, accept
 
     def forward_batch_generation(
@@ -338,6 +438,9 @@ class TpuSpecWorker(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             result = self.extend(batch)
         elif batch.forward_mode.is_idle():
+            if self._dp_attention and max(batch.global_num_tokens or (0,)) > 0:
+                # DP peers decode: enter their step's collectives too.
+                self._forward_idle_decode(batch)
             result = self._idle_result()
         else:
             result = self._forward_decode(batch)
@@ -347,7 +450,7 @@ class TpuSpecWorker(BaseSpecWorker):
 
     def _forward_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
         bs = batch.seq_lens.shape[0]
-        padded_bs = self._pad_bs(bs)
+        padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
             batch, self.num_verify_rows, padded_bs
         )
@@ -368,44 +471,172 @@ class TpuSpecWorker(BaseSpecWorker):
             bs=bs, next_state=next_state, logits_output=logits_output, accept=accept
         )
 
+    def _decode_buckets_for(self, bs: int) -> list[int]:
+        """Decode buckets a rank with bs live requests can run (_decode_bucket)."""
+        local = self._pad_bs(bs)
+        if not self._dp_attention:
+            return [local]
+        smallest = max(local, self._pad_bs(ceil_align(bs, self._attn_tp_size)))
+        return [b for b in self._b_bucketer().buckets if b >= smallest]
+
+    def _decode_bucket(self, batch: ScheduleBatch, bs: int) -> int:
+        """The decode batch bucket; DP-attention ranks agree on one from the synced sizes.
+
+        Matches the draft's DP peer rows (requests aligned to attention TP, topk
+        1), so the policies' DP padding of draft, verify and draft extend is a no-op.
+        """
+        if not self._dp_attention:
+            return self._pad_bs(bs)
+        max_bs = max(batch.global_num_tokens)
+        assert max_bs >= bs, (batch.global_num_tokens, bs)
+        return self._pad_bs(ceil_align(max_bs, self._attn_tp_size))
+
     def _bucket_state(
         self,
         batch: ScheduleBatch,
         padded_bs: int,
         verify_input: TpuSpecVerifyInput,
     ) -> BucketState:
-        """The previous step's padded state, re-padded only after filter/merge/extend."""
+        """The previous step's padded state, re-padded after filter/merge/extend or a new bucket."""
         bucket = self._bucket
-        # filter_batch/merge_batch rebind future_indices; identity pins the composition.
-        if bucket is not None and verify_input.future_indices is bucket.key:
+        # filter_batch/merge_batch rebind future_indices; identity pins the
+        # composition. Under DP attention the shared bucket can move by itself.
+        if (
+            bucket is not None
+            and verify_input.future_indices is bucket.key
+            and bucket.state.seq_lens.shape[0] == padded_bs
+        ):
             return bucket
         state = self.get_spec_state(batch)
         req_pool_indices = verify_input.req_pool_indices
         assert req_pool_indices.dtype == batch.req_pool_indices.dtype
         sampling_info = batch.sampling_info
         assert is_host_padded(sampling_info)
-        assert sampling_info.temperatures.shape[0] == padded_bs
         sampled = not sampling_info.is_all_greedy
+        # Host rows padded to the local bucket; DP attention may run a larger one.
+        params = sampling_info.host_params_at(padded_bs) if sampled else {}
+        bonus_tokens, seq_lens, draft_carry = pad_state_rows(
+            state.bonus_tokens, state.seq_lens, state.draft_carry, padded_bs
+        )
         return BucketState(
             key=batch.req_pool_indices,
             state=SpecState(
-                bonus_tokens=pad_rows(state.bonus_tokens, padded_bs),
-                seq_lens=pad_rows(state.seq_lens.to(torch.int64), padded_bs),
+                bonus_tokens=bonus_tokens,
+                seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
+                draft_carry=draft_carry,
             ),
             # The plan pads with the reserved pool row 0, which no live request holds.
             live_mask=req_pool_indices != 0,
-            # SamplingBatchInfo already holds these padded to padded_bs on host.
             temperatures=(
-                sampling_info.temperatures.view(-1).to(self.device, non_blocking=True)
+                params["temperatures"].view(-1).to(self.device, non_blocking=True)
                 if sampled
                 else None
             ),
             top_ks=(
-                sampling_info.top_ks.to(self.device, non_blocking=True)
-                if sampled
-                else None
+                params["top_ks"].to(self.device, non_blocking=True) if sampled else None
             ),
+            top_ps=(
+                params["top_ps"].to(self.device, non_blocking=True) if sampled else None
+            ),
+            min_ps=(
+                params["min_ps"].to(self.device, non_blocking=True) if sampled else None
+            ),
+            need_top_k=sampled and sampling_info.need_top_k_sampling,
+            need_top_p=sampled and sampling_info.need_top_p_sampling,
+            need_min_p=sampled and sampling_info.need_min_p_sampling,
+        )
+
+    def _forward_idle_decode(self, batch: ScheduleBatch) -> None:
+        """Run a decode step's forwards on all-padding rows of a DP rank with no requests.
+
+        Every DP rank must issue the same collectives in order, those over its
+        own TP group included; the active code at the shared bucket does.
+        """
+        padded_bs = self._decode_bucket(batch, 0)
+        verify_input = TpuSpecVerifyInput.idle(
+            num_verify_rows=self.num_verify_rows,
+            padded_bs=padded_bs,
+            device=self.device,
+        )
+        # Distinct tensors: the dynamo tracer guards on aliased inputs, and the
+        # active step never passes one tensor for two of these fields.
+        state = SpecState(
+            bonus_tokens=self._device_zeros(padded_bs),
+            seq_lens=self._device_zeros(padded_bs),
+            req_pool_indices=verify_input.req_pool_indices,
+            draft_carry=self.make_dummy_carry(padded_bs),
+        )
+        rows = select_verify_rows(
+            verify_input.verify_cache_candidates,
+            verify_input.committed_lens,
+            state.seq_lens,
+        )
+        # The forwards' preparation writes these; the idle batch must stay idle.
+        with _overridden(
+            batch,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=batch.spec_info,
+            input_ids=batch.input_ids,
+            out_cache_loc=batch.out_cache_loc,
+        ):
+            self._forward_idle_step(
+                batch=batch, state=state, rows=rows, verify_input=verify_input
+            )
+
+    def _forward_idle_step(
+        self,
+        *,
+        batch: ScheduleBatch,
+        state: SpecState,
+        rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
+    ) -> None:
+        """The decode forwards on idle rows: the target verify, plus any draft forwards."""
+        draft_tokens = torch.zeros(
+            (state.seq_lens.shape[0], self.num_drafts),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._forward_idle_verify(
+            batch=batch,
+            state=state,
+            rows=rows,
+            verify_input=verify_input,
+            verify_tokens=build_verify_tokens(state.bonus_tokens, draft_tokens),
+        )
+
+    def _forward_idle_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        state: SpecState,
+        rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
+        verify_tokens: torch.Tensor,
+    ) -> LogitsProcessorOutput:
+        """verify()'s collectives on idle rows: the target forward and the accept broadcasts.
+
+        A collective over a DP rank's own TP group still needs every DP rank to
+        issue it, so the idle rank mirrors the [pbs] int64 accept broadcasts.
+        """
+        logits_output = self._forward_target_verify(
+            batch=batch,
+            bucket_state=state,
+            verify_tokens=verify_tokens,
+            rows=rows,
+            verify_input=verify_input,
+        )
+        site = SpecTpSyncSite.SPEC_ACCEPT_GREEDY
+        padded_bs = state.seq_lens.shape[0]
+        self._tp_sync.sync(site, self._device_zeros(padded_bs))
+        self._tp_sync.sync(site, self._device_zeros(padded_bs))
+        return logits_output
+
+    def _device_zeros(self, rows: int) -> torch.Tensor:
+        """[rows] int64 zeros by a warmed H2D copy; a device fill compiles per shape."""
+        return torch.zeros((rows,), dtype=torch.int64).to(
+            self.device, non_blocking=True
         )
 
     def _pad_bs(self, bs: int) -> int:
@@ -452,6 +683,29 @@ class TpuSpecWorker(BaseSpecWorker):
                     :bs
                 ].cpu()
 
+    def _warmup_filtered_target(self) -> None:
+        """Sampled-verify target probs and their top-k/top-p/min-p filters per batch bucket."""
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        rows = self.num_verify_rows
+        with torch.no_grad():
+            for padded_bs in self._b_bucketer().buckets:
+                # Must match the serving call: float32 logits and params, int32 top-k.
+                probs = torch.zeros(
+                    (padded_bs * rows, vocab_size),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                ones = torch.ones((padded_bs,), dtype=torch.float32, device=self.device)
+                top_ks = torch.ones((padded_bs,), dtype=torch.int32, device=self.device)
+                warmup_compiled_op(
+                    target_sampling_probs, probs, ones, top_ks, ones, ones, rows
+                )
+                top_k_renorm_prob_tpu(probs, top_ks.repeat_interleave(rows))
+                top_p_renorm_prob_tpu(probs, ones.repeat_interleave(rows))
+                min_p_renorm_prob_tpu(probs, ones.repeat_interleave(rows))
+            # Run the eager filters without copying [pbs * (N + 1), V] rows back.
+            torch.accelerator.synchronize()
+
     def _warmup_relay_and_results(self) -> None:
         """FutureMap relay and result D2H run per live bs outside any compiled op."""
         runner = self.target_worker.model_runner
@@ -462,15 +716,25 @@ class TpuSpecWorker(BaseSpecWorker):
         )
         with torch.no_grad():
             for bs in range(1, max_bs + 1):
-                padded_bs = self._pad_bs(bs)
                 indices = torch.zeros((bs,), dtype=torch.int64).to(self.device)
-                # Decode relays [:bs] views of bucket state; extend relays a
-                # compact seq_lens upload.
-                bucket_rows = torch.zeros(
-                    (padded_bs,), dtype=torch.int64, device=self.device
-                )[:bs]
-                compact_rows = torch.zeros((bs,), dtype=torch.int64).to(self.device)
-                for rows in (bucket_rows, compact_rows):
+                # Decode relays [:bs] views of the state at each bucket the rank
+                # can run; extend relays a compact seq_lens upload.
+                relays = [
+                    (
+                        torch.zeros(
+                            (padded_bs,), dtype=torch.int64, device=self.device
+                        )[:bs],
+                        map_carry(self.make_dummy_carry(padded_bs), lambda t: t[:bs]),
+                    )
+                    for padded_bs in self._decode_buckets_for(bs)
+                ]
+                relays.append(
+                    (
+                        torch.zeros((bs,), dtype=torch.int64).to(self.device),
+                        self.make_dummy_carry(bs),
+                    )
+                )
+                for rows, carry in relays:
                     future_map.publish(indices, rows)
                     future_map.stash(
                         indices,
@@ -480,22 +744,47 @@ class TpuSpecWorker(BaseSpecWorker):
                                     bonus_tokens=rows,
                                     seq_lens=rows,
                                     req_pool_indices=indices,
+                                    draft_carry=carry,
                                 )
                             )
                         ),
                     )
+                    # The TPU EAGLE3 direct handoff defers the store to the next
+                    # resolve, which flushes it for host-padded inputs.
+                    flush_direct_handoff_tpu(future_map)
                 # resolve_seq_lens_cpu / _resolve_spec_extras gathers.
                 future_map.new_seq_lens_buf[indices].cpu()
                 future_map.output_tokens_buf[indices].cpu()
-                # GenerationBatchResult.copy_to_cpu of _pack_decode_result's rows.
-                torch.zeros(
-                    (padded_bs, self.num_verify_rows),
-                    dtype=torch.int64,
-                    device=self.device,
-                )[:bs].reshape(-1).cpu()
-                torch.zeros((padded_bs,), dtype=torch.int32, device=self.device)[
-                    :bs
-                ].cpu()
+                if future_map.need_topk:
+                    for tensor in gather_spec_extras_func(
+                        indices,
+                        future_map.topk_p_buf,
+                        future_map.topk_index_buf,
+                        future_map.output_tokens_buf,
+                        future_map.hidden_states_buf
+                        if future_map.need_hidden_states
+                        else None,
+                    ):
+                        if tensor is not None:
+                            tensor.cpu()
+                for padded_bs in self._decode_buckets_for(bs):
+                    # GenerationBatchResult.copy_to_cpu of _pack_decode_result's rows.
+                    torch.zeros(
+                        (padded_bs, self.num_verify_rows),
+                        dtype=torch.int64,
+                        device=self.device,
+                    )[:bs].reshape(-1).cpu()
+                    torch.zeros((padded_bs,), dtype=torch.int32, device=self.device)[
+                        :bs
+                    ].cpu()
+            if self._dp_attention:
+                for padded_bs in self._b_bucketer().buckets:
+                    # _forward_idle_step's all-padding drafts.
+                    torch.zeros(
+                        (padded_bs, self.num_drafts),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ).cpu()
 
     def _warmup_sampling_info(
         self, padded_bs: int, vocab_size: int, *, greedy: bool, top_k: bool
@@ -530,6 +819,52 @@ class TpuSpecWorker(BaseSpecWorker):
         assert b_bucketer is not None
         return b_bucketer
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _bucket_view(
+        batch: ScheduleBatch,
+        *,
+        bucket_state: SpecState,
+        verify_input: TpuSpecVerifyInput,
+        kv_rows: int,
+        **overrides: Any,
+    ) -> Iterator[ScheduleBatch]:
+        """batch with its row fields at the bucket, restored on exit, for code that reads them.
+
+        init_new snapshots these; feeding the bucket rows leaves the shim nothing
+        to pad. Padded rows hold pool row 0 and host KV length 0, inactive in RPA;
+        seq_lens_cpu bounds the KV length once kv_rows rows past seq_lens are
+        written. overrides set (and restore) further batch fields.
+        """
+        padded_bs = bucket_state.seq_lens.shape[0]
+        assert verify_input.req_pool_indices_cpu.shape[0] == padded_bs
+        seq_lens_cpu, seq_lens_sum = verify_input.padded_kv_lens_after_rows(kv_rows)
+        multimodal_inputs = batch.multimodal_inputs
+        if multimodal_inputs is not None:
+            # Spec M-RoPE positions read one entry per (bucket) row.
+            multimodal_inputs = multimodal_inputs + [None] * (
+                padded_bs - len(multimodal_inputs)
+            )
+        view_fields = {
+            "multimodal_inputs": multimodal_inputs,
+            "seq_lens": bucket_state.seq_lens,
+            "seq_lens_cpu": seq_lens_cpu,
+            "seq_lens_sum": seq_lens_sum,
+            # Ignored by direct compile on TPU; None keeps the shim from padding it per bs.
+            "orig_seq_lens": None,
+            "req_pool_indices": bucket_state.req_pool_indices,
+            "req_pool_indices_cpu": verify_input.req_pool_indices_cpu,
+            **overrides,
+        }
+        live_fields = {name: getattr(batch, name) for name in view_fields}
+        for name, value in view_fields.items():
+            setattr(batch, name, value)
+        try:
+            yield batch
+        finally:
+            for name, value in live_fields.items():
+                setattr(batch, name, value)
+
     def _build_verify_batch(
         self,
         *,
@@ -540,7 +875,6 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_input: TpuSpecVerifyInput,
     ) -> ForwardBatch:
         """TARGET_VERIFY ForwardBatch already at the [pbs, N + 1] bucket; the shim pads nothing."""
-        padded_bs = bucket_state.seq_lens.shape[0]
         # A chain verify is a causal block, so DFlash's linear verify input serves
         # every algorithm; the TPU compile policy warms exactly this structure.
         spec_info = DFlashVerifyInput(
@@ -551,39 +885,16 @@ class TpuSpecWorker(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
         )
-        live_fields = (
-            batch.seq_lens,
-            batch.seq_lens_cpu,
-            batch.seq_lens_sum,
-            batch.orig_seq_lens,
-            batch.req_pool_indices,
-            batch.req_pool_indices_cpu,
-        )
         batch.out_cache_loc = rows.flat_cache_locs
-        # init_new snapshots these; feed the bucket rows so the shim sees nothing
-        # to pad. Padded rows hold pool row 0 and KV length 0, inactive in RPA.
-        batch.seq_lens = bucket_state.seq_lens
-        batch.req_pool_indices = bucket_state.req_pool_indices
-        batch.req_pool_indices_cpu = verify_input.req_pool_indices_cpu
-        batch.seq_lens_cpu, batch.seq_lens_sum = verify_input.padded_kv_lens_after_rows(
-            self.num_verify_rows
-        )
-        # Ignored by direct compile on TPU; None keeps the shim from padding it per bs.
-        batch.orig_seq_lens = None
-        assert batch.req_pool_indices_cpu.shape[0] == padded_bs
-        try:
+        with self._bucket_view(
+            batch,
+            bucket_state=bucket_state,
+            verify_input=verify_input,
+            kv_rows=self.num_verify_rows,
+        ) as view:
             verify_forward_batch, _ = spec_info.prepare_for_verify(
-                batch, self.target_worker
+                view, self.target_worker
             )
-        finally:
-            (
-                batch.seq_lens,
-                batch.seq_lens_cpu,
-                batch.seq_lens_sum,
-                batch.orig_seq_lens,
-                batch.req_pool_indices,
-                batch.req_pool_indices_cpu,
-            ) = live_fields
         return verify_forward_batch
 
     def _forward_target_verify(
@@ -613,6 +924,8 @@ class TpuSpecWorker(BaseSpecWorker):
             skip_attn_backend_init=False,
         )
         logits_output = target_out.logits_output
+        if not batch.reqs:
+            return logits_output
         # Custom logit processors address live rows only; penalties / logit bias are
         # rejected in _check_supported.
         apply_verify_logits_adjustments(
@@ -646,6 +959,7 @@ class TpuSpecWorker(BaseSpecWorker):
                     bonus_tokens=next_state.bonus_tokens[:bs],
                     seq_lens=new_seq_lens,
                     req_pool_indices=next_state.req_pool_indices[:bs],
+                    draft_carry=map_carry(next_state.draft_carry, lambda t: t[:bs]),
                 )
             ),
             can_run_cuda_graph=False,
@@ -659,6 +973,7 @@ class TpuSpecWorker(BaseSpecWorker):
             bonus_tokens=empty_tokens,
             seq_lens=empty_tokens,
             req_pool_indices=empty_tokens,
+            draft_carry=self.make_dummy_carry(0),
         )
         return GenerationBatchResult(
             logits_output=None,
@@ -671,9 +986,8 @@ class TpuSpecWorker(BaseSpecWorker):
             new_seq_lens=empty_tokens,
         )
 
-    @staticmethod
     def _check_supported(
-        *, batch: ScheduleBatch, pp_proxy_tensors: PPProxyTensors | None
+        self, *, batch: ScheduleBatch, pp_proxy_tensors: PPProxyTensors | None
     ) -> None:
         if pp_proxy_tensors is not None:
             raise NotImplementedError("TpuSpecWorker does not support PP.")
@@ -682,6 +996,8 @@ class TpuSpecWorker(BaseSpecWorker):
         if batch.return_logprob:
             raise NotImplementedError("TpuSpecWorker does not support logprobs.")
         sampling_info = batch.sampling_info
+        if sampling_info is None:
+            return
         # Their per-request device state is not bucket-padded, so filter/merge
         # would compile per batch-size pair.
         if (
@@ -701,10 +1017,16 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "TpuSpecWorker does not support deterministic sampling."
             )
-        # top-k > 1 is not detectable without a device read; it is unsupported too.
-        if not sampling_info.is_all_greedy and (
-            sampling_info.need_top_p_sampling or sampling_info.need_min_p_sampling
-        ):
-            raise NotImplementedError(
-                "TpuSpecWorker only supports temperature sampling."
-            )
+
+
+@contextlib.contextmanager
+def _overridden(batch: ScheduleBatch, **overrides: Any) -> Iterator[ScheduleBatch]:
+    """batch with overrides set, restored on exit."""
+    live = {name: getattr(batch, name) for name in overrides}
+    for name, value in overrides.items():
+        setattr(batch, name, value)
+    try:
+        yield batch
+    finally:
+        for name, value in live.items():
+            setattr(batch, name, value)

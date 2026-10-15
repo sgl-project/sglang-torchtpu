@@ -411,6 +411,10 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
         )
 
 
+# Per-DP-rank token counts the compiled forward reads as device tensors.
+_DP_COUNT_FIELDS = ("global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu")
+
+
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
@@ -1099,7 +1103,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         sampling_info = forward_batch.sampling_info
         if sampling_info is None or not is_host_padded(sampling_info):
             return
-        for name in (*_TOKEN_FIELDS, *_BS_FIELDS):
+        # DP attention's bucket metadata is built on input_ids' (host) device too.
+        for name in (*_TOKEN_FIELDS, *_BS_FIELDS, *_DP_COUNT_FIELDS):
             if name == "req_pool_indices_cpu":
                 continue
             value = getattr(forward_batch, name, None)

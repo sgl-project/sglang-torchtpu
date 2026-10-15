@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.common import is_pin_memory_available
 
 
 def apply_verify_logits_adjustments(
@@ -55,3 +56,31 @@ def pad_rows(tensor: torch.Tensor, rows: int) -> torch.Tensor:
     if pad == 0:
         return tensor
     return torch.nn.functional.pad(tensor, [0, 0] * (tensor.dim() - 1) + [0, pad])
+
+
+def min_p_renorm_prob_tpu(probs: torch.Tensor, min_ps: torch.Tensor) -> torch.Tensor:
+    """Sort-free min-p renormalization of [rows, V] probs, like top_p_renorm_prob_tpu."""
+    from sglang_tpu.sampling_mask import tpu_filter_probs
+
+    rows = probs.shape[0]
+    kept = tpu_filter_probs(
+        probs,
+        torch.ones(rows, dtype=torch.int32, device=probs.device),
+        torch.ones(rows, dtype=torch.float32, device=probs.device),
+        min_ps,
+        need_top_k=False,
+        need_top_p=False,
+        need_min_p=True,
+    )
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def padded_h2d(rows_cpu: torch.Tensor, rows: int, device: str) -> torch.Tensor:
+    """Zero-pad host rows to rows (a batch bucket) in pinned memory, then upload."""
+    padded = torch.zeros(
+        (rows, *rows_cpu.shape[1:]),
+        dtype=rows_cpu.dtype,
+        pin_memory=is_pin_memory_available(device),
+    )
+    padded[: rows_cpu.shape[0]] = rows_cpu
+    return padded.to(device, non_blocking=True)

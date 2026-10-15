@@ -42,6 +42,7 @@ from sglang_tpu.cp_forward import (
     get_tpu_cp_layout,
     pinned_extend_seq_lens_cpu,
 )
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
@@ -1213,7 +1214,13 @@ class CompiledForwardShim:
                 ]
         if mm_embeds is not None:
             real_q = getattr(forward_batch, _REAL_Q_KEY, None)
-            if not keep_padded and real_q is not None and mm_embeds.shape[0] > real_q:
+            # A HOST_PADDED draft prefill reads the embeds at the token bucket.
+            if (
+                not keep_padded
+                and real_q is not None
+                and mm_embeds.shape[0] > real_q
+                and not is_host_padded(forward_batch.sampling_info)
+            ):
                 mm_embeds = mm_embeds[:real_q]
             forward_batch.mm_input_embeds = mm_embeds
 
