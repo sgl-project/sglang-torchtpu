@@ -1,115 +1,98 @@
-# SGLang: Fast inference for LLMs and multimodal models
+# SGLang-torchtpu
 
-<p align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="SGLang" width="400">
-</p>
+PyTorch-native SGLang serving on Google TPUs.
 
-<p align="center">
-  <a href="https://pypi.org/project/sglang/"><img src="https://img.shields.io/pypi/v/sglang?style=flat&amp;label=PyPI&amp;labelColor=555555&amp;color=orange" alt="PyPI version"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green?style=flat&amp;labelColor=555555" alt="License: Apache 2.0"></a>
-  <a href="https://pypistats.org/packages/sglang"><img src="https://img.shields.io/pypi/dm/sglang?style=flat&amp;label=Downloads&amp;labelColor=555555&amp;color=blue" alt="PyPI downloads per month"></a>
-</p>
+[![License](https://img.shields.io/badge/License-Apache%202.0-green?style=flat&labelColor=555555)](LICENSE)
+<!-- add once public: PyPI version · nightly single-host · nightly multi-host -->
 
-<p align="center">
-  <a href="https://docs.sglang.io/">Docs</a> |
-  <a href="https://cookbook.sglang.io/">Cookbook</a> |
-  <a href="https://www.sglang.io/">Website</a> |
-  <a href="https://lmsys.org/blog/">Blog</a> |
-  <a href="https://slack.sglang.io/">Slack</a>
-</p>
+[Docs](<docs url>) | [Quickstart](#get-started) | [Supported models and features](SUPPORT.md) | [Cookbook](https://cookbook.sglang.io/) | [Slack](<slack channel placeholder>) | [Issues](https://github.com/sgl-project/sglang-torchtpu/issues)
 
-SGLang is an open-source inference framework for large language, vision-language, and diffusion models, optimized for agentic workloads, RL rollouts, and large-scale serving. [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion) is its built-in image and video generation engine, included in this repository and the `sglang` Python package.
+SGLang-torchtpu runs the SGLang engine on TPUs through [torch_tpu](<torch_tpu url>) and Pallas kernels. It is the PyTorch-native sibling of [SGL-JAX](https://github.com/sgl-project/sglang-jax): eager execution, the PyTorch ecosystem, and the same server, OpenAI-compatible API, and scheduler as SGLang on GPUs. It ships as a plugin that installs next to stock SGLang.
 
-👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
+## What you get
 
-## Get Started
+- **Hardware:** TPU7x (Ironwood), single-host (4 chips) and multi-host (2 hosts at tp=16; 4 hosts for disaggregated prefill/decode).
+- **Models:** Gemma 4, GLM, Kimi, gpt-oss, DeepSeek, Qwen, at full size on multi-host TPU. Tiers in [SUPPORT.md](SUPPORT.md).
+- **Parallelism:** TP, EP, DPA, PP, CP.
+- **Caching:** prefix cache, HiCache KV offload to host memory, prefill/decode disaggregation with TP resharding.
+- **Speculative decoding:** EAGLE3, DFlash, DSPark.
+- **Quantization:** FP8 channelwise and blockwise, MXFP4, INT4 W4A16, fp8 KV cache.
+- **Compilation:** torch.compile/direct_compile with a TPU backend.
 
-Pull the Docker image, which includes SGLang and its dependencies:
+Everything above is backed by a registered test. [SUPPORT.md](SUPPORT.md) assigns each model and feature a tier; [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md) is generated from the CI registrations on every merge and shows the test behind every claim.
 
-```bash
-docker pull lmsysorg/sglang:latest
-```
+## Get started
 
-Alternatively, install SGLang in an activated Python environment with uv:
+Pull the image, which bundles SGLang, the TPU plugin, torch_tpu, and libtpu:
 
 ```bash
-uv pip install --prerelease=allow sglang
+docker pull <public registry>/sglang-torchtpu:latest
 ```
 
-Next, launch your model:
-
-- [Quickstart](https://docs.sglang.io/docs/get-started/quickstart): Run your first model and send a request.
-- [Cookbook](https://cookbook.sglang.io/): Choose your model and hardware to get a ready-to-run launch command.
-
-## Supported Hardware
-
-SGLang supports a wide range of GPUs, TPUs, NPUs, CPUs, and Apple Silicon platforms.
-
-| Platform | Representative hardware |
-| --- | --- |
-| [NVIDIA](https://docs.sglang.io/docs/hardware-platforms/nvidia-gpus) | A100; H100/H200/H800/H20; B200/B300/GB200/GB300; select RTX 30/40/50 series, RTX 6000 Ada / PRO 6000; DGX Spark, Jetson Orin |
-| [AMD](https://docs.sglang.io/docs/hardware-platforms/amd_gpu) | Instinct MI300X, MI325X, MI350X, MI355X |
-| [Google TPU](https://docs.sglang.io/docs/hardware-platforms/tpu) | v6e, v7; [SGL-JAX](https://github.com/sgl-project/sglang-jax) / [SGL-torchtpu](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/) |
-| Intel ([GPU](https://docs.sglang.io/docs/hardware-platforms/xpu) / [CPU](https://docs.sglang.io/docs/hardware-platforms/cpu_server)) | Arc / Arc Pro B-Series GPUs, Xeon CPUs |
-| [Apple Silicon](https://docs.sglang.io/docs/hardware-platforms/apple_metal) | Macs via Metal / MLX |
-| [Huawei Ascend](https://docs.sglang.io/docs/hardware-platforms/ascend-npus/getting-started/installation) | A2, A3, 950PR/DT NPUs |
-| [Moore Threads](https://docs.sglang.io/docs/hardware-platforms/mthreads_gpu) | MTT S5000 GPUs |
-
-Integrations in progress: AWS Trainium, [Alibaba T-Head PPU](https://github.com/sgl-project/sglang/issues/37519), [Cambricon MLU](https://github.com/sgl-project/sglang/pull/26898), Qualcomm QAIC, MetaX, Hygon HCU/DCU, Iluvatar CoreX, and more.
-
-See the [Cookbook](https://cookbook.sglang.io/) and platform guides for model compatibility and setup.
-
-## SGL Ecosystem
-
-| Area | Projects | Purpose |
-| --- | --- | --- |
-| Education | [Mini-SGLang](https://github.com/sgl-project/mini-sglang), [zero-to-sglang](https://github.com/datawhalechina/zero-to-sglang), [DeepLearning.AI course](https://www.deeplearning.ai/short-courses/efficient-inference-with-sglang-text-and-image-generation/) | Learn inference engine design and efficient text and image generation through code and hands-on courses. |
-| Diffusion | [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion/installation) | Built into SGLang for image and video generation with diffusion models. |
-| Audio | [SGLang Omni](https://github.com/sgl-project/sglang-omni) | Audio model serving for text-to-speech (TTS) and automatic speech recognition (ASR). |
-| RL and Post-Training | [Miles](https://github.com/radixark/miles), [slime](https://github.com/THUDM/slime), [AReaL](https://github.com/inclusionAI/AReaL), [Tunix](https://github.com/google/tunix), [verl](https://github.com/volcengine/verl) | Training frameworks that integrate SGLang for rollout generation. |
-| Speculative Decoding | [SpecForge](https://github.com/sgl-project/SpecForge) | Train draft models for speculative decoding and deploy them with SGLang. |
-| KV Cache | [HiCache](https://docs.sglang.io/docs/advanced_features/hicache_design), [Mooncake](https://kvcache-ai.github.io/Mooncake/), [LMCache](https://docs.lmcache.ai/developer_guide/integration.html) | Hierarchical KV caching across GPU memory, host memory, and external storage, with cache transfer and reuse for distributed inference. |
-| Deployment and Orchestration | [SMG](https://github.com/smg-project/smg), [RBG](https://github.com/sgl-project/rbg), [llm-d](https://llm-d.ai/docs/dev/operations/disaggregation/sglang), [Ray Serve](https://docs.ray.io/en/latest/serve/llm/user-guides/sglang.html), [NVIDIA Dynamo](https://docs.nvidia.com/dynamo/backends/sg-lang/reference-guide) | Deploy and scale SGLang inference services with routing, load balancing, and cluster orchestration. |
-
-## Development and Contributing
-
-Contributions are welcome, from bug fixes and documentation to model support and performance improvements.
-
-### Development setup
-
-Start from the `lmsysorg/sglang:dev` Docker image, which provides development tools and most dependencies. Clone or mount your SGLang checkout inside the container, then install it in editable mode from the repository root so tests use your local Python changes:
+Or install into a Python environment. The plugin pins the torch_tpu and libtpu versions it was validated with:
 
 ```bash
-pip install -e "python"
-pip install --no-deps -e .   # the TPU plugin in sglang_tpu/; core imports it
+pip install sglang sglang-tpu
 ```
 
-In an activated virtual environment, you can use `uv pip install --prerelease=allow -e "python"` instead. See the [development guide](https://docs.sglang.io/docs/developer_guide/development_guide_using_docker) for container setup and testing.
+Launch the quickstart model on a single host and send a request:
 
-### Contribute
+```bash
+python -m sglang.launch_server --model-path openai/gpt-oss-20b --device tpu --tp 4
 
-1. Fork the repository and create a branch for your changes. For larger changes, discuss your proposal in a [GitHub issue](https://github.com/sgl-project/sglang/issues) or on [Slack](https://slack.sglang.io/).
-2. Make your changes, run the relevant tests, and add regression coverage for fixes or new behavior. Run `pre-commit run --all-files` before submitting.
-3. Open a pull request describing the change and how you tested it. Include benchmarks or accuracy evaluations when relevant.
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "openai/gpt-oss-20b", "messages": [{"role": "user", "content": "Hello"}]}'
+```
 
-See the [contributor guide](https://docs.sglang.io/docs/developer_guide/contribution_guide) for formatting, testing, and pull request instructions. Documentation contributors can start with the [docs guide](docs/README.md).
+Next steps:
 
-## Community and Sponsorship
+- [TPU guide](<docs url>): multi-host launch, weights on shared storage, compile cache, and tuning flags.
+- [Cookbook](https://cookbook.sglang.io/): per-model launch commands.
+- Working from a checkout instead of the wheel:
 
-SGLang is hosted by [LMSYS](https://lmsys.org/about/), a non-profit open-source organization.
+  ```bash
+  git clone https://github.com/sgl-project/sglang-torchtpu.git && cd sglang-torchtpu
+  pip install -e python/          # sglang
+  pip install --no-deps -e .      # sglang-tpu, this plugin
+  ```
 
-- **Community discussions:** Join [Slack](https://slack.sglang.io/) for technical questions and development discussions.
-- **Events:** Find meetups, workshops, and office hours on [SGLang Events](https://www.sglang.io/events).
-- **Updates:** Follow [X](https://x.com/lmsysorg) and [LinkedIn](https://www.linkedin.com/company/sgl-project/) for project updates, and the [LMSYS Blog](https://lmsys.org/blog/) for release announcements and technical articles.
-- **Project resources:** Explore the [documentation](https://docs.sglang.io/), [Cookbook](https://cookbook.sglang.io/), [roadmap](https://roadmap.sglang.io/), [release notes](https://github.com/sgl-project/sglang/releases), [issue tracker](https://github.com/sgl-project/sglang/issues), and [contributor guide](https://docs.sglang.io/docs/developer_guide/contribution_guide).
-- **Contact Us:** For enterprise adoption and deployment, technical consulting, sponsorship, or partnership inquiries, please contact [sglang@lmsys.org](mailto:sglang@lmsys.org).
-- **Contributor sponsorship:** Long-term active SGLang contributors are eligible for coding agent sponsorship, including Cursor, Claude Code, or OpenAI Codex. To apply, email [sglang@lmsys.org](mailto:sglang@lmsys.org) with links to your key commits or pull requests.
+## Supported hardware
 
-## Trusted by Industry and Research
+| Generation | Single-host | Multi-host | Status |
+| --- | --- | --- | --- |
+| TPU7x (Ironwood) | 4 chips | 2 hosts (tp=16); 4 hosts for 2P+2D | CI + nightly |
 
-SGLang serves production workloads across AI labs, cloud platforms, enterprises, and universities.
+## Supported models and features
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="Organizations adopting SGLang" width="800">
+[SUPPORT.md](SUPPORT.md) lists every model and feature with a tier: **Quickstart** = small, runs on every PR · **Optimized** = tuned recipe with nightly accuracy and performance tracking · **Supported** = serves correctly, tracked nightly · **Experimental** = code present, no green on-device test yet. It also lists what is not supported. The test behind each claim is in the generated [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md).
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+## Relationship to SGLang
+
+SGLang-torchtpu is an out-of-tree platform plugin for [sgl-project/sglang](https://github.com/sgl-project/sglang). The TPU backend lives in `sglang_tpu/`; SGLang discovers it through the `sglang.srt.platforms` entry point and loads it when `--device tpu` is set. Changes that SGLang needs to host a hardware backend are proposed upstream as small extension points; TPU kernels, memory pools, and recipes stay here. A migration scoreboard tracks the remaining in-tree coupling and is published daily.
+
+Where to file what: TPU-specific bugs and feature requests here; engine bugs that reproduce on GPU upstream, with the `tpu` label if TPU is involved.
+
+## Development
+
+- CPU-only unit tests run on any machine without a TPU:
+
+  ```bash
+  python test/run_suite.py --suite base-a-test-cpu
+  ```
+
+- Kernel and end-to-end tests need a TPU. A maintainer applies the `run-ci` label and comments `/tag-and-rerun-ci` to run them on your pull request.
+- [CONTRIBUTING.md](CONTRIBUTING.md) covers the branch-and-PR flow, adding a test to the support matrix, and the policy for changes outside `sglang_tpu/`.
+
+## Community
+
+- Slack: `<channel placeholder>` in the SGLang workspace.
+- [GitHub Discussions](<discussions url placeholder>) for questions and design threads.
+- [Issues](https://github.com/sgl-project/sglang-torchtpu/issues) for bugs and feature requests, with chip generation, topology, and torch_tpu version in the template.
+- Security: see [SECURITY.md](SECURITY.md).
+
+## License and acknowledgments
+
+Apache-2.0. See [NOTICE](NOTICE) for code adapted from [tpu-inference](https://github.com/vllm-project/tpu-inference), [sglang-jax](https://github.com/sgl-project/sglang-jax), [torchtpu-vllm](<torchtpu-vllm url>), and [Helion](https://github.com/pytorch/helion).
+
+SGLang-torchtpu is built by RadixArk together with the Google TPU and torch_tpu teams and Meta. Thanks to the SGLang maintainers and community for the engine this plugin extends.
