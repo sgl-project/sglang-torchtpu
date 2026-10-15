@@ -48,6 +48,12 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    SIMULATE_ACC_TOKEN_MODE,
+    sample_simulated_acc_len,
+)
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
@@ -79,6 +85,9 @@ from sglang_tpu.experimental.speculative.spec_utils import (
     pad_rows,
 )
 
+# apply_dflash_simulated_acceptance's fixed_token_id, so both paths emit the same tokens.
+_SIMULATED_TOKEN = 100
+
 
 class TpuSpecWorker(BaseSpecWorker):
     """Speculative decoding as draft -> verify -> commit.
@@ -107,6 +116,15 @@ class TpuSpecWorker(BaseSpecWorker):
         self.device = target_worker.device
         self._tp_sync = SpecTpSync(parallel.tp_group)
         self._bucket: BucketState | None = None
+        # Benchmark knob: force the accept length (SGLANG_SIMULATE_ACC_LEN), as core DFlash does.
+        self._simulate_acc_len = SIMULATE_ACC_LEN
+        if self._simulate_acc_len > 0 and SIMULATE_ACC_TOKEN_MODE != "fixed":
+            raise NotImplementedError(
+                "TpuSpecWorker only supports SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed, "
+                f"got {SIMULATE_ACC_TOKEN_MODE!r}."
+            )
+        # Filled per batch bucket in init_cuda_graphs when simulating.
+        self._simulated_drafts: dict[int, torch.Tensor] = {}
         register_host_batch_padder(self._pad_bs)
 
     def init_cuda_graphs(self) -> None:
@@ -114,6 +132,13 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
+        if self._simulate_acc_len > 0:
+            self._simulated_drafts = {
+                pbs: torch.full(
+                    (pbs, self.num_drafts), _SIMULATED_TOKEN, dtype=torch.int64
+                ).to(self.device)
+                for pbs in self._b_bucketer().buckets
+            }
         snapshot_recompilation_baseline()
 
     def _warmup_logical_bs_ops(self) -> None:
@@ -253,17 +278,39 @@ class TpuSpecWorker(BaseSpecWorker):
                 bucket.top_ks,
             )
             site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
+        draft_tokens = draft_result.draft_tokens
+        if self._simulate_acc_len > 0:
+            num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
+                draft_tokens.shape[0]
+            )
         # Sampled acceptance draws per-rank randoms; ranks must commit rank 0's outcome.
         self._tp_sync.sync(site, num_correct_drafts)
         self._tp_sync.sync(site, bonus_tokens)
         accept = finalize_accept(
-            draft_result.draft_tokens,
+            draft_tokens,
             num_correct_drafts,
             bonus_tokens,
             bucket.state.seq_lens,
             bucket.live_mask,
         )
         return logits_output, accept
+
+    def _simulated_accept(
+        self, padded_bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forced num_correct_drafts, bonus_tokens and draft_tokens, all _SIMULATED_TOKEN."""
+        # Host CPU RNG, seeded alike on every rank, as in apply_dflash_simulated_acceptance.
+        commit_len = sample_simulated_acc_len(
+            self._simulate_acc_len, SIMULATE_ACC_METHOD, self.num_verify_rows
+        )
+        # Built on host and uploaded: a device fill would bake the value into the program.
+        num_correct_drafts = torch.full(
+            (padded_bs,), commit_len - 1, dtype=torch.int64
+        ).to(self.device, non_blocking=True)
+        bonus_tokens = torch.full((padded_bs,), _SIMULATED_TOKEN, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        return num_correct_drafts, bonus_tokens, self._simulated_drafts[padded_bs]
 
     def step(
         self,
