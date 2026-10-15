@@ -610,24 +610,33 @@ class TpModelWorker(BaseTpWorker):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
+        folded = None
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
             if get_exec().features.enable_encoder_swa_bounded_replay:
                 from sglang.srt.model_executor.encoder_swa_replay import (
+                    apply_folded_extend,
+                    fold_encoder_swa_replay,
                     run_encoder_swa_replay,
                 )
 
-                # Replay reads restored main/indexer KV before the normal extend.
-                run_encoder_swa_replay(self, batch)
+                if self.model_runner.attn_backend.folds_encoder_swa_replay:
+                    # Hits extend from their replay start, rebuilding the window in-pass.
+                    folded = fold_encoder_swa_replay(self, batch)
+                else:
+                    # Replay reads restored main/indexer KV before the normal extend.
+                    run_encoder_swa_replay(self, batch)
 
             forward_batch = ForwardBatch.init_new(
-                batch,
+                batch if folded is None else folded.batch,
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
+            if folded is not None:
+                apply_folded_extend(folded, forward_batch)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -647,6 +656,12 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if folded is not None:
+                from sglang.srt.model_executor.encoder_swa_replay import (
+                    drop_folded_rows,
+                )
+
+                drop_folded_rows(logits_output=logits_output, folded=folded)
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
