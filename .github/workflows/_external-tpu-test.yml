@@ -249,7 +249,7 @@ jobs:
               done ) &
             local stream_pid=$!
 
-            local deadline next_refresh auth_fails=0 iter=0 ok bad
+            local deadline next_refresh auth_fails=0 iter=0 ok bad settled=0
             deadline=$(( $(date +%s) + wait_budget ))  # outlast the JobSet's activeDeadlineSeconds
             next_refresh=$(( $(date +%s) + TOKEN_REFRESH_EVERY ))
             while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -265,24 +265,25 @@ jobs:
               if ! kubectl -n "$ns" get "$name" >/dev/null 2>&1; then
                 auth_fails=$((auth_fails + 1))
                 [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
-                if [ "$auth_fails" -ge "$AUTH_FAIL_LIMIT" ]; then echo "❌ ${label}: lost cluster access; outcome unknown"; break; fi
+                if [ "$auth_fails" -ge "$AUTH_FAIL_LIMIT" ]; then echo "❌ ${label}: lost cluster access; outcome unknown"; settled=1; break; fi
                 sleep "$POLL"; continue
               fi
               auth_fails=0
               ok="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
               bad="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
-              if [ "$ok" = "True" ]; then echo "✅ ${label} PASSED"; rc=0; break; fi
+              if [ "$ok" = "True" ]; then echo "✅ ${label} PASSED"; rc=0; settled=1; break; fi
               if [ "$bad" = "True" ]; then
                 echo "❌ ${label} FAILED"
                 kubectl -n "$ns" get pods -l "$sel" -o wide || true
                 kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 --max-log-requests=64 2>/dev/null || true
                 kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
                 kubectl -n "$ns" describe "$name" | tail -n 120 || true
-                rc=1; break
+                rc=1; settled=1; break
               fi
               sleep "$POLL"
             done
-            [ "$rc" = 0 ] || { [ "$iter" -gt 0 ] && echo "❌ ${label}: did not complete before deadline" || true; }
+            # Only a loop that ran out of budget timed out; PASSED/FAILED/lost-access already said why.
+            [ "$settled" = 1 ] || { [ "$iter" -gt 0 ] && echo "❌ ${label}: did not complete before deadline" || true; }
             # Let a still-attached stream drain the final lines (the results JSON
             # is printed at the very end) before tearing the JobSet down.
             sleep 15
