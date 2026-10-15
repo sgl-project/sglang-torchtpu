@@ -1178,12 +1178,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 pin_memory = is_pin_memory_available(device)
+                input_device = _extend_metadata_device(batch, device)
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
                 ret.extend_seq_lens_cpu = list(extend_seq_lens)
             else:
@@ -2301,3 +2302,8 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+def _extend_metadata_device(batch, device):
+    """Initial placement of host-built extend lengths and derived positions."""
+    return device

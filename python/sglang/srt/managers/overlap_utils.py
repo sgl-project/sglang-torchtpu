@@ -91,6 +91,11 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
+def _stage_prefill_tokens(batch):
+    """Materialize the staged prompt before combining it with decode inputs."""
+    return batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+
+
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
@@ -101,7 +106,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     if batch.prefill_input_ids_cpu is not None:
         if _is_tpu and any(batch.multimodal_inputs or ()):
             batch.mm_input_ids_cpu = batch.prefill_input_ids_cpu
-        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        prefill_gpu = _stage_prefill_tokens(batch)
         if batch.mix_running_indices is not None:
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)

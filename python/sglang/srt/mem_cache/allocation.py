@@ -296,6 +296,7 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
     out_cache_loc_host: Optional[torch.Tensor] = None,
+    return_host: bool = False,
 ):
     # Over estimate the number of tokens: assume each request needs a new page
     # (one page per CLASS per request under sharding — the min-class
@@ -322,6 +323,9 @@ def alloc_paged_token_slots_extend(
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+    if return_host:
+        # Opt-in allocators may defer the upload until forward-input padding.
+        extra_alloc_kwargs["return_host"] = True
     if out_cache_loc_host is not None:
         extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
 

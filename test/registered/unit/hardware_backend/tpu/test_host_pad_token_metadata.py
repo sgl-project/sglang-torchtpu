@@ -178,7 +178,7 @@ class TestHostPadFieldSelection(CustomTestCase):
 
     def _policy(self):
         return DecoderTpuCompilePolicy(
-            model_runner=SimpleNamespace(),
+            model_runner=SimpleNamespace(device="cpu"),
             t_bucketer=Bucketer(name="Token", buckets=[8]),
             b_bucketer=Bucketer(name="Bs", buckets=[1, 4]),
         )
@@ -300,6 +300,81 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertGreaterEqual(len(device_padded), 3)
         self.assertEqual(batch.input_ids.tolist(), [0, 1, 2, 0])
         self.assertEqual(batch.positions.tolist(), [13, 51, 7, 0])
+
+    def test_padding_precedes_upload_and_preserves_host_mirrors(self):
+        batch = self._extend_batch()
+        # Forward staging must also work without sampling metadata.
+        batch.sampling_info = None
+        batch.req_pool_indices_cpu = torch.tensor([2, 7])
+        policy = self._policy()
+        policy.model_runner.device = "meta"
+        copies = {}
+
+        class ObserveCopies(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten._to_copy.default:
+                    copies[id(args[0])] = args[0].clone()
+                return func(*args, **(kwargs or {}))
+
+        with envs.SGLANG_TPU_HOST_PADDING.override(True), ObserveCopies():
+            policy.prepare_forward_batch(batch)
+        self.assertEqual(batch.input_ids.device.type, "meta")
+        self.assertEqual(batch.input_ids.shape, (8,))
+        self.assertEqual(batch.extend_seq_lens.shape, (4,))
+        self.assertEqual(batch.req_pool_indices_cpu.device.type, "cpu")
+        self.assertEqual(batch.req_pool_indices_cpu.tolist(), [2, 7, 0, 0])
+        self.assertEqual(
+            sorted(x.shape[0] for x in copies.values()), [4, 4, 4, 8, 8, 8]
+        )
+        self.assertIn(
+            [11, 12, 13, 50, 51, 0, 0, 0], [x.tolist() for x in copies.values()]
+        )
+
+    def test_staging_fallbacks_preserve_device_inputs(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.hooks import host_padding
+
+        override = get_context().override_server_args(
+            enable_torch_compile=True,
+            sampling_backend="pytorch",
+            enable_mixed_chunk=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        batch = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            mix_running_indices=None,
+            dllm_config=None,
+            model_config=SimpleNamespace(
+                is_generation=True,
+                is_multimodal=False,
+                is_encoder_decoder=False,
+                use_ngram_embedding=False,
+                use_engram=False,
+            ),
+            prefill_input_ids_cpu=torch.tensor([1, 2, 3]),
+        )
+
+        def upload(batch):
+            return batch.prefill_input_ids_cpu.to("meta")
+
+        with envs.SGLANG_TPU_HOST_PADDING.override(True):
+            staged = host_padding.stage_prefill_tokens(upload, batch)
+            self.assertIs(staged, batch.prefill_input_ids_cpu)
+            for field, value in (
+                ("mix_running_indices", [0]),
+                ("spec_algorithm", SpeculativeAlgorithm.EAGLE3),
+            ):
+                old = getattr(batch, field)
+                setattr(batch, field, value)
+                self.assertEqual(
+                    host_padding.stage_prefill_tokens(upload, batch).device.type, "meta"
+                )
+                setattr(batch, field, old)
+        with envs.SGLANG_TPU_HOST_PADDING.override(False):
+            self.assertEqual(
+                host_padding.stage_prefill_tokens(upload, batch).device.type, "meta"
+            )
 
 
 if __name__ == "__main__":

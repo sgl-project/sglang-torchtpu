@@ -20,6 +20,7 @@ from sglang.srt.sampling.sampling_batch_info import (
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.sampling.sampling_batch_info import sampling_params_to_device
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"
@@ -879,6 +880,171 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(entry.indices.dtype, torch.long)
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
+
+
+class TestHostSamplingMode(CustomTestCase):
+    """Scheduler row ownership must survive bucketing and overlap snapshots."""
+
+    def _host_info(self, size):
+        return _make_info(size, params_on_cpu=True)
+
+    def test_filter_merge_and_forward_snapshot_keep_logical_rows(self):
+        info = self._host_info(3)
+        info.temperatures = torch.tensor([[0.5], [0.7], [0.9]])
+        info.top_ks = torch.tensor([1, 5, 20], dtype=torch.int32)
+        info.top_ps = torch.tensor([1.0, 0.8, 0.9])
+        info.min_ps = torch.tensor([0.0, 0.1, 0.2])
+        info.sampling_seed = torch.tensor([42, 43, 44])
+        snapshot = info.copy_for_forward()
+        # Device row indices cannot be read: host filtering must use the list.
+        info.filter_batch([2, 0], torch.empty(2, device="meta", dtype=torch.int64))
+        other = self._host_info(1)
+        other.top_ks = torch.tensor([7], dtype=torch.int32)
+        other.sampling_seed = torch.tensor([99])
+        info.merge_batch(other)
+        uploaded = sampling_params_to_device(info)
+        self.assertFalse(uploaded.params_on_cpu)
+        self.assertTrue(info.params_on_cpu)
+        self.assertIs(sampling_params_to_device(uploaded), uploaded)
+        self.assertEqual(len(uploaded), 3)
+        self.assertEqual(uploaded.top_ks.tolist(), [20, 1, 7])
+        self.assertEqual(uploaded.sampling_seed.tolist(), [44, 42, 99])
+        self.assertEqual(snapshot.top_ks.tolist(), [1, 5, 20])
+        torch.testing.assert_close(uploaded.top_ps, torch.tensor([0.9, 1.0, 1.0]))
+        torch.testing.assert_close(uploaded.min_ps, torch.tensor([0.2, 0.0, 0.0]))
+        uploaded.temperatures.zero_()
+        self.assertGreater(info.temperatures.sum().item(), 0)
+
+    def test_transfers_use_bucket_shape_but_expose_live_rows(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        for size in (0, 1, 3, 4, 5):
+            with self.subTest(size=size):
+                info = self._host_info(size)
+                info.device = "meta"
+                shapes = []
+
+                class ObserveCopies(TorchDispatchMode):
+                    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                        if func == torch.ops.aten._to_copy.default:
+                            shapes.append(args[0].shape[0])
+                        return func(*args, **(kwargs or {}))
+
+                with ObserveCopies():
+                    uploaded = sampling_params_to_device(info)
+                self.assertEqual(shapes, [1 << (max(size, 1) - 1).bit_length()] * 4)
+                self.assertEqual(len(uploaded), size)
+                self.assertEqual(info.temperatures.device.type, "cpu")
+
+    def test_factory_hook_selects_host_storage_only_for_non_spec_tpu_sampling(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.plugins.hook_registry import (
+            HookRegistry,
+            HookType,
+            _propagate_patch,
+        )
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.hooks.host_padding import (
+            extend_metadata_device,
+            sampling_from_batch,
+            stage_prefill_tokens,
+        )
+
+        override = get_context().override_server_args(sampling_backend="tpu")
+        override.install()
+        self.addCleanup(override.restore)
+        target = "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch"
+        raw = vars(SamplingBatchInfo)["from_schedule_batch"]
+        original = SamplingBatchInfo.from_schedule_batch
+        HookRegistry._apply_target(
+            target, [(HookType.AROUND, sampling_from_batch, None)]
+        )
+        wrapped = SamplingBatchInfo.from_schedule_batch
+
+        def restore():
+            SamplingBatchInfo.from_schedule_batch = raw
+            _propagate_patch(wrapped, original, SamplingBatchInfo)
+
+        self.addCleanup(restore)
+        batch = ScheduleBatch(
+            device="cpu",
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            reqs=[
+                SimpleNamespace(
+                    sampling_params=SamplingParams(temperature=0.7, top_k=5, top_p=0.8),
+                    custom_logit_processor=None,
+                    return_sampling_mask=False,
+                )
+            ],
+        )
+        batch.model_config = SimpleNamespace(
+            is_generation=True,
+            is_multimodal=False,
+            is_encoder_decoder=False,
+            use_ngram_embedding=False,
+            use_engram=False,
+        )
+        batch.prefill_input_ids_cpu = torch.tensor([1, 2, 3])
+        # Exercise all four combinations; neither mode may imply the other.
+        for host_sampling in (False, True):
+            for host_inputs in (False, True):
+                mode = get_context().override_server_args(
+                    sampling_backend="tpu" if host_sampling else "pytorch",
+                    enable_torch_compile=host_inputs,
+                    enable_mixed_chunk=False,
+                )
+                mode.install()
+                try:
+                    with envs.SGLANG_TPU_HOST_PADDING.override(True):
+                        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                        batch.input_ids = stage_prefill_tokens(
+                            lambda b: b.prefill_input_ids_cpu.to("meta"), batch
+                        )
+                        self.assertEqual(info.params_on_cpu, host_sampling)
+                        self.assertEqual(
+                            batch.input_ids.device.type,
+                            "cpu" if host_inputs else "meta",
+                        )
+                        self.assertEqual(
+                            extend_metadata_device(lambda b, d: d, batch, "meta"),
+                            "cpu" if host_inputs else "meta",
+                        )
+                finally:
+                    mode.restore()
+        with envs.SGLANG_TPU_HOST_PADDING.override(True):
+            info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+            self.assertIs(type(info), SamplingBatchInfo)
+            self.assertTrue(info.params_on_cpu)
+            self.assertEqual(info.top_ks.tolist(), [5])
+            torch.testing.assert_close(info.top_ps, torch.tensor([0.8]))
+            batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+            self.assertFalse(
+                SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).params_on_cpu
+            )
+        batch.spec_algorithm = SpeculativeAlgorithm.NONE
+        with envs.SGLANG_TPU_HOST_PADDING.override(False):
+            self.assertFalse(
+                SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).params_on_cpu
+            )
+
+    def test_merge_rejects_incompatible_modes_before_mutating(self):
+        info = self._host_info(2)
+        other = _make_info(1)
+        with self.assertRaisesRegex(ValueError, "storage modes"):
+            info.merge_batch(other)
+        self.assertEqual(len(info), 2)
+        info.penalizer_orchestrator.merge.assert_not_called()
+
+    def test_penalties_use_logits_device_when_parameters_are_on_host(self):
+        info = self._host_info(3)
+        info.device = "meta"
+        info.penalizer_orchestrator.is_required = True
+        info.update_penalties()
+        self.assertEqual(info.acc_additive_penalties.device.type, "meta")
+        self.assertEqual(info.acc_additive_penalties.shape, (3, VOCAB_SIZE))
 
 
 if __name__ == "__main__":

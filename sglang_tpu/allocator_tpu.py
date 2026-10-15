@@ -199,6 +199,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
         out_indices_cpu: torch.Tensor = None,
+        return_host: bool = False,
     ):
         if self.debug_mode:
             assert torch.all(
@@ -241,7 +242,11 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_indices_cpu,
             self.page_size,
         )
-        out_indices = out_indices_cpu.to(self.device, non_blocking=True)
+        out_indices = (
+            out_indices_cpu
+            if return_host
+            else out_indices_cpu.to(self.device, non_blocking=True)
+        )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
