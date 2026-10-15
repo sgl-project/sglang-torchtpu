@@ -1020,7 +1020,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             forward_batch.forward_mode.is_extend_without_speculative()
             and forward_batch.input_ids.device.type == "cpu"
         )
-        if not (staged_metadata or staged_prefill):
+        mrope = getattr(forward_batch, "mrope_positions", None)
+        staged_mrope = isinstance(mrope, torch.Tensor) and mrope.device.type == "cpu"
+        if not (staged_metadata or staged_prefill or staged_mrope):
             return
         # Only staged forward inputs move here; CPU mirrors stay on the host.
         # Mamba tracking followed seq_lens.device during padding, so host-owned
@@ -1032,6 +1034,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             "req_pool_indices",
             "input_ids",
             "positions",
+            "mrope_positions",
             "out_cache_loc",
             "extend_seq_lens",
             "extend_prefix_lens",

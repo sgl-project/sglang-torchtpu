@@ -56,6 +56,24 @@ def metadata_device(original, batch):
     return original(batch)
 
 
+def mrope_decode_device(original, batch, device):
+    # Unlike token staging, mRoPE construction supports multimodal decode.
+    # Parallel/mixed paths have separate metadata preparation contracts.
+    parallel = get_parallel()
+    if (
+        _enabled(batch)
+        and get_flags().capture.enable_torch_compile
+        and parallel.pp_size == 1
+        and parallel.attn_cp_size == 1
+        and parallel.attn_dp_size == 1
+        and parallel.attn_dcp_size == 1
+        and not get_schedule().enable_mixed_chunk
+        and batch.forward_mode.is_decode()
+    ):
+        return "cpu"
+    return original(batch, device)
+
+
 def stage_prefill_tokens(original, batch):
     if _can_stage_prefill(batch):
         return batch.prefill_input_ids_cpu
@@ -117,6 +135,11 @@ def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     return [
+        (
+            "sglang.srt.model_executor.forward_batch_info._mrope_decode_device",
+            mrope_decode_device,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.managers.schedule_batch.ScheduleBatch.metadata_device",
             metadata_device,

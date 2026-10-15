@@ -777,6 +777,15 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     """
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
+        if (
+            field == "mrope_positions"
+            and isinstance(value, torch.Tensor)
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.spec_info is None
+        ):
+            # Ordinary decode consumes mRoPE only inside the decoder. Leave
+            # its device tensor bucketed instead of creating an unused slice.
+            continue
         dim = _TOKEN_FIELD_DIM.get(field, 0)
         if isinstance(value, torch.Tensor) and value.shape[dim] > real_q:
             setattr(forward_batch, field, value.narrow(dim, 0, real_q))

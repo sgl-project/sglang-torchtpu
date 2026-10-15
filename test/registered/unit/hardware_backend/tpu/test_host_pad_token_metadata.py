@@ -290,6 +290,34 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertEqual(batch.mrope_positions.shape, (3, 2))
         self.assertEqual(batch.mrope_positions[:, 0].tolist(), [0, 8, 16])
 
+    def test_decode_restoration_keeps_mrope_but_trims_consumed_metadata(self):
+        for live_rows in (4, 7, 8):
+            with self.subTest(live_rows=live_rows):
+                batch = self._decode_batch()
+                batch.input_ids = torch.arange(8)
+                batch.positions = torch.arange(8)
+                batch.seq_lens = torch.arange(8)
+                mrope = torch.empty((3, 8), dtype=torch.int64, device="meta")
+                batch.mrope_positions = mrope
+
+                class RejectMropeSlice(TorchDispatchMode):
+                    def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                        if func == torch.ops.aten.slice.Tensor and args[0] is mrope:
+                            raise AssertionError("ordinary decode must not slice mRoPE")
+                        return func(*args, **(kwargs or {}))
+
+                with RejectMropeSlice():
+                    shim._restore_forward_batch_inputs(batch, live_rows, live_rows)
+                self.assertIs(batch.mrope_positions, mrope)
+                self.assertEqual(batch.positions.shape, (live_rows,))
+                self.assertEqual(batch.input_ids.shape, (live_rows,))
+                self.assertEqual(batch.seq_lens.shape, (live_rows,))
+
+        # Speculative decode retains its existing restoration contract.
+        batch.spec_info = SimpleNamespace(hidden_states=None)
+        shim._restore_forward_batch_inputs(batch, 7, 7)
+        self.assertEqual(batch.mrope_positions.shape, (3, 7))
+
     def test_decode_keeps_device_pad(self):
         batch = self._decode_batch()
 
@@ -324,11 +352,132 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertEqual(batch.req_pool_indices_cpu.device.type, "cpu")
         self.assertEqual(batch.req_pool_indices_cpu.tolist(), [2, 7, 0, 0])
         self.assertEqual(
-            sorted(x.shape[0] for x in copies.values()), [4, 4, 4, 4, 8, 8, 8]
+            sorted(x.shape[0] for x in copies.values()), [3, 4, 4, 4, 4, 8, 8, 8]
         )
         self.assertIn(
             [11, 12, 13, 50, 51, 0, 0, 0], [x.tolist() for x in copies.values()]
         )
+
+    def test_decode_mrope_builds_on_host_and_uploads_only_bucket_shape(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.hooks import host_padding
+
+        override = get_context().override_server_args(
+            enable_torch_compile=True,
+            enable_mixed_chunk=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        original = forward_batch_info._mrope_decode_device
+
+        def placement(batch, device):
+            return host_padding.mrope_decode_device(original, batch, device)
+
+        for size in (4, 7):
+            for multimodal in (False, True):
+                with self.subTest(size=size, multimodal=multimodal):
+                    lengths = torch.arange(10, 10 + size)
+                    deltas = [(-3 if i % 2 == 0 else 0) for i in range(size)]
+                    mm_inputs = [
+                        SimpleNamespace(
+                            mrope_positions=None,
+                            mrope_position_delta=torch.tensor(delta),
+                        )
+                        if multimodal and delta
+                        else None
+                        for delta in deltas
+                    ]
+                    batch = SimpleNamespace(
+                        forward_mode=ForwardMode.DECODE,
+                        spec_algorithm=SpeculativeAlgorithm.NONE,
+                        multimodal_inputs=mm_inputs,
+                    )
+                    forward = SimpleNamespace(
+                        forward_mode=ForwardMode.DECODE,
+                        spec_info=None,
+                        seq_lens_cpu=lengths,
+                        seq_lens=lengths.to("meta"),
+                        input_ids=torch.empty(size, dtype=torch.int64, device="meta"),
+                        positions=torch.empty(size, dtype=torch.int64, device="meta"),
+                        out_cache_loc=torch.empty(
+                            size, dtype=torch.int32, device="meta"
+                        ),
+                        mm_inputs=None,
+                    )
+                    runner = SimpleNamespace(device="meta")
+                    with (
+                        envs.SGLANG_TPU_HOST_PADDING.override(True),
+                        patch.object(
+                            forward_batch_info, "_mrope_decode_device", placement
+                        ),
+                    ):
+                        forward_batch_info.ForwardBatch._compute_mrope_positions_decode(
+                            forward, runner, batch
+                        )
+                        expected = lengths - 1
+                        if multimodal:
+                            expected = expected + torch.tensor(deltas)
+                        self.assertEqual(forward.mrope_positions.device.type, "cpu")
+                        self.assertTrue(
+                            torch.equal(
+                                forward.mrope_positions,
+                                expected.unsqueeze(0).repeat(3, 1),
+                            )
+                        )
+                        uploads = []
+
+                        class RecordUploads(TorchDispatchMode):
+                            def __torch_dispatch__(
+                                mode, func, types, args=(), kwargs=None
+                            ):
+                                if func == torch.ops.aten._to_copy.default:
+                                    uploads.append(args[0].clone())
+                                return func(*args, **(kwargs or {}))
+
+                        policy = self._policy()
+                        policy.model_runner = runner
+                        policy.b_bucketer = Bucketer(name="Bs", buckets=[8])
+                        with RecordUploads():
+                            policy.prepare_forward_batch(forward)
+                        self.assertEqual(len(uploads), 1)
+                        self.assertEqual(uploads[0].shape, (3, 8))
+                        self.assertTrue(
+                            torch.equal(
+                                uploads[0][:, :size], expected.unsqueeze(0).repeat(3, 1)
+                            )
+                        )
+                        self.assertTrue(torch.all(uploads[0][:, size:] == 0))
+                        self.assertEqual(forward.mrope_positions.device.type, "meta")
+                        self.assertEqual(forward.mrope_positions.dtype, torch.int64)
+                    with envs.SGLANG_TPU_HOST_PADDING.override(False):
+                        self.assertEqual(placement(batch, "meta"), "meta")
+                    with envs.SGLANG_TPU_HOST_PADDING.override(True):
+                        batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+                        self.assertEqual(placement(batch, "meta"), "meta")
+
+    def test_precomputed_decode_mrope_keeps_spatial_axes(self):
+        from types import MethodType
+
+        positions = torch.tensor([[10, 11, 12], [20, 21, 22], [30, 31, 32]])
+        mm_input = SimpleNamespace(mrope_positions=positions)
+        forward = SimpleNamespace(
+            seq_lens_cpu=torch.tensor([2, 3]), seq_lens=torch.empty(2, device="meta")
+        )
+        forward._expand_mrope_from_input = MethodType(
+            forward_batch_info.ForwardBatch._expand_mrope_from_input, forward
+        )
+        # A fallback request must not consult delta-based placement at all.
+        with patch.object(
+            forward_batch_info,
+            "_mrope_decode_device",
+            side_effect=AssertionError("precomputed positions must be preserved"),
+        ):
+            forward_batch_info.ForwardBatch._compute_mrope_positions_decode(
+                forward,
+                SimpleNamespace(device="cpu"),
+                SimpleNamespace(multimodal_inputs=[mm_input, None]),
+            )
+        self.assertEqual(forward.mrope_positions.tolist(), [[11, 2], [21, 2], [31, 2]])
 
     def test_decode_metadata_pads_on_host_before_upload(self):
         # Device tokens coexist with independent CPU length/index snapshots.
