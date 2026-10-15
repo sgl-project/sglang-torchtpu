@@ -5,9 +5,9 @@ PyTorch-native SGLang serving on Google TPUs.
 [![License](https://img.shields.io/badge/License-Apache%202.0-green?style=flat&labelColor=555555)](LICENSE)
 <!-- add once public: PyPI version · nightly single-host · nightly multi-host -->
 
-[Docs](<docs url>) | [Quickstart](#get-started) | [Supported models and features](SUPPORT.md) | [Cookbook](https://cookbook.sglang.io/) | [Slack](<slack channel placeholder>) | [Issues](https://github.com/sgl-project/sglang-torchtpu/issues)
+Docs | [Quickstart](#get-started) | [Supported models and features](SUPPORT.md) | [Cookbook](https://cookbook.sglang.io/) | Slack | [Issues](https://github.com/sgl-project/sglang-torchtpu/issues)
 
-SGLang-torchtpu runs the SGLang engine on TPUs through [torch_tpu](<torch_tpu url>) and Pallas kernels. It is the PyTorch-native sibling of [SGL-JAX](https://github.com/sgl-project/sglang-jax): eager execution, the PyTorch ecosystem, and the same server, OpenAI-compatible API, and scheduler as SGLang on GPUs. It ships as a plugin that installs next to stock SGLang.
+SGLang-torchtpu runs the SGLang engine on TPUs through torch_tpu and Pallas kernels. It is the PyTorch-native sibling of [SGL-JAX](https://github.com/sgl-project/sglang-jax): eager execution, the PyTorch ecosystem, and the same server, OpenAI-compatible API, and scheduler as SGLang on GPUs. It ships as a plugin that installs next to stock SGLang.
 
 ## What you get
 
@@ -47,7 +47,7 @@ curl http://localhost:30000/v1/chat/completions \
 
 Next steps:
 
-- [TPU guide](<docs url>): multi-host launch, weights on shared storage, compile cache, and tuning flags.
+- TPU guide: multi-host launch, weights on shared storage, compile cache, and tuning flags.
 - [Cookbook](https://cookbook.sglang.io/): per-model launch commands.
 - Working from a checkout instead of the wheel:
 
@@ -82,17 +82,17 @@ Where to file what: TPU-specific bugs and feature requests here; engine bugs tha
   ```
 
 - Kernel and end-to-end tests need a TPU. A maintainer applies the `run-ci` label and comments `/tag-and-rerun-ci` to run them on your pull request.
-- [CONTRIBUTING.md](CONTRIBUTING.md) covers the branch-and-PR flow, adding a test to the support matrix, and the policy for changes outside `sglang_tpu/`.
+- CONTRIBUTING.md covers the branch-and-PR flow, adding a test to the support matrix, and the policy for changes outside `sglang_tpu/`.
 
 ## Community
 
 - Slack: `<channel placeholder>` in the SGLang workspace.
-- [GitHub Discussions](<discussions url placeholder>) for questions and design threads.
+- GitHub Discussions for questions and design threads.
 - [Issues](https://github.com/sgl-project/sglang-torchtpu/issues) for bugs and feature requests, with chip generation, topology, and torch_tpu version in the template.
-- Security: see [SECURITY.md](SECURITY.md).
+- Security: see SECURITY.md.
 
 ## License and acknowledgments
 
-Apache-2.0. See [NOTICE](NOTICE) for code adapted from [tpu-inference](https://github.com/vllm-project/tpu-inference), [sglang-jax](https://github.com/sgl-project/sglang-jax), [torchtpu-vllm](<torchtpu-vllm url>), and [Helion](https://github.com/pytorch/helion).
+Apache-2.0. See NOTICE for code adapted from [tpu-inference](https://github.com/vllm-project/tpu-inference), [sglang-jax](https://github.com/sgl-project/sglang-jax), torchtpu-vllm, and [Helion](https://github.com/pytorch/helion).
 
 SGLang-torchtpu is built by the SGLang community, RadixArk, Google, and Meta.
