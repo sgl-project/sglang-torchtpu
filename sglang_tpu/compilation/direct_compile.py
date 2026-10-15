@@ -648,6 +648,17 @@ class _CompiledArtifact:
                     f"is now {tuple(value.shape)} ({value.dtype}). The "
                     "specialization key does not cover whatever varies here."
                 )
+            if value._base is not None or not (
+                value.is_contiguous() and value.storage_offset() == 0
+            ):
+                # execute materializes a view in an eager as_strided program, one
+                # serving-time compile per view geometry that warmup never sees.
+                raise ValueError(
+                    "A direct_compile tensor input is a view: "
+                    f"{tree_util.keystr(path)} has shape {tuple(value.shape)}, "
+                    f"stride {value.stride()}, offset {value.storage_offset()}. "
+                    "Produce it as its own tensor (e.g. a compiled-op output)."
+                )
             inputs.append(value)
 
         if self.rng_device is None:
