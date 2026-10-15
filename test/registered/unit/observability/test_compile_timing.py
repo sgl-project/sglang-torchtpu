@@ -12,7 +12,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def test_compile_timing_is_added_to_scheduler_startup_time() -> None:
+@pytest.mark.parametrize("model_startup", [None, 15.0])
+def test_compile_timing_is_added_to_scheduler_startup_time(model_startup) -> None:
     target = CompileTimingRecorder()
     target.record(
         component="target",
@@ -39,8 +40,14 @@ def test_compile_timing_is_added_to_scheduler_startup_time() -> None:
         draft_cuda_graph=None,
         target_compile_steps=target.snapshot(),
         draft_compile_steps=draft.snapshot(),
+        model_startup=model_startup,
     )
 
+    assert startup_time["scheduler_e2e"] == 20.0
+    if model_startup is None:
+        assert "model_startup" not in startup_time
+    else:
+        assert startup_time["model_startup"] == model_startup
     assert "total_seconds" not in startup_time["compile"]
     assert [step["component"] for step in startup_time["compile"]["steps"]] == [
         "target",
@@ -63,20 +70,26 @@ def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
     result = aggregate_scheduler_startup_times(
         [
             {
+                "scheduler_e2e": 100.0,
+                "model_startup": 15.0,
                 "compile": {
                     "schema_version": 1,
                     "steps": [step, second_step],
-                }
+                },
             },
             {
+                "scheduler_e2e": 50.0,
+                "model_startup": 20.0,
                 "compile": {
                     "schema_version": 1,
                     "steps": [slower_step, slower_second_step],
-                }
+                },
             },
         ]
     )
 
+    assert result["scheduler_e2e"] == 100.0
+    assert result["model_startup"] == 20.0
     assert "total_seconds" not in result["compile"]
     assert [step["duration_seconds"] for step in result["compile"]["steps"]] == [
         4.0,

@@ -108,6 +108,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
+    get_world_group,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -538,6 +539,7 @@ class Scheduler(
             dist_port=self.nccl_port,
         )
         bootstrap.init_layer_runtime(model_config=self.model_config)
+        self.init_model_startup_timing_begin()
 
         # Init metrics stats
         self.init_metrics_collector()
@@ -723,15 +725,28 @@ class Scheduler(
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
+        self.model_startup_begin: Optional[float] = None
+
+    def init_model_startup_timing_begin(self) -> None:
+        if get_device().device == "tpu":
+            # Exclude peer launch skew and distributed bootstrap from model startup.
+            get_world_group().barrier()
+            self.model_startup_begin = time.perf_counter()
 
     def init_startup_timing_summary(self) -> None:
+        startup_end = time.perf_counter()
         self.startup_time = build_scheduler_startup_time(
             target_load_weight=self.tp_worker.weight_load_time,
             draft_load_weight=(
                 0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
             ),
             kv_cache_allocation=self.kv_cache_allocation_time,
-            scheduler_e2e=time.perf_counter() - self.scheduler_startup_begin,
+            scheduler_e2e=startup_end - self.scheduler_startup_begin,
+            model_startup=(
+                None
+                if self.model_startup_begin is None
+                else startup_end - self.model_startup_begin
+            ),
             target_cuda_graph=self.tp_worker.graph_time_usage,
             draft_cuda_graph=(
                 None
