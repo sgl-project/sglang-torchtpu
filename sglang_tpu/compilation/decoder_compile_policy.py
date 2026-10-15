@@ -1805,7 +1805,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         positions: torch.Tensor,
         forward_batch: Any,
         *,
-        input_embeds: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
         **_kwargs: Any,
     ) -> tuple[Any, ...]:
@@ -1818,7 +1818,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
-            input_embeds.shape[0],
+            (input_embeds if input_embeds is not None else input_ids).shape[0],
+            input_embeds is not None,
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
