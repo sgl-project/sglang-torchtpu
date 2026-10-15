@@ -9,8 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from jax import tree_util
-from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_flatten, tree_leaves, tree_map
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
@@ -50,7 +49,7 @@ def _canonical_tensor(value):
 
 
 def _specialization_key(*args, **kwargs):
-    leaves, structure = tree_util.tree_flatten((args, kwargs))
+    leaves, structure = tree_flatten((args, kwargs))
     return structure, tuple(
         (tuple(value.shape), value.dtype, value.device)
         if isinstance(value, torch.Tensor)
@@ -98,9 +97,7 @@ def compiled_op(
                 # Bind to fn's signature: positional warmups and keyword callers share a key.
                 bound = signature.bind(*args, **kwargs)
                 bound.apply_defaults()
-                args, kwargs = tree_util.tree_map(
-                    _canonical_tensor, (bound.args, bound.kwargs)
-                )
+                args, kwargs = tree_map(_canonical_tensor, (bound.args, bound.kwargs))
                 if compiled_fn is None:
                     use_direct = get_exec().graph.tpu_compile_tracer == "direct"
                     if use_direct:

@@ -1,3 +1,6 @@
+import importlib.util
+import runpy
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,6 +36,19 @@ class _StringAnnotatedMropeModel:
         forward_batch,
     ):
         return input_ids, positions, forward_batch
+
+
+def test_compiled_op_imports_and_runs_without_jax():
+    module_path = importlib.util.find_spec("sglang.srt.compilation.compiled_op").origin
+    with patch.dict(sys.modules, {"jax": None}):
+        module = runpy.run_path(module_path)
+
+        @module["compiled_op"]()
+        def helper(x):
+            return x + 1
+
+        x = torch.tensor([1, 2])
+        torch.testing.assert_close(helper(x), x + 1)
 
 
 def test_positions_marks_the_token_axis_dynamic_for_mrope_and_1d_rope():
