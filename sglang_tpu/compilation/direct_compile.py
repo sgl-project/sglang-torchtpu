@@ -32,12 +32,12 @@ from sglang.srt.speculative.eagle_info import (
 from sglang_tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
 )
-from sglang_tpu.compilation.graph_identity import _key_value, canonical
+from sglang_tpu.compilation.graph_identity import _key_value, canonical, digest
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.pp_proxy_pytree import (
     register_pp_proxy_pytree,
 )
-from sglang_tpu.compilation.spmd_compiler import SPMDCompiler
+from sglang_tpu.compilation.spmd_compiler import ExecutableInterface, SPMDCompiler
 from sglang_tpu.compilation.warmup_queue import current_warmup_queue
 from sglang_tpu.rank_local import trace_rank
 
@@ -307,6 +307,10 @@ class CompiledFunction:
         return artifact((args, kwargs))
 
     def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
+        queue = current_warmup_queue()
+        if self._spmd_safe and queue is not None and queue.spmd_compiler is not None:
+            # Snapshot reused containers while retaining their local tensor buffers.
+            args, kwargs = tree_util.tree_map(lambda value: value, (args, kwargs))
         artifact = self._get_artifact(args, kwargs, async_compile=True)
         return PendingCall(lambda: artifact((args, kwargs)))
 
@@ -333,11 +337,19 @@ class CompiledFunction:
             else None
         )
         artifact = self.cache.get(key)
-        if spmd_compiler is not None and (
-            artifact is None or artifact.pending_compile is not spmd_compiler
-        ):
-            # Each queue must cover every key even if local caches differ across ranks.
-            artifact = None
+        if spmd_compiler is not None:
+            pending = (
+                spmd_compiler
+                if spmd_compiler.verify_spmd_safe
+                else spmd_compiler.submissions.get(graph)
+            )
+            if (
+                pending is None
+                or artifact is None
+                or artifact.pending_compile is not pending
+            ):
+                # Each queue must cover every key even if local caches differ across ranks.
+                artifact = None
         if artifact is None:
             # set_stance has no public getter and replaces eval_frame._stance.
             if (
@@ -465,6 +477,75 @@ class CompiledFunction:
         if spmd_compiler is not None:
             sync.synchronize(flat_inputs)
 
+        binding_input_digest = None
+        interface = None
+        if spmd_compiler is not None and not spmd_compiler.verify_spmd_safe:
+            binding_input_digest = digest(
+                dict(
+                    model=registered_model_inputs,
+                    extras=[
+                        (path, item[2])
+                        for path, item in zip(
+                            self._model_extra_tensor_attrs,
+                            extra_model_inputs,
+                            strict=True,
+                        )
+                    ],
+                    rank_input=rank_input_index,
+                    model_count=model_input_count,
+                    kv_count=len(kv_pool_inputs),
+                    tensor_paths=[
+                        tree_util.keystr(path) for path in tensor_inputs_key_paths
+                    ],
+                )
+            )
+            submission = spmd_compiler.submissions[graph]
+            if submission.owner != spmd_compiler.rank:
+                artifact = _CompiledArtifact(
+                    executable=None,
+                    model_inputs=tuple(model_inputs),
+                    kv_pool=self._kv_pool,
+                    tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
+                    tensor_inputs_traced_shapes=tuple(
+                        tuple(path_leaves[index][1].shape)
+                        for index in tensor_leaf_indices
+                    ),
+                    output_treespec=None,
+                    output_count=0,
+                    pending_compile=submission,
+                )
+
+                def bind(owner_interface: ExecutableInterface) -> None:
+                    if owner_interface.input_digest != binding_input_digest:
+                        raise ValueError("Shared TPU input binding changed")
+                    live_model_inputs = tuple(
+                        model_inputs[index] for index in owner_interface.model_indices
+                    )
+                    selected = [*live_model_inputs, *flat_inputs[model_input_count:]]
+                    layouts = []
+                    for tensor in selected:
+                        layout = None
+                        if tensor.device.type == "tpu":
+                            layout = (
+                                tpu_torch_compile.get_device_layout_if_materialized(
+                                    tensor
+                                )
+                            )
+                        layouts.append(layout[0] if layout is not None else [])
+                    if (
+                        _tensor_specs(selected) != owner_interface.input_specs
+                        or layouts != owner_interface.argument_layouts
+                    ):
+                        raise ValueError(
+                            "Shared TPU input shapes, dtypes or layouts changed"
+                        )
+                    artifact.model_inputs = live_model_inputs
+                    artifact.output_treespec = owner_interface.output_treespec
+                    artifact.output_count = owner_interface.output_treespec.num_leaves
+
+                submission.bind = bind
+                return artifact
+
         # Step 2: We've figured out all of our args. Now, we can create
         # placeholders for them. These will all be inputs to the MLIR graph.
         graph_inputs = [tpu_torch_compile.placeholder_like(t) for t in flat_inputs]
@@ -575,6 +656,7 @@ class CompiledFunction:
                 "direct_compile requires TPU tensor outputs or KV-pool mutations"
             )
 
+        live_model_indices = tuple(range(model_input_count))
         if self._prune_unused_inputs:
             # Only immutable model state can be dropped. Keep every explicit input
             # (and its runtime shape check), KV input/output, and callback output.
@@ -618,6 +700,18 @@ class CompiledFunction:
             argument_layouts.append(layout[0] if layout is not None else [])
         if rng_device is not None:
             argument_layouts.append([])
+        if spmd_compiler is not None and not spmd_compiler.verify_spmd_safe:
+            if inserted_callbacks:
+                raise ValueError(
+                    "Shared TPU compilation does not support trace-inserted callbacks"
+                )
+            interface = ExecutableInterface(
+                input_digest=binding_input_digest,
+                input_specs=_tensor_specs(graph_inputs),
+                argument_layouts=argument_layouts,
+                model_indices=live_model_indices,
+                output_treespec=output_treespec,
+            )
         pending_compile = None
         executable = None
         start = time.perf_counter()
@@ -632,6 +726,7 @@ class CompiledFunction:
                         result_tensors,
                         graph_inputs,
                         argument_layouts=argument_layouts,
+                        interface=interface,
                         graph=graph,
                     )
             logger.info(
@@ -663,6 +758,10 @@ class CompiledFunction:
             pending_compile=pending_compile,
             rng_device=rng_device,
         )
+
+
+def _tensor_specs(tensors):
+    return tuple((tuple(tensor.shape), str(tensor.dtype)) for tensor in tensors)
 
 
 @dataclass
