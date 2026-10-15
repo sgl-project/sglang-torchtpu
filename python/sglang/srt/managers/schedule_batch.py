@@ -2799,6 +2799,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
+    def metadata_device(self):
+        """Placement of scheduler-owned lengths and request rows.
+
+        Backends may retain logical metadata on host and materialize device
+        copies on the forward batch after padding. Token tensors are separate.
+        """
+        return self.device
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -2829,12 +2837,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # resolve_forward_inputs.
         pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+            self.metadata_device(), non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         orig_seq_lens_tensor = torch.tensor(
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        ).to(self.metadata_device(), non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -3538,11 +3546,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.metadata_device())
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.orig_seq_lens = torch.empty(
+            0, dtype=torch.int32, device=self.metadata_device()
+        )
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.empty(
+            0, dtype=torch.int64, device=self.metadata_device()
+        )
         self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
@@ -3786,10 +3798,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+        self.req_pool_indices = self.req_pool_indices[
+            keep_indices
+            if self.req_pool_indices.device.type == "cpu"
+            else keep_indices_device
+        ]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
-        self.seq_lens = self.seq_lens[keep_indices_device]
-        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        self.seq_lens = self.seq_lens[
+            keep_indices if self.seq_lens.device.type == "cpu" else keep_indices_device
+        ]
+        self.orig_seq_lens = self.orig_seq_lens[
+            keep_indices
+            if self.orig_seq_lens.device.type == "cpu"
+            else keep_indices_device
+        ]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None

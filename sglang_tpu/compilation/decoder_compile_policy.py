@@ -51,6 +51,7 @@ from sglang_tpu.compilation.attention_rank_inputs import (
 )
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
+    _MAMBA_TRACK_FIELDS,
     _REAL_B_KEY,
     _REAL_Q_KEY,
     CompiledForwardShim,
@@ -1009,14 +1010,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
     def _upload_host_inputs(self, forward_batch: ForwardBatch) -> None:
-        if not (
-            envs.SGLANG_TPU_HOST_PADDING.get()
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            and forward_batch.input_ids.device.type == "cpu"
+        if (
+            not envs.SGLANG_TPU_HOST_PADDING.get()
+            or forward_batch.spec_info is not None
         ):
             return
+        staged_metadata = forward_batch.seq_lens.device.type == "cpu"
+        staged_prefill = (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.input_ids.device.type == "cpu"
+        )
+        if not (staged_metadata or staged_prefill):
+            return
         # Only staged forward inputs move here; CPU mirrors stay on the host.
+        # Mamba tracking followed seq_lens.device during padding, so host-owned
+        # lengths defer those uploads to this boundary as well.
         for name in (
+            *_MAMBA_TRACK_FIELDS,
+            "seq_lens",
+            "orig_seq_lens",
+            "req_pool_indices",
             "input_ids",
             "positions",
             "out_cache_loc",

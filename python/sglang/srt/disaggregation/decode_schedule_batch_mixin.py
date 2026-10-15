@@ -88,13 +88,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # input_ids from the relay.
         self.input_ids = None
         self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+            req_pool_indices, dtype=torch.int64, device=self.metadata_device()
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens = torch.tensor(
+            seq_lens, dtype=torch.int64, device=self.metadata_device()
+        )
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
+            seq_lens, dtype=torch.int32, device=self.metadata_device()
         )
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)

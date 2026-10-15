@@ -502,7 +502,9 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
     )
-    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    req_pool_indices_device = req_pool_indices_cpu.to(
+        batch.metadata_device(), non_blocking=True
+    )
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)

@@ -1,4 +1,4 @@
-"""Tests for preparing and padding token metadata on the host during TPU prefill."""
+"""Host staging, scheduler metadata ownership, and TPU forward padding."""
 
 import os
 import unittest
@@ -127,7 +127,7 @@ class TestPadTensorOnHost(CustomTestCase):
 
 
 class TestHostPadFieldSelection(CustomTestCase):
-    """Host padding is opt-in for prefill and never used for decode or verify."""
+    """Host staging is opt-in; device token padding retains its existing policy."""
 
     def setUp(self):
         super().setUp()
@@ -324,11 +324,207 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertEqual(batch.req_pool_indices_cpu.device.type, "cpu")
         self.assertEqual(batch.req_pool_indices_cpu.tolist(), [2, 7, 0, 0])
         self.assertEqual(
-            sorted(x.shape[0] for x in copies.values()), [4, 4, 4, 8, 8, 8]
+            sorted(x.shape[0] for x in copies.values()), [4, 4, 4, 4, 8, 8, 8]
         )
         self.assertIn(
             [11, 12, 13, 50, 51, 0, 0, 0], [x.tolist() for x in copies.values()]
         )
+
+    def test_decode_metadata_pads_on_host_before_upload(self):
+        # Device tokens coexist with independent CPU length/index snapshots.
+        batch = self._decode_batch()
+        batch.input_ids = batch.input_ids.to("meta")
+        batch.out_cache_loc = batch.out_cache_loc.to("meta")
+        batch.orig_seq_lens = torch.tensor([90, 70, 80], dtype=torch.int32)
+        batch.req_pool_indices = torch.tensor([2, 7, 9])
+        batch.seq_lens_cpu = batch.seq_lens
+        batch.req_pool_indices_cpu = batch.req_pool_indices
+        batch.mamba_track_indices = torch.tensor([3, 4, 5])
+        originals = {
+            name: getattr(batch, name)
+            for name in ("seq_lens", "orig_seq_lens", "req_pool_indices")
+        }
+        values = {name: value.clone() for name, value in originals.items()}
+        policy = self._policy()
+        policy.model_runner.device = "meta"
+        uploads = []
+
+        class RecordUploads(TorchDispatchMode):
+            def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                if func == torch.ops.aten._to_copy.default and kwargs.get(
+                    "device"
+                ) == torch.device("meta"):
+                    uploads.append(args[0].clone())
+                return func(*args, **kwargs)
+
+        with envs.SGLANG_TPU_HOST_PADDING.override(True), RecordUploads():
+            policy.prepare_forward_batch(batch)
+        for name, original in originals.items():
+            self.assertTrue(torch.equal(original, values[name]))
+            self.assertEqual(original.shape[0], 3)
+            self.assertEqual(getattr(batch, name).device.type, "meta")
+            self.assertEqual(getattr(batch, name).shape[0], 4)
+        self.assertTrue(any(x.tolist() == [90, 70, 80, 0] for x in uploads))
+        self.assertTrue(all(x.shape[0] == 4 for x in uploads))
+        self.assertEqual(batch.orig_seq_lens.dtype, torch.int32)
+        self.assertEqual(batch.mamba_track_indices.device.type, "meta")
+        self.assertIs(batch.seq_lens_cpu, originals["seq_lens"])
+        self.assertEqual(batch.req_pool_indices_cpu.device.type, "cpu")
+
+    def test_host_scheduler_merge_filter_decode_preserves_snapshots(self):
+        from unittest.mock import MagicMock
+
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        def make_batch(lengths, originals, indices):
+            return ScheduleBatch(
+                reqs=[
+                    SimpleNamespace(
+                        beam_group=None,
+                        decode_batch_idx=0,
+                        return_logprob=False,
+                        grammar=None,
+                        return_hidden_states_mode=CaptureHiddenMode.NULL,
+                    )
+                    for _ in lengths
+                ],
+                device="meta",
+                model_config=SimpleNamespace(is_encoder_decoder=False),
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                seq_lens=torch.tensor(lengths),
+                seq_lens_cpu=torch.tensor(lengths),
+                orig_seq_lens=torch.tensor(originals, dtype=torch.int32),
+                req_pool_indices=torch.tensor(indices),
+                req_pool_indices_cpu=torch.tensor(indices),
+                sampling_info=MagicMock(),
+            )
+
+        batch = make_batch([5, 6, 7], [50, 60, 70], [1, 2, 3])
+        other = make_batch([8, 9], [80, 90], [4, 5])
+        names = ("seq_lens", "orig_seq_lens", "req_pool_indices")
+        snapshot = {name: getattr(batch, name) for name in names}
+        batch.merge_batch(other)
+        batch.filter_batch(keep_indices=[4, 0, 2])
+        self.assertEqual(batch.seq_lens.tolist(), [9, 5, 7])
+        self.assertEqual(batch.orig_seq_lens.tolist(), [90, 50, 70])
+        self.assertEqual(batch.req_pool_indices.tolist(), [5, 1, 3])
+        forward_snapshot = {name: getattr(batch, name) for name in names}
+        batch.sampling_info.penalizer_orchestrator.is_required = False
+        with patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+            return_value=torch.empty(3, device="meta"),
+        ):
+            batch.prepare_for_decode()
+        self.assertEqual(batch.seq_lens.tolist(), [10, 6, 8])
+        self.assertEqual(batch.orig_seq_lens.tolist(), [91, 51, 71])
+        self.assertEqual(forward_snapshot["seq_lens"].tolist(), [9, 5, 7])
+        self.assertEqual(forward_snapshot["orig_seq_lens"].tolist(), [90, 50, 70])
+        self.assertEqual(snapshot["seq_lens"].tolist(), [5, 6, 7])
+        self.assertEqual(snapshot["orig_seq_lens"].tolist(), [50, 60, 70])
+        self.assertEqual(snapshot["req_pool_indices"].tolist(), [1, 2, 3])
+        self.assertTrue(
+            all(getattr(batch, name).device.type == "cpu" for name in names)
+        )
+
+    def test_relay_materializes_device_indices_without_replacing_host_metadata(self):
+        from sglang.srt.managers import overlap_utils
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        indices = torch.tensor([2, 7, 9])
+        batch = ScheduleBatch(reqs=[], req_pool_indices=indices)
+        relay = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        relay.spec_algo = SpeculativeAlgorithm.NONE
+        relay._use_dynamic_index = True
+        relay.output_tokens_buf = torch.empty(16, dtype=torch.int64, device="meta")
+        operations = []
+
+        class CheckIndexDevice(TorchDispatchMode):
+            def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten.index.Tensor:
+                    self.assertEqual(args[1][0].device, args[0].device)
+                    operations.append("gather")
+                elif func == torch.ops.aten.index_copy_.default:
+                    self.assertEqual(args[2].device, args[0].device)
+                    operations.append("store")
+                return func(*args, **(kwargs or {}))
+
+        with patch.object(overlap_utils, "_DEBUG_ASSERT", False), CheckIndexDevice():
+            overlap_utils.resolve_forward_inputs(batch, relay)
+            relay.stash_bonus_tokens(
+                indices, torch.empty(3, dtype=torch.int64, device="meta")
+            )
+        self.assertEqual(operations, ["gather", "store"])
+        self.assertIs(batch.req_pool_indices, indices)
+        self.assertEqual(indices.tolist(), [2, 7, 9])
+        self.assertEqual(batch.input_ids.device.type, "meta")
+
+    def test_prebuilt_metadata_uses_same_host_placement(self):
+        from unittest.mock import MagicMock
+
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.hooks import host_padding
+
+        req = SimpleNamespace(
+            kv=SimpleNamespace(req_pool_idx=1),
+            prefix_indices=[0, 1],
+            extend_range=SimpleNamespace(length=3),
+            origin_input_ids=[10, 11, 12, 13, 14],
+            output_ids=[],
+            retracted_stain=True,
+            is_retracted=True,
+            multimodal_inputs=None,
+            beam_group=None,
+        )
+        batch = ScheduleBatch(
+            reqs=[req],
+            device="meta",
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(10).reshape(2, 5)
+            ),
+            model_config=SimpleNamespace(
+                vocab_size=32,
+                is_generation=True,
+                is_multimodal=False,
+                is_encoder_decoder=False,
+                use_ngram_embedding=False,
+                use_engram=False,
+            ),
+        )
+        override = get_context().override_server_args(
+            enable_torch_compile=True,
+            sampling_backend="pytorch",
+            enable_mixed_chunk=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        original = ScheduleBatch.metadata_device
+
+        def placement(batch):
+            return host_padding.metadata_device(original, batch)
+
+        with (
+            envs.SGLANG_TPU_HOST_PADDING.override(True),
+            patch.object(ScheduleBatch, "metadata_device", placement),
+            patch(
+                "sglang.srt.disaggregation.decode_schedule_batch_mixin.SamplingBatchInfo.from_schedule_batch",
+                return_value=MagicMock(),
+            ),
+        ):
+            batch.prepare_for_prebuilt()
+        self.assertEqual(batch.seq_lens.tolist(), [5])
+        self.assertEqual(batch.orig_seq_lens.tolist(), [5])
+        self.assertEqual(batch.req_pool_indices.tolist(), [1])
+        self.assertEqual(batch.orig_seq_lens.dtype, torch.int32)
+        self.assertIsNone(batch.input_ids)
+        # The placement hook defaults to the existing backend contract.
+        with envs.SGLANG_TPU_HOST_PADDING.override(False):
+            self.assertEqual(placement(batch), "meta")
 
     def test_staging_fallbacks_preserve_device_inputs(self):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

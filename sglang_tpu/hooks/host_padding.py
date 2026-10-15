@@ -1,7 +1,7 @@
 """Defer host-built inputs until the decoder's padding boundary.
 
 Why: uploading before padding produces unnecessary transfers and shape variants.
-How: AROUND the sampling factory, input staging, and extend allocation.
+How: AROUND metadata placement, sampling, input staging, and extend allocation.
 Upstream seam issue: not filed (local prototype).
 Remove when: upstream provides backend factories for these staging decisions.
 """
@@ -41,6 +41,19 @@ def _can_stage_prefill(batch):
         and not batch.model_config.is_encoder_decoder
         and batch.dllm_config is None
     )
+
+
+def metadata_device(original, batch):
+    # Independent of sampling parameter placement. Host allocation must also
+    # understand these indices before the forward upload boundary.
+    if (
+        _can_stage_prefill(batch)
+        and batch.req_to_token_pool.req_to_token.device.type == "cpu"
+        and batch.hisparse_coordinator is None
+        and not any(req.beam_group is not None for req in batch.reqs)
+    ):
+        return "cpu"
+    return original(batch)
 
 
 def stage_prefill_tokens(original, batch):
@@ -104,6 +117,11 @@ def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     return [
+        (
+            "sglang.srt.managers.schedule_batch.ScheduleBatch.metadata_device",
+            metadata_device,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.mem_cache.allocation.alloc_paged_token_slots_extend",
             alloc_extend,

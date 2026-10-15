@@ -123,10 +123,14 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
     elif batch.input_ids is None and future_map.spec_algo.is_none():
-        batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
+        # Relay needs device indices even when scheduler metadata stays on host.
+        relay_indices = batch.req_pool_indices.to(
+            future_map.output_tokens_buf.device, non_blocking=True
+        )
+        batch.input_ids = future_map.output_tokens_buf[relay_indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
-                batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
+                batch.input_ids, future_map.output_tokens_buf, relay_indices
             )
 
     # Only the overlap path relays spec extras through the future_map; the
@@ -526,6 +530,7 @@ class FutureMap:
         # returns int64 token ids that must land in the buffer's dtype).
         if values.dtype != buf.dtype:
             values = values.to(buf.dtype)
+        indices = indices.to(buf.device, non_blocking=True)
         if self._use_dynamic_index:
             buf.index_copy_(0, indices, values)
         else:
