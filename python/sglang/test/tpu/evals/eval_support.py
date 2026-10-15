@@ -61,6 +61,8 @@ def wait_for_health(
             raise RuntimeError(f"server exited with code {process.returncode}")
         try:
             response = requests.get(base_url.rstrip("/") + endpoint, timeout=10)
+            if response.status_code == 404 and endpoint == "/health_generate":
+                response = requests.get(base_url.rstrip("/") + "/readyz", timeout=10)
             if response.status_code == 200:
                 print(
                     f"[{tag}] server healthy after {time.perf_counter() - start:.0f}s",
@@ -326,7 +328,7 @@ def lm_eval_runner(config_path: str, report_only: bool = False):
 
         # Prefix caching would let a repeated eval short-circuit real prefills.
         try:
-            requests.get(base_url.rstrip("/") + "/flush_cache", timeout=30)
+            requests.post(base_url.rstrip("/") + "/flush_cache", timeout=30)
         except requests.RequestException:
             pass
 

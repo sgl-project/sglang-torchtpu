@@ -165,6 +165,7 @@ _GATE_PASSTHROUGH = {
     "top_k",
     "api",
     "spec_accept_length_threshold",
+    "spec_accept_length_url",
     "runner",
     "report_only",
 }

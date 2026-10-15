@@ -21,21 +21,32 @@ mkdir -p "$TRACE_CACHE_DIR"
 # summarize.py collects legs from the "colocated" and "pd" subdirs.
 if [[ "$PD_DISAGG" == "1" ]]; then
     MODE_LABEL=pd
-    # The mini-LB serves no /metrics; the cache/offload counters live on the
-    # prefill engine, the spec/abort side on the decode engine. Engine leaders
-    # follow PHYSICAL host order (serve_group.sh's rendezvous writes the map
-    # for this pod), not pod-index order.
+    # The P/D router does not proxy engine /metrics; the cache/offload counters
+    # live on the prefill engines, the spec/abort side on the decode engines.
+    # Under cache_aware routing (PD_ROUTER=smg), a single-session leg pins all
+    # rounds of its session to whichever prefill engine won round 1, so PROBE_URL
+    # must sum counters across both prefill engines. Engine leaders follow
+    # PHYSICAL host order (serve_group.sh's rendezvous writes the map for this
+    # pod), not pod-index order.
     if [[ -s /tmp/bench_matrix_phys_hosts ]]; then
         mapfile -t _slice_hosts < /tmp/bench_matrix_phys_hosts
     else
         IFS=',' read -r -a _slice_hosts <<< "${TPU_WORKER_HOSTNAMES:-}"
     fi
-    if [[ -z "${PROBE_URL:-}" && ${#_slice_hosts[@]} -ge 1 ]]; then
-        PROBE_URL="http://${_slice_hosts[0]}:$PD_PREFILL_PORT"
+    if [[ -z "${PROBE_URL:-}" ]]; then
+        if [[ "$PD_ROUTER" == "smg" && ${#_slice_hosts[@]} -ge 2 ]]; then
+            PROBE_URL="http://${_slice_hosts[0]}:$PD_PREFILL_PORT,http://${_slice_hosts[1]}:$PD_PREFILL_PORT"
+        elif [[ ${#_slice_hosts[@]} -ge 1 ]]; then
+            PROBE_URL="http://${_slice_hosts[0]}:$PD_PREFILL_PORT"
+        fi
     fi
     PROBE_URL=${PROBE_URL:-http://127.0.0.1:$PD_PREFILL_PORT}
-    if [[ -z "${PROBE_URL_2:-}" && ${#_slice_hosts[@]} -ge 3 ]]; then
-        PROBE_URL_2="http://${_slice_hosts[2]}:$PD_DECODE_PORT"
+    if [[ -z "${PROBE_URL_2:-}" ]]; then
+        if [[ "$PD_ROUTER" == "smg" && ${#_slice_hosts[@]} -ge 4 ]]; then
+            PROBE_URL_2="http://${_slice_hosts[2]}:$PD_DECODE_PORT,http://${_slice_hosts[3]}:$PD_DECODE_PORT"
+        elif [[ ${#_slice_hosts[@]} -ge 3 ]]; then
+            PROBE_URL_2="http://${_slice_hosts[2]}:$PD_DECODE_PORT"
+        fi
     fi
 else
     MODE_LABEL=colocated
@@ -53,13 +64,14 @@ log_config | tee "$RUN_ROOT/config.log"
     echo "git       = $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } | tee -a "$RUN_ROOT/config.log"
 
-echo "[sweep] waiting for $BASE_URL"
+HEALTH_PATH=$([[ "$PD_DISAGG" == "1" && "$PD_ROUTER" == "smg" ]] && echo /readyz || echo /health)
+echo "[sweep] waiting for $BASE_URL$HEALTH_PATH"
 start=$SECONDS
 while :; do
-    code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$BASE_URL/health" 2>/dev/null || echo 000)
+    code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$BASE_URL$HEALTH_PATH" 2>/dev/null || echo 000)
     [[ "$code" == "200" ]] && break
     if (( SECONDS - start >= HEALTH_TIMEOUT )); then
-        echo "[sweep] ERROR: $BASE_URL never healthy (last=$code)" >&2
+        echo "[sweep] ERROR: $BASE_URL$HEALTH_PATH never healthy (last=$code)" >&2
         echo "failed:server" >"$OUT_DIR/MODE_STATUS"
         exit 1
     fi

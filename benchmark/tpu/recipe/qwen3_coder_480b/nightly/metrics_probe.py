@@ -109,18 +109,26 @@ def _parse_prometheus(text: str) -> Dict[str, float]:
 
 
 def _snapshot(url: str, timeout: int) -> Dict:
-    base = url.rstrip("/")
-    record: Dict = {"url": base}
+    urls = [u.strip().rstrip("/") for u in url.split(",") if u.strip()]
+    base = urls[0] if urls else url.rstrip("/")
+    record: Dict = {"url": ",".join(urls) if len(urls) > 1 else base}
 
-    metrics_text = _get(f"{base}/metrics", timeout)
-    if metrics_text is None:
+    texts: List[str] = []
+    missing: List[str] = []
+    for u in urls:
+        t = _get(f"{u}/metrics", timeout)
+        if t is None:
+            missing.append(u)
+        else:
+            texts.append(t)
+    if not texts:
         record["metrics"] = {}
         record["_error"] = (
             f"could not read {base}/metrics -- was the server launched with "
             "--enable-metrics?"
         )
     else:
-        record["metrics"] = _parse_prometheus(metrics_text)
+        record["metrics"] = _parse_prometheus("\n".join(texts))
 
     info_text = _get(f"{base}/server_info", timeout)
     if info_text is not None:

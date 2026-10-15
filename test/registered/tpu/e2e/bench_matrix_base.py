@@ -214,12 +214,12 @@ def _reachable_prefix_hit_rate(config, dp_size):
 
 
 def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
-    """Where the spec gauges live: the engine that decodes.
+    """Where the spec gauges live: the engine(s) that decode.
 
-    For P/D that is the decode leader (hosts[2] of the slice), never the
-    mini-LB -- the LB serves no /metrics, and a request-level probe through
-    it is not a reliable oracle on this P/D setup. For 1-host recipes the
-    one server is the decode.
+    For P/D that is the decode pool (hosts[2..3] of the slice), never the
+    router -- the router serves no engine /metrics, and a request-level probe
+    through it is not a reliable oracle on this P/D setup. For 1-host recipes
+    the one server is the decode.
     """
     if bench_recipe.startswith("pd_"):
         # Engine leaders follow PHYSICAL host order (serve_group.sh's
@@ -233,19 +233,21 @@ def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
             ]
         if len(hosts) >= 3:
             port = os.environ.get("PD_DECODE_PORT", "30002")
-            return f"http://{hosts[2]}:{port}"
+            return ",".join(f"http://{h}:{port}" for h in hosts[2:4])
     return base_url
 
 
 def _read_spec_accept_length(metrics_url: str) -> float:
-    """Max sglang:spec_accept_length across ranks; 0.0 when spec never ran."""
-    with urllib.request.urlopen(metrics_url.rstrip("/") + "/metrics", timeout=60) as r:
-        text = r.read().decode()
-    values = [
-        float(line.rsplit(" ", 1)[1])
-        for line in text.splitlines()
-        if line.startswith("sglang:spec_accept_length") and " " in line
-    ]
+    """Max sglang:spec_accept_length across ranks/URLs; 0.0 when spec never ran."""
+    values = []
+    for url in (u.strip() for u in metrics_url.split(",") if u.strip()):
+        with urllib.request.urlopen(url.rstrip("/") + "/metrics", timeout=60) as r:
+            text = r.read().decode()
+        values.extend(
+            float(line.rsplit(" ", 1)[1])
+            for line in text.splitlines()
+            if line.startswith("sglang:spec_accept_length") and " " in line
+        )
     return max(values, default=0.0)
 
 
@@ -325,19 +327,20 @@ def build_bench_test(
             last_note = start
             deadline = start + HEALTH_TIMEOUT
             while time.perf_counter() < deadline:
-                try:
-                    if (
-                        requests.get(cls.base_url + "/health", timeout=10).status_code
-                        == 200
-                    ):
-                        print(
-                            f"[{label}] server healthy after "
-                            f"{time.perf_counter() - start:.0f}s",
-                            flush=True,
-                        )
-                        return
-                except requests.RequestException:
-                    pass
+                for path in ("/health", "/readyz"):
+                    try:
+                        if (
+                            requests.get(cls.base_url + path, timeout=10).status_code
+                            == 200
+                        ):
+                            print(
+                                f"[{label}] server healthy after "
+                                f"{time.perf_counter() - start:.0f}s",
+                                flush=True,
+                            )
+                            return
+                    except requests.RequestException:
+                        pass
                 if time.perf_counter() - last_note >= 60:
                     last_note = time.perf_counter()
                     print(
@@ -347,7 +350,7 @@ def build_bench_test(
                     )
                 time.sleep(5)
             raise TimeoutError(
-                f"{cls.base_url}/health did not return 200 within {HEALTH_TIMEOUT}s"
+                f"{cls.base_url}/health (or /readyz) did not return 200 within {HEALTH_TIMEOUT}s"
             )
 
         @classmethod
@@ -468,13 +471,28 @@ def build_bench_test(
                     # with probability 1/N. A round that lands elsewhere still
                     # hits that engine's older copy of the session, so 1/N of
                     # the ideal is a floor, not an estimate.
+                    #
+                    # cache_aware routing sends a session back to the engine that
+                    # holds it, so that 1/N discount does not apply. Keeping it
+                    # would leave the floor N times looser than the run can
+                    # achieve, and the gate would stop measuring the routing it
+                    # is there to check.
                     prefill_engines = int(config.get("pd_prefill_engines") or 1)
-                    reachable /= prefill_engines
-                    routing = (
-                        f" across {prefill_engines} randomly paired prefill engines"
-                        if prefill_engines > 1
-                        else ""
-                    )
+                    affinity_routed = config.get("pd_router") == "smg"
+                    if affinity_routed:
+                        routing = (
+                            f" with cache-aware affinity across {prefill_engines}"
+                            " prefill engines"
+                            if prefill_engines > 1
+                            else ""
+                        )
+                    else:
+                        reachable /= prefill_engines
+                        routing = (
+                            f" across {prefill_engines} randomly paired prefill engines"
+                            if prefill_engines > 1
+                            else ""
+                        )
                     floor = MIN_PREFIX_HIT_FRACTION * reachable
                     how = (
                         f"{MIN_PREFIX_HIT_FRACTION:.0%} of the {reachable:.1%} "

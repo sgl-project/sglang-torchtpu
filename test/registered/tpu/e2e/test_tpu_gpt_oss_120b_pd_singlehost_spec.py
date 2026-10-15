@@ -165,26 +165,27 @@ def engine_configuration_failures(
     return failures
 
 
-def build_model_config() -> dict[str, Any]:
+def build_model_config(*, decode_host: str | None = None) -> dict[str, Any]:
+    gsm8k_gate: dict[str, Any] = {
+        "dataset": "gsm8k",
+        "label": "gsm8k",
+        "baseline": GSM8K_BASELINE,
+        "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
+        "num_examples": NUM_EXAMPLES,
+        "num_threads": NUM_THREADS,
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.0,
+        # Match the other speculative GSM8K gates so their acceptance
+        # measurements use the same request contract.
+        "api": "chat",
+    }
+    if decode_host is not None:
+        gsm8k_gate["spec_accept_length_url"] = f"http://{decode_host}:{DECODE_PORT}"
     return {
         "model": SERVED_MODEL_NAME,
         "test_name": "gpt-oss-120b-pd-singlehost-spec-gsm8k",
         "variant": "PD-1P1D-TP8+EP8+Raiden+EAGLE3-c16",
-        "gates": [
-            {
-                "dataset": "gsm8k",
-                "label": "gsm8k",
-                "baseline": GSM8K_BASELINE,
-                "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
-                "num_examples": NUM_EXAMPLES,
-                "num_threads": NUM_THREADS,
-                "max_tokens": MAX_TOKENS,
-                "temperature": 0.0,
-                # Match the other speculative GSM8K gates so their acceptance
-                # measurements use the same request contract.
-                "api": "chat",
-            },
-        ],
+        "gates": [gsm8k_gate],
     }
 
 
@@ -204,7 +205,7 @@ class TestPdSingleHostSpecGptOss120bIntegration(PDSingleHostTestCase):
 
     @classmethod
     def build_model_config(cls) -> dict[str, Any]:
-        return build_model_config()
+        return build_model_config(decode_host=cls.decode_hostname())
 
     @classmethod
     def check_server_configuration(cls) -> None:

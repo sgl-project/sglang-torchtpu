@@ -88,9 +88,16 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.test_utils import dump_metric
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        prefill_kv_events_args,
+        router_ready_url,
+    )
 except ModuleNotFoundError as exc:
     # Keep the configuration tests runnable in a source-only checkout; the
     # integration cases need the full SGLang TPU environment anyway.
+    import importlib.util
+
     SGLANG_IMPORT_ERROR = exc
 
     def register_tpu_ci(*_args, **_kwargs):
@@ -98,6 +105,24 @@ except ModuleNotFoundError as exc:
 
     def dump_metric(*_args, **_kwargs):
         return None
+
+    _pd_router_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            *[".."] * 4,
+            "python",
+            "sglang",
+            "test",
+            "tpu",
+            "pd_router.py",
+        )
+    )
+    _spec = importlib.util.spec_from_file_location("pd_router", _pd_router_path)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    build_router_cmd = _mod.build_router_cmd
+    prefill_kv_events_args = _mod.prefill_kv_events_args
+    router_ready_url = _mod.router_ready_url
 
 
 # run_suite requires every file under test/registered to carry a registration;
@@ -493,6 +518,7 @@ def build_prefill_env(
                 *prefill_args,
                 hicache_server_args(profile, values),
                 *profile.extra_server_args,
+                *prefill_kv_events_args(env=values),
                 values.get("EXTRA_PREFILL_ARGS", ""),
             )
         ).strip(),
@@ -579,28 +605,53 @@ class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
     latency_seconds: float
 
 
-def _generate(base_url: str, prompt: str, max_new_tokens: int = 32) -> GenerationRecord:
+def _tokenize(prompt: str, model: str) -> list[int]:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PREFILL_PORT}/tokenize",
+        data=json.dumps(
+            {"model": model, "prompt": prompt, "add_special_tokens": False}
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return list(json.loads(resp.read())["tokens"])
+
+
+def _generate(
+    base_url: str,
+    prompt: str,
+    max_new_tokens: int = 32,
+    model: str = "gpt-oss-120b",
+) -> GenerationRecord:
+    input_ids = _tokenize(prompt, model)
     started = time.perf_counter()
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/generate",
+        base_url.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(
             {
-                "text": prompt,
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": max_new_tokens,
-                },
+                "model": model,
+                "messages": [{"role": "user", "content": ""}],
+                "input_ids": input_ids,
+                "temperature": 0.0,
+                "max_tokens": max_new_tokens,
+                "separate_reasoning": False,
+                "return_meta_info": True,
             }
         ).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=900) as resp:
         payload = json.loads(resp.read())
-    meta = payload.get("meta_info") or {}
+    choice = payload["choices"][0]
+    text = choice["message"].get("content") or ""
+    meta = choice.get("meta_info") or {}
+    usage = payload.get("usage") or {}
     return GenerationRecord(
-        text=payload["text"],
-        prompt_tokens=int(meta.get("prompt_tokens") or 0),
-        completion_tokens=int(meta.get("completion_tokens") or 0),
+        text=text,
+        prompt_tokens=int(meta.get("prompt_tokens") or usage.get("prompt_tokens") or 0),
+        completion_tokens=int(
+            meta.get("completion_tokens") or usage.get("completion_tokens") or 0
+        ),
         latency_seconds=round(time.perf_counter() - started, 3),
     )
 
@@ -679,7 +730,10 @@ def run_cold_length_sweep(base_url: str, profile: ModelProfile) -> None:
         prompt = sweep_question(
             paragraphs, rotate=step + 1, tag=f"Memo {step:02d}-{step * 7 + 3}. "
         )
-        recs = [_generate(base_url, prompt, 64) for _ in range(attempts)]
+        recs = [
+            _generate(base_url, prompt, 64, model=profile.served_name)
+            for _ in range(attempts)
+        ]
         flags = [sweep_answer_missing(r.text) for r in recs]
         bad = [r for r, missing in zip(recs, flags) if missing]
         results.append(
@@ -709,14 +763,14 @@ def run_cold_length_sweep(base_url: str, profile: ModelProfile) -> None:
 def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
     records = []
     for i, prompt in enumerate(_PROMPTS):
-        rec = _generate(base_url, prompt, 32)
+        rec = _generate(base_url, prompt, 32, model=profile.served_name)
         if not rec.text.strip() or rec.completion_tokens <= 0:
             raise AssertionError(
                 f"Request {i} produced empty decode output -- TP resharding P/D transfer failed"
             )
         records.append(rec)
 
-    resend = _generate(base_url, _PROMPTS[0], 32)
+    resend = _generate(base_url, _PROMPTS[0], 32, model=profile.served_name)
     if resend.text != records[0].text:
         raise AssertionError(
             "Greedy generation output diverged on resend under TP resharding"
@@ -904,35 +958,33 @@ class TestPdTpResharding(unittest.TestCase):
                 tuple(cls.procs),
             )
 
-            # The mini-LB injects the --prefill hostname into requests as the KV
+            # The router injects the prefill hostname into requests as the KV
             # bootstrap address the decode pods dial -- it must be this pod's
             # cluster-reachable name, never 127.0.0.1.
             cls.procs.append(
                 subprocess.Popen(
                     _tee_command(
-                        (
-                            PYTHON,
-                            "-m",
-                            "sglang_router.launch_router",
-                            "--pd-disaggregation",
-                            "--mini-lb",
-                            "--prefill",
-                            f"http://{self_host}:{PREFILL_PORT}",
-                            "--decode",
-                            f"http://{decode_host}:{DECODE_PORT}",
-                            "--host",
-                            "0.0.0.0",
-                            "--port",
-                            str(LB_PORT),
-                            "--request-timeout-secs",
-                            "3600",
+                        build_router_cmd(
+                            python=PYTHON,
+                            prefill_url=f"http://{self_host}:{PREFILL_PORT}",
+                            decode_url=f"http://{decode_host}:{DECODE_PORT}",
+                            host="0.0.0.0",
+                            port=LB_PORT,
+                            bootstrap_port=BOOTSTRAP_PORT,
+                            request_timeout_secs=3600,
+                            model_id=cls.profile.served_name,
+                            tokenizer_path=model_path,
                         ),
                         log_path=LB_LOG,
                     ),
                     preexec_fn=os.setsid,
                 )
             )
-            _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(cls.procs))
+            _wait_http_200(
+                router_ready_url(host="127.0.0.1", port=LB_PORT),
+                300,
+                tuple(cls.procs),
+            )
         except Exception:
             for log_file, name in [
                 (PREFILL_LOG, "prefill"),

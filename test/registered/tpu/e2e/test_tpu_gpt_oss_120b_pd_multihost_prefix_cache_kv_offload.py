@@ -62,6 +62,11 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.test_utils import dump_metric
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        prefill_kv_events_args,
+        router_ready_url,
+    )
 except ModuleNotFoundError as exc:
     # Keep the configuration tests runnable in a source-only checkout; the
     # end-to-end cases need the full SGLang TPU environment anyway.
@@ -72,6 +77,27 @@ except ModuleNotFoundError as exc:
 
     def dump_metric(*_args, **_kwargs):
         return None
+
+    import importlib.util as _importlib_util
+
+    _pd_router_spec = _importlib_util.spec_from_file_location(
+        "sglang.test.tpu.pd_router",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            *[".."] * 4,
+            "python",
+            "sglang",
+            "test",
+            "tpu",
+            "pd_router.py",
+        ),
+    )
+    _pd_router_mod = _importlib_util.module_from_spec(_pd_router_spec)
+    sys.modules[_pd_router_spec.name] = _pd_router_mod
+    _pd_router_spec.loader.exec_module(_pd_router_mod)
+    build_router_cmd = _pd_router_mod.build_router_cmd
+    prefill_kv_events_args = _pd_router_mod.prefill_kv_events_args
+    router_ready_url = _pd_router_mod.router_ready_url
 
 
 # One invocation runs two GPT-OSS-120B engines (weight load + compile), the
@@ -386,6 +412,7 @@ def build_prefill_env(
                 # until that is fixed upstream.
                 "--sampling-backend",
                 "pytorch",
+                *prefill_kv_events_args(env=values),
                 values.get("EXTRA_PREFILL_ARGS", ""),
             )
         ).strip(),
@@ -491,29 +518,54 @@ class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
     latency_seconds: float
 
 
-def _generate(base_url: str, prompt: str, max_new_tokens: int) -> GenerationRecord:
+def _tokenize(prompt: str, model: str) -> Tuple[int, ...]:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PREFILL_PORT}/tokenize",
+        data=json.dumps(
+            {"model": model, "prompt": prompt, "add_special_tokens": False}
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return tuple(json.loads(resp.read())["tokens"])
+
+
+def _generate(
+    base_url: str,
+    prompt: str,
+    max_new_tokens: int,
+    model: str = "gpt-oss-120b",
+) -> GenerationRecord:
+    input_ids = _tokenize(prompt, model)
     started = time.perf_counter()
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/generate",
+        base_url.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(
             {
-                "text": prompt,
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": max_new_tokens,
-                },
+                "model": model,
+                "messages": [{"role": "user", "content": ""}],
+                "input_ids": list(input_ids),
+                "temperature": 0.0,
+                "max_tokens": max_new_tokens,
+                "separate_reasoning": False,
+                "return_meta_info": True,
             }
         ).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=900) as resp:
         payload = json.loads(resp.read())
-    meta = payload.get("meta_info") or {}
+    choice = payload["choices"][0]
+    text = (choice.get("message") or {}).get("content") or ""
+    meta = choice.get("meta_info") or payload.get("meta_info") or {}
+    usage = payload.get("usage") or {}
     details = meta.get("cached_tokens_details") or {}
     return GenerationRecord(
-        text=payload["text"],
-        prompt_tokens=int(meta.get("prompt_tokens") or 0),
-        completion_tokens=int(meta.get("completion_tokens") or 0),
+        text=text,
+        prompt_tokens=int(meta.get("prompt_tokens") or usage.get("prompt_tokens") or 0),
+        completion_tokens=int(
+            meta.get("completion_tokens") or usage.get("completion_tokens") or 0
+        ),
         device_cached_tokens=int(details.get("device") or 0),
         host_cached_tokens=int(details.get("host") or 0),
         latency_seconds=round(time.perf_counter() - started, 3),
@@ -521,7 +573,8 @@ def _generate(base_url: str, prompt: str, max_new_tokens: int) -> GenerationReco
 
 
 def _flush_cache(url: str) -> None:
-    with urllib.request.urlopen(url.rstrip("/") + "/flush_cache", timeout=60) as r:
+    req = urllib.request.Request(url.rstrip("/") + "/flush_cache", method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:
         r.read()
 
 
@@ -832,33 +885,30 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
         _assert_raiden_engaged(PREFILL_LOG)
         _wait_http_200(f"http://{decode_host}:{DECODE_PORT}/health", WAIT_SECS)
 
-        # The mini-LB injects the --prefill hostname into requests as the KV
+        # The router injects the --prefill hostname into requests as the KV
         # bootstrap address the decode pods dial -- it must be this pod's
         # cluster-reachable name, never 127.0.0.1.
         cls.procs.append(
             subprocess.Popen(
                 _tee_command(
-                    (
-                        PYTHON,
-                        "-m",
-                        "sglang_router.launch_router",
-                        "--pd-disaggregation",
-                        "--mini-lb",
-                        "--prefill",
-                        f"http://{self_host}:{PREFILL_PORT}",
-                        "--decode",
-                        f"http://{decode_host}:{DECODE_PORT}",
-                        "--host",
-                        "0.0.0.0",
-                        "--port",
-                        str(LB_PORT),
+                    build_router_cmd(
+                        python=PYTHON,
+                        prefill_url=f"http://{self_host}:{PREFILL_PORT}",
+                        decode_url=f"http://{decode_host}:{DECODE_PORT}",
+                        host="0.0.0.0",
+                        port=LB_PORT,
+                        bootstrap_port=BOOTSTRAP_PORT,
+                        model_id=cls.profile.served_name,
+                        tokenizer_path=model_path,
                     ),
                     log_path=LB_LOG,
                 ),
                 preexec_fn=os.setsid,
             )
         )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(cls.procs))
+        _wait_http_200(
+            router_ready_url(host="127.0.0.1", port=LB_PORT), 300, tuple(cls.procs)
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:

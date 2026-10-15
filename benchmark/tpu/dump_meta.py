@@ -213,7 +213,7 @@ def _fetch_server_info(url: str):
     server is actually running, independent of the launch script's view."""
     import urllib.request
 
-    base = url.rstrip("/")
+    base = url.split(",")[0].strip().rstrip("/")
     for path in ("/server_info", "/get_server_info"):
         try:
             with urllib.request.urlopen(base + path, timeout=15) as resp:

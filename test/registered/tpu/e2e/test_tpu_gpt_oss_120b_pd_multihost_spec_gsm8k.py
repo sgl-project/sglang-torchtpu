@@ -28,7 +28,14 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        prefill_kv_events_args,
+        router_ready_url,
+    )
 except ModuleNotFoundError as exc:
+    import importlib.util
+
     SGLANG_IMPORT_ERROR = exc
 
     def register_tpu_ci(*_args, **_kwargs):
@@ -36,6 +43,24 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    _pd_router_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            *[".."] * 4,
+            "python",
+            "sglang",
+            "test",
+            "tpu",
+            "pd_router.py",
+        )
+    )
+    _spec = importlib.util.spec_from_file_location("pd_router", _pd_router_path)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    build_router_cmd = _mod.build_router_cmd
+    prefill_kv_events_args = _mod.prefill_kv_events_args
+    router_ready_url = _mod.router_ready_url
 
 
 register_tpu_ci(
@@ -279,6 +304,7 @@ def build_prefill_env(
         "--sampling-backend",
         "pytorch",
         *_spec_server_args(values),
+        *prefill_kv_events_args(env=values),
     ]
     if MAX_TOTAL_TOKENS is not None:
         extra_args += ["--max-total-tokens", str(MAX_TOTAL_TOKENS)]
@@ -393,21 +419,16 @@ def execute_router(
     decode_port: int = DECODE_PORT,
     log_path: str = LB_LOG,
 ) -> subprocess.Popen:
-    """Launch mini-LB router connecting prefill and decode engines."""
-    cmd = (
-        PYTHON,
-        "-m",
-        "sglang_router.launch_router",
-        "--pd-disaggregation",
-        "--mini-lb",
-        "--prefill",
-        f"http://{prefill_host}:{prefill_port}",
-        "--decode",
-        f"http://{decode_host}:{decode_port}",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(port),
+    """Launch router connecting prefill and decode engines."""
+    cmd = build_router_cmd(
+        python=PYTHON,
+        prefill_url=f"http://{prefill_host}:{prefill_port}",
+        decode_url=f"http://{decode_host}:{decode_port}",
+        host="0.0.0.0",
+        port=port,
+        bootstrap_port=BOOTSTRAP_PORT,
+        model_id=SERVED_MODEL_NAME,
+        tokenizer_path=resolve_model_path(),
     )
     return _launch(cmd, log_path=log_path)
 
@@ -467,7 +488,7 @@ def _serve_worker(topology: PodTopology, role: Role) -> int:
 
 
 def _serve_prefill_leader(topology: PodTopology) -> int:
-    """Serve prefill engine, start mini-LB, and run GSM8K accuracy evaluation."""
+    """Serve prefill engine, start router, and run GSM8K accuracy evaluation."""
     # Run the router on the prefill leader to avoid requesting another pod.
     procs = []
     self_host = topology.group_hostnames[0]
@@ -491,7 +512,11 @@ def _serve_prefill_leader(topology: PodTopology) -> int:
                 decode_port=DECODE_PORT,
             )
         )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(procs))
+        _wait_http_200(
+            router_ready_url(host="127.0.0.1", port=LB_PORT),
+            300,
+            tuple(procs),
+        )
 
         model_config_main(MODEL_CONFIG, base_url=f"http://127.0.0.1:{LB_PORT}")
         return 0

@@ -196,7 +196,7 @@ ${WEIGHTS_VOLUME}
                       if [ "$RANK" = "0" ]; then
                         ok=0
                         for i in $(seq 1 300); do
-                          curl -sf --max-time 5 http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
+                          (curl -sf --max-time 5 http://127.0.0.1:30000/health_generate >/dev/null 2>&1 || curl -sf --max-time 5 http://127.0.0.1:30000/readyz >/dev/null 2>&1) && { ok=1; break; }
                           kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
                           sleep 10
                         done

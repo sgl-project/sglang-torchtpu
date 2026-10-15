@@ -5,6 +5,7 @@ import unittest
 from benchmark.tpu.launch_server import (
     LaunchConfig,
     load_recipe,
+    plan_launch,
     resolve_server,
 )
 
@@ -107,6 +108,29 @@ class TestRuntimeEnvironment(unittest.TestCase):
                 )
                 self.assertEqual(overridden["HF_HUB_OFFLINE"], "1")
                 self.assertNotIn("TORCH_LOGS", overridden)
+
+    def test_pd_group_router_command_respects_pd_router_seam(self):
+        cfg = load_recipe("recipe/configs/gpt_oss_120b/pd_singlehost.py")
+        base_env = {
+            "TPU_WORKER_HOSTNAMES": "prefill-0,decode-0",
+            "TPU_WORKER_ID": "0",
+            "SGLANG_HOST_IP": "127.0.0.1",
+        }
+        smg_plan = plan_launch(
+            cfg,
+            {**base_env, "SGLANG_TPU_PD_ROUTER": "smg"},
+        )
+        self.assertEqual(smg_plan.router[0], "sgl-router")
+        self.assertIn("--worker-urls", smg_plan.router)
+        self.assertIn("kv_events_config", smg_plan.config.server_args)
+
+        mini_plan = plan_launch(
+            cfg,
+            {**base_env, "SGLANG_TPU_PD_ROUTER": "mini_lb"},
+        )
+        self.assertIn("sglang_router.launch_router", mini_plan.router)
+        self.assertIn("--mini-lb", mini_plan.router)
+        self.assertNotIn("kv_events_config", mini_plan.config.server_args)
 
 
 if __name__ == "__main__":

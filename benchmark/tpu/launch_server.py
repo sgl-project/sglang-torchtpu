@@ -237,20 +237,61 @@ def python_command(module: str) -> list[str]:
     return [path]
 
 
+def _load_pd_router():
+    try:
+        from sglang.test.tpu import pd_router
+
+        return pd_router
+    except ModuleNotFoundError:
+        import importlib.util
+
+        path = (
+            TPU_ROOT.parents[1] / "python" / "sglang" / "test" / "tpu" / "pd_router.py"
+        )
+        spec = importlib.util.spec_from_file_location("pd_router", path)
+        if spec is None or spec.loader is None:
+            raise
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+
 def router_command(
-    prefill_urls, decode_urls, *, bootstrap_port=8998, host="0.0.0.0", port=30000
+    prefill_urls,
+    decode_urls,
+    *,
+    bootstrap_port=8998,
+    host="0.0.0.0",
+    port=30000,
+    model_id=None,
+    tokenizer_path=None,
+    env=None,
 ):
-    command = [
-        *python_command("sglang_router.launch_router"),
-        "--pd-disaggregation",
-        "--mini-lb",
-    ]
-    for url in prefill_urls:
-        command.extend(["--prefill", url, str(bootstrap_port)])
-    for url in decode_urls:
-        command.extend(["--decode", url])
-    command.extend(["--host", host, "--port", str(port)])
-    return command
+    pd_router = _load_pd_router()
+    if pd_router.resolve_mode(env=env) == pd_router.MINI_LB:
+        command = [
+            *python_command("sglang_router.launch_router"),
+            "--pd-disaggregation",
+            "--mini-lb",
+        ]
+        for url in prefill_urls:
+            command.extend(["--prefill", url, str(bootstrap_port)])
+        for url in decode_urls:
+            command.extend(["--decode", url])
+        command.extend(["--host", host, "--port", str(port)])
+        return command
+    return list(
+        pd_router.build_router_cmd(
+            python=sys.executable,
+            host=host,
+            port=int(port),
+            prefills=[(url, int(bootstrap_port)) for url in prefill_urls],
+            decodes=list(decode_urls),
+            model_id=model_id,
+            tokenizer_path=tokenizer_path,
+            env=env,
+        )
+    )
 
 
 def _kill_group(process: subprocess.Popen, sig: int) -> None:
@@ -505,6 +546,10 @@ def _plan_pd_group(config, group, topology, common_env, overrides, *, inherited,
         f"http://{host}:{prefill_port if i < prefill_count else decode_port}"
         for i, host in enumerate(hosts)
     )
+    if rank < prefill_count and not selected.server_args.get("disable_radix_cache"):
+        kv_args = _load_pd_router().prefill_kv_events_args(env=env)
+        if len(kv_args) == 2 and "kv_events_config" not in selected.server_args:
+            selected.server_args["kv_events_config"] = kv_args[1]
     if rank == 0:
         lb_port = env.get("LB_PORT", "30000")
         if int(lb_port) == int(prefill_port):
@@ -516,6 +561,9 @@ def _plan_pd_group(config, group, topology, common_env, overrides, *, inherited,
             urls[prefill_count:],
             bootstrap_port=bootstrap,
             port=lb_port,
+            model_id=selected.server_args.get("served_model_name"),
+            tokenizer_path=selected.server_args.get("model_path"),
+            env=env,
         )
     return selected, hosts, router, urls
 

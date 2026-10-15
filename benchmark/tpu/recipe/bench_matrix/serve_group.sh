@@ -150,10 +150,15 @@ if [[ "$ROLE" == "prefill" ]]; then
     # the spec bootstrap state).
     export MAX_TOTAL_TOKENS=$MAX_TOTAL_TOKENS_PREFILL
     export KV_OFFLOAD HICACHE_RATIO HICACHE_IO_BACKEND HICACHE_MEM_LAYOUT
+    KV_EVENTS_ARGS=""
+    if [[ "$PD_ROUTER" == "smg" ]]; then
+        KV_EVENTS_PORT=$(( ${SGLANG_TPU_KV_EVENTS_PORT:-5557} + WORKER_ID ))
+        KV_EVENTS_ARGS="--load-publish-endpoint auto --kv-events-config {\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://0.0.0.0:${KV_EVENTS_PORT}\"}"
+    fi
     export EXTRA_ARGS="$BASE_EXTRA_ARGS \
 --disaggregation-mode prefill \
 --disaggregation-transfer-backend raiden \
---disaggregation-bootstrap-port $PD_BOOTSTRAP_PORT"
+--disaggregation-bootstrap-port $PD_BOOTSTRAP_PORT $KV_EVENTS_ARGS"
 else
     # Decode: no hicache (spec draft KV is not offloaded; matches the
     # validated P/D+spec gates); its disaggregation radix cache stays off.
@@ -171,22 +176,52 @@ ENGINE_PID=$!
 CHILD_PIDS+=("$ENGINE_PID")
 
 if [[ "$WORKER_ID" == "0" ]]; then
-    # POD 0 fronts all four engines with the mini-LB on :30000 -- the port the
-    # JobSet health-gates and rank-0's test files bench, both on this pod. The
-    # --prefill hostnames are injected into requests as the KV bootstrap
+    # POD 0 fronts all four engines with the P/D router on :30000 -- the port
+    # the JobSet health-gates and rank-0's test files bench, both on this pod.
+    # The prefill hostnames are injected into requests as the KV bootstrap
     # addresses the decode engines dial, so they must be the cluster-reachable
     # names, never 127.0.0.1.
     wait_url "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "prefill engine 0" "$HEALTH_TIMEOUT" "$ENGINE_PID" || exit 1
     wait_url "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "prefill engine 1" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" "decode engine 0" "$HEALTH_TIMEOUT" || exit 1
     wait_url "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" "decode engine 1" "$HEALTH_TIMEOUT" || exit 1
-    "$PYTHON" -m sglang_router.launch_router \
-        --pd-disaggregation --mini-lb \
-        --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
-        --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
-        --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
-        --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
-        --host 0.0.0.0 --port "$LB_PORT" > >(sed 's/^/[mini-lb] /') 2>&1 &
+    if [[ "$PD_ROUTER" == "smg" ]]; then
+        # experimental/sgl-router discovers prefill/decode role, bootstrap_port,
+        # KV-event ZMQ publisher port, block_size, and EAGLE bigram hashing mode
+        # from each worker's /server_info. Affinity is prefill-only: a P/D
+        # decode engine runs with disable_radix_cache, so a decode-side match
+        # could never correspond to a cache hit.
+        TOK_PATH="${TOKENIZER:-$MODEL}"
+        if [[ -d "$TOK_PATH" && -f "$TOK_PATH/tokenizer.json" ]]; then
+            TOK_PATH="$TOK_PATH/tokenizer.json"
+        fi
+        PREFILL_POL="${SGLANG_TPU_PD_PREFILL_POLICY:-cache_aware}"
+        ROUTER_EXTRA_ARGS=()
+        if [[ "$PREFILL_POL" == "sticky" ]]; then
+            ROUTER_EXTRA_ARGS+=(--routing-key-header "${SGLANG_TPU_ROUTING_KEY_HEADER:-x-smg-routing-key}")
+        fi
+        "${SGLANG_TPU_SMG_BIN:-sgl-router}" \
+            --model-id "$MODEL" \
+            --tokenizer-path "$TOK_PATH" \
+            --worker-urls \
+                "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" \
+                "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" \
+                "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
+                "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
+            --host 0.0.0.0 --port "$LB_PORT" \
+            --policy "$PREFILL_POL" \
+            --decode-policy "${SGLANG_TPU_PD_DECODE_POLICY:-power_of_two}" \
+            "${ROUTER_EXTRA_ARGS[@]}" \
+            > >(sed 's/^/[smg] /') 2>&1 &
+    else
+        "$PYTHON" -m sglang_router.launch_router \
+            --pd-disaggregation --mini-lb \
+            --prefill "http://${SLICE_HOSTS[0]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
+            --prefill "http://${SLICE_HOSTS[1]}:$PD_PREFILL_PORT" "$PD_BOOTSTRAP_PORT" \
+            --decode "http://${SLICE_HOSTS[2]}:$PD_DECODE_PORT" \
+            --decode "http://${SLICE_HOSTS[3]}:$PD_DECODE_PORT" \
+            --host 0.0.0.0 --port "$LB_PORT" > >(sed 's/^/[mini-lb] /') 2>&1 &
+    fi
     CHILD_PIDS+=("$!")
 fi
 

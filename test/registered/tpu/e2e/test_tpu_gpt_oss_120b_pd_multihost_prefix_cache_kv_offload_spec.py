@@ -32,6 +32,11 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.tpu import model_config_main
+    from sglang.test.tpu.pd_router import (
+        build_router_cmd,
+        prefill_kv_events_args,
+        router_ready_url,
+    )
 except ModuleNotFoundError as exc:
     SGLANG_IMPORT_ERROR = exc
 
@@ -40,6 +45,27 @@ except ModuleNotFoundError as exc:
 
     def model_config_main(*_args, **_kwargs):
         return None
+
+    import importlib.util as _importlib_util
+
+    _pd_router_spec = _importlib_util.spec_from_file_location(
+        "sglang.test.tpu.pd_router",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            *[".."] * 4,
+            "python",
+            "sglang",
+            "test",
+            "tpu",
+            "pd_router.py",
+        ),
+    )
+    _pd_router_mod = _importlib_util.module_from_spec(_pd_router_spec)
+    sys.modules[_pd_router_spec.name] = _pd_router_mod
+    _pd_router_spec.loader.exec_module(_pd_router_mod)
+    build_router_cmd = _pd_router_mod.build_router_cmd
+    prefill_kv_events_args = _pd_router_mod.prefill_kv_events_args
+    router_ready_url = _pd_router_mod.router_ready_url
 
 
 register_tpu_ci(
@@ -297,6 +323,7 @@ def build_prefill_env(
         "--sampling-backend",
         "pytorch",
         *_spec_server_args(values),
+        *prefill_kv_events_args(env=values),
     ]
     if MAX_TOTAL_TOKENS is not None:
         extra_args += ["--max-total-tokens", str(MAX_TOTAL_TOKENS)]
@@ -411,21 +438,20 @@ def execute_router(
     decode_port: int = DECODE_PORT,
     log_path: str = LB_LOG,
 ) -> subprocess.Popen:
-    """Launch mini-LB router connecting prefill and decode engines."""
-    cmd = (
-        PYTHON,
-        "-m",
-        "sglang_router.launch_router",
-        "--pd-disaggregation",
-        "--mini-lb",
-        "--prefill",
-        f"http://{prefill_host}:{prefill_port}",
-        "--decode",
-        f"http://{decode_host}:{decode_port}",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(port),
+    """Launch the router connecting prefill and decode engines.
+
+    ``SGLANG_TPU_PD_ROUTER`` selects mini-LB (the default, and what this test
+    has always used) or the SGLang Model Gateway PD router.
+    """
+    cmd = build_router_cmd(
+        python=PYTHON,
+        prefill_url=f"http://{prefill_host}:{prefill_port}",
+        decode_url=f"http://{decode_host}:{decode_port}",
+        host="0.0.0.0",
+        port=port,
+        bootstrap_port=BOOTSTRAP_PORT,
+        model_id=SERVED_MODEL_NAME,
+        tokenizer_path=resolve_model_path(),
     )
     return _launch(cmd, log_path=log_path)
 
@@ -471,26 +497,39 @@ def _probe_prompt(index: int, words: int) -> str:
 
 def _generate_probe(base_url: str, prompt: str, max_new_tokens: int) -> Dict:
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/generate",
+        base_url.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(
             {
-                "text": prompt,
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": max_new_tokens,
-                },
+                "model": SERVED_MODEL_NAME,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": max_new_tokens,
+                "separate_reasoning": False,
+                "return_meta_info": True,
             }
         ).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=900) as resp:
         payload = json.loads(resp.read())
-    meta = payload.get("meta_info") or {}
+    choices = payload.get("choices")
+    if choices:
+        choice = choices[0]
+        text = (choice.get("message") or {}).get("content") or ""
+        meta = choice.get("meta_info") or payload.get("meta_info") or {}
+    else:
+        text = payload.get("text") or ""
+        meta = payload.get("meta_info") or {}
+    usage = payload.get("usage") or {}
     details = meta.get("cached_tokens_details") or {}
     return {
-        "text": payload.get("text") or "",
-        "prompt_tokens": int(meta.get("prompt_tokens") or 0),
-        "completion_tokens": int(meta.get("completion_tokens") or 0),
+        "text": text,
+        "prompt_tokens": int(
+            meta.get("prompt_tokens") or usage.get("prompt_tokens") or 0
+        ),
+        "completion_tokens": int(
+            meta.get("completion_tokens") or usage.get("completion_tokens") or 0
+        ),
         "device_cached_tokens": int(details.get("device") or 0),
         "host_cached_tokens": int(details.get("host") or 0),
         "spec_verify_ct": int(meta.get("spec_verify_ct") or 0),
@@ -513,8 +552,10 @@ def _assert_spec_active(record: Dict, label: str) -> None:
 
 def run_cache_offload_spec_probe(base_url: str, flush_url: str) -> None:
     """Prove prefix KV survives host offload while EAGLE3 remains active."""
-    flush_endpoint = flush_url.rstrip("/") + "/flush_cache"
-    with urllib.request.urlopen(flush_endpoint, timeout=60) as r:
+    flush_req = urllib.request.Request(
+        flush_url.rstrip("/") + "/flush_cache", method="POST"
+    )
+    with urllib.request.urlopen(flush_req, timeout=60) as r:
         r.read()
 
     target = _probe_prompt(0, CACHE_TARGET_WORDS)
@@ -603,7 +644,7 @@ def _serve_worker(topology: PodTopology, role: Role) -> int:
 
 
 def _serve_prefill_leader(topology: PodTopology) -> int:
-    """Serve prefill, start the mini-LB, then run the cache probe and GSM8K."""
+    """Serve prefill, start the router, then run the cache probe and GSM8K."""
     # Run the router on the prefill leader to avoid requesting another pod.
     procs = []
     self_host = topology.group_hostnames[0]
@@ -627,7 +668,9 @@ def _serve_prefill_leader(topology: PodTopology) -> int:
                 decode_port=DECODE_PORT,
             )
         )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(procs))
+        _wait_http_200(
+            router_ready_url(host="127.0.0.1", port=LB_PORT), 300, tuple(procs)
+        )
 
         base_url = f"http://127.0.0.1:{LB_PORT}"
         run_cache_offload_spec_probe(

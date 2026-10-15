@@ -113,25 +113,41 @@ else
     trap - EXIT
 fi
 
-echo "[leg $TAG] waiting up to ${HEALTH_TIMEOUT}s for $BASE_URL/health"
+HEALTH_PATH=$([[ "$PD_DISAGG" == "1" && "$PD_ROUTER" == "smg" ]] && echo /readyz || echo /health)
+echo "[leg $TAG] waiting up to ${HEALTH_TIMEOUT}s for $BASE_URL$HEALTH_PATH"
 health_start=$SECONDS
 while :; do
-    code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$BASE_URL/health" 2>/dev/null || echo "000")
+    code=$(curl -sS -o /dev/null -m "$CURL_MAX_TIME" -w "%{http_code}" "$BASE_URL$HEALTH_PATH" 2>/dev/null || echo "000")
     [[ "$code" == "200" ]] && break
     if (( SECONDS - health_start >= HEALTH_TIMEOUT )); then
         echo "failed:health" >"$STATUS_FILE"
-        echo "ERROR: $BASE_URL/health never reached 200 (last=$code)" >&2
+        echo "ERROR: $BASE_URL$HEALTH_PATH never reached 200 (last=$code)" >&2
         exit 1
     fi
     sleep "$HEALTH_POLL_INTERVAL"
 done
 
 if [[ "$FLUSH_CACHE" == "1" ]]; then
-    # Legs must not inherit the previous leg's radix tree (the mini-LB
-    # forwards /flush_cache to both engines).
-    curl -sS -X POST -m 60 "$BASE_URL/flush_cache" >/dev/null 2>&1 \
-        && echo "[leg $TAG] flushed prefix cache" \
-        || echo "[leg $TAG] WARN: /flush_cache failed; cache carries over" >&2
+    # Legs must not inherit the previous leg's radix tree. The mini-LB forwards
+    # /flush_cache to its engines; experimental/sgl-router does not expose
+    # /flush_cache, so flush the prefill and decode engines directly.
+    if [[ "$PD_DISAGG" == "1" && "$PD_ROUTER" == "smg" && -s /tmp/bench_matrix_phys_hosts ]]; then
+        mapfile -t _flush_hosts < /tmp/bench_matrix_phys_hosts
+        flush_ok=1
+        for _h in "${_flush_hosts[@]:0:2}"; do
+            curl -sf -X POST -m 60 "http://${_h}:$PD_PREFILL_PORT/flush_cache" >/dev/null 2>&1 || flush_ok=0
+        done
+        for _h in "${_flush_hosts[@]:2:2}"; do
+            curl -sf -X POST -m 60 "http://${_h}:$PD_DECODE_PORT/flush_cache" >/dev/null 2>&1 || flush_ok=0
+        done
+        (( flush_ok == 1 )) \
+            && echo "[leg $TAG] flushed prefix cache across P/D engines" \
+            || echo "[leg $TAG] WARN: engine /flush_cache failed; cache carries over" >&2
+    else
+        curl -sS -X POST -m 60 "$BASE_URL/flush_cache" >/dev/null 2>&1 \
+            && echo "[leg $TAG] flushed prefix cache" \
+            || echo "[leg $TAG] WARN: /flush_cache failed; cache carries over" >&2
+    fi
     sleep 2
 fi
 
@@ -239,6 +255,7 @@ bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))
     --set spec_decode="$SPEC_DECODE" \
     --set pd_disagg="$PD_DISAGG" \
     --set pd_prefill_engines="$PD_PREFILL_ENGINES" \
+    --set pd_router="$PD_ROUTER" \
     --set hicache_ratio="$HICACHE_RATIO" \
     --set seed="$SEED" \
     --set max_leg_seconds="$MAX_LEG_SECONDS" \

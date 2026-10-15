@@ -47,6 +47,9 @@ class AccuracyTestParams:
     # Optional secondary gate read from /server_info after the evaluation. The
     # primary score remains dataset accuracy. Every scheduler state must meet it.
     spec_accept_length_threshold: Optional[float] = None
+    # Optional explicit engine URL to query /server_info from when base_url is a
+    # router (e.g. experimental/sgl-router) that does not proxy /server_info.
+    spec_accept_length_url: Optional[str] = None
     # When set, run_accuracy_test dumps the measured score as `[METRIC] {name}=score`
     # with these labels, whatever backend scored it. This is the one channel that
     # feeds dashboards, so only declared gates are ever plotted; the backends' own
@@ -613,7 +616,9 @@ def run_accuracy_test(
         success, error, metrics = _dispatch_eval(model, params, base_url)
         if success and params.spec_accept_length_threshold is not None:
             try:
-                spec_accept_lengths = _get_avg_spec_accept_lengths(base_url)
+                spec_accept_lengths = _get_avg_spec_accept_lengths(
+                    params.spec_accept_length_url or base_url
+                )
             except (TypeError, ValueError, requests.RequestException) as exc:
                 spec_accept_length_error = str(exc)
 

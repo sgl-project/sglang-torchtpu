@@ -6,6 +6,7 @@ import signal
 from pathlib import Path
 from typing import Any, ClassVar
 
+from sglang.test.tpu.pd_router import SMG, resolve_mode
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 
@@ -59,6 +60,9 @@ class PDSingleHostTestCase(TPULauncherTestCase):
     def setUpClass(cls) -> None:
         cls.role = os.environ.get("CI_PD_ROLE")
         if cls.role == "prefill":
+            if resolve_mode() == SMG:
+                cls.health_endpoint = "/readyz"
+                cls.health_generate_timeout = None
             super().setUpClass()
         elif cls.role == "decode":
             cls._launcher = cls._start_launcher(

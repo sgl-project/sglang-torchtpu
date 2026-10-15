@@ -179,7 +179,7 @@ spec:
                         # read plus tp=16 compile warmup can exceed the old 50 min cap.
                         HEALTH_TRIES=540; HEALTH_POLL=10; HEALTH_CURL_MAX=5
                         for i in $(seq 1 "$HEALTH_TRIES"); do
-                          curl -sf --max-time "$HEALTH_CURL_MAX" http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
+                          (curl -sf --max-time "$HEALTH_CURL_MAX" http://127.0.0.1:30000/health_generate >/dev/null 2>&1 || curl -sf --max-time "$HEALTH_CURL_MAX" http://127.0.0.1:30000/readyz >/dev/null 2>&1) && { ok=1; break; }
                           kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
                           sleep "$HEALTH_POLL"
                         done

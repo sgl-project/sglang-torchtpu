@@ -300,27 +300,33 @@ def _generate(
     base_url: str, input_ids: list[int], max_new_tokens: int, *, ignore_eos: bool
 ) -> tuple[Turn, list[int]]:
     reply = _post_json(
-        f"{base_url}/generate",
+        f"{base_url}/v1/chat/completions",
         {
+            "model": SERVED_MODEL_NAME,
+            "messages": [{"role": "user", "content": ""}],
             "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": ignore_eos,
-            },
+            "temperature": 0,
+            "max_tokens": max_new_tokens,
+            "ignore_eos": ignore_eos,
+            "separate_reasoning": False,
+            "return_token_ids": True,
+            "return_meta_info": True,
         },
         timeout=GENERATE_TIMEOUT,
     )
+    choice = reply["choices"][0]
+    text = choice["message"].get("content") or ""
+    output_ids = list(choice["response_token_ids"])
     meta = reply["meta_info"]
     details = meta.get("cached_tokens_details") or {}
     turn = Turn(
         prompt_tokens=int(meta["prompt_tokens"]),
         cached_tokens=int(meta["cached_tokens"]),
         host_cached_tokens=int(details.get("host") or 0),
-        text=reply["text"],
-        output_ids=tuple(reply["output_ids"]),
+        text=text,
+        output_ids=tuple(output_ids),
     )
-    return turn, list(reply["output_ids"])
+    return turn, output_ids
 
 
 def _decode_load_back_tokens(decode_url: str) -> float:

@@ -289,6 +289,41 @@ class TestBenchMatrix(CustomTestCase):
             f"{bench_base.SWEEP_TIMEOUT_DEFAULT}s",
         )
 
+    def test_config_resolves_pd_router(self):
+        base_env = {
+            **{k: v for k, v in os.environ.items() if k != "SGLANG_TPU_PD_ROUTER"},
+            "BENCH_MODEL": "gpt_oss_120b",
+            "BENCH_RECIPE": "pd_2p2d_pc_spec_kvoff",
+            "WORKLOAD": "agentic",
+            "PROFILE": "ci",
+        }
+        for env_val, expected in (
+            (None, "smg"),
+            ("mini_lb", "mini_lb"),
+            ("smg", "smg"),
+        ):
+            env = dict(base_env)
+            if env_val is not None:
+                env["SGLANG_TPU_PD_ROUTER"] = env_val
+            out = subprocess.run(
+                ["bash", "-c", 'source ./config.sh && echo "ROUTER=$PD_ROUTER"'],
+                cwd=BENCH_MATRIX,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn(f"ROUTER={expected}", out.stdout)
+
+        bad = subprocess.run(
+            ["bash", "-c", "source ./config.sh"],
+            cwd=BENCH_MATRIX,
+            env={**base_env, "SGLANG_TPU_PD_ROUTER": "bogus"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(bad.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

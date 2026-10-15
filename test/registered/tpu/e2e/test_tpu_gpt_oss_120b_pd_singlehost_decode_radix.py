@@ -275,18 +275,23 @@ def _generate(
     base_url: str, input_ids: list[int], max_new_tokens: int, *, ignore_eos: bool
 ) -> tuple[str, list[int], dict[str, Any]]:
     reply = _post_json(
-        f"{base_url}/generate",
+        f"{base_url}/v1/chat/completions",
         {
+            "model": SERVED_MODEL_NAME,
+            "messages": [{"role": "user", "content": ""}],
             "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": ignore_eos,
-            },
+            "temperature": 0,
+            "max_tokens": max_new_tokens,
+            "ignore_eos": ignore_eos,
+            "separate_reasoning": False,
+            "return_token_ids": True,
+            "return_meta_info": True,
         },
         timeout=GENERATE_TIMEOUT,
     )
-    return reply["text"], list(reply["output_ids"]), reply["meta_info"]
+    choice = reply["choices"][0]
+    text = choice["message"].get("content") or ""
+    return text, list(choice["response_token_ids"]), choice["meta_info"]
 
 
 def run_conversation(

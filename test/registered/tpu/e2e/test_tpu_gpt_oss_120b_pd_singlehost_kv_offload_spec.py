@@ -339,17 +339,23 @@ def _generate(
     base_url: str, input_ids: list[int], max_new_tokens: int, *, ignore_eos: bool
 ) -> tuple[Turn, list[int]]:
     reply = _post_json(
-        f"{base_url}/generate",
+        f"{base_url}/v1/chat/completions",
         {
+            "model": SERVED_MODEL_NAME,
+            "messages": [{"role": "user", "content": ""}],
             "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": ignore_eos,
-            },
+            "temperature": 0,
+            "max_tokens": max_new_tokens,
+            "ignore_eos": ignore_eos,
+            "separate_reasoning": False,
+            "return_token_ids": True,
+            "return_meta_info": True,
         },
         timeout=GENERATE_TIMEOUT,
     )
+    choice = reply["choices"][0]
+    text = choice["message"].get("content") or ""
+    output_ids = list(choice["response_token_ids"])
     meta = reply["meta_info"]
     details = meta.get("cached_tokens_details") or {}
     turn = Turn(
@@ -358,10 +364,10 @@ def _generate(
         host_cached_tokens=int(details.get("host") or 0),
         completion_tokens=int(meta["completion_tokens"]),
         spec_verify_ct=int(meta.get("spec_verify_ct") or 0),
-        text=reply["text"],
-        output_ids=tuple(reply["output_ids"]),
+        text=text,
+        output_ids=tuple(output_ids),
     )
-    return turn, list(reply["output_ids"])
+    return turn, output_ids
 
 
 def _decode_load_back_tokens(decode_url: str) -> float:
@@ -455,6 +461,7 @@ def offload_runner(*, tokenize_url: str, decode_url: str):
 
 def build_model_config(*, decode_host: str) -> dict[str, Any]:
     prefill_url = f"http://{LOCAL_HOST}:{PREFILL_PORT}"
+    decode_url = f"http://{decode_host}:{DECODE_PORT}"
     return {
         "model": SERVED_MODEL_NAME,
         "test_name": "gpt-oss-120b-pd-singlehost-kv-offload-spec",
@@ -465,7 +472,7 @@ def build_model_config(*, decode_host: str) -> dict[str, Any]:
                 "label": "kv-offload-spec",
                 "runner": offload_runner(
                     tokenize_url=prefill_url,
-                    decode_url=f"http://{decode_host}:{DECODE_PORT}",
+                    decode_url=decode_url,
                 ),
             },
             {
@@ -473,6 +480,7 @@ def build_model_config(*, decode_host: str) -> dict[str, Any]:
                 "label": "gsm8k",
                 "baseline": GSM8K_BASELINE,
                 "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
+                "spec_accept_length_url": decode_url,
                 "num_examples": NUM_EXAMPLES,
                 "num_threads": NUM_THREADS,
                 "max_tokens": MAX_TOKENS,
