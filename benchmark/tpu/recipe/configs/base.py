@@ -3,6 +3,23 @@
 import os
 from copy import deepcopy
 
+# Overlap compute with collectives; the sparse-core collective offloads stay off
+# (they regressed these serving shapes). The joined string is part of the
+# compile-cache key, so a derived recipe substitutes a flag in place rather than
+# appending. common_env.sh carries the shell launcher's copy.
+LIBTPU_FLAGS = (
+    "--xla_tpu_enable_async_collective_fusion=true",
+    "--xla_tpu_overlap_compute_collective_tc=true",
+    "--xla_tpu_enable_async_collective_fusion_multiple_steps=true",
+    "--xla_tpu_enable_latency_hiding_scheduler=true",
+    "--xla_latency_hiding_scheduler_rerun=10",
+    "--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative",
+    "--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative",
+    "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
+    "--xla_tpu_offload_gather_to_sparsecore=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
+)
+
 CONFIG = {
     "server_args": {
         "device": "tpu",
@@ -56,22 +73,6 @@ _FP8_BASE_CONFIG["runtime_env"].update(
         "ENABLE_TPU_TELEMETRY": "0",
         "TPU_TELEMETRY_INTERVAL_SECONDS": "86400",
         "TPU_TELEMETRY_INTERVAL_SEC": "86400",
-        # Latency-hiding + async collective fusion overlap compute and
-        # collectives; the sparse-core collective offloads are pinned off (they
-        # regressed these serving shapes).
-        "LIBTPU_INIT_ARGS": " ".join(
-            [
-                "--xla_tpu_enable_async_collective_fusion=true",
-                "--xla_tpu_overlap_compute_collective_tc=true",
-                "--xla_tpu_enable_async_collective_fusion_multiple_steps=true",
-                "--xla_tpu_enable_latency_hiding_scheduler=true",
-                "--xla_latency_hiding_scheduler_rerun=10",
-                "--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative",
-                "--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative",
-                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
-                "--xla_tpu_offload_gather_to_sparsecore=false",
-                "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
-            ]
-        ),
+        "LIBTPU_INIT_ARGS": " ".join(LIBTPU_FLAGS),
     }
 )

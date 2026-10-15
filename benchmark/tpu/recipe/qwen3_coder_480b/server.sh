@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sample usage: ISL=8192 OSL=1024 CONCUR=64 ./server.sh
-set -uo pipefail
+set -euo pipefail
 
 ISL=${ISL:-8192}
 OSL=${OSL:-1024}
