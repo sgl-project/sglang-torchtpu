@@ -538,7 +538,6 @@ class Scheduler(
             dist_port=self.nccl_port,
         )
         bootstrap.init_layer_runtime(model_config=self.model_config)
-        self.init_model_startup_timing_begin()
 
         # Init metrics stats
         self.init_metrics_collector()
@@ -724,16 +723,10 @@ class Scheduler(
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
-        self.model_startup_begin: Optional[float] = None
-
-    def init_model_startup_timing_begin(self) -> None:
-        if get_device().device == "tpu":
-            # Exclude peer launch skew and distributed bootstrap from model startup.
-            get_parallel().world_group.barrier()
-            self.model_startup_begin = time.perf_counter()
 
     def init_startup_timing_summary(self) -> None:
         startup_end = time.perf_counter()
+        model_startup_begin = self.tp_worker.model_runner.model_startup_begin
         self.startup_time = build_scheduler_startup_time(
             target_load_weight=self.tp_worker.weight_load_time,
             draft_load_weight=(
@@ -743,8 +736,8 @@ class Scheduler(
             scheduler_e2e=startup_end - self.scheduler_startup_begin,
             model_startup=(
                 None
-                if self.model_startup_begin is None
-                else startup_end - self.model_startup_begin
+                if model_startup_begin is None
+                else startup_end - model_startup_begin
             ),
             target_cuda_graph=self.tp_worker.graph_time_usage,
             draft_cuda_graph=(
