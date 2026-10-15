@@ -386,19 +386,52 @@ class TpuSampler(Sampler):
         """Sample from exact global TopK when full logits gathering was skipped.
         Full-logit outputs retain the base sampler's processing and return contract."""
 
-        from sglang_tpu.sampling.sampling_batch_info import sampling_params_to_device
+        from sglang_tpu.sampling.sampling_batch_info import (
+            sampling_params_to_device,
+            supports_padded_sampling,
+        )
 
-        sampling_info = sampling_params_to_device(sampling_info)
+        live_rows = None
+        if sampling_info.params_on_cpu:
+            live_rows = len(sampling_info)
+            logits = (
+                logits_output.next_token_global_top_k_logits
+                if logits_output.has_next_token_global_top_k
+                else logits_output.next_token_logits
+            )
+            physical_rows = logits.shape[0]
+            if physical_rows != live_rows and (
+                return_logprob or not supports_padded_sampling(sampling_info)
+            ):
+                raise ValueError("This sampling mode requires live-row logits")
+            if (
+                sampling_info.sampling_seed is not None
+                and positions.shape[0] != physical_rows
+            ):
+                raise ValueError(
+                    "Seeded sampling positions must match physical logits rows"
+                )
+            # The producer retains physical logits and forward metadata. Never
+            # slice or re-pad them here. Only CPU parameters need materializing
+            # at the producer's extent (prefill can use a fixed batch cap).
+            sampling_info = sampling_params_to_device(
+                sampling_info, padded_size=physical_rows
+            )
 
         # No global TopK: sample from the full-vocabulary logits instead.
         if not logits_output.has_next_token_global_top_k:
-            return super().forward(
+            token_ids = super().forward(
                 logits_output,
                 sampling_info,
                 return_logprob,
                 top_logprobs_nums,
                 token_ids_logprobs,
                 positions,
+            )
+            return (
+                token_ids
+                if live_rows is None or live_rows == token_ids.shape[0]
+                else token_ids[:live_rows]
             )
 
         if return_logprob:
@@ -415,7 +448,11 @@ class TpuSampler(Sampler):
         ).view(-1)
         batch_next_token_ids = batch_next_token_ids.to(torch.int64)
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
-        return batch_next_token_ids
+        return (
+            batch_next_token_ids
+            if live_rows is None or live_rows == batch_next_token_ids.shape[0]
+            else batch_next_token_ids[:live_rows]
+        )
 
     def _sample_from_probs(
         self,

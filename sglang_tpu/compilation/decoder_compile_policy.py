@@ -969,6 +969,45 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 physical_num_tokens=int(forward_batch.input_ids.shape[0]),
             )
 
+    def _supports_padded_sampling_outputs(self) -> bool:
+        return self._compiles_logits_processor()
+
+    def keep_outputs_padded(self, batch: ForwardBatch) -> bool:
+        from sglang_tpu.sampling.sampling_batch_info import supports_padded_sampling
+
+        info = getattr(batch, "sampling_info", None)
+        if not envs.SGLANG_TPU_HOST_PADDING.get() or info is None:
+            return False
+        if not supports_padded_sampling(info):
+            return False
+        parallel = get_parallel()
+        config = self.model_runner.model_config
+        observer = getattr(self.model_runner, "sampling_observer", None)
+        return (
+            batch.spec_info is None
+            # Beam-member tails are sliced by the worker before sampling.
+            and len(info) == getattr(batch, _REAL_B_KEY, batch.seq_lens.shape[0])
+            and (
+                batch.forward_mode.is_decode()
+                or batch.forward_mode.is_extend_without_speculative()
+            )
+            and not batch.is_prefill_only
+            and not batch.return_logprob
+            and batch.capture_hidden_mode == CaptureHiddenMode.NULL
+            and not batch.return_pooled_hidden_states
+            and not batch.return_hidden_states_before_norm
+            and parallel.pp_size == 1
+            and parallel.attn_cp_size == 1
+            and parallel.attn_dp_size == 1
+            and parallel.attn_dcp_size == 1
+            and not get_schedule().enable_mixed_chunk
+            and not config.use_ngram_embedding
+            and not config.use_engram
+            and not config.is_encoder_decoder
+            and (observer is None or not observer.is_active(info))
+            and self._supports_padded_sampling_outputs()
+        )
+
     def _upload_host_inputs(self, forward_batch: ForwardBatch) -> None:
         if not (
             envs.SGLANG_TPU_HOST_PADDING.get()
@@ -1852,6 +1891,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         unhidden.
         """
         return t if t.shape[0] == real_q else t[:real_q]
+
+    def _supports_padded_sampling_outputs(self) -> bool:
+        # Qwen-VL runs its logits processor outside the inner decoder. Both
+        # hidden states and ForwardBatch must retain matching physical rows.
+        return True
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""

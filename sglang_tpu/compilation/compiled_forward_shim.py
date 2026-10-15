@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -46,6 +45,7 @@ from sglang_tpu.cp_forward import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
+    from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 
 logger = get_logger(__name__)
 
@@ -879,7 +879,7 @@ class CompiledForwardShim:
     def __init__(
         self,
         compiled_fn: Callable[..., Any],
-        policy: DecoderCompilePolicy,
+        policy: DecoderTpuCompilePolicy,
         warmup_async_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.fn = compiled_fn
@@ -1051,6 +1051,7 @@ class CompiledForwardShim:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        keep_padded = self.policy.keep_outputs_padded(forward_batch)
         # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
         # which is_extend() excludes.
         if (
@@ -1175,13 +1176,17 @@ class CompiledForwardShim:
                 def finalize_pending(result: Any) -> Any:
                     previous = _pin_fields(forward_batch, finalize_fields)
                     try:
-                        return self._finalize_forward(result, forward_batch)
+                        return self._finalize_forward(
+                            result, forward_batch, keep_padded=keep_padded
+                        )
                     finally:
                         _restore_fields(forward_batch, previous)
 
                 out = out.then(finalize_pending)
             else:
-                out = self._finalize_forward(out, forward_batch)
+                out = self._finalize_forward(
+                    out, forward_batch, keep_padded=keep_padded
+                )
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
@@ -1191,7 +1196,7 @@ class CompiledForwardShim:
                 ]
         if mm_embeds is not None:
             real_q = getattr(forward_batch, _REAL_Q_KEY, None)
-            if real_q is not None and mm_embeds.shape[0] > real_q:
+            if not keep_padded and real_q is not None and mm_embeds.shape[0] > real_q:
                 mm_embeds = mm_embeds[:real_q]
             forward_batch.mm_input_embeds = mm_embeds
 
@@ -1210,9 +1215,11 @@ class CompiledForwardShim:
             return out.then(finish)
         return finish(out)
 
-    def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
+    def _finalize_forward(
+        self, out: Any, forward_batch: Any, *, keep_padded: bool
+    ) -> Any:
         spec_info = forward_batch.spec_info
-        if spec_info is None or not spec_info.keep_outputs_padded:
+        if not keep_padded and (spec_info is None or not spec_info.keep_outputs_padded):
             out = self.policy.finalize_forward_batch(out, forward_batch)
         return out
 
