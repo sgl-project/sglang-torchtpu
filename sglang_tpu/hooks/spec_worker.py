@@ -25,6 +25,6 @@ def select_experimental_spec_worker(
     del result, server_args
     if not is_experimental_dspark(algorithm):
         return None
-    from sglang_tpu.experimental.tpu_dspark_worker import TpuDsparkWorker
+    from sglang_tpu.experimental.speculative.dspark.dspark_worker import TpuDsparkWorker
 
     return TpuDsparkWorker

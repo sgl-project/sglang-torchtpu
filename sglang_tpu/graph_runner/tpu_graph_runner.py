@@ -58,7 +58,7 @@ from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
 from sglang_tpu.experimental import is_experimental_dspark
-from sglang_tpu.experimental.tpu_dspark_compile_policy import (
+from sglang_tpu.experimental.compilation.dspark_compile_policy import (
     TpuDsparkSpecDecodeCompilePolicyMixin,
 )
 

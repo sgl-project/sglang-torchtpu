@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang_tpu.dflash_utils_tpu import select_dflash_verify_cache_locs_tpu
-from sglang_tpu.experimental.tpu_spec_types import (
+from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     DraftBlockInputs,
     VerifyRows,

@@ -20,8 +20,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental import register_host_batch_padder
-from sglang_tpu.experimental.draft_input import HostPaddedDraftInput
-from sglang_tpu.experimental.host_sampling import HostPaddedSamplingInfo
+from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
 from sglang_tpu.hooks.experimental_spec import alloc_extend, hook_specs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -211,8 +211,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             )
 
     def test_worker_publishes_plugin_owned_draft_state(self):
-        from sglang_tpu.experimental.tpu_dspark_worker import TpuDsparkWorker
-        from sglang_tpu.experimental.tpu_spec_types import SpecState
+        from sglang_tpu.experimental.speculative.dspark.dspark_worker import (
+            TpuDsparkWorker,
+        )
+        from sglang_tpu.experimental.speculative.spec_types import SpecState
 
         state = SpecState(
             torch.tensor([4, 5]), torch.tensor([10, 20]), torch.tensor([1, 2])

@@ -12,7 +12,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang_tpu.dflash_draft_kv_write import dflash_write_draft_kv
-from sglang_tpu.experimental.tpu_dspark_compile_policy import (
+from sglang_tpu.experimental.compilation.dspark_compile_policy import (
     TpuDsparkSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool

@@ -59,13 +59,18 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
-from sglang_tpu.experimental.draft_input import HostPaddedDraftInput
-from sglang_tpu.experimental.tpu_dspark_draft_worker import TpuDsparkDraftWorker
-from sglang_tpu.experimental.tpu_spec_ops import (
+from sglang_tpu.experimental.speculative.base_spec_worker import (
+    TpuSpecWorker,
+)
+from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
+from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
+    TpuDsparkDraftWorker,
+)
+from sglang_tpu.experimental.speculative.spec_ops import (
     build_draft_block_inputs,
     sample_tokens,
 )
-from sglang_tpu.experimental.tpu_spec_types import (
+from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
     DraftResult,
@@ -73,10 +78,7 @@ from sglang_tpu.experimental.tpu_spec_types import (
     TpuSpecVerifyInput,
     VerifyRows,
 )
-from sglang_tpu.experimental.tpu_spec_utils import pad_rows, prompt_positions
-from sglang_tpu.experimental.tpu_spec_worker import (
-    TpuSpecWorker,
-)
+from sglang_tpu.experimental.speculative.spec_utils import pad_rows, prompt_positions
 
 
 class TpuDsparkWorker(TpuSpecWorker):

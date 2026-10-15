@@ -34,7 +34,9 @@ def copy_host_batch(result, batch):
 
 def sampling_from_batch(original, cls, batch, vocab_size):
     if uses_host_batch(batch):
-        from sglang_tpu.experimental.host_sampling import HostPaddedSamplingInfo
+        from sglang_tpu.experimental.sampling.sampling_batch_info import (
+            HostPaddedSamplingInfo,
+        )
 
         cls = HostPaddedSamplingInfo
     return original(cls, batch, vocab_size)
@@ -68,7 +70,7 @@ def merge_model_inputs(original, batch, other):
 def filter_spec_input(original, batch, keep_indices, keep_indices_device):
     if not uses_host_batch(batch):
         return original(batch, keep_indices, keep_indices_device)
-    from sglang_tpu.experimental.draft_input import HostPaddedDraftInput
+    from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.filter_batch(
@@ -81,7 +83,7 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
 def merge_spec_input(original, batch, other):
     if not uses_host_batch(batch):
         return original(batch, other)
-    from sglang_tpu.experimental.draft_input import HostPaddedDraftInput
+    from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.merge_batch(other.spec_info, future_indices=batch.req_pool_indices)
@@ -97,7 +99,7 @@ def stage_prefill_tokens(original, batch):
 
 
 def extend_metadata_device(original, batch, device):
-    from sglang_tpu.experimental.host_sampling import is_host_padded
+    from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 
     if is_host_padded(batch.sampling_info):
         return "cpu"
@@ -138,7 +140,7 @@ def sample_draft_tokens(original, model, hidden_states, input_ids):
 
     if not envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.get():
         return original(model, hidden_states, input_ids)
-    from sglang_tpu.experimental.draft_model import sample_draft_tokens as sample
+    from sglang_tpu.experimental.models.dspark import sample_draft_tokens as sample
 
     return sample(model, hidden_states, input_ids)
 

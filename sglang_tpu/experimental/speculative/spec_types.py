@@ -14,8 +14,8 @@ import msgspec
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang_tpu.experimental.draft_input import HostPaddedDraftInput
-from sglang_tpu.experimental.tpu_spec_utils import pad_rows
+from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
+from sglang_tpu.experimental.speculative.spec_utils import pad_rows
 
 
 class SpecState(NamedTuple):

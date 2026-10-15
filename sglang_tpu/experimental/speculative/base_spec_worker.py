@@ -54,16 +54,21 @@ from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
 from sglang_tpu.experimental import register_host_batch_padder
-from sglang_tpu.experimental.host_sampling import HostPaddedSamplingInfo, is_host_padded
-from sglang_tpu.experimental.tpu_dspark_draft_worker import TpuDsparkDraftWorker
-from sglang_tpu.experimental.tpu_spec_ops import (
+from sglang_tpu.experimental.sampling.sampling_batch_info import (
+    HostPaddedSamplingInfo,
+    is_host_padded,
+)
+from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
+    TpuDsparkDraftWorker,
+)
+from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_greedy,
     accept_drafts_sampled,
     build_verify_tokens,
     finalize_accept,
     select_verify_rows,
 )
-from sglang_tpu.experimental.tpu_spec_types import (
+from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
     DraftResult,
@@ -71,7 +76,7 @@ from sglang_tpu.experimental.tpu_spec_types import (
     TpuSpecVerifyInput,
     VerifyRows,
 )
-from sglang_tpu.experimental.tpu_spec_utils import (
+from sglang_tpu.experimental.speculative.spec_utils import (
     apply_verify_logits_adjustments,
     pad_rows,
 )
