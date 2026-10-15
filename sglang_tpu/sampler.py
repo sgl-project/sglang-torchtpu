@@ -213,6 +213,16 @@ def _filter_gathered_top_k_probs(
     )
 
 
+def _is_speculative_batch(forward_batch) -> bool:
+    # Draft and verify forwards carry spec_info even when their spec_algorithm
+    # field differs between precompile and serving. Return before reading either
+    # spec_algorithm or sampling_info so Dynamo does not guard those fields.
+    if getattr(forward_batch, "spec_info", None) is not None:
+        return True
+    spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
+    return spec_algorithm is not None and not spec_algorithm.is_none()
+
+
 def distributed_top_k_for_batch(
     forward_batch,
     *,
@@ -225,17 +235,10 @@ def distributed_top_k_for_batch(
         return None
     if forward_batch is None:
         return None
-    # Draft and verify forwards carry spec_info even when their spec_algorithm
-    # field differs between precompile and serving. Return before reading either
-    # spec_algorithm or sampling_info so Dynamo does not guard those fields.
-    if getattr(forward_batch, "spec_info", None) is not None:
-        return None
-    spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
-    has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
     # Speculative decoding never uses the distributed TopK path. Check this
     # before sampling_info so compiled speculative forwards do not specialize
     # on request-specific sampling state.
-    if has_speculative_decode:
+    if _is_speculative_batch(forward_batch):
         return None
     if getattr(forward_batch, "sampling_info", None) is None:
         return None
@@ -284,6 +287,10 @@ def distributed_top_k_for_batch(
 def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     """Select full-vocabulary logits or distributed TopK candidates."""
 
+    # Model capability negotiation uses a CPU collective, which speculative
+    # forwards never need because they require full-vocabulary logits.
+    if _is_speculative_batch(forward_batch):
+        return LogitsOutputMode.FULL_VOCAB
     candidate_width = distributed_top_k_candidate_width_for_model(model)
     if candidate_width is None:
         return LogitsOutputMode.FULL_VOCAB

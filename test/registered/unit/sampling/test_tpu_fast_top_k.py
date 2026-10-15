@@ -8,7 +8,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 import importlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -382,6 +382,14 @@ class TestDistributedTopKEligibility(CustomTestCase):
         self.assertIsNone(
             distributed_top_k_for_batch(SpecBatch(), sampling_backend="tpu")
         )
+        with patch.object(
+            tpu_sampler_module, "distributed_top_k_candidate_width_for_model"
+        ) as candidate_width:
+            self.assertIs(
+                select_logits_output_mode(SpecBatch(), object()),
+                LogitsOutputMode.FULL_VOCAB,
+            )
+        candidate_width.assert_not_called()
 
     def test_draft_batch_does_not_inspect_sampling_state(self):
         class DraftBatch:
@@ -398,6 +406,47 @@ class TestDistributedTopKEligibility(CustomTestCase):
         self.assertIsNone(
             distributed_top_k_for_batch(DraftBatch(), sampling_backend="tpu")
         )
+        with patch.object(
+            tpu_sampler_module, "distributed_top_k_candidate_width_for_model"
+        ) as candidate_width:
+            self.assertIs(
+                select_logits_output_mode(DraftBatch(), object()),
+                LogitsOutputMode.FULL_VOCAB,
+            )
+        candidate_width.assert_not_called()
+
+    def test_non_speculative_selection_keeps_capability_negotiation_order(self):
+        batch = _forward_batch(batch_size=64)
+        model = object()
+        calls = MagicMock()
+        with (
+            patch.object(
+                tpu_sampler_module,
+                "distributed_top_k_candidate_width_for_model",
+            ) as candidate_width,
+            patch.object(
+                tpu_sampler_module, "distributed_top_k_for_batch"
+            ) as requested_top_k,
+        ):
+            calls.attach_mock(candidate_width, "candidate_width")
+            calls.attach_mock(requested_top_k, "requested_top_k")
+            for width, requested, expected in (
+                (None, 50, LogitsOutputMode.FULL_VOCAB),
+                (64, None, LogitsOutputMode.FULL_VOCAB),
+                (64, 65, LogitsOutputMode.FULL_VOCAB),
+                (64, 50, LogitsOutputMode.DISTRIBUTED_TOP_K),
+            ):
+                with self.subTest(width=width, requested=requested):
+                    calls.reset_mock()
+                    candidate_width.return_value = width
+                    requested_top_k.return_value = requested
+                    self.assertIs(select_logits_output_mode(batch, model), expected)
+                    expected_calls = [call.candidate_width(model)]
+                    if width is not None:
+                        expected_calls.append(
+                            call.requested_top_k(batch, sampling_backend="tpu")
+                        )
+                    self.assertEqual(calls.mock_calls, expected_calls)
 
     def test_environment_can_raise_the_pre_gather_cutoff(self):
         cutoff = envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
