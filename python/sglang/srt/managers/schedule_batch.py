@@ -2446,7 +2446,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     input_ids: torch.Tensor = None  # shape: [b], int64
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
-    # Original prefill IDs retained for MM masks after staging is consumed.
+    # Original prefill IDs retained for MM masks and host-side model padding.
     # Mixed-batch decode tokens are not included in this CPU prefix.
     mm_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
@@ -2474,6 +2474,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
+    orig_seq_lens_cpu: Optional[torch.Tensor] = None
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
@@ -2811,9 +2812,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.device, non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(
+        self.orig_seq_lens_cpu = torch.tensor(
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        )
+        orig_seq_lens_tensor = self.orig_seq_lens_cpu.to(self.device, non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -3762,6 +3764,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        if self.orig_seq_lens_cpu is not None:
+            self.orig_seq_lens_cpu = self.orig_seq_lens_cpu[keep_indices]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3824,6 +3828,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self.orig_seq_lens_cpu = (
+            torch.cat([self.orig_seq_lens_cpu, other.orig_seq_lens_cpu])
+            if self.orig_seq_lens_cpu is not None
+            and other.orig_seq_lens_cpu is not None
+            else None
+        )
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None

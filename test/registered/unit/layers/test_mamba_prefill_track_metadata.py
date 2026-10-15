@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
     MambaAttnBackendBase,
@@ -220,6 +221,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
             mamba_track_seqlens_cpu=[65],
         )
         runner = SimpleNamespace(
+            compile_policy=NoopCompilePolicy(),
             device="cpu",
             is_draft_worker=False,
             model_config=SimpleNamespace(

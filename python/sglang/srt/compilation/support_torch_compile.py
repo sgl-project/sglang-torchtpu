@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.observability.compile_timing import CompileTimingRecorder
     from sglang.srt.speculative.spec_info import SpecInput
@@ -64,6 +65,15 @@ class CompilePolicy(ABC):
     @abstractmethod
     def precompile(self) -> None:
         """Warm compile artifacts for this policy."""
+
+    def prepare_batch_inputs(self, batch: ScheduleBatch) -> ScheduleBatch:
+        """Select model input placement before ForwardBatch construction.
+
+        Return a separate batch view when changing inputs. The scheduler's
+        logical tensors must remain unchanged, including on forward failure.
+        Host inputs must be uploaded by prepare_forward_batch after padding.
+        """
+        return batch
 
 
 class DecoderCompilePolicy(CompilePolicy):

@@ -99,7 +99,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """
     batch.mm_input_ids_cpu = None
     if batch.prefill_input_ids_cpu is not None:
-        if _is_tpu and any(batch.multimodal_inputs or ()):
+        if _is_tpu:
             batch.mm_input_ids_cpu = batch.prefill_input_ids_cpu
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:

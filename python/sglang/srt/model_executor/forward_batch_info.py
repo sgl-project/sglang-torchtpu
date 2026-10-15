@@ -967,6 +967,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
+        input_batch = model_runner.compile_policy.prepare_batch_inputs(batch)
+        input_device = (
+            model_runner.device
+            if input_batch is batch
+            else input_batch.input_ids.device
+        )
+        batch = input_batch
 
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
@@ -1177,13 +1184,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
-                pin_memory = is_pin_memory_available(device)
+                # A compile policy may keep model inputs on CPU until padding.
+                pin_memory = is_pin_memory_available(input_device)
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
                 ret.extend_seq_lens_cpu = list(extend_seq_lens)
             else:
