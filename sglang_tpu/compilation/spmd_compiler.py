@@ -35,6 +35,7 @@ class ExecutableInterface:
     argument_layouts: list
     model_indices: tuple[int, ...]
     output_treespec: Any
+    callback_factories: bytes
 
 
 @dataclass

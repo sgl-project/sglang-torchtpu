@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import pickle
 import time
 from collections.abc import Callable, Hashable, Sequence
 from contextlib import ExitStack, contextmanager
@@ -43,11 +44,14 @@ from sglang_tpu.rank_local import trace_rank
 
 logger = logging.getLogger(__name__)
 
+CallbackFactory = Callable[[torch.nn.Module | None], Callable[[torch.Tensor], None]]
+
 
 @dataclass(frozen=True)
 class _InsertedCallback:
     tensor: torch.Tensor
     callback: Callable[[torch.Tensor], None]
+    callback_factory: CallbackFactory | None
 
 
 _ACTIVE_CALLBACKS: ContextVar[list[_InsertedCallback] | None] = ContextVar(
@@ -66,7 +70,10 @@ def _collect_callbacks() -> Iterator[list[_InsertedCallback]]:
 
 
 def insert_callback(
-    tensor: torch.Tensor, callback: Callable[[torch.Tensor], None]
+    tensor: torch.Tensor,
+    callback: Callable[[torch.Tensor], None],
+    *,
+    callback_factory: CallbackFactory | None = None,
 ) -> bool:
     """Register a callback for a tensor produced during direct compilation.
 
@@ -78,11 +85,16 @@ def insert_callback(
 
     Returns ``True`` while a direct-compile trace is collecting callbacks.
     Otherwise returns ``False`` without invoking ``callback`` eagerly.
+
+    Shared compilation requires ``callback_factory(model)`` to bind a callback
+    to each rank's local model without tracing it. The factory must be picklable
+    (a module-level function or partial) and capture only tensor-free,
+    rank-independent metadata, never a model or recorder instance.
     """
     callbacks = _ACTIVE_CALLBACKS.get()
     if callbacks is None:
         return False
-    callbacks.append(_InsertedCallback(tensor=tensor, callback=callback))
+    callbacks.append(_InsertedCallback(tensor, callback, callback_factory))
     return True
 
 
@@ -542,6 +554,10 @@ class CompiledFunction:
                     artifact.model_inputs = live_model_inputs
                     artifact.output_treespec = owner_interface.output_treespec
                     artifact.output_count = owner_interface.output_treespec.num_leaves
+                    artifact.callbacks = tuple(
+                        factory(self._model)
+                        for factory in pickle.loads(owner_interface.callback_factories)
+                    )
 
                 submission.bind = bind
                 return artifact
@@ -700,17 +716,24 @@ class CompiledFunction:
             argument_layouts.append(layout[0] if layout is not None else [])
         if rng_device is not None:
             argument_layouts.append([])
+        callbacks = tuple(entry.callback for entry in inserted_callbacks)
         if spmd_compiler is not None and not spmd_compiler.verify_spmd_safe:
-            if inserted_callbacks:
+            factories = tuple(entry.callback_factory for entry in inserted_callbacks)
+            if any(factory is None for factory in factories):
                 raise ValueError(
-                    "Shared TPU compilation does not support trace-inserted callbacks"
+                    "Shared TPU callbacks require a callback_factory for local binding"
                 )
+            # Fail during tracing, before interface collectives, if a factory
+            # accidentally captures an unpicklable recorder or local closure.
+            callback_factories = pickle.dumps(factories)
+            callbacks = tuple(factory(self._model) for factory in factories)
             interface = ExecutableInterface(
                 input_digest=binding_input_digest,
                 input_specs=_tensor_specs(graph_inputs),
                 argument_layouts=argument_layouts,
                 model_indices=live_model_indices,
                 output_treespec=output_treespec,
+                callback_factories=callback_factories,
             )
         pending_compile = None
         executable = None
@@ -754,7 +777,7 @@ class CompiledFunction:
             ),
             output_treespec=output_treespec,
             output_count=len(output_leaves),
-            callbacks=tuple(entry.callback for entry in inserted_callbacks),
+            callbacks=callbacks,
             pending_compile=pending_compile,
             rng_device=rng_device,
         )
