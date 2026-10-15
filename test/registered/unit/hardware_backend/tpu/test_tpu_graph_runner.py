@@ -248,7 +248,9 @@ class TestTpuGraphRunner(CustomTestCase):
     def test_queues_all_modules_before_waiting_for_warmups(self):
         events = []
         modules = [self._annotate(_model_with(forward=MagicMock())) for _ in range(2)]
-        model = _model_with(modules=lambda: modules)
+        model = _model_with(
+            named_modules=lambda: [(str(i), module) for i, module in enumerate(modules)]
+        )
 
         def precompile():
             index = len(events)
@@ -273,7 +275,11 @@ class TestTpuGraphRunner(CustomTestCase):
         with collect_warmups() as queue:
             for _ in range(3):
                 module = self._annotate(_model_with(forward=MagicMock()))
-                TpuGraphRunner(self._runner_for(_model_with(modules=lambda: [module])))
+                TpuGraphRunner(
+                    self._runner_for(
+                        _model_with(named_modules=lambda: [("decoder", module)])
+                    )
+                )
             self.assertEqual(events, [("submit", i) for i in range(3)])
         self.assertEqual(
             events, [("submit", i) for i in range(3)] + [("wait", i) for i in range(3)]
@@ -549,7 +555,7 @@ class TestTpuGraphRunner(CustomTestCase):
         for is_draft_worker in (False, True):
             vision_module = _VisionModule()
             model = _model_with()
-            model.modules = lambda: (model, vision_module)
+            model.named_modules = lambda: (("", model), ("vision", vision_module))
             runner = self._runner_for(model)
             runner.is_draft_worker = is_draft_worker
             TpuGraphRunner(runner)
@@ -581,7 +587,7 @@ class TestTpuGraphRunner(CustomTestCase):
         foreign_module = _model_with(forward=MagicMock())
         support_torch_compile(foreign_module, policy=_CudaPolicy)
         model = _model_with(forward=MagicMock())
-        model.modules = lambda: (model, foreign_module)
+        model.named_modules = lambda: (("", model), ("foreign", foreign_module))
         runner = self._runner_for(model)
 
         TpuGraphRunner(runner)
