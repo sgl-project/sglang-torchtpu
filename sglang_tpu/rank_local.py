@@ -1,7 +1,8 @@
 """Source-level rank-local operations with an explicit direct-compile input.
 
 Outside a rank-parameterized trace these are ordinary slices of the caller's
-rank. Rank lifting is independent of how compilation is scheduled.
+rank. Dynamo specializes the caller's rank; only direct compilation lifts it.
+Rank lifting is independent of how compilation is scheduled.
 """
 
 from contextlib import contextmanager
@@ -49,7 +50,7 @@ def traced_rank(
     expected_rank: int, *, group_size: int | None = None
 ) -> torch.Tensor | None:
     """Return the rank input, optionally within a contiguous parallel group."""
-    rank = _RANK.get()
+    rank = None if torch.compiler.is_dynamo_compiling() else _RANK.get()
     if rank is None:
         return None
     logical_rank = dist.get_rank()
@@ -79,7 +80,7 @@ def rank_slice(
     if parts == 1:
         # One chunk is rank-agnostic (e.g. decode QKVOG RoPE rows at tp_size=1).
         return tensor
-    traced = _RANK.get()
+    traced = None if torch.compiler.is_dynamo_compiling() else _RANK.get()
     if traced is None:
         return tensor.tensor_split(parts, dim)[rank]
     mesh_size = len(get_device_assignment())

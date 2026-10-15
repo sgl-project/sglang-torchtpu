@@ -1200,6 +1200,9 @@ class TpuSRTPlatform(SRTPlatform):
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        # Resolve after worker setup, before Dynamo can trace either helper.
+        rank_slice._load()
+        traced_rank._load()
         _register_attention_backends()
         self._backend_initialized = True
 
