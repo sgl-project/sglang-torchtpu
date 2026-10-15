@@ -151,7 +151,8 @@ jobs:
       contents: read
       id-token: write
 
-  # Per-commit TPU suite on a single-host 2x2x1 slice (sized from topology.yaml).
+  # Per-commit TPU suite on any single host: a 2x2x1 slice, one host of the pr-gate 2x2x2
+  # slice, or one host of the external cluster while its nightly is idle.
   unit:
     name: unit-test
     needs: build
@@ -167,10 +168,15 @@ jobs:
       # Most unit tests are registered chips=1 and run four at a time, each
       # pinned to one chip of the slice. Whole-node tests follow sequentially.
       tpu_chip_workers: 4
+      multihost_slots: true
+      external_slots: true
+    secrets: inherit
     permissions:
       contents: read
       id-token: write
+      actions: read
 
+  # In-project only: the external cluster has no model-weights PVC.
   e2e:
     name: e2e-test
     needs: build
@@ -180,6 +186,7 @@ jobs:
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
       weights_pvc: model-weights
+      multihost_slots: true
     permissions:
       contents: read
       id-token: write

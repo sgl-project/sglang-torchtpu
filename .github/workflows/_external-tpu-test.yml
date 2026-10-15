@@ -173,6 +173,35 @@ jobs:
           # A cancel signals the step; exit through the EXIT trap rather than dying first.
           trap 'exit 130' INT TERM
 
+          # PR-gate jobs borrow single hosts here (_tpu-test.yml external_slots) and stop
+          # submitting once this run is live. Delete their unstarted pods, wait out the ones
+          # on this row's slices, and preempt any still there after PR_DRAIN_MAX.
+          PR_DRAIN_MAX=5400
+          pr_jobsets() {  # jq filter over PR pods -> their JobSet names
+            kubectl -n "$ns" get pods -l app=tpu-ci -o json \
+              | jq -r --argjson nodes "$1" "[.items[] | select(.status.phase == \"Pending\" or .status.phase == \"Running\") | $2
+                                            | .metadata.labels[\"jobset.sigs.k8s.io/jobset-name\"]] | unique | .[]"
+          }
+          slice_nodes="$(for pool in "$NODEPOOL" $NODEPOOL_DECODE; do
+              kubectl get nodes -l "cloud.google.com/gke-nodepool=${pool}" -o json | jq '[.items[].metadata.name]'
+            done | jq -s 'add')"
+          drain_deadline=$(( $(date +%s) + PR_DRAIN_MAX ))
+          while true; do
+            for js in $(pr_jobsets '[]' 'select(.spec.nodeName == null)'); do
+              echo "deleting unstarted PR JobSet ${js}"
+              kubectl -n "$ns" delete jobset "$js" --ignore-not-found --wait=false || true
+            done
+            busy="$(pr_jobsets "$slice_nodes" 'select(.spec.nodeName as $n | $nodes | index($n))')"
+            [ -z "$busy" ] && break
+            if [ "$(date +%s)" -ge "$drain_deadline" ]; then
+              echo "preempting PR JobSet(s) still on this slice after ${PR_DRAIN_MAX}s: ${busy}"
+              for js in $busy; do kubectl -n "$ns" delete jobset "$js" --ignore-not-found --wait=true --timeout=300s || true; done
+              break
+            fi
+            echo "waiting for PR job(s) on this slice to finish: ${busy}"
+            sleep 30
+          done
+
           # A JobSet still pinned to this row's slices was left by a canceled run (the
           # slice concurrency group rules out a live one). With no gang scheduling, its
           # pods would half-place this run's JobSets, so delete it before starting.

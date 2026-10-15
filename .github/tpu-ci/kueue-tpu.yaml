@@ -101,8 +101,8 @@ spec:
             - name: "memory"
               nominalQuota: 64Gi
 ---
-# One slice = 8 chips = one concurrent job. No headroom possible: a 2-host job needs
-# exactly 8, so any lower value admits nothing.
+# One slice = 8 chips = one 2-host job, or two 1-host PR jobs (one per host). No headroom
+# possible: a 2-host job needs exactly 8, so any lower value admits nothing.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:

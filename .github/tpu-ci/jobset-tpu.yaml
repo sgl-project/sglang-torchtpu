@@ -3,6 +3,7 @@
 # in these comments -- the renderer would substitute them here too):
 #   IMAGE         digest-pinned image
 #   HOSTS         completions/parallelism (single-host = 1)
+#   HOST_LOCAL    non-empty when a single-host job takes one host of a bigger slice
 #   TOPOLOGY/POOL node labels (looked up by host count in topology.yaml)
 #   RUN_NAME      DNS-safe label for the JobSet (a suite name or a launch-group name)
 #   SUITE         single-host: the run_suite suite; NIGHTLY_FLAG: --nightly or empty
@@ -116,6 +117,14 @@ ${WEIGHTS_VOLUME}
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.
                       export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
                       export JAX_COMPILATION_CACHE_DIR=/compile-cache/jax
+                      # One host of a bigger slice: the injected TPU_* vars describe the whole
+                      # slice, so libtpu would wait for peers; without them it finds this host alone.
+                      if [ -n "${HOST_LOCAL}" ]; then
+                        unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES \
+                              TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS \
+                              TPU_ACCELERATOR_TYPE
+                        for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
+                      fi
                       NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
                       RANK="${TPU_WORKER_ID:-0}"
                       echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"

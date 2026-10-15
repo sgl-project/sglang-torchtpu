@@ -2,6 +2,8 @@
 # its logs, and gate on the JobSet Completed/Failed condition. Two modes:
 #   * single-host suite  -> pass `suite` (run_suite runs it; hosts=1)
 #   * multi-host group    -> pass `launch_script` + `files` + `hosts` (+ weights_pvc)
+# A single-host suite may also race for any single-host slot (multihost_slots /
+# external_slots): it is submitted to every eligible target and the first to start wins.
 name: _tpu-test
 
 on:
@@ -94,10 +96,21 @@ on:
         required: false
         type: number
         default: 0
+      # --- single-host slot racing (suite mode only) ---
+      # Also take one host of this lane's 2-host slice.
+      multihost_slots:
+        required: false
+        type: boolean
+        default: false
+      # Also take one host of the external cluster while no external nightly is live.
+      # Needs `secrets: inherit` and `actions: read` from the caller.
+      external_slots:
+        required: false
+        type: boolean
+        default: false
 
-permissions:
-  contents: read
-  id-token: write
+# No permissions block: a called workflow may not exceed its caller's grant, and only
+# external_slots callers grant actions: read. Every caller sets contents + id-token.
 
 concurrency:
   # Per-run group: supersession only. Slice contention is Kueue's job -- a shared
@@ -130,22 +143,63 @@ jobs:
         with:
           cluster_name: ${{ env.GKE_CLUSTER }}
           location: ${{ env.GKE_ZONE }}
+      - id: in-ctx
+        run: |
+          echo "ctx=$(kubectl config current-context)" >> "$GITHUB_OUTPUT"
+          echo "kubeconfig=${KUBECONFIG}" >> "$GITHUB_OUTPUT"
+      - if: inputs.external_slots
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.EXTERNAL_CLUSTER }}
+          location: us-central1
+          project_id: ${{ secrets.EXTERNAL_PROJECT }}
+          use_dns_based_endpoint: true
+      - id: ext-ctx
+        if: inputs.external_slots
+        # get-gke-credentials writes a fresh kubeconfig per call, so merge both clusters into one.
+        # Bare kubectl (discover_pools, reconcile_quota) must keep talking to the in-project cluster.
+        run: |
+          echo "ctx=$(kubectl config current-context)" >> "$GITHUB_OUTPUT"
+          merged="$RUNNER_TEMP/kubeconfig-merged"
+          KUBECONFIG="${{ steps.in-ctx.outputs.kubeconfig }}:${KUBECONFIG}" kubectl config view --flatten > "$merged"
+          echo "KUBECONFIG=${merged}" >> "$GITHUB_ENV"
+          KUBECONFIG="$merged" kubectl config use-context '${{ steps.in-ctx.outputs.ctx }}'
 
-      - name: Render + run on TPU
+      - name: TPU inventory
+        continue-on-error: true
+        run: |
+          python3 .github/tpu-ci/tpu_inventory.py --summary "$GITHUB_STEP_SUMMARY" \
+            --context 'internal=${{ steps.in-ctx.outputs.ctx }}' \
+            --context 'external=${{ steps.ext-ctx.outputs.ctx }}'
+
+      - name: Render + acquire a TPU slot
+        id: acquire
+        env:
+          IN_CTX: ${{ steps.in-ctx.outputs.ctx }}
+          EXT_CTX: ${{ steps.ext-ctx.outputs.ctx }}
+          GH_TOKEN: ${{ github.token }}
+          # Mirror _external-tpu-test.yml: one line per nodepool_vars entry in external-topology.yaml.
+          EXTERNAL_NODEPOOL_2X2X2_0: ${{ inputs.external_slots && secrets.EXTERNAL_NODEPOOL_2X2X2_0 || '' }}
+          EXTERNAL_NODEPOOL_2X2X2_1: ${{ inputs.external_slots && secrets.EXTERNAL_NODEPOOL_2X2X2_1 || '' }}
+          EXTERNAL_NODEPOOL_2X2X2_2: ${{ inputs.external_slots && secrets.EXTERNAL_NODEPOOL_2X2X2_2 || '' }}
+          EXTERNAL_NODEPOOL_2X2X2_3: ${{ inputs.external_slots && secrets.EXTERNAL_NODEPOOL_2X2X2_3 || '' }}
+          EXTERNAL_NODEPOOL_2X2X4_0: ${{ inputs.external_slots && secrets.EXTERNAL_NODEPOOL_2X2X4_0 || '' }}
+          EXTERNAL_NODEPOOL_2X2X4_1: ${{ inputs.external_slots && secrets.EXTERNAL_NODEPOOL_2X2X4_1 || '' }}
         run: |
           set -euo pipefail
           label='${{ inputs.run_name || inputs.test_file || inputs.files || inputs.suite }}'
           JOB_CEILING_S=21600        # 360m, the GitHub cap
           suite='${{ inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
-          # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
-          # render time. Unions topology.yaml's list with any pool labelled
-          # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
-          # so adding a slice needs no code change. Fails open to topology.yaml.
-          pools="$(python3 .github/tpu-ci/discover_pools.py \
-                     --lane '${{ inputs.lane }}' --hosts '${{ inputs.hosts }}' --sync)"
-          echo "pools for lane=${{ inputs.lane }} hosts=${{ inputs.hosts }}: ${pools}"
-          python3 .github/tpu-ci/render_jobset.py \
+          multihost_slots='${{ inputs.multihost_slots }}'
+          external_slots='${{ inputs.external_slots }}'
+          if { [ "$multihost_slots" = true ] || [ "$external_slots" = true ]; } && \
+             { [ -z "$suite" ] || [ -n "${{ inputs.launch_script }}${{ inputs.exec_cmd }}" ] || \
+               [ '${{ inputs.hosts }}' != 1 ] || [ '${{ inputs.pd_prefill_hosts }}' != 0 ]; }; then
+            echo "::error::multihost_slots/external_slots need single-host suite mode"; exit 1
+          fi
+          render() {  # extra render_jobset.py args...
+            python3 .github/tpu-ci/render_jobset.py \
             --image '${{ inputs.image }}' \
             --suite '${{ inputs.suite }}' \
             --test-file '${{ inputs.test_file }}' \
@@ -154,7 +208,6 @@ jobs:
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
             --lane '${{ inputs.lane }}' \
-            --pools "${pools}" \
             --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \
             --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
@@ -163,43 +216,94 @@ jobs:
             --partition-id '${{ inputs.partition_id }}' \
             --partition-size '${{ inputs.partition_size }}' \
             --name '${{ inputs.run_name }}' \
-            --service-account '${{ vars.TPU_CI_POD_KSA }}' \
-            ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
-          echo "== rendered (key fields) =="
-          grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
+            ${{ inputs.nightly && '--nightly' || '' }} "$@"
+          }
+          # Targets: id -> kube context, namespace, manifest, and whether Kueue admits it.
+          declare -A T_CTX T_NS T_FILE T_KUEUE T_NAME
+          targets=()
+          add_target() {  # id ctx ns kueue(1|"") render-args...
+            local id="$1" ctx="$2" ns="$3" kueue="$4"; shift 4
+            render "$@" > "/tmp/job-${id}.yaml"
+            T_CTX[$id]="$ctx"; T_NS[$id]="$ns"; T_FILE[$id]="/tmp/job-${id}.yaml"; T_KUEUE[$id]="$kueue"
+            targets+=("$id")
+            echo "== rendered ${id} (key fields) =="
+            grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|gke-nodepool|claimName:|bash "benchmark|for f in|run_suite.py' "/tmp/job-${id}.yaml" | head
+          }
+          # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
+          # render time. Unions topology.yaml's list with any pool labelled
+          # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
+          # so adding a slice needs no code change. Fails open to topology.yaml.
+          pools="$(python3 .github/tpu-ci/discover_pools.py \
+                     --lane '${{ inputs.lane }}' --hosts '${{ inputs.hosts }}' --sync)"
+          echo "pools for lane=${{ inputs.lane }} hosts=${{ inputs.hosts }}: ${pools}"
+          add_target slice "$IN_CTX" tpu-ci 1 --pools "${pools}" \
+            --service-account '${{ vars.TPU_CI_POD_KSA }}'
+          if [ "$multihost_slots" = true ]; then
+            pools2="$(python3 .github/tpu-ci/discover_pools.py --lane '${{ inputs.lane }}' --hosts 2 --sync)"
+            echo "pools for lane=${{ inputs.lane }} hosts=2 (one host per job): ${pools2}"
+            add_target host-of-2h "$IN_CTX" tpu-ci 1 --pools "${pools2}" --slice-hosts 2 \
+              --service-account '${{ vars.TPU_CI_POD_KSA }}'
+          fi
+
+          # The external nightly owns the external cluster while any run of it is live.
+          # Fail closed: an unreadable run list counts as live.
+          external_nightly_live() {
+            local n
+            n="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/nightly-test-external-tpu.yml/runs?per_page=20" \
+                   --jq '[.workflow_runs[] | select(.status != "completed")] | length')" || return 0
+            [ "$n" != 0 ]
+          }
+          if [ "$external_slots" = true ]; then
+            ext_pools=""
+            for v in $(python3 -c 'import yaml; s=yaml.safe_load(open(".github/tpu-ci/external/external-topology.yaml"))["suites"]; print(" ".join(dict.fromkeys(v for x in s.values() for v in x["nodepool_vars"])))'); do
+              [ -n "${!v:-}" ] || { echo "::error::repo secret ${v} is not set (external/README.md 'Configuration')"; exit 1; }
+              ext_pools="${ext_pools} ${!v}"
+            done
+            if external_nightly_live; then
+              echo "external nightly is live; external slots stay off for this job"
+            else
+              add_target external "$EXT_CTX" default "" --external-pools "${ext_pools}"
+            fi
+          fi
           # Quota tracks live capacity, checked here rather than on a timer: it only has to
           # be right at the moment admission is decided. Fails open -- a stale quota is
           # survivable (waitForPodsReady evicts and requeues), a blocked test is not.
           # A (lane, hosts) can own several interchangeable slices, so reconcile each of its
           # pools: --pool drives the one-slice-per-pool guard, and a resized multi-host pool
           # must fail the job that would have straddled it.
-          for p in $(grep -o '^# ci-tpu-pools: .*' /tmp/job.yaml | cut -d' ' -f3-); do
-            python3 .github/tpu-ci/reconcile_quota.py --pool="$p"
+          for t in "${targets[@]}"; do
+            for p in $(grep -o '^# ci-tpu-pools: .*' "${T_FILE[$t]}" | cut -d' ' -f3-); do
+              python3 .github/tpu-ci/reconcile_quota.py --pool="$p"
+            done
           done
 
-          name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
-          echo "Created ${name}"
-          trap 'kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
-          short="${name##*/}"
-          sel="jobset.sigs.k8s.io/jobset-name=${short}"
-
-          # No Workload means Kueue ignored this JobSet and it would run with no gang
-          # admission -- silent, and on a multi-host slice it ends as two half-placed gangs
-          # deadlocked until their deadline. Fail closed instead.
-          uid="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.metadata.uid}')"
-          wl_sel="kueue.x-k8s.io/job-uid=${uid}"
-          for _ in $(seq 1 15); do
-            [ -n "$(kubectl -n tpu-ci get workloads -l "$wl_sel" -o name 2>/dev/null)" ] && break
-            sleep 2
+          kt() { local t="$1"; shift; kubectl --context="${T_CTX[$t]}" -n "${T_NS[$t]}" "$@"; }
+          cleanup() {
+            for t in "${!T_NAME[@]}"; do kt "$t" delete "${T_NAME[$t]}" --ignore-not-found --wait=false || true; done
+          }
+          trap cleanup EXIT
+          for t in "${targets[@]}"; do
+            T_NAME[$t]="$(kt "$t" create -f "${T_FILE[$t]}" -o name)"
+            echo "Created ${T_NAME[$t]} on ${t}"
+            [ -n "${T_KUEUE[$t]}" ] || continue
+            # No Workload means Kueue ignored this JobSet and it would run with no gang
+            # admission -- silent, and on a multi-host slice it ends as two half-placed gangs
+            # deadlocked until their deadline. Fail closed instead.
+            uid="$(kt "$t" get "${T_NAME[$t]}" -o jsonpath='{.metadata.uid}')"
+            wl_sel="kueue.x-k8s.io/job-uid=${uid}"
+            for _ in $(seq 1 15); do
+              [ -n "$(kt "$t" get workloads -l "$wl_sel" -o name 2>/dev/null)" ] && break
+              sleep 2
+            done
+            if [ -z "$(kt "$t" get workloads -l "$wl_sel" -o name 2>/dev/null)" ]; then
+              echo "❌ ${label}: no Kueue Workload for ${T_NAME[$t]} -- admission control is OFF."
+              echo "   Check: queue-name label on the JobSet, jobset in integrations.frameworks,"
+              echo "   and that LocalQueue $(grep -o 'queue-name: .*' "${T_FILE[$t]}" | awk '{print $2}') exists in tpu-ci."
+              kt "$t" get localqueues 2>/dev/null || true
+              exit 1
+            fi
+            echo "Kueue Workload present on ${t}; admission control active."
           done
-          if [ -z "$(kubectl -n tpu-ci get workloads -l "$wl_sel" -o name 2>/dev/null)" ]; then
-            echo "❌ ${label}: no Kueue Workload for ${short} -- admission control is OFF."
-            echo "   Check: queue-name label on the JobSet, jobset in integrations.frameworks,"
-            echo "   and that LocalQueue $(grep -o 'queue-name: .*' /tmp/job.yaml | awk '{print $2}') exists in tpu-ci."
-            kubectl -n tpu-ci get localqueues 2>/dev/null || true
-            exit 1
-          fi
-          echo "Kueue Workload present; admission control active."
 
           # Runtime budget, computed here because the admission budget is whatever is left
           # of the runner's lifetime after it.
@@ -261,32 +365,70 @@ jobs:
               -H "Authorization: Bearer ${sts}" -H 'Content-Type: application/json' \
               -d '{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}' \
               | python3 -c 'import json,sys; print(json.load(sys.stdin)["accessToken"])')" || return 1
-            user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
-            kubectl config set-credentials "$user" --token "$sa_token" >/dev/null
+            # Every context: an external-slots job holds the in-project and external clusters.
+            for user in $(kubectl config view -o jsonpath='{.users[*].name}'); do
+              kubectl config set-credentials "$user" --token "$sa_token" >/dev/null
+            done
             echo "refreshed cluster credentials at $(date -u +%FT%TZ)"
           }
 
 
+          # A target holds its slot once Kueue releases pods (in-project) or the default
+          # scheduler binds the pod (external, no Kueue).
+          started() {
+            local t="$1" out
+            local sel="jobset.sigs.k8s.io/jobset-name=${T_NAME[$t]##*/}"
+            if [ -n "${T_KUEUE[$t]}" ]; then
+              out="$(kt "$t" get pods -l "$sel" -o name 2>&1)" || return 2
+            else
+              out="$(kt "$t" get pods -l "$sel" -o jsonpath='{.items[*].spec.nodeName}' 2>&1)" || return 2
+            fi
+            [ -n "$out" ]
+          }
+          withdraw() {  # t reason
+            echo "withdrawing ${T_NAME[$1]} from $1: $2"
+            kt "$1" delete "${T_NAME[$1]}" --ignore-not-found --wait=false || true
+            unset "T_NAME[$1]"
+          }
+
           admit_s=$(( JOB_CEILING_S - wait_s - 900 - 600 ))
           echo "budgets for ${label}: admission ${admit_s}s, runtime ${wait_s}s"
-          echo "queued in this ClusterQueue right now:"
-          kubectl -n tpu-ci get workloads 2>/dev/null | tail -n +2 | wc -l | xargs echo "  workloads:"
+          echo "racing for a slot on: ${targets[*]}"
+          kt slice get workloads 2>/dev/null | tail -n +2 | wc -l | xargs echo "  in-project workloads queued:"
           admit_deadline=$(( $(date +%s) + admit_s ))
           next_refresh=$(( $(date +%s) + 2400 ))
+          next_gate=$(( $(date +%s) + 30 ))
           auth_fails=0
+          winner=""
           while true; do
             # A dead kubectl looks identical to "no pods yet" with errors
             # suppressed, so track it explicitly and recover the credentials
             # instead of reporting NOT ADMITTED with an expired kubeconfig.
-            if pods="$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>&1)"; then
-              auth_fails=0
-              [ -n "$pods" ] && break
-            else
-              auth_fails=$((auth_fails + 1))
-              if [ "$auth_fails" -ge 3 ]; then
-                refresh_cluster_token || echo "credential refresh failed; will retry"
-                auth_fails=0
+            for t in "${targets[@]}"; do
+              [ -n "${T_NAME[$t]:-}" ] || continue
+              rc=0; started "$t" || rc=$?
+              if [ "$rc" = 0 ]; then winner="$t"; break; fi
+              if [ "$rc" = 2 ]; then
+                if ! out="$(kt "$t" get "${T_NAME[$t]}" 2>&1)" && grep -q NotFound <<<"$out"; then
+                  # The external nightly's drain deletes PR pods that never started.
+                  echo "${T_NAME[$t]} on ${t} was deleted externally; dropping ${t}"
+                  unset "T_NAME[$t]"
+                else
+                  auth_fails=$((auth_fails + 1))
+                fi
               fi
+            done
+            [ -n "$winner" ] && break
+            if [ "$auth_fails" -ge 3 ]; then
+              refresh_cluster_token || echo "credential refresh failed; will retry"
+              auth_fails=0
+            fi
+            if [ -n "${T_NAME[external]:-}" ] && [ "$(date +%s)" -ge "$next_gate" ]; then
+              external_nightly_live && withdraw external "external nightly went live"
+              next_gate=$(( $(date +%s) + 30 ))
+            fi
+            if [ "${#T_NAME[@]}" = 0 ]; then
+              echo "❌ ${label}: every target was withdrawn or deleted before starting"; exit 1
             fi
             if [ "$(date +%s)" -ge "$next_refresh" ]; then
               if refresh_cluster_token; then
@@ -299,17 +441,52 @@ jobs:
               fi
             fi
             if [ "$(date +%s)" -ge "$admit_deadline" ]; then
-              echo "❌ ${label} NOT ADMITTED after ${admit_s}s -- slice quota never freed"
-              kubectl -n tpu-ci get workloads 2>/dev/null | grep -- "${short}" || true
-              kubectl -n tpu-ci describe "$name" 2>/dev/null | tail -n 40 || true
+              echo "❌ ${label} NOT ADMITTED after ${admit_s}s -- no slot freed on ${!T_NAME[*]}"
+              for t in "${!T_NAME[@]}"; do
+                [ -n "${T_KUEUE[$t]}" ] && { kt "$t" get workloads 2>/dev/null | grep -- "${T_NAME[$t]##*/}" || true; }
+                kt "$t" describe "${T_NAME[$t]}" 2>/dev/null | tail -n 40 || true
+              done
               exit 1
             fi
             sleep 10
           done
+          for t in "${!T_NAME[@]}"; do
+            [ "$t" = "$winner" ] || withdraw "$t" "${winner} started first"
+          done
+          echo "${label} runs on ${winner}"
+          name="${T_NAME[$winner]}"
+          case "$winner" in
+            external)   where="EXTERNAL cluster: one host of a partner tpu7x slice" ;;
+            host-of-2h) where="INTERNAL cluster: one host of the ${{ inputs.lane }} 2x2x2 slice" ;;
+            *)          topo="$(grep -om1 'gke-tpu-topology: .*' "${T_FILE[$winner]}" | awk '{print $2}' | tr -d '"')"
+                        where="INTERNAL cluster: ${{ inputs.lane }} ${topo} slice" ;;
+          esac
+          echo "where=${where}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=TPU target::${label} -> ${where}"
+          {
+            echo "### TPU target"
+            echo
+            echo "| test | runs on | JobSet |"
+            echo "|---|---|---|"
+            echo "| ${label} | **${where}** | ${name##*/} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Hand the winner to the next step, named after the target; it owns cleanup from here.
+          { declare -p T_CTX T_NS T_KUEUE label winner wait_s name; declare -f refresh_cluster_token; } \
+            > "$RUNNER_TEMP/tpu-run-state.sh"
+          trap - EXIT
+
+      - name: Run on ${{ steps.acquire.outputs.where }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/tpu-run-state.sh"
+          K=(kubectl --context="${T_CTX[$winner]}" -n "${T_NS[$winner]}")
+          trap '"${K[@]}" delete "$name" --ignore-not-found --wait=false || true' EXIT
+          short="${name##*/}"
+          sel="jobset.sigs.k8s.io/jobset-name=${short}"
 
           # Admitted, but pods still bind and pull -- don't charge the pull to the test.
           running_deadline=$(( $(date +%s) + 900 ))
-          until kubectl -n tpu-ci get pods -l "$sel" \
+          until "${K[@]}" get pods -l "$sel" \
                   -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
             if [ "$(date +%s)" -ge "$running_deadline" ]; then
               echo "⚠️  ${label}: no pod Running 900s after admission; continuing anyway"
@@ -317,7 +494,7 @@ jobs:
             fi
             sleep 5
           done
-          kubectl -n tpu-ci get pods -l "$sel" -o wide || true
+          "${K[@]}" get pods -l "$sel" -o wide || true
 
           # The stream below can outlive the token it starts with; start it fresh.
           refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
@@ -326,9 +503,9 @@ jobs:
           # live: the pod log is the only egress from a JobSet, results included.
           rm -f "$RUNNER_TEMP/tpu-pod-logs.txt"
           since=""
-          while kubectl -n tpu-ci get "$name" >/dev/null 2>&1; do
-            jok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
-            jbad="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+          while "${K[@]}" get "$name" >/dev/null 2>&1; do
+            jok="$("${K[@]}" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
+            jbad="$("${K[@]}" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
             { [ "$jok" = "True" ] || [ "$jbad" = "True" ]; } && break
             if [ -n "$since" ]; then
               echo "--- [$(date +%T)] log stream ended while ${label} is still running; re-attaching ---"
@@ -337,7 +514,7 @@ jobs:
             else
               range=(--tail=-1)
             fi
-            kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
+            "${K[@]}" logs -f -l "$sel" --all-containers=true --prefix=true \
               --max-log-requests=10 --pod-running-timeout=15m "${range[@]}" \
               2>&1 | tee -a "$RUNNER_TEMP/tpu-pod-logs.txt" || true
             since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -365,13 +542,17 @@ jobs:
             # each pod landed once a minute (12 x the 5s poll below).
             if [ $(( iter % 12 )) -eq 0 ]; then
               echo "--- [$(date +%T)] Pod Status for ${label} ---"
-              kubectl -n tpu-ci get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName,IP:.status.podIP 2>/dev/null || true
+              "${K[@]}" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName,IP:.status.podIP 2>/dev/null || true
             fi
             iter=$(( iter + 1 ))
             # A dead kubectl looks identical to "no condition yet" with errors
             # suppressed, so track it explicitly instead of polling blind until
             # the budget runs out; try one refresh before giving up.
-            if ! kubectl -n tpu-ci get "$name" >/dev/null 2>&1; then
+            if ! out="$("${K[@]}" get "$name" 2>&1)"; then
+              if grep -q NotFound <<<"$out"; then
+                echo "❌ ${label}: ${name} was deleted mid-run (on ${winner}: the external nightly preempts PR slots it waited too long for)"
+                exit 1
+              fi
               auth_fails=$((auth_fails + 1))
               [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
               if [ "$auth_fails" -ge 12 ]; then
@@ -381,28 +562,28 @@ jobs:
               sleep 5; continue
             fi
             auth_fails=0
-            ok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
-            bad="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            ok="$("${K[@]}" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
+            bad="$("${K[@]}" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
             [ "$ok" = "True" ]  && { echo "✅ ${label} PASSED"; exit 0; }
             [ "$bad" = "True" ] && {
               echo "❌ ${label} FAILED"
               # Scheduling/admission evidence: pod placement, Kueue workload
               # state, and recent namespace events tell apart "test failed"
               # from "pods never got hardware".
-              kubectl -n tpu-ci get pods -l "$sel" -o wide || true
+              "${K[@]}" get pods -l "$sel" -o wide || true
               # Late-arriving pods never join the initial `logs -f` stream, so
               # re-collect every pod's tail before the JobSet is deleted.
-              kubectl -n tpu-ci logs -l "$sel" --all-containers --prefix --tail=150 2>/dev/null || true
-              kubectl -n tpu-ci get workloads -o wide 2>/dev/null || true
-              kubectl -n tpu-ci get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
-              kubectl -n tpu-ci describe "$name" | tail -n 200
+              "${K[@]}" logs -l "$sel" --all-containers --prefix --tail=150 2>/dev/null || true
+              [ -n "${T_KUEUE[$winner]}" ] && { "${K[@]}" get workloads -o wide 2>/dev/null || true; }
+              "${K[@]}" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
+              "${K[@]}" describe "$name" | tail -n 200
               exit 1
             }
             sleep 5
           done
           echo "❌ ${label} TIMED OUT after ${wait_s}s"
-          kubectl -n tpu-ci get pods -l "$sel" -o wide || true
-          kubectl -n tpu-ci describe "$name" | tail -n 120 || true
+          "${K[@]}" get pods -l "$sel" -o wide || true
+          "${K[@]}" describe "$name" | tail -n 120 || true
           exit 1
 
       # A benchmark test prints its results JSON between markers, because the pod

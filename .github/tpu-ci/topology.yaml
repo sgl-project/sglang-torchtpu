@@ -18,6 +18,7 @@ lanes:
   pr-gate:
     1: { topology: 2x2x1, pools: [pr-gate],             queue: tpu-prgate-1h }   # 2 nodes = 2 slices
     2: { topology: 2x2x2, pools: [pr-gate-2h],          queue: tpu-prgate-2h }   # 1 slice = 2 hosts
+    # pr-test-tpu.yml also runs 1-host jobs on 2: render_jobset.py --slice-hosts 2, one job per host.
   nightly:
     1: { topology: 2x2x1, pools: [nightly-1h],          queue: tpu-nightly-1h }  # 3 nodes = 3 slices
     2: { topology: 2x2x2, pools: [nightly, nightly-b],  queue: tpu-nightly-2h }  # 2 slices x 2 hosts

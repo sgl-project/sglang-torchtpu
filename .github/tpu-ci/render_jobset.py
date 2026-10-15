@@ -19,6 +19,10 @@ of the registered tree sums est_time over the suite's enabled tests -- no sglang
 needed (same technique as discover_multihost.py). The workflow uses it so the poll
 timeout scales with the suite instead of a fixed ceiling.
 
+A single-host suite can also take one host of a bigger slice (--slice-hosts N: a host of
+that lane's N-host slice) or one host of the external cluster (--external-pools: no Kueue,
+the default scheduler queues the lone pod); both drop the slice-wide TPU env in the pod.
+
 A third mode renders jobset-tpu-pd.yaml instead: P/D disaggregation across TWO
 slices (one per role). Every pod of both slices runs the --exec command; the
 test file dispatches roles from CI_PD_ROLE + the slice-local TPU worker env.
@@ -27,6 +31,8 @@ Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
        render_jobset.py --image <ref> --launch-script <rel> --files "<f>..." --hosts N
        render_jobset.py --image <ref> --exec "<cmd>" --pd-prefill-hosts N \
            --pd-decode-hosts N [--weights-pvc <pvc>] [--name <run-name>]
+       render_jobset.py --image <ref> --suite <name> --slice-hosts 2
+       render_jobset.py --image <ref> --suite <name> --external-pools "<pool>..."
        render_jobset.py --suite <name> --print-wait-seconds
 """
 
@@ -83,6 +89,11 @@ WEIGHTS_MOUNT_TMPL = (
     "                      mountPath: /weights\n"
     "                      readOnly: true"
 )
+# Pods on the external cluster: it has no Kueue, no Workload Identity binding for the
+# compile-cache bucket, and an admission policy that rejects privileged containers.
+EXTERNAL_NAMESPACE = "default"
+EXTERNAL_NODEPOOL_KEY = "cloud.google.com/gke-nodepool"
+
 # serviceAccountName sits under `spec:` of the pod template, at 14 spaces. Empty unless
 # --service-account is given, so the pod keeps using the namespace default.
 SERVICE_ACCOUNT_TMPL = "              serviceAccountName: {sa}"
@@ -157,6 +168,10 @@ def main():
     # Plain words only -- the command is inlined into the pod script unquoted.
     ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
+    # Single-host suite only: run on one host of this lane's N-host slice instead.
+    ap.add_argument("--slice-hosts", type=int, default=0)
+    # Single-host suite only: run on one host of these external-cluster nodepools.
+    ap.add_argument("--external-pools", default="")
     # Which lane's pools to use. pr-gate and nightly both own 1- and 2-host slices, so a
     # host count alone no longer identifies a pool (see topology.yaml).
     ap.add_argument("--lane", default="pr-gate")
@@ -360,10 +375,19 @@ def main():
         if a.timeout_per_file <= 0:
             ap.error("--timeout-per-file must be a positive integer")
 
-    sl = slice_for(hosts)
+    if (a.slice_hosts or a.external_pools) and not suite:
+        ap.error("--slice-hosts/--external-pools need single-host suite mode")
+    if a.slice_hosts and a.external_pools:
+        ap.error("--slice-hosts and --external-pools are exclusive")
+    if a.external_pools and a.weights_pvc:
+        ap.error("--external-pools cannot mount a weights PVC (in-project only)")
+    slice_hosts = a.slice_hosts or hosts
+    if slice_hosts < hosts:
+        ap.error("--slice-hosts must be >= the job's host count")
+    sl = slice_for(slice_hosts)
 
     # Discovered set when --pools is passed (it already unions in topology.yaml's entry).
-    pools = a.pools.split() or sl["pools"]
+    pools = a.external_pools.split() or a.pools.split() or sl["pools"]
 
     # Suite mode's deadline scales with the suite (same est_time formula as
     # _tpu-test's poll budget, keeping the two in agreement), discounted for
@@ -392,6 +416,7 @@ def main():
         "ACTIVE_DEADLINE": str(active_deadline),
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
+        "HOST_LOCAL": "1" if a.external_pools or slice_hosts > hosts else "",
         "TOPOLOGY": sl["topology"],
         "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(pools)),
         "POOL_LIST": " ".join(pools),
@@ -430,7 +455,37 @@ def main():
 
     tpl = open(f"{a.dir}/jobset-tpu.yaml").read()
     out = re.sub(r"\$\{(\w+)\}", lambda m: vals.get(m.group(1), m.group(0)), tpl)
+    if a.external_pools:
+        out = to_external(out, pools=pools)
     sys.stdout.write(out)
+
+
+def to_external(rendered, *, pools):
+    """Retarget a rendered single-host JobSet at the external cluster."""
+    doc = yaml.safe_load(rendered)
+    doc["metadata"]["namespace"] = EXTERNAL_NAMESPACE
+    del doc["metadata"]["labels"]["kueue.x-k8s.io/queue-name"]
+    pod = doc["spec"]["replicatedJobs"][0]["template"]["spec"]["template"]["spec"]
+    pod.pop("serviceAccountName", None)
+    # Its slices mix topologies; the nodepool list alone keeps pods off the partner's pools.
+    del pod["nodeSelector"]["cloud.google.com/gke-tpu-topology"]
+    term = pod["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]
+    term["nodeSelectorTerms"] = [
+        {
+            "matchExpressions": [
+                {"key": EXTERNAL_NODEPOOL_KEY, "operator": "In", "values": pools}
+            ]
+        }
+    ]
+    for vol in pod["volumes"]:
+        if vol["name"] == "compile-cache":
+            vol.pop("csi")
+            vol["emptyDir"] = {}
+    for c in pod["containers"]:
+        c.pop("securityContext", None)
+    return yaml.safe_dump(doc, sort_keys=False, width=1000)
 
 
 if __name__ == "__main__":

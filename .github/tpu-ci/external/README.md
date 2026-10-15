@@ -109,6 +109,17 @@ gh workflow run "Nightly Test (External TPU)" --ref <branch> -f ref=<branch> \
 python3 .github/tpu-ci/external/render_external_jobset.py --list-groups  # what would run
 ```
 
+## PR-gate jobs on idle slices
+
+`pr-test-tpu.yml`'s unit suite also races for single hosts here (`_tpu-test.yml`
+`external_slots`): one pod per job, `app=tpu-ci`, pinned to the `nodepool_vars` pools,
+queued by the default scheduler. The nightly always wins:
+
+- A PR job submits here only while no run of this workflow is queued or in progress,
+  and withdraws its unstarted pod within 30s of one starting.
+- Each nightly slice job first deletes every unstarted PR pod, then waits for PR pods
+  on its own nodepools to finish; it preempts any still running after 90 min.
+
 ## Configuration
 
 Non-sensitive structure lives in [`external-topology.yaml`](external-topology.yaml). Partner-internal
