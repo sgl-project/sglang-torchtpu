@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, TypeVar
 
-import jax
 import torch
 import torch.distributed as dist
 import zstandard
@@ -116,7 +115,6 @@ class SPMDCompiler:
                 ],
                 os.environ.get("XLA_FLAGS", ""),
                 os.environ.get("LIBTPU_INIT_ARGS", ""),
-                jax.config.jax_include_full_tracebacks_in_locations,
             )
             if self.size != len(mapping) or self.size != dist.get_world_size():
                 error = "only the full TPU TP group is supported"
@@ -135,11 +133,6 @@ class SPMDCompiler:
         dist.all_gather_object(result, value, group=self.group)
         return result
 
-    def check_errors(self, stage: str, error: str | None = None) -> None:
-        errors = self.gather(error)
-        if any(error is not None for error in errors):
-            raise RuntimeError(f"Shared compile {stage} failed: {errors}")
-
     @contextmanager
     def coordinate_errors(self, stage: str) -> Iterator[None]:
         error: str | None = None
@@ -148,7 +141,9 @@ class SPMDCompiler:
         except Exception as caught:
             logger.exception("Shared compile %s failed on rank %d", stage, self.rank)
             error = f"{type(caught).__name__}: {str(caught)[:512]}"
-        self.check_errors(stage, error)
+        errors = self.gather(error)
+        if any(error is not None for error in errors):
+            raise RuntimeError(f"Shared compile {stage} failed: {errors}")
 
     def enqueue(self, graph: str) -> None:
         if self.verify_spmd_safe:
@@ -196,38 +191,16 @@ class SPMDCompiler:
         """
         raise RuntimeError("SPMD verification does not produce an executable")
 
-    def _bind_consumers(self) -> None:
-        owned = {
-            graph: item.interface
-            for graph, item in self.submissions.items()
-            if item.owner == self.rank
-        }
-        interfaces = self.gather(owned)
-        with self.coordinate_errors("consumer bindings"):
-            for graph, item in self.submissions.items():
-                if item.owner == self.rank:
-                    continue
-                interface = interfaces[item.owner][graph]
-                if interface is None or item.bind is None:
-                    raise ValueError(f"Incomplete shared executable interface: {graph}")
-                item.bind(interface)
-                item.bind = None
-        logger.info(
-            "[shared_compile] traced=%d reused=%d cases=%d",
-            len(owned),
-            len(self.submissions) - len(owned),
-            len(self.submissions),
-        )
-
     def finish(self, error: str | None = None) -> None:
         if self.verify_spmd_safe:
             self._finish_verification(error)
-        self.check_errors("tracing", error)
+        errors = self.gather(error)
+        if any(error is not None for error in errors):
+            raise RuntimeError(f"Shared compile tracing failed: {errors}")
         assignments = [(graph, item.owner) for graph, item in self.submissions.items()]
         if any(peer != assignments for peer in self.gather(assignments)):
             raise ValueError("Shared TPU graph order or owners differ across ranks")
         start = time.perf_counter()
-        self._bind_consumers()
         if self.rank == 0:
             for graph, owner in assignments:
                 logger.info("[shared_compile] owner=%d graph=%s", owner, graph)
@@ -303,6 +276,27 @@ class SPMDCompiler:
         raise SystemExit(0)
 
     def _distribute(self) -> None:
+        owned = {
+            graph: item.interface
+            for graph, item in self.submissions.items()
+            if item.owner == self.rank
+        }
+        interfaces = self.gather(owned)
+        with self.coordinate_errors("consumer bindings"):
+            for graph, item in self.submissions.items():
+                if item.owner == self.rank:
+                    continue
+                interface = interfaces[item.owner][graph]
+                if interface is None or item.bind is None:
+                    raise ValueError(f"Incomplete shared executable interface: {graph}")
+                item.bind(interface)
+                item.bind = None
+        logger.info(
+            "[shared_compile] traced=%d reused=%d cases=%d",
+            len(owned),
+            len(self.submissions) - len(owned),
+            len(self.submissions),
+        )
         # Serialize concurrently, then broadcast in the agreed queue order.
         prepared = {
             graph: self._serializer.submit(_prepare_executable, item, self.size > 1)
