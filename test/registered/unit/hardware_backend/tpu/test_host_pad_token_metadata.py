@@ -152,6 +152,73 @@ class TestPositionOnHost(CustomTestCase):
                     self.assertEqual(uploads[0].tolist(), expected_positions)
                     self.assertEqual(uploads[1].tolist(), expected_starts)
 
+    def test_cpu_staged_positions_use_the_callers_host_lengths(self):
+        """With the batch's host lengths, no device tensor is read back (a draft
+        extend builds its batch right after the target forward is queued)."""
+        device = torch.device("meta")
+        prefix_tensor = torch.empty(2, dtype=torch.int32, device=device)
+        length_tensor = torch.empty(2, dtype=torch.int32, device=device)
+        reads, uploads = [], []
+
+        def read_lengths(tensor):
+            reads.append(id(tensor))
+            return [0] * tensor.numel()
+
+        class Uploads(TorchDispatchMode):
+            def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                if (
+                    func == torch.ops.aten._to_copy.default
+                    and kwargs.get("device") == device
+                ):
+                    uploads.append(args[0])
+                return func(*args, **kwargs)
+
+        with (
+            patch.object(patches, "_compute_position_torch_patched", False),
+            patch.object(
+                forward_batch_info,
+                "compute_position_torch",
+                forward_batch_info.compute_position_torch,
+            ),
+            patch.object(torch.Tensor, "tolist", read_lengths),
+            Uploads(),
+            torch.device("meta"),
+        ):
+            patches._patch_compute_position_torch()
+            forward_batch_info.compute_position_torch(
+                prefix_tensor,
+                length_tensor,
+                extend_prefix_lens_cpu=[2, 10],
+                extend_seq_lens_cpu=[2, 3],
+            )
+        self.assertEqual(reads, [])
+        self.assertEqual(uploads[0].tolist(), [2, 3, 10, 11, 12])
+        self.assertEqual(uploads[1].tolist(), [0, 2])
+
+    def test_compute_position_forwards_host_lengths_to_the_torch_path(self):
+        seen = {}
+
+        def record(prefix, lengths, **host):
+            seen.update(host)
+            return prefix, lengths
+
+        with (
+            patch.object(forward_batch_info, "support_triton", lambda _: False),
+            patch.object(forward_batch_info, "compute_position_torch", record),
+        ):
+            forward_batch_info.compute_position(
+                "fa3",
+                torch.tensor([1]),
+                torch.tensor([2]),
+                2,
+                extend_prefix_lens_cpu=[1],
+                extend_seq_lens_cpu=[2],
+            )
+        self.assertEqual(
+            seen, dict(extend_prefix_lens_cpu=[1], extend_seq_lens_cpu=[2])
+        )
+
 
 class TestPadTensor(CustomTestCase):
     """Padding preserves values on the input's device and handles token axes."""
