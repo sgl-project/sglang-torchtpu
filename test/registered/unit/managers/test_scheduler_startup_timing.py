@@ -21,7 +21,9 @@ def test_model_startup_excludes_wait_for_peers(monkeypatch, device, peer_wait):
     monkeypatch.setattr(scheduler.time, "perf_counter", lambda: now)
     monkeypatch.setattr(scheduler, "get_device", lambda: SimpleNamespace(device=device))
     monkeypatch.setattr(
-        scheduler, "get_world_group", lambda: SimpleNamespace(barrier=barrier)
+        scheduler,
+        "get_parallel",
+        lambda: SimpleNamespace(world_group=SimpleNamespace(barrier=barrier)),
     )
     instance = scheduler.Scheduler.__new__(scheduler.Scheduler)
     instance.init_startup_timing_begin()

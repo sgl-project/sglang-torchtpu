@@ -108,7 +108,6 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
-    get_world_group,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -730,7 +729,7 @@ class Scheduler(
     def init_model_startup_timing_begin(self) -> None:
         if get_device().device == "tpu":
             # Exclude peer launch skew and distributed bootstrap from model startup.
-            get_world_group().barrier()
+            get_parallel().world_group.barrier()
             self.model_startup_begin = time.perf_counter()
 
     def init_startup_timing_summary(self) -> None:
