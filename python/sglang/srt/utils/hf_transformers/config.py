@@ -16,8 +16,6 @@
 from pathlib import Path
 from typing import Optional
 
-import transformers
-from packaging.version import Version
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -108,20 +106,17 @@ def _gemma4_attention_shapes(text_config) -> dict[str, tuple[int, int]]:
     return {layer_type: shape.pop() for layer_type, shape in shapes.items()}
 
 
-# transformers < 5.17 keeps Gemma4's full-attention shape in `global_head_dim` /
-# `num_global_key_value_heads` (pyproject_tpu.toml pins 5.8.1); drop once it pins >= 5.17.
-_GEMMA4_LEGACY_GLOBAL_ATTRS = Version(transformers.__version__) < Version("5.17")
-
-
 def _apply_gemma4_attention_overrides(config):
     # Gemma4 states its shapes SWA-first: base attributes are the sliding-window
     # values and full-attention overrides them; SGLang's base is full attention.
     text_config = config.text_config
 
-    if _GEMMA4_LEGACY_GLOBAL_ATTRS:
+    # transformers < 5.17 keeps the full-attention shape in `global_*`; 5.17 pops it.
+    global_head_dim = getattr(text_config, "global_head_dim", None)
+    if global_head_dim is not None:
         swa_head_dim = text_config.head_dim
         swa_kv_heads = text_config.num_key_value_heads
-        full_head_dim = text_config.global_head_dim or swa_head_dim
+        full_head_dim = global_head_dim
         full_kv_heads = text_config.num_global_key_value_heads or swa_kv_heads
     elif text_config.is_heterogeneous:
         # transformers states that split as a `per_layer_config`, and
