@@ -18,7 +18,7 @@ def build_scheduler_startup_time(
     draft_cuda_graph: Mapping[str, float] | None,
     target_compile_steps: Iterable[Mapping] | None = None,
     draft_compile_steps: Iterable[Mapping] | None = None,
-    model_startup: float | None = None,
+    post_sync_startup: float | None = None,
 ) -> dict:
     result = {
         "load_weight": target_load_weight + draft_load_weight,
@@ -29,8 +29,8 @@ def build_scheduler_startup_time(
             draft_cuda_graph,
         ),
     }
-    if model_startup is not None:
-        result["model_startup"] = model_startup
+    if post_sync_startup is not None:
+        result["post_sync_startup"] = post_sync_startup
     compile_steps = [
         dict(step)
         for steps in (target_compile_steps, draft_compile_steps)
@@ -69,9 +69,10 @@ def aggregate_scheduler_startup_times(
             result["scheduler_e2e"],
             float(startup_time.get("scheduler_e2e", 0.0)),
         )
-        if "model_startup" in startup_time:
-            result["model_startup"] = max(
-                result.get("model_startup", 0.0), float(startup_time["model_startup"])
+        if "post_sync_startup" in startup_time:
+            result["post_sync_startup"] = max(
+                result.get("post_sync_startup", 0.0),
+                float(startup_time["post_sync_startup"]),
             )
         for phase, duration in startup_time.get("cuda_graph", {}).items():
             result["cuda_graph"][phase] = max(

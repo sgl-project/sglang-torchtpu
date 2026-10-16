@@ -10,7 +10,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize("device,peer_wait", [("tpu", 0), ("tpu", 300), ("cuda", 300)])
-def test_model_startup_excludes_existing_pre_load_sync(monkeypatch, device, peer_wait):
+def test_post_sync_startup_excludes_existing_pre_load_sync(
+    monkeypatch, device, peer_wait
+):
     now = 0.0
     memory_checks = []
 
@@ -46,7 +48,7 @@ def test_model_startup_excludes_existing_pre_load_sync(monkeypatch, device, peer
     draft.is_draft_worker = True
     draft.init_startup_observability()
     draft.init_torch_distributed()
-    assert draft.model_startup_begin is None
+    assert draft.post_sync_startup_begin is None
     now += 10
 
     instance.tp_worker = SimpleNamespace(
@@ -67,7 +69,7 @@ def test_model_startup_excludes_existing_pre_load_sync(monkeypatch, device, peer
     assert memory_checks == [(device, False), (device, True)]
     assert instance.startup_time["scheduler_e2e"] == now
     if device == "tpu":
-        assert instance.startup_time["model_startup"] == 20
+        assert instance.startup_time["post_sync_startup"] == 20
     else:
-        assert target.model_startup_begin is None
-        assert "model_startup" not in instance.startup_time
+        assert target.post_sync_startup_begin is None
+        assert "post_sync_startup" not in instance.startup_time

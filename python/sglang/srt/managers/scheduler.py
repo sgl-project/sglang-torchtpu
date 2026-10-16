@@ -726,7 +726,7 @@ class Scheduler(
 
     def init_startup_timing_summary(self) -> None:
         startup_end = time.perf_counter()
-        model_startup_begin = self.tp_worker.model_runner.model_startup_begin
+        post_sync_startup_begin = self.tp_worker.model_runner.post_sync_startup_begin
         self.startup_time = build_scheduler_startup_time(
             target_load_weight=self.tp_worker.weight_load_time,
             draft_load_weight=(
@@ -734,10 +734,10 @@ class Scheduler(
             ),
             kv_cache_allocation=self.kv_cache_allocation_time,
             scheduler_e2e=startup_end - self.scheduler_startup_begin,
-            model_startup=(
+            post_sync_startup=(
                 None
-                if model_startup_begin is None
-                else startup_end - model_startup_begin
+                if post_sync_startup_begin is None
+                else startup_end - post_sync_startup_begin
             ),
             target_cuda_graph=self.tp_worker.graph_time_usage,
             draft_cuda_graph=(

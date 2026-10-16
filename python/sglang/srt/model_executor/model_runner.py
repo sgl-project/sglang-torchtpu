@@ -504,7 +504,7 @@ class ModelRunner:
         self.init_weight_exporter()
 
     def init_startup_observability(self) -> None:
-        self.model_startup_begin: Optional[float] = None
+        self.post_sync_startup_begin: Optional[float] = None
         self.weight_load_time = 0.0
         self.graph_memory_usage: dict[str, float] = {}
         self.graph_time_usage: dict[str, float] = {}
@@ -1218,7 +1218,7 @@ class ModelRunner:
         )
         if self.device == "tpu" and not self.is_draft_worker:
             # The existing memory reduction has already waited for every target rank.
-            self.model_startup_begin = time.perf_counter()
+            self.post_sync_startup_begin = time.perf_counter()
         # Draft forwards run without the pipeline scope the draft is built in,
         # so keep the PP group it was built with; read every other placement
         # value from the context where it is used.
