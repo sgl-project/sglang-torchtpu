@@ -174,8 +174,6 @@ def _build_pallas_sparse_mla_kernel_op():
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     """``pallas_tpu_mla`` with sparse attention: it runs the DSA indexer too."""
 
-    # The sparse kernel has no fixed-width decode pass, so verification stays
-    # on the extend layout.
     kernel_spec = dataclasses.replace(
         TpuPallasMlaAttnBackend.kernel_spec, supports_decode_query_size=False
     )

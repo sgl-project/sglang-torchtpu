@@ -273,7 +273,7 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     ) -> torch.Tensor:
         out = self._op(
             *self._mla_kernel_args(q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope),
-            # Only this dense kernel takes these two. The sparse op does not.
+            # Only this dense kernel takes ``segments``. The sparse op does not.
             segments=self.forward_metadata.segments,
             decode_query_size=self.forward_metadata.decode_query_size,
         )

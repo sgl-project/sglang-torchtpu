@@ -326,7 +326,6 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
             assert all(q == 1 for q, _ in lens), "decode expects q_len == 1"
             distribution = np.array([bs, bs, bs], dtype=np.int32)
         elif mode == "verify":
-            # The backend puts verify rows in the decode range.
             distribution = np.array([bs, bs, bs], dtype=np.int32)
         else:
             distribution = np.array([0, 0, bs], dtype=np.int32)
@@ -364,8 +363,7 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         out, updated_cache = call("all")
         jax.block_until_ready((out, updated_cache))
         if mode != "verify":
-            # Skipping the passes this distribution leaves empty is
-            # bit-identical. Verify needs every pass: it may fall back to MIXED.
+            # Skipping the passes this distribution leaves empty is bit-identical.
             out_seg, cache_seg = call("decode" if mode == "decode" else "mixed")
             np.testing.assert_array_equal(np.asarray(out_seg), np.asarray(out))
             np.testing.assert_array_equal(

@@ -2332,8 +2332,6 @@ def mla_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int | None = None,
     decode_batch_size: int = 1,
-    # Static query rows per decode sequence (1 = ordinary decode). Above 1,
-    # fixed-width speculative verification runs on the decode passes.
     decode_query_size: int = 1,
     mixed_q_split: int = 1,
     s_dtype: jnp.dtype = jnp.bfloat16,
@@ -2470,7 +2468,6 @@ def mla_ragged_paged_attention(
             num_queries_per_blocks = num_queries_per_block
 
     if decode_query_size > 1:
-        # One query tile per decode sequence holds all of its rows.
         num_queries_per_blocks = (decode_query_size, *num_queries_per_blocks[1:])
 
     if vmem_limit_bytes is None:
@@ -2733,10 +2730,6 @@ def mla_ragged_paged_attention(
 
     assert segments in ("all", "decode", "mixed"), segments
     if decode_query_size > 1:
-        # The decode passes' loop bounds are static, so they hold only when
-        # every active decode sequence has exactly decode_query_size rows.
-        # Otherwise the whole batch moves to MIXED, the dynamic-q pass, without
-        # a host sync or recompile; that pass must therefore be launched.
         assert segments == "all", segments
         is_decode = jnp.arange(kv_lens.shape[0]) < distribution[0]
         uniform = jnp.all(~is_decode | (jnp.diff(cu_q_lens) == decode_query_size))

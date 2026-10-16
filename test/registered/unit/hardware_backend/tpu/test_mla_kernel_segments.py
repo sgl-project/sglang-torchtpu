@@ -138,7 +138,6 @@ class TestMlaKernelSegments(CustomTestCase):
         )
         self.assertEqual(metadata.decode_query_size, DRAFT_TOKENS)
         self.assertEqual(metadata.distribution.tolist(), [2, 2, 2])
-        # A verify width other than the backend's stays on MIXED.
         other = SimpleNamespace(num_tokens_per_req=DRAFT_TOKENS - 1)
         metadata = self._metadata(
             backend, _batch(ForwardMode.TARGET_VERIFY, [10, 20], spec_info=other)
