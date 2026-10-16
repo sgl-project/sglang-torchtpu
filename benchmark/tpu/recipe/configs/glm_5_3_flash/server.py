@@ -3,10 +3,11 @@
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/glm_5_3_flash/server.py
 
-SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT=<tokens> serves dense attention instead,
-matching the model only up to index_topk tokens.
+GLM_FLASH_DENSE_MAX_CONTEXT=<tokens> serves dense MLA instead (no indexer), at
+that context length; it matches the model only up to index_topk tokens.
 """
 
+import json
 import os
 from copy import deepcopy
 
@@ -15,7 +16,10 @@ from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
 INPUT_TOKENS = 8192
 OUTPUT_TOKENS = 1024
 CONCURRENCY = 1
-CONTEXT_LENGTH = INPUT_TOKENS + OUTPUT_TOKENS + 1024
+DENSE_MAX_CONTEXT = os.environ.get("GLM_FLASH_DENSE_MAX_CONTEXT")
+CONTEXT_LENGTH = (
+    int(DENSE_MAX_CONTEXT) if DENSE_MAX_CONTEXT else INPUT_TOKENS + OUTPUT_TOKENS + 1024
+)
 MAX_RUNNING = CONCURRENCY if CONCURRENCY == 1 else CONCURRENCY + 2
 COMPILE_BS = [b for b in (1, 2, 4, 8, 16) if b <= CONCURRENCY] or [1]
 
@@ -38,9 +42,7 @@ CONFIG["server_args"].update(
         "max_total_tokens": max(2, MAX_RUNNING) * CONTEXT_LENGTH,
         "max_mamba_cache_size": MAX_RUNNING + 2,
         "attention_backend": (
-            "pallas_tpu_mla"
-            if os.environ.get("SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT")
-            else "pallas_tpu_mla_sparse"
+            "pallas_tpu_mla" if DENSE_MAX_CONTEXT else "pallas_tpu_mla_sparse"
         ),
         "kv_cache_dtype": "fp8_e4m3",
         "page_size": 128,
@@ -50,7 +52,20 @@ CONFIG["server_args"].update(
         "watchdog_timeout": 1800,
     }
 )
-CONFIG["runtime_env"].update({"SGLANG_MAMBA_SSM_DTYPE": "float32"})
+if DENSE_MAX_CONTEXT:
+    # is_deepseek_dsa reads index_topk from both config levels.
+    CONFIG["server_args"]["json_model_override_args"] = json.dumps(
+        {"index_topk": None, "text_config": {"index_topk": None}}
+    )
+CONFIG["runtime_env"].update(
+    {
+        "SGLANG_MAMBA_SSM_DTYPE": "float32",
+        # The TileLang mHC kernels and the fusion built on them are CUDA-only.
+        "SGLANG_OPT_USE_TILELANG_MHC_PRE": "0",
+        "SGLANG_OPT_USE_TILELANG_MHC_POST": "0",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE": "0",
+    }
+)
 # libtpu >= 0.0.46 bug (#1137, fixed in 0.0.51): with large KV pools the fast-merge
 # fallback corrupts SparseCore buffers (SparseCore halt or NaN routing).
 CONFIG["runtime_env"]["LIBTPU_INIT_ARGS"] += (

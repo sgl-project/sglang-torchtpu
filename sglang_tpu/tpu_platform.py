@@ -765,9 +765,6 @@ class TpuSRTPlatform(SRTPlatform):
         _validate_prefill_context_parallel(server_args)
         apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
         # Before the default backend below, so the error names what was passed.
-        from sglang_tpu.glm5_next_args import apply_glm5_next_server_args
-
-        apply_glm5_next_server_args(server_args)
         _validate_dsa(server_args)
 
         # Decode context parallelism runs on one backend only, so an unset

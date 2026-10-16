@@ -206,20 +206,13 @@ def model_config_of(server_args: Any):
         # at the local pull directory when the weights sit behind an
         # object-store URI, so its field is not the key. A configuration a
         # fixture supplied carries no key and is handed back as it is.
-        # Overrides are in the key: a later rule may declare them.
         built_from = getattr(server_args, "_model_config_built_from", None)
-        if built_from is None or built_from == (
-            cfg.model_path,
-            cfg.json_model_override_args,
-        ):
+        if built_from is None or built_from == cfg.model_path:
             return memo
 
     model_config = ModelConfig.from_server_args(server_args)
     server_args._model_config = model_config
-    server_args._model_config_built_from = (
-        cfg.model_path,
-        cfg.json_model_override_args,
-    )
+    server_args._model_config_built_from = cfg.model_path
     if model_config.is_hybrid_swa:
         logger.info(
             "Hybrid SWA model detected. architectures=%s",

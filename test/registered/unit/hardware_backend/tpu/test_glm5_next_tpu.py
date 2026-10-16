@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contracts for GLM-5.3-Flash on TPU: server args, the torch mHC path and
-the gated norm the shared model runs there."""
+"""CPU contracts for what GLM-5.3-Flash runs on TPU: the torch mHC path, the
+gated norm and the checkpoint config."""
 
 import json
 import tempfile
@@ -21,16 +21,9 @@ from sglang.kernels.ops.layernorm.mhc import (
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig
 from sglang.srt.configs.hybrid_arch import glm5_next_config
-from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers.config import HfModelConfigParser
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.glm5_next_args import (
-    _merge,
-    _use_torch_mhc,
-    _validate,
-    dense_overrides,
-)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -39,18 +32,6 @@ _MHC_ENVS = (
     envs.SGLANG_OPT_USE_TILELANG_MHC_POST,
     envs.SGLANG_OPT_FUSE_MHC_POST_PRE,
 )
-
-
-def _serving_args(**overrides):
-    args = dict(
-        disable_radix_cache=True,
-        speculative_algorithm=None,
-        attn_dp_size=1,
-        enable_dp_attention=False,
-        pp_size=1,
-    )
-    args.update(overrides)
-    return SimpleNamespace(**args)
 
 
 class TestGlm5NextTpu(unittest.TestCase):
@@ -71,53 +52,10 @@ class TestGlm5NextTpu(unittest.TestCase):
         self.assertEqual(config.qk_rope_head_dim, 64)
         self.assertEqual(config.qk_head_dim, 256)
 
-    def test_dense_opt_in_clears_index_topk_for_flash_only(self):
-        flash = SimpleNamespace(architectures=["Glm5NextForConditionalGeneration"])
-        other = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
-        self.assertEqual(dense_overrides(flash, None), {})
-        self.assertEqual(dense_overrides(other, 2048), {})
-        # index_topk cleared at both levels, so is_deepseek_dsa reads the model
-        # as plain MLA.
-        dense = dense_overrides(flash, 2048)
-        self.assertIsNone(dense["index_topk"])
-        self.assertIsNone(dense["text_config"]["index_topk"])
-        self.assertFalse(
-            is_deepseek_dsa(
-                SimpleNamespace(
-                    architectures=["Glm5NextForConditionalGeneration"],
-                    index_topk=dense["index_topk"],
-                )
-            )
-        )
-        # A user's own text_config overrides survive the merge.
-        merged = _merge({"text_config": {"rms_norm_eps": 1e-6}}, dense)
-        self.assertEqual(merged["text_config"]["rms_norm_eps"], 1e-6)
-        self.assertIsNone(merged["text_config"]["index_topk"])
-
-    def test_unsupported_serving_features_are_rejected(self):
-        text = SimpleNamespace(index_kpool=4, index_kpool_always_select_tail=True)
-        _validate(_serving_args(), text)
-        for overrides in (
-            dict(disable_radix_cache=False),
-            dict(speculative_algorithm="EAGLE3"),
-            dict(attn_dp_size=2),
-            dict(enable_dp_attention=True),
-            dict(pp_size=2),
-        ):
-            with self.subTest(**overrides), self.assertRaises(ValueError):
-                _validate(_serving_args(**overrides), text)
-        with self.assertRaises(ValueError):
-            _validate(
-                _serving_args(),
-                SimpleNamespace(index_kpool=4, index_kpool_always_select_tail=False),
-            )
-
-    def test_tpu_selects_the_traceable_torch_mhc_path(self):
+    def test_mhc_envs_off_select_the_traceable_torch_path(self):
         with ExitStack() as stack:
             for env in _MHC_ENVS:
-                stack.enter_context(env.override(True))
-            _use_torch_mhc()
-            self.assertTrue(all(env.get() is False for env in _MHC_ENVS))
+                stack.enter_context(env.override(False))
             self.assertTrue(_mhc_pre_uses_torch())
             self.assertTrue(_mhc_post_uses_torch())
 
