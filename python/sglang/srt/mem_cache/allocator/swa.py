@@ -311,8 +311,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
         out_indices_cpu: Optional[torch.Tensor] = None,
+        return_host: bool = False,
     ):
         assert self.page_size > 1
+        # Opt-in: inner allocators return host indices for later padded upload.
+        host_kwargs = {"return_host": True} if return_host else {}
 
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
@@ -330,11 +333,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 extend_num_tokens,
                 num_new_pages=num_new_pages,
+                **host_kwargs,
             )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
-        full_alloc_kwargs = {"num_new_pages": num_new_pages}
+        full_alloc_kwargs = {"num_new_pages": num_new_pages, **host_kwargs}
         if out_indices_cpu is not None:
             # TPU speculative decoding preallocates this host output buffer.
             # Only the full-attention locations are returned to the caller;
@@ -359,6 +363,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_last_loc,
             extend_num_tokens,
             num_new_pages=num_new_pages,
+            **host_kwargs,
         )
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None

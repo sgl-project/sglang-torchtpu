@@ -1281,10 +1281,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         max_live = min(runner.max_running_requests, max(buckets))
         runner.req_to_token_pool._tpu_relay_bucketer = self.b_bucketer
-        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+        from sglang_tpu.allocator_tpu import host_return_allocators
 
-        if type(runner.token_to_kv_pool_allocator) is TpuPagedTokenToKVPoolAllocator:
-            runner.token_to_kv_pool_allocator.defer_decode_upload = True
+        for allocator in host_return_allocators(runner.token_to_kv_pool_allocator):
+            allocator.defer_decode_upload = True
         warmup_sequence_lengths(runner.device, buckets)
         for backend in {id(value): value for value in backends}.values():
             warmup = getattr(backend, "warmup_distributions", None)

@@ -396,3 +396,23 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             free_index = free_index.cpu()
         free_index = free_index.to(dtype=torch.int32)
         super().free_segment(free_index, start_pos=start_pos)
+
+
+def host_return_allocators(allocator) -> list[TpuPagedTokenToKVPoolAllocator]:
+    """TPU allocators behind ``allocator`` that can return host-resident indices.
+
+    Empty when any inner allocator would keep its device-return contract. An SWA
+    allocator qualifies when both inner allocators are plain TPU allocators; its
+    full-to-SWA mapping is host-resident on TPU.
+    """
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+    if type(allocator) is TpuPagedTokenToKVPoolAllocator:
+        return [allocator]
+    if type(allocator) is SWATokenToKVPoolAllocator:
+        inner = [allocator.full_attn_allocator, allocator.swa_attn_allocator]
+        if all(type(a) is TpuPagedTokenToKVPoolAllocator for a in inner) and (
+            allocator.full_to_swa_index_mapping.device.type == "cpu"
+        ):
+            return inner
+    return []

@@ -111,14 +111,14 @@ def alloc_extend(
     out_cache_loc_host=None,
     return_host=False,
 ):
-    from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+    from sglang_tpu.allocator_tpu import host_return_allocators
 
-    # Wrapped/SWA allocators retain their original return-device contract.
+    # Other wrapped allocators retain their original return-device contract.
     # VL embedding preparation needs device token IDs, but not KV locations.
     allocator = tree_cache.token_to_kv_pool_allocator
     if (
         batch is not None
-        and type(allocator) is TpuPagedTokenToKVPoolAllocator
+        and host_return_allocators(allocator)
         and _can_stage_forward_metadata(batch)
         and batch.req_to_token_pool.req_to_token.device.type == "cpu"
     ):
