@@ -48,7 +48,7 @@
     "python/sglang/srt/mem_cache/allocator/swa.py": 10,
     "python/sglang/srt/mem_cache/kv_cache_builder.py": 2,
     "python/sglang/srt/mem_cache/kv_cache_configurator.py": 6,
-    "python/sglang/srt/mem_cache/memory_pool.py": 3,
+    "python/sglang/srt/mem_cache/memory_pool.py": 4,
     "python/sglang/srt/mem_cache/memory_pool_host.py": 2,
     "python/sglang/srt/model_executor/forward_batch_info.py": 4,
     "python/sglang/srt/model_executor/model_runner.py": 2,
