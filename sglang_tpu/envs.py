@@ -21,10 +21,8 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
-    # GLM-5.3-Flash: attend densely (every causal key, on pallas_tpu_mla) with
-    # contexts up to this many tokens, instead of DeepSeek Sparse Attention.
-    # Exact up to index_topk; past it, outputs no longer match the model.
-    # Unset = DSA. See sglang_tpu/models/glm5_next_args.py.
+    # GLM-5.3-Flash: dense attention up to this context instead of DSA (unset).
+    # Matches the model only up to index_topk tokens.
     SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT = EnvInt(None)
 
     @classmethod

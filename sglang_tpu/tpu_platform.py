@@ -471,8 +471,6 @@ def _validate_dsa(server_args) -> None:
 
     cfg = resolving_view(server_args)
     try:
-        # With the overrides the model is served with (e.g. a dense opt-in
-        # that clears index_topk).
         hf_config = get_config(
             cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
@@ -514,8 +512,7 @@ def _validate_dsa(server_args) -> None:
 
 
 def _register_models() -> None:
-    """Serve the plugin's model implementations (sglang_tpu/models) in place of
-    core's for the same architectures. Runs in the worker before model load."""
+    """Serve sglang_tpu/models in place of core's models of the same arch."""
     from sglang.srt.models.registry import ModelRegistry
 
     ModelRegistry.register("sglang_tpu.models", overwrite=True)

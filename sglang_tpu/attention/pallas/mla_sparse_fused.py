@@ -127,10 +127,8 @@ def sparse_mla_attention_fused(
         sm_scale=sm_scale,
         k_scale=k_scale,
         cache_layout=TENSORCORE_CACHE_LAYOUT,
-        # Each chunk of queries is one SparseCore gather program, unrolled at trace
-        # time. The kernel default (64) makes num_tokens / 64 of them per layer:
-        # 128 at an 8192-token prefill, ~1400 per graph, which halts the SparseCore
-        # (RuntimeUnexpectedCoreHalt). 256-token chunks keep it to 32 per layer.
+        # One SparseCore program per chunk: the default 64 gives ~1400 per 8k
+        # prefill graph, which halts the SparseCore.
         gather_and_attention_chunk_size=min(
             _GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0])
         ),

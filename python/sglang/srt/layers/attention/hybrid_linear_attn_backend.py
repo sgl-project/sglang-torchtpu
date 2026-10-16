@@ -1236,8 +1236,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         return None
 
     def forward_indexer(self, indexer, *, layer_id: int, **kwargs):
-        # Backends that run the DSA indexer themselves (TPU sparse MLA); only
-        # full-attention layers have one.
+        # Only full-attention layers have a DSA indexer.
         return self.full_attn_backend.forward_indexer(
             indexer, layer_id=layer_id, **kwargs
         )

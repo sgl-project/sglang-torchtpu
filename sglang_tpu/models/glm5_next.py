@@ -1,20 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash text serving on TPU.
 
-Projection and checkpoint mappings adapted from SGLang PR #36507. The 11
-full-attention layers run the model's own DeepSeek Sparse Attention: the pooled
-(kpool) indexer picks index_topk tokens per query and absorbed MLA attends over
-them on pallas_tpu_mla_sparse, with the latent cache in FP8. KDA runs on the
-fused GDN v3 Pallas kernel in KDA mode (sglang_tpu.attention_kda_pallas, shared
-with Kimi-K3).
-
-SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT opts into dense attention instead
-(absorbed MLA over every causal key, on pallas_tpu_mla). Up to index_topk tokens
-of context DSA selects every causal key, so dense is exact there; past it,
-dense no longer matches the model.
-
-The TPU platform registers this class over core's glm5_next and adjusts the
-model config for it (glm5_next_args).
+Projection and checkpoint mappings adapted from SGLang PR #36507. Full-attention
+layers run DeepSeek Sparse Attention (pooled indexer + absorbed MLA on
+pallas_tpu_mla_sparse); SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT opts into dense
+absorbed MLA on pallas_tpu_mla, exact only up to index_topk tokens. KDA runs on
+the shared TPU KDA backend (Kimi-K3).
 """
 
 import logging
@@ -299,14 +290,10 @@ class Glm5NextLinearAttention(nn.Module):
 
 
 class Glm5NextLatentAttention(nn.Module):
-    """Absorbed MLA over the normed 512-dim latent cache: W_UK folds into q and
-    W_UV into the output, and every head attends as MQA over the latent. Dense
-    (every causal key), on pallas_tpu_mla.
+    """Absorbed MLA over the latent cache, attending to every causal key.
 
-    The checkpoint is NoPE. The TPU MLA kernels need a rope segment, so the
-    platform sets qk_rope_head_dim to a zero segment of that width
-    (sglang_tpu.models.glm5_next_args); q_pe . k_pe = 0 leaves the scores
-    unchanged.
+    The checkpoint is NoPE; qk_rope_head_dim is a zero segment the TPU MLA kernels
+    require (set by glm5_next_args), so q_pe . k_pe = 0.
     """
 
     def __init__(self, config, layer_id, quant_config, prefix):
@@ -390,8 +377,7 @@ class Glm5NextLatentAttention(nn.Module):
 
 
 class Glm5NextSparseAttention(Glm5NextLatentAttention):
-    """DeepSeek Sparse Attention: the pooled (kpool) indexer picks each query's
-    keys, and the absorbed MLA attends over only those (pallas_tpu_mla_sparse)."""
+    """DeepSeek Sparse Attention: the pooled indexer picks the keys to attend."""
 
     def __init__(self, config, layer_id, quant_config, prefix):
         super().__init__(config, layer_id, quant_config, prefix)
@@ -433,7 +419,6 @@ class Glm5NextSparseAttention(Glm5NextLatentAttention):
 
 
 def _runs_dsa() -> bool:
-    # Sparse attention unless the dense opt-in is set (see glm5_next_args).
     return tpu_envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get() is None
 
 
@@ -686,8 +671,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         missing = set(params) - loaded
         if missing:
             raise ValueError(f"Missing GLM-5.3-Flash weights: {sorted(missing)}")
-        # After loaders that rebind storage (the TPU FP8 preparation path uses
-        # this convention), bind what the KDA kernel reads.
+        # After loaders that rebind storage, bind what the KDA kernel reads.
         for layer in self.model.layers:
             attn = layer.self_attn
             if isinstance(attn, Glm5NextLinearAttention):
@@ -700,5 +684,4 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
 
 
-# Registered over core's glm5_next by TpuSRTPlatform.init_backend.
 EntryClass = [Glm5NextForConditionalGeneration]

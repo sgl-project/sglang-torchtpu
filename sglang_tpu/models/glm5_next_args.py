@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Model-config and server-arg adjustments for GLM-5.3-Flash on TPU.
+"""GLM-5.3-Flash model-config overrides on TPU, declared as
+--json-model-override-args from TpuSRTPlatform.apply_server_args_defaults:
 
-Applied from TpuSRTPlatform.apply_server_args_defaults through
---json-model-override-args, so core's ModelConfig needs no TPU special case:
-
-- The checkpoint is NoPE (qk_rope_head_dim = 0), and the TPU MLA kernels need a
-  rope segment. The override sets a zero segment of ROPE_PAD lanes, which the
-  model fills with zeros (q_pe . k_pe = 0), so the KV pool is sized and laid out
-  for what the kernels read.
-- SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT clears index_topk, so the model serves
-  as plain MLA (pallas_tpu_mla) instead of DeepSeek Sparse Attention.
+- qk_rope_head_dim: a zero rope segment for the NoPE checkpoint, which the TPU
+  MLA kernels require; the KV pool is then sized for it.
+- index_topk cleared under the dense opt-in, so the model serves as plain MLA.
 """
 
 from __future__ import annotations
@@ -23,7 +18,7 @@ from sglang_tpu.envs import envs as tpu_envs
 logger = logging.getLogger(__name__)
 
 ARCH = "Glm5NextForConditionalGeneration"
-# Rope lanes of the zero segment; 64 is the TPU MLA kernels' tested DeepSeek shape.
+# The TPU MLA kernels' tested rope width (DeepSeek).
 ROPE_PAD = 64
 
 
@@ -33,14 +28,12 @@ def _arch(hf_config) -> Optional[str]:
 
 
 def model_overrides(hf_config, dense_max_context: Optional[int]) -> dict[str, Any]:
-    """--json-model-override-args entries for GLM-5.3-Flash on TPU, or {} for
-    any other model. ``dense_max_context`` is the dense opt-in (None = DSA)."""
+    """Overrides for GLM-5.3-Flash ({} for other models); dense_max_context=None is DSA."""
     if _arch(hf_config) != ARCH:
         return {}
     text = {"qk_rope_head_dim": ROPE_PAD}
     if dense_max_context is not None:
-        # index_topk is what marks a DSA model (is_deepseek_dsa); it is read
-        # from both the top-level and the text config.
+        # is_deepseek_dsa reads index_topk from both config levels.
         text["index_topk"] = None
     top = dict(text)
     top["text_config"] = text
@@ -48,7 +41,7 @@ def model_overrides(hf_config, dense_max_context: Optional[int]) -> dict[str, An
 
 
 def _merge(user: dict, ours: dict) -> dict:
-    """Ours on top of the user's overrides, merging the nested text_config."""
+    """Ours over the user's, merging text_config."""
     merged = {**user, **ours}
     if isinstance(user.get("text_config"), dict) and "text_config" in ours:
         merged["text_config"] = {**user["text_config"], **ours["text_config"]}
@@ -56,7 +49,7 @@ def _merge(user: dict, ours: dict) -> dict:
 
 
 def apply_glm5_next_server_args(server_args) -> None:
-    """Declare the overrides (and the dense attention backend) for GLM-5.3-Flash."""
+    """Declare the overrides, and pallas_tpu_mla when dense."""
     from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
     from sglang.srt.utils.hf_transformers.config import get_config
 

@@ -231,9 +231,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.index_topk_pattern = index_topk_pattern
         self.index_skip_topk_offset = index_skip_topk_offset
 
-        # Older Transformers validates a closed list of layer type strings.
-        # Retain the checkpoint names after base initialization; SGLang routes
-        # by the explicit KDA/full layer-id lists above.
+        # Older Transformers rejects these layer_types; restore them after init.
         layer_types = kwargs.pop("layer_types", None)
         super().__init__(
             pad_token_id=pad_token_id,

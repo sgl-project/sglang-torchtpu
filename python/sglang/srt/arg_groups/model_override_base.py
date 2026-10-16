@@ -206,8 +206,7 @@ def model_config_of(server_args: Any):
         # at the local pull directory when the weights sit behind an
         # object-store URI, so its field is not the key. A configuration a
         # fixture supplied carries no key and is handed back as it is.
-        # The model overrides are part of the key too: a rule may declare
-        # json_model_override_args after an earlier one built the configuration.
+        # Overrides are in the key: a later rule may declare them.
         built_from = getattr(server_args, "_model_config_built_from", None)
         if built_from is None or built_from == (
             cfg.model_path,

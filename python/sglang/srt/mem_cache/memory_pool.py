@@ -4245,9 +4245,7 @@ class HybridLinearKVPool(KVCache):
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         self.use_dsa = use_dsa
-        # Platforms that bring their own KV pool classes (out-of-tree, and TPU,
-        # which is in-tree but overrides them) build the full-attention pool
-        # through the platform's factories.
+        # TPU is in-tree but supplies its own pool classes, like OOT platforms.
         uses_platform_pools = (
             current_platform.is_out_of_tree() or current_platform.is_tpu()
         )
@@ -4306,8 +4304,6 @@ class HybridLinearKVPool(KVCache):
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
             if uses_platform_pools:
-                # The platform's sparse MLA kernels read their own paged layout
-                # (TPU: a pooled indexer keeps its raw keys there too).
                 skips = skip_topk_layers or [False] * self.full_layer_nums
                 self.full_kv_pool = current_platform.get_dsa_kv_pool_cls()(
                     size=size,
@@ -4516,7 +4512,7 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id)
 
-    # Split sparse-MLA pool buffers (TPU DSA), addressed by global layer id.
+    # Split sparse-MLA pool buffers, by global layer id.
     def get_nope_cache(self, layer_id: int):
         return self.full_kv_pool.get_nope_cache(
             self._transfer_full_attention_id(layer_id)
