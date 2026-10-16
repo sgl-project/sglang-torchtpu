@@ -244,6 +244,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
             tpu_compile_tracer="dynamo",
+            json_model_override_args=None,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
