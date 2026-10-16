@@ -32,6 +32,7 @@ class WarmupQueue:
         self.spmd_compiler: SPMDCompiler | None = None
         self.calls: list[PendingCall] = []
         # TpuGraphRunner attaches its recompilation checker after every warmup.
+        # The scheduler warms sampling after this queue drains.
         self.completions: list[Callable[[], None]] = []
 
         if not dist.is_initialized():

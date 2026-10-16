@@ -344,8 +344,8 @@ class TpuGraphRunner:
         self._finish_warmup(installed_policies)
 
     def _finish_warmup(self, installed_policies: list[CompilePolicy]) -> None:
-        # Baseline after model warmup. Later TPU speculative-op and KV-offload
-        # warmup refresh the shared baseline in their own completion paths.
+        # Baseline after model warmup. Later speculative-op, sampling, and
+        # KV-offload warmups refresh it in their own completion paths.
         if envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
             # A draft model precompiles later, from precompile_draft, and installs
             # the checker itself once that is done.
@@ -354,8 +354,7 @@ class TpuGraphRunner:
                     policies=installed_policies,
                     model_label=type(self.model).__name__,
                 )
-        # PD harnesses wait for this marker before issuing requests.
-        logger.info("TpuGraphRunner precompile done")
+        logger.info("TpuGraphRunner model warmup done")
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.

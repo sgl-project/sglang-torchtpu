@@ -16,11 +16,16 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.runtime_context import get_exec
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
@@ -719,6 +724,30 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
     # Configuration lifecycle
     # ------------------------------------------------------------------
+
+    def prewarm_sampling(self, model_runner: ModelRunner) -> None:
+        # TpuSampler transitively imports current_platform through shared layers;
+        # defer it to avoid a circular import during platform discovery.
+        from sglang_tpu.sampler import TpuSampler
+
+        if model_runner.is_draft_worker:
+            return
+        if (
+            model_runner.pp_group.is_last_rank
+            and model_runner.model_config.is_generation
+            and isinstance(model_runner.sampler, TpuSampler)
+        ):
+            model_runner.sampler.warmup_small_top_k(
+                max_batch_size=min(
+                    model_runner.max_running_requests,
+                    get_exec().graph.torch_compile_max_bs,
+                ),
+                vocab_size=model_runner.model_config.vocab_size,
+                device=torch.device(model_runner.device),
+            )
+        snapshot_recompilation_baseline()
+        # Keep the marker consumed by PD harnesses, after sampler completion.
+        logger.info("TpuGraphRunner precompile done")
 
     def apply_server_args_defaults(self, server_args: ServerArgs) -> None:
         # Pre-publish resolution declares rather than writes, so every read below goes

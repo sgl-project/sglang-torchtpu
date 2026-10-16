@@ -371,10 +371,13 @@ def tpu_top_k(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]
         raise ValueError(f"tpu_top_k expects a 2D tensor, got shape {values.shape}")
     if not 0 < k <= values.shape[-1]:
         raise ValueError(f"k must be in [1, {values.shape[-1]}], got {k}")
-    # The exported op compiles once per argument shape: bucket rows to a power of two.
+    # The exported op specializes on shapes and static K. Bound both dimensions.
     rows = values.shape[0]
     bucket = row_bucket(rows)
-    top_values, top_ids = _get_tpu_top_k_op()(pad_rows(values, bucket), k)
+    k_bucket = min(row_bucket(k), values.shape[-1])
+    top_values, top_ids = _get_tpu_top_k_op()(pad_rows(values, bucket), k_bucket)
+    if k_bucket != k:
+        top_values, top_ids = top_values[:, :k], top_ids[:, :k]
     if bucket != rows:
         return top_values[:rows], top_ids[:rows]
     return top_values, top_ids

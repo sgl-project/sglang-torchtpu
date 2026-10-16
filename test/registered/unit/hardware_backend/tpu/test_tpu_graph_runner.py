@@ -15,11 +15,14 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
 )
 from sglang.srt.environ import envs
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -42,6 +45,8 @@ from sglang_tpu.graph_runner.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
 )
+from sglang_tpu.sampler import TpuSampler
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 DECODER_POLICY_PRECOMPILE = (
     "sglang_tpu.compilation.decoder_compile_policy.DecoderTpuCompilePolicy.precompile"
@@ -194,7 +199,11 @@ class TestTpuGraphRunner(CustomTestCase):
         server_args.override = _override
         return SimpleNamespace(
             model=model,
-            model_config=SimpleNamespace(context_len=2048),
+            model_config=SimpleNamespace(
+                context_len=2048, is_generation=True, vocab_size=128
+            ),
+            sampler=MagicMock(),
+            device="cpu",
             max_running_requests=1,
             is_draft_worker=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -335,16 +344,33 @@ class TestTpuGraphRunner(CustomTestCase):
 
                     self.mock_precompile.side_effect = precompile
                     model = self._annotate(_model_with(forward=MagicMock()))
+                    runner = self._runner_for(model)
+                    runner.sampler = MagicMock(spec=TpuSampler)
+                    runner.sampler.warmup_small_top_k.side_effect = lambda **kwargs: (
+                        events.append("sampler")
+                    )
                     scope = collect_warmups() if global_queue else nullcontext()
-                    with patch(
-                        "sglang_tpu.graph_runner.tpu_graph_runner.logger.info",
-                        side_effect=record_log,
+                    with (
+                        patch(
+                            "sglang_tpu.graph_runner.tpu_graph_runner.logger.info",
+                            side_effect=record_log,
+                        ),
+                        patch(
+                            "sglang_tpu.tpu_platform.logger.info",
+                            side_effect=record_log,
+                        ),
+                        patch(
+                            "sglang_tpu.tpu_platform.snapshot_recompilation_baseline",
+                            side_effect=lambda: events.append("baseline"),
+                        ),
                     ):
                         with scope:
-                            TpuGraphRunner(self._runner_for(model))
-                            if global_queue:
-                                self.assertNotIn("done", events)
-                    self.assertEqual(events, ["execute", "done"])
+                            TpuGraphRunner(runner)
+                            runner.sampler.warmup_small_top_k.assert_not_called()
+                            self.assertNotIn("done", events)
+                        self.assertEqual(events, ["execute"])
+                        TpuSRTPlatform().prewarm_sampling(runner)
+                    self.assertEqual(events, ["execute", "sampler", "baseline", "done"])
 
     def test_prepare_forward_batch_composes_model_and_policy_hooks(self):
         model_prepare = MagicMock()
@@ -583,7 +609,7 @@ class TestTpuGraphRunner(CustomTestCase):
 
         support_torch_compile(_VisionModule, policy=_VisionPolicy)
         model = _model_with()
-        model.modules = lambda: (model, _VisionModule())
+        model.named_modules = lambda: (("", model), ("vision", _VisionModule()))
         with self.assertLogs(tpu_graph_runner.logger, level="WARNING") as logs:
             TpuGraphRunner(self._runner_for(model))
         self.assertTrue(
@@ -865,6 +891,88 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         worker._prepare_draft_forward_batch(batch, refresh_dp_metadata=True)
 
         self.assertEqual(events, ["spec", "dp", "metadata", "ready"])
+
+
+class TestTpuSamplingPrewarm(unittest.TestCase):
+    def setUp(self):
+        self.platform = TpuSRTPlatform()
+        self.runner = SimpleNamespace(
+            sampler=MagicMock(spec=TpuSampler),
+            max_running_requests=8,
+            model=SimpleNamespace(_can_torch_compile=True),
+            model_config=SimpleNamespace(is_generation=True, vocab_size=128),
+            is_draft_worker=False,
+            pp_group=SimpleNamespace(is_last_rank=True),
+            device="cpu",
+        )
+        self.enterContext(get_context().override_server_args(torch_compile_max_bs=8))
+        self.baseline = self.enterContext(
+            patch("sglang_tpu.tpu_platform.snapshot_recompilation_baseline")
+        )
+        self.log = self.enterContext(patch("sglang_tpu.tpu_platform.logger.info"))
+
+    def test_sampling_warmup_respects_limits_without_model_compilation(self):
+        for enable_compile, can_compile, serving_limit, compile_limit, expected in (
+            (True, True, 4, 32, 4),
+            (False, True, 32, 4, 4),
+            (True, False, 8, 8, 8),
+        ):
+            with (
+                self.subTest(
+                    enable_compile=enable_compile,
+                    can_compile=can_compile,
+                    serving_limit=serving_limit,
+                    compile_limit=compile_limit,
+                ),
+                get_context().override_server_args(
+                    enable_torch_compile=enable_compile,
+                    torch_compile_max_bs=compile_limit,
+                ),
+            ):
+                self.runner.model._can_torch_compile = can_compile
+                self.runner.max_running_requests = serving_limit
+                self.runner.sampler.warmup_small_top_k.reset_mock()
+                self.platform.prewarm_sampling(self.runner)
+                self.runner.sampler.warmup_small_top_k.assert_called_once_with(
+                    max_batch_size=expected, vocab_size=128, device=torch.device("cpu")
+                )
+
+    def test_skips_draft_embedding_nonfinal_and_other_sampler(self):
+        for role in ("draft", "embedding", "nonfinal", "other_sampler"):
+            with self.subTest(role=role):
+                self.runner.is_draft_worker = role == "draft"
+                self.runner.model_config.is_generation = role != "embedding"
+                self.runner.pp_group.is_last_rank = role != "nonfinal"
+                self.runner.sampler = (
+                    MagicMock()
+                    if role == "other_sampler"
+                    else MagicMock(spec=TpuSampler)
+                )
+                self.baseline.reset_mock()
+                self.log.reset_mock()
+                self.platform.prewarm_sampling(self.runner)
+                self.runner.sampler.warmup_small_top_k.assert_not_called()
+                if role == "draft":
+                    self.baseline.assert_not_called()
+                    self.log.assert_not_called()
+                else:
+                    self.baseline.assert_called_once_with()
+                    self.log.assert_called_once_with("TpuGraphRunner precompile done")
+
+    def test_warmup_failure_does_not_publish_completion(self):
+        self.runner.sampler.warmup_small_top_k.side_effect = RuntimeError(
+            "warmup failed"
+        )
+        with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+            self.platform.prewarm_sampling(self.runner)
+        self.baseline.assert_not_called()
+        self.log.assert_not_called()
+
+    def test_default_platform_preserves_noop(self):
+        SRTPlatform().prewarm_sampling(self.runner)
+        self.runner.sampler.warmup_small_top_k.assert_not_called()
+        self.baseline.assert_not_called()
+        self.log.assert_not_called()
 
 
 if __name__ == "__main__":

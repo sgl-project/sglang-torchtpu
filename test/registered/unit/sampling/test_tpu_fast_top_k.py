@@ -1252,5 +1252,161 @@ class TestRowPad(CustomTestCase):
         self.assertEqual(ks[3:].tolist(), [0] * 5)
 
 
+class TestTpuTopKWarmup(CustomTestCase):
+    def test_covers_every_logical_row_k_and_filter_without_advancing_rng(self):
+        seen = set()
+
+        def sample(probs, info, positions, simple_sampling_case):
+            self.assertFalse(simple_sampling_case)
+            self.assertEqual(probs.dtype, torch.float32)
+            self.assertEqual(probs.shape[1], 128)
+            self.assertEqual(positions.shape, (probs.shape[0],))
+            self.assertIsNone(info.sampling_seed)
+            self.assertIsNone(info.sampling_mask_batch_indices)
+            self.assertTrue(info.need_top_k_sampling)
+            self.assertTrue(torch.all(info.top_ks == info.uniform_top_k))
+            seen.add(
+                (
+                    probs.shape[0],
+                    info.uniform_top_k,
+                    info.need_top_p_sampling,
+                    info.need_min_p_sampling,
+                )
+            )
+            return torch.rand(probs.shape[0]).to(torch.int64), None
+
+        sampler = object.__new__(TpuSampler)
+        rng_state = torch.random.get_rng_state()
+        with (
+            patch.object(TpuSampler, "_sample_from_probs", side_effect=sample),
+            patch.object(tpu_sampler_module, "_BSEARCH_SAMPLING_ENABLED", True),
+        ):
+            sampler.warmup_small_top_k(
+                max_batch_size=3, vocab_size=128, device=torch.device("cpu")
+            )
+        self.assertTrue(torch.equal(rng_state, torch.random.get_rng_state()))
+        self.assertEqual(
+            seen,
+            {
+                (rows, k, top_p, min_p)
+                for rows in range(1, 4)
+                for k in range(2, 65)
+                for top_p in (False, True)
+                for min_p in (False, True)
+            },
+        )
+
+    def test_respects_vocab_and_filter_switch_and_restores_rng_on_failure(self):
+        sampler = object.__new__(TpuSampler)
+        with (
+            patch.object(
+                TpuSampler,
+                "_sample_from_probs",
+                return_value=(torch.zeros(1, dtype=torch.int64), None),
+            ) as sample,
+            patch.object(tpu_sampler_module, "_BSEARCH_SAMPLING_ENABLED", False),
+        ):
+            sampler.warmup_small_top_k(
+                max_batch_size=1, vocab_size=3, device=torch.device("cpu")
+            )
+            self.assertEqual(sample.call_count, 2)
+            for call in sample.call_args_list:
+                self.assertFalse(call.args[1].need_top_p_sampling)
+                self.assertFalse(call.args[1].need_min_p_sampling)
+
+        def fail(*args, **kwargs):
+            torch.rand(1)
+            raise RuntimeError("warmup failed")
+
+        rng_state = torch.random.get_rng_state()
+        with patch.object(TpuSampler, "_sample_from_probs", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+                sampler.warmup_small_top_k(
+                    max_batch_size=1, vocab_size=3, device=torch.device("cpu")
+                )
+        self.assertTrue(torch.equal(rng_state, torch.random.get_rng_state()))
+
+
+class _TpuTagged(torch.Tensor):
+    """CPU tensor that reports a TPU device, to drive tpu_top_k's dispatch."""
+
+    @property
+    def device(self):
+        return SimpleNamespace(type="tpu")
+
+
+class TestTpuTopKStaticKBuckets(CustomTestCase):
+    """The exported TopK compiles per static k; per-request sampling top_k
+    values must collapse onto power-of-two k buckets."""
+
+    def _run(self, values: torch.Tensor, ks):
+        compiled = []
+
+        def fake_op(x, k):
+            x = x.as_subclass(torch.Tensor)
+            compiled.append((x.shape[0], k))
+            top_values, top_ids = torch.topk(x, k, dim=-1)
+            return top_values, top_ids.to(torch.int32)
+
+        tagged = values.as_subclass(_TpuTagged)
+        results = {}
+        with patch.object(tpu_top_k_module, "_get_tpu_top_k_op", return_value=fake_op):
+            for k in ks:
+                results[k] = tpu_top_k(tagged, k)
+        return compiled, results
+
+    def test_requested_k_values_share_power_of_two_programs(self):
+        values = torch.randn(3, 100)
+        compiled, results = self._run(values, (2, 3, 5, 7, 8, 20, 40, 64))
+        self.assertEqual({k for _, k in compiled}, {2, 4, 8, 32, 64})
+        for k, (top_values, top_ids) in results.items():
+            expected_values, expected_ids = torch.topk(values, k, dim=-1)
+            torch.testing.assert_close(
+                top_values.as_subclass(torch.Tensor), expected_values
+            )
+            self.assertEqual(
+                top_ids.as_subclass(torch.Tensor).tolist(), expected_ids.tolist()
+            )
+
+    def test_k_bucket_is_capped_at_the_row_width(self):
+        values = torch.randn(5, 6)
+        compiled, results = self._run(values, (5,))
+        self.assertEqual(compiled, [(8, 6)])
+        top_values, top_ids = results[5]
+        self.assertEqual(tuple(top_values.shape), (5, 5))
+        self.assertEqual(
+            top_ids.as_subclass(torch.Tensor).tolist(),
+            torch.topk(values, 5).indices.tolist(),
+        )
+
+    def test_power_of_two_k_is_passed_through(self):
+        compiled, _ = self._run(torch.randn(4, 16), (1, 8))
+        self.assertEqual(compiled, [(4, 1), (4, 8)])
+
+
+class TestRowPad(CustomTestCase):
+    """Eager TPU ops compile per shape; rows round up to a power of two so a
+    batch draining one request at a time compiles log2(bs) times, not bs."""
+
+    def test_rounds_up_to_the_next_power_of_two(self):
+        self.assertEqual(
+            [row_bucket(n) for n in (0, 1, 2, 3, 5, 8, 9, 63, 64, 65)],
+            [1, 1, 2, 4, 8, 8, 16, 64, 64, 128],
+        )
+
+    def test_pads_the_leading_dim_with_the_fill_value(self):
+        x = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+        padded = pad_rows(x, 4, fill=1.0)
+        self.assertEqual(tuple(padded.shape), (4, 2))
+        torch.testing.assert_close(padded[:3], x)
+        self.assertTrue(bool((padded[3] == 1.0).all()))
+        # Already at the bucket: the same tensor, no copy.
+        self.assertIs(pad_rows(x, 3), x)
+        ks = pad_rows(torch.ones(3, dtype=torch.int32), 8)
+        self.assertEqual(tuple(ks.shape), (8,))
+        self.assertEqual(ks.dtype, torch.int32)
+        self.assertEqual(ks[3:].tolist(), [0] * 5)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ Unsupported sampling features retain the full-vocabulary PyTorch path."""
 from __future__ import annotations
 
 import logging
+import time
 from typing import NamedTuple, Optional
 
 import torch
@@ -373,6 +374,70 @@ def _capture_sampling_mask(
 class TpuSampler(Sampler):
     """Consume a pre-gather global TopK for eligible TPU sampling batches.
     Every other batch delegates to the full-vocabulary sampler implementation."""
+
+    def warmup_small_top_k(
+        self, *, max_batch_size: int, vocab_size: int, device: torch.device
+    ) -> None:
+        """Warm the unseeded K=2..64 probability-sampling path before serving.
+
+        The model unpads logits before sampling, so every logical row count is
+        needed, not just the model's batch buckets. TopK buckets alone do not
+        cover the exact-K slices, filters, random draws and final token gather.
+        Seeded sampling, logprobs and optional sampling-mask capture are outside
+        this path's warmup contract.
+        """
+        start = time.perf_counter()
+        device_module = (
+            torch.random if device.type == "cpu" else torch.get_device_module(device)
+        )
+        rng_state = device_module.get_rng_state()
+        filtering_modes = [(False, False)]
+        if _BSEARCH_SAMPLING_ENABLED:
+            filtering_modes += [(True, False), (False, True), (True, True)]
+        cases = 0
+        try:
+            for rows in range(1, max_batch_size + 1):
+                probs = torch.full(
+                    (rows, vocab_size),
+                    1.0 / vocab_size,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                positions = torch.zeros(rows, dtype=torch.int64, device=device)
+                for k in range(2, min(MAX_DISTRIBUTED_TOP_K, vocab_size) + 1):
+                    info = SamplingBatchInfo(
+                        temperatures=torch.ones(rows, 1, device=device),
+                        top_ks=torch.full((rows,), k, dtype=torch.int32, device=device),
+                        top_ps=torch.full((rows,), 0.9, device=device),
+                        min_ps=torch.full((rows,), 0.05, device=device),
+                        is_all_greedy=False,
+                        is_any_greedy=False,
+                        need_top_k_sampling=True,
+                        need_top_p_sampling=False,
+                        need_min_p_sampling=False,
+                        uniform_top_k=k,
+                        vocab_size=vocab_size,
+                        device=str(device),
+                    )
+                    for need_top_p, need_min_p in filtering_modes:
+                        info.need_top_p_sampling = need_top_p
+                        info.need_min_p_sampling = need_min_p
+                        token_ids, _ = self._sample_from_probs(
+                            probs, info, positions, simple_sampling_case=False
+                        )
+                        # Materialize each lazy native program before dropping its
+                        # inputs, and finish the draw before restoring the RNG.
+                        token_ids.cpu()
+                        cases += 1
+        finally:
+            device_module.set_rng_state(rng_state)
+        logger.info(
+            "TPU small-TopK sampler warmup: %d cases, rows=1..%d, K=2..%d, %.3fs",
+            cases,
+            max_batch_size,
+            min(MAX_DISTRIBUTED_TOP_K, vocab_size),
+            time.perf_counter() - start,
+        )
 
     def forward(
         self,

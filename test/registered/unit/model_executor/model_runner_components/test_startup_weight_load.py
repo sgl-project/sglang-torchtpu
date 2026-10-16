@@ -814,11 +814,16 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "sglang.srt.managers.scheduler.prewarm_graph_pool_borrow",
                 side_effect=lambda: trace.append("borrow_prewarm"),
             ),
+            patch(
+                "sglang.srt.managers.scheduler.current_platform.prewarm_sampling",
+                side_effect=lambda runner: trace.append("platform_prewarm"),
+            ) as platform_prewarm,
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
             scheduler.init_model_worker()
 
         self.assertIs(scheduler.schedule_stream, None if mlx else schedule_stream)
+        platform_prewarm.assert_called_once_with(worker.model_runner)
         worker.model_runner.post_capture_resize_kv_pool.assert_called_once_with(
             draft_runners=(worker.model_runner,) if use_draft_worker else ()
         )
@@ -834,6 +839,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "stream_enter",
                 "borrow_prewarm",
                 "prewarm",
+                "platform_prewarm",
                 "stream_exit",
                 "resize",
             ],
@@ -862,6 +868,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "stream_enter",
                 "borrow_prewarm",
                 "prewarm",
+                "platform_prewarm",
                 "stream_exit",
                 "resize",
                 "finalize",
@@ -878,6 +885,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "stream_enter",
                 "borrow_prewarm",
                 "draft_prewarm",
+                "platform_prewarm",
                 "stream_exit",
                 "resize",
             ],

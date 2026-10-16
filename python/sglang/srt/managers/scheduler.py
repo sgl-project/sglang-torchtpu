@@ -1165,6 +1165,7 @@ class Scheduler(
                 model_runner.prewarm_sampling()
             else:
                 self.draft_worker.prewarm_sampling()
+            current_platform.prewarm_sampling(model_runner)
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool(

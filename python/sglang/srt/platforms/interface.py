@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 # Re-export for convenience
 __all__ = ["SRTPlatform", "PlatformEnum"]
@@ -43,6 +44,10 @@ class SRTPlatform(DeviceMixin):
     # ------------------------------------------------------------------
     # Configuration lifecycle
     # ------------------------------------------------------------------
+
+    def prewarm_sampling(self, model_runner: ModelRunner) -> None:
+        """Warm platform sampling kernels after all model graph warmups finish."""
+        pass
 
     def apply_server_args_defaults(self, server_args) -> None:
         """Apply platform-specific default values to server arguments.
