@@ -37,7 +37,6 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(
     est_time=240,
     suite="stage-a-test-tpu-unit",
-    disabled="needs a torch_tpu with standalone process subgroups (torch_tpu #4387 / #5092)",
     chips=4,
 )
 
