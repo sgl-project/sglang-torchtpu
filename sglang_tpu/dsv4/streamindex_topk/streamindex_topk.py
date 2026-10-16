@@ -94,6 +94,7 @@ def kernel(
     cp_size: int = 1,
     interleave_c: int = 1,
     chunk_idx: int = 0,
+    causal_offset: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -336,7 +337,7 @@ def kernel(
             q_l = q_e - q_s
             block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
             q_pos = s_l - q_l + block_start + jnp.arange(bq_sz, dtype=jnp.int32)
-            bq_pos_compressed_vec.append(q_pos >> shift_comp)
+            bq_pos_compressed_vec.append((q_pos - causal_offset) >> shift_comp)
 
         bkvs = []
         bkv_scales = []
@@ -521,6 +522,7 @@ def _effective_row_lengths(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    causal_offset: int = 0,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix."""
     max_num_seqs = seq_lens.shape[0]
@@ -535,7 +537,7 @@ def _effective_row_lengths(
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
     kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    visible = jnp.minimum(kv_len, (token_pos - causal_offset) // compression_ratio + 1)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
@@ -557,6 +559,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "causal_offset",
     ),
 )
 def streamindex_topk(
@@ -582,8 +585,14 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    causal_offset: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """StreamIndex Top-K retrieval."""
+    """StreamIndex Top-K retrieval.
+
+    A query at position ``p`` sees compressed rows ``<= (p - causal_offset) //
+    compression_ratio``. The default 0 lets a token see the row it falls in;
+    ``compression_ratio - 1`` limits it to rows already closed (GLM-5.3-Flash's
+    pooled indexer)."""
     kv_layout = KVLayout.parse(kv_layout)
 
     if cp_size < 1:
@@ -599,6 +608,10 @@ def streamindex_topk(
             raise NotImplementedError(
                 "enable_early_exit is not supported with cp_size > 1."
             )
+    if enable_early_exit and causal_offset:
+        raise NotImplementedError(
+            "causal_offset is not supported with enable_early_exit."
+        )
     if enable_early_exit and return_scores:
         raise NotImplementedError(
             "return_scores is not supported with enable_early_exit."
@@ -771,6 +784,7 @@ def streamindex_topk(
                     cp_size=cp_size,
                     interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
+                    causal_offset=causal_offset,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -914,6 +928,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            causal_offset=causal_offset,
         )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:

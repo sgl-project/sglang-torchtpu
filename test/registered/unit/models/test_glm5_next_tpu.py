@@ -14,9 +14,13 @@ import torch
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.hybrid_arch import glm5_next_config
 from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
+from sglang.srt.environ import envs
 from sglang.srt.models.glm5_next_tpu import (
+    Glm5NextDenseAttention,
     Glm5NextLinearAttention,
+    Glm5NextSparseAttention,
     TpuRMSNormGated,
+    _full_attention_cls,
     hc_post,
     hc_pre,
 )
@@ -45,7 +49,7 @@ class TestGlm5NextTpu(unittest.TestCase):
         self.assertEqual(config.qk_rope_head_dim, 64)
         self.assertEqual(config.qk_head_dim, 256)
 
-    def test_dense_dsa_does_not_allocate_sparse_seed_metadata(self):
+    def test_flash_runs_dsa_unless_dense_is_opted_into(self):
         flash = SimpleNamespace(
             architectures=["Glm5NextForConditionalGeneration"],
             index_share_for_mtp_iteration=True,
@@ -56,10 +60,15 @@ class TestGlm5NextTpu(unittest.TestCase):
             index_share_for_mtp_iteration=True,
             index_topk=2048,
         )
-        # The TPU Flash model attends densely, so it has no top-k to seed;
-        # a sparse-DSA model still does.
-        self.assertEqual(get_dsa_seed_metadata_dim(flash), 0)
-        self.assertEqual(get_dsa_seed_metadata_dim(full), 2048)
+        with patch("sglang.srt.configs.model_config.is_tpu", return_value=True):
+            # Sparse attention by default: the model's top-k is seeded.
+            self.assertEqual(get_dsa_seed_metadata_dim(flash), 2048)
+            self.assertIs(_full_attention_cls(), Glm5NextSparseAttention)
+            # The dense opt-in has no top-k to seed; other DSA models still do.
+            with envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.override(2048):
+                self.assertEqual(get_dsa_seed_metadata_dim(flash), 0)
+                self.assertEqual(get_dsa_seed_metadata_dim(full), 2048)
+                self.assertIs(_full_attention_cls(), Glm5NextDenseAttention)
 
     def test_kda_output_keeps_batch_one_token_axis(self):
         config = Glm5NextTextConfig(
@@ -73,10 +82,11 @@ class TestGlm5NextTpu(unittest.TestCase):
             forward_mode=SimpleNamespace(is_idle=lambda: False, is_decode=lambda: True)
         )
         # The TPU KDA backend returns [1, tokens, heads, dim].
-        with patch.object(
-            attn.attn, "forward", return_value=torch.ones(1, 1, 2, 4)
-        ), get_parallel().override(
-            tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, tp_group=None
+        with (
+            patch.object(attn.attn, "forward", return_value=torch.ones(1, 1, 2, 4)),
+            get_parallel().override(
+                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, tp_group=None
+            ),
         ):
             output = attn(torch.ones(1, config.hidden_size), batch)
         self.assertEqual(output.shape, (1, config.hidden_size))

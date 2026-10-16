@@ -61,7 +61,7 @@ def generation_gate(base_url):
 MODEL_CONFIG = {
     "model": MODEL_PATH,
     "test_name": "GLM-5.3-Flash",
-    "variant": "TP8+EP8 text",
+    "variant": "TP8 text, DSA",
     "launch": {
         "recipe": "recipe/glm_5_3_flash.sh",
         "health_timeout": float(os.environ.get("HEALTH_TIMEOUT", "3600")),

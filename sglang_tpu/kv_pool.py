@@ -993,7 +993,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     Each layer that runs its own DSA indexer also gets an index-key buffer. It
     uses the same page table. A layer that reuses the previous layer's top-k
-    result has no index-key buffer.
+    result has no index-key buffer. With a pooled indexer (``index_kpool > 1``,
+    GLM-5.3-Flash) the index-key buffer holds one record per pool, at the pool's
+    position, and a raw buffer keeps each token's bf16 index key and
+    compression gate, ``[num_pages, page_size, 2 * index_head_dim]``.
 
     Only the ops write these buffers, and they update them in place. That is
     why the accessors of the flat MLA pool, which address tokens by index, are
@@ -1026,6 +1029,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         *,
         index_head_dim: int,
         index_key_layers: list[bool],
+        index_kpool: int = 1,
     ):
         # Skip MLATokenToKVPool.__init__: it allocates flat [size, 1, 576]
         # buffers, which the kernels cannot use. TpuFusedMLATokenToKVPool does
@@ -1059,6 +1063,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         self._index_head_dim = index_head_dim
         self._index_key_layers = index_key_layers
+        self._index_kpool = index_kpool
 
         if self.size % self.page_size != 0:
             raise ValueError(
@@ -1138,11 +1143,21 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             )
             for has_indexer in self._index_key_layers
         ]
+        raw_shape = (self.num_pages, self.page_size, 2 * self._index_head_dim)
+        self.kpool_raw_buffer = [
+            (
+                _zeros_kv_buffer(raw_shape, torch.bfloat16, self.device)
+                if has_indexer and self._index_kpool > 1
+                else None
+            )
+            for has_indexer in self._index_key_layers
+        ]
 
     def _clear_buffers(self):
         del self.nope_buffer
         del self.rope_buffer
         del self.index_key_buffer
+        del self.kpool_raw_buffer
 
     def get_nope_cache(self, layer_id: int) -> torch.Tensor:
         return self.nope_buffer[layer_id - self.start_layer]
@@ -1159,8 +1174,19 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             )
         return buf
 
+    def get_kpool_raw_cache(self, layer_id: int) -> torch.Tensor:
+        buf = self.kpool_raw_buffer[layer_id - self.start_layer]
+        if buf is None:
+            raise ValueError(f"layer {layer_id} has no pooled-indexer raw cache.")
+        return buf
+
     def get_kv_size_bytes(self):
-        buffers = [*self.nope_buffer, *self.rope_buffer, *self.index_key_buffer]
+        buffers = [
+            *self.nope_buffer,
+            *self.rope_buffer,
+            *self.index_key_buffer,
+            *self.kpool_raw_buffer,
+        ]
         return sum(get_tensor_size_bytes(buf) for buf in buffers if buf is not None)
 
     def _unsupported(self, accessor: str):

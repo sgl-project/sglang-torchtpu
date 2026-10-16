@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash text serving on TPU.
 
-Projection and checkpoint mappings adapted from SGLang PR #36507. This initial
-implementation supports bounded-context text generation: below index_topk
-tokens DSA selects the entire causal prefix, which can be evaluated exactly using
-ordinary attention. KDA runs on the fused GDN v3 Pallas kernel in KDA mode
-(sglang_tpu.attention_kda_pallas, shared with Kimi-K3).
+Projection and checkpoint mappings adapted from SGLang PR #36507. The 11
+full-attention layers run the model's own DeepSeek Sparse Attention: the pooled
+(kpool) indexer picks index_topk tokens per query and absorbed MLA attends over
+them on pallas_tpu_mla_sparse, with the latent cache in FP8. KDA runs on the
+fused GDN v3 Pallas kernel in KDA mode (sglang_tpu.attention_kda_pallas, shared
+with Kimi-K3).
+
+SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT opts into dense attention instead
+(unabsorbed MLA over an MHA KV pool). Up to index_topk tokens of context DSA
+selects every causal key, so dense is exact there; past it, dense no longer
+matches the model.
 """
 
+import logging
 from typing import Optional
 
 import torch
@@ -15,7 +22,9 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.srt.configs.glm5_next import Glm5NextTextConfig
+from sglang.srt.configs.model_config import GLM5_NEXT_TPU_MLA_ROPE_PAD
 from sglang.srt.distributed import divide
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -28,6 +37,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -43,6 +53,8 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2MLP, DeepseekV2MoE
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils.common import set_weight_attrs
+
+logger = logging.getLogger(__name__)
 
 
 class TpuRMSNormGated(nn.Module):
@@ -326,7 +338,10 @@ class Glm5NextDenseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.attn = RadixAttention(
+        self.attn = self._make_attn(layer_id)
+
+    def _make_attn(self, layer_id):
+        return RadixAttention(
             self.heads,
             self.q_dim,
             self.q_dim**-0.5,
@@ -348,6 +363,92 @@ class Glm5NextDenseAttention(nn.Module):
         k, v = kv.split([self.q_dim, self.v_dim], dim=-1)
         out = self.attn(q, k.contiguous(), v.contiguous(), forward_batch)
         return self.o_proj(out.reshape(-1, self.heads * self.v_dim))[0]
+
+
+class Glm5NextSparseAttention(Glm5NextDenseAttention):
+    """DeepSeek Sparse Attention as absorbed MLA: the pooled (kpool) indexer picks
+    each query's keys, W_UK folds into q and W_UV into the output, and the query
+    attends as MQA over only the selected 512-dim latents (pallas_tpu_mla_sparse).
+    """
+
+    rope_pad = GLM5_NEXT_TPU_MLA_ROPE_PAD
+
+    def __init__(self, config, layer_id, quant_config, prefix):
+        super().__init__(config, layer_id, quant_config, prefix)
+        # forward views kv_b_proj.weight as [heads, q_dim + v_dim, kv_rank]; that
+        # holds only for the unquantized [out, in] layout the checkpoint ships.
+        assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
+        from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+
+        self.layer_id = layer_id
+        self.indexer = IndexerKPool(
+            hidden_size=config.hidden_size,
+            index_n_heads=config.index_n_heads,
+            index_head_dim=config.index_head_dim,
+            rope_head_dim=0,
+            index_topk=config.index_topk,
+            q_lora_rank=self.q_rank,
+            max_position_embeddings=config.max_position_embeddings,
+            rope_theta=getattr(config, "rope_theta", 10000.0),
+            scale_fmt="ue8m0",
+            layer_id=layer_id,
+            prefix=f"{prefix}.indexer",
+            quant_config=quant_config,
+            skip_rope=True,
+            config=config,
+        )
+
+    def _make_attn(self, layer_id):
+        return RadixAttention(
+            self.heads,
+            self.kv_rank + self.rope_pad,
+            self.q_dim**-0.5,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            v_head_dim=self.kv_rank,
+        )
+
+    def forward(self, hidden_states, forward_batch, **kwargs):
+        q_latent, kv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
+            [self.q_rank, self.kv_rank], dim=-1
+        )
+        q_lora = self.q_a_layernorm(q_latent)
+        topk_indices = self.indexer(
+            x=hidden_states,
+            q_lora=q_lora,
+            positions=forward_batch.positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+        )
+        q = self.q_b_proj(q_lora)[0].view(-1, self.heads, self.q_dim)
+        # kv_b_proj rows are per head [K (q_dim) | V (v_dim)] over the latent.
+        w_kv = self.kv_b_proj.weight.view(self.heads, self.q_dim + self.v_dim, -1)
+        q_absorbed = torch.einsum("thd,hdc->thc", q, w_kv[:, : self.q_dim])
+        latent = self.kv_a_layernorm(kv_latent).unsqueeze(1)
+        n = hidden_states.shape[0]
+        # NoPE checkpoint: zero rope segments, so q_pe . k_pe adds nothing.
+        q_pe = q.new_zeros(n, self.heads, self.rope_pad)
+        k_pe = q.new_zeros(n, 1, self.rope_pad)
+        out = self.attn(
+            q_absorbed,
+            latent,
+            latent,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            topk_indices=topk_indices,
+        ).view(n, self.heads, self.kv_rank)
+        out = torch.einsum("thc,hvc->thv", out, w_kv[:, self.q_dim :])
+        return self.o_proj(out.reshape(n, self.heads * self.v_dim))[0]
+
+
+def _runs_dsa() -> bool:
+    # Sparse attention unless the dense opt-in is set (model_config.runs_dsa_densely).
+    return envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get() is None
+
+
+def _full_attention_cls():
+    return Glm5NextSparseAttention if _runs_dsa() else Glm5NextDenseAttention
 
 
 def hc_pre(x, fn, scale, base, config):
@@ -392,7 +493,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 reduce_results=True,
             )
         else:
-            self.self_attn = Glm5NextDenseAttention(
+            self.self_attn = _full_attention_cls()(
                 config, layer_id, quant_config, f"{prefix}.self_attn"
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -482,17 +583,28 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.config = config.get_text_config()
         c = self.config
         dense_limit = c.index_topk
+        unsafe_limit = envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get()
+        if unsafe_limit is not None and unsafe_limit > dense_limit:
+            logger.warning(
+                "GLM-5.3-Flash attends densely up to %d tokens, past index_topk=%d; "
+                "outputs beyond index_topk do not match DSA",
+                unsafe_limit,
+                dense_limit,
+            )
+            dense_limit = unsafe_limit
         if not args.language_model_only:
             raise ValueError("GLM-5.3-Flash TPU requires --language-model-only")
         if getattr(c, "index_kpool", 1) > 1 and not getattr(
             c, "index_kpool_always_select_tail", False
         ):
             raise ValueError(
-                "Dense DSA requires the checkpoint's always-select-tail setting"
+                "GLM-5.3-Flash TPU requires the checkpoint's always-select-tail setting"
             )
-        if args.context_length is None or args.context_length > dense_limit:
+        if not _runs_dsa() and (
+            args.context_length is None or args.context_length > dense_limit
+        ):
             raise ValueError(
-                f"GLM-5.3-Flash TPU requires --context-length <= {dense_limit}; sparse top-k is not implemented"
+                f"Dense GLM-5.3-Flash requires --context-length <= {dense_limit}"
             )
         if not args.disable_radix_cache:
             raise ValueError(
@@ -546,7 +658,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         loaded = set()
         for name, weight in weights:
             name = name.replace("model.language_model.", "model.")
-            if name.startswith("model.visual.") or ".indexer." in name:
+            if name.startswith("model.visual."):
+                continue
+            if ".indexer." in name and not _runs_dsa():
                 continue
             if (
                 name.startswith("model.layers.")
