@@ -974,7 +974,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return self._compiles_logits_processor()
 
     def keep_outputs_padded(self, batch: ForwardBatch) -> bool:
-        from sglang_tpu.sampling.sampling_batch_info import supports_padded_sampling
+        from sglang_tpu.sampler import supports_padded_sampling
 
         # EAGLE warmup and serving have different sampling_info values. Avoid
         # guarding that metadata in compiled paths which cannot use this mode.

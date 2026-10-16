@@ -20,7 +20,7 @@ from sglang.srt.sampling.sampling_batch_info import (
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.sampling.sampling_batch_info import sampling_params_to_device
+from sglang_tpu.sampler import sampling_params_to_device
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"
