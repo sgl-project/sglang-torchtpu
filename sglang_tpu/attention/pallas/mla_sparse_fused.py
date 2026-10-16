@@ -36,9 +36,6 @@ from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 
-# Query tokens per sparse-attention gather chunk (one SparseCore program each).
-_GATHER_CHUNK_TOKENS = 256
-
 # The sparse kernels only support these two sizes.
 NOPE_DIM = 512
 ROPE_DIM = 64
@@ -127,11 +124,6 @@ def sparse_mla_attention_fused(
         sm_scale=sm_scale,
         k_scale=k_scale,
         cache_layout=TENSORCORE_CACHE_LAYOUT,
-        # One SparseCore program per chunk: the default 64 gives ~1400 per 8k
-        # prefill graph, which halts the SparseCore.
-        gather_and_attention_chunk_size=min(
-            _GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0])
-        ),
     )
     # The kernel returns 512 NoPE + 64 RoPE values per head. Only the NoPE part
     # is the attention output.
