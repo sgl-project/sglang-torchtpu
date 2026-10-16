@@ -4479,64 +4479,58 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         self.assertEqual(finalized[1].shape, (BS,))
 
 
-class TestDraftTensorVocabBounds(CustomTestCase):
-    def test_padding_added_vocab_and_shared_weight_survive_install(self):
-        """Mask shard boundaries and LoRA padding without replacing shared weights."""
-        from sglang.srt.layers.vocab_parallel_embedding import (
-            VocabParallelEmbedding,
-            get_masked_input_and_mask,
-        )
-        from sglang_tpu.draft_embedding import install_tensor_vocab_bounds
+class TestDraftRankInputVocabBounds(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.layers import vocab_parallel_embedding
 
         # TPU backend initialization unwraps this dynamic CPU/CUDA compile wrapper.
         self.enterContext(
-            patch(
-                "sglang_tpu.draft_embedding.get_masked_input_and_mask",
-                get_masked_input_and_mask.__wrapped__,
+            patch.object(
+                vocab_parallel_embedding,
+                "get_masked_input_and_mask",
+                vocab_parallel_embedding.get_masked_input_and_mask.__wrapped__,
             )
         )
+
+    def _embedding(self, tp_rank):
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
         embedding = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
         torch.nn.Module.__init__(embedding)
+        embedding.tp_rank = tp_rank
         embedding.tp_size = 4
-        embedding.output_dtype = torch.float32
-        embedding.shard_indices = SimpleNamespace(
-            org_vocab_start_index=4,
-            org_vocab_end_index=7,
-            num_org_vocab_padding=1,
-            added_vocab_start_index=16,
-            added_vocab_end_index=18,
+        embedding.org_vocab_size = 15
+        embedding.org_vocab_size_padded = 16
+        embedding.num_embeddings = 18
+        embedding.num_embeddings_padded = 24
+        embedding.shard_indices = VocabParallelEmbedding._get_indices(
+            24, 16, 18, 15, tp_rank, 4
         )
-        embedding.weight = torch.nn.Parameter(torch.arange(12.0).reshape(6, 2))
-        embedding.quant_method = SimpleNamespace(
-            embedding=lambda module, ids: torch.nn.functional.embedding(
-                ids, module.weight
-            )
-        )
-        shared_weight = embedding.weight
-        install_tensor_vocab_bounds(embedding)
-        bounds = embedding._tpu_vocab_bounds
-        install_tensor_vocab_bounds(embedding)
-        self.assertIs(embedding._tpu_vocab_bounds, bounds)
-        self.assertIs(embedding.weight, shared_weight)
-        self.assertNotIn("_tpu_vocab_bounds", embedding.state_dict())
-        ids = torch.tensor([3, 4, 6, 7, 15, 16, 17, 18])
-        expected = torch.zeros(8, 2)
-        expected[[1, 2, 5, 6]] = shared_weight[[0, 2, 4, 5]]
-        torch.testing.assert_close(embedding._embed_local_shard(ids), expected)
-        # Target/draft weight sharing may replace the parameter after installation.
-        embedding.weight = torch.nn.Parameter(shared_weight.detach() + 10)
-        expected[[1, 2, 5, 6]] += 10
-        torch.testing.assert_close(embedding._embed_local_shard(ids), expected)
+        embedding.weight = torch.nn.Parameter(torch.zeros(6, 2))
+        return embedding
 
-    def test_unsharded_embedding_is_unchanged(self):
-        from sglang_tpu.draft_embedding import install_tensor_vocab_bounds
+    def test_rank_input_bounds_match_the_shard_constants(self):
+        for tp_rank in range(4):
+            with self.subTest(tp_rank=tp_rank):
+                embedding = self._embedding(tp_rank)
+                ids = torch.arange(18)
+                constant = embedding._get_masked_input_and_mask(ids)
+                embedding.lift_rank_to_input()
+                lifted = embedding._get_masked_input_and_mask(ids)
+                for got, want in zip(lifted, constant):
+                    torch.testing.assert_close(got, want)
+                self.assertNotIn("_rank_input", embedding.state_dict())
 
-        embedding = torch.nn.Embedding(8, 2)
-        embedding.tp_size = 1
-        before = embedding(torch.tensor([0, 7]))
-        install_tensor_vocab_bounds(embedding)
-        torch.testing.assert_close(embedding(torch.tensor([0, 7])), before)
-        self.assertEqual(list(embedding.buffers()), [])
+    def test_lifting_is_idempotent_and_skips_unsharded(self):
+        embedding = self._embedding(1)
+        embedding.lift_rank_to_input()
+        rank = embedding._rank_input
+        embedding.lift_rank_to_input()
+        self.assertIs(embedding._rank_input, rank)
+        unsharded = self._embedding(0)
+        unsharded.tp_size = 1
+        unsharded.lift_rank_to_input()
+        self.assertEqual(list(unsharded.buffers()), [])
 
 
 if __name__ == "__main__":

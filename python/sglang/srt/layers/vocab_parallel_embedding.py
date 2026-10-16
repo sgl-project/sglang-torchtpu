@@ -385,6 +385,19 @@ class VocabParallelEmbedding(torch.nn.Module):
             added_vocab_end_index,
         )
 
+    def lift_rank_to_input(self) -> None:
+        """Derive the shard bounds from a rank buffer instead of constants.
+
+        A compiled graph then holds no rank-specific bounds, as under a
+        platform's traced rank.
+        """
+        if self.tp_size > 1 and "_rank_input" not in self._buffers:
+            self.register_buffer(
+                "_rank_input",
+                torch.tensor(self.tp_rank, device=self.weight.device),
+                persistent=False,
+            )
+
     def _traced_shard_bounds(self, rank: torch.Tensor):
         """``get_masked_input_and_mask`` bounds for a traced rank tensor.
 
@@ -499,6 +512,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.shard_indices.added_vocab_end_index,
         )
         rank = current_platform.get_traced_rank(self.tp_rank, group_size=self.tp_size)
+        if rank is None:
+            rank = self._buffers.get("_rank_input")
         if rank is not None:
             bounds = self._traced_shard_bounds(rank.to(input_.dtype))
         return get_masked_input_and_mask(input_, *bounds)
