@@ -33,14 +33,18 @@ _AITER_MHC_RUNTIME_DISABLED = False
 _AITER_MHC_ACTIVE_LOGGED = False
 
 
+# The platform probes below are fixed for the process and not traceable, so a
+# compiled forward evaluates them once at trace time.
+@torch.compiler.assume_constant_result
+def _aiter_mhc_supported() -> bool:
+    return is_gfx95_supported() and envs.SGLANG_USE_AITER.get()
+
+
 def _use_aiter_mhc() -> bool:
-    return (
-        not _AITER_MHC_RUNTIME_DISABLED
-        and is_gfx95_supported()
-        and envs.SGLANG_USE_AITER.get()
-    )
+    return not _AITER_MHC_RUNTIME_DISABLED and _aiter_mhc_supported()
 
 
+@torch._dynamo.disable
 def _try_aiter_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -92,6 +96,7 @@ def _try_aiter_mhc_pre(
     return result
 
 
+@torch._dynamo.disable
 def _try_aiter_mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -224,25 +229,14 @@ def _use_deep_gemm_hc_prenorm() -> bool:
     return ENABLE_JIT_DEEPGEMM
 
 
+@torch.compiler.assume_constant_result
 def _use_tilelang_mhc_pre() -> bool:
     return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_hip()
 
 
+@torch.compiler.assume_constant_result
 def _use_tilelang_mhc_post() -> bool:
     return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
-
-
-# Fixed for the process and evaluated once at trace time: the platform probes
-# are not traceable. Once aiter is runtime-disabled it stays disabled, and the
-# kernel dispatch re-checks it.
-@torch.compiler.assume_constant_result
-def _mhc_pre_uses_torch() -> bool:
-    return not _use_aiter_mhc() and not _use_tilelang_mhc_pre()
-
-
-@torch.compiler.assume_constant_result
-def _mhc_post_uses_torch() -> bool:
-    return not _use_aiter_mhc() and not _use_tilelang_mhc_post()
 
 
 FP8 = "float8_e4m3"
@@ -1958,6 +1952,7 @@ def _mhc_post_torch(
     return out.type_as(x)
 
 
+# Only the kernel calls stay out of the graph; the torch path is traceable.
 def _mhc_pre_dispatch(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1972,49 +1967,6 @@ def _mhc_pre_dispatch(
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
-    if _mhc_pre_uses_torch():
-        # Pure torch stays traceable, so whole-graph compilers keep it in graph.
-        post_mix, comb_mix, layer_input = _mhc_pre_torch(
-            residual=residual,
-            fn=fn,
-            hc_scale=hc_scale,
-            hc_base=hc_base,
-            rms_eps=rms_eps,
-            hc_pre_eps=hc_pre_eps,
-            hc_sinkhorn_eps=hc_sinkhorn_eps,
-            hc_post_mult_value=hc_post_mult_value,
-            sinkhorn_repeat=sinkhorn_repeat,
-        )
-        return post_mix, comb_mix, layer_input, False
-    return _mhc_pre_kernel_dispatch(
-        residual=residual,
-        fn=fn,
-        hc_scale=hc_scale,
-        hc_base=hc_base,
-        rms_eps=rms_eps,
-        hc_pre_eps=hc_pre_eps,
-        hc_sinkhorn_eps=hc_sinkhorn_eps,
-        hc_post_mult_value=hc_post_mult_value,
-        sinkhorn_repeat=sinkhorn_repeat,
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-    )
-
-
-@torch._dynamo.disable
-def _mhc_pre_kernel_dispatch(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     if _use_aiter_mhc():
         result = _try_aiter_mhc_pre(
             residual=residual,
@@ -2047,7 +1999,7 @@ def _mhc_pre_kernel_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
-    post_mix, comb_mix, layer_input = mhc_pre(
+    post_mix, comb_mix, layer_input = torch._dynamo.disable(mhc_pre)(
         residual=residual,
         fn=fn,
         hc_scale=hc_scale,
@@ -2071,18 +2023,6 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
-    if _mhc_post_uses_torch():
-        return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
-    return _mhc_post_kernel_dispatch(x, residual, post_layer_mix, comb_res_mix)
-
-
-@torch._dynamo.disable
-def _mhc_post_kernel_dispatch(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_layer_mix: torch.Tensor,
-    comb_res_mix: torch.Tensor,
-) -> torch.Tensor:
     if _use_aiter_mhc():
         result = _try_aiter_mhc_post(
             x=x,
@@ -2095,7 +2035,7 @@ def _mhc_post_kernel_dispatch(
 
     if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
-    return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+    return torch._dynamo.disable(mhc_post)(x, residual, post_layer_mix, comb_res_mix)
 
 
 def hc_pre(

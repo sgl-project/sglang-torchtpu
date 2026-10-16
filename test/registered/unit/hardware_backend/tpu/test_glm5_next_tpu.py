@@ -14,8 +14,9 @@ import torch
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import (
-    _mhc_post_uses_torch,
-    _mhc_pre_uses_torch,
+    _use_aiter_mhc,
+    _use_tilelang_mhc_post,
+    _use_tilelang_mhc_pre,
     hc_post,
     hc_pre,
 )
@@ -56,8 +57,9 @@ class TestGlm5NextTpu(unittest.TestCase):
         with ExitStack() as stack:
             for env in _MHC_ENVS:
                 stack.enter_context(env.override(False))
-            self.assertTrue(_mhc_pre_uses_torch())
-            self.assertTrue(_mhc_post_uses_torch())
+            self.assertFalse(_use_aiter_mhc())
+            self.assertFalse(_use_tilelang_mhc_pre())
+            self.assertFalse(_use_tilelang_mhc_post())
 
     def test_nested_checkpoint_config_preserves_attention_types_and_gate(self):
         cfg = Glm5NextConfig(
