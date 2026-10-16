@@ -976,18 +976,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def keep_outputs_padded(self, batch: ForwardBatch) -> bool:
         from sglang_tpu.sampling.sampling_batch_info import supports_padded_sampling
 
-        info = getattr(batch, "sampling_info", None)
-        if not envs.SGLANG_TPU_HOST_PADDING.get() or info is None:
+        # EAGLE warmup and serving have different sampling_info values. Avoid
+        # guarding that metadata in compiled paths which cannot use this mode.
+        if not envs.SGLANG_TPU_HOST_PADDING.get() or batch.spec_info is not None:
             return False
-        if not supports_padded_sampling(info):
+        info = getattr(batch, "sampling_info", None)
+        if info is None or not supports_padded_sampling(info):
             return False
         parallel = get_parallel()
         config = self.model_runner.model_config
         observer = getattr(self.model_runner, "sampling_observer", None)
         return (
-            batch.spec_info is None
             # Beam-member tails are sliced by the worker before sampling.
-            and len(info) == getattr(batch, _REAL_B_KEY, batch.seq_lens.shape[0])
+            len(info) == getattr(batch, _REAL_B_KEY, batch.seq_lens.shape[0])
             and (
                 batch.forward_mode.is_decode()
                 or batch.forward_mode.is_extend_without_speculative()

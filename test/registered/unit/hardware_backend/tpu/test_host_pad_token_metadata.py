@@ -28,6 +28,34 @@ from sglang_tpu.compilation.decoder_compile_policy import (
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+class TestPaddedSamplingCompileGuards(CustomTestCase):
+    def test_ineligible_paths_do_not_guard_sampling_metadata(self):
+        policy = object.__new__(DecoderTpuCompilePolicy)
+
+        def forward(value, batch):
+            if policy.keep_outputs_padded(batch):
+                return value + 2
+            return value + 1
+
+        for enabled, speculative in ((False, False), (False, True), (True, True)):
+            with (
+                self.subTest(enabled=enabled, speculative=speculative),
+                envs.SGLANG_TPU_HOST_PADDING.override(enabled),
+            ):
+                torch._dynamo.reset()
+                self.addCleanup(torch._dynamo.reset)
+                batch = SimpleNamespace(
+                    spec_info=SimpleNamespace() if speculative else None,
+                    sampling_info=None,
+                )
+                compiled = torch.compile(forward, backend="eager", fullgraph=True)
+                value = torch.ones(2)
+                torch.testing.assert_close(compiled(value, batch), value + 1)
+                batch.sampling_info = SimpleNamespace(params_on_cpu=True)
+                with torch.compiler.set_stance("fail_on_recompile"):
+                    torch.testing.assert_close(compiled(value, batch), value + 1)
+
+
 class TestPositionOnHost(CustomTestCase):
     def test_compute_position_torch_cpu_staged(self):
         cases = (
