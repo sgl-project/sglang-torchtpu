@@ -904,12 +904,15 @@ class TestHostPadFieldSelection(CustomTestCase):
             _tpu_relay_bucketer=Bucketer("Bs", [1, 2, 4, 8]),
         )
         relay = HostPaddingFutureMap("cpu", SpeculativeAlgorithm.NONE, pool)
+        untouched_indices = torch.tensor([0, 2, 3, 5, 6, 8])
+        untouched_before = relay.output_tokens_buf[untouched_indices].clone()
         relay.stash(
             torch.tensor([7, 1, 4]), RelayPayload(bonus_tokens=torch.arange(8) + 10)
         )
         self.assertEqual(relay.gather(torch.tensor([4, 7])).tolist(), [12, 10])
-        self.assertEqual(relay.output_tokens_buf[0].item(), 0)
-        self.assertEqual(relay.output_tokens_buf[2].item(), 0)
+        torch.testing.assert_close(
+            relay.output_tokens_buf[untouched_indices], untouched_before
+        )
 
     def test_bucketed_relay_preserves_ci_consume_once_checks(self):
         from sglang.srt.managers import overlap_utils
