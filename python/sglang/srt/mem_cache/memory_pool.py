@@ -1091,6 +1091,11 @@ class MambaPool:
         self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
         self._warmup_fused_copy_slot_kernel()
 
+    @classmethod
+    def cache_bytes_per_request(cls, cache_params):
+        """Persistent recurrent/conv bytes per request across configured layers."""
+        return cache_params.mamba_cache_per_req
+
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache

@@ -37,6 +37,8 @@ class CompilePolicy(ABC):
     backend: ClassVar[str | None] = None
     fullgraph: ClassVar[bool] = True
     dynamic: ClassVar[bool] = False
+    # Identical executable graphs and interfaces across the supported TP group.
+    spmd_safe: bool = False
 
     def __init__(
         self,
@@ -72,7 +74,10 @@ class DecoderCompilePolicy(CompilePolicy):
     b_bucketer: Any | None = None
 
     def precompile_draft(
-        self, draft_attn_backend: Any, draft_extend_attn_backend: Any
+        self,
+        draft_attn_backend: Any,
+        draft_extend_attn_backend: Any,
+        fused_draft_forward: Callable[[ForwardBatch], Any] | None = None,
     ) -> None:
         """Run warmup after speculative-draft attention backends are available."""
 

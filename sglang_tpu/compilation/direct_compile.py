@@ -18,7 +18,7 @@ from jax import tree_util
 from torch._dynamo import eval_frame
 from torch._dynamo.utils import dynamo_timed
 from torch.nn.utils.stateless import _reparametrize_module
-from torch_tpu._internal import execution_mode
+from torch_tpu._internal import execution_mode, sync
 from torch_tpu._internal.compile import tpu_torch_compile
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -32,10 +32,13 @@ from sglang.srt.speculative.eagle_info import (
 from sglang_tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
 )
+from sglang_tpu.compilation.graph_identity import _key_value, canonical
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.pp_proxy_pytree import (
     register_pp_proxy_pytree,
 )
+from sglang_tpu.compilation.spmd_compiler import SPMDCompiler
+from sglang_tpu.compilation.warmup_queue import current_warmup_queue
 from sglang_tpu.rank_local import trace_rank
 
 logger = logging.getLogger(__name__)
@@ -138,6 +141,8 @@ def direct_compile(
     *,
     specialization_key: SpecializationKey,
     lift_rank: bool = False,
+    name: str | None = None,
+    spmd_safe: bool = False,
     model: torch.nn.Module | None = None,
     model_extra_tensor_attrs: Sequence[str] = (),
     kv_pool: KVPool | None = None,
@@ -155,6 +160,14 @@ def direct_compile(
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
     ``lift_rank`` also passes the logical distributed rank as a tensor input,
     so rank-local operations can select their data without specializing the graph.
+
+    ``name`` identifies the compilation boundary independently of rank, such as
+    ``"target/model.forward"``. It is required with ``spmd_safe=True`` and combines
+    with the complete ``specialization_key`` to identify a graph across ranks.
+    ``spmd_safe`` declares eligibility; it neither verifies nor enables sharing.
+    Enable coordination with ``--use-spmd-compile`` and add a recipe test using
+    ``sglang_tpu.testing.spmd_safe`` to validate identical graphs and input layouts
+    on every rank. ``VERIFY_SPMD_SAFE=1`` runs that verification without execution.
 
     ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
     Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
@@ -232,6 +245,8 @@ def direct_compile(
         fn,
         specialization_key=specialization_key,
         lift_rank=lift_rank,
+        name=name,
+        spmd_safe=spmd_safe,
         model=model,
         model_extra_tensor_attrs=model_extra_tensor_attrs,
         kv_pool=kv_pool,
@@ -255,6 +270,8 @@ class CompiledFunction:
         *,
         specialization_key: SpecializationKey,
         lift_rank: bool = False,
+        name: str | None = None,
+        spmd_safe: bool = False,
         model: torch.nn.Module | None = None,
         model_extra_tensor_attrs: Sequence[str] = (),
         kv_pool: KVPool | None = None,
@@ -278,6 +295,10 @@ class CompiledFunction:
         self._ignored_argnames = ignored_argnames
         self._prune_unused_inputs = prune_unused_inputs
         self._uses_rng = uses_rng
+        if spmd_safe and name is None:
+            raise ValueError("spmd_safe=True requires passing name= to direct_compile")
+        self._name = name
+        self._spmd_safe = spmd_safe
         self._lift_rank = lift_rank
         self._rank_input: torch.Tensor | None = None
 
@@ -304,10 +325,26 @@ class CompiledFunction:
         async_compile: bool = False,
     ) -> _CompiledArtifact:
         key = self.specialization_key(*args, **kwargs)
+        queue = current_warmup_queue() if async_compile and self._spmd_safe else None
+        spmd_compiler = queue.spmd_compiler if queue is not None else None
+        graph = (
+            f"{self._name}:{canonical(_key_value(key))}"
+            if spmd_compiler is not None
+            else None
+        )
         artifact = self.cache.get(key)
+        if spmd_compiler is not None and (
+            artifact is None or artifact.pending_compile is not spmd_compiler
+        ):
+            # Each queue must cover every key even if local caches differ across ranks.
+            artifact = None
         if artifact is None:
             # set_stance has no public getter and replaces eval_frame._stance.
-            if self.cache and eval_frame._stance.stance == "fail_on_recompile":
+            if (
+                spmd_compiler is None
+                and self.cache
+                and eval_frame._stance.stance == "fail_on_recompile"
+            ):
                 raise RuntimeError(
                     "Detected recompile when torch.compile stance is "
                     "'fail_on_recompile'. direct_compile specialization key: "
@@ -316,7 +353,15 @@ class CompiledFunction:
             logger.info(
                 "[direct_compile] new specialization %r (async=%s)", key, async_compile
             )
-            artifact = self._compile(args, kwargs, async_compile=async_compile)
+            if spmd_compiler is not None:
+                spmd_compiler.enqueue(graph)
+            artifact = self._compile(
+                args,
+                kwargs,
+                async_compile=async_compile,
+                spmd_compiler=spmd_compiler,
+                graph=graph,
+            )
             self.cache[key] = artifact
         return artifact
 
@@ -326,10 +371,14 @@ class CompiledFunction:
         kwargs: dict[str, Any],
         *,
         async_compile: bool = False,
+        spmd_compiler: SPMDCompiler | None = None,
+        graph: str | None = None,
     ) -> _CompiledArtifact:
         """Compile one specialization into a PJRT executable."""
 
         # Step 1: Figure out a flat list of Tensor inputs.
+        if spmd_compiler is not None and self._uses_rng:
+            raise ValueError("Shared TPU compilation requires explicit RNG inputs")
         call = (args, kwargs)
         # Yes, use jax's tree_util API. jax is required for pallas anyways
         # and their tree_util API is pretty nice.
@@ -413,6 +462,8 @@ class CompiledFunction:
         kv_pool_input_stop = kv_pool_input_start + len(kv_pool_inputs)
         flat_inputs = [*model_inputs, *kv_pool_inputs]
         flat_inputs.extend(path_leaves[index][1] for index in tensor_leaf_indices)
+        if spmd_compiler is not None:
+            sync.synchronize(flat_inputs)
 
         # Step 2: We've figured out all of our args. Now, we can create
         # placeholders for them. These will all be inputs to the MLIR graph.
@@ -572,9 +623,17 @@ class CompiledFunction:
         start = time.perf_counter()
         if async_compile:
             with dynamo_timed("direct_compile_async_submit"):
-                pending_compile = tpu_torch_compile.async_traverse_and_compile(
-                    result_tensors, graph_inputs, argument_layouts=argument_layouts
-                )
+                if spmd_compiler is None:
+                    pending_compile = tpu_torch_compile.async_traverse_and_compile(
+                        result_tensors, graph_inputs, argument_layouts=argument_layouts
+                    )
+                else:
+                    pending_compile = spmd_compiler.compile(
+                        result_tensors,
+                        graph_inputs,
+                        argument_layouts=argument_layouts,
+                        graph=graph,
+                    )
             logger.info(
                 "[direct_compile] native async submission %.3fs (ready=%s)",
                 time.perf_counter() - start,

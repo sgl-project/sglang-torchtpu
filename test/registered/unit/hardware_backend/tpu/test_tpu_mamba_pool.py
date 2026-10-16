@@ -18,8 +18,8 @@ layout and slot bookkeeping that the fused Pallas GDN kernel depends on:
 * recurrent buffer is ``[size+1, n_v, d_k, d_v]`` per layer (swapped vs.
   the GPU ``[..., n_v, d_v, d_k]``);
 * slot 0 is reserved; ``alloc``/``free`` cycle real slots ``1..size``;
-* ``clear_slots`` is a no-op (kernel masks stale slots via
-  ``has_initial_state``) and ``copy_from`` clones every layer for radix CoW;
+* ``clear_slots`` resets speculative checkpoint offsets; ``copy_from`` clones
+  non-speculative state for radix CoW.
 * ReplaySSM is disabled here, but its flags must still be *present* --
   the shared req-slot alloc path reads them without a hasattr guard.
 """
@@ -78,6 +78,34 @@ class TestTpuMambaPool(CustomTestCase):
             cache_params=cp,
             mamba_layer_ids=self.LAYERS,
             device="cpu",
+        )
+
+    def test_speculative_checkpoint_storage_and_commit(self):
+        cp = _make_cache_params(
+            self.N_KQ, self.N_V, self.D_K, self.D_V, self.K, self.LAYERS
+        )
+        pool = TpuMambaPool(
+            size=3,
+            spec_state_size=3,
+            cache_params=cp,
+            mamba_layer_ids=self.LAYERS,
+            device="cpu",
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+        )
+        self.assertEqual(pool.checkpoint_width, 4)
+        self.assertEqual(pool.mamba_cache.temporal[0].shape[0], 16)
+        pool.select_checkpoints(torch.tensor([1, 3]), torch.tensor([2, 0]))
+        self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 2, 0, 0])
+        # Reordered batch, null padding, and inactive rows do not change another request.
+        pool.select_checkpoints(torch.tensor([3, 1, 0]), torch.tensor([3, -1, 2]))
+        self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 2, 0, 3])
+        pool.clear_slots(torch.tensor([1]))
+        self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 0, 0, 3])
+        # fp32 accounting covers all allocated checkpoint buffers conservatively.
+        self.assertEqual(
+            pool.get_kv_size_bytes(),
+            (pool.size + 1) * 4 * pool.cache_bytes_per_request(cp),
         )
 
     def test_disabled_replayssm_surface_covers_base(self):
@@ -292,11 +320,11 @@ class TestTpuMambaPool(CustomTestCase):
                 reqs[0].kv.mamba_next_track_idx = 0
                 reqs[0].kv.mamba_ping_pong_track_buffer = buffers[0]
 
-    def test_speculative_unsupported(self):
+    def test_speculative_pool_must_fit_request_pool(self):
         cp = _make_cache_params(
             self.N_KQ, self.N_V, self.D_K, self.D_V, self.K, self.LAYERS
         )
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(ValueError, "active state pool"):
             TpuMambaPool(
                 size=self.SIZE,
                 spec_state_size=4,

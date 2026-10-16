@@ -413,7 +413,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
     def test_unsupported_builtin_spec_algorithm_is_rejected(self):
         args = self._args(speculative_algorithm="NGRAM")
-        with self.assertRaisesRegex(NotImplementedError, "only EAGLE3"):
+        with self.assertRaisesRegex(NotImplementedError, "only EAGLE"):
             self._apply(args)
 
     def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):

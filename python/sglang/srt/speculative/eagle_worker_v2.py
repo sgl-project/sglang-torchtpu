@@ -61,6 +61,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_flags,
     get_model,
     get_parallel,
     get_schedule,
@@ -819,7 +820,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return tree_outputs
 
     def _should_fuse_draft_steps(self) -> bool:
-        return _is_tpu and self.speculative_num_steps > 1
+        return (
+            _is_tpu
+            and get_flags().capture.enable_torch_compile
+            and self.speculative_num_steps > 1
+        )
 
     def _fused_draft_steps(
         self,

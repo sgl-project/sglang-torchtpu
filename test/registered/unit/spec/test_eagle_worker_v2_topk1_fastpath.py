@@ -221,12 +221,34 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
     def test_fused_steps_support_both_compile_tracers(self):
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
 
-        with patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True):
+        with (
+            patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_flags",
+                return_value=SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=True)
+                ),
+            ),
+        ):
             worker.server_args.tpu_compile_tracer = "dynamo"
             self.assertTrue(worker._should_fuse_draft_steps())
 
             worker.server_args.tpu_compile_tracer = "direct"
             self.assertTrue(worker._should_fuse_draft_steps())
+
+    def test_eager_tpu_does_not_enter_compiled_draft_loop(self):
+        """Eager MTP must not call methods missing from NoopCompilePolicy."""
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        with (
+            patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_flags",
+                return_value=SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=False)
+                ),
+            ),
+        ):
+            self.assertFalse(worker._should_fuse_draft_steps())
 
     def test_fused_steps_thread_per_step_inputs(self):
         from sglang_tpu.eagle_utils_tpu import (
@@ -433,6 +455,12 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
 
         with (
             patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_flags",
+                return_value=SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=True)
+                ),
+            ),
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
                 return_value=(forward_batch, False),

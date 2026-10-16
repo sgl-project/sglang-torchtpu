@@ -2352,14 +2352,12 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
 
         self.assertEqual(draft_extend_backend.calls, [(4, 1), (16, 4)])
 
-    def test_non_eagle3_algorithm_raises(self):
-        # The spec policy enforces the supported algorithm at construction (only
-        # EAGLE3 today); an unsupported algorithm fails loudly rather than
-        # silently degrading to a non-spec policy.
+    def test_non_eagle_family_algorithm_raises(self):
+        # Unsupported algorithms must fail instead of running a non-spec policy.
         mr = _spec_model_runner()
         # The algorithm is read from get_spec() as the policy is constructed.
         self.publish_config(speculative_algorithm="NGRAM")
-        with self.assertRaisesRegex(ValueError, "only supports EAGLE3"):
+        with self.assertRaisesRegex(ValueError, "supports EAGLE, EAGLE3 and NEXTN"):
             _make_spec_policy(mr)
 
 
@@ -4479,6 +4477,66 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         self.assertTrue(torch.all(logits[LOGICAL_TOKENS:] == 0))
         finalized, _ = policy.finalize_spec_verify(padding, result, (None, None))
         self.assertEqual(finalized[1].shape, (BS,))
+
+
+class TestDraftTensorVocabBounds(CustomTestCase):
+    def test_padding_added_vocab_and_shared_weight_survive_install(self):
+        """Mask shard boundaries and LoRA padding without replacing shared weights."""
+        from sglang.srt.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+            get_masked_input_and_mask,
+        )
+        from sglang_tpu.draft_embedding import install_tensor_vocab_bounds
+
+        # TPU backend initialization unwraps this dynamic CPU/CUDA compile wrapper.
+        self.enterContext(
+            patch(
+                "sglang_tpu.draft_embedding.get_masked_input_and_mask",
+                get_masked_input_and_mask.__wrapped__,
+            )
+        )
+        embedding = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+        torch.nn.Module.__init__(embedding)
+        embedding.tp_size = 4
+        embedding.output_dtype = torch.float32
+        embedding.shard_indices = SimpleNamespace(
+            org_vocab_start_index=4,
+            org_vocab_end_index=7,
+            num_org_vocab_padding=1,
+            added_vocab_start_index=16,
+            added_vocab_end_index=18,
+        )
+        embedding.weight = torch.nn.Parameter(torch.arange(12.0).reshape(6, 2))
+        embedding.quant_method = SimpleNamespace(
+            embedding=lambda module, ids: torch.nn.functional.embedding(
+                ids, module.weight
+            )
+        )
+        shared_weight = embedding.weight
+        install_tensor_vocab_bounds(embedding)
+        bounds = embedding._tpu_vocab_bounds
+        install_tensor_vocab_bounds(embedding)
+        self.assertIs(embedding._tpu_vocab_bounds, bounds)
+        self.assertIs(embedding.weight, shared_weight)
+        self.assertNotIn("_tpu_vocab_bounds", embedding.state_dict())
+        ids = torch.tensor([3, 4, 6, 7, 15, 16, 17, 18])
+        expected = torch.zeros(8, 2)
+        expected[[1, 2, 5, 6]] = shared_weight[[0, 2, 4, 5]]
+        torch.testing.assert_close(embedding._embed_local_shard(ids), expected)
+        # Target/draft weight sharing may replace the parameter after installation.
+        embedding.weight = torch.nn.Parameter(shared_weight.detach() + 10)
+        expected[[1, 2, 5, 6]] += 10
+        torch.testing.assert_close(embedding._embed_local_shard(ids), expected)
+
+    def test_unsharded_embedding_is_unchanged(self):
+        from sglang_tpu.draft_embedding import install_tensor_vocab_bounds
+
+        embedding = torch.nn.Embedding(8, 2)
+        embedding.tp_size = 1
+        before = embedding(torch.tensor([0, 7]))
+        install_tensor_vocab_bounds(embedding)
+        torch.testing.assert_close(embedding(torch.tensor([0, 7])), before)
+        self.assertEqual(list(embedding.buffers()), [])
 
 
 if __name__ == "__main__":

@@ -424,14 +424,19 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
     is irrelevant here (state is always updated).
     """
 
-    commits_verify_by_read_offset = True
-
     def __init__(self, model_runner: "ModelRunner"):
         super().__init__(model_runner)
         # Build (and JAX-export) the custom op eagerly at construction time so
         # the heavyweight export does not happen inside a torch.compile trace.
         self._op = build_gdn_pallas_op()
         self._extra_buffer_enabled = get_exec().mamba.enable_mamba_extra_buffer
+        if (
+            self._extra_buffer_enabled
+            and self.req_to_token_pool.mamba_pool.checkpoint_width > 1
+        ):
+            raise NotImplementedError(
+                "TPU GDN speculative prefix caching is unsupported"
+            )
         if self._extra_buffer_enabled:
             self.req_to_token_pool.mamba_pool.warmup_state_copy(
                 self.req_to_token_pool.size
@@ -447,10 +452,10 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # (see _get_distribution), so each runs one kernel pass instead of both.
         self._is_decode = False
         mamba_pool = self.req_to_token_pool.mamba_pool
-        self._spec_window = mamba_pool.spec_window
+        self._spec_window = mamba_pool.checkpoint_width
         # DP attention pads slot ids with -1, which index_copy_ cannot take.
         self._clamp_verify_slots = get_parallel().attn_dp_enabled
-        self._read_offsets_pool = mamba_pool.read_offsets
+        self._read_offsets_pool = mamba_pool.checkpoint_read_offsets
         # Per-forward verify state: the window's read offsets and slot ids.
         self._read_offsets: Optional[torch.Tensor] = None
         self._num_spec_tokens = 0
@@ -623,13 +628,26 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         return seq_lens + self._spec_window if is_verify else seq_lens
 
-    def commit_verify(self, last_correct_step_indices: torch.Tensor) -> None:
+    def commit_mamba_state_after_verify(
+        self,
+        last_correct_step_indices,
+        mamba_track_indices,
+        mamba_steps_to_track,
+        req_pool_indices=None,
+    ) -> bool:
         """Point each verified slot's next read at its last accepted checkpoint."""
-        num_reqs = last_correct_step_indices.shape[0]
-        rows = last_correct_step_indices
-        if rows.dtype != torch.int32:
-            rows = rows.to(torch.int32)
-        self._read_offsets_pool.index_copy_(0, self._verify_slots[:num_reqs], rows)
+        if mamba_track_indices is not None:
+            raise NotImplementedError(
+                "TPU GDN speculative prefix caching is unsupported"
+            )
+        if req_pool_indices is None:
+            slots = self._verify_slots[: last_correct_step_indices.shape[0]]
+        else:
+            slots = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        self.req_to_token_pool.mamba_pool.select_checkpoints(
+            slots.clamp(min=0), last_correct_step_indices
+        )
+        return True
 
     def _run(
         self,

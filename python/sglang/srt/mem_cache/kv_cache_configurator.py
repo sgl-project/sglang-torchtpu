@@ -2802,7 +2802,10 @@ class KVCacheConfigurator:
             max_stage_mamba_layers = len(all_mamba_layers)
         pp_layer_scale = max_stage_mamba_layers / max(len(all_mamba_layers), 1)
         stage_per_req = int(
-            config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale
+            current_platform.get_mamba_pool_cls().cache_bytes_per_request(
+                config.mamba2_cache_params
+            )
+            * pp_layer_scale
         )
 
         has_spec_dec = not self.spec_algorithm.is_none()

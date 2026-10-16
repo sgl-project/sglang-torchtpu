@@ -68,9 +68,16 @@ class MambaAttnBackendBase(AttentionBackend):
     # by KDAAttnBackend where `_can_fuse_accept_state` holds. None everywhere
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
     accept_lens_pool: Optional[torch.Tensor] = None
-    # True when verify writes one state checkpoint per window position and the
-    # commit only records which one the next forward reads (TPU GDN/KDA).
-    commits_verify_by_read_offset: bool = False
+
+    def commit_mamba_state_after_verify(
+        self,
+        last_correct_step_indices,
+        mamba_track_indices,
+        mamba_steps_to_track,
+        req_pool_indices=None,
+    ) -> bool:
+        """Return True when a backend owns its speculative state commit."""
+        return False
 
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
@@ -1431,9 +1438,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool_indices: Optional[torch.Tensor] = None,
     ):
         """Commit accepted Mamba states; PP rows identify the delayed batch."""
-        if self.linear_attn_backend.commits_verify_by_read_offset:
-            assert mamba_track_indices is None, "read-offset commit runs with radix off"
-            self.linear_attn_backend.commit_verify(last_correct_step_indices)
+        if self.linear_attn_backend.commit_mamba_state_after_verify(
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            req_pool_indices,
+        ):
             return
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None

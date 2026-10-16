@@ -17,20 +17,21 @@ GDN backend passes the per-layer table straight to the op with no per-forward
 transpose.
 
 
-Slot 0 is a reserved null block (padded / invalid tokens); real slots are
-``1 .. size``. With speculative decoding every slot index ``r`` owns a group of
-``spec_window`` consecutive state rows ``[r * W, (r + 1) * W)``, one checkpoint
-per verify position, and ``read_offsets[r]`` names the committed one. The
-kernel masks reads on fresh requests via ``has_initial_state`` (derived from
-``seq_lens - query_lens``), so slot reuse needs **no** explicit clearing — hence
-``clear_slots`` is a no-op here and no dynamic in-place scatter is required on
-device.
+Without speculation, slot 0 is reserved for padding and real slots are
+``1 .. size``. With speculation, each slot expands to ``checkpoint_width``
+consecutive states, one per verify input. A per-request offset selects the
+last accepted state for the next forward, avoiding a full-state copy.
+
+The kernel masks reads on fresh requests via ``has_initial_state`` (derived
+from ``seq_lens - query_lens``), so slot reuse needs no full-state clearing.
+``clear_slots`` only resets the small checkpoint-offset vector when present.
 
 Selected by ``TpuSRTPlatform.get_mamba_pool_cls`` and instantiated from
 ``HybridReqToTokenPool._init_mamba_pool``.
 """
 
 import logging
+import math
 from typing import List, Optional
 
 import msgspec
@@ -102,10 +103,23 @@ class TpuMambaPool(MambaPool):
         # NOTE: deliberately does NOT call super().__init__ — the base
         # allocator is CUDA/NPU/CPU-specific. We reproduce only the pieces the
         # TPU GDN path needs.
-        if speculative_eagle_topk is not None and speculative_eagle_topk > 1:
-            raise NotImplementedError(
-                "Tree speculative verify is not supported by the TPU GDN state pool."
+        self.checkpoint_width = speculative_num_draft_tokens or 1
+        if self.checkpoint_width < 1:
+            raise ValueError("GDN checkpoint width must be positive")
+        if self.checkpoint_width > 1 and (speculative_eagle_topk or 1) != 1:
+            raise NotImplementedError("TPU GDN supports linear-chain speculation only")
+        if self.checkpoint_width > 1 and size > spec_state_size:
+            raise ValueError(
+                "TPU GDN speculation requires the active state pool to fit the "
+                "request pool; disable radix cache and cap --max-mamba-cache-size "
+                "at --max-running-requests."
             )
+        state_slots = (size + 1) * self.checkpoint_width
+        self.checkpoint_read_offsets = (
+            torch.zeros(size + 1, dtype=torch.int32, device=device)
+            if self.checkpoint_width > 1
+            else None
+        )
         if enable_linear_replayssm:
             raise NotImplementedError(
                 "GDN ReplaySSM ring buffers are not supported on the TPU GDN "
@@ -129,11 +143,6 @@ class TpuMambaPool(MambaPool):
         )
         self.size = size
         self.device = device
-        # Rows per slot: the verify window (anchor + drafts), or 1 without spec.
-        self.spec_window = int(speculative_num_draft_tokens or 1)
-        rows = (size + 1) * self.spec_window
-        # Checkpoint row within the slot's group that the next forward reads.
-        self.read_offsets = torch.zeros(size + 1, dtype=torch.int32, device=device)
         self.num_mamba_layers = num_mamba_layers
         # TPU does not use NVLink custom mem pools.
         self.enable_custom_mem_pool = False
@@ -176,7 +185,7 @@ class TpuMambaPool(MambaPool):
         conv_state = [
             [
                 torch.zeros(
-                    (rows, conv_dim_km1[1], 1, conv_dim_km1[0]),
+                    (state_slots, conv_dim_km1[1], 1, conv_dim_km1[0]),
                     dtype=conv_dtype,
                     device=device,
                 )
@@ -185,11 +194,11 @@ class TpuMambaPool(MambaPool):
             for conv_dim_km1 in conv_state_shapes
         ]
 
-        # recurrent: kernel-native [size+1, n_v, d_k, d_v] per layer
+        # recurrent: kernel-native [state_slots, n_v, d_k, d_v] per layer
         # (GPU stores [..., n_v, d_v, d_k]; we swap the trailing two axes).
         temporal_state = [
             torch.zeros(
-                (rows, n_v, d_k, d_v),
+                (state_slots, n_v, d_k, d_v),
                 dtype=ssm_dtype,
                 device=device,
             )
@@ -199,10 +208,9 @@ class TpuMambaPool(MambaPool):
         self.mamba_cache = TpuPerLayerState(conv=conv_state, temporal=temporal_state)
         self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
         logger.info(
-            "TPU Mamba/GDN state cache allocated: max_size=%d, spec_window=%d, "
-            "layers=%d, per-layer conv=%s%s, per-layer recurrent=%s (mem=%.3fGB)",
+            "TPU Mamba/GDN state cache allocated: max_size=%d, layers=%d, "
+            "per-layer conv=%s%s, per-layer recurrent=%s (mem=%.3fGB)",
             size,
-            self.spec_window,
             num_mamba_layers,
             list(conv_state[0][0].shape),
             "" if len(conv_state) == 1 else f" x{len(conv_state)}",
@@ -216,17 +224,38 @@ class TpuMambaPool(MambaPool):
         # Keeping IDs here avoids variable-size TPU casts/pads and host readbacks.
         return "cpu"
 
+    @classmethod
+    def cache_bytes_per_request(cls, cache_params):
+        # Both TPU state regions use fp32, including the conv taps.
+        elements = sum(math.prod(shape) for shape in cache_params.shape.conv)
+        elements += math.prod(cache_params.shape.temporal)
+        return elements * 4 * len(cache_params.layers)
+
+    def select_checkpoints(self, indices, last_correct_step_indices):
+        """Record the state after the final accepted verify input, without copying HBM."""
+        if self.checkpoint_read_offsets is None:
+            raise RuntimeError("GDN checkpoint storage was not allocated")
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        offsets = last_correct_step_indices.to(device=self.device, dtype=torch.int32)
+        previous = self.checkpoint_read_offsets.index_select(0, indices)
+        # Negative steps denote inactive requests. The null slot stays inert.
+        offsets = torch.where((indices > 0) & (offsets >= 0), offsets, previous)
+        self.checkpoint_read_offsets.index_copy_(0, indices, offsets)
+
     def clear_slots(self, indices: torch.Tensor):
-        """No-op on TPU.
+        """Reset checkpoint selection when a request slot is reused.
 
         The fused GDN kernel zeroes a slot's contribution whenever
         ``has_initial_state`` is False (a fresh request), so reused slots need
-        no explicit clearing and we avoid a dynamic in-place device scatter.
+        no full-state clearing. Only the small checkpoint-offset vector is reset.
         Note that the masking is derived from ``query_lens``, so anything that
         corrupts ``query_start_loc`` makes the predicate read True for a fresh
         request and resurrects the previous occupant's state.
         """
-        return
+        if self.checkpoint_read_offsets is not None:
+            self.checkpoint_read_offsets.index_fill_(
+                0, indices.to(device=self.device, dtype=torch.int64), 0
+            )
 
     def _copy_states(self):
         return [
@@ -239,9 +268,9 @@ class TpuMambaPool(MambaPool):
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         if src_indices.numel() == 0:
             return
-        if self.spec_window > 1:
-            # Slot ids address groups of spec_window checkpoint rows here, and
-            # the committed row is read_offsets[slot], not the slot itself.
+        if self.checkpoint_width > 1:
+            # Slot ids address groups of checkpoint rows here, and the committed
+            # row is checkpoint_read_offsets[slot], not the slot itself.
             raise NotImplementedError(
                 "Copying GDN/KDA state between slots (radix prefix cache) is not "
                 "supported together with speculative decoding on TPU."

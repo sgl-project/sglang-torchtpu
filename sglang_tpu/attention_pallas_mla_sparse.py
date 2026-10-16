@@ -232,6 +232,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             metadata.distribution,
             weight_scale,
             self._topk,
+            metadata.decode_query_size,
         )
 
     def _forward_mla(
