@@ -69,16 +69,6 @@ class MambaAttnBackendBase(AttentionBackend):
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
     accept_lens_pool: Optional[torch.Tensor] = None
 
-    def commit_mamba_state_after_verify(
-        self,
-        last_correct_step_indices,
-        mamba_track_indices,
-        mamba_steps_to_track,
-        req_pool_indices=None,
-    ) -> bool:
-        """Return True when a backend owns its speculative state commit."""
-        return False
-
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
         super().__init__()
@@ -119,6 +109,25 @@ class MambaAttnBackendBase(AttentionBackend):
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
+
+    def commit_verified_states(
+        self,
+        mamba_caches,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+        src_indices_raw: Optional[torch.Tensor],
+    ) -> None:
+        """Commit each verified request's state at its last accepted token."""
+        scatter_mamba_states_after_mtp_verify(
+            mamba_caches,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
+        )
 
     @property
     def mamba_chunk_size(self) -> int:
@@ -1438,13 +1447,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool_indices: Optional[torch.Tensor] = None,
     ):
         """Commit accepted Mamba states; PP rows identify the delayed batch."""
-        if self.linear_attn_backend.commit_mamba_state_after_verify(
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-            req_pool_indices,
-        ):
-            return
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
@@ -1523,13 +1525,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        scatter_mamba_states_after_mtp_verify(
+        self.linear_attn_backend.commit_verified_states(
             mamba_caches,
             state_indices_tensor,
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
+            src_indices_raw,
         )
 
         self._update_ple_state_after_mtp_verify(

@@ -231,6 +231,10 @@ class TpuMambaPool(MambaPool):
         elements += math.prod(cache_params.shape.temporal)
         return elements * 4 * len(cache_params.layers)
 
+    def get_speculative_mamba2_params_all_layers(self) -> TpuPerLayerState:
+        """Verify checkpoints live in the main cache."""
+        return self.mamba_cache
+
     def select_checkpoints(self, indices, last_correct_step_indices):
         """Record the state after the final accepted verify input, without copying HBM."""
         if self.checkpoint_read_offsets is None:

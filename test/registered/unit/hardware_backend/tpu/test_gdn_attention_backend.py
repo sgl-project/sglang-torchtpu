@@ -48,14 +48,10 @@ class _BackendNoInit(TpuGDNAttnBackend):
     def __init__(self):  # noqa: D107  (deliberately skips super().__init__)
         self._distribution_cache = {}
         self._query_start_loc_cache = {}
-        self._slot_memo = None
         self._spec_window = 1
-        self._clamp_verify_slots = False
         self._read_offsets_pool = None
         self._read_offsets = None
         self._num_spec_tokens = 0
-        self._verify_slots = None
-        self._model_runner = SimpleNamespace(attn_backend=None)
 
 
 class TestGDNDistribution(CustomTestCase):
@@ -130,8 +126,6 @@ class TestGDNSinglePassFlags(CustomTestCase):
             mamba2_layer_cache=lambda _: cache,
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
-            req_index_to_mamba_index_mapping=torch.zeros(1),
-            mamba_v2p_table=None,
         )
         batch = SimpleNamespace(
             seq_lens=torch.full((bs,), 5),
@@ -190,8 +184,6 @@ class TestGDNVerifyMetadata(CustomTestCase):
             mamba_pool=SimpleNamespace(select_checkpoints=Mock()),
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
-            req_index_to_mamba_index_mapping=torch.zeros(1),
-            mamba_v2p_table=None,
         )
         return backend
 
@@ -228,14 +220,28 @@ class TestGDNVerifyMetadata(CustomTestCase):
 
     def test_commit_selects_checkpoints_for_the_verified_slots(self):
         backend = self._backend(torch.zeros(3, dtype=torch.int32))
-        backend.init_forward_metadata(self._batch(ForwardMode.TARGET_VERIFY))
         steps = torch.tensor([1, -1])
-        self.assertTrue(backend.commit_mamba_state_after_verify(steps, None, None))
+        # A DP pad slot (-1) maps to the null slot, which the pool keeps inert.
+        backend.commit_verified_states(
+            None, torch.tensor([2, -1]), steps, None, None, None
+        )
         slots, got_steps = (
             backend.req_to_token_pool.mamba_pool.select_checkpoints.call_args.args
         )
-        self.assertEqual(slots.tolist(), [2, 1])
+        self.assertEqual(slots.tolist(), [2, 0])
         self.assertIs(got_steps, steps)
+
+    def test_commit_rejects_radix_tracking(self):
+        backend = self._backend(torch.zeros(3, dtype=torch.int32))
+        with self.assertRaises(NotImplementedError):
+            backend.commit_verified_states(
+                None,
+                torch.tensor([2]),
+                torch.tensor([1]),
+                torch.tensor([3]),
+                torch.tensor([1]),
+                None,
+            )
 
 
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")

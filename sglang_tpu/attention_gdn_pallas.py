@@ -30,18 +30,15 @@ Sibling to :mod:`sglang_tpu.attention_pallas_rpa_v3`
 # reject them.
 
 import logging
-import weakref
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-    HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang_tpu.attention_pallas_rpa_base import PallasForwardMetadata
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -453,49 +450,13 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._is_decode = False
         mamba_pool = self.req_to_token_pool.mamba_pool
         self._spec_window = mamba_pool.checkpoint_width
-        # DP attention pads slot ids with -1, which index_copy_ cannot take.
-        self._clamp_verify_slots = get_parallel().attn_dp_enabled
         self._read_offsets_pool = mamba_pool.checkpoint_read_offsets
-        # Per-forward verify state: the window's read offsets and slot ids.
         self._read_offsets: Optional[torch.Tensor] = None
         self._num_spec_tokens = 0
-        self._verify_slots: Optional[torch.Tensor] = None
         # Cache the (shape-static) distribution vector across forwards, keyed by
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
         self._query_start_loc_cache: dict = {}
-        self._slot_memo: Optional[tuple] = None
-
-    def _slot_indices(
-        self, req_pool_indices: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """(slot ids, int32 slot ids) of the batch's requests.
-
-        An unchanged batch reuses the last result: the gather and the cast are
-        two launches per round otherwise. The request-to-slot table is written
-        in place only when a request is allocated, which bumps its version.
-        """
-        pool = self.req_to_token_pool
-        table = pool.req_index_to_mamba_index_mapping
-        memo = self._slot_memo
-        if (
-            memo is not None
-            and memo[0]() is req_pool_indices
-            and memo[1] == req_pool_indices._version
-            and memo[2] == table._version
-        ):
-            return memo[3], memo[4]
-        slots = self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices))
-        slots_i32 = slots.to(torch.int32)
-        if pool.mamba_v2p_table is None:
-            self._slot_memo = (
-                weakref.ref(req_pool_indices),
-                req_pool_indices._version,
-                table._version,
-                slots,
-                slots_i32,
-            )
-        return slots, slots_i32
 
     def _uniform_query_start_loc(
         self, padded_bs: int, step: int, device: torch.device
@@ -544,12 +505,17 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._is_decode = is_decode
         # Full per-request sequence length including this forward's tokens (the
         # verify window too); the kernel derives has_initial_state from it.
-        self._seq_lens = self._full_attn_kv_lens(forward_batch, is_verify=is_verify)
+        self._seq_lens = forward_batch.seq_lens.to(torch.int32)
+        if is_verify:
+            self._seq_lens = self._seq_lens + self._spec_window
         # Build only TPU metadata. The GPU base constructs variable-length
         # tracked-row selections and reads device masks on the host. Here every
         # row retains its bucket slot and disabled snapshots use end=-1.
         # Slot ids; the op clamps the -1 pad in-graph (see build_gdn_pallas_op).
-        slots, self._state_indices = self._slot_indices(forward_batch.req_pool_indices)
+        slots = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        )
+        self._state_indices = slots.to(torch.int32)
         padded_bs = forward_batch.seq_lens.shape[0]
         if is_decode:
             # One token per request, or the verify window per request.
@@ -596,58 +562,39 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
     def _init_spec_metadata(self, forward_batch: "ForwardBatch") -> None:
         self._read_offsets = None
         self._num_spec_tokens = 0
-        self._verify_slots = None
         if self._spec_window == 1:
             return
         mode = forward_batch.forward_mode
-        # index_copy_ / index_fill_ take int64 slot ids.
-        slots = self._state_indices.long()
         if mode.is_target_verify():
-            if self._clamp_verify_slots:
-                slots = slots.clamp(min=0)
             # Checkpoint rows are laid out per pool window; a different verify
             # width (adaptive spec) would read and commit the wrong rows.
             assert forward_batch.spec_info.num_tokens_per_req == self._spec_window
             self._read_offsets = self._read_offsets_pool
             self._num_spec_tokens = self._spec_window - 1
-            self._verify_slots = slots
         elif mode.is_extend():
             # Extend writes its final state to checkpoint row 0 of the group.
-            self._read_offsets_pool.index_fill_(0, slots.clamp(min=0), 0)
+            self._read_offsets_pool.index_fill_(
+                0, self._state_indices.clamp(min=0).long(), 0
+            )
 
-    def _full_attn_kv_lens(self, forward_batch, *, is_verify: bool) -> torch.Tensor:
-        """RPA's int32 kv_lens for this forward, else a fresh cast of seq_lens.
-
-        Relies on HybridLinearAttnBackend initializing the full-attention backend
-        before this one in the same forward."""
-        full = self._model_runner.attn_backend
-        if isinstance(full, HybridLinearAttnBackend) and isinstance(
-            full.full_attn_backend.forward_metadata, PallasForwardMetadata
-        ):
-            return full.full_attn_backend.forward_metadata.kv_lens
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        return seq_lens + self._spec_window if is_verify else seq_lens
-
-    def commit_mamba_state_after_verify(
+    def commit_verified_states(
         self,
-        last_correct_step_indices,
-        mamba_track_indices,
-        mamba_steps_to_track,
-        req_pool_indices=None,
-    ) -> bool:
+        mamba_caches,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+        src_indices_raw: Optional[torch.Tensor],
+    ) -> None:
         """Point each verified slot's next read at its last accepted checkpoint."""
         if mamba_track_indices is not None:
             raise NotImplementedError(
-                "TPU GDN speculative prefix caching is unsupported"
+                "TPU GDN/KDA speculative decoding does not support the radix "
+                "prefix cache."
             )
-        if req_pool_indices is None:
-            slots = self._verify_slots[: last_correct_step_indices.shape[0]]
-        else:
-            slots = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.req_to_token_pool.mamba_pool.select_checkpoints(
-            slots.clamp(min=0), last_correct_step_indices
+            state_indices_tensor.clamp(min=0), last_correct_step_indices
         )
-        return True
 
     def _run(
         self,
