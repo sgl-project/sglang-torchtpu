@@ -496,7 +496,21 @@ class TpuSampler(Sampler):
         ):
             from sglang_tpu.top_k import tpu_top_k
 
-            global_top_k_probs, global_top_k_token_ids = tpu_top_k(probs, top_k)
+            candidate_width = (
+                min(MAX_DISTRIBUTED_TOP_K, probs.shape[-1])
+                if envs.SGLANG_TPU_HOST_PADDING.get()
+                else top_k
+            )
+            global_top_k_probs, global_top_k_token_ids = tpu_top_k(
+                probs, candidate_width
+            )
+            if envs.SGLANG_TPU_HOST_PADDING.get():
+                # Keep the candidate shape independent of the requested k.
+                # Rank masking retains exactly the requested number of candidates.
+                ranks = torch.arange(candidate_width, device=probs.device)
+                global_top_k_probs = global_top_k_probs.masked_fill(
+                    ranks[None, :] >= sampling_info.top_ks[:, None], 0
+                )
             if needs_top_p_or_min_p:
                 # Filtering the gathered block replaces ~30 full-vocabulary
                 # reductions with ~30 reductions over top_k columns.

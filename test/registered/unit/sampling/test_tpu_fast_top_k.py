@@ -521,6 +521,34 @@ class TestDistributedTopKEligibility(CustomTestCase):
 
 
 class TestTpuSamplerGlobalTopK(CustomTestCase):
+    def test_host_padding_keeps_candidate_width_and_exact_requested_support(self):
+        probs = torch.arange(128, 0, -1, dtype=torch.float32).reshape(1, -1)
+        probs /= probs.sum()
+        for k in (2, 20, 50, 64):
+            with self.subTest(k=k):
+                info = _forward_batch(uniform_top_k=k).sampling_info
+                info.top_ks = torch.tensor([k], dtype=torch.int32)
+                observed = []
+
+                def sample(weights, **kwargs):
+                    observed.append(weights)
+                    return weights.argmax(-1).to(torch.int32)
+
+                with (
+                    envs.SGLANG_TPU_HOST_PADDING.override(True),
+                    patch("sglang_tpu.top_k.tpu_top_k", side_effect=torch.topk),
+                    patch.object(
+                        tpu_sampler_module, "sampling_from_probs_torch", sample
+                    ),
+                ):
+                    result, _ = TpuSampler._sample_from_probs(
+                        SimpleNamespace(), probs, info, torch.zeros(1), False
+                    )
+                self.assertEqual(observed[0].shape, (1, 64))
+                torch.testing.assert_close(observed[0][:, :k], probs[:, :k])
+                self.assertEqual(torch.count_nonzero(observed[0][:, k:]).item(), 0)
+                self.assertEqual(result.tolist(), [0])
+
     def test_global_top_k_outputs_are_paired_and_exclusive(self):
         with self.assertRaisesRegex(ValueError, "must be provided together"):
             LogitsProcessorOutput(
