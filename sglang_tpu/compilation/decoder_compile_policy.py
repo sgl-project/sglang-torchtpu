@@ -1233,11 +1233,63 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self._assert_cp_family_compiled()
         if disagg_mode != "prefill":
             pending += self._precompile_decode()
+        spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
+        if (
+            envs.SGLANG_TPU_HOST_PADDING.get()
+            and spec_algorithm is not None
+            and spec_algorithm.is_none()
+            and get_exec().kernel.sampling_backend == "tpu"
+            and get_parallel().pp_size == 1
+            and get_parallel().attn_dp_size == 1
+            and get_parallel().attn_cp_size == 1
+            and get_parallel().attn_dcp_size == 1
+        ):
+            # Execute after queued model warmups, before the checker is armed.
+            pending.append(PendingCall(self._warmup_host_padding))
         logger.info(
             "[decoder compile policy] queued precompile in %.1fs.",
             time.perf_counter() - overall,
         )
         return pending
+
+    def _warmup_host_padding(self) -> None:
+        from sglang_tpu.compilation.host_padding_warmup import (
+            warmup_host_relay,
+            warmup_sequence_lengths,
+        )
+        from sglang_tpu.sampling.warmup import warmup_host_sampling
+
+        runner = self.model_runner
+        buckets = sorted(set(self.b_bucketer.buckets) | {self._extend_compile_cap()})
+        backends = (
+            runner.attn_backend,
+            runner.decode_attn_backend,
+            *(runner.decode_attn_backend_group or ()),
+        )
+        max_live = min(runner.max_running_requests, max(buckets))
+        warmup_sequence_lengths(runner.device, buckets)
+        for backend in {id(value): value for value in backends}.values():
+            warmup = getattr(backend, "warmup_distributions", None)
+            if warmup is not None:
+                warmup(max_live, runner.device)
+        warmup_host_sampling(
+            runner.sampler,
+            buckets,
+            runner.model_config.vocab_size,
+            runner.device,
+            make_logits=self._sampling_warmup_logits,
+        )
+        warmup_host_relay(
+            runner,
+            self.b_bucketer,
+            min(max_live, self.b_bucketer.max_val),
+            extend_cap=self._extend_compile_cap(),
+        )
+
+    def _sampling_warmup_logits(self, rows: int) -> torch.Tensor:
+        return torch.zeros(
+            (rows, self.model_runner.model_config.vocab_size), dtype=torch.float32
+        ).to(self.model_runner.device)
 
     def _assert_cp_family_compiled(self) -> None:
         """Raise if prefill context parallelism is on but warmup compiled no
@@ -1817,6 +1869,38 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
+
+    def _warmup_host_padding(self) -> None:
+        # The compiled inner decoder excludes eager prompt embedding and logits.
+        if not self._compiles_logits_processor():
+            with torch.no_grad():
+                for tokens, rows, mode in self._extend_compile_cases():
+                    embedding = self.owner.get_input_embeddings()
+                    ids = torch.zeros(tokens, dtype=torch.int64).to(
+                        self.model_runner.device
+                    )
+                    ids.clamp_(min=0, max=embedding.num_embeddings - 1)
+                    embedding(ids).cpu()
+                    self._eager_warmup_logits(tokens, rows, mode).cpu()
+        super()._warmup_host_padding()
+
+    def _sampling_warmup_logits(self, rows: int) -> torch.Tensor:
+        if self._compiles_logits_processor():
+            return super()._sampling_warmup_logits(rows)
+        return self._eager_warmup_logits(rows, rows, ForwardMode.DECODE)
+
+    def _eager_warmup_logits(
+        self, tokens: int, rows: int, mode: ForwardMode
+    ) -> torch.Tensor:
+        runner = self.model_runner
+        batch = self._make_dummy_forward_batch(tokens, rows, mode)
+        batch.logits_output_mode = LogitsOutputMode.FULL_VOCAB
+        hidden = torch.zeros(
+            (tokens, runner.model_config.hidden_size), dtype=runner.dtype
+        ).to(runner.device)
+        return runner.model.logits_processor(
+            batch.input_ids, hidden, runner.model.lm_head, batch
+        ).next_token_logits
 
     def install(self) -> bool:
         outer = getattr(self.model_runner, "model", None)

@@ -828,6 +828,47 @@ class TestHostPadFieldSelection(CustomTestCase):
                 host_padding.stage_prefill_tokens(upload, batch).device.type, "meta"
             )
 
+    def test_relay_warmup_covers_nonbucket_live_sizes_without_mutating_pool(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.compilation.host_padding_warmup import warmup_host_relay
+
+        table = torch.full((9, 16), 123, dtype=torch.int32)
+        runner = SimpleNamespace(
+            device="cpu",
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+        )
+        gathered_rows = set()
+        padded_tokens = {}
+
+        class TrackRelayGather(TorchDispatchMode):
+            def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten.index.Tensor and args[0].shape == (9,):
+                    gathered_rows.add(args[1][0].numel())
+                result = func(*args, **(kwargs or {}))
+                if func == torch.ops.aten.constant_pad_nd.default:
+                    padded_tokens[args[0].numel(), args[0].dtype] = result
+                return result
+
+        with TrackRelayGather():
+            warmup_host_relay(
+                runner, Bucketer(name="Bs", buckets=[1, 2, 4, 8]), 8, extend_cap=8
+            )
+        self.assertEqual(gathered_rows, set(range(1, 9)))
+        self.assertEqual(
+            set(padded_tokens),
+            {
+                (rows, dtype)
+                for rows in (3, 5, 6, 7)
+                for dtype in (torch.int32, torch.int64)
+            },
+        )
+        for (rows, _), padded in padded_tokens.items():
+            self.assertEqual(
+                padded.tolist(), list(range(rows)) + [0] * (len(padded) - rows)
+            )
+        self.assertTrue(torch.all(table == 123).item())
+
 
 if __name__ == "__main__":
     unittest.main()

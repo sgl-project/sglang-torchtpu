@@ -744,6 +744,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return width if lens and all(n == width for n in lens) else 1
         return 1
 
+    def warmup_distributions(self, max_live: int, device) -> None:
+        """Populate the finite active-row variants before serving starts."""
+        # Serving keys use tensor.device (e.g. tpu:0), not the runner's "tpu".
+        device = torch.empty(0, device=device).device
+        for is_decode in (False, True):
+            for live_rows in range(max_live + 1):
+                self._get_cached_rpa_distribution(is_decode, live_rows, device)
+
     def _get_cached_rpa_distribution(
         self, is_decode: bool, non_empty_bs: int, device
     ) -> torch.Tensor:
