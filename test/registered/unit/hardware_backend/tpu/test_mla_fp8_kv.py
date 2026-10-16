@@ -128,6 +128,7 @@ def _run_forward_mla(*, quant_dtype, k_scale_float):
             cu_kv_lens=torch.zeros(2, dtype=torch.int32),
             distribution=torch.zeros(3, dtype=torch.int32),
             segments="mixed",
+            decode_query_size=1,
         ),
         token_to_kv_pool=SimpleNamespace(get_fused_kv_buffer=lambda _: "kv"),
     )
