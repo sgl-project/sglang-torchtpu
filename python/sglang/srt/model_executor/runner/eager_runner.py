@@ -135,7 +135,7 @@ class EagerRunner(BaseRunner):
         self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = None
-        if not _is_tpu:
+        if not (envs.SGLANG_EAGER_INPUT_NO_COPY.get() or _is_tpu):
             self._eager_registry = build_eager_registry(
                 device=mr.device,
                 max_bs=max_bs,
@@ -192,7 +192,7 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or self._eager_registry is None:
+        if self._eager_registry is None:
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:

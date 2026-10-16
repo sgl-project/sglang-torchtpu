@@ -78,7 +78,7 @@ def _make_registry(max_bs: int = 8, max_num_tokens: int = 16):
 
 
 class TestEagerRegistry(unittest.TestCase):
-    def test_tpu_skips_unused_registry_without_changing_copy_backends(self):
+    def test_registry_is_allocated_only_for_copy_mode(self):
         mr = SimpleNamespace(
             server_args=object(),
             spec_algorithm=SimpleNamespace(
@@ -91,9 +91,9 @@ class TestEagerRegistry(unittest.TestCase):
             device="cpu",
         )
         batch = _MiniForwardBatch(batch_size=3, input_ids=torch.arange(3))
-        for is_tpu in (True, False):
+        for is_tpu, no_copy in ((True, False), (False, True), (False, False)):
             with (
-                self.subTest(is_tpu=is_tpu),
+                self.subTest(is_tpu=is_tpu, no_copy=no_copy),
                 patch.object(eager_runner, "_is_tpu", is_tpu),
                 patch.object(eager_runner.BaseRunner, "__init__", return_value=None),
                 patch.object(eager_runner.EagerRunner, "warmup") as warmup,
@@ -115,12 +115,12 @@ class TestEagerRegistry(unittest.TestCase):
                     ),
                 ),
                 patch.object(eager_runner, "build_eager_registry") as build,
-                eager_runner.envs.SGLANG_EAGER_INPUT_NO_COPY.override(False),
+                eager_runner.envs.SGLANG_EAGER_INPUT_NO_COPY.override(no_copy),
             ):
                 runner = eager_runner.EagerRunner(mr)
                 warmup.assert_called_once_with()
                 loaded = runner.load_batch(batch)
-                if is_tpu:
+                if is_tpu or no_copy:
                     build.assert_not_called()
                     self.assertIsNone(runner._eager_registry)
                     self.assertIsNot(loaded, batch)
@@ -137,11 +137,6 @@ class TestEagerRegistry(unittest.TestCase):
                         padded_num_tokens=3,
                         pp_proxy_tensors=None,
                     )
-                    registry.reset_mock()
-                    with eager_runner.envs.SGLANG_EAGER_INPUT_NO_COPY.override(True):
-                        loaded = runner.load_batch(batch)
-                    self.assertIs(loaded.input_ids, batch.input_ids)
-                    registry.fill_from.assert_not_called()
 
 
 class TestGraphSlot(unittest.TestCase):
