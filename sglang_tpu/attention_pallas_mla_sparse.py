@@ -19,7 +19,6 @@ layout the sparse kernels read.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
-import dataclasses
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -174,10 +173,6 @@ def _build_pallas_sparse_mla_kernel_op():
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     """``pallas_tpu_mla`` with sparse attention: it runs the DSA indexer too."""
 
-    kernel_spec = dataclasses.replace(
-        TpuPallasMlaAttnBackend.kernel_spec, supports_decode_query_size=False
-    )
-
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
     ) -> None:
@@ -237,6 +232,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             metadata.distribution,
             weight_scale,
             self._topk,
+            metadata.decode_query_size,
         )
 
     def _forward_mla(
