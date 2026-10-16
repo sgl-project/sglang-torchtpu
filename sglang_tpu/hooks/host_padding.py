@@ -14,11 +14,15 @@ def _enabled(batch):
     return envs.SGLANG_TPU_HOST_PADDING.get() and batch.spec_algorithm.is_none()
 
 
-def sampling_from_batch(original, cls, batch, vocab_size, *, params_on_cpu=False):
-    params_on_cpu = params_on_cpu or (
+def sampling_from_batch(
+    original, cls, batch, vocab_size, *, sampling_params_on_cpu=False
+):
+    sampling_params_on_cpu = sampling_params_on_cpu or (
         _enabled(batch) and get_exec().kernel.sampling_backend == "tpu"
     )
-    return original(cls, batch, vocab_size, params_on_cpu=params_on_cpu)
+    return original(
+        cls, batch, vocab_size, sampling_params_on_cpu=sampling_params_on_cpu
+    )
 
 
 def _can_stage_forward_metadata(batch):

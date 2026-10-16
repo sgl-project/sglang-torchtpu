@@ -49,7 +49,7 @@ def warmup_host_sampling(sampler, buckets, vocab_size, device, *, make_logits):
                 return_sampling_masks=[False] * rows,
                 device=str(device),
                 uniform_top_k=None if mixed_k else k,
-                params_on_cpu=True,
+                sampling_params_on_cpu=True,
             )
             result = sampler(
                 LogitsProcessorOutput(next_token_logits=logits),

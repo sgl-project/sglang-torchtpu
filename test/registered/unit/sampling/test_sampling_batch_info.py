@@ -886,7 +886,7 @@ class TestHostSamplingMode(CustomTestCase):
     """Scheduler row ownership must survive bucketing and overlap snapshots."""
 
     def _host_info(self, size):
-        return _make_info(size, params_on_cpu=True)
+        return _make_info(size, sampling_params_on_cpu=True)
 
     def _sampler(self):
         from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
@@ -955,7 +955,7 @@ class TestHostSamplingMode(CustomTestCase):
             uploaded = sampler._device_params.materialize(sampled, 4)
             self.assertEqual(upload.call_count, 4)
             self.assertEqual(uploaded.temperatures[:, 0].tolist(), [1.0, 1.0, 0.5, 1.0])
-            self.assertTrue(sampled.params_on_cpu)
+            self.assertTrue(sampled.sampling_params_on_cpu)
 
     def test_filter_merge_and_forward_snapshot_keep_logical_rows(self):
         info = self._host_info(3)
@@ -972,8 +972,8 @@ class TestHostSamplingMode(CustomTestCase):
         other.sampling_seed = torch.tensor([99])
         info.merge_batch(other)
         uploaded = sampling_params_to_device(info)
-        self.assertFalse(uploaded.params_on_cpu)
-        self.assertTrue(info.params_on_cpu)
+        self.assertFalse(uploaded.sampling_params_on_cpu)
+        self.assertTrue(info.sampling_params_on_cpu)
         self.assertIs(sampling_params_to_device(uploaded), uploaded)
         self.assertEqual(len(uploaded), 3)
         self.assertEqual(uploaded.top_ks.tolist(), [20, 1, 7])
@@ -1084,7 +1084,7 @@ class TestHostSamplingMode(CustomTestCase):
                     self.assertEqual(set(reductions), {physical_rows})
                     self.assertEqual(repads, [])
                     self.assertEqual(len(info), size)
-                    self.assertTrue(info.params_on_cpu)
+                    self.assertTrue(info.sampling_params_on_cpu)
                     original_logits = (
                         output.next_token_global_top_k_logits
                         if global_top_k
@@ -1137,7 +1137,7 @@ class TestHostSamplingMode(CustomTestCase):
                 (batch, "capture_hidden_mode", CaptureHiddenMode.FULL),
                 (batch, "spec_info", object()),
                 (batch, "_tpu_real_b", 4),  # beam tail before padding
-                (info, "params_on_cpu", False),
+                (info, "sampling_params_on_cpu", False),
                 (info, "grammars", [object()]),
                 (info, "logit_bias", torch.zeros(3, 8)),
                 (info, "has_custom_logit_processor", True),
@@ -1198,7 +1198,7 @@ class TestHostSamplingMode(CustomTestCase):
                 info.min_ps = torch.tensor([0.0, 0.1, 0.2])
                 expected = sampler(
                     LogitsProcessorOutput(next_token_logits=logits.clone()),
-                    replace(info, params_on_cpu=False),
+                    replace(info, sampling_params_on_cpu=False),
                     False,
                     [0] * 3,
                     [[]] * 3,
@@ -1315,7 +1315,7 @@ class TestHostSamplingMode(CustomTestCase):
                         batch.input_ids = stage_prefill_tokens(
                             lambda b: b.prefill_input_ids_cpu.to("meta"), batch
                         )
-                        self.assertEqual(info.params_on_cpu, host_sampling)
+                        self.assertEqual(info.sampling_params_on_cpu, host_sampling)
                         self.assertEqual(
                             batch.input_ids.device.type,
                             "cpu" if host_inputs else "meta",
@@ -1329,17 +1329,21 @@ class TestHostSamplingMode(CustomTestCase):
         with envs.SGLANG_TPU_HOST_PADDING.override(True):
             info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
             self.assertIs(type(info), SamplingBatchInfo)
-            self.assertTrue(info.params_on_cpu)
+            self.assertTrue(info.sampling_params_on_cpu)
             self.assertEqual(info.top_ks.tolist(), [5])
             torch.testing.assert_close(info.top_ps, torch.tensor([0.8]))
             batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
             self.assertFalse(
-                SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).params_on_cpu
+                SamplingBatchInfo.from_schedule_batch(
+                    batch, VOCAB_SIZE
+                ).sampling_params_on_cpu
             )
         batch.spec_algorithm = SpeculativeAlgorithm.NONE
         with envs.SGLANG_TPU_HOST_PADDING.override(False):
             self.assertFalse(
-                SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).params_on_cpu
+                SamplingBatchInfo.from_schedule_batch(
+                    batch, VOCAB_SIZE
+                ).sampling_params_on_cpu
             )
 
     def test_merge_rejects_incompatible_modes_before_mutating(self):

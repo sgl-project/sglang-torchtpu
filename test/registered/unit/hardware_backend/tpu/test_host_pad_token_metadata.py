@@ -51,7 +51,7 @@ class TestPaddedSamplingCompileGuards(CustomTestCase):
                 compiled = torch.compile(forward, backend="eager", fullgraph=True)
                 value = torch.ones(2)
                 torch.testing.assert_close(compiled(value, batch), value + 1)
-                batch.sampling_info = SimpleNamespace(params_on_cpu=True)
+                batch.sampling_info = SimpleNamespace(sampling_params_on_cpu=True)
                 with torch.compiler.set_stance("fail_on_recompile"):
                     torch.testing.assert_close(compiled(value, batch), value + 1)
 

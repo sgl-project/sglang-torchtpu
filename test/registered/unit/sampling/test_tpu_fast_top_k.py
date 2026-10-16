@@ -48,7 +48,7 @@ from sglang_tpu.top_k import (
 
 def _forward_batch(*, batch_size=1, **info_overrides):
     info = SimpleNamespace(
-        params_on_cpu=False,
+        sampling_params_on_cpu=False,
         uniform_top_k=50,
         is_any_greedy=False,
         need_top_k_sampling=True,

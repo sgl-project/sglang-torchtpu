@@ -388,7 +388,7 @@ def supports_padded_sampling(info: SamplingBatchInfo) -> bool:
     together with logits, rather than padding only their sampling parameters.
     """
     return (
-        info.params_on_cpu
+        info.sampling_params_on_cpu
         and not info.has_custom_logit_processor
         and info.sampling_mask_batch_indices is None
         and info.sampling_support_logprobs_capture_indices is None
@@ -413,11 +413,13 @@ def sampling_params_to_device(
     row count; other callers upload live rows directly, without a device slice.
     Device-backed inputs need no preparation.
     """
-    if not info.params_on_cpu:
+    if not info.sampling_params_on_cpu:
         return info
     size = len(info)
     padded_size = size if padded_size is None else padded_size
-    return replace(info, params_on_cpu=False, **_upload_params(info, padded_size))
+    return replace(
+        info, sampling_params_on_cpu=False, **_upload_params(info, padded_size)
+    )
 
 
 def _upload_params(info: SamplingBatchInfo, padded_size: int) -> dict:
@@ -457,11 +459,11 @@ class _DeviceParamCache:
                 a is b for a, b in zip(cached_host, host)
             ):
                 self._entries.append(self._entries.pop(index))
-                return replace(info, params_on_cpu=False, **params)
+                return replace(info, sampling_params_on_cpu=False, **params)
         params = _upload_params(info, padded_size)
         # Holding the host tensors keeps their identities from being reused.
         self._entries = [*self._entries, (host, padded_size, params)][-self._CAPACITY :]
-        return replace(info, params_on_cpu=False, **params)
+        return replace(info, sampling_params_on_cpu=False, **params)
 
 
 class TpuSampler(Sampler):
@@ -485,7 +487,7 @@ class TpuSampler(Sampler):
         Full-logit outputs retain the base sampler's processing and return contract."""
 
         live_rows = None
-        if sampling_info.params_on_cpu:
+        if sampling_info.sampling_params_on_cpu:
             live_rows = len(sampling_info)
             logits = (
                 logits_output.next_token_global_top_k_logits
@@ -512,7 +514,7 @@ class TpuSampler(Sampler):
                 and not logits_output.has_next_token_global_top_k
             ):
                 # Greedy argmax reads no sampling parameters.
-                sampling_info = replace(sampling_info, params_on_cpu=False)
+                sampling_info = replace(sampling_info, sampling_params_on_cpu=False)
             else:
                 sampling_info = self._device_params.materialize(
                     sampling_info, physical_rows

@@ -104,7 +104,7 @@ class SamplingBatchInfo:
     # Execution device for logits, penalties, and grammar masks.
     device: str = "cuda"
     # Storage mode for request sampling parameters only.
-    params_on_cpu: bool = False
+    sampling_params_on_cpu: bool = False
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
@@ -121,14 +121,18 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(
-        cls, batch: ScheduleBatch, vocab_size: int, *, params_on_cpu: bool = False
+        cls,
+        batch: ScheduleBatch,
+        vocab_size: int,
+        *,
+        sampling_params_on_cpu: bool = False,
     ):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
-        param_device = "cpu" if params_on_cpu else device
+        param_device = "cpu" if sampling_params_on_cpu else device
         # Match the [B, 1] device allocation produced by merging/filtering.
         # A device-side view of [B] gives TorchTPU a different compiled input.
         temperatures = (
@@ -264,7 +268,7 @@ class SamplingBatchInfo:
         )
 
         ret = cls(
-            params_on_cpu=params_on_cpu,
+            sampling_params_on_cpu=sampling_params_on_cpu,
             temperatures=temperatures,
             top_ps=top_ps,
             top_ks=top_ks,
@@ -444,7 +448,7 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
-        indices = keep_indices if self.params_on_cpu else keep_indices_device
+        indices = keep_indices if self.sampling_params_on_cpu else keep_indices_device
         for item in [
             "temperatures",
             "top_ps",
@@ -515,7 +519,7 @@ class SamplingBatchInfo:
             self.has_custom_logit_processor = False
 
     def merge_batch(self, other: SamplingBatchInfo):
-        if self.params_on_cpu != other.params_on_cpu:
+        if self.sampling_params_on_cpu != other.sampling_params_on_cpu:
             raise ValueError(
                 "Cannot merge sampling parameters with different storage modes"
             )
