@@ -18,6 +18,7 @@ import dataclasses
 import unittest
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import patch
 
 import torch
 
@@ -27,6 +28,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     PaddingPolicy,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.runner import eager_runner
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -73,6 +75,73 @@ def _make_registry(max_bs: int = 8, max_num_tokens: int = 16):
         max_bs=max_bs,
         max_num_tokens=max_num_tokens,
     )
+
+
+class TestEagerRegistry(unittest.TestCase):
+    def test_tpu_skips_unused_registry_without_changing_copy_backends(self):
+        mr = SimpleNamespace(
+            server_args=object(),
+            spec_algorithm=SimpleNamespace(
+                is_speculative=lambda: False, is_none=lambda: True
+            ),
+            is_draft_worker=False,
+            max_running_requests=4,
+            max_total_num_tokens=16,
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            device="cpu",
+        )
+        batch = _MiniForwardBatch(batch_size=3, input_ids=torch.arange(3))
+        for is_tpu in (True, False):
+            with (
+                self.subTest(is_tpu=is_tpu),
+                patch.object(eager_runner, "_is_tpu", is_tpu),
+                patch.object(eager_runner.BaseRunner, "__init__", return_value=None),
+                patch.object(eager_runner.EagerRunner, "warmup") as warmup,
+                patch.object(
+                    eager_runner.DllmConfig, "from_server_args", return_value=None
+                ),
+                patch.object(
+                    eager_runner, "get_eager_max_batch_size", side_effect=lambda bs: bs
+                ),
+                patch.object(
+                    eager_runner, "max_prefill_buffer_tokens", return_value=16
+                ),
+                patch.object(eager_runner, "require_mlp_sync", return_value=False),
+                patch.object(
+                    eager_runner,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        mamba=SimpleNamespace(enable_mamba_extra_buffer=False)
+                    ),
+                ),
+                patch.object(eager_runner, "build_eager_registry") as build,
+                eager_runner.envs.SGLANG_EAGER_INPUT_NO_COPY.override(False),
+            ):
+                runner = eager_runner.EagerRunner(mr)
+                warmup.assert_called_once_with()
+                loaded = runner.load_batch(batch)
+                if is_tpu:
+                    build.assert_not_called()
+                    self.assertIsNone(runner._eager_registry)
+                    self.assertIsNot(loaded, batch)
+                    self.assertIs(loaded.input_ids, batch.input_ids)
+                else:
+                    build.assert_called_once()
+                    registry = build.return_value
+                    self.assertIs(loaded, registry.extract_buffer.return_value)
+                    registry.fill_from.assert_called_once_with(
+                        batch,
+                        raw_bs=3,
+                        padded_bs=3,
+                        raw_num_tokens=3,
+                        padded_num_tokens=3,
+                        pp_proxy_tensors=None,
+                    )
+                    registry.reset_mock()
+                    with eager_runner.envs.SGLANG_EAGER_INPUT_NO_COPY.override(True):
+                        loaded = runner.load_batch(batch)
+                    self.assertIs(loaded.input_ids, batch.input_ids)
+                    registry.fill_from.assert_not_called()
 
 
 class TestGraphSlot(unittest.TestCase):

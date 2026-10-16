@@ -134,25 +134,29 @@ class EagerRunner(BaseRunner):
         self._eager_max_bs = max_bs
         self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
-        self._eager_registry = build_eager_registry(
-            device=mr.device,
-            max_bs=max_bs,
-            max_num_token=max_num_token,
-            cache_loc_dtype=torch.int64,
-            enable_mamba_track=(
-                get_exec().mamba.enable_mamba_extra_buffer
-                and mr.spec_algorithm.is_none()
-            ),
-            is_encoder_decoder=is_encoder_decoder,
-            encoder_len_fill_value=(
-                getattr(mr.model_config.hf_config, "max_source_positions", 0)
-                if is_encoder_decoder
-                else 0
-            ),
-            encoder_lens_dtype=(
-                torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
-            ),
-        )
+        self._eager_registry = None
+        if not _is_tpu:
+            self._eager_registry = build_eager_registry(
+                device=mr.device,
+                max_bs=max_bs,
+                max_num_token=max_num_token,
+                cache_loc_dtype=torch.int64,
+                enable_mamba_track=(
+                    get_exec().mamba.enable_mamba_extra_buffer
+                    and mr.spec_algorithm.is_none()
+                ),
+                is_encoder_decoder=is_encoder_decoder,
+                encoder_len_fill_value=(
+                    getattr(mr.model_config.hf_config, "max_source_positions", 0)
+                    if is_encoder_decoder
+                    else 0
+                ),
+                encoder_lens_dtype=(
+                    torch.int64
+                    if torch.device(mr.device).type == "cpu"
+                    else torch.int32
+                ),
+            )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         if run_warmup:
             self.warmup()
@@ -188,7 +192,7 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or _is_tpu:
+        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or self._eager_registry is None:
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:
