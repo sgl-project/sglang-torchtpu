@@ -93,6 +93,15 @@ class TestSPMDSafe(CustomTestCase):
                     self.assertEqual(len(result_files), 1)
                     result = json.loads(result_files[0].read_text())
                     self.assertEqual(result["passed"], mode == "matching")
+                    self.assertEqual(
+                        result["launcher_exit_code"], int(mode != "matching")
+                    )
+                    self.assertFalse(
+                        any(
+                            error.startswith("Verification startup exceeded")
+                            for error in result["errors"]
+                        )
+                    )
                     if mode != "matching":
                         self.assertIn(json.dumps(_KEY), " ".join(result["errors"]))
 
