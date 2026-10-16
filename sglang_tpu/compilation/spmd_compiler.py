@@ -48,9 +48,6 @@ class Submission:
     pending: Any = None
     executable: Any = None
 
-    def is_ready(self) -> bool:
-        return self.executable is not None
-
     def get(self) -> Any:
         if self.executable is None:
             raise RuntimeError("Shared compilation must finish before graph execution")
@@ -185,10 +182,6 @@ class SPMDCompiler:
             outputs, inputs, argument_layouts=interface.argument_layouts
         )
         return submission
-
-    def is_ready(self) -> bool:
-        """Always return False: verification records graphs without an executable."""
-        return False
 
     def get(self) -> Any:
         """Raise if an async caller tries to retrieve a verification executable.

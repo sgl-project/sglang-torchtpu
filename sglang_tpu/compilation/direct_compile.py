@@ -753,9 +753,8 @@ class CompiledFunction:
                         graph=graph,
                     )
             logger.info(
-                "[direct_compile] native async submission %.3fs (ready=%s)",
+                "[direct_compile] native async submission %.3fs",
                 time.perf_counter() - start,
-                pending_compile.is_ready(),
             )
         else:
             with dynamo_timed("direct_compile_traverse_and_compile"):
