@@ -61,14 +61,30 @@ class _Tensor:
 
 
 class ReshardGeometryTest(unittest.TestCase):
-    def test_head_pair_bytes_matches_both_sides(self):
-        # hd=128 (bf16, kv_packing=2): head-pair = 2*128*2 = 512B.
-        prefill_t = _Tensor((100, 1024, 1, 2, 128), 2)
-        decode_t = _Tensor((100, 1024, 2, 2, 128), 2)
-        self.assertEqual(rs.head_pair_bytes(prefill_t), 512)
-        self.assertEqual(rs.head_pair_bytes(decode_t), 512)
-        self.assertEqual(rs.per_rank_head_count(prefill_t), 1)
-        self.assertEqual(rs.per_rank_head_count(decode_t), 2)
+    def test_layout_geometry_matches_both_sides(self):
+        # hd=128 bf16 (kv_packing=2): one head's K+V per 512B granule.
+        prefill = rs.KVLayoutGeometry.from_tensor(
+            (100, 1024, 1, 2, 128), 2, 1, seq_along_lane=False
+        )
+        decode = rs.KVLayoutGeometry.from_tensor(
+            (100, 1024, 2, 2, 128), 2, 2, seq_along_lane=False
+        )
+        self.assertEqual(prefill.unit(), decode.unit())
+        self.assertEqual(prefill.granule_bytes, 512)
+        self.assertEqual((prefill.row_bytes, decode.row_bytes), (512, 1024))
+
+    def test_fp8_granule_holds_two_heads(self):
+        # fp8 (kv_packing=4): a 512B granule is two heads, 256B each; one and
+        # two heads per rank share a shape, so the count comes from the caller.
+        one = rs.KVLayoutGeometry.from_tensor(
+            (100, 256, 1, 4, 128), 1, 1, seq_along_lane=False
+        )
+        two = one.with_heads(2)
+        self.assertEqual(one.granule_bytes / one.heads_per_granule, 256)
+        self.assertEqual(one.row_bytes, two.row_bytes)
+        geom = rs.ReshardGeometry.from_layout(4, 2, one, 8)
+        # Prefill rank 1 holds heads 2-3: the second granule of decode rank 0.
+        self.assertEqual(geom.entry_bytes(1, 0), (0, 512, 512, 512, 1024))
 
     def test_geometry_8_to_4_concat(self):
         # total_kv_heads=8 >= src_tp=8: distinct heads, decode rank concatenates
