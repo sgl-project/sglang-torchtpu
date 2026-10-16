@@ -86,12 +86,9 @@ def stage_prefill_tokens(original, batch):
 
 
 def extend_metadata_device(original, batch, device):
-    # Input placement carries the decision across ScheduleBatch -> worker batch.
-    if (
-        _can_stage_prefill(batch)
-        and batch.input_ids is not None
-        and batch.input_ids.device.type == "cpu"
-    ):
+    # VL token IDs reach embedding preparation before the decoder, but extend
+    # lengths and offsets are consumed after the decoder's padded upload.
+    if _can_stage_forward_metadata(batch):
         return "cpu"
     return original(batch, device)
 
@@ -113,11 +110,12 @@ def alloc_extend(
     from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 
     # Wrapped/SWA allocators retain their original return-device contract.
+    # VL embedding preparation needs device token IDs, but not KV locations.
     allocator = tree_cache.token_to_kv_pool_allocator
     if (
         batch is not None
         and type(allocator) is TpuPagedTokenToKVPoolAllocator
-        and _can_stage_prefill(batch)
+        and _can_stage_forward_metadata(batch)
         and batch.req_to_token_pool.req_to_token.device.type == "cpu"
     ):
         return_host = True

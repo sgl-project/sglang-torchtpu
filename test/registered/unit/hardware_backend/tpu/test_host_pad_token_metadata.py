@@ -688,6 +688,100 @@ class TestHostPadFieldSelection(CustomTestCase):
         with envs.SGLANG_TPU_HOST_PADDING.override(False):
             self.assertEqual(placement(batch), "meta")
 
+    def test_vl_kv_locations_upload_only_after_padding(self):
+        """VL embedding IDs need the device, but KV slots must upload bucketed."""
+        from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+        from sglang_tpu.hooks import host_padding
+
+        override = get_context().override_server_args(
+            enable_torch_compile=True, enable_mixed_chunk=False
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        batch = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            mix_running_indices=None,
+            dllm_config=None,
+            model_config=SimpleNamespace(
+                is_generation=True,
+                is_multimodal=True,
+                is_encoder_decoder=False,
+                use_ngram_embedding=False,
+                use_engram=False,
+            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((2, 16))),
+        )
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_TPU_HOST_PADDING.override(enabled),
+            ):
+                allocator = TpuPagedTokenToKVPoolAllocator(
+                    size=24,
+                    page_size=4,
+                    dtype=torch.bfloat16,
+                    device="meta",
+                    kvcache=None,
+                    need_sort=False,
+                )
+                tree = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    supports_prefix_sharing=lambda: False,
+                )
+                prefix = torch.tensor([0, 0])
+                lengths = torch.tensor([3, 2])
+                slots = host_padding.alloc_extend(
+                    alloc_paged_token_slots_extend,
+                    tree,
+                    prefix,
+                    prefix,
+                    lengths,
+                    lengths,
+                    prefix - 1,
+                    5,
+                    batch=batch,
+                )
+                self.assertEqual(slots.device.type, "cpu" if enabled else "meta")
+                if not enabled:
+                    continue
+                self.assertEqual(slots.tolist(), [4, 5, 6, 8, 9])
+                forward = self._extend_batch()
+                forward.input_ids = forward.input_ids.to("meta")
+                forward.out_cache_loc = slots
+                batch.input_ids = forward.input_ids
+                metadata_device = host_padding.extend_metadata_device(
+                    lambda batch, device: device, batch, "meta"
+                )
+                forward.extend_seq_lens = lengths.to(metadata_device)
+                forward.extend_prefix_lens = prefix.to(metadata_device)
+                self.assertEqual(forward.extend_seq_lens.device.type, "cpu")
+                positions, forward.extend_start_loc = (
+                    forward_batch_info.compute_position_torch(
+                        forward.extend_prefix_lens, forward.extend_seq_lens
+                    )
+                )
+                self.assertEqual(positions.tolist(), [0, 1, 2, 0, 1])
+                shim._pad_batch_fields(
+                    forward, pad_t=8, pad_b=8, real_b=2, is_draft_extend_v2=False
+                )
+                self.assertEqual(
+                    forward.extend_seq_lens.tolist(), [3, 2, 0, 0, 0, 0, 0, 0]
+                )
+                self.assertEqual(forward.out_cache_loc.device.type, "cpu")
+                self.assertEqual(
+                    forward.out_cache_loc.tolist(), [4, 5, 6, 8, 9, 0, 0, 0]
+                )
+                policy = object.__new__(DecoderTpuCompilePolicy)
+                policy.model_runner = SimpleNamespace(device="meta")
+                policy._upload_host_inputs(forward)
+                self.assertEqual(forward.out_cache_loc.device.type, "meta")
+                self.assertEqual(forward.out_cache_loc.shape, (8,))
+                allocator.free(slots)
+                allocator.merge_and_sort_free()
+                self.assertEqual(allocator.available_size(), 24)
+
     def test_staging_fallbacks_preserve_device_inputs(self):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang_tpu.hooks import host_padding
