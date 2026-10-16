@@ -239,6 +239,13 @@ class TpuMambaPool(MambaPool):
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         if src_indices.numel() == 0:
             return
+        if self.spec_window > 1:
+            # Slot ids address groups of spec_window checkpoint rows here, and
+            # the committed row is read_offsets[slot], not the slot itself.
+            raise NotImplementedError(
+                "Copying GDN/KDA state between slots (radix prefix cache) is not "
+                "supported together with speculative decoding on TPU."
+            )
         states = self._copy_states()
         if states[0].device.type == "cpu":
             # CPU reference for layout and allocator tests.

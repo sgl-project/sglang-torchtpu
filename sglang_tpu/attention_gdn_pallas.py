@@ -449,7 +449,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         mamba_pool = self.req_to_token_pool.mamba_pool
         self._spec_window = mamba_pool.spec_window
         # DP attention pads slot ids with -1, which index_copy_ cannot take.
-        self._clamp_verify_slots = get_parallel().enable_dp_attention
+        self._clamp_verify_slots = get_parallel().attn_dp_enabled
         self._read_offsets_pool = mamba_pool.read_offsets
         # Per-forward verify state: the window's read offsets and slot ids.
         self._read_offsets: Optional[torch.Tensor] = None
