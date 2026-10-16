@@ -1,9 +1,11 @@
 """Exercise graph and physical-layout rejection through the public recipe runner."""
 
 import json
+import os
 import shlex
 import sys
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 
@@ -138,6 +140,18 @@ def _run_worker(mode: str) -> None:
 
 if __name__ == "__main__":
     if "--spmd-safe-worker" in sys.argv:
-        _run_worker(sys.argv[-1])
+        status = 1
+        try:
+            _run_worker(sys.argv[-1])
+        except SystemExit as error:
+            status = 0 if error.code in (None, 0) else 1
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            # As in test_collective_compile_cache, skip libtpu's atexit
+            # StopSession: it can wedge the next test case's TPU initialization.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(status)
     else:
         unittest.main()
