@@ -73,15 +73,18 @@ def _prepare_executable(
 
 
 class SPMDCompiler:
-    """Verify warmup graphs and physical input layouts across a TP group.
+    """Coordinate shared compilation or graph verification for a warmup queue.
 
-    Each rank traces every SPMD-safe specialization. ``compile`` records its
-    MLIR and input layouts under the same named key on every rank. ``finish``
-    compares the collected records, writes diagnostics, and exits successfully
-    or raises on a mismatch. Verification does not compile or execute graphs.
+    Sharing assigns each named specialization to a rank in round-robin order.
+    Only that rank traces and compiles it; ``finish`` distributes the executable
+    and binds it to every rank's local inputs and callbacks. All ranks must
+    enqueue the same keys in the same order.
 
-    Returned in place of a native pending compilation so ``direct_compile`` can
-    use its usual async path while execution stays deferred until ``finish``.
+    Verification instead traces every specialization on every rank. ``compile``
+    records MLIR and physical input layouts; ``finish`` compares those records,
+    writes diagnostics, and exits successfully or raises on a mismatch. The
+    coordinator acts as a pending compilation in this mode but never produces
+    an executable.
     """
 
     def __init__(
@@ -136,6 +139,7 @@ class SPMDCompiler:
 
     @contextmanager
     def coordinate_errors(self, stage: str) -> Iterator[None]:
+        """Report local failures to every rank before the next collective stage."""
         error: str | None = None
         try:
             yield
@@ -147,6 +151,7 @@ class SPMDCompiler:
             raise RuntimeError(f"Shared compile {stage} failed: {errors}")
 
     def enqueue(self, graph: str) -> None:
+        """Reject duplicate identities and assign an owner when sharing executables."""
         if self.verify_spmd_safe:
             if graph in self.mlirs:
                 raise ValueError(f"Duplicate SPMD verification graph name: {graph}")
@@ -164,6 +169,7 @@ class SPMDCompiler:
         interface: ExecutableInterface | None = None,
         graph: str,
     ) -> Submission | SPMDCompiler:
+        """Capture MLIR/layouts for verification or submit the owner's compilation."""
         if self.verify_spmd_safe:
             module = tc.build_mlir(outputs, inputs)
             self.mlirs[graph] = tc.serialize_mlir_text(module, enable_debug_info=False)
@@ -193,6 +199,7 @@ class SPMDCompiler:
         raise RuntimeError("SPMD verification does not produce an executable")
 
     def finish(self, error: str | None = None) -> None:
+        """Finish verification or distribute all successfully compiled submissions."""
         if self.verify_spmd_safe:
             self._finish_verification(error)
         errors = self.gather(error)
@@ -212,6 +219,7 @@ class SPMDCompiler:
         )
 
     def _finish_verification(self, error: str | None) -> NoReturn:
+        """Check all ranks' graphs/layouts, retain diagnostics, and exit or raise."""
         mlir_hashes = {graph: digest(mlir) for graph, mlir in self.mlirs.items()}
         records = self.gather(
             {
@@ -277,6 +285,7 @@ class SPMDCompiler:
         raise SystemExit(0)
 
     def _distribute(self) -> None:
+        """Bind local consumers and broadcast executables in agreed queue order."""
         owned = {
             graph: item.interface
             for graph, item in self.submissions.items()
@@ -340,6 +349,7 @@ class SPMDCompiler:
                 item.executable = executable
 
     def clear(self) -> None:
+        """Wait for native work and release this queue's graphs and submissions."""
         if self._serializer is not None:
             self._serializer.shutdown(wait=True, cancel_futures=True)
         for item in self.submissions.values():
@@ -357,6 +367,7 @@ class SPMDCompiler:
 def create_spmd_compiler(
     group: dist.ProcessGroup, *, verify_spmd_safe: bool = False
 ) -> SPMDCompiler | None:
+    """Create a coordinator, falling back to local compilation for runtime mismatch."""
     spmd_compiler = SPMDCompiler(group, verify_spmd_safe=verify_spmd_safe)
     if spmd_compiler.fallback_reason is None:
         return spmd_compiler
