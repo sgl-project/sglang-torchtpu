@@ -23,13 +23,17 @@ class TestMlaSpecVerifyRange(CustomTestCase):
         mla = TpuPallasMlaAttnBackend.kernel_spec.supports_decode_query_size
         self.assertFalse(mla)
         self.assertEqual(
-            _resolve_decode_query_size(supports_decode_query_size=mla, spec_enabled=True),
+            _resolve_decode_query_size(
+                supports_decode_query_size=mla, spec_enabled=True
+            ),
             1,
         )
 
     def test_rpa_v3_keeps_decode_routing(self):
         # The MLA spec is derived from RPA v3's; only this flag differs.
-        self.assertTrue(TpuPallasRpaV3AttnBackend.kernel_spec.supports_decode_query_size)
+        self.assertTrue(
+            TpuPallasRpaV3AttnBackend.kernel_spec.supports_decode_query_size
+        )
 
 
 if __name__ == "__main__":
