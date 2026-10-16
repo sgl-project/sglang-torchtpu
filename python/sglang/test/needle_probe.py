@@ -15,7 +15,10 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 FILLER = "The quick brown fox jumps over the lazy dog. "
-QUESTION = "Question: what is the secret code word? Answer: The secret code word is"
+QUESTION = "Question: what is the secret code word?"
+ANSWER = "The secret code word is"
+# The question and the start of its answer as one plain-text prompt.
+PLAIN_FORMAT = "{context}{question} Answer: {answer}"
 # Prompt k repeats the filler 40 + 5k times on each side of its code word:
 # 0.8K to 2.3K tokens, one 512-row local bucket each at attention CP 8.
 CODE_WORDS = (
@@ -47,9 +50,16 @@ SHORT_PROMPTS = (
 )
 
 
-def _recall(base_url: str, word: str, filler_repeats: int, max_new_tokens: int) -> dict:
+def _recall(
+    base_url: str,
+    word: str,
+    filler_repeats: int,
+    max_new_tokens: int,
+    prompt_format: str,
+) -> dict:
     side = FILLER * filler_repeats
-    text = f"{side}The secret code word is {word}. Remember it. {side}{QUESTION}"
+    context = f"{side}The secret code word is {word}. Remember it. {side}"
+    text = prompt_format.format(context=context, question=QUESTION, answer=ANSWER)
     return _generate(base_url, word, text, max_new_tokens)
 
 
@@ -71,23 +81,29 @@ def _generate(base_url: str, word: str, text: str, max_new_tokens: int) -> dict:
     }
 
 
-def needle_runner(base_url: str, max_new_tokens: int = 12) -> dict:
+def needle_runner(
+    base_url: str, max_new_tokens: int = 12, prompt_format: str = PLAIN_FORMAT
+) -> dict:
+    """``prompt_format`` frames each needle prompt from ``{context}``,
+    ``{question}`` and ``{answer}``; the short prompts stay plain text."""
     cases = [(word, 40 + 5 * k) for k, word in enumerate(CODE_WORDS)]
     results = [
-        _recall(base_url, *cases[0], max_new_tokens),
-        _recall(base_url, *cases[-1], max_new_tokens),
+        _recall(base_url, *cases[0], max_new_tokens, prompt_format),
+        _recall(base_url, *cases[-1], max_new_tokens, prompt_format),
     ]
     with ThreadPoolExecutor(len(cases) + len(SHORT_PROMPTS)) as pool:
         # Each short prompt follows long ones, so it joins their batch instead of
         # running alone on an idle server.
         futures = []
         for k, case in enumerate(cases):
-            futures.append(pool.submit(_recall, base_url, *case, max_new_tokens))
+            futures.append(
+                pool.submit(_recall, base_url, *case, max_new_tokens, prompt_format)
+            )
             if k % 4 == 3:
                 short = SHORT_PROMPTS[k // 4]
                 futures.append(pool.submit(_generate, base_url, *short, max_new_tokens))
         results += [future.result() for future in futures]
-    results.append(_recall(base_url, *LONG_NEEDLE, max_new_tokens))
+    results.append(_recall(base_url, *LONG_NEEDLE, max_new_tokens, prompt_format))
     failures = []
     for result in results:
         recalled = result["word"] in result["text"]

@@ -36,8 +36,12 @@ SERVER_LOG = os.path.join(tempfile.mkdtemp(prefix="gpt-oss-20b-pcp-"), "server.l
 # gpt-oss-20b scores 0.52-0.59 on these 200 questions (PP4xPCP2, TP8, PP8, and
 # 0.54 here); broken output scores near zero. Same floor as pp4_pcp2.
 GSM8K_ACCURACY = 0.45
-# GPT-OSS reasons before answering; 48 tokens cut a found word off mid-answer.
-NEEDLE_MAX_NEW_TOKENS = 128
+# Opens GPT-OSS's final channel after the question, so the code word is the
+# greedy continuation rather than wherever a free-form reasoning trace ends up.
+NEEDLE_FORMAT = (
+    "<|start|>user<|message|>{context}{question}<|end|>"
+    "<|start|>assistant<|channel|>final<|message|>{answer}"
+)
 
 MODEL_CONFIG = {
     "model": "gpt-oss-20b",
@@ -48,7 +52,7 @@ MODEL_CONFIG = {
             "dataset": "needle",
             "label": "needle-recall",
             "runner": lambda base_url: needle_runner(
-                base_url, max_new_tokens=NEEDLE_MAX_NEW_TOKENS
+                base_url, prompt_format=NEEDLE_FORMAT
             ),
         },
         {
