@@ -4246,9 +4246,8 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         self.use_dsa = use_dsa
         # TPU is in-tree but supplies its own pool classes, like OOT platforms.
-        uses_platform_pools = (
-            current_platform.is_out_of_tree() or current_platform.is_tpu()
-        )
+        on_tpu = current_platform.is_tpu()
+        uses_platform_pools = current_platform.is_out_of_tree() or on_tpu
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
             # aliasing the shared byte buffer.
@@ -4303,7 +4302,9 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            if uses_platform_pools:
+            if on_tpu:
+                # TPU's split MLA pool, built as in
+                # kv_cache_configurator._build_tpu_dsa_kv_pool.
                 skips = skip_topk_layers or [False] * self.full_layer_nums
                 self.full_kv_pool = current_platform.get_dsa_kv_pool_cls()(
                     size=size,
