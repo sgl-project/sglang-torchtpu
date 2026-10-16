@@ -511,13 +511,6 @@ def _validate_dsa(server_args) -> None:
         )
 
 
-def _register_models() -> None:
-    """Serve sglang_tpu/models in place of core's models of the same arch."""
-    from sglang.srt.models.registry import ModelRegistry
-
-    ModelRegistry.register("sglang_tpu.models", overwrite=True)
-
-
 def _register_attention_backends() -> None:
     """Add the attention backends that only this package knows to the registry."""
     from sglang.srt.layers.attention.attention_registry import (
@@ -772,7 +765,7 @@ class TpuSRTPlatform(SRTPlatform):
         _validate_prefill_context_parallel(server_args)
         apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
         # Before the default backend below, so the error names what was passed.
-        from sglang_tpu.models.glm5_next_args import apply_glm5_next_server_args
+        from sglang_tpu.glm5_next_args import apply_glm5_next_server_args
 
         apply_glm5_next_server_args(server_args)
         _validate_dsa(server_args)
@@ -1198,7 +1191,6 @@ class TpuSRTPlatform(SRTPlatform):
 
         apply_tpu_patches()
         _register_attention_backends()
-        _register_models()
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:

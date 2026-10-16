@@ -49,6 +49,11 @@ def _torch_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
     return packing_bits // bits
 
 
+# Rope width the TPU MLA kernels attend with when the model has none (NoPE, e.g.
+# GLM-5.3-Flash): the backend feeds zeros, so q_pe . k_pe = 0.
+NOPE_MLA_ROPE_DIM = 64
+
+
 def _zeros_kv_buffer(shape, dtype: torch.dtype, device) -> torch.Tensor:
     """Preallocate one layer's KV buffer as a genuine ``dtype`` base tensor.
 
@@ -807,8 +812,9 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
         self.nope_dim = (
             _cdiv(kv_lora_rank, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
         )
+        rope_width = qk_rope_head_dim or NOPE_MLA_ROPE_DIM
         self.rope_dim = (
-            _cdiv(qk_rope_head_dim, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
+            _cdiv(rope_width, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
         )
         self.padded_kv_cache_dim = self.nope_dim + self.rope_dim
 

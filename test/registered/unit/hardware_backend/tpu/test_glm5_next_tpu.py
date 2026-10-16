@@ -1,35 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contracts for GLM's TPU text configuration, router and mHC."""
+"""CPU contracts for GLM-5.3-Flash on TPU: server args, the torch mHC path and
+the gated norm the shared model runs there."""
 
 import json
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import torch
 
-from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
-from sglang.srt.configs.hybrid_arch import glm5_next_config
-from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.hf_transformers.config import HfModelConfigParser
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.models.glm5_next import (
-    Glm5NextLatentAttention,
-    Glm5NextLinearAttention,
-    Glm5NextSparseAttention,
-    TpuRMSNormGated,
-    _full_attention_cls,
+from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.layernorm.mhc import (
+    _mhc_post_uses_torch,
+    _mhc_pre_uses_torch,
     hc_post,
     hc_pre,
 )
-from sglang_tpu.models.glm5_next_args import ROPE_PAD, _merge, model_overrides
+from sglang.srt.configs.glm5_next import Glm5NextConfig
+from sglang.srt.configs.hybrid_arch import glm5_next_config
+from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.environ import envs
+from sglang.srt.utils.hf_transformers.config import HfModelConfigParser
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.glm5_next_args import (
+    _merge,
+    _use_torch_mhc,
+    _validate,
+    dense_overrides,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_MHC_ENVS = (
+    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE,
+    envs.SGLANG_OPT_USE_TILELANG_MHC_POST,
+    envs.SGLANG_OPT_FUSE_MHC_POST_PRE,
+)
+
+
+def _serving_args(**overrides):
+    args = dict(
+        disable_radix_cache=True,
+        speculative_algorithm=None,
+        attn_dp_size=1,
+        enable_dp_attention=False,
+        pp_size=1,
+    )
+    args.update(overrides)
+    return SimpleNamespace(**args)
 
 
 class TestGlm5NextTpu(unittest.TestCase):
@@ -50,17 +71,14 @@ class TestGlm5NextTpu(unittest.TestCase):
         self.assertEqual(config.qk_rope_head_dim, 64)
         self.assertEqual(config.qk_head_dim, 256)
 
-    def test_tpu_config_overrides_keep_core_free_of_glm_branches(self):
+    def test_dense_opt_in_clears_index_topk_for_flash_only(self):
         flash = SimpleNamespace(architectures=["Glm5NextForConditionalGeneration"])
         other = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
-        self.assertEqual(model_overrides(other, None), {})
-        # DSA: only the zero rope segment the TPU MLA kernels read.
-        sparse = model_overrides(flash, None)
-        self.assertEqual(sparse["qk_rope_head_dim"], ROPE_PAD)
-        self.assertEqual(sparse["text_config"], {"qk_rope_head_dim": ROPE_PAD})
-        # Dense opt-in: index_topk cleared at both levels, so is_deepseek_dsa
-        # reads the model as plain MLA.
-        dense = model_overrides(flash, 2048)
+        self.assertEqual(dense_overrides(flash, None), {})
+        self.assertEqual(dense_overrides(other, 2048), {})
+        # index_topk cleared at both levels, so is_deepseek_dsa reads the model
+        # as plain MLA.
+        dense = dense_overrides(flash, 2048)
         self.assertIsNone(dense["index_topk"])
         self.assertIsNone(dense["text_config"]["index_topk"])
         self.assertFalse(
@@ -72,56 +90,36 @@ class TestGlm5NextTpu(unittest.TestCase):
             )
         )
         # A user's own text_config overrides survive the merge.
-        merged = _merge({"text_config": {"rms_norm_eps": 1e-6}}, sparse)
+        merged = _merge({"text_config": {"rms_norm_eps": 1e-6}}, dense)
         self.assertEqual(merged["text_config"]["rms_norm_eps"], 1e-6)
-        self.assertEqual(merged["text_config"]["qk_rope_head_dim"], ROPE_PAD)
+        self.assertIsNone(merged["text_config"]["index_topk"])
 
-    def test_dense_opt_in_selects_the_attention_class(self):
-        self.assertIs(_full_attention_cls(), Glm5NextSparseAttention)
-        with tpu_envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.override(2048):
-            self.assertIs(_full_attention_cls(), Glm5NextLatentAttention)
+    def test_unsupported_serving_features_are_rejected(self):
+        text = SimpleNamespace(index_kpool=4, index_kpool_always_select_tail=True)
+        _validate(_serving_args(), text)
+        for overrides in (
+            dict(disable_radix_cache=False),
+            dict(speculative_algorithm="EAGLE3"),
+            dict(attn_dp_size=2),
+            dict(enable_dp_attention=True),
+            dict(pp_size=2),
+        ):
+            with self.subTest(**overrides), self.assertRaises(ValueError):
+                _validate(_serving_args(**overrides), text)
+        with self.assertRaises(ValueError):
+            _validate(
+                _serving_args(),
+                SimpleNamespace(index_kpool=4, index_kpool_always_select_tail=False),
+            )
 
-    def test_kda_output_keeps_batch_one_token_axis(self):
-        config = Glm5NextTextConfig(
-            hidden_size=16, linear_num_heads=2, linear_head_dim=4
-        )
-        with get_parallel().override(
-            tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-        ):
-            attn = Glm5NextLinearAttention(0, config.hidden_size, config)
-        batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_idle=lambda: False, is_decode=lambda: True)
-        )
-        # The TPU KDA backend returns [1, tokens, heads, dim].
-        with (
-            patch.object(attn.attn, "forward", return_value=torch.ones(1, 1, 2, 4)),
-            get_parallel().override(
-                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0, tp_group=None
-            ),
-        ):
-            output = attn(torch.ones(1, config.hidden_size), batch)
-        self.assertEqual(output.shape, (1, config.hidden_size))
-
-    def test_tpu_kda_binding_matches_kernel_layout(self):
-        config = Glm5NextTextConfig(
-            hidden_size=16, linear_num_heads=2, linear_head_dim=4
-        )
-        with get_parallel().override(
-            tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-        ):
-            attn = Glm5NextLinearAttention(0, config.hidden_size, config)
-        with torch.no_grad():
-            attn.A_log.copy_(torch.tensor([0.5, -0.25]).reshape(attn.A_log.shape))
-            attn.dt_bias.copy_(torch.arange(8, dtype=torch.float32))
-        attn.bind_tpu_attn_weights()
-        bound = attn.attn
-        # The depthwise [dim, 1, K] parameter itself, not a view.
-        self.assertIs(bound.conv_weights, attn.qkv_conv1d.weight)
-        self.assertEqual(tuple(bound.conv_weights.shape[1:]), (1, attn.conv_size))
-        self.assertEqual(bound.A_log.tolist(), [0.5, -0.25])
-        self.assertIs(bound.dt_bias, attn.dt_bias)
-        self.assertIsNotNone(bound.packed_kernel_weights)
-        self.assertEqual(bound.packed_kernel_weights.dtype, torch.float32)
+    def test_tpu_selects_the_traceable_torch_mhc_path(self):
+        with ExitStack() as stack:
+            for env in _MHC_ENVS:
+                stack.enter_context(env.override(True))
+            _use_torch_mhc()
+            self.assertTrue(all(env.get() is False for env in _MHC_ENVS))
+            self.assertTrue(_mhc_pre_uses_torch())
+            self.assertTrue(_mhc_post_uses_torch())
 
     def test_nested_checkpoint_config_preserves_attention_types_and_gate(self):
         cfg = Glm5NextConfig(
@@ -145,26 +143,9 @@ class TestGlm5NextTpu(unittest.TestCase):
         self.assertEqual(text.layer_types[-1], "deepseek_sparse_attention")
         self.assertEqual(text.linear_attn_config["gate_lower_bound"], -5.0)
 
-    def test_hyper_connection_collapse_and_residual_orientation(self):
-        cfg = SimpleNamespace(
-            hc_mult=3, hc_eps=1e-6, rms_norm_eps=1e-5, hc_sinkhorn_iters=20
-        )
-        x = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
-        fn = torch.zeros(15, 12)
-        collapsed, post, comb = hc_pre(x, fn, torch.ones(3), torch.zeros(15), cfg)
-        torch.testing.assert_close(collapsed, x.sum(1) * (0.5 + cfg.hc_eps))
-        torch.testing.assert_close(post, torch.ones_like(post))
-        torch.testing.assert_close(comb.sum(-1), torch.ones(1, 3), atol=1e-5, rtol=0)
-        # A cyclic residual mixer catches accidentally transposing H_res.
-        permutation = torch.tensor(
-            [[[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]]
-        )
-        output = hc_post(torch.zeros(1, 4), x, post, permutation)
-        torch.testing.assert_close(output, x[:, [2, 0, 1]])
-
     def test_gated_rms_norm_matches_high_precision_reference(self):
         generator = torch.Generator().manual_seed(53)
-        norm = TpuRMSNormGated(8, eps=1e-6)
+        norm = FusedRMSNormGated(8, eps=1e-6, activation="sigmoid")
         with torch.no_grad():
             norm.weight.copy_(torch.randn(8, generator=generator))
         for tokens in (1, 5):
@@ -179,16 +160,14 @@ class TestGlm5NextTpu(unittest.TestCase):
                     expected = (
                         expected * norm.weight.double() / (1 + (-gate.double()).exp())
                     ).to(dtype)
-                    output = norm(x, gate)
+                    output = norm.forward_native(x, gate)
                     torch.testing.assert_close(output, expected)
                     self.assertEqual(output.dtype, dtype)
 
-    def test_nonuniform_hyper_connections_match_numpy(self):
+    def test_torch_mhc_matches_numpy(self):
         rng = np.random.default_rng(53)
         h, d, tokens = 4, 8, 3
-        cfg = SimpleNamespace(
-            hc_mult=h, hc_eps=1e-6, rms_norm_eps=1e-5, hc_sinkhorn_iters=20
-        )
+        rms_eps, hc_eps, iters = 1e-5, 1e-6, 20
         x = rng.normal(size=(tokens, h, d))
         fn = rng.normal(scale=0.1, size=((2 + h) * h, h * d))
         scale = np.array([0.8, 1.1, 1.3])
@@ -196,28 +175,44 @@ class TestGlm5NextTpu(unittest.TestCase):
         branch = rng.normal(size=(tokens, d))
         expected, expected_post, expected_comb, expected_output = [], [], [], []
         for row, branch_row in zip(x, branch):
-            normalized = row.ravel() / np.sqrt(np.mean(row**2) + cfg.rms_norm_eps)
+            normalized = row.ravel() / np.sqrt(np.mean(row**2) + rms_eps)
             logits = fn @ normalized
-            pre = 1 / (1 + np.exp(-(logits[:h] * scale[0] + base[:h]))) + cfg.hc_eps
+            pre = 1 / (1 + np.exp(-(logits[:h] * scale[0] + base[:h]))) + hc_eps
             post = 2 / (1 + np.exp(-(logits[h : 2 * h] * scale[1] + base[h : 2 * h])))
             matrix = (logits[2 * h :] * scale[2] + base[2 * h :]).reshape(h, h)
             matrix = np.exp(matrix - matrix.max(axis=1, keepdims=True))
-            matrix = matrix / matrix.sum(axis=1, keepdims=True) + cfg.hc_eps
-            matrix /= matrix.sum(axis=0, keepdims=True) + cfg.hc_eps
-            for _ in range(cfg.hc_sinkhorn_iters - 1):
-                matrix /= matrix.sum(axis=1, keepdims=True) + cfg.hc_eps
-                matrix /= matrix.sum(axis=0, keepdims=True) + cfg.hc_eps
+            matrix = matrix / matrix.sum(axis=1, keepdims=True) + hc_eps
+            matrix /= matrix.sum(axis=0, keepdims=True) + hc_eps
+            for _ in range(iters - 1):
+                matrix /= matrix.sum(axis=1, keepdims=True) + hc_eps
+                matrix /= matrix.sum(axis=0, keepdims=True) + hc_eps
             expected.append(pre @ row)
             expected_post.append(post)
-            expected_comb.append(matrix)
-            expected_output.append(matrix.T @ row + post[:, None] * branch_row)
-        inputs = [
-            torch.tensor(value, dtype=torch.float32) for value in (x, fn, scale, base)
-        ]
-        collapsed, post, comb = hc_pre(*inputs, cfg)
-        output = hc_post(
-            torch.tensor(branch, dtype=torch.float32), inputs[0], post, comb
+            expected_comb.append(matrix.ravel())
+            # H_res mixes streams as matrix.T @ row: a transposed mixer fails here.
+            expected_output.append(
+                (matrix.T @ row + post[:, None] * branch_row).ravel()
+            )
+        x_t, fn_t, scale_t, base_t, branch_t = (
+            torch.tensor(value, dtype=torch.float32)
+            for value in (x, fn, scale, base, branch)
         )
+        residual = x_t.reshape(tokens, h * d)
+        with ExitStack() as stack:
+            for env in _MHC_ENVS:
+                stack.enter_context(env.override(False))
+            collapsed, comb, post, norm_fused = hc_pre(
+                residual,
+                fn_t,
+                scale_t,
+                base_t,
+                hc_mult=h,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+                sinkhorn_iters=iters,
+            )
+            output = hc_post(branch_t, residual, post, comb, hc_mult=h)
+        self.assertFalse(norm_fused)
         for actual, reference in zip(
             (collapsed, post, comb, output),
             (expected, expected_post, expected_comb, expected_output),

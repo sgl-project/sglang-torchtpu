@@ -43,11 +43,13 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
         if conv_weight.ndim == 2:
             conv_weight = conv_weight.unsqueeze(1)
         # The kernel takes the raw forget gate [T, n_v * d_k] and raw beta [T, n_v];
-        # the model hands them over with leading batch / per-head axes.
+        # the model hands them over with leading batch / per-head axes. Fused
+        # projections pass split views, and the op reads raw buffers, so make
+        # every input dense.
         out = self._op(
-            mixed_qkv,
-            b.reshape(num_tokens, n_v),
-            a.reshape(num_tokens, n_v * d_k),
+            mixed_qkv.contiguous(),
+            b.reshape(num_tokens, n_v).contiguous(),
+            a.reshape(num_tokens, n_v * d_k).contiguous(),
             layer_cache.conv[0],
             layer_cache.temporal,
             conv_weight,
