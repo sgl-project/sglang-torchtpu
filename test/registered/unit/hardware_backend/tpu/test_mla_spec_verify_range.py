@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Speculative target verify on pallas_tpu_mla stays on the kernel's MIXED pass.
+"""Where speculative target verify runs on the MLA backends.
 
-The MLA v2 kernel's DECODE range attends one query row per sequence. RPA v3
-routes fixed-width verify to DECODE (decode_query_size = draft width), which on
-MLA would read only each window's first query row: output past the first
-draft token would be garbage. MLA turns that routing off.
+Dense ``pallas_tpu_mla`` runs fixed-width verify on the MLA kernel's decode
+passes with ``decode_query_size`` rows per sequence, as RPA v3 does. The sparse
+backend's kernel has no fixed-width decode pass, so its verify keeps the extend
+layout.
 """
 
 import unittest
@@ -12,27 +12,24 @@ import unittest
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+from sglang_tpu.attention_pallas_mla_sparse import TpuPallasSparseMlaAttnBackend
 from sglang_tpu.attention_pallas_rpa_base import _resolve_decode_query_size
-from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestMlaSpecVerifyRange(CustomTestCase):
-    def test_mla_verify_stays_on_mixed(self):
-        mla = TpuPallasMlaAttnBackend.kernel_spec.supports_decode_query_size
-        self.assertFalse(mla)
+    def test_dense_mla_verifies_on_decode(self):
+        self.assertTrue(TpuPallasMlaAttnBackend.kernel_spec.supports_decode_query_size)
+
+    def test_sparse_mla_keeps_verify_on_extend(self):
+        sparse = TpuPallasSparseMlaAttnBackend.kernel_spec.supports_decode_query_size
+        self.assertFalse(sparse)
         self.assertEqual(
             _resolve_decode_query_size(
-                supports_decode_query_size=mla, spec_enabled=True
+                supports_decode_query_size=sparse, spec_enabled=True
             ),
             1,
-        )
-
-    def test_rpa_v3_keeps_decode_routing(self):
-        # The MLA spec is derived from RPA v3's; only this flag differs.
-        self.assertTrue(
-            TpuPallasRpaV3AttnBackend.kernel_spec.supports_decode_query_size
         )
 
 

@@ -130,6 +130,22 @@ class TestMlaKernelSegments(CustomTestCase):
             with self.subTest(case=name):
                 self._assert_covered(self._metadata(backend, batch), expected)
 
+    def test_target_verify_runs_on_the_decode_passes(self):
+        backend = self._backend(spec=True)
+        verify = SimpleNamespace(num_tokens_per_req=DRAFT_TOKENS)
+        metadata = self._metadata(
+            backend, _batch(ForwardMode.TARGET_VERIFY, [10, 20], spec_info=verify)
+        )
+        self.assertEqual(metadata.decode_query_size, DRAFT_TOKENS)
+        self.assertEqual(metadata.distribution.tolist(), [2, 2, 2])
+        # A verify width other than the backend's stays on MIXED.
+        other = SimpleNamespace(num_tokens_per_req=DRAFT_TOKENS - 1)
+        metadata = self._metadata(
+            backend, _batch(ForwardMode.TARGET_VERIFY, [10, 20], spec_info=other)
+        )
+        self.assertEqual(metadata.decode_query_size, 1)
+        self.assertEqual(metadata.distribution.tolist(), [0, 0, 2])
+
     def test_forward_passes_metadata_segments_to_op(self):
         backend = self._backend(spec=False)
         layer = SimpleNamespace(
@@ -153,9 +169,10 @@ class TestMlaKernelSegments(CustomTestCase):
                 q_rope=torch.randn(T, H, D, dtype=torch.bfloat16),
                 k_rope=torch.randn(T, 1, D, dtype=torch.bfloat16),
             )
+            kwargs = backend._op.call_args.kwargs
+            self.assertEqual(kwargs["segments"], backend.forward_metadata.segments)
             self.assertEqual(
-                backend._op.call_args.kwargs["segments"],
-                backend.forward_metadata.segments,
+                kwargs["decode_query_size"], backend.forward_metadata.decode_query_size
             )
 
 

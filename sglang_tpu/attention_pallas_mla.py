@@ -38,7 +38,6 @@ Design notes
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
-import dataclasses
 import logging
 from typing import TYPE_CHECKING, Optional
 
@@ -49,7 +48,6 @@ from sglang_tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
 from sglang_tpu.attention_pallas_rpa_v3 import (
-    RPA_V3_SPEC,
     TpuPallasRpaV3AttnBackend,
 )
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
@@ -100,6 +98,7 @@ def _build_pallas_mla_kernel_op():
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         segments: str = "all",
+        decode_query_size: int = 1,
     ) -> tuple[jax.Array, jax.Array]:
         return _jax_mla(
             ql_nope,
@@ -117,12 +116,13 @@ def _build_pallas_mla_kernel_op():
             v_scale=v_scale,
             decode_batch_size=_MLA_DECODE_BATCH_SIZE,
             segments=segments,
+            decode_query_size=decode_query_size,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=(10, 11, 12, 13),
+        static_argnums=(10, 11, 12, 13, 14),
         donate_argnums=(4,),
         input_output_aliases={4: 1},
         warn_deprecated=False,
@@ -148,6 +148,7 @@ def _build_pallas_mla_kernel_op():
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         segments: str = "all",
+        decode_query_size: int = 1,
     ) -> torch.Tensor:
         # JAX is CPU-only here, so Mosaic needs the TPU generation patched in.
         # Inside the custom op like the RPA base: Dynamo can't trace the patch's lock.
@@ -167,6 +168,7 @@ def _build_pallas_mla_kernel_op():
                 k_scale,
                 v_scale,
                 segments,
+                decode_query_size,
             )
         return output
 
@@ -191,10 +193,6 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     MLA kernel consumes the identical layout — and overrides only the op
     registration and the per-layer forward.
     """
-
-    # The MLA kernel's DECODE range attends one query row per sequence, so
-    # fixed-width target verification must stay on MIXED.
-    kernel_spec = dataclasses.replace(RPA_V3_SPEC, supports_decode_query_size=False)
 
     def _build_kernel_op(self):
         # Hook called by ``super().__init__()`` to populate ``self._op``. Both
@@ -275,8 +273,9 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     ) -> torch.Tensor:
         out = self._op(
             *self._mla_kernel_args(q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope),
-            # Only this dense kernel takes ``segments``. The sparse op does not.
+            # Only this dense kernel takes these two. The sparse op does not.
             segments=self.forward_metadata.segments,
+            decode_query_size=self.forward_metadata.decode_query_size,
         )
         # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
         # views it back to 3D and folds W_UV.

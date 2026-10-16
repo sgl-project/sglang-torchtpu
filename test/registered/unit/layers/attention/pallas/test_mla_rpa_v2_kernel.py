@@ -21,6 +21,10 @@ What each case checks
 3. the ``segments`` the backend passes for this distribution (skipping the
    passes it leaves empty) is bit-identical to ``segments="all"``.
 
+Speculative verify runs on the decode passes with ``decode_query_size`` rows per
+sequence (``mode="verify"``). A batch whose decode rows are not all that wide
+must fall back to MIXED inside the kernel and stay correct.
+
 Metadata mirrors what ``TpuPallasRpaV3AttnBackend._build_metadata`` feeds the
 kernel in production: real (unaligned) ``kv_lens``, a *rectangular*
 ``page_indices`` table of ``bs * pages_per_seq`` entries and
@@ -308,9 +312,10 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         decode_batch_size=_DECODE_BATCH_SIZE,
         dtype=None,
         s_dtype=None,
+        decode_query_size=1,
         seed=0,
     ):
-        assert mode in ("extend", "decode")
+        assert mode in ("extend", "decode", "verify")
         dtype = jnp.bfloat16 if dtype is None else dtype
         case = _build_case(
             lens, page_size=page_size, num_heads=num_heads, dtype=dtype, seed=seed
@@ -319,6 +324,9 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
 
         if mode == "decode":
             assert all(q == 1 for q, _ in lens), "decode expects q_len == 1"
+            distribution = np.array([bs, bs, bs], dtype=np.int32)
+        elif mode == "verify":
+            # The backend puts verify rows in the decode range.
             distribution = np.array([bs, bs, bs], dtype=np.int32)
         else:
             distribution = np.array([0, 0, bs], dtype=np.int32)
@@ -347,6 +355,7 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
                 soft_cap=soft_cap,
                 mask_value=_MASK_VALUE,
                 decode_batch_size=decode_batch_size,
+                decode_query_size=decode_query_size,
                 segments=segments,
                 **({} if s_dtype is None else {"s_dtype": s_dtype}),
                 **block_kwargs,
@@ -354,10 +363,14 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
 
         out, updated_cache = call("all")
         jax.block_until_ready((out, updated_cache))
-        # Skipping the passes this distribution leaves empty is bit-identical.
-        out_seg, cache_seg = call("decode" if mode == "decode" else "mixed")
-        np.testing.assert_array_equal(np.asarray(out_seg), np.asarray(out))
-        np.testing.assert_array_equal(np.asarray(cache_seg), np.asarray(updated_cache))
+        if mode != "verify":
+            # Skipping the passes this distribution leaves empty is
+            # bit-identical. Verify needs every pass: it may fall back to MIXED.
+            out_seg, cache_seg = call("decode" if mode == "decode" else "mixed")
+            np.testing.assert_array_equal(np.asarray(out_seg), np.asarray(out))
+            np.testing.assert_array_equal(
+                np.asarray(cache_seg), np.asarray(updated_cache)
+            )
 
         expected = _ref_attention(
             case,
@@ -579,6 +592,35 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
             sliding_window=128,
             soft_cap=30.0,
         )
+
+    def test_verify_batched_and_tail_passes(self):
+        """9 sequences of 4 rows: 8 through the batched pass, 1 through the tail.
+
+        KV lengths straddle page boundaries so each window crosses a page.
+        """
+        lens = [(4, n) for n in (66, 127, 128, 129, 200, 255, 256, 257, 1025)]
+        self._run("verify", lens, page_size=64, decode_query_size=4)
+
+    def test_verify_tail_pass_only(self):
+        self._run(
+            "verify", [(4, 70), (4, 300), (4, 513)], page_size=64, decode_query_size=4
+        )
+
+    def test_verify_eight_rows_tuned_block_sizes(self):
+        """8-row verify (7 drafts) at page 128 with the tuned decode entry."""
+        lens = [(8, 100 + 61 * i) for i in range(12)]
+        self._run(
+            "verify",
+            lens,
+            page_size=128,
+            decode_query_size=8,
+            tuned_blocks=True,
+        )
+
+    def test_verify_non_uniform_falls_back_to_mixed(self):
+        """One window narrower than decode_query_size: the kernel runs MIXED."""
+        lens = [(4, 130), (2, 260), (4, 390), (4, 520), (4, 650)]
+        self._run("verify", lens, page_size=64, decode_query_size=4)
 
     def test_extend_with_tuned_block_sizes(self):
         """Block sizes left unset -> the kernel consults the tuned table.
