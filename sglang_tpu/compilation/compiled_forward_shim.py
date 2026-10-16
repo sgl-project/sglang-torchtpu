@@ -609,7 +609,12 @@ def _pad_forward_batch_inputs(
     is_draft_extend_v2 = forward_batch.forward_mode.is_draft_extend_v2()
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
-    if is_decode and forward_batch.spec_info is None:
+    if (
+        envs.SGLANG_TPU_HOST_PADDING.get()
+        and is_decode
+        and forward_batch.spec_info is None
+    ):
+        # Relay-gathered decode tokens arrive bucketed; lengths stay logical.
         real_q = real_b
 
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -780,7 +785,8 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
         if (
-            field == "mrope_positions"
+            envs.SGLANG_TPU_HOST_PADDING.get()
+            and field == "mrope_positions"
             and isinstance(value, torch.Tensor)
             and forward_batch.forward_mode.is_decode()
             and forward_batch.spec_info is None

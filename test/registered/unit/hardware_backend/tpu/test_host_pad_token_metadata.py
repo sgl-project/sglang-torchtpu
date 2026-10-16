@@ -320,7 +320,10 @@ class TestHostPadFieldSelection(CustomTestCase):
 
     def test_decode_restoration_keeps_mrope_but_trims_consumed_metadata(self):
         for live_rows in (4, 7, 8):
-            with self.subTest(live_rows=live_rows):
+            with (
+                self.subTest(live_rows=live_rows),
+                envs.SGLANG_TPU_HOST_PADDING.override(True),
+            ):
                 batch = self._decode_batch()
                 batch.input_ids = torch.arange(8)
                 batch.positions = torch.arange(8)
@@ -341,10 +344,20 @@ class TestHostPadFieldSelection(CustomTestCase):
                 self.assertEqual(batch.input_ids.shape, (live_rows,))
                 self.assertEqual(batch.seq_lens.shape, (live_rows,))
 
-        # Speculative decode retains its existing restoration contract.
-        batch.spec_info = SimpleNamespace(hidden_states=None)
-        shim._restore_forward_batch_inputs(batch, 7, 7)
-        self.assertEqual(batch.mrope_positions.shape, (3, 7))
+        # Without host padding and for speculative decode, mRoPE is trimmed as before.
+        for flag, spec_info in (
+            (False, None),
+            (True, SimpleNamespace(hidden_states=None)),
+        ):
+            with (
+                self.subTest(flag=flag, spec=spec_info is not None),
+                envs.SGLANG_TPU_HOST_PADDING.override(flag),
+            ):
+                batch = self._decode_batch()
+                batch.spec_info = spec_info
+                batch.mrope_positions = torch.zeros((3, 8), dtype=torch.int64)
+                shim._restore_forward_batch_inputs(batch, 7, 7)
+                self.assertEqual(batch.mrope_positions.shape, (3, 7))
 
     def test_decode_keeps_device_pad(self):
         batch = self._decode_batch()

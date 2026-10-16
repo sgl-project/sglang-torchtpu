@@ -43,6 +43,11 @@ class HostPaddingFutureMap(FutureMap):
         padded_indices = self._indices(indices, len(values))
         buf.index_copy_(0, padded_indices, values.to(buf.dtype))
 
+    def publish(self, future_indices, new_seq_lens, confidence=None):
+        # Only spec batches read published lengths, and this map is non-spec;
+        # skipping avoids per-step uploads of host-owned lengths.
+        return
+
     def gather(self, indices):
         width = self.bucketer.next_bucket(len(indices))
         device_indices = self._indices(indices, width)

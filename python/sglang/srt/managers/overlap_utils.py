@@ -528,8 +528,8 @@ class FutureMap:
         """
         # Cast to the buffer dtype before storing (main #134: the sampler now
         # returns int64 token ids that must land in the buffer's dtype).
-        if values.dtype != buf.dtype:
-            values = values.to(buf.dtype)
+        # Host-owned scheduler lengths may arrive on CPU; same-device values are no-ops.
+        values = values.to(device=buf.device, dtype=buf.dtype, non_blocking=True)
         indices = indices.to(buf.device, non_blocking=True)
         if self._use_dynamic_index:
             buf.index_copy_(0, indices, values)
