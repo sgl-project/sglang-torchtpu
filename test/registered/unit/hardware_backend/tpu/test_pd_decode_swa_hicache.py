@@ -321,6 +321,28 @@ class TestCacheConstruction(CustomTestCase):
         register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
         self.assertIsNone(tpu._building_draft_plan)
 
+    def test_draft_writing_into_the_target_pool_builds_without_a_sidecar(self):
+        # The full-only host pool backs all of such a draft's KV, so any algorithm passes.
+        cache = MagicMock()
+        draft_plan = SimpleNamespace(mode=HiCacheDraftMode.NONE)
+
+        def upstream_build(**kwargs):
+            self.assertFalse(kwargs["enable_hierarchical_cache"])
+            mark_full_only(cache)
+            return tpu._create_tree_cache(lambda ctx: cache, make_ctx())
+
+        with (
+            patch(TPU + ".get_disagg", return_value=disagg()),
+            patch(TPU + ".get_memory", return_value=memory()),
+            patch(TPU + ".auto_size_hicache"),
+        ):
+            built = tpu._build_kv_cache(
+                upstream_build,
+                **build_kwargs(spec_algorithm=spec(), hicache_draft_plan=draft_plan),
+            )
+        self.assertIs(built, cache)
+        self.assertFalse(tpu._is_building_full_only_host_cache)
+
     def test_full_only_build_requires_the_full_only_stack(self):
         # E.g. a cache type the SWA host strategy does not build.
         def upstream_build(**kwargs):
@@ -353,8 +375,20 @@ class TestCacheConstruction(CustomTestCase):
     def test_unsupported_configs_are_rejected(self):
         for overrides, mem, dis, tree_core, reason in (
             ({"page_size": 1}, {}, {}, "python", "page-size"),
-            # DFlash and the other drafts are not validated in this mode.
+            # DFlash and the other drafts with their own KV are not validated in this mode.
             ({"spec_algorithm": spec()}, {}, {}, "python", "Only EAGLE3"),
+            (
+                {
+                    "spec_algorithm": spec(),
+                    "hicache_draft_plan": SimpleNamespace(
+                        mode=HiCacheDraftMode.SIDECAR
+                    ),
+                },
+                {},
+                {},
+                "python",
+                "Only EAGLE3",
+            ),
             # EAGLE3 draft KV reaches RAM only as upstream's draft sidecar.
             ({"spec_algorithm": spec(eagle3=True)}, {}, {}, "python", "sidecar"),
             (

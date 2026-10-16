@@ -10,6 +10,7 @@ to host RAM:
   the window and the new tokens.
 - A request that reuses pages of an unfinished RAM restore waits for it.
 - With EAGLE3, the draft KV goes to RAM together with the full-attention KV.
+  A draft that writes into the target pool needs nothing more.
 
 ``install()`` wraps a few upstream functions and registers a host stack
 strategy. Each behaves exactly like upstream unless the decode cache is one of
@@ -128,6 +129,12 @@ def _validate_full_only_host_cache_config(
 ) -> None:
     """Raise for settings the full-only cache does not support."""
     memory = get_memory()
+    # NONE: the draft keeps no KV outside the target pool, which the full-only
+    # host pool already backs (no draft model, or one writing into the target pool).
+    draft_in_target_pool = (
+        hicache_draft_plan is not None
+        and hicache_draft_plan.mode == HiCacheDraftMode.NONE
+    )
     requirements = (
         (
             memory.hicache_io_backend == "raiden",
@@ -143,14 +150,17 @@ def _validate_full_only_host_cache_config(
         ),
         (page_size > 1, "--page-size must be > 1 for the page-aligned SWA tail"),
         (
-            spec_algorithm.is_none() or spec_algorithm.is_eagle3(),
-            "Only EAGLE3 is supported for speculative decoding in this mode",
+            spec_algorithm.is_none()
+            or draft_in_target_pool
+            or spec_algorithm.is_eagle3(),
+            "Only EAGLE3 is supported for a draft with its own KV pool in this mode",
         ),
         # Draft KV reaches RAM only through upstream's draft sidecar pool. A
         # packed draft lives inside the full KV pool, which this build does
         # not lay out for.
         (
             spec_algorithm.is_none()
+            or draft_in_target_pool
             or (
                 hicache_draft_plan is not None
                 and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
