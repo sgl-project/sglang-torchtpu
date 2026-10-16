@@ -18,10 +18,10 @@ from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.pending_call import PendingCall
 
 if TYPE_CHECKING:
-    from sglang_tpu.compilation.shared_compile import SharedCompiler
+    from sglang_tpu.compilation.spmd_compiler import SPMDCompiler
 
-create_shared_compile = LazyImport(
-    "sglang_tpu.compilation.shared_compile", "create_shared_compile"
+create_spmd_compiler = LazyImport(
+    "sglang_tpu.compilation.spmd_compiler", "create_spmd_compiler"
 )
 logger = get_logger(__name__)
 
@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 class WarmupQueue:
     def __init__(self, group: dist.ProcessGroup | None = None) -> None:
         self.verify = os.environ.get("VERIFY_SPMD_SAFE", "0") == "1"
-        self.shared_compile: SharedCompiler | None = None
+        self.spmd_compiler: SPMDCompiler | None = None
         self.calls: list[PendingCall] = []
         # TpuGraphRunner attaches its recompilation checker after every warmup.
         self.completions: list[Callable[[], None]] = []
@@ -42,17 +42,17 @@ class WarmupQueue:
             return
         if group is None:
             group = get_parallel().tp_group.cpu_group
-        allow_spmd_safe = get_exec().graph.allow_spmd_safe
+        use_spmd_compile = get_exec().graph.use_spmd_compile
         # Agree before compiler construction can enter mode-specific collectives.
-        mode = (self.verify, allow_spmd_safe)
+        mode = (self.verify, use_spmd_compile)
         modes = [None] * dist.get_world_size(group)
         dist.all_gather_object(modes, mode, group=group)
         if any(peer != mode for peer in modes):
             raise ValueError("SPMD compilation flags differ across TPU ranks")
-        if self.verify and not allow_spmd_safe:
-            raise ValueError("SPMD verification requires --allow-spmd-safe")
-        if allow_spmd_safe:
-            self.shared_compile = create_shared_compile(
+        if self.verify and not use_spmd_compile:
+            raise ValueError("SPMD verification requires --use-spmd-compile")
+        if use_spmd_compile:
+            self.spmd_compiler = create_spmd_compiler(
                 group, verify_spmd_safe=self.verify
             )
 
@@ -79,15 +79,15 @@ def collect_warmups(*, group: dist.ProcessGroup | None = None) -> Iterator[Warmu
         yield existing
         return
     queue = WarmupQueue(group)
-    shared_compile = queue.shared_compile
+    spmd_compiler = queue.spmd_compiler
     token = _CURRENT.set(queue)
     start = time.perf_counter()
     try:
-        trace_error = ""
+        trace_error: str | None = None
         try:
             yield queue
         except Exception as caught:
-            if shared_compile is None:
+            if spmd_compiler is None:
                 raise
             logger.exception("SPMD compilation trace failed")
             trace_error = f"{type(caught).__name__}: {caught}"
@@ -95,9 +95,9 @@ def collect_warmups(*, group: dist.ProcessGroup | None = None) -> Iterator[Warmu
         count = len(queue.calls)
         logger.info("TPU global warmup: submitted %d calls; joining", count)
         # Pending calls retain this queue's context, but must compile locally after join.
-        queue.shared_compile = None
-        if shared_compile is not None:
-            shared_compile.finish(trace_error)
+        queue.spmd_compiler = None
+        if spmd_compiler is not None:
+            spmd_compiler.finish(trace_error)
         queue.wait()
         finished = time.perf_counter()
         logger.info(
@@ -111,6 +111,6 @@ def collect_warmups(*, group: dist.ProcessGroup | None = None) -> Iterator[Warmu
         _CURRENT.reset(token)
         queue.calls.clear()
         queue.completions.clear()
-        queue.shared_compile = None
-        if shared_compile is not None:
-            shared_compile.clear()
+        queue.spmd_compiler = None
+        if spmd_compiler is not None:
+            spmd_compiler.clear()

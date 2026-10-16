@@ -37,7 +37,7 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.pp_proxy_pytree import (
     register_pp_proxy_pytree,
 )
-from sglang_tpu.compilation.shared_compile import SharedCompiler
+from sglang_tpu.compilation.spmd_compiler import SPMDCompiler
 from sglang_tpu.compilation.warmup_queue import current_warmup_queue
 from sglang_tpu.rank_local import trace_rank
 
@@ -160,6 +160,14 @@ def direct_compile(
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
     ``lift_rank`` also passes the logical distributed rank as a tensor input,
     so rank-local operations can select their data without specializing the graph.
+
+    ``name`` identifies the compilation boundary independently of rank, such as
+    ``"target/model.forward"``. It is required with ``spmd_safe=True`` and combines
+    with the complete ``specialization_key`` to identify a graph across ranks.
+    ``spmd_safe`` declares eligibility; it neither verifies nor enables sharing.
+    Enable coordination with ``--use-spmd-compile`` and add a recipe test using
+    ``sglang_tpu.testing.spmd_safe`` to validate identical graphs and input layouts
+    on every rank. ``VERIFY_SPMD_SAFE=1`` runs that verification without execution.
 
     ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
     Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
@@ -288,9 +296,7 @@ class CompiledFunction:
         self._prune_unused_inputs = prune_unused_inputs
         self._uses_rng = uses_rng
         if spmd_safe and name is None:
-            raise ValueError(
-                "An SPMD-safe direct compilation requires a full graph name"
-            )
+            raise ValueError("spmd_safe=True requires passing name= to direct_compile")
         self._name = name
         self._spmd_safe = spmd_safe
         self._lift_rank = lift_rank
@@ -320,22 +326,22 @@ class CompiledFunction:
     ) -> _CompiledArtifact:
         key = self.specialization_key(*args, **kwargs)
         queue = current_warmup_queue() if async_compile and self._spmd_safe else None
-        shared_compile = queue.shared_compile if queue is not None else None
+        spmd_compiler = queue.spmd_compiler if queue is not None else None
         graph = (
             f"{self._name}:{canonical(_key_value(key))}"
-            if shared_compile is not None
+            if spmd_compiler is not None
             else None
         )
         artifact = self.cache.get(key)
-        if shared_compile is not None and (
-            artifact is None or artifact.pending_compile is not shared_compile
+        if spmd_compiler is not None and (
+            artifact is None or artifact.pending_compile is not spmd_compiler
         ):
             # Each queue must cover every key even if local caches differ across ranks.
             artifact = None
         if artifact is None:
             # set_stance has no public getter and replaces eval_frame._stance.
             if (
-                shared_compile is None
+                spmd_compiler is None
                 and self.cache
                 and eval_frame._stance.stance == "fail_on_recompile"
             ):
@@ -347,13 +353,13 @@ class CompiledFunction:
             logger.info(
                 "[direct_compile] new specialization %r (async=%s)", key, async_compile
             )
-            if shared_compile is not None:
-                shared_compile.enqueue(graph)
+            if spmd_compiler is not None:
+                spmd_compiler.enqueue(graph)
             artifact = self._compile(
                 args,
                 kwargs,
                 async_compile=async_compile,
-                shared_compile=shared_compile,
+                spmd_compiler=spmd_compiler,
                 graph=graph,
             )
             self.cache[key] = artifact
@@ -365,13 +371,13 @@ class CompiledFunction:
         kwargs: dict[str, Any],
         *,
         async_compile: bool = False,
-        shared_compile: SharedCompiler | None = None,
+        spmd_compiler: SPMDCompiler | None = None,
         graph: str | None = None,
     ) -> _CompiledArtifact:
         """Compile one specialization into a PJRT executable."""
 
         # Step 1: Figure out a flat list of Tensor inputs.
-        if shared_compile is not None and self._uses_rng:
+        if spmd_compiler is not None and self._uses_rng:
             raise ValueError("Shared TPU compilation requires explicit RNG inputs")
         call = (args, kwargs)
         # Yes, use jax's tree_util API. jax is required for pallas anyways
@@ -456,7 +462,7 @@ class CompiledFunction:
         kv_pool_input_stop = kv_pool_input_start + len(kv_pool_inputs)
         flat_inputs = [*model_inputs, *kv_pool_inputs]
         flat_inputs.extend(path_leaves[index][1] for index in tensor_leaf_indices)
-        if shared_compile is not None:
+        if spmd_compiler is not None:
             sync.synchronize(flat_inputs)
 
         # Step 2: We've figured out all of our args. Now, we can create
@@ -617,14 +623,15 @@ class CompiledFunction:
         start = time.perf_counter()
         if async_compile:
             with dynamo_timed("direct_compile_async_submit"):
-                if shared_compile is None:
+                if spmd_compiler is None:
                     pending_compile = tpu_torch_compile.async_traverse_and_compile(
                         result_tensors, graph_inputs, argument_layouts=argument_layouts
                     )
                 else:
-                    pending_compile = shared_compile.compile(
+                    pending_compile = spmd_compiler.compile(
                         result_tensors,
                         graph_inputs,
+                        argument_layouts=argument_layouts,
                         graph=graph,
                     )
             logger.info(

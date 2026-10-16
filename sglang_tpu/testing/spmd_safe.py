@@ -60,6 +60,7 @@ def verify_startup(
     if process.returncode not in (0, 1):
         errors.append(f"Server launcher exited with code {process.returncode}")
     results = [json.loads(path.read_text()) for path in directory.glob("worker-*.json")]
+    errors.extend(dict.fromkeys(error for item in results for error in item["errors"]))
     ranks = sorted(item["rank"] for item in results)
     if not len(ranks) == len(set(ranks)) == local_world_size or any(
         not 0 <= rank < world_size for rank in ranks
