@@ -21,10 +21,10 @@ def sampling_from_batch(original, cls, batch, vocab_size, *, params_on_cpu=False
     return original(cls, batch, vocab_size, params_on_cpu=params_on_cpu)
 
 
-def _can_stage_prefill(batch):
+def _can_stage_forward_metadata(batch):
     parallel = get_parallel()
-    # Only the ordinary compiled text path has the upload boundary below.
-    # Mixed chunks concatenate device-resident decode tokens before that point.
+    # Ordinary compiled forwards upload metadata after padding, including VL.
+    # Parallel and mixed-chunk paths retain their existing placement contracts.
     return (
         _enabled(batch)
         and get_flags().capture.enable_torch_compile
@@ -37,17 +37,22 @@ def _can_stage_prefill(batch):
         and batch.model_config.is_generation
         and not batch.model_config.use_ngram_embedding
         and not batch.model_config.use_engram
-        and not batch.model_config.is_multimodal
         and not batch.model_config.is_encoder_decoder
         and batch.dllm_config is None
     )
+
+
+def _can_stage_prefill(batch):
+    # Multimodal embedding preparation still consumes device token IDs before
+    # decoder padding. This restriction does not apply to scheduler metadata.
+    return _can_stage_forward_metadata(batch) and not batch.model_config.is_multimodal
 
 
 def metadata_device(original, batch):
     # Independent of sampling parameter placement. Host allocation must also
     # understand these indices before the forward upload boundary.
     if (
-        _can_stage_prefill(batch)
+        _can_stage_forward_metadata(batch)
         and batch.req_to_token_pool.req_to_token.device.type == "cpu"
         and batch.hisparse_coordinator is None
         and not any(req.beam_group is not None for req in batch.reqs)

@@ -665,12 +665,25 @@ class TestHostPadFieldSelection(CustomTestCase):
                 return_value=MagicMock(),
             ),
         ):
-            batch.prepare_for_prebuilt()
-        self.assertEqual(batch.seq_lens.tolist(), [5])
-        self.assertEqual(batch.orig_seq_lens.tolist(), [5])
-        self.assertEqual(batch.req_pool_indices.tolist(), [1])
-        self.assertEqual(batch.orig_seq_lens.dtype, torch.int32)
-        self.assertIsNone(batch.input_ids)
+            # Multimodal models used to inherit the text-token staging gate,
+            # leaving scheduler metadata on device even for text-only requests.
+            for multimodal in (False, True):
+                with self.subTest(multimodal=multimodal):
+                    batch.model_config.is_multimodal = multimodal
+                    batch.prepare_for_prebuilt()
+                    self.assertEqual(batch.seq_lens.device.type, "cpu")
+                    self.assertEqual(batch.seq_lens.tolist(), [5])
+                    self.assertEqual(batch.orig_seq_lens.tolist(), [5])
+                    self.assertEqual(batch.req_pool_indices.tolist(), [1])
+                    self.assertEqual(batch.orig_seq_lens.dtype, torch.int32)
+                    self.assertIsNone(batch.input_ids)
+                    batch.prefill_input_ids_cpu = torch.tensor([10, 11, 12])
+                    tokens = host_padding.stage_prefill_tokens(
+                        lambda b: b.prefill_input_ids_cpu.to("meta"), batch
+                    )
+                    self.assertEqual(
+                        tokens.device.type, "meta" if multimodal else "cpu"
+                    )
         # The placement hook defaults to the existing backend contract.
         with envs.SGLANG_TPU_HOST_PADDING.override(False):
             self.assertEqual(placement(batch), "meta")
