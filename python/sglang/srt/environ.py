@@ -1987,10 +1987,6 @@ class Envs:
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
-    # GLM-5.3-Flash: attend densely (unabsorbed MLA over an MHA KV pool) with
-    # contexts up to this many tokens, instead of DeepSeek Sparse Attention. Exact
-    # up to index_topk; past it, outputs no longer match the model. Unset = DSA.
-    SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT = EnvInt(None)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

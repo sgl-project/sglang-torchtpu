@@ -9,9 +9,12 @@ fused GDN v3 Pallas kernel in KDA mode (sglang_tpu.attention_kda_pallas, shared
 with Kimi-K3).
 
 SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT opts into dense attention instead
-(unabsorbed MLA over an MHA KV pool). Up to index_topk tokens of context DSA
-selects every causal key, so dense is exact there; past it, dense no longer
-matches the model.
+(absorbed MLA over every causal key, on pallas_tpu_mla). Up to index_topk tokens
+of context DSA selects every causal key, so dense is exact there; past it,
+dense no longer matches the model.
+
+The TPU platform registers this class over core's glm5_next and adjusts the
+model config for it (glm5_next_args).
 """
 
 import logging
@@ -22,9 +25,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.srt.configs.glm5_next import Glm5NextTextConfig
-from sglang.srt.configs.model_config import GLM5_NEXT_TPU_MLA_ROPE_PAD
 from sglang.srt.distributed import divide
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -50,9 +51,10 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP, DeepseekV2MoE
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils.common import set_weight_attrs
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.models.glm5_next_args import ROPE_PAD
 
 logger = logging.getLogger(__name__)
 
@@ -296,8 +298,16 @@ class Glm5NextLinearAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
-class Glm5NextDenseAttention(nn.Module):
-    """Unabsorbed MLA, exact while all causal keys fit the indexer budget."""
+class Glm5NextLatentAttention(nn.Module):
+    """Absorbed MLA over the normed 512-dim latent cache: W_UK folds into q and
+    W_UV into the output, and every head attends as MQA over the latent. Dense
+    (every causal key), on pallas_tpu_mla.
+
+    The checkpoint is NoPE. The TPU MLA kernels need a rope segment, so the
+    platform sets qk_rope_head_dim to a zero segment of that width
+    (sglang_tpu.models.glm5_next_args); q_pe . k_pe = 0 leaves the scores
+    unchanged.
+    """
 
     def __init__(self, config, layer_id, quant_config, prefix):
         super().__init__()
@@ -306,8 +316,7 @@ class Glm5NextDenseAttention(nn.Module):
         self.v_dim = config.v_head_dim
         self.q_rank = config.q_lora_rank
         self.kv_rank = config.kv_lora_rank
-        if config.qk_rope_head_dim != 0:
-            raise ValueError("GLM-5.3-Flash TPU expects NoPE attention")
+        self.rope_pad = config.qk_rope_head_dim
         self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
             config.hidden_size,
             self.q_rank + self.kv_rank,
@@ -331,6 +340,9 @@ class Glm5NextDenseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
+        # forward views kv_b_proj.weight as [heads, q_dim + v_dim, kv_rank]; that
+        # holds only for the unquantized [out, in] layout the checkpoint ships.
+        assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.v_dim,
             config.hidden_size,
@@ -338,46 +350,51 @@ class Glm5NextDenseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.attn = self._make_attn(layer_id)
-
-    def _make_attn(self, layer_id):
-        return RadixAttention(
+        self.attn = RadixAttention(
             self.heads,
-            self.q_dim,
+            self.kv_rank + self.rope_pad,
             self.q_dim**-0.5,
-            num_kv_heads=self.heads,
+            num_kv_heads=1,
             layer_id=layer_id,
-            v_head_dim=self.v_dim,
+            v_head_dim=self.kv_rank,
         )
+
+    def _attend(self, hidden_states, forward_batch, q_lora, kv_latent, **attn_kwargs):
+        q = self.q_b_proj(q_lora)[0].view(-1, self.heads, self.q_dim)
+        # kv_b_proj rows are per head [K (q_dim) | V (v_dim)] over the latent.
+        w_kv = self.kv_b_proj.weight.view(self.heads, self.q_dim + self.v_dim, -1)
+        q_absorbed = torch.einsum("thd,hdc->thc", q, w_kv[:, : self.q_dim])
+        latent = self.kv_a_layernorm(kv_latent).unsqueeze(1)
+        n = hidden_states.shape[0]
+        q_pe = q.new_zeros(n, self.heads, self.rope_pad)
+        k_pe = q.new_zeros(n, 1, self.rope_pad)
+        out = self.attn(
+            q_absorbed,
+            latent,
+            latent,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            **attn_kwargs,
+        ).view(n, self.heads, self.kv_rank)
+        out = torch.einsum("thc,hvc->thv", out, w_kv[:, self.q_dim :])
+        return self.o_proj(out.reshape(n, self.heads * self.v_dim))[0]
 
     def forward(self, hidden_states, forward_batch, **kwargs):
         q_latent, kv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
             [self.q_rank, self.kv_rank], dim=-1
         )
-        q = self.q_b_proj(self.q_a_layernorm(q_latent))[0].view(
-            -1, self.heads, self.q_dim
+        return self._attend(
+            hidden_states, forward_batch, self.q_a_layernorm(q_latent), kv_latent
         )
-        kv = self.kv_b_proj(self.kv_a_layernorm(kv_latent))[0].view(
-            -1, self.heads, self.q_dim + self.v_dim
-        )
-        k, v = kv.split([self.q_dim, self.v_dim], dim=-1)
-        out = self.attn(q, k.contiguous(), v.contiguous(), forward_batch)
-        return self.o_proj(out.reshape(-1, self.heads * self.v_dim))[0]
 
 
-class Glm5NextSparseAttention(Glm5NextDenseAttention):
-    """DeepSeek Sparse Attention as absorbed MLA: the pooled (kpool) indexer picks
-    each query's keys, W_UK folds into q and W_UV into the output, and the query
-    attends as MQA over only the selected 512-dim latents (pallas_tpu_mla_sparse).
-    """
-
-    rope_pad = GLM5_NEXT_TPU_MLA_ROPE_PAD
+class Glm5NextSparseAttention(Glm5NextLatentAttention):
+    """DeepSeek Sparse Attention: the pooled (kpool) indexer picks each query's
+    keys, and the absorbed MLA attends over only those (pallas_tpu_mla_sparse)."""
 
     def __init__(self, config, layer_id, quant_config, prefix):
         super().__init__(config, layer_id, quant_config, prefix)
-        # forward views kv_b_proj.weight as [heads, q_dim + v_dim, kv_rank]; that
-        # holds only for the unquantized [out, in] layout the checkpoint ships.
-        assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
         from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 
         self.layer_id = layer_id
@@ -398,16 +415,6 @@ class Glm5NextSparseAttention(Glm5NextDenseAttention):
             config=config,
         )
 
-    def _make_attn(self, layer_id):
-        return RadixAttention(
-            self.heads,
-            self.kv_rank + self.rope_pad,
-            self.q_dim**-0.5,
-            num_kv_heads=1,
-            layer_id=layer_id,
-            v_head_dim=self.kv_rank,
-        )
-
     def forward(self, hidden_states, forward_batch, **kwargs):
         q_latent, kv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
             [self.q_rank, self.kv_rank], dim=-1
@@ -420,35 +427,18 @@ class Glm5NextSparseAttention(Glm5NextDenseAttention):
             forward_batch=forward_batch,
             layer_id=self.layer_id,
         )
-        q = self.q_b_proj(q_lora)[0].view(-1, self.heads, self.q_dim)
-        # kv_b_proj rows are per head [K (q_dim) | V (v_dim)] over the latent.
-        w_kv = self.kv_b_proj.weight.view(self.heads, self.q_dim + self.v_dim, -1)
-        q_absorbed = torch.einsum("thd,hdc->thc", q, w_kv[:, : self.q_dim])
-        latent = self.kv_a_layernorm(kv_latent).unsqueeze(1)
-        n = hidden_states.shape[0]
-        # NoPE checkpoint: zero rope segments, so q_pe . k_pe adds nothing.
-        q_pe = q.new_zeros(n, self.heads, self.rope_pad)
-        k_pe = q.new_zeros(n, 1, self.rope_pad)
-        out = self.attn(
-            q_absorbed,
-            latent,
-            latent,
-            forward_batch,
-            q_rope=q_pe,
-            k_rope=k_pe,
-            topk_indices=topk_indices,
-        ).view(n, self.heads, self.kv_rank)
-        out = torch.einsum("thc,hvc->thv", out, w_kv[:, self.q_dim :])
-        return self.o_proj(out.reshape(n, self.heads * self.v_dim))[0]
+        return self._attend(
+            hidden_states, forward_batch, q_lora, kv_latent, topk_indices=topk_indices
+        )
 
 
 def _runs_dsa() -> bool:
-    # Sparse attention unless the dense opt-in is set (model_config.runs_dsa_densely).
-    return envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get() is None
+    # Sparse attention unless the dense opt-in is set (see glm5_next_args).
+    return tpu_envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get() is None
 
 
 def _full_attention_cls():
-    return Glm5NextSparseAttention if _runs_dsa() else Glm5NextDenseAttention
+    return Glm5NextSparseAttention if _runs_dsa() else Glm5NextLatentAttention
 
 
 def hc_pre(x, fn, scale, base, config):
@@ -577,21 +567,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
-        if not current_platform.is_tpu():
-            raise NotImplementedError("This GLM-5.3-Flash implementation requires TPU")
         args = get_server_args()
         self.config = config.get_text_config()
         c = self.config
-        dense_limit = c.index_topk
-        unsafe_limit = envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get()
-        if unsafe_limit is not None and unsafe_limit > dense_limit:
-            logger.warning(
-                "GLM-5.3-Flash attends densely up to %d tokens, past index_topk=%d; "
-                "outputs beyond index_topk do not match DSA",
-                unsafe_limit,
-                dense_limit,
-            )
-            dense_limit = unsafe_limit
         if not args.language_model_only:
             raise ValueError("GLM-5.3-Flash TPU requires --language-model-only")
         if getattr(c, "index_kpool", 1) > 1 and not getattr(
@@ -600,12 +578,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
             raise ValueError(
                 "GLM-5.3-Flash TPU requires the checkpoint's always-select-tail setting"
             )
-        if not _runs_dsa() and (
-            args.context_length is None or args.context_length > dense_limit
-        ):
-            raise ValueError(
-                f"Dense GLM-5.3-Flash requires --context-length <= {dense_limit}"
-            )
+        if not _runs_dsa():
+            dense_limit = tpu_envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get()
+            if args.context_length is None or args.context_length > dense_limit:
+                raise ValueError(
+                    f"Dense GLM-5.3-Flash requires --context-length <= {dense_limit}"
+                )
         if not args.disable_radix_cache:
             raise ValueError(
                 "GLM-5.3-Flash TPU currently requires --disable-radix-cache"
@@ -614,8 +592,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
             raise ValueError(
                 "GLM-5.3-Flash TPU currently supports TP/EP text serving without speculative decoding or DP/PP"
             )
-        if not c.mhc or c.qk_rope_head_dim != 0:
-            raise ValueError("Expected the GLM-5.3-Flash mHC/NoPE checkpoint")
+        if not c.mhc or c.qk_rope_head_dim != ROPE_PAD:
+            raise ValueError(
+                "Expected the GLM-5.3-Flash mHC checkpoint with the TPU zero rope "
+                f"segment (qk_rope_head_dim={ROPE_PAD}, set by glm5_next_args)"
+            )
         self.quant_config = quant_config
         if quant_config is not None:
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
@@ -719,5 +700,5 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
 
 
-# Replaces the upstream glm5_next implementation on TPU.
-EntryClass = [Glm5NextForConditionalGeneration] if current_platform.is_tpu() else []
+# Registered over core's glm5_next by TpuSRTPlatform.init_backend.
+EntryClass = [Glm5NextForConditionalGeneration]

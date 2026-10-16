@@ -4245,6 +4245,12 @@ class HybridLinearKVPool(KVCache):
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         self.use_dsa = use_dsa
+        # Platforms that bring their own KV pool classes (out-of-tree, and TPU,
+        # which is in-tree but overrides them) build the full-attention pool
+        # through the platform's factories.
+        uses_platform_pools = (
+            current_platform.is_out_of_tree() or current_platform.is_tpu()
+        )
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
             # aliasing the shared byte buffer.
@@ -4255,7 +4261,7 @@ class HybridLinearKVPool(KVCache):
 
             # TPU is a known-enum platform (is_out_of_tree() is False) but still
             # overrides the MHA pool class (fused RPA-v3 layout), so include it.
-            if current_platform.is_out_of_tree() or current_platform.is_tpu():
+            if uses_platform_pools:
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
                 quant_method_kwarg = {}
             elif _is_npu:
@@ -4299,19 +4305,19 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            if current_platform.is_out_of_tree() or current_platform.is_tpu():
+            if uses_platform_pools:
                 # The platform's sparse MLA kernels read their own paged layout
                 # (TPU: a pooled indexer keeps its raw keys there too).
                 skips = skip_topk_layers or [False] * self.full_layer_nums
                 self.full_kv_pool = current_platform.get_dsa_kv_pool_cls()(
-                    size,
-                    self.page_size,
-                    dtype,
-                    kv_lora_rank,
-                    qk_rope_head_dim,
-                    self.full_layer_nums,
-                    device,
-                    enable_memory_saver,
+                    size=size,
+                    page_size=self.page_size,
+                    dtype=dtype,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    layer_num=self.full_layer_nums,
+                    device=device,
+                    enable_memory_saver=enable_memory_saver,
                     index_head_dim=index_head_dim,
                     index_key_layers=[not skip for skip in skips],
                     index_kpool=index_kpool,
@@ -4337,7 +4343,7 @@ class HybridLinearKVPool(KVCache):
         else:
             TokenToKVPoolClass = MLATokenToKVPool
 
-            if current_platform.is_out_of_tree() or current_platform.is_tpu():
+            if uses_platform_pools:
                 TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
             elif _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (

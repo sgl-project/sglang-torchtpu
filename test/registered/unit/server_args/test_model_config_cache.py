@@ -1,4 +1,5 @@
-"""`model_config_of()` caches, and the key is the path the record carried.
+"""`model_config_of()` caches, keyed on the path the record carried and its
+model overrides.
 
 Two movements of a `model_path` reach this cache, and only the first one means
 the cached configuration describes the wrong checkpoint:
@@ -161,6 +162,23 @@ class TestTheModelConfigCache(CustomTestCase):
         rebuilt = model_config_of(server_args)
         self.assertEqual(rebuilt.model_path, second_checkpoint)
         self.assertIs(model_config_of(server_args), rebuilt)
+
+    def test_declared_model_overrides_rebuild_the_configuration(self):
+        """A rule may declare json_model_override_args after an earlier rule
+        built the configuration; the overrides are part of the key."""
+        server_args = ServerArgs(model_path=self._checkpoint(), device="cuda")
+        first = model_config_of(server_args)
+        self.assertEqual(first.hf_config.vocab_size, 128)
+
+        declare_resolution(
+            server_args,
+            "test_declared_model_overrides_rebuild_the_configuration",
+            json_model_override_args=json.dumps({"vocab_size": 256}),
+        )
+        second = model_config_of(server_args)
+        self.assertIsNot(second, first)
+        self.assertEqual(second.hf_config.vocab_size, 256)
+        self.assertIs(model_config_of(server_args), second)
 
     def test_a_supplied_configuration_is_handed_back(self):
         """A configuration nothing in here built carries no key, so nothing

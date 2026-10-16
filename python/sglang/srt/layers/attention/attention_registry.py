@@ -395,6 +395,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.utils import (
             is_blackwell,
             is_npu,
+            is_tpu,
             is_xpu,
         )
 
@@ -518,8 +519,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
-        elif kimi_linear_config(runner.model_config) is not None:
-            if _is_npu:
+        elif (
+            kimi_linear_config(runner.model_config) is not None
+            or glm5_next_config(runner.model_config) is not None
+        ):
+            # Kimi-Linear and GLM-5.3 share the KDA layer.
+            if _is_npu and kimi_linear_config(runner.model_config) is not None:
                 from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
                     AscendKDAAttnBackend,
                     AscendKDAHybridLinearAttnBackend,
@@ -532,17 +537,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     TpuKDAAttnBackend,
                 )
 
-                logger.info(
-                    "Using TPU KDA linear-attention backend for Kimi linear models."
-                )
-                linear_attn_backend = TpuKDAAttnBackend(runner)
-            else:
-                linear_attn_backend = KDAAttnBackend(runner)
-        elif glm5_next_config(runner.model_config) is not None:
-            if is_tpu():
-                # Same fused KDA kernel backend as Kimi-K3.
-                from sglang_tpu.attention_kda_pallas import TpuKDAAttnBackend
-
+                logger.info("Using TPU KDA linear-attention backend.")
                 linear_attn_backend = TpuKDAAttnBackend(runner)
             else:
                 linear_attn_backend = KDAAttnBackend(runner)

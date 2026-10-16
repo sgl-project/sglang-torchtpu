@@ -8,10 +8,13 @@ Sample usage (from the repo root):
 The 11 full-attention layers run the model's DeepSeek Sparse Attention: the
 pooled (kpool) indexer picks index_topk tokens per query, and absorbed MLA attends
 over them on pallas_tpu_mla_sparse, with an FP8 latent cache. The 34 KDA layers
-run on the fused GDN v3 kernel in KDA mode. SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT
-switches to dense attention, which matches the model only up to index_topk tokens.
+run on the fused GDN v3 kernel in KDA mode.
+
+SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT=<tokens> switches to dense attention on
+pallas_tpu_mla, which matches the model only up to index_topk tokens of context.
 """
 
+import os
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
@@ -44,7 +47,11 @@ CONFIG["server_args"].update(
         "max_total_tokens": max(2, MAX_RUNNING) * CONTEXT_LENGTH,
         # KDA state slots: one per running request, plus spare.
         "max_mamba_cache_size": MAX_RUNNING + 2,
-        "attention_backend": "pallas_tpu_mla_sparse",
+        "attention_backend": (
+            "pallas_tpu_mla"
+            if os.environ.get("SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT")
+            else "pallas_tpu_mla_sparse"
+        ),
         "kv_cache_dtype": "fp8_e4m3",
         "page_size": 128,
         "disable_radix_cache": True,

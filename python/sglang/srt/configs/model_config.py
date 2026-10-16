@@ -34,7 +34,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_tpu, retry
+from sglang.srt.utils import is_hip, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -187,23 +187,6 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
-# Zero rope lanes the TPU GLM-5.3-Flash MLA path appends: the checkpoint is NoPE,
-# and the Pallas MLA kernels need a rope segment (q_pe . k_pe = 0). 64 is the
-# kernels' tested DeepSeek shape.
-GLM5_NEXT_TPU_MLA_ROPE_PAD = 64
-
-
-def runs_dsa_densely(config) -> bool:
-    """DSA model served with dense attention: no indexer runs, so there is no
-    top-k to compute, relay or share. On TPU, GLM-5.3-Flash runs DSA unless
-    SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT opts into dense attention."""
-    return (
-        is_tpu()
-        and _hf_arch(config) == "Glm5NextForConditionalGeneration"
-        and envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get() is not None
-    )
-
-
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -225,7 +208,6 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
-        and not runs_dsa_densely(config)
     )
 
 
@@ -1203,13 +1185,6 @@ class ModelConfig:
 
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
-        if (
-            is_tpu()
-            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
-        ):
-            # Per-head K/V width of the TPU model's attention (NoPE).
-            self.head_dim = self.hf_text_config.qk_nope_head_dim
-            self.hf_text_config.head_dim = self.head_dim
         if self.head_dim is None:
             if is_pure_ssm:
                 self.head_dim = 0
@@ -1234,20 +1209,8 @@ class ModelConfig:
         if self.swa_v_head_dim is None:
             self.swa_v_head_dim = self.swa_head_dim
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
-        # TPU GLM-5.3-Flash (glm5_next_tpu) runs DSA as absorbed MLA over the
-        # latent cache. The dense opt-in instead runs unabsorbed MHA over per-head
-        # K/V, which needs the MHA KV pool and backend.
-        # TODO: drop the dense MHA path once the sparse path covers every TPU
-        # configuration the dense path does (speculative draft heads, PD).
-        tpu_glm5_next = (
-            is_tpu()
-            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
-        )
-        tpu_glm5_next_mha = tpu_glm5_next and runs_dsa_densely(self.hf_config)
         # FIXME: temporary special judge for MLA architecture
-        if tpu_glm5_next_mha:
-            self.attention_arch = AttentionArch.MHA
-        elif (
+        if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
@@ -1293,11 +1256,6 @@ class ModelConfig:
                 if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
-            if tpu_glm5_next:
-                # Flash is NoPE; the Pallas MLA kernels need a rope segment, so
-                # carry a zero one (q_pe . k_pe = 0, attention is unchanged).
-                self.qk_rope_head_dim = GLM5_NEXT_TPU_MLA_ROPE_PAD
-                self.swa_qk_rope_head_dim = GLM5_NEXT_TPU_MLA_ROPE_PAD
             # In transformers v5, rope_scaling is just rope_parameters.
             rope_scaling = getattr(
                 self.hf_text_config, "rope_parameters", None

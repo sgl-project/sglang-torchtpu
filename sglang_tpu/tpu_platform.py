@@ -7,6 +7,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
@@ -470,10 +471,13 @@ def _validate_dsa(server_args) -> None:
 
     cfg = resolving_view(server_args)
     try:
+        # With the overrides the model is served with (e.g. a dense opt-in
+        # that clears index_topk).
         hf_config = get_config(
             cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=cfg.revision,
+            model_override_args=json.loads(cfg.json_model_override_args or "{}"),
         )
     except Exception:
         # A model that cannot be loaded here fails later with its real error.
@@ -507,6 +511,14 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU needs --tpu-compile-tracer dynamo, got "
             f"{cfg.tpu_compile_tracer!r}."
         )
+
+
+def _register_models() -> None:
+    """Serve the plugin's model implementations (sglang_tpu/models) in place of
+    core's for the same architectures. Runs in the worker before model load."""
+    from sglang.srt.models.registry import ModelRegistry
+
+    ModelRegistry.register("sglang_tpu.models", overwrite=True)
 
 
 def _register_attention_backends() -> None:
@@ -763,6 +775,9 @@ class TpuSRTPlatform(SRTPlatform):
         _validate_prefill_context_parallel(server_args)
         apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
         # Before the default backend below, so the error names what was passed.
+        from sglang_tpu.models.glm5_next_args import apply_glm5_next_server_args
+
+        apply_glm5_next_server_args(server_args)
         _validate_dsa(server_args)
 
         # Decode context parallelism runs on one backend only, so an unset
@@ -1186,6 +1201,7 @@ class TpuSRTPlatform(SRTPlatform):
 
         apply_tpu_patches()
         _register_attention_backends()
+        _register_models()
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:

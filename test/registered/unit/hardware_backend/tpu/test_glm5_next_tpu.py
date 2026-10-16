@@ -13,10 +13,13 @@ import torch
 
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.hybrid_arch import glm5_next_config
-from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
-from sglang.srt.environ import envs
-from sglang.srt.models.glm5_next_tpu import (
-    Glm5NextDenseAttention,
+from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.hf_transformers.config import HfModelConfigParser
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.models.glm5_next import (
+    Glm5NextLatentAttention,
     Glm5NextLinearAttention,
     Glm5NextSparseAttention,
     TpuRMSNormGated,
@@ -24,9 +27,7 @@ from sglang.srt.models.glm5_next_tpu import (
     hc_post,
     hc_pre,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.hf_transformers.config import HfModelConfigParser
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.models.glm5_next_args import ROPE_PAD, _merge, model_overrides
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -49,26 +50,36 @@ class TestGlm5NextTpu(unittest.TestCase):
         self.assertEqual(config.qk_rope_head_dim, 64)
         self.assertEqual(config.qk_head_dim, 256)
 
-    def test_flash_runs_dsa_unless_dense_is_opted_into(self):
-        flash = SimpleNamespace(
-            architectures=["Glm5NextForConditionalGeneration"],
-            index_share_for_mtp_iteration=True,
-            index_topk=2048,
+    def test_tpu_config_overrides_keep_core_free_of_glm_branches(self):
+        flash = SimpleNamespace(architectures=["Glm5NextForConditionalGeneration"])
+        other = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        self.assertEqual(model_overrides(other, None), {})
+        # DSA: only the zero rope segment the TPU MLA kernels read.
+        sparse = model_overrides(flash, None)
+        self.assertEqual(sparse["qk_rope_head_dim"], ROPE_PAD)
+        self.assertEqual(sparse["text_config"], {"qk_rope_head_dim": ROPE_PAD})
+        # Dense opt-in: index_topk cleared at both levels, so is_deepseek_dsa
+        # reads the model as plain MLA.
+        dense = model_overrides(flash, 2048)
+        self.assertIsNone(dense["index_topk"])
+        self.assertIsNone(dense["text_config"]["index_topk"])
+        self.assertFalse(
+            is_deepseek_dsa(
+                SimpleNamespace(
+                    architectures=["Glm5NextForConditionalGeneration"],
+                    index_topk=dense["index_topk"],
+                )
+            )
         )
-        full = SimpleNamespace(
-            architectures=["GlmMoeDsaForCausalLM"],
-            index_share_for_mtp_iteration=True,
-            index_topk=2048,
-        )
-        with patch("sglang.srt.configs.model_config.is_tpu", return_value=True):
-            # Sparse attention by default: the model's top-k is seeded.
-            self.assertEqual(get_dsa_seed_metadata_dim(flash), 2048)
-            self.assertIs(_full_attention_cls(), Glm5NextSparseAttention)
-            # The dense opt-in has no top-k to seed; other DSA models still do.
-            with envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.override(2048):
-                self.assertEqual(get_dsa_seed_metadata_dim(flash), 0)
-                self.assertEqual(get_dsa_seed_metadata_dim(full), 2048)
-                self.assertIs(_full_attention_cls(), Glm5NextDenseAttention)
+        # A user's own text_config overrides survive the merge.
+        merged = _merge({"text_config": {"rms_norm_eps": 1e-6}}, sparse)
+        self.assertEqual(merged["text_config"]["rms_norm_eps"], 1e-6)
+        self.assertEqual(merged["text_config"]["qk_rope_head_dim"], ROPE_PAD)
+
+    def test_dense_opt_in_selects_the_attention_class(self):
+        self.assertIs(_full_attention_cls(), Glm5NextSparseAttention)
+        with tpu_envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.override(2048):
+            self.assertIs(_full_attention_cls(), Glm5NextLatentAttention)
 
     def test_kda_output_keeps_batch_one_token_axis(self):
         config = Glm5NextTextConfig(
