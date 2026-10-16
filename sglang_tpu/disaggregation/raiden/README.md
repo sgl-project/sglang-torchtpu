@@ -181,7 +181,7 @@ namespaces after the prefill finishes. Full-attention and window page lists
 remain independent, and a cached decode prefix is clipped from each layer's
 transfer.
 
-Two opt-in modes overlap the hand-off with the prefill; both are set on the
+Three opt-in modes overlap the hand-off with the prefill; all are set on the
 prefill (`SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` on the decode):
 
 | Env var | Default | Meaning |
@@ -190,6 +190,7 @@ prefill (`SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` on the decode):
 | `SGLANG_RAIDEN_PIPELINE_PART_PAGES` | `16` | minimum pages per early part; fewer ride the closing transfer |
 | `SGLANG_RAIDEN_PIPELINE_STAGE_PARTS` | `0` | each group of stages moves its layers (`<room>.s<g>`) once its forwards of the final chunk complete, instead of after the last stage samples; the first token follows from the last stage |
 | `SGLANG_RAIDEN_PIPELINE_STAGE_GROUP` | `1` | consecutive stages per group transfer |
+| `SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE` | `0` | each stage registers its share of the closing transfer when it launches the final chunk, the last stage once the PP loop has copied that forward's sampled tokens, so no stage waits for its result; the first token comes with the last stage's share; not with stage groups |
 | `SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` | `1` | decode threads coordinating transfers, one controller client each |
 
 A stage group is fenced on a host copy of one element of its forward's
@@ -198,6 +199,11 @@ the execution that writes the KV completes. Stage groups other than the first
 name non-contiguous source ranks, which needs a tpu-sync planner that accepts
 any subset of a controller's registered transfer ranks. Each early part and
 stage group holds its own decode staging reservation.
+
+With early close, the decode starts the transfer only once the last stage has
+announced its share, after its forward, which needs every earlier stage's. A
+request returning logprobs or a sampling mask, using a grammar or a KV
+checksum, or still bootstrapping gets its first token at the result point.
 
 Each worker owns one Raiden engine. Pipeline stages share one controller hosted
 by stage zero; independent attention-DP workers each own one. Pool geometry and

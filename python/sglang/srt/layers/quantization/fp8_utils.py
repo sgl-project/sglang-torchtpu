@@ -612,9 +612,12 @@ def dispatch_w8a8_block_fp8_linear(
     """
     if _is_tpu:
         from sglang_tpu.fp8_linear import (
+            register_tpu_block_fp8_linear,
             tpu_w8a8_block_fp8_linear,
         )
 
+        if weight_block_size is not None:
+            register_tpu_block_fp8_linear()
         return tpu_w8a8_block_fp8_linear
     # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
     # groupwise kernels and CUTLASS take 128-wide K blocks only.

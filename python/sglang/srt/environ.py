@@ -761,6 +761,9 @@ class Envs:
     SGLANG_RAIDEN_PIPELINE_STAGE_GROUP = EnvInt(1)
     # Decode: threads coordinating pipeline transfers, one client each.
     SGLANG_RAIDEN_PIPELINE_COORD_WORKERS = EnvInt(1)
+    # Pipeline prefill: each stage registers its share of the closing transfer
+    # at the final chunk's launch, the last stage once its tokens are copied.
+    SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )

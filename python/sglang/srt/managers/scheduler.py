@@ -1807,12 +1807,7 @@ class Scheduler(
             synchronize_device=self.device_module.synchronize,
             **fence_kwargs,
         )
-        # A PD prefill server releases requests after their prefill forward,
-        # whose copy_done precedes the backup, so its backups need no deferral.
-        if (
-            self._uses_raiden_hicache()
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
+        if self._uses_raiden_hicache():
             fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
 
     def precompile_tpu_spec_ops(self) -> None:
@@ -3799,11 +3794,7 @@ class Scheduler(
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
-            defer_page_release = (
-                getattr(req.disagg_kv_sender, "group_failure_requires_drain", False)
-                and hasattr(req.disagg_kv_sender, "drained")
-                and not self._group_drained([req.disagg_kv_sender])[0]
-            )
+            defer_page_release = self._defer_aborted_page_release(req.disagg_kv_sender)
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
@@ -3823,10 +3814,34 @@ class Scheduler(
         self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
+    def _defer_aborted_page_release(self, sender) -> bool:
+        """Whether an aborted prefill request keeps its pages until ``sender``
+        has drained. Pipeline stages always defer: only the in-flight queue's
+        release consensus frees them, in the same iteration on every stage."""
+        if not (
+            getattr(sender, "group_failure_requires_drain", False) is True
+            and hasattr(sender, "drained")
+        ):
+            return False
+        return get_parallel().pp_size > 1 or not self._group_drained([sender])[0]
+
+    def _release_consensus_sender_aborts(self, rids) -> None:
+        """Pipeline prefill: free the pages of deferred aborts whose senders
+        every stage reported drained in the release consensus ``rids``."""
+        still_held = []
+        for req in self._deferred_chunked_sender_aborts:
+            if req.rid not in rids:
+                still_held.append(req)
+                continue
+            req.disagg_kv_sender.clear()
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._deferred_chunked_sender_aborts = still_held
+
     def _drain_deferred_chunked_sender_aborts(self) -> None:
         """Release locally-aborted prefill pages after raiden relinquishes them."""
         pending = self._deferred_chunked_sender_aborts
-        if not pending:
+        if not pending or get_parallel().pp_size > 1:
+            # Pipeline stages free them through _release_consensus_sender_aborts.
             return
         drained = None
         if current_platform.is_tpu():

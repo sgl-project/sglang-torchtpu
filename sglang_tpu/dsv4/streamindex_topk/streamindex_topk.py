@@ -322,6 +322,12 @@ def kernel(
                 q_hm_ref[...] = transpose_to_head_major(q_vmem[...], bq_sz)
 
             bq_vec = [q_hm_ref[...]]
+        elif bq_sz > 1:
+            q_data = q_vmem[...].reshape(seq_batch_size, bq_sz, num_q_heads, head_dim)
+            bq_vec = [
+                transpose_to_head_major(q_data[batch_idx], bq_sz)
+                for batch_idx in range(seq_batch_size)
+            ]
         else:
             q_data = q_vmem[...].reshape(seq_batch_size, -1, head_dim)
             bq_vec = [q_data[batch_idx] for batch_idx in range(seq_batch_size)]
@@ -373,7 +379,7 @@ def kernel(
             bq_pos_compressed_vec,
             bkv_idx,
             batch_start_seq_idx,
-            q_is_head_major=q_hm_ref is not None,
+            q_is_head_major=q_hm_ref is not None or bq_sz > 1,
             cp_rank=cp_rank,
         )
         scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
@@ -553,6 +559,7 @@ def _effective_row_lengths(
         "buffer_count",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "decode_query_size",
         "enable_early_exit",
         "kv_layout",
         "chunk_tokens",
@@ -578,6 +585,7 @@ def streamindex_topk(
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    decode_query_size: int = 1,
     enable_early_exit: bool = False,
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
@@ -589,11 +597,27 @@ def streamindex_topk(
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
+    ``decode_query_size`` is the number of query rows of every decode-range
+    sequence (fixed-width speculative verify). A batch whose decode rows are
+    not all that wide runs entirely on the mixed pass.
+
     A query at position ``p`` sees compressed rows ``<= (p - causal_offset) //
     compression_ratio``. The default 0 lets a token see the row it falls in;
     ``compression_ratio - 1`` limits it to rows already closed (GLM-5.3-Flash's
-    pooled indexer)."""
+    pooled indexer).
+    """
     kv_layout = KVLayout.parse(kv_layout)
+    if decode_query_size > 1:
+        if enable_early_exit or cp_size > 1:
+            raise NotImplementedError(
+                "decode_query_size > 1 is not supported with enable_early_exit "
+                "or cp_size > 1."
+            )
+        is_decode = jnp.arange(seq_lens.shape[0]) < distribution[1]
+        uniform = jnp.all(~is_decode | (jnp.diff(cu_q_lens) == decode_query_size))
+        distribution = jnp.where(
+            uniform, distribution, jnp.array([0, 0, 1], jnp.int32) * distribution[2]
+        )
 
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
@@ -647,11 +671,13 @@ def streamindex_topk(
             f"buffer_count must be a 3-tuple or a single integer, got {buffer_count}"
         )
 
-    if chunk_tokens is not None and chunk_tokens % decode_req_batch_size:
+    decode_block_tokens = decode_req_batch_size * decode_query_size
+    if chunk_tokens is not None and chunk_tokens % decode_block_tokens:
         raise ValueError(
             f"chunk_tokens ({chunk_tokens}) must be a multiple of"
-            f" decode_req_batch_size ({decode_req_batch_size}), or a cut can"
-            " fall inside a decode block and split it across two chunks."
+            f" decode_req_batch_size * decode_query_size ({decode_block_tokens}),"
+            " or a cut can fall inside a decode block and split it across two"
+            " chunks."
         )
 
     max_num_seqs = seq_lens.shape[0]
@@ -729,7 +755,7 @@ def streamindex_topk(
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
         if seq_batch_size > 1:
-            assert static_q_len == 1
+            assert static_q_len is not None
 
         chunked = chunk_token_start is not None
         if not chunked:
@@ -823,9 +849,13 @@ def streamindex_topk(
         """`run_scores_kernel` kwargs for the three passes over the batch."""
         decode_cfg = dict(
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-            num_queries_per_block=num_queries_per_blocks[0],
+            num_queries_per_block=(
+                decode_query_size
+                if decode_query_size > 1
+                else num_queries_per_blocks[0]
+            ),
             buffer_count=buffer_counts[0],
-            static_q_len=1,
+            static_q_len=decode_query_size,
             case=MlaCase.DECODE,
         )
         return (

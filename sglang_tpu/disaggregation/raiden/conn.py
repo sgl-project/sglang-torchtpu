@@ -1138,6 +1138,7 @@ class RaidenKVManager(
                     self._prefill.reshard_ready_pages,
                     self._prefill.reshard_chunk_acked,
                     self._prefill.send_blocks,
+                    self._prefill.send_block_set,
                     self._prefill.send_swa_blocks,
                     self._prefill.send_aux,
                     self._prefill.decode_addr,

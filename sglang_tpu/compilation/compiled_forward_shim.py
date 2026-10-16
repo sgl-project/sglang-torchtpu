@@ -27,7 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import ceil_align, next_power_of_2
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.bucketer import (
     Bucketer,
@@ -1236,6 +1236,7 @@ def reconcile_tpu_batch_limits(
     tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
     attn_dp_size: int = 1,
+    attn_tp_size: int = 1,
 ) -> tuple[int, Optional[List[int]], int]:
     """Make the TPU compile grid cover scheduler concurrency without dead shapes.
 
@@ -1243,6 +1244,11 @@ def reconcile_tpu_batch_limits(
     at most ``max_running_requests // attn_dp_size`` requests (the same
     division kv_cache_configurator applies), so all coupling here uses that
     per-worker concurrency, not the global cap.
+
+    ``attn_tp_size`` is the attention-TP width under attention DP and 1
+    otherwise: attention DP rounds every worker's decode rows up to a multiple
+    of it before the bucket lookup (``get_dp_padded_token_counts``), so the
+    grid has to reach the rounded per-worker cap.
     """
     per_worker_mrr = (
         max(max_running_requests // attn_dp_size, 1)
@@ -1267,14 +1273,14 @@ def reconcile_tpu_batch_limits(
     else:
         tcmb = DEFAULT_TPU_COMPILE_MAX_BS
 
-    if per_worker_mrr is not None:
-        tcmb = max(tcmb, per_worker_mrr)
-    else:
+    if per_worker_mrr is None:
         per_worker_mrr = tcmb
         max_running_requests = tcmb * attn_dp_size
+    per_worker_rows = ceil_align(per_worker_mrr, attn_tp_size)
+    tcmb = max(tcmb, per_worker_rows)
 
-    if tpu_compile_bs and max(tpu_compile_bs) < per_worker_mrr:
-        tpu_compile_bs = sorted(set(tpu_compile_bs) | {per_worker_mrr})
+    if tpu_compile_bs and max(tpu_compile_bs) < per_worker_rows:
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {per_worker_rows})
 
     return tcmb, tpu_compile_bs, max_running_requests
 

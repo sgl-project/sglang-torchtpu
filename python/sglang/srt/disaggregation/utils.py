@@ -521,8 +521,12 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
+        self.set_buf_with_first_token(req, req.output_ids[0])
 
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+    def set_buf_with_first_token(self, req: Req, first_token: int):
+        """set_buf with the first output token passed in, for a token known
+        before req's result is processed."""
+        self.output_ids[req.metadata_buffer_index][0] = first_token
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.

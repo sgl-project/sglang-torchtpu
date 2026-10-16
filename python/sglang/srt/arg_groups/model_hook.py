@@ -495,8 +495,6 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.set(False)
             envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.set(True)
-            if not envs.SGLANG_DSV4_FP4_DEQUANT.is_set():
-                envs.SGLANG_DSV4_FP4_DEQUANT.set(True)
 
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the

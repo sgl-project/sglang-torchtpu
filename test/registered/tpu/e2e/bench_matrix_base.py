@@ -140,6 +140,17 @@ def _print_workload_digest(summary) -> None:
         )
 
 
+def _dp_schedulers(server_info):
+    """Number of DP schedulers, each with its own radix cache: ``dp_size``
+    replicas times ``attn_dp_size`` attention-DP groups. Since --attn-dp-size,
+    ``--dp-size N --enable-dp-attention`` reports dp_size=1, attn_dp_size=N.
+    None when server_info records no dp_size."""
+    dp_size = server_info.get("dp_size")
+    if dp_size is None:
+        return None
+    return int(dp_size) * int(server_info.get("attn_dp_size") or 1)
+
+
 def _reachable_prefix_hit_rate(config, dp_size):
     """Prefix-cache hit rate a leg of this shape can reach at this DP count.
 
@@ -426,7 +437,7 @@ def build_bench_test(
                     # count would go stale the next time the parallelism
                     # moves -- silently, as an unreachable floor.
                     config = leg.get("config") or {}
-                    dp_size = (leg.get("server_info") or {}).get("dp_size")
+                    dp_size = _dp_schedulers(leg.get("server_info") or {})
                     self.assertIsNotNone(
                         dp_size,
                         f"{leg['tag']}: leg meta records no dp_size, so the "
@@ -434,7 +445,7 @@ def build_bench_test(
                         "MIN_PREFIX_HIT_RATE",
                     )
                     reachable = _reachable_prefix_hit_rate(
-                        config=config, dp_size=int(dp_size)
+                        config=config, dp_size=dp_size
                     )
                     self.assertIsNotNone(
                         reachable,
@@ -556,7 +567,7 @@ def build_bench_test(
                     accept_lengths = (
                         derived.get("spec_accept_length_by_scheduler") or []
                     )
-                    dp_size = int(server_info.get("dp_size") or 0)
+                    dp_size = _dp_schedulers(server_info) or 0
                     self.assertGreater(
                         dp_size,
                         0,
@@ -632,7 +643,7 @@ def build_bench_test(
                             for field, expected in expected_fields.items()
                         )
                         and (features.get("spec_verify_calls") or 0.0) > 0.0
-                        and len(accept_lengths) == int(server_info.get("dp_size") or 0)
+                        and len(accept_lengths) == (_dp_schedulers(server_info) or 0)
                         and len(accept_lengths) > 0
                         and all(
                             float(accept_length)

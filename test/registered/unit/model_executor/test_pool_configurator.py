@@ -1895,6 +1895,71 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(planner.kv_bytes, 512)
         self.assertEqual(planner.bytes_per_swa_token, 512)
 
+    def test_dsv4_tpu_budget_accounting(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        kvc = _make_model_runner(self, num_layers=44, page_size=256)
+        _publish_config(self, dsv4_attn_backend="tpu_dsv4", page_size=256)
+        kvc.kv_cache_dtype_str = "bf16"
+        cfg = kvc.model_config
+        cfg.qk_nope_head_dim = 448
+        cfg.qk_rope_head_dim = 64
+        cfg.index_head_dim = 128
+        cfg.compress_ratios = [0, 0] + [128, 4] * 21
+        cfg.window_size = 512
+        cfg.hf_config.kv_source_layer_ids = []
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertTrue(planner._is_tpu_dsv4)
+        self.assertEqual(planner.bytes_per_swa_token, 44 * 1024.0)
+        expected_full = (
+            0.1 * (44 * 1024.0)
+            + (1 / 4) * 640 * 21
+            + (1 / 128) * 1024 * 21
+            + (1 / 4) * 256 * 21
+        )
+        self.assertEqual(planner.bytes_per_full_token, expected_full)
+        mrr = 64
+        num_req_slots = mrr + 1
+        c4_rows = 4 + num_req_slots * max(planner.ring_sizes[4], 32) + 8192
+        self.assertEqual(
+            planner._fixed_c4_state_bytes(mrr),
+            c4_rows * (4 * 512 * 4 + 4 * 128 * 4) * 21,
+        )
+        c128_rows = 8 + num_req_slots * max(planner.ring_sizes[128], 256) + 8192
+        self.assertEqual(
+            planner._get_c128_state_fixed_bytes(mrr),
+            c128_rows * (2 * 512 * 4) * 21,
+        )
+
+    def test_dsv4_pro_tpu_budget_accounting(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        kvc = _make_model_runner(self, num_layers=61, page_size=256)
+        _publish_config(self, dsv4_attn_backend="tpu_dsv4", page_size=256)
+        kvc.kv_cache_dtype_str = "bf16"
+        cfg = kvc.model_config
+        cfg.qk_nope_head_dim = 448
+        cfg.qk_rope_head_dim = 64
+        cfg.index_head_dim = 128
+        # DeepSeek-V4-Pro config.json has 64 entries for 61 target layers
+        # (31 HCA, 30 CSA, and 3 trailing MTP 0s).
+        cfg.compress_ratios = [128] + [128, 4] * 30 + [0, 0, 0]
+        cfg.window_size = 128
+        cfg.hf_config.kv_source_layer_ids = []
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertTrue(planner._is_tpu_dsv4)
+        self.assertEqual(planner.num_layers_total, 61)
+        self.assertEqual(planner.num_layers(4), 30)
+        self.assertEqual(planner.num_layers(128), 31)
+        self.assertEqual(planner.bytes_per_swa_token, 61 * 1024.0)
+        expected_full = (
+            0.1 * (61 * 1024.0)
+            + (1 / 4) * 640 * 30
+            + (1 / 128) * 1024 * 31
+            + (1 / 4) * 256 * 30
+        )
+        self.assertEqual(planner.bytes_per_full_token, expected_full)
+
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in
         # finalize_with_max_running_requests, so it must not scale here.

@@ -253,6 +253,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             metadata.distribution,
             weight_scale,
             self._topk,
+            metadata.decode_query_size,
         )
 
     def index_topk_kpool(
@@ -287,6 +288,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._topk,
             kpool,
             self._kpool_width,
+            metadata.decode_query_size,
         )
 
     def _forward_mla(

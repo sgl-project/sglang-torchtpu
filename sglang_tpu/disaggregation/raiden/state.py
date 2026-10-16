@@ -17,6 +17,8 @@ class PrefillState:
 
     # Accumulated page ids and aux data, keyed by room.
     send_blocks: Dict[int, List[int]] = field(default_factory=dict)
+    # The pages of send_blocks, for the repeated-page check.
+    send_block_set: Dict[int, Set[int]] = field(default_factory=dict)
     send_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
     send_aux: Dict[int, bytes] = field(default_factory=dict)
 

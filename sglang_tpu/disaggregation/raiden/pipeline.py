@@ -25,6 +25,7 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     ranks_per_node,
 )
+from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     ReshardGeometry,
     head_bytes,
@@ -631,6 +632,22 @@ class PipelineTransfer:
         )
         self.stage_group_size = max(1, envs.SGLANG_RAIDEN_PIPELINE_STAGE_GROUP.get())
         self.coord_workers = max(1, envs.SGLANG_RAIDEN_PIPELINE_COORD_WORKERS.get())
+        self.early_close = (
+            envs.SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE.get() and self.producer
+        )
+        if self.early_close and self.stage_parts:
+            raise ValueError(
+                "SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE moves each stage's share in the "
+                "closing transfer, which stage groups replace; unset "
+                "SGLANG_RAIDEN_PIPELINE_STAGE_PARTS"
+            )
+        if self.early_close and get_parallel().pp_async_batch_depth < 1:
+            raise ValueError(
+                "SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE needs --pp-async-batch-depth 1: "
+                "the last stage closes its share on the deferred output send"
+            )
+        # Producer: this stage's final chunks until their KV is handed off.
+        self.final_chunks = FinalChunks(self) if self.producer else None
         # A ReshardClient owns one socket, so each coordinating thread has its own.
         self._thread_clients = threading.local()
         # Producer: a room's early parts, and this stage's closing part.
@@ -1128,9 +1145,52 @@ class PipelineTransfer:
 
     # ----- producer: closing transfer --------------------------------------
 
+    def _closing_entry(self, room, full: list[int], swa: list[int], aux: bytes):
+        """The room's closing transfer: the pages its early parts left, the
+        window and the first-token metadata. Hold the manager's state lock."""
+        state = self.early.get(room)
+        start = state["offered"] if state else 0
+        if full and start >= len(full):
+            # Keep the full-attention page the decode's completion
+            # is keyed on in the closing transfer.
+            start = len(full) - 1
+        # The pages register with the consumer's head geometry, so
+        # registration waits for the first consumer request.
+        return dict(
+            full=full[start:],
+            start=start,
+            parts=len(state["parts"]) if state else 0,
+            swa=swa,
+            aux=aux,
+            expires=time.monotonic() + self.manager._timeout_s,
+            registered=False,
+            replied=set(),
+        )
+
+    def close_early(
+        self, room: int, full: list[int], swa: list[int], aux: bytes = b""
+    ) -> None:
+        """SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE: register and announce this
+        stage's share of the closing transfer before its result point. Its
+        pages may still be written: tpu-sync reads registered pages only when
+        the decode coordinates the transfer (request_block_registry.cc), which
+        it does once every stage has announced."""
+        self._validate_room(room)
+        mgr = self.manager
+        with self.lock:
+            with mgr._state_lock:
+                if room in mgr._aborted or room in self.sent or room in self.failed:
+                    return
+                self.sent[room] = self._closing_entry(
+                    room, [int(b) for b in full], [int(b) for b in swa], aux
+                )
+            self._reply(room)
+
     def finalize_send(self, room: int, aux_index: int | None) -> bool:
         self._validate_room(room)
         mgr = self.manager
+        late_aux = False
+        mismatch = None
         with self.lock:
             with mgr._state_lock:
                 if room in mgr._aborted:
@@ -1153,33 +1213,66 @@ class PipelineTransfer:
                     # The forward has certainly completed at the result point.
                     entry["fence"] = None
                     entry["aux"] = aux
+                elif room in self.sent:
+                    # Closed early: check its pages, and give a last-stage share
+                    # sent without first-token metadata the result point's.
+                    item = self.sent[room]
+                    if item["full"] != full[item["start"] :] or item["swa"] != swa:
+                        mismatch = (
+                            f"the pages registered before the result point "
+                            f"({len(item['full'])} full, {len(item['swa'])} window) "
+                            f"differ from the result point's "
+                            f"({len(full) - item['start']}, {len(swa)})"
+                        )
+                        self._abort_room(room, mismatch)
+                    elif not item["aux"] and aux and mgr.pp_rank == mgr.pp_size - 1:
+                        item["aux"] = aux
+                        late_aux = True
                 else:
-                    state = self.early.get(room)
-                    start = state["offered"] if state else 0
-                    if full and start >= len(full):
-                        # Keep the full-attention page the decode's completion
-                        # is keyed on in the closing transfer.
-                        start = len(full) - 1
-                    # The pages register with the consumer's head geometry, so
-                    # registration waits for the first consumer request.
-                    self.sent[room] = dict(
-                        full=full[start:],
-                        start=start,
-                        parts=len(state["parts"]) if state else 0,
-                        swa=swa,
-                        aux=aux,
-                        expires=time.monotonic() + mgr._timeout_s,
-                        registered=False,
-                        replied=set(),
-                    )
+                    self.sent[room] = self._closing_entry(room, full, swa, aux)
                 mgr.update_status(room, KVPoll.Transferring)
+            if mismatch is not None:
+                for endpoint in self.replies.get(room, {}):
+                    mgr._reply_room_failed(
+                        room=room, endpoint=endpoint, reason=mismatch
+                    )
+                return False
             # Registration calls the controller, so it runs outside the
             # manager's state lock.
             if self.stage_parts:
                 self._advance_stage(room)
             else:
+                if late_aux:
+                    self._announce_aux(room)
                 self._reply(room)
             return room not in self.failed
+
+    def _abort_room(self, room, reason: str) -> None:
+        """Fail a room as an abort does: the producer poll cancels its closing
+        transfer if unclaimed, and a claimed one keeps the room's pages until
+        it settles. Hold the manager's state lock."""
+        mgr = self.manager
+        logger.error("Raiden pipeline rank%d room %s: %s", self.rank, room, reason)
+        mgr._mark_aborted_locked(room)
+        mgr._fail_room_locked(room, reason, preserve_reason=True)
+        mgr.update_status(room, KVPoll.Failed)
+
+    def _announce_aux(self, room) -> None:
+        """Send the first-token metadata alone to every decode already told of
+        the room's closing share; later ones get it with the share."""
+        item = self.sent[room]
+        mgr = self.manager
+        meta = json.dumps(dict(rank=mgr.pp_rank, pp_size=mgr.pp_size, aux_only=True))
+        for endpoint in item["replied"]:
+            self._send(
+                endpoint,
+                [
+                    MessageTag.PIPELINE_READY,
+                    str(room).encode(),
+                    meta.encode(),
+                    item["aux"],
+                ],
+            )
 
     def _fail_room(self, room, reason: str) -> None:
         """Fail one room and record why; its sender or receiver concludes it on

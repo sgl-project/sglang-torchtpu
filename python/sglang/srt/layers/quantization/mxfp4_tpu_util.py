@@ -156,7 +156,7 @@ def process_mxfp4_moe_weights_bf16(
     w2_bias: torch.Tensor,
     *,
     w13_interleaved: bool,
-    align_to: int = 128,
+    padded_intermediate: int | None = None,
 ) -> tuple[
     torch.Tensor,  # w13_weight  (E, hidden_K_padded, 2*N_int_padded)  bfloat16
     torch.Tensor,  # w13_bias    (E, 1, 2*N_int_padded)                fp32
@@ -166,11 +166,20 @@ def process_mxfp4_moe_weights_bf16(
     """Dequantize HF GPT-OSS MXFP4 weights to **bf16** in gmm_v2's (g, k, n)
     layout (the torchtpu-vllm "dequant at load" approach). Same layout as
     :func:`process_mxfp4_moe_weights_native`
+
+    ``padded_intermediate`` is ``N_int_padded``, the width each of gate and up
+    (and w2's K) is zero-padded to; by default the next multiple of 128.
     """
     E_w13, two_N_int, K_packed_w13 = w13_packed.shape
     N_int = two_N_int // 2
     hidden = K_packed_w13 * PACKING
-    pad_n = (align_to - N_int % align_to) % align_to
+    if padded_intermediate is None:
+        padded_intermediate = -(-N_int // 128) * 128
+    assert padded_intermediate >= N_int and padded_intermediate % 128 == 0, (
+        f"padded_intermediate={padded_intermediate} must be a multiple of 128 "
+        f"and at least the intermediate size {N_int}"
+    )
+    pad_n = padded_intermediate - N_int
 
     # w13: dequant (along K=hidden) → deinterleave gate/up → pad N → transpose.
     # ``w13_interleaved`` follows the checkpoint's gate/up layout: SWIGLUOAI
@@ -369,7 +378,9 @@ _MAX_DEQUANT_ELEMENTS = 2**30
 _EXPERTS_PER_CHUNK = 16
 
 
-def _process_mxfp4_moe_weights_in_chunks(layer: torch.nn.Module, w13_interleaved: bool):
+def _process_mxfp4_moe_weights_in_chunks(
+    layer: torch.nn.Module, w13_interleaved: bool, padded_intermediate: int
+):
     """``process_mxfp4_moe_weights_bf16`` over expert chunks, concatenated one
     output at a time so the chunks of a finished output are freed before the
     next one is assembled."""
@@ -384,6 +395,7 @@ def _process_mxfp4_moe_weights_in_chunks(layer: torch.nn.Module, w13_interleaved
             layer.w2_weight_scale.data[i : i + _EXPERTS_PER_CHUNK],
             layer.w2_weight_bias.data[i : i + _EXPERTS_PER_CHUNK],
             w13_interleaved=w13_interleaved,
+            padded_intermediate=padded_intermediate,
         )
         for parts, part in zip(outputs, chunk):
             parts.append(part)
@@ -394,16 +406,49 @@ def _process_mxfp4_moe_weights_in_chunks(layer: torch.nn.Module, w13_interleaved
     return tuple(results)
 
 
+def _gmm_padded_intermediate(
+    hidden_size: int, intermediate_size: int, activation: str
+) -> int:
+    """Intermediate width at which the fused MoE's first GEMM runs the fewest
+    N tiles on this TPU.
+
+    ``_fused_moe_jax`` runs GMM1 on bf16 activations and these bf16 weights,
+    contracting over hidden padded to 128 lanes, with the gated activation
+    fused, so N is tiled per gate/up half; see
+    ``gmm_v2.pad_size_n_to_fewest_tiles``. The tile depends on the chip's VMEM:
+    gpt-oss's 2880 pads to 3072 on tpu7x (64 MiB) and to 2944, the next
+    multiple of 128, where 2944 fits one tile (128 MiB).
+    """
+    from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
+    from sglang.srt.layers.moe.pallas.fused_moe_op import _fuse_act_name
+    from sglang.srt.layers.moe.pallas.gmm_v2 import pad_size_n_to_fewest_tiles
+
+    fuse_act = "situ:0:none" if activation == "situ" else _fuse_act_name(activation)
+    # JAX runs CPU-only next to TorchTPU; this swaps in the physical TPU's
+    # metadata, the VMEM the kernel's tiles are sized against.
+    with tpu_info_for_cpu_export():
+        return pad_size_n_to_fewest_tiles(
+            size_k=-(-hidden_size // 128) * 128,
+            size_n=intermediate_size,
+            fuse_act=fuse_act,
+        )
+
+
 def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module, *, with_bias: bool) -> None:
     """Format MXFP4 MoE weights for the TPU Pallas gmm_v2 backend.
 
     Non-interleaved checkpoints with a lane-aligned hidden size (e.g. Kimi-K3)
     keep packed FP4 + per-32 scales and dequantize in-kernel
     (:func:`process_mxfp4_moe_weights_native`). Interleaved GPT-OSS (SWIGLUOAI)
-    stays on the bf16 dequant-at-load path.
+    stays on the bf16 dequant-at-load path, with its intermediate zero-padded
+    to the width at which the kernel runs the fewest N tiles
+    (:func:`_gmm_padded_intermediate`): gpt-oss's 2880 becomes 3072 on tpu7x,
+    4.3% more MoE weight bytes than 2944, for a first GEMM that runs 3 N tiles
+    instead of 23.
     """
+    activation = layer.moe_runner_config.activation
     # GPT-OSS (SWIGLUOAI) ships w13 interleaved as [gate_0, up_0, ...].
-    w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
+    w13_interleaved = activation == "swigluoai"
     # The packed path does not pad K, so it needs a lane-aligned hidden size.
     hidden_aligned = (layer.w13_weight.shape[-1] * PACKING) % 128 == 0
     w13_scale = w2_scale = None
@@ -421,22 +466,28 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module, *, with_bias: bool) ->
         )
         w13_scale = Parameter(w13_scale, requires_grad=False)
         w2_scale = Parameter(w2_scale, requires_grad=False)
-    elif 2 * layer.w13_weight.data.numel() > _MAX_DEQUANT_ELEMENTS:
-        # All 128 experts of gpt-oss-120b on one device (a pipeline stage:
-        # 2.1e9 values before padding) are processed a few at a time.
-        w13, w13_bias, w2, w2_bias = _process_mxfp4_moe_weights_in_chunks(
-            layer, w13_interleaved
-        )
     else:
-        w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
-            layer.w13_weight.data,
-            layer.w13_weight_scale.data,
-            layer.w13_weight_bias.data,
-            layer.w2_weight.data,
-            layer.w2_weight_scale.data,
-            layer.w2_weight_bias.data,
-            w13_interleaved=w13_interleaved,
+        _, two_n_int, k_packed = layer.w13_weight.data.shape
+        padded_intermediate = _gmm_padded_intermediate(
+            k_packed * PACKING, two_n_int // 2, activation
         )
+        if 2 * layer.w13_weight.data.numel() > _MAX_DEQUANT_ELEMENTS:
+            # All 128 experts of gpt-oss-120b on one device (a pipeline stage:
+            # 2.1e9 values before padding) are processed a few at a time.
+            w13, w13_bias, w2, w2_bias = _process_mxfp4_moe_weights_in_chunks(
+                layer, w13_interleaved, padded_intermediate
+            )
+        else:
+            w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
+                layer.w13_weight.data,
+                layer.w13_weight_scale.data,
+                layer.w13_weight_bias.data,
+                layer.w2_weight.data,
+                layer.w2_weight_scale.data,
+                layer.w2_weight_bias.data,
+                w13_interleaved=w13_interleaved,
+                padded_intermediate=padded_intermediate,
+            )
     layer.w13_weight = Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = w13_scale
     layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)

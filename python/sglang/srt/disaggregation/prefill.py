@@ -622,6 +622,11 @@ class SchedulerDisaggregationPrefillMixin:
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
             return
+        exposed = getattr(req.disagg_kv_sender, "pages_exposed_before_result", False)
+        if exposed is True and req.extend_range.end >= len(req.origin_input_ids):
+            # A transfer may already read these pages, and an insert frees the
+            # ones the tree also holds; release_kv_cache inserts them later.
+            return
 
         checkpoint_kv_cache(req, cache)
 
@@ -1180,6 +1185,8 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        if rids_to_check is not None:
+            self._release_consensus_sender_aborts(rids_to_check)
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -1353,7 +1360,10 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            if self._defer_aborted_page_release(sender):
+                self._deferred_chunked_sender_aborts.append(req)
+            else:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -1579,6 +1589,13 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if not last_chunk:
+            # The next checkpoint can dedup the request's own pages past
+            # cache_protected_len and free them while a transfer still lists them.
+            if (
+                self.tree_cache.supports_prefix_sharing()
+                and not req.skip_radix_cache_insert
+            ):
+                end_idx = min(end_idx, req.kv.cache_protected_len)
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
             if self.enable_staging:

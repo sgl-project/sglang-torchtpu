@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -262,6 +263,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             tp_rank = 0
             self.tp_size = 1
 
+        self.tp_rank = tp_rank
         self.num_embeddings = num_embeddings
         self.org_vocab_size = org_num_embeddings or num_embeddings
 
@@ -383,6 +385,32 @@ class VocabParallelEmbedding(torch.nn.Module):
             added_vocab_end_index,
         )
 
+    def _traced_shard_bounds(self, rank: torch.Tensor):
+        """``get_masked_input_and_mask`` bounds for a traced rank tensor.
+
+        Mirrors ``_get_indices`` (clamp replaces min) so a shared executable
+        selects each rank's shard at runtime.
+        """
+        org_stride = self.org_vocab_size_padded // self.tp_size
+        added_stride = (
+            self.num_embeddings_padded - self.org_vocab_size_padded
+        ) // self.tp_size
+        org_start = (rank * org_stride).clamp(max=self.org_vocab_size)
+        org_end = ((rank + 1) * org_stride).clamp(max=self.org_vocab_size)
+        added_start = (self.org_vocab_size + rank * added_stride).clamp(
+            max=self.num_embeddings
+        )
+        added_end = (self.org_vocab_size + (rank + 1) * added_stride).clamp(
+            max=self.num_embeddings
+        )
+        return (
+            org_start,
+            org_end,
+            org_stride - (org_end - org_start),
+            added_start,
+            added_end,
+        )
+
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
@@ -461,6 +489,20 @@ class VocabParallelEmbedding(torch.nn.Module):
             and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         )
 
+    def _get_masked_input_and_mask(self, input_: torch.Tensor):
+        """Map IDs to this shard and identify foreign IDs, including shared traces."""
+        bounds = (
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        rank = current_platform.get_traced_rank(self.tp_rank, group_size=self.tp_size)
+        if rank is not None:
+            bounds = self._traced_shard_bounds(rank.to(input_.dtype))
+        return get_masked_input_and_mask(input_, *bounds)
+
     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero
         (identity when tp_size == 1).
@@ -493,14 +535,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output_parallel = output_parallel.to(self.output_dtype)
             return output_parallel
         # Map out-of-shard ids to index 0, gather, then zero those rows.
-        masked_input, input_mask = get_masked_input_and_mask(
-            input_,
-            self.shard_indices.org_vocab_start_index,
-            self.shard_indices.org_vocab_end_index,
-            self.shard_indices.num_org_vocab_padding,
-            self.shard_indices.added_vocab_start_index,
-            self.shard_indices.added_vocab_end_index,
-        )
+        masked_input, input_mask = self._get_masked_input_and_mask(input_)
         with symm_alloc:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.output_dtype is not None:

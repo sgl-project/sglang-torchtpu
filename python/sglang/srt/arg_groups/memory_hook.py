@@ -17,7 +17,11 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    attn_tp_size_of,
+    get_platform,
+)
 from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
@@ -237,6 +241,7 @@ def handle_gpu_memory_settings(server_args: Any):
                 attn_dp_size=(
                     cfg.dp_size if resolved_view(server_args).enable_dp_attention else 1
                 ),
+                attn_tp_size=attn_tp_size_of(cfg) if attn_dp_enabled_of(cfg) else 1,
             )
         )
         declare_resolution(

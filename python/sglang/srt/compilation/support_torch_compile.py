@@ -37,6 +37,8 @@ class CompilePolicy(ABC):
     backend: ClassVar[str | None] = None
     fullgraph: ClassVar[bool] = True
     dynamic: ClassVar[bool] = False
+    # Identical executable graphs and interfaces across the supported TP group.
+    spmd_safe: bool = False
 
     def __init__(
         self,

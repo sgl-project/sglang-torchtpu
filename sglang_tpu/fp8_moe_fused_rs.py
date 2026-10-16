@@ -135,6 +135,13 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.runtime_context import get_exec, get_parallel
 
+    w13_weight = getattr(layer, "w13_weight", None)
+    if w13_weight is not None and w13_weight.dtype == torch.uint8:
+        layer.__dict__["_tpu_fused_rs_unsupported_reason"] = (
+            "packed-FP4 uint8 MoE weights use the gmm_v2 backend"
+        )
+        return False
+
     runner_config = layer.moe_runner_config
     parallel = get_parallel()
     ep_size = parallel.moe_ep_size

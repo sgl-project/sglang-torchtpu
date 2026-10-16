@@ -6,7 +6,7 @@
 # test_tpu_qwen3_coder_480b_multihost_agentic_spec.py via MULTIHOST_LAUNCH; the
 # TPU CI JobSet runs this on every host and rank 0 runs that test against the
 # resulting server.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 
 PROFILE=${PROFILE:-ci}

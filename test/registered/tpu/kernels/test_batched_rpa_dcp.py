@@ -20,6 +20,8 @@ Cases:
 * ``skip_kv_write`` leaves the KV cache untouched while the output is unchanged.
 * With every new flag at its default the kernel still reproduces the v3
   reference over decode, extend, windowed and soft-capped shapes.
+* At page size 512, wider than the MXU, decode with searched k blocks still
+  merges back into the dense result.
 
 Requires JAX on a TPU device; skipped otherwise. No torch_tpu, no server.
 """
@@ -36,11 +38,11 @@ import numpy as np
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.ci.gate_matrix import full_matrix
 
-register_tpu_ci(est_time=240, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=250, suite="stage-a-test-tpu-unit", chips=1)
 # Every shard of every (geometry, window, blocks) case is its own compile, and
 # DCP8 runs eight of them per case. The two merge tests below walk the diagonal
 # of window x blocks on the gate; the nightly walks the square.
-register_tpu_ci(est_time=360, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(est_time=385, suite="nightly-tpu-4-v7", nightly=True)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process. SGLang
 # platform discovery selects CPU-only JAX for export, so select the physical
@@ -115,7 +117,7 @@ def _random(rng, shape, scale=1.0) -> np.ndarray:
     return _round_to_bf16(scale * rng.standard_normal(shape, np.float32))
 
 
-def _fused_cache(slot_k: np.ndarray, slot_v: np.ndarray):
+def _fused_cache(slot_k: np.ndarray, slot_v: np.ndarray, page_size: int = PAGE_SIZE):
     """Pack per-slot K/V [slots, num_kv_heads, HEAD_DIM] into the kernel's
     token-major paged cache: K and V of a head interleaved along the head axis."""
     import jax.numpy as jnp
@@ -126,7 +128,7 @@ def _fused_cache(slot_k: np.ndarray, slot_v: np.ndarray):
 
     slots, num_kv_heads, _ = slot_k.shape
     shape = get_kv_cache_shape(
-        slots // PAGE_SIZE, PAGE_SIZE, num_kv_heads, HEAD_DIM, jnp.bfloat16
+        slots // page_size, page_size, num_kv_heads, HEAD_DIM, jnp.bfloat16
     )
     _, _, kv_words, packing, aligned_head_dim = shape
     kv = np.stack([slot_k, slot_v], axis=2).reshape(slots, 2 * num_kv_heads, HEAD_DIM)
@@ -147,7 +149,9 @@ class _PagedShard(NamedTuple):
     kv_lens: list
 
 
-def _paged_shard(seq_keys, seq_values, pages_per_seq, rng, num_kv_heads):
+def _paged_shard(
+    seq_keys, seq_values, pages_per_seq, rng, num_kv_heads, page_size=PAGE_SIZE
+):
     """Page table and cache holding seq_keys[s] / seq_values[s] as sequence s.
 
     Physical pages are shuffled so the page table is followed, and every slot
@@ -155,19 +159,19 @@ def _paged_shard(seq_keys, seq_values, pages_per_seq, rng, num_kv_heads):
     """
     num_seqs = len(seq_keys)
     total_pages = num_seqs * pages_per_seq
-    slots = total_pages * PAGE_SIZE
+    slots = total_pages * page_size
     slot_k = _random(rng, (slots, num_kv_heads, HEAD_DIM), scale=50.0)
     slot_v = _random(rng, (slots, num_kv_heads, HEAD_DIM), scale=50.0)
     page_indices = rng.permutation(total_pages).astype(np.int32)
     for seq, (keys, values) in enumerate(zip(seq_keys, seq_values)):
-        assert len(keys) <= pages_per_seq * PAGE_SIZE
+        assert len(keys) <= pages_per_seq * page_size
         for j in range(len(keys)):
-            page = page_indices[seq * pages_per_seq + j // PAGE_SIZE]
-            slot = page * PAGE_SIZE + j % PAGE_SIZE
+            page = page_indices[seq * pages_per_seq + j // page_size]
+            slot = page * page_size + j % page_size
             slot_k[slot] = keys[j]
             slot_v[slot] = values[j]
     return _PagedShard(
-        cache=_fused_cache(slot_k, slot_v),
+        cache=_fused_cache(slot_k, slot_v, page_size),
         page_indices=page_indices,
         kv_lens=[len(keys) for keys in seq_keys],
     )
@@ -214,10 +218,10 @@ def _local_positions(length: int, rank: int, cp: int) -> np.ndarray:
     return np.arange(rank, length, cp)
 
 
-def _pages_per_seq(lengths, cp: int) -> int:
+def _pages_per_seq(lengths, cp: int, page_size: int = PAGE_SIZE) -> int:
     """Pages per sequence on the rank with the longest shard (rank 0)."""
     longest = max(-(-length // cp) for length in lengths)
-    return max(1, -(-longest // PAGE_SIZE))
+    return max(1, -(-longest // page_size))
 
 
 def _dense_attention(
@@ -331,7 +335,9 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
         sinks = _random(rng, (geo.num_q_heads,))
         return full_k, full_v, queries, sinks
 
-    def _run_shard(self, geo: Geometry, rank: int, window, blocks, sinks=None):
+    def _run_shard(
+        self, geo: Geometry, rank: int, window, blocks, sinks=None, page_size=PAGE_SIZE
+    ):
         import jax.numpy as jnp
 
         full_k, full_v, queries, _ = self._data(geo)
@@ -340,9 +346,10 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
         shard = _paged_shard(
             [k[p] for k, p in zip(full_k, positions)],
             [v[p] for v, p in zip(full_v, positions)],
-            _pages_per_seq(self.SEQ_LENS, geo.cp),
+            _pages_per_seq(self.SEQ_LENS, geo.cp, page_size),
             rng,
             geo.num_kv_heads,
+            page_size,
         )
         num_seqs = len(self.SEQ_LENS)
         unused_kv = np.zeros((self.MAX_NUM_TOKENS, geo.num_kv_heads, HEAD_DIM))
@@ -360,11 +367,12 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
         )
         return out[:num_seqs], lse[:num_seqs]
 
-    def _partials(self, geo: Geometry, window, blocks):
-        key = (geo, window, blocks)
+    def _partials(self, geo: Geometry, window, blocks, page_size=PAGE_SIZE):
+        key = (geo, window, blocks, page_size)
         if key not in self._partials_cache:
             self._partials_cache[key] = [
-                self._run_shard(geo, rank, window, blocks) for rank in range(geo.cp)
+                self._run_shard(geo, rank, window, blocks, page_size=page_size)
+                for rank in range(geo.cp)
             ]
         return self._partials_cache[key]
 
@@ -403,6 +411,24 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
                         ref_out, ref_lse = self._reference(geo, window)
                         self.assert_out_close(out, ref_out, label)
                         self.assert_lse_close(lse, ref_lse, label)
+
+    def test_searched_blocks_at_a_page_wider_than_the_mxu(self):
+        """At a page wider than the MXU the searched k blocks must cover whole
+        pages; otherwise a shard past one block attends keys from the wrong pages."""
+        page_size = 2 * PAGE_SIZE
+        for geo in (DCP2, DCP8):
+            # On v7x, DCP2's 1,300-key shard spans two searched blocks and DCP8's
+            # block is grown to one page. The gate runs DCP2, the nightly both.
+            if not full_matrix() and geo is DCP8:
+                continue
+            label = f"{geo.name} page={page_size} blocks=searched"
+            with self.subTest(label):
+                out, lse = _merge_by_lse(
+                    self._partials(geo, None, None, page_size=page_size)
+                )
+                ref_out, ref_lse = self._reference(geo, None)
+                self.assert_out_close(out, ref_out, label)
+                self.assert_lse_close(lse, ref_lse, label)
 
     def test_sink_fold_after_the_merge_matches_the_dense_reference(self):
         for geo in (DCP2, DCP8):

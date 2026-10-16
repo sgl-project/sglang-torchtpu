@@ -898,6 +898,16 @@ def _patch_host_heap_trim() -> None:
     host_heap_trim.install()
 
 
+def _patch_profile_auto() -> None:
+    """Arm a staged xprof capture at launch under SGLANG_TPU_ENABLE_PROFILE_AUTO.
+
+    See ``profile_auto``.
+    """
+    from sglang_tpu import profile_auto
+
+    profile_auto.install()
+
+
 def _patch_scheduler_reject_prompt_logprob() -> None:
     """Finish prompt-logprob requests the compiled forward cannot serve with a
     400 at scheduler intake, instead of raising inside the forward.
@@ -956,4 +966,5 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _patch_pd_decode_async_prefill_info()
     _patch_host_heap_trim()
+    _patch_profile_auto()
     _patch_scheduler_reject_prompt_logprob()

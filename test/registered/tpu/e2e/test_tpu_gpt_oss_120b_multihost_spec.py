@@ -14,7 +14,7 @@ register_tpu_ci(
 )
 
 MULTIHOST_LAUNCH = {
-    "launch_script": "recipe/gpt_120b_spec_mh.sh",
+    "launch_script": "recipe/gpt_oss_120b_spec_mh.sh",
     "weights": "gpt-oss-120b",
 }
 

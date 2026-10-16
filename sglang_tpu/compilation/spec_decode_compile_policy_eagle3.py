@@ -506,36 +506,6 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             self._materialize_dp_idle_decode(forward_batch, rows=rows)
 
     @staticmethod
-    def _materialize_dp_idle_decode(
-        forward_batch: ForwardBatch, *, rows: int = 1
-    ) -> None:
-        """Represent an idle draft-decode rank with physical dummy sequences."""
-        if forward_batch.seq_lens.numel() > 0:
-            return
-
-        rows = max(int(rows), 1)
-        device = forward_batch.input_ids.device
-        seq_dtype = forward_batch.seq_lens.dtype
-        forward_batch.batch_size = rows
-        forward_batch.seq_lens = torch.ones(rows, dtype=seq_dtype, device=device)
-        forward_batch.seq_lens_cpu = torch.ones(rows, dtype=seq_dtype)
-        forward_batch.seq_lens_sum = rows
-        forward_batch.input_ids = torch.zeros(
-            rows, dtype=forward_batch.input_ids.dtype, device=device
-        )
-        forward_batch.positions = torch.zeros(rows, dtype=torch.int64, device=device)
-        if isinstance(forward_batch.out_cache_loc, torch.Tensor):
-            forward_batch.out_cache_loc = torch.zeros(
-                rows, dtype=forward_batch.out_cache_loc.dtype, device=device
-            )
-        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
-            pool_dtype = forward_batch.req_pool_indices.dtype
-            forward_batch.req_pool_indices = torch.zeros(
-                rows, dtype=pool_dtype, device=device
-            )
-            forward_batch.req_pool_indices_cpu = torch.zeros(rows, dtype=pool_dtype)
-
-    @staticmethod
     def _materialize_dp_idle_draft_extend(
         forward_batch: ForwardBatch, *, pre_write_seq_lens: bool = False
     ) -> None:

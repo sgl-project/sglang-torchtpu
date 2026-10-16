@@ -752,18 +752,24 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             **kwargs: Any,
         ) -> Any:
             backend = get_forward_context().attn_backend
-            previous_metadata = backend.forward_metadata
-            # Attention reads metadata through the backend during tracing.
-            backend.forward_metadata = attention_metadata
-            try:
-                with use_attention_rank_tensors(attention_rank_tensors):
-                    return fn(input_ids, positions, forward_batch, *args, **kwargs)
-            finally:
-                backend.forward_metadata = previous_metadata
+            with (
+                backend.bind_forward_metadata(
+                    attention_metadata, forward_batch.forward_mode
+                ),
+                use_attention_rank_tensors(attention_rank_tensors),
+            ):
+                return fn(input_ids, positions, forward_batch, *args, **kwargs)
 
         compiled = direct_compile(
             trace_forward,
             specialization_key=self._direct_compile_specialization_key,
+            name=self.name,
+            spmd_safe=self.spmd_safe,
+            lift_rank=(
+                torch.distributed.is_initialized()
+                and get_parallel().tp_group.world_size
+                == torch.distributed.get_world_size()
+            ),
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.get_direct_compile_kv_pool(),
@@ -1018,6 +1024,60 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch.out_cache_loc = forward_batch.out_cache_loc.to(
             dtype=self._dummy_out_cache_loc_dtype(ForwardMode.DECODE)
         )
+        self._match_busiest_dp_decode_rows(forward_batch)
+
+    def _match_busiest_dp_decode_rows(self, forward_batch: ForwardBatch) -> None:
+        """Give an idle decode rank as many rows as the busiest DP rank.
+
+        The shim unpads decode outputs to this rank's entry of
+        ``original_global_num_tokens_cpu``. At zero rows the eager tail skips
+        work the busy ranks run (an LM head outside the compiled decoder skips
+        its attention-TP gather), and TPU collectives pair up by issue order
+        across every rank, so the busy ranks would wait forever.
+        """
+        # With a peer extending, the counts are tokens, not rows, and
+        # prepare_mlp_sync_batch materializes this rank as a dummy extend.
+        if forward_batch.is_extend_in_batch or forward_batch.seq_lens.numel() > 0:
+            return
+        counts = forward_batch.original_global_num_tokens_cpu
+        rows = max(counts)
+        if rows == 0:
+            return
+
+        self._materialize_dp_idle_decode(forward_batch, rows=rows)
+        # Rebind a copy: the list object is shared with the ScheduleBatch.
+        counts = list(counts)
+        counts[get_parallel().attn_dp_rank] = rows
+        forward_batch.original_global_num_tokens_cpu = counts
+
+    def _materialize_dp_idle_decode(
+        self, forward_batch: ForwardBatch, *, rows: int = 1
+    ) -> None:
+        """Represent an idle decode rank with physical dummy sequences."""
+        if forward_batch.seq_lens.numel() > 0:
+            return
+
+        rows = max(int(rows), 1)
+        device = forward_batch.input_ids.device
+        seq_dtype = forward_batch.seq_lens.dtype
+        forward_batch.batch_size = rows
+        forward_batch.seq_lens = torch.ones(rows, dtype=seq_dtype, device=device)
+        forward_batch.seq_lens_cpu = torch.ones(rows, dtype=seq_dtype)
+        forward_batch.seq_lens_sum = rows
+        forward_batch.input_ids = torch.zeros(
+            rows, dtype=forward_batch.input_ids.dtype, device=device
+        )
+        forward_batch.positions = torch.zeros(rows, dtype=torch.int64, device=device)
+        if isinstance(forward_batch.out_cache_loc, torch.Tensor):
+            forward_batch.out_cache_loc = torch.zeros(
+                rows, dtype=forward_batch.out_cache_loc.dtype, device=device
+            )
+        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
+            pool_dtype = forward_batch.req_pool_indices.dtype
+            forward_batch.req_pool_indices = torch.zeros(
+                rows, dtype=pool_dtype, device=device
+            )
+            forward_batch.req_pool_indices_cpu = torch.zeros(rows, dtype=pool_dtype)
 
     def materialize_dp_idle_extend(
         self, forward_batch: ForwardBatch, num_tokens: int

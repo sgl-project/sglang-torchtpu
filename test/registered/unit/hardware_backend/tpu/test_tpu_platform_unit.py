@@ -126,6 +126,14 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 "sglang_tpu.patches.apply_tpu_patches",
                 side_effect=lambda: calls.append(("patch", None)),
             ),
+            patch(
+                "sglang_tpu.tpu_platform.rank_slice._load",
+                side_effect=lambda: calls.append(("rank_slice", None)),
+            ),
+            patch(
+                "sglang_tpu.tpu_platform.traced_rank._load",
+                side_effect=lambda: calls.append(("traced_rank", None)),
+            ),
         ):
             self.platform.init_backend()
 
@@ -140,6 +148,8 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 ),
                 ("cache_key", "--xla_user=1 --xla_override=0"),
                 ("patch", None),
+                ("rank_slice", None),
+                ("traced_rank", None),
             ],
         )
 

@@ -5,9 +5,8 @@ ExternalServerLauncher: the shared runner waits for /health_generate and never
 launches or kills anything.
 
 Its MULTIHOST_LAUNCH forms its own launch group: recipe/mimo_v25_pro_mh.sh on 2 hosts.
-The recipe mirrors the E2E-validated DP-attention config from
-recipe/mimo/launch_mimo_25_pro_multihost.sh (PR #155): tp=16, ep=16, dp=2 ->
-attention_tp=8, mem_fraction 0.7, max_running 8 -- with prefill raised to 8192.
+That recipe is the E2E-validated DP-attention config: tp=16, ep=16, dp=2 ->
+attention_tp=8, mem_fraction 0.7, max_running 8, prefill 8192.
 Weights (~1.0TB fp8) come from the shared read-only Filestore PVC
 model-weights-filestore (see .github/tpu-ci/pvc-model-weights-filestore.yaml).
 The CI runs this file on rank-0 against the server the JobSet brought up; skips

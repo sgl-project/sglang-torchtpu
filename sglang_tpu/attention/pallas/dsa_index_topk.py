@@ -116,6 +116,7 @@ def dsa_indexer_step(
     *,
     weight_scale: float,
     topk: int,
+    decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Store this step's index keys, then pick the top-k keys for each query.
 
@@ -125,6 +126,9 @@ def dsa_indexer_step(
 
     ``weight_scale`` is a constant factor on the head weights: the indexer's
     softmax scale times ``index_n_heads ** -0.5``.
+
+    ``decode_query_size`` is the number of query rows of each decode-range
+    sequence (fixed-width speculative verify); 1 for ordinary decode.
 
     Returns ``(topk_indices, cache_k)``:
 
@@ -161,6 +165,7 @@ def dsa_indexer_step(
         compression_ratio=1,
         num_kv_pages_per_block=_NUM_KV_PAGES_PER_BLOCK,
         num_queries_per_block=_NUM_QUERIES_PER_BLOCK,
+        decode_query_size=decode_query_size,
         enable_early_exit=False,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
     )

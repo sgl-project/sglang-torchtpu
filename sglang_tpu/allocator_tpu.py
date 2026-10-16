@@ -133,6 +133,10 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         self.num_staged_pages = 0
         # Pages freed while a forward was in flight; see kv_free_fence.py.
         self.held_pages = HeldPages()
+        # True while a page sits in free_pages, staged_pages or held_pages; a
+        # second release would let a later allocation hand it to two owners.
+        self.page_is_free = torch.ones(self.num_pages + 1, dtype=torch.bool)
+        self.page_is_free[0] = False
 
     def available_size(self):
         return super().available_size() + self.held_pages.num_pages * self.page_size
@@ -176,6 +180,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+        self._mark_handed_out(out_pages)
 
         # Expand to per-token indices on CPU, then one async H2D.
         out_indices = (
@@ -242,6 +247,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages_item:]
+        self._mark_handed_out(free_pages_cpu)
         return out_indices.int()
 
     def alloc_decode(
@@ -281,6 +287,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             mask = need_new_pages.to(torch.bool)
             per_req_new_page[mask] = new_page_ids[start_new_pages[mask].long()]
             self.free_pages = self.free_pages[num_new_pages:]
+            self._mark_handed_out(new_page_ids)
 
         #   need_new_pages[i] == 1  →  out_indices[i] = new_page * page_size
         #   need_new_pages[i] == 0  →  out_indices[i] = last_loc + 1
@@ -306,11 +313,41 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         return out_indices.int()
 
+    def _mark_handed_out(self, page_ids: torch.Tensor) -> None:
+        if page_ids.numel() == 0:
+            return
+        ids = page_ids.long()
+        if not bool(self.page_is_free[ids].all()):
+            raise RuntimeError(
+                "KV page allocator handed out pages that are not free: "
+                f"{ids[~self.page_is_free[ids]].tolist()}"
+            )
+        self.page_is_free[ids] = False
+
+    def _mark_released(self, page_ids: torch.Tensor) -> None:
+        if page_ids.numel() == 0:
+            return
+        ids = page_ids.long()
+        already_free = self.page_is_free[ids]
+        if bool(already_free.any()):
+            raise RuntimeError(
+                "KV page allocator released pages that are already free: "
+                f"{ids[already_free].tolist()}"
+            )
+        unique_ids, counts = torch.unique(ids, return_counts=True)
+        if unique_ids.numel() != ids.numel():
+            raise RuntimeError(
+                "KV page allocator released pages twice in one call: "
+                f"{unique_ids[counts > 1].tolist()}"
+            )
+        self.page_is_free[ids] = True
+
     def _release_page_ids(self, *page_ids: torch.Tensor) -> None:
         """Keep every page-id release path on the host pool's int32 dtype."""
         normalized = tuple(
             page_id.to(device="cpu", dtype=torch.int32) for page_id in page_ids
         )
+        self._mark_released(torch.cat(normalized))
         tag = (
             None
             if self.kv_free_fence is None

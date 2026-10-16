@@ -148,6 +148,7 @@ def kpool_indexer_step(
     topk: int,
     kpool: int,
     out_width: int = 0,
+    decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Returns (topk_indices i32[num_tokens, max(out_width, topk + kpool - 1)],
     raw_cache, pooled_cache). Rows list sequence-relative token positions: the
@@ -233,6 +234,7 @@ def kpool_indexer_step(
         causal_offset=kpool - 1,
         num_kv_pages_per_block=_NUM_KV_PAGES_PER_BLOCK,
         num_queries_per_block=_NUM_QUERIES_PER_BLOCK,
+        decode_query_size=decode_query_size,
         enable_early_exit=False,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         chunk_tokens=_CHUNK_TOKENS if chunked else None,

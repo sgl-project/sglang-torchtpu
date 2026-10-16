@@ -1061,9 +1061,14 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         tpu_compile_bs=None,
         max_running_requests=None,
         attn_dp_size=1,
+        attn_tp_size=1,
     ):
         return reconcile_tpu_batch_limits(
-            torch_compile_max_bs, tpu_compile_bs, max_running_requests, attn_dp_size
+            torch_compile_max_bs,
+            tpu_compile_bs,
+            max_running_requests,
+            attn_dp_size,
+            attn_tp_size=attn_tp_size,
         )
 
     def test_default_neither_set(self):
@@ -1161,6 +1166,38 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
                 self.assertGreaterEqual(
                     max(bs), mrr, f"buckets don't cover concurrency for {cases}"
                 )
+
+    def test_dp_attention_grid_covers_attention_tp_padded_decode_rows(self):
+        # Attention DP pads each worker's decode rows up to a multiple of the
+        # attention-TP width before the bucket lookup. 184 requests over 4
+        # workers at attention TP 8 pad a full worker's 46 rows to 48, which a
+        # grid ending at 46 refused ("exceeds the maximum bucket size 46").
+        cases = [(46, 4, 8, [16, 32, 46])] + [
+            (per_worker, 2, attn_tp_size, bs)
+            for per_worker in (1, 3, 64, 94)
+            for attn_tp_size in (2, 8, 16)
+            for bs in (None, [1, 2, 4])
+        ]
+        for per_worker, attn_dp_size, attn_tp_size, bs_in in cases:
+            with self.subTest(
+                per_worker=per_worker, attn_tp_size=attn_tp_size, bs=bs_in
+            ):
+                tcmb, bs, mrr = self._r(
+                    tpu_compile_bs=bs_in,
+                    max_running_requests=per_worker * attn_dp_size,
+                    attn_dp_size=attn_dp_size,
+                    attn_tp_size=attn_tp_size,
+                )
+                self.assertEqual(mrr, per_worker * attn_dp_size)
+                bucketer = (
+                    _bucketer("Bs", bs)
+                    if bs
+                    else PowerBucketer(name="Bs", min_val=1, max_val=tcmb)
+                )
+                for rows in range(1, per_worker + 1):
+                    padded = -(-rows // attn_tp_size) * attn_tp_size
+                    self.assertLessEqual(padded, tcmb)
+                    bucketer.next_bucket(padded)
 
 
 class TestDpAttnSelectBucketShape(CustomTestCase):

@@ -8,7 +8,7 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat
+from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -21,6 +21,11 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # Launch-time xprof capture (see profile_auto.py): each stage once, without
+    # /start_profile. Keep the step count small: each chip's trace is hundreds
+    # of MB.
+    SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
+    SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
 
     @classmethod
     def names(cls) -> list[str]:

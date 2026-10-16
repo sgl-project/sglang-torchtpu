@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import contextlib
+import functools
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -18,6 +19,8 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
@@ -44,6 +47,7 @@ from sglang_tpu import sampler as tpu_sampler_module
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
+    _dp_attn_compute_padding,
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
@@ -347,12 +351,24 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         compiled = compile_module.direct_compile.return_value
         compiled.side_effect = trace_forward
         compiled.warmup_async.side_effect = trace_forward
-        backend = SimpleNamespace(forward_metadata=object())
-        inputs = (torch.ones(2), None, None)
+        backend = AttentionBackend()
+        metadata = object()
+        backend.forward_metadata = metadata
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        inputs = (torch.ones(2), None, forward_batch)
         with forward_context(ForwardContext(attn_backend=backend)):
             for invoke in (call, warmup_async):
-                with self.subTest(invoke=invoke.__name__):
+                with (
+                    self.subTest(invoke=invoke.__name__),
+                    patch.object(
+                        backend,
+                        "bind_forward_metadata",
+                        wraps=backend.bind_forward_metadata,
+                    ) as bind_metadata,
+                ):
                     self.assertIs(invoke(*inputs), model.forward.return_value)
+                    bind_metadata.assert_called_once_with(metadata, ForwardMode.DECODE)
+                    self.assertIs(backend.forward_metadata, metadata)
         self.assertEqual(model.forward.call_count, 2)
 
         compile_module.direct_compile.assert_called_once()
@@ -1272,37 +1288,114 @@ class TestMakeDummyForwardBatch(_PolicyTestCase):
         self.assertIsNone(fb.sampling_info.penalizer_orchestrator)
 
 
+def _idle_forward_batch(global_num_tokens, *, is_extend_in_batch=False):
+    """An idle DP rank's ForwardBatch as init_new builds it, before MLP sync."""
+    empty = functools.partial(torch.empty, 0, dtype=torch.int64)
+    return SimpleNamespace(
+        forward_mode=ForwardMode.IDLE,
+        _original_forward_mode=None,
+        spec_info=None,
+        is_extend_in_batch=is_extend_in_batch,
+        global_num_tokens_cpu=global_num_tokens,
+        original_global_num_tokens_cpu=global_num_tokens,
+        batch_size=0,
+        # ScheduleBatch.prepare_for_idle uses int64 regardless of the
+        # allocator dtype used by active peers and warmup.
+        input_ids=empty(),
+        positions=empty(),
+        out_cache_loc=empty(),
+        seq_lens=empty(),
+        seq_lens_cpu=empty(),
+        seq_lens_sum=0,
+        orig_seq_lens=torch.empty(0, dtype=torch.int32),
+        req_pool_indices=empty(),
+        req_pool_indices_cpu=empty(),
+    )
+
+
 class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
+    def _as_rank(self, attn_dp_rank):
+        """Run as attention-DP rank ``attn_dp_rank`` of the published groups."""
+        return get_parallel().override(
+            tp_rank=attn_dp_rank, attn_tp_rank=0, attn_dp_rank=attn_dp_rank
+        )
+
+    def _run_idle_rank(
+        self,
+        batch,
+        *,
+        attn_dp_rank,
+        allocator_dtype=torch.int32,
+        make_policy=_make_policy,
+    ):
+        dp_size = len(batch.global_num_tokens_cpu)
+        self.publish_config(tp_size=dp_size, attn_dp_size=dp_size)
+        policy = make_policy()
+        policy.model_runner.token_to_kv_pool_allocator.free_pages = torch.arange(
+            4, dtype=allocator_dtype
+        )
+        seen = []
+        policy.model_runner.forward = lambda batch: seen.append(
+            (batch.forward_mode, batch.out_cache_loc.dtype)
+        )
+        policy._install_dp_idle_as_decode()
+        with _dp_attention(True), self._as_rank(attn_dp_rank):
+            policy.model_runner.forward(batch)
+        return policy, seen
+
     def test_plain_idle_decode_matches_warmup_cache_location_dtype(self):
         for dtype in (torch.int32, torch.int64):
             with self.subTest(allocator_dtype=dtype):
-                policy = _make_policy()
-                policy.model_runner.token_to_kv_pool_allocator.free_pages = (
-                    torch.arange(4, dtype=dtype)
+                batch = _idle_forward_batch([0, 1])
+                policy, seen = self._run_idle_rank(
+                    batch, attn_dp_rank=0, allocator_dtype=dtype
                 )
-                seen = []
-                policy.model_runner.forward = lambda batch: seen.append(
-                    (batch.forward_mode, batch.out_cache_loc.dtype)
-                )
-                policy._install_dp_idle_as_decode()
                 warmup = policy._make_dummy_forward_batch(
                     num_tokens=4, bs=4, mode=ForwardMode.DECODE
                 )
-                batch = SimpleNamespace(
-                    forward_mode=ForwardMode.IDLE,
-                    global_num_tokens_cpu=[0, 1],
-                    # ScheduleBatch.prepare_for_idle uses int64 regardless of
-                    # the allocator dtype used by active peers and warmup.
-                    out_cache_loc=torch.empty(0, dtype=torch.int64),
-                )
-
-                with _dp_attention(True):
-                    policy.model_runner.forward(batch)
 
                 self.assertEqual(
                     seen, [(ForwardMode.DECODE, warmup.out_cache_loc.dtype)]
                 )
-                self.assertEqual(batch.out_cache_loc.shape, (0,))
+
+    def test_idle_decode_rank_keeps_the_busiest_ranks_rows(self):
+        """An idle DP rank's decode outputs must not be unpadded to zero rows
+        while its peers keep theirs: TPU collectives in the eager tail pair up
+        by issue order across ranks, so the busy ranks hang."""
+        scheduler_counts = [3, 1, 0]
+        batch = _idle_forward_batch(scheduler_counts)
+        self._run_idle_rank(batch, attn_dp_rank=2)
+
+        self.assertEqual(batch.seq_lens.tolist(), [1, 1, 1])
+        self.assertEqual(batch.out_cache_loc.tolist(), [0, 0, 0])
+        self.assertEqual(batch.req_pool_indices.tolist(), [0, 0, 0])
+        self.assertEqual(batch.original_global_num_tokens_cpu, [3, 1, 3])
+        self.assertEqual(scheduler_counts, [3, 1, 0])
+
+        # MLP sync pads every rank to the shared max before the shim runs.
+        batch.global_num_tokens_cpu = [3, 3, 3]
+        batch.dp_padding_mode = DpPaddingMode.MAX_LEN
+        with self._as_rank(2):
+            _, _, real_q_out, real_b_out = _dp_attn_compute_padding(
+                batch,
+                Bucketer(name="Token", buckets=[64]),
+                Bucketer(name="Bs", buckets=[1, 4]),
+                real_q=3,
+                real_b=3,
+            )
+        self.assertEqual((real_q_out, real_b_out), (3, 3))
+
+    def test_idle_rank_beside_an_extending_peer_is_left_to_the_extend_path(self):
+        # The counts are tokens here: rows built from them would not match any
+        # compiled decode shape, and MLP sync materializes the rank as an extend.
+        # The EAGLE3 policy sends its spec-less target prefill down this path too.
+        for make_policy in (_make_policy, _make_spec_policy):
+            with self.subTest(policy=make_policy.__name__):
+                batch = _idle_forward_batch([1024, 0], is_extend_in_batch=True)
+                self._run_idle_rank(batch, attn_dp_rank=1, make_policy=make_policy)
+
+                self.assertEqual(batch.seq_lens.shape, (0,))
+                self.assertEqual(batch.original_global_num_tokens_cpu, [1024, 0])
 
     def test_prepare_materializes_zero_row_spec_batch(self):
         policy = _make_spec_policy()
