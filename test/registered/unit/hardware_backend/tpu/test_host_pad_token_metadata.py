@@ -828,46 +828,113 @@ class TestHostPadFieldSelection(CustomTestCase):
                 host_padding.stage_prefill_tokens(upload, batch).device.type, "meta"
             )
 
-    def test_relay_warmup_covers_nonbucket_live_sizes_without_mutating_pool(self):
+    def test_bucketed_relay_preserves_live_slots_and_only_uses_bucket_shapes(self):
+        from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.compilation.host_padding_warmup import warmup_host_relay
+        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
 
+        buckets = Bucketer(name="Bs", buckets=[1, 2, 4, 8])
         table = torch.full((9, 16), 123, dtype=torch.int32)
-        runner = SimpleNamespace(
-            device="cpu",
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            req_to_token_pool=SimpleNamespace(req_to_token=table),
-        )
-        gathered_rows = set()
-        padded_tokens = {}
+        pool = SimpleNamespace(req_to_token=table, _tpu_relay_bucketer=buckets)
+        relay = HostPaddingFutureMap("cpu", SpeculativeAlgorithm.NONE, pool)
+        observed = set()
 
-        class TrackRelayGather(TorchDispatchMode):
-            def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
-                if func == torch.ops.aten.index.Tensor and args[0].shape == (9,):
-                    gathered_rows.add(args[1][0].numel())
-                result = func(*args, **(kwargs or {}))
-                if func == torch.ops.aten.constant_pad_nd.default:
-                    padded_tokens[args[0].numel(), args[0].dtype] = result
-                return result
+        class ObserveRelay(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten.index_copy_.default:
+                    observed.add(args[2].numel())
+                    # Includes ghost writes: no duplicate destination indices.
+                    assert args[2].unique().numel() == args[2].numel()
+                if func == torch.ops.aten.index.Tensor:
+                    observed.add(args[1][0].numel())
+                return func(*args, **(kwargs or {}))
 
-        with TrackRelayGather():
-            warmup_host_relay(
-                runner, Bucketer(name="Bs", buckets=[1, 2, 4, 8]), 8, extend_cap=8
+        for live in range(1, 9):
+            indices = torch.arange(8, 8 - live, -1)
+            width = buckets.next_bucket(live)
+            values = torch.arange(width) + 100 * live
+            before = relay.output_tokens_buf.clone()
+            with ObserveRelay():
+                relay.stash(indices, RelayPayload(bonus_tokens=values))
+                result = relay.gather(indices)
+            self.assertEqual(len(result), width)
+            torch.testing.assert_close(result[:live], values[:live])
+            # Inactive request slots, including slot0, cannot be overwritten.
+            torch.testing.assert_close(
+                relay.output_tokens_buf[: 9 - live], before[: 9 - live]
             )
-        self.assertEqual(gathered_rows, set(range(1, 9)))
-        self.assertEqual(
-            set(padded_tokens),
-            {
-                (rows, dtype)
-                for rows in (3, 5, 6, 7)
-                for dtype in (torch.int32, torch.int64)
-            },
-        )
-        for (rows, _), padded in padded_tokens.items():
-            self.assertEqual(
-                padded.tolist(), list(range(rows)) + [0] * (len(padded) - rows)
-            )
+        self.assertEqual(observed, {1, 2, 4, 8})
         self.assertTrue(torch.all(table == 123).item())
+
+    def test_prefill_cap_relay_can_gather_a_smaller_decode_bucket(self):
+        from sglang.srt.managers.overlap_utils import RelayPayload
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+
+        pool = SimpleNamespace(
+            req_to_token=torch.zeros((9, 16), dtype=torch.int32),
+            _tpu_relay_bucketer=Bucketer("Bs", [1, 2, 4, 8]),
+        )
+        relay = HostPaddingFutureMap("cpu", SpeculativeAlgorithm.NONE, pool)
+        relay.stash(
+            torch.tensor([7, 1, 4]), RelayPayload(bonus_tokens=torch.arange(8) + 10)
+        )
+        self.assertEqual(relay.gather(torch.tensor([4, 7])).tolist(), [12, 10])
+        self.assertEqual(relay.output_tokens_buf[0].item(), 0)
+        self.assertEqual(relay.output_tokens_buf[2].item(), 0)
+
+    def test_bucketed_relay_preserves_ci_consume_once_checks(self):
+        from sglang.srt.managers import overlap_utils
+        from sglang.srt.managers.overlap_utils import RelayPayload
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+
+        pool = SimpleNamespace(
+            req_to_token=torch.zeros((9, 16), dtype=torch.int32),
+            _tpu_relay_bucketer=Bucketer("Bs", [1, 2, 4, 8]),
+        )
+        check = overlap_utils._assert_nonneg_and_invalidate
+        check = getattr(check, "_torchdynamo_orig_callable", check)
+        with (
+            patch.object(overlap_utils, "_DEBUG_ASSERT", True),
+            patch.object(overlap_utils, "_assert_nonneg_and_invalidate", check),
+        ):
+            relay = HostPaddingFutureMap("cpu", SpeculativeAlgorithm.NONE, pool)
+            indices = torch.tensor([7, 1, 4])
+            relay.stash(indices, RelayPayload(bonus_tokens=torch.arange(8) + 10))
+            self.assertEqual(relay.gather(indices).tolist(), [10, 11, 12, 0])
+            with self.assertRaises(RuntimeError):
+                relay.gather(indices)
+
+    def test_decode_allocator_can_retain_host_locations_until_padding(self):
+        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+
+        allocator = TpuPagedTokenToKVPoolAllocator(
+            size=24,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="meta",
+            kvcache=None,
+            need_sort=False,
+        )
+        allocator.defer_decode_upload = True
+        slots = allocator.alloc_decode(
+            torch.tensor([2, 3, 4]), torch.tensor([2, 3, 4]), torch.tensor([4, 9, 14])
+        )
+        self.assertEqual(slots.device.type, "cpu")
+        self.assertEqual(slots.tolist(), [5, 10, 15])
+
+    def test_result_trims_only_after_copy_to_cpu(self):
+        from sglang_tpu.hooks.host_padding import copy_result_to_cpu
+
+        result = SimpleNamespace(next_token_ids=torch.arange(8), _tpu_live_token_rows=3)
+
+        def copy(result):
+            self.assertEqual(result.next_token_ids.shape, (8,))
+            result.next_token_ids = result.next_token_ids.cpu()
+
+        copy_result_to_cpu(copy, result)
+        self.assertEqual(result.next_token_ids.tolist(), [0, 1, 2])
 
 
 if __name__ == "__main__":

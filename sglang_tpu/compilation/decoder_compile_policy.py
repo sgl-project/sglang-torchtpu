@@ -1243,6 +1243,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             and get_parallel().attn_dp_size == 1
             and get_parallel().attn_cp_size == 1
             and get_parallel().attn_dcp_size == 1
+            and not get_schedule().enable_mixed_chunk
         ):
             # Execute after queued model warmups, before the checker is armed.
             pending.append(PendingCall(self._warmup_host_padding))
@@ -1253,6 +1254,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return pending
 
     def _warmup_host_padding(self) -> None:
+        from sglang.srt.arg_groups.overrides import resolving_view
         from sglang_tpu.compilation.host_padding_warmup import (
             warmup_host_relay,
             warmup_sequence_lengths,
@@ -1260,6 +1262,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         from sglang_tpu.sampling.warmup import warmup_host_sampling
 
         runner = self.model_runner
+        config = runner.model_config
+        if (
+            not config.is_generation
+            or config.use_ngram_embedding
+            or config.use_engram
+            or config.is_encoder_decoder
+            or resolving_view(runner.server_args).dllm_algorithm is not None
+            or runner.req_to_token_pool.req_to_token.device.type != "cpu"
+        ):
+            return
         buckets = sorted(set(self.b_bucketer.buckets) | {self._extend_compile_cap()})
         backends = (
             runner.attn_backend,
@@ -1267,6 +1279,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             *(runner.decode_attn_backend_group or ()),
         )
         max_live = min(runner.max_running_requests, max(buckets))
+        runner.req_to_token_pool._tpu_relay_bucketer = self.b_bucketer
+        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+
+        if type(runner.token_to_kv_pool_allocator) is TpuPagedTokenToKVPoolAllocator:
+            runner.token_to_kv_pool_allocator.defer_decode_upload = True
         warmup_sequence_lengths(runner.device, buckets)
         for backend in {id(value): value for value in backends}.values():
             warmup = getattr(backend, "warmup_distributions", None)

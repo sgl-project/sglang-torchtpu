@@ -46,6 +46,3 @@ def warmup_host_sampling(sampler, buckets, vocab_size, device, *, make_logits):
                 positions,
             )
             result.cpu()
-            # Only results cross back at live batch size; logits stay padded.
-            for live_rows in range(1, rows):
-                result[:live_rows].cpu()

@@ -609,6 +609,8 @@ def _pad_forward_batch_inputs(
     is_draft_extend_v2 = forward_batch.forward_mode.is_draft_extend_v2()
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
+    if is_decode and forward_batch.spec_info is None:
+        real_q = real_b
 
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 

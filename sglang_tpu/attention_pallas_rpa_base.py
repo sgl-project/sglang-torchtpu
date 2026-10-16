@@ -745,12 +745,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         return 1
 
     def warmup_distributions(self, max_live: int, device) -> None:
-        """Populate the finite active-row variants before serving starts."""
+        """Warm fixed-shape metadata; live row counts are tensor values."""
         # Serving keys use tensor.device (e.g. tpu:0), not the runner's "tpu".
         device = torch.empty(0, device=device).device
         for is_decode in (False, True):
-            for live_rows in range(max_live + 1):
-                self._get_cached_rpa_distribution(is_decode, live_rows, device)
+            self._get_cached_rpa_distribution(is_decode, max_live, device)
 
     def _get_cached_rpa_distribution(
         self, is_decode: bool, non_empty_bs: int, device
@@ -763,7 +762,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return cached
 
         dist = self._make_rpa_distribution_cpu(is_decode, non_empty_bs).to(device)
-        dist.tolist()  # one-time blocking sync: wait until the H2D completes
         self._distribution_cache[key] = dist
         return dist
 

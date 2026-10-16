@@ -121,6 +121,10 @@ def alloc_extend_vectorized_cpu(
 
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+    # Set by the non-spec host-padding policy; wrapped allocators retain
+    # their existing device-return contract.
+    defer_decode_upload: bool = False
+
     def clear(self) -> None:
         # Slot 0 is reserved as the dummy-padding page, so page IDs start at 1.
         self.free_pages = torch.arange(
@@ -304,7 +308,11 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
             if out_indices_cpu is not None:
                 out_indices_cpu.copy_(host_indices)
-            out_indices = host_indices.to(self.device, non_blocking=True)
+            out_indices = (
+                host_indices
+                if self.defer_decode_upload
+                else host_indices.to(self.device, non_blocking=True)
+            )
         else:
             # Device formula on fixed-shape (bs,) inputs (bs is bucketed).
             per_req_new_page_dev = per_req_new_page.to(self.device, non_blocking=True)

@@ -1023,7 +1023,8 @@ class TestHostSamplingMode(CustomTestCase):
                             [[]] * size,
                             torch.arange(size),
                         )
-                    torch.testing.assert_close(actual, expected)
+                    self.assertEqual(actual.shape, (physical_rows,))
+                    torch.testing.assert_close(actual.cpu()[:size], expected)
                     self.assertTrue(reductions)
                     self.assertEqual(set(reductions), {physical_rows})
                     self.assertEqual(repads, [])
@@ -1158,7 +1159,8 @@ class TestHostSamplingMode(CustomTestCase):
                     [[]] * 3,
                     torch.nn.functional.pad(positions, (0, 5)),
                 )
-                torch.testing.assert_close(actual, expected)
+                self.assertEqual(actual.shape, (8,))
+                torch.testing.assert_close(actual.cpu()[:3], expected)
 
     def test_logprobs_and_custom_processors_preserve_live_row_contract(self):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput

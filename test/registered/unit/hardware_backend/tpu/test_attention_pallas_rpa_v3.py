@@ -30,20 +30,16 @@ from sglang_tpu.attention_pallas_rpa_base import (
 
 
 class TestDistributionWarmup(CustomTestCase):
-    def test_every_live_row_count_is_cached_before_serving(self):
+    def test_distribution_has_fixed_shape_for_all_live_counts(self):
         backend = object.__new__(TpuPallasRpaV3AttnBackend)
         backend._distribution_cache = {}
-        # A device alias must resolve to the same key as a resident tensor.
-        backend.warmup_distributions(8, "cpu:0")
-        with patch.object(
-            backend,
-            "_make_rpa_distribution_cpu",
-            side_effect=AssertionError("cache miss"),
-        ):
-            for rows in range(9):
-                for decode in (False, True):
-                    dist = backend._get_cached_rpa_distribution(decode, rows, "cpu")
-                    self.assertEqual(dist.tolist(), [rows if decode else 0, rows, rows])
+        backend.warmup_distributions(256, "cpu:0")
+        self.assertEqual(len(backend._distribution_cache), 2)
+        for rows in (0, 1, 3, 7, 255, 256):
+            for decode in (False, True):
+                dist = backend._get_cached_rpa_distribution(decode, rows, "cpu")
+                self.assertEqual(dist.shape, (3,))
+                self.assertEqual(dist.tolist(), [rows if decode else 0, rows, rows])
 
 
 class TestPageTableSmemBudget(unittest.TestCase):

@@ -1,7 +1,7 @@
 """Defer host-built inputs until the decoder's padding boundary.
 
 Why: uploading before padding produces unnecessary transfers and shape variants.
-How: AROUND metadata placement, sampling, input staging, and extend allocation.
+How: AROUND metadata placement, relay factory/entry, result copy, and allocation.
 Upstream seam issue: not filed (local prototype).
 Remove when: upstream provides backend factories for these staging decisions.
 """
@@ -134,10 +134,88 @@ def alloc_extend(
     )
 
 
+def create_future_map(original, algorithm, device, req_to_token_pool, *args, **kwargs):
+    if (
+        envs.SGLANG_TPU_HOST_PADDING.get()
+        and algorithm.is_none()
+        and getattr(req_to_token_pool, "_tpu_relay_bucketer", None) is not None
+    ):
+        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+
+        return HostPaddingFutureMap(
+            device, algorithm, req_to_token_pool, *args, **kwargs
+        )
+    return original(algorithm, device, req_to_token_pool, *args, **kwargs)
+
+
+def resolve_forward_inputs(original, batch, future_map):
+    from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+
+    if (
+        isinstance(future_map, HostPaddingFutureMap)
+        and _can_stage_forward_metadata(batch)
+        and batch.forward_mode.is_decode()
+        and batch.prefill_input_ids_cpu is None
+        and batch.input_ids is None
+        and batch.req_pool_indices.device.type == "cpu"
+    ):
+        batch.input_ids = future_map.gather(batch.req_pool_indices)
+    return original(batch, future_map)
+
+
+def relay_forward_payload(original, scheduler, batch, future_indices, result):
+    from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+
+    padded = (
+        isinstance(scheduler.future_map, HostPaddingFutureMap)
+        and result.has_sampled_token_ids
+        and result.next_draft_input is None
+    )
+    if padded:
+        result._tpu_live_token_rows = len(future_indices)
+    value = original(scheduler, batch, future_indices, result)
+    if padded and not scheduler.enable_overlap:
+        # Synchronous scheduling already consumes the tokens on CPU next.
+        result.next_token_ids = result.next_token_ids.cpu()[
+            : result._tpu_live_token_rows
+        ]
+    return value
+
+
+def copy_result_to_cpu(original, result, *args, **kwargs):
+    value = original(result, *args, **kwargs)
+    live = getattr(result, "_tpu_live_token_rows", None)
+    if live is not None:
+        # This is a host view, with no read of pending D2H contents. The original
+        # copy_done event still owns completion and consumers wait on it.
+        result.next_token_ids = result.next_token_ids[:live]
+    return value
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     return [
+        (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_future_map",
+            create_future_map,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.overlap_utils.resolve_forward_inputs",
+            resolve_forward_inputs,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.scheduler.Scheduler._relay_forward_payload",
+            relay_forward_payload,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.utils.GenerationBatchResult.copy_to_cpu",
+            copy_result_to_cpu,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.model_executor.forward_batch_info._mrope_decode_device",
             mrope_decode_device,

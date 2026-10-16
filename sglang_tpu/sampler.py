@@ -428,11 +428,7 @@ class TpuSampler(Sampler):
                 token_ids_logprobs,
                 positions,
             )
-            return (
-                token_ids
-                if live_rows is None or live_rows == token_ids.shape[0]
-                else token_ids[:live_rows]
-            )
+            return token_ids
 
         if return_logprob:
             raise ValueError("distributed TPU top-k cannot return full logprobs")
@@ -448,11 +444,7 @@ class TpuSampler(Sampler):
         ).view(-1)
         batch_next_token_ids = batch_next_token_ids.to(torch.int64)
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
-        return (
-            batch_next_token_ids
-            if live_rows is None or live_rows == batch_next_token_ids.shape[0]
-            else batch_next_token_ids[:live_rows]
-        )
+        return batch_next_token_ids
 
     def _sample_from_probs(
         self,
