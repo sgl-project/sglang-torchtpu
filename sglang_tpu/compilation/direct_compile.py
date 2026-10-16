@@ -38,7 +38,11 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.pp_proxy_pytree import (
     register_pp_proxy_pytree,
 )
-from sglang_tpu.compilation.spmd_compiler import ExecutableInterface, SPMDCompiler
+from sglang_tpu.compilation.spmd_compiler import (
+    ExecutableInterface,
+    InputSpec,
+    SPMDCompiler,
+)
 from sglang_tpu.compilation.warmup_queue import current_warmup_queue
 from sglang_tpu.rank_local import trace_rank
 
@@ -492,6 +496,7 @@ class CompiledFunction:
         binding_input_digest = None
         interface = None
         if spmd_compiler is not None and not spmd_compiler.verify_spmd_safe:
+            # The digest checks that every rank assembles inputs in the same order.
             binding_input_digest = digest(
                 dict(
                     model=registered_model_inputs,
@@ -529,7 +534,12 @@ class CompiledFunction:
 
                 def bind(owner_interface: ExecutableInterface) -> None:
                     if owner_interface.input_digest != binding_input_digest:
-                        raise ValueError("Shared TPU input binding changed")
+                        raise ValueError(
+                            f"Shared TPU input binding changed: graph={graph}, "
+                            f"owner={submission.owner}, rank={spmd_compiler.rank}, "
+                            f"owner_digest={owner_interface.input_digest}, "
+                            f"local_digest={binding_input_digest}"
+                        )
                     live_model_inputs = tuple(
                         model_inputs[index] for index in owner_interface.model_indices
                     )
@@ -544,12 +554,20 @@ class CompiledFunction:
                                 )
                             )
                         layouts.append(layout[0] if layout is not None else [])
-                    if (
-                        _tensor_specs(selected) != owner_interface.input_specs
-                        or layouts != owner_interface.argument_layouts
-                    ):
+                    local_specs = _tensor_specs(selected)
+                    if local_specs != owner_interface.input_specs:
                         raise ValueError(
-                            "Shared TPU input shapes, dtypes or layouts changed"
+                            f"Shared TPU input views changed: graph={graph}, "
+                            f"owner={submission.owner}, rank={spmd_compiler.rank}, "
+                            f"owner_specs={owner_interface.input_specs}, "
+                            f"local_specs={local_specs}"
+                        )
+                    if layouts != owner_interface.argument_layouts:
+                        raise ValueError(
+                            f"Shared TPU input layouts changed: graph={graph}, "
+                            f"owner={submission.owner}, rank={spmd_compiler.rank}, "
+                            f"owner_layouts={owner_interface.argument_layouts}, "
+                            f"local_layouts={layouts}"
                         )
                     artifact.model_inputs = live_model_inputs
                     artifact.output_treespec = owner_interface.output_treespec
@@ -729,7 +747,7 @@ class CompiledFunction:
             callbacks = tuple(factory(self._model) for factory in factories)
             interface = ExecutableInterface(
                 input_digest=binding_input_digest,
-                input_specs=_tensor_specs(graph_inputs),
+                input_specs=_tensor_specs(flat_inputs),
                 argument_layouts=argument_layouts,
                 model_indices=live_model_indices,
                 output_treespec=output_treespec,
@@ -782,8 +800,17 @@ class CompiledFunction:
         )
 
 
-def _tensor_specs(tensors):
-    return tuple((tuple(tensor.shape), str(tensor.dtype)) for tensor in tensors)
+def _tensor_specs(tensors: Sequence[torch.Tensor]) -> tuple[InputSpec, ...]:
+    """Check logical input compatibility before binding another rank's executable."""
+    return tuple(
+        InputSpec(
+            tuple(tensor.shape),
+            str(tensor.dtype),
+            tuple(tensor.stride()),
+            tensor.storage_offset(),
+        )
+        for tensor in tensors
+    )
 
 
 @dataclass

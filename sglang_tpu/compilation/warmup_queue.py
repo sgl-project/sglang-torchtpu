@@ -7,7 +7,6 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -17,12 +16,7 @@ from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.pending_call import PendingCall
 
-if TYPE_CHECKING:
-    from sglang_tpu.compilation.spmd_compiler import SPMDCompiler
-
-create_spmd_compiler = LazyImport(
-    "sglang_tpu.compilation.spmd_compiler", "create_spmd_compiler"
-)
+SPMDCompiler = LazyImport("sglang_tpu.compilation.spmd_compiler", "SPMDCompiler")
 logger = get_logger(__name__)
 
 
@@ -52,9 +46,7 @@ class WarmupQueue:
         if self.verify and not use_spmd_compile:
             raise ValueError("SPMD verification requires --use-spmd-compile")
         if use_spmd_compile:
-            self.spmd_compiler = create_spmd_compiler(
-                group, verify_spmd_safe=self.verify
-            )
+            self.spmd_compiler = SPMDCompiler(group, verify_spmd_safe=self.verify)
 
     def wait(self) -> None:
         with torch.no_grad():

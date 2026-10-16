@@ -11,11 +11,12 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn, TypeVar
+from typing import Any, NamedTuple, NoReturn, TypeVar
 
 import torch
 import torch.distributed as dist
 import zstandard
+from jax import tree_util
 from torch_tpu._internal.compile import tpu_torch_compile as tc
 from torch_tpu._internal.distributed import device_mesh
 
@@ -26,27 +27,58 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 
 
+class InputSpec(NamedTuple):
+    """Logical view metadata for one materialized executable input."""
+
+    shape: tuple[int, ...]
+    """Logical tensor dimensions."""
+    dtype: str
+    """Stable string representation of the Torch dtype."""
+    stride: tuple[int, ...]
+    """Element strides of the logical view."""
+    storage_offset: int
+    """Element offset from the underlying storage."""
+
+
 @dataclass(frozen=True)
 class ExecutableInterface:
     """Tensor-free bindings needed to load another rank's executable."""
 
     input_digest: str
-    input_specs: tuple
-    argument_layouts: list
+    """Digest of the ordered input bindings, excluding tensor values."""
+    input_specs: tuple[InputSpec, ...]
+    """Logical views of the owner's retained materialized inputs."""
+    argument_layouts: list[list[int]]
+    """Physical TPU layouts in executable input order."""
     model_indices: tuple[int, ...]
-    output_treespec: Any
+    """Indices of model tensors retained after unused-input pruning."""
+    output_treespec: tree_util.PyTreeDef
+    """Structure used to rebuild the callable's returned tensor tree."""
     callback_factories: bytes
+    """Pickled factories that bind output callbacks to each rank's model."""
 
 
 @dataclass
 class Submission:
-    """One full graph key's pending shared executable."""
+    """Per-key state held on every rank until a shared executable is usable.
+
+    The owner sets ``pending`` to its native compile future and publishes
+    ``interface``. Consumers instead set ``bind`` to validate that interface
+    and attach local inputs and callbacks without tracing. During ``finish``,
+    consumers bind, the owner serializes its executable, and distribution sets
+    ``executable`` on every rank. ``get`` is valid only after that completes.
+    """
 
     owner: int
+    """Group rank assigned to trace and compile this graph."""
     bind: Callable[[ExecutableInterface], None] | None = None
+    """Consumer-only binding callback, cleared after interface validation."""
     interface: ExecutableInterface | None = None
+    """Owner-only metadata distributed before executable transfer."""
     pending: Any = None
+    """Owner-only native compilation future, cleared after retrieval."""
     executable: Any = None
+    """Locally compiled or loaded executable available after distribution."""
 
     def get(self) -> Any:
         if self.executable is None:
@@ -98,7 +130,6 @@ class SPMDCompiler:
         self.directory = (
             Path(os.environ["VERIFY_SPMD_SAFE_DUMP_DIR"]) if verify_spmd_safe else None
         )
-        self.fallback_reason: str | None = None
         self._serializer: ThreadPoolExecutor | None = None
         if verify_spmd_safe:
             if self.size != dist.get_world_size():
@@ -108,24 +139,35 @@ class SPMDCompiler:
         error: str | None = None
         try:
             mapping = [int(value) for value in device_mesh.get_device_assignment()]
-            runtime = (
-                mapping,
-                [
-                    importlib.metadata.version(n)
+            runtime = dict(
+                device_assignment=mapping,
+                versions={
+                    n: importlib.metadata.version(n)
                     for n in ("torch", "torch-tpu", "jax", "libtpu")
-                ],
-                os.environ.get("XLA_FLAGS", ""),
-                os.environ.get("LIBTPU_INIT_ARGS", ""),
+                },
+                XLA_FLAGS=os.environ.get("XLA_FLAGS", ""),
+                LIBTPU_INIT_ARGS=os.environ.get("LIBTPU_INIT_ARGS", ""),
             )
             if self.size != len(mapping) or self.size != dist.get_world_size():
                 error = "only the full TPU TP group is supported"
         except Exception as caught:
             error = f"cannot identify the compiler runtime: {type(caught).__name__}: {caught}"
         records = self.gather((runtime, error))
-        reasons = sorted({reason for _, reason in records if reason is not None})
-        if any(peer != runtime for peer, _ in records):
-            reasons.append("device mappings or runtimes differ across ranks")
-        self.fallback_reason = "; ".join(reasons) or None
+        reasons = [
+            f"rank {rank}: {reason}"
+            for rank, (_, reason) in enumerate(records)
+            if reason is not None
+        ]
+        if not reasons:
+            for field in runtime:
+                values = [peer[field] for peer, _ in records]
+                if any(value != values[0] for value in values):
+                    reasons.append(f"{field} differs across ranks: {values}")
+        if reasons:
+            raise ValueError(
+                f"Incompatible SPMD compilation configuration: {'; '.join(reasons)}. "
+                "Fix the configuration or remove --use-spmd-compile."
+            )
         self._serializer = ThreadPoolExecutor(thread_name_prefix="tpu-serialize")
 
     def gather(self, value: T) -> list[T]:
@@ -355,18 +397,3 @@ class SPMDCompiler:
         self.submissions.clear()
         self.mlirs.clear()
         self.argument_layouts.clear()
-
-
-def create_spmd_compiler(
-    group: dist.ProcessGroup, *, verify_spmd_safe: bool = False
-) -> SPMDCompiler | None:
-    """Create a coordinator, falling back to local compilation for runtime mismatch."""
-    spmd_compiler = SPMDCompiler(group, verify_spmd_safe=verify_spmd_safe)
-    if spmd_compiler.fallback_reason is None:
-        return spmd_compiler
-    logger.warning(
-        "[shared_compile] Compiling locally on every rank: %s",
-        spmd_compiler.fallback_reason,
-    )
-    spmd_compiler.clear()
-    return None
