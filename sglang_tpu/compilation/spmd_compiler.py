@@ -18,18 +18,15 @@ T = TypeVar("T")
 
 
 class SPMDCompiler:
-    """Coordinate SPMD-safe compilation within one warmup queue and TP group.
+    """Verify warmup graphs and physical input layouts across a TP group.
 
-    ``collect_warmups`` creates this coordinator with ``--use-spmd-compile``.
-    Eligible ``direct_compile(..., name=..., spmd_safe=True).warmup_async`` calls
-    enqueue their full graph key, then ``compile`` collects their MLIR and input
-    layouts. Keys must identify the same boundary and specialization on all ranks.
+    Each rank traces every SPMD-safe specialization. ``compile`` records its
+    MLIR and input layouts under the same named key on every rank. ``finish``
+    compares the collected records, writes diagnostics, and exits successfully
+    or raises on a mismatch. Verification does not compile or execute graphs.
 
-    With ``VERIFY_SPMD_SAFE=1``, every rank traces every eligible graph. ``finish``
-    collectively checks equivalence and writes worker diagnostics, then raises
-    on failure or exits successfully before any queued call executes. ``clear``
-    releases retained graphs when the warmup context closes. Verification never
-    produces an executable.
+    Returned in place of a native pending compilation so ``direct_compile`` can
+    use its usual async path while execution stays deferred until ``finish``.
     """
 
     def __init__(
@@ -69,11 +66,15 @@ class SPMDCompiler:
         return self
 
     def is_ready(self) -> bool:
-        """Report executable readiness to async callers; verification has no artifact."""
+        """Always return False: verification records graphs without an executable."""
         return False
 
     def get(self) -> Any:
-        """Reject execution of a verification-only submission."""
+        """Raise if an async caller tries to retrieve a verification executable.
+
+        ``finish`` must exit or raise before the warmup queue waits on its calls.
+        Reaching this method means that verification lifecycle was bypassed.
+        """
         raise RuntimeError("SPMD verification does not produce an executable")
 
     def finish(self, error: str | None = None) -> NoReturn:

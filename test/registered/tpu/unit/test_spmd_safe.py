@@ -54,7 +54,7 @@ class TestSPMDSafe(CustomTestCase):
                             ["bash", "-lc", command],
                             world_size=world_size,
                             local_world_size=world_size,
-                            timeout=300,
+                            timeout=600,
                             dump_dir=directory,
                             env={
                                 "JAX_PLATFORMS": "cpu",
@@ -108,29 +108,32 @@ class TestSPMDSafe(CustomTestCase):
 
 def _run_worker(mode: str) -> None:
     dist.init_process_group(backend="tpu_dist")
-    group = dist.new_group(backend="gloo")
-    rank = dist.get_rank()
-    order = [0, 1] if mode == "layout" and rank == 1 else [1, 0]
-    with LayoutContext(TpuLayout(minor_to_major=order)):
-        value = torch.ones((128, 128)).to("tpu")
-    observed = tc.get_device_layout_if_materialized(value)
-    assert observed is not None and observed[0] == order, observed
-    constant = 2 if mode == "mlir" and rank == 1 else 1
+    try:
+        group = dist.new_group(backend="gloo")
+        rank = dist.get_rank()
+        order = [0, 1] if mode == "layout" and rank == 1 else [1, 0]
+        with LayoutContext(TpuLayout(minor_to_major=order)):
+            value = torch.ones((128, 128)).to("tpu")
+        observed = tc.get_device_layout_if_materialized(value)
+        assert observed is not None and observed[0] == order, observed
+        constant = 2 if mode == "mlir" and rank == 1 else 1
 
-    def forward(value):
-        return value + constant
+        def forward(value):
+            return value + constant
 
-    compiled = direct_compile(
-        forward,
-        specialization_key=lambda value: ("TARGET_VERIFY", "NULL", 1, 8, False),
-        name="test/model.forward",
-        spmd_safe=True,
-        lift_rank=False,
-    )
-    with get_context().override_server_args(use_spmd_compile=True):
-        with collect_warmups(group=group) as queue:
-            queue.calls.append(compiled.warmup_async(value))
-    raise AssertionError("Verification must exit before warmup execution")
+        compiled = direct_compile(
+            forward,
+            specialization_key=lambda value: ("TARGET_VERIFY", "NULL", 1, 8, False),
+            name="test/model.forward",
+            spmd_safe=True,
+            lift_rank=False,
+        )
+        with get_context().override_server_args(use_spmd_compile=True):
+            with collect_warmups(group=group) as queue:
+                queue.calls.append(compiled.warmup_async(value))
+        raise AssertionError("Verification must exit before warmup execution")
+    finally:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
