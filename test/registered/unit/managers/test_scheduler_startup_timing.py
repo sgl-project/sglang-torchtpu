@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -73,3 +74,7 @@ def test_post_sync_startup_excludes_existing_pre_load_sync(
     else:
         assert target.post_sync_startup_begin is None
         assert "post_sync_startup" not in instance.startup_time
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
