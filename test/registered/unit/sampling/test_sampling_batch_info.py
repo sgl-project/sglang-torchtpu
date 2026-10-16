@@ -890,7 +890,7 @@ class TestHostSamplingMode(CustomTestCase):
 
     def _sampler(self):
         from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
-        from sglang_tpu.sampler import TpuSampler
+        from sglang_tpu.sampler import TpuSampler, _DeviceParamCache
 
         # Exercise real sampling math without distributed CPU setup.
         sampler = TpuSampler.__new__(TpuSampler)
@@ -900,7 +900,62 @@ class TestHostSamplingMode(CustomTestCase):
         sampler.use_log_softmax_logprob = False
         sampler.use_ascend_backend = False
         sampler.output_logprob_processor = OutputLogprobProcessor()
+        sampler._device_params = _DeviceParamCache()
         return sampler
+
+    def test_parameter_uploads_follow_batch_composition(self):
+        """Uploads happen only when the sampled rows change.
+
+        Each upload is a fixed host launch per decode step; a stale reuse would
+        sample with another batch's parameters.
+        """
+        from unittest.mock import patch
+
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang_tpu import sampler as sampler_module
+
+        sampler = self._sampler()
+
+        def sample(info, physical_rows):
+            logits = torch.full((physical_rows, 8), -torch.inf)
+            logits[:, 2] = 0
+            size = len(info)
+            return sampler(
+                LogitsProcessorOutput(next_token_logits=logits),
+                info,
+                False,
+                [0] * size,
+                [[]] * size,
+                torch.arange(physical_rows),
+            )
+
+        with patch.object(
+            sampler_module, "_upload_params", wraps=sampler_module._upload_params
+        ) as upload:
+            greedy = self._host_info(3)
+            greedy.is_all_greedy = greedy.is_any_greedy = True
+            for _ in range(2):
+                tokens = sample(greedy, 4)
+                torch.testing.assert_close(tokens[:3], torch.full((3,), 2))
+            self.assertEqual(upload.call_count, 0)
+
+            sampled = self._host_info(3)
+            sample(sampled, 4)
+            sample(sampled, 4)
+            self.assertEqual(upload.call_count, 1)
+            sample(sampled, 8)  # A different physical extent needs new rows.
+            self.assertEqual(upload.call_count, 2)
+            sampled.filter_batch([2, 0], torch.empty(2, device="meta"))
+            sample(sampled, 2)
+            sample(sampled, 2)
+            self.assertEqual(upload.call_count, 3)
+            other = self._host_info(1)
+            other.temperatures = torch.full((1, 1), 0.5)
+            sampled.merge_batch(other)
+            uploaded = sampler._device_params.materialize(sampled, 4)
+            self.assertEqual(upload.call_count, 4)
+            self.assertEqual(uploaded.temperatures[:, 0].tolist(), [1.0, 1.0, 0.5, 1.0])
+            self.assertTrue(sampled.params_on_cpu)
 
     def test_filter_merge_and_forward_snapshot_keep_logical_rows(self):
         info = self._host_info(3)

@@ -417,6 +417,11 @@ def sampling_params_to_device(
         return info
     size = len(info)
     padded_size = size if padded_size is None else padded_size
+    return replace(info, params_on_cpu=False, **_upload_params(info, padded_size))
+
+
+def _upload_params(info: SamplingBatchInfo, padded_size: int) -> dict:
+    size = len(info)
     if padded_size < size:
         raise ValueError("Sampling parameter rows cannot be smaller than the batch")
     params = {}
@@ -427,12 +432,45 @@ def sampling_params_to_device(
         padded = value.new_full((padded_size, *value.shape[1:]), fill)
         padded[:size].copy_(value)
         params[name] = padded.to(info.device, non_blocking=True)
-    return replace(info, params_on_cpu=False, **params)
+    return params
+
+
+class _DeviceParamCache:
+    """Reuse uploaded sampling parameters while a batch keeps its composition.
+
+    Each upload costs a fixed host launch, so per-step uploads dominate small
+    decode steps. filter_batch and merge_batch rebind the host tensors, so tensor
+    identity marks a composition change. Two entries cover alternating batches.
+    """
+
+    _CAPACITY = 2
+
+    def __init__(self):
+        self._entries: list[tuple[tuple, int, dict]] = []
+
+    def materialize(
+        self, info: SamplingBatchInfo, padded_size: int
+    ) -> SamplingBatchInfo:
+        host = tuple(getattr(info, name) for name in _PARAM_DEFAULTS)
+        for index, (cached_host, cached_size, params) in enumerate(self._entries):
+            if cached_size == padded_size and all(
+                a is b for a, b in zip(cached_host, host)
+            ):
+                self._entries.append(self._entries.pop(index))
+                return replace(info, params_on_cpu=False, **params)
+        params = _upload_params(info, padded_size)
+        # Holding the host tensors keeps their identities from being reused.
+        self._entries = [*self._entries, (host, padded_size, params)][-self._CAPACITY :]
+        return replace(info, params_on_cpu=False, **params)
 
 
 class TpuSampler(Sampler):
     """Consume a pre-gather global TopK for eligible TPU sampling batches.
     Every other batch delegates to the full-vocabulary sampler implementation."""
+
+    def __init__(self):
+        super().__init__()
+        self._device_params = _DeviceParamCache()
 
     def forward(
         self,
@@ -469,9 +507,16 @@ class TpuSampler(Sampler):
             # The producer retains physical logits and forward metadata. Never
             # slice or re-pad them here. Only CPU parameters need materializing
             # at the producer's extent (prefill can use a fixed batch cap).
-            sampling_info = sampling_params_to_device(
-                sampling_info, padded_size=physical_rows
-            )
+            if (
+                sampling_info.is_all_greedy
+                and not logits_output.has_next_token_global_top_k
+            ):
+                # Greedy argmax reads no sampling parameters.
+                sampling_info = replace(sampling_info, params_on_cpu=False)
+            else:
+                sampling_info = self._device_params.materialize(
+                    sampling_info, physical_rows
+                )
 
         # No global TopK: sample from the full-vocabulary logits instead.
         if not logits_output.has_next_token_global_top_k:
