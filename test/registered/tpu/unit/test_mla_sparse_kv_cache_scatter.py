@@ -149,12 +149,16 @@ class SparseMLAScatterTest(parameterized.TestCase):
         )
         block_tables = np.apply_along_axis(rng.permutation, 1, base_pages)
 
-        # Raw bytes, not sampled floats: fp8 has redundant NaN encodings, and
-        # the writers are byte transport -- every bit pattern must survive.
+        # Raw bytes, not sampled floats: every surviving fp8 bit pattern must
+        # round-trip through byte transport. Read the expected uint8 bytes back
+        # from the float8_e4m3fn tensors because TPU XLA canonicalizes -NaN
+        # (0xFF) to +NaN (0x7F) on float8_e4m3fn bitcast.
         key = jax.random.PRNGKey(42)
         k_nope, k_rope = jax.random.split(key, 2)
         kv_c_u8 = jax.random.randint(k_nope, (num_tokens, LKV_DIM), 0, 256, jnp.uint8)
         k_pe_u8 = jax.random.randint(k_rope, (num_tokens, ROPE_DIM), 0, 256, jnp.uint8)
+        kv_c_normed = jax.lax.bitcast_convert_type(kv_c_u8, jnp.float8_e4m3fn)
+        k_pe = jax.lax.bitcast_convert_type(k_pe_u8, jnp.float8_e4m3fn)
 
         specs = {
             name: SparseMLAKVCacheSpec.create(
@@ -173,10 +177,10 @@ class SparseMLAScatterTest(parameterized.TestCase):
         return {
             "specs": specs,
             "caches": {k: jnp.zeros(s.shape, s.jax_dtype) for k, s in specs.items()},
-            "kv_c_u8": kv_c_u8,
-            "kv_c_normed": jax.lax.bitcast_convert_type(kv_c_u8, jnp.float8_e4m3fn),
-            "k_pe_u8": k_pe_u8,
-            "k_pe": jax.lax.bitcast_convert_type(k_pe_u8, jnp.float8_e4m3fn),
+            "kv_c_u8": jax.lax.bitcast_convert_type(kv_c_normed, jnp.uint8),
+            "kv_c_normed": kv_c_normed,
+            "k_pe_u8": jax.lax.bitcast_convert_type(k_pe, jnp.uint8),
+            "k_pe": k_pe,
             "seq_lens": jnp.asarray(seq_lens),
             "block_tables": jnp.asarray(block_tables.reshape(-1)),
             "query_start_loc": jnp.asarray(query_start_loc),
