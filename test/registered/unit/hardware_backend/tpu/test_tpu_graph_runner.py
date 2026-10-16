@@ -583,7 +583,7 @@ class TestTpuGraphRunner(CustomTestCase):
 
         support_torch_compile(_VisionModule, policy=_VisionPolicy)
         model = _model_with()
-        model.modules = lambda: (model, _VisionModule())
+        model.named_modules = lambda: (("", model), ("vision", _VisionModule()))
         with self.assertLogs(tpu_graph_runner.logger, level="WARNING") as logs:
             TpuGraphRunner(self._runner_for(model))
         self.assertTrue(
