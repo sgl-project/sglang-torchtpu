@@ -386,6 +386,10 @@ class TpuSampler(Sampler):
         """Sample from exact global TopK when full logits gathering was skipped.
         Full-logit outputs retain the base sampler's processing and return contract."""
 
+        from sglang_tpu.sampling.sampling_batch_info import sampling_params_to_device
+
+        sampling_info = sampling_params_to_device(sampling_info)
+
         # No global TopK: sample from the full-vocabulary logits instead.
         if not logits_output.has_next_token_global_top_k:
             return super().forward(

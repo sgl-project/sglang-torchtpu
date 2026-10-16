@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
@@ -38,6 +39,8 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
 ]
+
+HOOKS.extend(host_padding_hooks())
 
 _registered = False
 

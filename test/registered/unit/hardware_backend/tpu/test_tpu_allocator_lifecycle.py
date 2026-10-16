@@ -280,5 +280,47 @@ class TestTpuAllocatorLifecycle(CustomTestCase):
         )
 
 
+class TestHostExtendAllocation(CustomTestCase):
+    def test_host_return_is_explicit_and_preserves_page_ownership(self):
+        allocator = TpuPagedTokenToKVPoolAllocator(
+            size=24,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="meta",
+            kvcache=None,
+            need_sort=False,
+        )
+        prefix = torch.tensor([0, 0])
+        lengths = torch.tensor([3, 2])
+        mirror = torch.empty(5, dtype=torch.int32)
+        # A supplied mirror alone must not change the old device-return contract.
+        result = allocator.alloc_extend(
+            prefix,
+            prefix,
+            lengths,
+            lengths,
+            prefix - 1,
+            5,
+            out_indices_cpu=mirror,
+        )
+        self.assertEqual(result.device.type, "meta")
+        self.assertEqual(mirror.tolist(), [4, 5, 6, 8, 9])
+        grown = torch.tensor([5, 5])
+        result = allocator.alloc_extend(
+            lengths,
+            lengths,
+            grown,
+            grown,
+            mirror[[2, 4]],
+            5,
+            return_host=True,
+        )
+        self.assertEqual(result.tolist(), [7, 12, 10, 11, 16])
+        self.assertEqual(allocator.available_size(), 8)
+        allocator.free(torch.cat([mirror, result]))
+        allocator.merge_and_sort_free()
+        self.assertEqual(allocator.available_size(), 24)
+
+
 if __name__ == "__main__":
     unittest.main()

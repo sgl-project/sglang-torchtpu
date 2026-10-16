@@ -955,6 +955,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.b_bucketer,
                 extend_bs=self.extend_bs,
             )
+        self._upload_host_inputs(forward_batch)
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
         spec_info = forward_batch.spec_info
@@ -965,6 +966,30 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 logical_num_tokens=real_q,
                 physical_num_tokens=int(forward_batch.input_ids.shape[0]),
             )
+
+    def _upload_host_inputs(self, forward_batch: ForwardBatch) -> None:
+        if not (
+            envs.SGLANG_TPU_HOST_PADDING.get()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.input_ids.device.type == "cpu"
+        ):
+            return
+        # Only staged forward inputs move here; CPU mirrors stay on the host.
+        for name in (
+            "input_ids",
+            "positions",
+            "out_cache_loc",
+            "extend_seq_lens",
+            "extend_prefix_lens",
+            "extend_start_loc",
+        ):
+            value = getattr(forward_batch, name, None)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                setattr(
+                    forward_batch,
+                    name,
+                    value.to(self.model_runner.device, non_blocking=True),
+                )
 
     def _cp_batch_active(self, forward_batch: ForwardBatch) -> bool:
         """Whether this extend batch runs the context-parallel program."""
@@ -1778,7 +1803,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         positions: torch.Tensor,
         forward_batch: Any,
         *,
-        input_embeds: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
         **_kwargs: Any,
     ) -> tuple[Any, ...]:
@@ -1791,7 +1816,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
-            input_embeds.shape[0],
+            (input_embeds if input_embeds is not None else input_ids).shape[0],
+            input_embeds is not None,
             input_deepstack_embeds is not None,
             logits_output_mode,
         )

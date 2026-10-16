@@ -335,7 +335,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 
         self.assertEqual(
-            HOOKS,
+            HOOKS[:3],
             [
                 (
                     "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
