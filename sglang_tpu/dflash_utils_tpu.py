@@ -252,18 +252,22 @@ def argmax_draft_tokens_tpu(
     """
     hs_3d = hidden_states.view(-1, block_size, hidden_states.shape[-1])
     bs = hs_3d.shape[0]
-    hs_1d = hs_3d[:, 1:, :].reshape(-1, hs_3d.shape[-1])
-    hs = (
-        hs_1d if hs_1d.dtype == lm_head.weight.dtype else hs_1d.to(lm_head.weight.dtype)
-    )
+    hs = hs_3d[:, 1:, :].reshape(-1, hs_3d.shape[-1])
+    from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+
+    # A quant method takes the activation as is, as in the logits processor; an
+    # unquantized head multiplies in its weight dtype.
+    if not should_apply_lm_head_quant_method(lm_head, lm_head.quant_method):
+        hs = hs.to(lm_head.weight.dtype)
 
     tp_size = (
         int(get_parallel().tp_group.world_size)
         if model_parallel_is_initialized()
         else 1
     )
+    # Through the head's own quant method, so a quantized head serves the draft too.
+    local_logits = lm_head.quant_method.apply(lm_head, hs)
     if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
-        local_logits = torch.matmul(hs, lm_head.weight.T)
         _, global_token_ids = distributed_tpu_top_k(
             local_logits,
             TpuVocabShard.from_lm_head(lm_head),
@@ -277,9 +281,7 @@ def argmax_draft_tokens_tpu(
     num_org = int(shard.num_org_elements) if shard is not None else 0
     org_vocab_start = int(shard.org_vocab_start_index) if shard is not None else 0
     if num_org > 0:
-        local_logits = torch.matmul(hs, lm_head.weight[:num_org].T)
-    else:
-        local_logits = torch.matmul(hs, lm_head.weight.T)
+        local_logits = local_logits[:, :num_org]
 
     tokens = torch.argmax(local_logits, dim=-1).to(torch.long)
     if org_vocab_start > 0:
