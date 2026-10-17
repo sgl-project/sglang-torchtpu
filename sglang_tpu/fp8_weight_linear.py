@@ -146,3 +146,29 @@ def install_fp8_linears(module: torch.nn.Module) -> int:
             sub.quant_method = TpuFp8LinearMethod(sub)
             count += 1
     return count
+
+
+class _Fp8PlainLinear(torch.nn.Module):
+    """A plain ``nn.Linear`` whose decode-sized calls run through the fp8 weight-only op."""
+
+    def __init__(self, linear: torch.nn.Linear) -> None:
+        super().__init__()
+        self.weight = linear.weight
+        self.bias = linear.bias
+        self._method = TpuFp8LinearMethod(self)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._method.apply(self, x, self.bias)
+
+
+def install_fp8_plain_linears(module: torch.nn.Module, names: tuple[str, ...]) -> int:
+    """Swap every ``nn.Linear`` child named in ``names`` under ``module``; returns the count."""
+    swaps = [
+        (parent, name, child)
+        for parent in module.modules()
+        for name, child in parent.named_children()
+        if name in names and type(child) is torch.nn.Linear
+    ]
+    for parent, name, child in swaps:
+        setattr(parent, name, _Fp8PlainLinear(child))
+    return len(swaps)

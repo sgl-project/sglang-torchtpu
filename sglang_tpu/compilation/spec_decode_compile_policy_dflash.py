@@ -164,11 +164,16 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
         model = self.model_runner.model
         if tpu_envs.SGLANG_TPU_DFLASH_FP8_DRAFT.get():
-            from sglang_tpu.fp8_weight_linear import install_fp8_linears
+            from sglang_tpu.fp8_weight_linear import (
+                install_fp8_linears,
+                install_fp8_plain_linears,
+            )
 
+            num_fp8 = install_fp8_linears(model)
+            num_fp8 += install_fp8_plain_linears(model, ("kernel_projection",))
             logger.info(
                 "[spec compile policy] DFLASH draft: %d linears as fp8 weight-only.",
-                install_fp8_linears(model),
+                num_fp8,
             )
 
     def _ensure_kv_appender(self, dflash_worker: DFlashWorkerV2 | None = None) -> None:

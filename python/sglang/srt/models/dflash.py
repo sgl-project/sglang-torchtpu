@@ -481,6 +481,26 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size
     return out.flatten(-2)
 
 
+# Groups per expansion matmul (SGLANG_DFLASH_CONV_MATMUL_EXPAND): keeps the 0/1 matrix
+# one lane-width deep instead of [groups, hidden].
+_EXPAND_GROUPS = 128
+
+
+def _grouped_conv_channels(hidden_states, delta, base, block_size, taps):
+    """_grouped_conv with ``delta`` [T, taps, H] already widened to channels."""
+    coefficients = base.unsqueeze(0) + delta
+    out = coefficients[:, 0] * hidden_states
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    position = position % block_size
+    for tap in range(1, taps):
+        shifted = torch.cat(
+            [hidden_states.new_zeros(tap, hidden_states.shape[1]), hidden_states[:-tap]]
+        )
+        shifted = torch.where((position >= tap).unsqueeze(1), shifted, 0)
+        out = out + coefficients[:, tap] * shifted
+    return out
+
+
 class DFlashGroupedConv(nn.Module):
     """Grouped dynamic depthwise K-tap convolution across one DFlash block.
 
@@ -509,6 +529,20 @@ class DFlashGroupedConv(nn.Module):
         self.kernel_projection = nn.Linear(
             hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
+        # Convolve flat [T, H] rows, the deltas widened by one 0/1 matmul per sublayer;
+        # on TPU the [T, groups, group_size] views pad to 128 lanes and become copies.
+        self.matmul_expand = (
+            envs.SGLANG_DFLASH_CONV_MATMUL_EXPAND.get()
+            and self.num_groups % _EXPAND_GROUPS == 0
+        )
+        if self.matmul_expand:
+            # Row g is one over channels [g * group_size, (g + 1) * group_size), so
+            # each output is exactly one delta.
+            columns = torch.arange(_EXPAND_GROUPS * self.group_size)
+            expand = columns // self.group_size == torch.arange(_EXPAND_GROUPS)[:, None]
+            self.register_buffer(
+                "group_expand", expand.to(torch.get_default_dtype()), persistent=False
+            )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
         # Marked here, not inside: by the time the compiled function traces, the dim
@@ -526,8 +560,25 @@ class DFlashGroupedConv(nn.Module):
             self.taps,
         )
 
+    def _convolve_channels(self, hidden_states, delta, side: int) -> torch.Tensor:
+        return _grouped_conv_channels(
+            hidden_states, delta, self.base_kernel[side], self.block_size, self.taps
+        )
+
     def prepare(self, hidden_states: torch.Tensor):
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        coefficients = self.kernel_projection(hidden_states)
+        if self.matmul_expand:
+            # Both sides' deltas at once: [T * 2 * taps * groups / 128, 128] @ group_expand.
+            coefficients = torch.matmul(
+                coefficients.reshape(-1, _EXPAND_GROUPS), self.group_expand
+            ).reshape(*hidden_states.shape[:-1], 2, self.taps, -1)
+            return (
+                self._convolve_channels(
+                    hidden_states, coefficients[..., 0, :, :], side=0
+                ),
+                coefficients[..., 1, :, :],
+            )
+        coefficients = coefficients.reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (
@@ -536,6 +587,8 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
+        if self.matmul_expand:
+            return self._convolve_channels(hidden_states, coefficients, side=1)
         return self._convolve(hidden_states, coefficients, side=1)
 
 
