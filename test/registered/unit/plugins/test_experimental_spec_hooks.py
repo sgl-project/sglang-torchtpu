@@ -382,6 +382,159 @@ class TestExperimentalSpecHooks(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "custom logit processors"):
             init(True)
 
+    def test_worker_rejects_mixed_phase_dp_steps(self):
+        """Under DP attention, prefill coordination or a skipped MLP sync lets one
+        rank prefill while another decodes; the worker must refuse, not desync."""
+        from sglang.srt.environ import envs as srt_envs
+        from sglang_tpu.experimental.speculative import base_spec_worker
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        class _Stop(Exception):
+            pass
+
+        class _Parallel:
+            pp_size = 1
+
+            @property
+            def attn_tp_size(self):
+                # Reached only past the mixed-phase check.
+                raise _Stop
+
+        def init(*, dp_attention, coordination=False, skip_mlp_sync=False):
+            runner = SimpleNamespace(sampler=_host_padded_sampler())
+            worker = object.__new__(TpuBlockSpecWorker)
+            with (
+                patch.object(
+                    base_spec_worker, "get_parallel", return_value=_Parallel()
+                ),
+                patch.object(
+                    base_spec_worker,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        features=SimpleNamespace(enable_custom_logit_processor=False)
+                    ),
+                ),
+                patch.object(base_spec_worker, "get_dp_tp_group", return_value=None),
+                patch.object(base_spec_worker, "SpecTpSync", lambda group: None),
+                patch.object(
+                    base_spec_worker,
+                    "is_dp_attention_enabled",
+                    return_value=dp_attention,
+                ),
+                patch.object(
+                    base_spec_worker,
+                    "get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_skip_dp_mlp_sync=skip_mlp_sync
+                    ),
+                ),
+                srt_envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(
+                    coordination
+                ),
+            ):
+                base_spec_worker.TpuSpecWorker.__init__(
+                    worker,
+                    SimpleNamespace(model_runner=runner, device="cpu"),
+                    None,
+                    3,
+                )
+
+        for flags in ({"coordination": True}, {"skip_mlp_sync": True}):
+            with self.assertRaisesRegex(NotImplementedError, "mixed prefill/decode"):
+                init(dp_attention=True, **flags)
+            with self.assertRaises(_Stop):
+                init(dp_attention=False, **flags)
+        with self.assertRaises(_Stop):
+            init(dp_attention=True)
+
+    def test_partial_bucket_results_are_copied_on_the_forward_thread(self):
+        """Rows the result-copy thread reads below a full bucket are fresh tensors,
+        not views that need a program queued behind the next step."""
+        from sglang_tpu.experimental.speculative.base_spec_worker import _live_rows
+
+        full = torch.arange(8).reshape(4, 2)
+        self.assertIs(_live_rows(full, 4), full)
+        live = _live_rows(full, 3)
+        self.assertEqual(live.tolist(), full[:3].tolist())
+        self.assertIsNone(live._base)
+        self.assertNotEqual(live.data_ptr(), full.data_ptr())
+
+    def test_filtered_target_warmup_matches_serving_inputs(self):
+        """Serving uploads temperatures, top-p and min-p as separate tensors; an
+        aliased warmup would leave Dynamo an alias guard serving never satisfies."""
+        from sglang_tpu.experimental.speculative import base_spec_worker
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 2
+        worker.device = "cpu"
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(model_config=SimpleNamespace(vocab_size=8))
+        )
+        calls = []
+        with (
+            patch.object(
+                TpuBlockSpecWorker,
+                "_b_bucketer",
+                return_value=SimpleNamespace(buckets=[4]),
+            ),
+            patch.object(
+                base_spec_worker,
+                "warmup_compiled_op",
+                lambda op, *args: calls.append(args),
+            ),
+            patch.object(base_spec_worker, "_joint_filter_renorm", lambda *a: None),
+            patch.object(torch.accelerator, "synchronize", lambda: None),
+        ):
+            worker._warmup_filtered_target()
+        probs, temperatures, top_ks, top_ps, min_ps, rows = calls[0]
+        self.assertEqual(len({id(t) for t in (temperatures, top_ps, min_ps)}), 3)
+        self.assertEqual(
+            (temperatures.shape, temperatures.dtype), ((4,), torch.float32)
+        )
+        self.assertEqual(top_ks.dtype, torch.int32)
+        self.assertEqual(probs.shape, (8, 8))
+
+    def test_pd_seed_reaches_decode_as_the_host_padded_input(self):
+        """A PD decode server's prebuilt batch must carry the experimental input
+        type: experimental decode prep and filter/merge reject the core one."""
+        from sglang_tpu.experimental.speculative.eagle_info import (
+            HostPaddedEagleDraftInput,
+        )
+        from sglang_tpu.hooks.experimental_spec import build_disagg_eagle_input
+
+        rows = torch.tensor([3, 5])
+        core = SimpleNamespace(
+            bonus_tokens=torch.tensor([7, 9]),
+            topk_p=torch.ones(2, 1),
+            topk_index=torch.zeros(2, 1, dtype=torch.int64),
+            hidden_states=torch.zeros(2, 4),
+            dsa_topk_indices=None,
+            future_indices=rows,
+        )
+        batch = SimpleNamespace(
+            host_pad_bs=_pad, seq_lens=torch.tensor([11, 21], dtype=torch.int32)
+        )
+        draft = build_disagg_eagle_input(lambda *a: core, batch, None, None)
+        self.assertIsInstance(draft, HostPaddedEagleDraftInput)
+        self.assertIs(draft.future_indices, rows)
+        self.assertIs(draft.topk_p, core.topk_p)
+        self.assertIs(draft.hidden_states, core.hidden_states)
+        self.assertEqual(draft.new_seq_lens.tolist(), [11, 21])
+        self.assertFalse(draft.tpu_host_seq_lens_is_committed)
+
+        core.dsa_topk_indices = torch.zeros(2, 4)
+        with self.assertRaisesRegex(NotImplementedError, "DSA"):
+            build_disagg_eagle_input(lambda *a: core, batch, None, None)
+        batch.host_pad_bs = None
+        self.assertIs(
+            build_disagg_eagle_input(lambda *a: core, batch, None, None), core
+        )
+
     def test_filtered_sampling_needs_the_sort_free_filter(self):
         """Verify always filters sort-free; with the target on the sort-based
         fallback the two keep different boundary ties, so filtering is refused."""

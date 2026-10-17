@@ -107,6 +107,29 @@ def prepare_spec_decode(original, batch):
     batch.spec_info.prepare_for_decode(batch)
 
 
+def build_disagg_eagle_input(original, batch, last_tokens_tensor, future_map):
+    # Core builds and relays the PD seed; the experimental worker reads it back
+    # through its own input type.
+    spec_info = original(batch, last_tokens_tensor, future_map)
+    if not uses_host_batch(batch):
+        return spec_info
+    from sglang_tpu.experimental.speculative.eagle_info import (
+        HostPaddedEagleDraftInput,
+    )
+
+    if spec_info.dsa_topk_indices is not None:
+        raise NotImplementedError("TpuEagle3Worker does not support DSA PD seeds.")
+    draft_input = HostPaddedEagleDraftInput(
+        bonus_tokens=spec_info.bonus_tokens,
+        new_seq_lens=batch.seq_lens.to(torch.int64),
+        topk_p=spec_info.topk_p,
+        topk_index=spec_info.topk_index,
+        hidden_states=spec_info.hidden_states,
+    )
+    draft_input.future_indices = spec_info.future_indices
+    return draft_input
+
+
 def stage_prefill_tokens(original, batch):
     if not uses_host_batch(batch):
         return original(batch)
@@ -212,6 +235,11 @@ def hook_specs():
         (
             "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",
             prepare_spec_decode,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.eagle_disaggregation.build_eagle_disagg_draft_input",
+            build_disagg_eagle_input,
             HookType.AROUND,
         ),
         (

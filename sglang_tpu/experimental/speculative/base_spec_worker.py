@@ -151,6 +151,15 @@ class TpuSpecWorker(BaseSpecWorker):
         # Ranks that share one batch: the attention-TP group under DP attention.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         self._dp_attention = is_dp_attention_enabled()
+        if self._dp_attention and (
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+            or get_spec().speculative_skip_dp_mlp_sync
+        ):
+            # Both let DP ranks mix prefill and decode in one step; dispatch and
+            # the idle-rank mirror assume every rank runs the same phase.
+            raise NotImplementedError(
+                "TpuSpecWorker does not support mixed prefill/decode DP steps."
+            )
         self._attn_tp_size = parallel.attn_tp_size
         if self._dp_attention and self._tp_sync.enabled(
             SpecTpSyncSite.SPEC_ACCEPT_GREEDY
@@ -706,16 +715,26 @@ class TpuSpecWorker(BaseSpecWorker):
                     dtype=torch.float32,
                     device=self.device,
                 )
-                ones = torch.ones((padded_bs,), dtype=torch.float32, device=self.device)
+                # Serving uploads each param separately; Dynamo guards on aliasing.
+                temperatures, top_ps, min_ps = (
+                    torch.ones((padded_bs,), dtype=torch.float32, device=self.device)
+                    for _ in range(3)
+                )
                 top_ks = torch.ones((padded_bs,), dtype=torch.int32, device=self.device)
                 warmup_compiled_op(
-                    target_sampling_probs, probs, ones, top_ks, ones, ones, rows
+                    target_sampling_probs,
+                    probs,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    min_ps,
+                    rows,
                 )
                 _joint_filter_renorm(
                     probs,
                     top_ks.repeat_interleave(rows),
-                    ones.repeat_interleave(rows),
-                    ones.repeat_interleave(rows),
+                    top_ps.repeat_interleave(rows),
+                    min_ps.repeat_interleave(rows),
                 )
             # Run the eager filters without copying [pbs * (N + 1), V] rows back.
             torch.accelerator.synchronize()
@@ -782,15 +801,21 @@ class TpuSpecWorker(BaseSpecWorker):
                         if tensor is not None:
                             tensor.cpu()
                 for padded_bs in self._decode_buckets_for(bs):
-                    # GenerationBatchResult.copy_to_cpu of _pack_decode_result's rows.
-                    torch.zeros(
-                        (padded_bs, self.num_verify_rows),
-                        dtype=torch.int64,
-                        device=self.device,
-                    )[:bs].reshape(-1).cpu()
-                    torch.zeros((padded_bs,), dtype=torch.int32, device=self.device)[
-                        :bs
-                    ].cpu()
+                    # _pack_decode_result's rows, then GenerationBatchResult.copy_to_cpu.
+                    _live_rows(
+                        torch.zeros(
+                            (padded_bs, self.num_verify_rows),
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),
+                        bs,
+                    ).reshape(-1).cpu()
+                    _live_rows(
+                        torch.zeros(
+                            (padded_bs,), dtype=torch.int32, device=self.device
+                        ),
+                        bs,
+                    ).cpu()
             if self._dp_attention:
                 for padded_bs in self._b_bucketer().buckets:
                     # _forward_idle_step's all-padding drafts.
@@ -948,14 +973,14 @@ class TpuSpecWorker(BaseSpecWorker):
         accept: AcceptResult,
     ) -> GenerationBatchResult:
         # The scheduler relays and accounts per live request, so cut the bucket rows here.
-        accept_lens = accept.accept_lens[:bs]
+        accept_lens = _live_rows(accept.accept_lens, bs)
         new_seq_lens = next_state.seq_lens[:bs]
         logits_output.next_token_logits = logits_output.next_token_logits[
             : bs * self.num_verify_rows
         ]
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=accept.accept_tokens[:bs].reshape(-1),
+            next_token_ids=_live_rows(accept.accept_tokens, bs).reshape(-1),
             accept_lens=accept_lens,
             block_accept_lens=accept_lens,
             next_draft_input=self.state_to_spec_info(
@@ -1032,6 +1057,12 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "TpuSpecWorker does not support deterministic sampling."
             )
+
+
+def _live_rows(tensor: torch.Tensor, bs: int) -> torch.Tensor:
+    # The result-copy thread reads these after the next step is queued; a [:bs]
+    # view would then need its own program behind that step, so copy it here.
+    return tensor if tensor.shape[0] == bs else tensor[:bs].clone()
 
 
 def _joint_filter_renorm(
