@@ -352,7 +352,6 @@ class RaidenKVManager(
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             KVLayoutGeometry,
             ReshardGeometry,
-            swa_geometry_kv_heads,
         )
 
         tensors = self._swa_kv_caches if swa else self._kv_caches
@@ -382,22 +381,8 @@ class RaidenKVManager(
             seq_along_lane=self._seq_along_lane,
             page_size=int(self.kv_args.page_size) if self._seq_along_lane else None,
         )
-        if not self._seq_along_lane:
-            return ReshardGeometry.from_layout(
-                src_attn_tp, dst_attn_tp, layout, total_kv_heads
-            )
-        # TODO(#829-P1a-HND): SEQ_ALONG_LANE keeps the legacy unit, and at fp8
-        # the SWA count that unit needs.
-        if swa:
-            total_kv_heads = swa_geometry_kv_heads(
-                int(self.kv_args.total_kv_head_num),
-                total_kv_heads,
-                layout.kv_packing,
-                src_attn_tp,
-                dst_attn_tp,
-            )
-        return ReshardGeometry(
-            src_attn_tp, dst_attn_tp, layout.legacy_row_bytes, total_kv_heads
+        return ReshardGeometry.from_layout(
+            src_attn_tp, dst_attn_tp, layout, total_kv_heads
         )
 
     def _reshard_layers(self, swa: bool) -> List[Tuple[tuple, int, int]]:
