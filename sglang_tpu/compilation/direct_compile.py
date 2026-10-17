@@ -21,6 +21,7 @@ from torch.nn.utils.stateless import _reparametrize_module
 from torch_tpu._internal import execution_mode, sync
 from torch_tpu._internal.compile import tpu_torch_compile
 
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -134,6 +135,13 @@ tree_util.register_dataclass(PallasForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
 # Pipeline stages exchange PPProxyTensors as the compiled input and output.
 register_pp_proxy_pytree(tree_util)
+# EAGLE3 targets return their aux hidden states as this list subclass, which
+# tree_util would otherwise treat as one opaque leaf.
+tree_util.register_pytree_node(
+    AuxHiddenStateList,
+    lambda states: (list(states), None),
+    lambda _, children: AuxHiddenStateList(children),
+)
 
 
 def direct_compile(
