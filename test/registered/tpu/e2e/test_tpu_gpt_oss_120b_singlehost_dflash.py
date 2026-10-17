@@ -49,6 +49,7 @@ LAUNCH_ENV = {
     # init and the RNG draws. The deterministic ones (greedy accept) compute the
     # same answer everywhere, so syncing them costs a collective per step.
     "SGLANG_SPEC_TP_SYNC": "rng",
+    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "

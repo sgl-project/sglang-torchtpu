@@ -1,4 +1,4 @@
-"""TPU compile policy for TpuDsparkWorker's target and draft runners."""
+"""TPU compile policy for TpuBlockSpecWorker's target and draft runners."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -27,16 +28,26 @@ from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
 logger = get_logger(__name__)
 
 
-class TpuDsparkSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
+def block_draft_width(model: DFlashDraftModel, num_verify_rows: int) -> int:
+    """Rows per request in the draft block forward [r, m, ..., m]."""
+    # Anchor DSpark drafts read all gamma rows, so the block drops the last mask row.
+    if isinstance(model, DSparkDraftModel) and model.sample_from_anchor:
+        return num_verify_rows - 1
+    return num_verify_rows
+
+
+class TpuBlockSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
     """Target warms TARGET_VERIFY and EXTEND(FULL); the draft warms its block forward and KV writer.
 
-    DSpark's dense draft shares DFlash's spec inputs and K/V layout, so the target
+    DFlash and DSpark drafts share the spec inputs and K/V layout, so the target
     verify grid and the draft KV writer carry over. The target scores
     [r, d_1..d_gamma] (draft_token_num = gamma + 1 rows); the draft forwards
     [r, m, ..., m] (draft_block_width rows) and never runs EXTEND.
     """
 
-    algo_label = "DSPARK"
+    @property
+    def algo_label(self) -> str:
+        return self.model_runner.spec_algorithm.name
 
     # TpuSpecWorker never sends the target DECODE (decode is TARGET_VERIFY) or a
     # capture-NULL EXTEND (extend always captures hidden for the draft KV).
@@ -48,15 +59,13 @@ class TpuDsparkSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
 
     @property
     def draft_block_width(self) -> int:
-        """Rows per request in the draft block forward; must match TpuDsparkWorker."""
         model = self.model_runner.model
-        if not isinstance(model, DSparkDraftModel):
-            raise TypeError(f"Expected a DSparkDraftModel draft, got {type(model)}.")
-        gamma = self.draft_token_num - 1
-        return gamma if model.sample_from_anchor else gamma + 1
+        if not isinstance(model, DFlashDraftModel):
+            raise TypeError(f"Expected a DFlashDraftModel draft, got {type(model)}.")
+        return block_draft_width(model, self.draft_token_num)
 
     def make_null_spec_info(self) -> DFlashVerifyInput:
-        # Same structure as TpuDsparkWorker's draft block input, so the draft trace matches.
+        # Same structure as TpuBlockSpecWorker's draft block input, so the draft trace matches.
         width = self.draft_block_width if self.is_draft_worker else self.draft_token_num
         return make_draft_block_spec_info(
             draft_token_num=width, device=self.model_runner.device
@@ -78,7 +87,7 @@ class TpuDsparkSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
         )
-        # DFlash feeds the draft input_embeds; DSpark embeds input_ids in-graph.
+        # The draft embeds input_ids in-graph with the attached embedding.
         if self.is_draft_worker:
             batch.input_embeds = None
         return batch
@@ -91,7 +100,7 @@ class TpuDsparkSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
     ) -> None:
         """Compile the draft block forward and the draft KV writer."""
         if not self.is_draft_worker:
-            raise ValueError("precompile_draft runs on the DSpark draft runner only.")
+            raise ValueError("precompile_draft runs on the draft runner only.")
         if self.b_bucketer is None:
             raise ValueError("b_bucketer must be initialized before precompile_draft.")
         start = time.perf_counter()
@@ -104,7 +113,8 @@ class TpuDsparkSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
         if disagg_mode != "decode":
             self._precompile_draft_append_kv_extend()
         logger.info(
-            "[spec compile policy] DSPARK DRAFT precompile done in %.1fs.",
+            "[spec compile policy] %s DRAFT precompile done in %.1fs.",
+            self.algo_label,
             time.perf_counter() - start,
         )
         install_recompilation_checker(
@@ -117,7 +127,8 @@ class TpuDsparkSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
         width = self.draft_block_width
         shapes = [(bs, bs * width) for bs in self.b_bucketer.buckets]
         logger.info(
-            "[spec compile policy] DSPARK DRAFT BLOCK: %d shapes (bs=%s, width=%d)",
+            "[spec compile policy] %s DRAFT BLOCK: %d shapes (bs=%s, width=%d)",
+            self.algo_label,
             len(shapes),
             list(self.b_bucketer.buckets),
             width,
@@ -135,4 +146,4 @@ class TpuDsparkSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
             )
             return f"bs={bs}, tokens={num_tokens}"
 
-        self._precompile_shapes("DSPARK DRAFT BLOCK", shapes, run)
+        self._precompile_shapes(f"{self.algo_label} DRAFT BLOCK", shapes, run)

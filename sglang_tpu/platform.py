@@ -88,7 +88,7 @@ class TpuOOTPlatform(TpuSRTPlatform):
     def supports_speculative_algorithm(self, algorithm: str) -> bool:
         name = str(algorithm).upper()
         if name == "DSPARK":
-            # Served by sglang_tpu.experimental.TpuDsparkWorker.
+            # Served by sglang_tpu.experimental.TpuBlockSpecWorker.
             from sglang_tpu.experimental import experimental_spec_enabled
 
             return experimental_spec_enabled()

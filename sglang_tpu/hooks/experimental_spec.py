@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang_tpu.experimental import get_host_batch_padder, is_experimental_dspark
+from sglang_tpu.experimental import get_host_batch_padder, is_experimental_spec_worker
 
 
 def uses_host_batch(batch):
@@ -19,9 +19,11 @@ def uses_host_batch(batch):
 
 
 def initialize_host_batch(result, *args, **kwargs):
-    if is_experimental_dspark(result.spec_algorithm):
+    if is_experimental_spec_worker(result.spec_algorithm):
         if not result.enable_overlap:
-            raise ValueError("Experimental TPU DSpark requires overlap scheduling")
+            raise ValueError(
+                "The experimental TPU spec worker requires overlap scheduling"
+            )
         result.host_pad_bs = get_host_batch_padder()
     return result
 

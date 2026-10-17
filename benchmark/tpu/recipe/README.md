@@ -102,7 +102,7 @@ diverge on serving says why in a comment.
 | `gemma4_26b_a4b/` | `accuracy`, `perf` | `nightly-tpu-accuracy-gemma4-26b-a4b-*`, `nightly-tpu-perf-gemma4-26b-a4b` |
 | `gemma4_31b/` | `server`, `accuracy`, `perf` | `nightly-tpu-accuracy-gemma4-31b-*`, `nightly-tpu-perf-gemma4-31b` |
 | `gpt_oss_120b/` | `server`, `accuracy`, `accuracy_{aime,gpqa,gsm8k,mmlupro}`, `singlehost_spec`, `pd_singlehost`, `pd_singlehost_{spec,decode_radix,kv_offload,kv_offload_spec,mxint8_multiturn}` | `nightly-tpu-accuracy-gpt-oss-120b-*`, `tpu-integration`, `external-nightly-1host` |
-| `gpt_oss_20b/` | `accuracy`, `perf`, `pcp`, `pp4_pcp2`, `pp4_tp2` | `nightly-tpu-accuracy-gpt-oss-20b`, `nightly-tpu-perf-gpt-oss-20b`, `stage-b-test-tpu-4-v7` |
+| `gpt_oss_20b/` | `server`, `accuracy`, `perf`, `spec`, `spec_dpa`, `prefix_cache_kv_offload`, `pcp`, `pp4_pcp2`, `pp4_tp2` | `nightly-tpu-accuracy-gpt-oss-20b`, `nightly-tpu-perf-gpt-oss-20b`, `stage-b-test-tpu-4-v7` |
 | `kimi_k26/` | `mmmu`, `perf` | `nightly-tpu-multihost-accuracy`, `nightly-tpu-perf-kimi-k26` |
 | `qwen3_0_6b.py` | (flat) | the compile-tracer e2e; single chip |
 | `qwen3_5_397b/` | `server`, `perf` | `nightly-tpu-perf-qwen3-5-397b` |
@@ -121,6 +121,8 @@ Three forms, and a rename has to update whichever a test uses:
 - `MULTIHOST_LAUNCH["launch_script"]` — the JobSet runs this on every host of the
   slice. `.github/tpu-ci/external/render_external_jobset.py` reads the same
   field, so a rename touches the test and `.github/tpu-ci/` together.
+- `MODEL_CONFIG["launch"]["config"]` — the Python launcher, run from the repo
+  root. This is the form a new test takes.
 - `MODEL_CONFIG["launch"]["recipe"]` — `bash <script>`, shell recipes only.
 
 ## Legacy shell recipes
@@ -130,7 +132,7 @@ its tests move to a Python config; do not add more.
 
 | Recipe | Tests |
 | --- | --- |
-| `gpt_oss_120b/server.sh` | the gpt-oss-120b single-host perf and feature gates, plus six 20B tests that override `MODEL` |
+| `gpt_oss_120b/server.sh` | the gpt-oss-120b single-host perf and feature gates |
 | `qwen3_coder_480b/server.sh` | Qwen3-Coder-480B single-host gates |
 | `qwen3_vl_8b/server.sh` | Qwen3-VL-8B EAGLE3 |
 | `qwen3_vl_30b_a3b/server.sh` | the single-host MMMU-Pro gate; paired with `configs/qwen3_vl_30b_a3b/pd_singlehost.py` |

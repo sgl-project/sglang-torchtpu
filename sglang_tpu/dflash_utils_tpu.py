@@ -20,7 +20,7 @@ from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import is_pin_memory_available
-from sglang_tpu.experimental import is_experimental_dspark
+from sglang_tpu.experimental import is_experimental_spec_worker
 from sglang_tpu.spec_op_warmup import (
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
@@ -314,7 +314,7 @@ def _dflash_device_accept_eligible(
         and batch.enable_overlap
         and (
             batch.spec_algorithm.is_dflash()
-            or is_experimental_dspark(batch.spec_algorithm)
+            or is_experimental_spec_worker(batch.spec_algorithm)
         )
         and batch.req_to_token_pool.host_resident
         and not batch.return_logprob
@@ -562,7 +562,7 @@ def plan_dflash_device_accept(
         committed_lens_cpu[:bs],
         block_size,
     )
-    if is_experimental_dspark(batch.spec_algorithm):
+    if is_experimental_spec_worker(batch.spec_algorithm):
         # TpuSpecWorker runs at the batch bucket; 0 is the reserved pool row and slot.
         assert batch.host_pad_bs is not None
         padded_bs = batch.host_pad_bs(bs)
