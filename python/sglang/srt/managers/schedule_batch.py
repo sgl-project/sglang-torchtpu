@@ -117,7 +117,11 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    KVCache,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
@@ -2030,7 +2034,9 @@ class Req(ReqDllmMixin):
             return None
         return req_to_token_pool.mamba_pool
 
-    def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+    def offload_kv_cache(
+        self, req_to_token_pool, token_to_kv_pool_allocator, draft_kv_pools=()
+    ):
         token_indices = req_to_token_pool.req_to_token[
             self.kv.req_pool_idx, : self.seqlen - 1
         ]
@@ -2048,6 +2054,15 @@ class Req(ReqDllmMixin):
                 mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
                 if mamba_pool is not None and self.kv.holds_mamba
                 else None
+            ),
+            draft_cpu=tuple(
+                (
+                    pool,
+                    pool.get_cpu_copy(
+                        token_indices, req_pool_index=self.kv.req_pool_idx
+                    ),
+                )
+                for pool in draft_kv_pools
             ),
         )
 
@@ -2068,6 +2083,10 @@ class Req(ReqDllmMixin):
             mamba_indices=self.kv.mamba_pool_idx,
             req_pool_index=self.kv.req_pool_idx,
         )
+        for pool, draft_cpu in self.kv.retraction_backup.draft_cpu:
+            pool.load_cpu_copy(
+                draft_cpu, token_indices, req_pool_index=self.kv.req_pool_idx
+            )
         self.kv.retraction_backup = None
 
     def build_rebootstrap_payload(self) -> dict:
@@ -2287,6 +2306,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    draft_kv_pools: tuple[KVCache, ...] = (),
 ) -> bool:
     """Returns False when the KV backup failed and the request cannot be resumed."""
     if hisparse_coordinator is not None and not req.finished():
@@ -2305,6 +2325,7 @@ def release_req(
             req_to_token_pool,
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
+            draft_kv_pools=draft_kv_pools,
         )
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
@@ -3356,8 +3377,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
-    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
-        """Retract the decoding requests when there is not enough memory."""
+    def retract_decode(
+        self, *, draft_kv_pools: tuple[KVCache, ...] = ()
+    ) -> Tuple[List[Req], float, List[Req]]:
+        """Retract the decoding requests when there is not enough memory.
+        ``draft_kv_pools`` are backed up with the target KV."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
         sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
 
@@ -3393,7 +3417,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices)):
+            if self.release_req(
+                idx, len(sorted_indices), draft_kv_pools=draft_kv_pools
+            ):
                 retracted_reqs.append(req)
             else:
                 # No backup exists and the device KV is already freed, so the
@@ -3492,6 +3518,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         idx: int,
         remaing_req_count: int,
         offload_kv: bool = True,
+        draft_kv_pools: tuple[KVCache, ...] = (),
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
@@ -3501,6 +3528,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
+            draft_kv_pools=draft_kv_pools,
         )
 
     def prepare_encoder_info_decode(self):

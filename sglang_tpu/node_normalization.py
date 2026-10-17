@@ -17,6 +17,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -136,6 +137,10 @@ def _coordinate_worker(local_rank, config, host_index, timeout, writer):
 
     import torch.distributed as dist
     from torch_tpu._internal.distributed import tpu_distributed
+
+    # Legacy path for torch_tpu without torch.tpu.distributed.set_tpu_launch_env
+    # (the 2026.9.22 release): newer torch_tpu removed this module (#4287) and
+    # takes the public path in query_node_rank. Delete with that pin.
     from torch_tpu._internal.distributed.launchers.multihost_wrapper import (
         calculate_topological_node_rank,
     )
@@ -185,7 +190,71 @@ def _exit_without_native_teardown(local_rank, error_dir, worker, *args):
     os._exit(status)
 
 
+_PUBLIC_RANK_PREFIX = "SGLANG_TPU_NODE_RANK="
+# Runs in a child so that set_tpu_launch_env's environment writes, and the PJRT
+# client its coordinate query starts, stay out of this process.
+_PUBLIC_RANK_PROBE = f"""
+import os, sys
+try:
+    import torch_tpu  # noqa: F401 (registers torch.tpu)
+    from torch.tpu.distributed import set_tpu_launch_env
+except (ImportError, AttributeError):
+    print("{_PUBLIC_RANK_PREFIX}unavailable")
+    sys.exit(0)
+set_tpu_launch_env(nnodes=int(sys.argv[1]), nproc_per_node=int(sys.argv[2]))
+print("{_PUBLIC_RANK_PREFIX}" + os.environ["NODE_RANK"])
+"""
+
+
+def _query_public_node_rank(config: TopologyConfig, timeout: int) -> int | None:
+    """This host's node rank from torch.tpu.distributed.set_tpu_launch_env.
+
+    None when torch_tpu has no such API, or when the chips per host are not the
+    2x2x1 it assumes.
+    """
+    if tuple(config.chips_per_host) != (2, 2, 1):
+        return None
+    env = dict(os.environ)
+    env.update(config.environment(0))
+    # Make torch_tpu derive the rank from coordinates: it never overwrites a set
+    # NODE_RANK, and without coordinates it would fall back to the pod index.
+    for name in ("NODE_RANK", "JOB_COMPLETION_INDEX"):
+        env.pop(name, None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _PUBLIC_RANK_PROBE,
+            str(len(config.hosts)),
+            str(config.devices_per_host),
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+    lines = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith(_PUBLIC_RANK_PREFIX)
+    ]
+    if result.returncode != 0 or not lines:
+        raise RuntimeError(
+            "torch.tpu.distributed.set_tpu_launch_env failed to derive NODE_RANK "
+            f"(exit {result.returncode}); see its traceback above"
+        )
+    value = lines[-1].removeprefix(_PUBLIC_RANK_PREFIX)
+    if value == "unavailable":
+        return None
+    logger.info("TPU node rank %s from torch.tpu.distributed.set_tpu_launch_env", value)
+    return int(value)
+
+
 def query_node_rank(config: TopologyConfig, host_index: int, timeout: int) -> int:
+    # canonical_host_order validates the ranks of all hosts together.
+    rank = _query_public_node_rank(config, timeout)
+    if rank is not None:
+        return rank
     # GKE needs a full SliceBuilder world before local_device_coords() works.
     # Use disposable spawn workers: discovery must release PJRT before the
     # existing scheduler launcher starts model workers. No torchrun/server CLI.

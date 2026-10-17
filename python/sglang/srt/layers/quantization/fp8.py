@@ -2677,10 +2677,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_mxfp8=self.use_mxfp8,
                 is_fp4_expert=self.is_fp4_expert,
             )
-            # TODO(#1065): let `auto` pick fused-RS again once #1122 lands.
-            # Until then Qwen3 MoE sums the fused-RS output twice, so only the
-            # explicit backend opts in.
-            if get_moe_runner_backend().is_pallas_tpu_fused_rs():
+            moe_runner_backend = get_moe_runner_backend()
+            if (
+                moe_runner_backend.is_auto()
+                or moe_runner_backend.is_pallas_tpu_fused_rs()
+            ):
                 from sglang_tpu.fp8_moe_fused_rs import (
                     prepare_fp8_fused_rs,
                 )
@@ -2688,7 +2689,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.handles_moe_reduction = prepare_fp8_fused_rs(layer)
                 if self.handles_moe_reduction and get_parallel().tp_rank == 0:
                     logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
-                if not self.handles_moe_reduction:
+                if (
+                    moe_runner_backend.is_pallas_tpu_fused_rs()
+                    and not self.handles_moe_reduction
+                ):
                     reason = getattr(
                         layer,
                         "_tpu_fused_rs_unsupported_reason",

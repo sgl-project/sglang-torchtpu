@@ -5,6 +5,7 @@ import itertools
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -128,6 +129,56 @@ class TestNodeNormalization(unittest.TestCase):
                         coords
                     )
                     normalization._coordinate_worker(0, self.config, 1, 10, Mock())
+
+    def _probe_result(self, returncode=0, stdout=""):
+        return subprocess.CompletedProcess([], returncode, stdout)
+
+    def test_public_launch_env_gives_the_node_rank(self):
+        # torch_tpu 0.1.2+: set_tpu_launch_env derives NODE_RANK; sglang must
+        # neither preset it nor let it fall back to the pod index.
+        run = Mock(
+            return_value=self._probe_result(stdout="log\nSGLANG_TPU_NODE_RANK=1\n")
+        )
+        with (
+            patch.dict(os.environ, NODE_RANK="0", JOB_COMPLETION_INDEX="0"),
+            patch.object(normalization.subprocess, "run", run),
+            patch("torch.multiprocessing.spawn") as spawn,
+        ):
+            self.assertEqual(normalization.query_node_rank(self.config, 0, 10), 1)
+        spawn.assert_not_called()
+        argv, env = run.call_args.args[0], run.call_args.kwargs["env"]
+        self.assertEqual(argv[-2:], ["2", "8"])
+        self.assertNotIn("NODE_RANK", env)
+        self.assertNotIn("JOB_COMPLETION_INDEX", env)
+        self.assertEqual(env["TORCH_TPU_TOPOLOGY"], "2,2,2,2")
+        self.assertEqual(env["TPU_WORKER_HOSTNAMES"], "source,destination")
+
+    def test_without_the_public_api_discovery_uses_the_spawn_workers(self):
+        # The 2026.9.22 release has no set_tpu_launch_env.
+        probe = self._probe_result(stdout="SGLANG_TPU_NODE_RANK=unavailable\n")
+        with (
+            patch.object(normalization.subprocess, "run", return_value=probe),
+            patch("torch.multiprocessing.spawn", side_effect=RuntimeError("spawned")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "spawned"):
+                normalization.query_node_rank(self.config, 0, 10)
+
+    def test_public_launch_env_failure_is_an_error_not_a_fallback(self):
+        probe = self._probe_result(returncode=1)
+        with (
+            patch.object(normalization.subprocess, "run", return_value=probe),
+            patch("torch.multiprocessing.spawn") as spawn,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "set_tpu_launch_env.*exit 1"):
+                normalization.query_node_rank(self.config, 0, 10)
+        spawn.assert_not_called()
+
+    def test_other_chip_layouts_skip_the_public_api(self):
+        # set_tpu_launch_env assumes 2x2x1 chips per host.
+        config = replace(self.config, topology=(2, 2, 2, 2), chips_per_host=(2, 1, 2))
+        with patch.object(normalization.subprocess, "run") as run:
+            self.assertIsNone(normalization._query_public_node_rank(config, 10))
+        run.assert_not_called()
 
     def test_spawn_probe_returns_rank_and_cleans_up_on_failure(self):
         import torch.multiprocessing as mp

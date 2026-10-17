@@ -752,18 +752,24 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             **kwargs: Any,
         ) -> Any:
             backend = get_forward_context().attn_backend
-            previous_metadata = backend.forward_metadata
-            # Attention reads metadata through the backend during tracing.
-            backend.forward_metadata = attention_metadata
-            try:
-                with use_attention_rank_tensors(attention_rank_tensors):
-                    return fn(input_ids, positions, forward_batch, *args, **kwargs)
-            finally:
-                backend.forward_metadata = previous_metadata
+            with (
+                backend.bind_forward_metadata(
+                    attention_metadata, forward_batch.forward_mode
+                ),
+                use_attention_rank_tensors(attention_rank_tensors),
+            ):
+                return fn(input_ids, positions, forward_batch, *args, **kwargs)
 
         compiled = direct_compile(
             trace_forward,
             specialization_key=self._direct_compile_specialization_key,
+            name=self.name,
+            spmd_safe=self.spmd_safe,
+            lift_rank=(
+                torch.distributed.is_initialized()
+                and get_parallel().tp_group.world_size
+                == torch.distributed.get_world_size()
+            ),
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.get_direct_compile_kv_pool(),

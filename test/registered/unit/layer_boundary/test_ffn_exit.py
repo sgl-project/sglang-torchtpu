@@ -37,9 +37,10 @@ def make_group(scale=3):
     return types.SimpleNamespace(all_reduce=MagicMock(side_effect=lambda h: h * scale))
 
 
-def ordinary_steps(output, *, returns_over_dp=False):
+def ordinary_steps(output, *, returns_over_dp=False, move_sums=False):
     """A layer's ordinary steps, carrying the FFN output declaration the exit
-    reads and whether the output goes back over attention DP."""
+    reads, whether the output goes back over attention DP, and whether the
+    output move itself completes the sum (a CP reduce-scatter)."""
     return comm.StagePath(
         entry=comm.EntryPath(
             prepare=partial(
@@ -60,6 +61,7 @@ def ordinary_steps(output, *, returns_over_dp=False):
         output=output,
         returns_over_dp=returns_over_dp,
         output_move=None if returns_over_dp else keep_output,
+        output_move_completes_sum=move_sums,
     )
 
 
@@ -72,6 +74,7 @@ def make_communicator(
     group=None,
     fusions=None,
     leaves_sum=True,
+    move_sums=False,
 ):
     """A communicator whose decisions and postprocess are stubbed, built
     without the process-wide parallel state."""
@@ -84,6 +87,7 @@ def make_communicator(
             may_defer_to_next=leaves_sum,
         ),
         returns_over_dp=scatters_to_local_tokens,
+        move_sums=move_sums,
     )
     if fusions is None:
         communicator.output._defers_sum = MagicMock(return_value=fuse)
@@ -198,6 +202,53 @@ class TestFfnExit(CustomTestCase):
         communicator.output._defers_sum.assert_not_called()
         communicator.output._complete_now.assert_called_once()
         torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
+
+    def test_an_ffn_summed_by_compute_owes_nothing(self):
+        """An output summed by compute is neither left to the next layer nor
+        summed again."""
+        communicator = make_communicator(fuse=True, reduce_scatter=False)
+        with communicator.output.ffn_exit(
+            self.forward_batch, stream=ResidualStream(), summed_by_compute=True
+        ) as ffn_exit:
+            hidden_states = self.hidden_states * 2
+        hidden_states, _ = finish_exit(ffn_exit, hidden_states, self.residual)
+
+        self.assertNotIsInstance(hidden_states, UnreducedOutput)
+        communicator.output._complete_now.assert_called_once()
+        self.assertFalse(communicator.output._complete_now.call_args.kwargs["owes_sum"])
+
+    def test_an_ffn_summed_by_compute_rejects_a_summing_reduce_scatter(self):
+        communicator = make_communicator(fuse=False, reduce_scatter=True)
+        with self.assertRaises(NotImplementedError):
+            communicator.output.ffn_exit(
+                self.forward_batch, stream=ResidualStream(), summed_by_compute=True
+            )
+
+    def test_complete_now_skips_the_sum_for_an_ffn_summed_by_compute(self):
+        """The operation-scheduled (TBO) path completes now without summing."""
+        communicator = make_communicator(fuse=False, reduce_scatter=False)
+        stream = ResidualStream()
+        stream.residual = self.residual
+        communicator.output.complete_now(
+            self.hidden_states, stream, self.forward_batch, summed_by_compute=True
+        )
+
+        communicator.output._complete_now.assert_called_once()
+        self.assertFalse(communicator.output._complete_now.call_args.kwargs["owes_sum"])
+
+    def test_complete_now_rejects_a_summing_move_for_an_ffn_summed_by_compute(self):
+        """On the TBO path only the output move (a CP reduce-scatter) can sum."""
+        communicator = make_communicator(
+            fuse=False, reduce_scatter=False, move_sums=True
+        )
+        with self.assertRaises(NotImplementedError):
+            communicator.output.complete_now(
+                self.hidden_states,
+                ResidualStream(),
+                self.forward_batch,
+                summed_by_compute=True,
+            )
+        communicator.output._complete_now.assert_not_called()
 
     def test_finish_applies_the_decision_the_ffn_saw(self):
         """finish() applies the decision published to the FFN, even when the

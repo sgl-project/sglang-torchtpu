@@ -14,6 +14,7 @@ from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayou
 from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import dp_attention
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -253,8 +254,12 @@ class TestDirectCompile(CustomTestCase):
                     artifact.executable = None
                     artifact.pending_compile = future
 
-                def compile_helper(args, kwargs, *, async_compile):
+                def compile_helper(
+                    args, kwargs, *, async_compile, spmd_compiler, graph
+                ):
                     self.assertEqual(async_compile, asynchronous)
+                    self.assertIsNone(spmd_compiler)
+                    self.assertIsNone(graph)
                     return artifact
 
                 with (
@@ -1501,23 +1506,33 @@ class TestDirectCompileDpRanks(unittest.TestCase):
             for device in (torch.device("tpu"), value.device)
         }
         values = torch.tensor([2.0, 3.0], device="tpu")
-        backend = SimpleNamespace(forward_metadata=None)
+        backend = AttentionBackend()
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=2,
+            input_ids=values,
+            req_pool_indices=None,
+            seq_lens=None,
+            out_cache_loc=None,
+            seq_lens_sum=0,
+        )
+        inputs = (values, None, forward_batch)
         with (
             patch.object(dp_attention, "_RANK_TENSORS", cache),
             forward_context(ForwardContext(attn_backend=backend)),
         ):
             compiled, warmup_async = policy._direct_compile(model.forward)
             torch.testing.assert_close(
-                warmup_async(values, None, None).wait().cpu(),
-                model(values, None, None).cpu(),
+                warmup_async(*inputs).wait().cpu(),
+                model(*inputs).cpu(),
             )
             # Reuse one executable while changing both scalar rank buffers.
             # Constants baked during tracing would return the first rank's result.
             for tp_rank, dp_rank in ((0, 0), (0, 1), (1, 0), (1, 1)):
                 ranks["attn_tp"].fill_(tp_rank)
                 ranks["attn_dp"].fill_(dp_rank)
-                expected = model(values, None, None).cpu()
-                actual = compiled(values, None, None).cpu()
+                expected = model(*inputs).cpu()
+                actual = compiled(*inputs).cpu()
                 torch.testing.assert_close(actual, expected)
                 self.assertIs(dp_attention._RANK_TENSORS, cache)
 

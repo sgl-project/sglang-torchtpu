@@ -66,6 +66,45 @@ Apply the checks relevant to the changed execution paths.
   Preserve request/response and streaming semantics; keep CLI defaults, validation,
   docs, and diagnostic messages consistent with the implemented behavior.
 
+### Plugin migration
+
+The TPU backend is becoming an out-of-tree plugin (`sglang_tpu/`); the fork in
+`python/` shrinks until it equals a pinned upstream release. Every review of a
+change that touches `python/sglang/srt/` or `sglang_tpu/` checks the migration
+does not move backwards.
+
+- Placement: new TPU-only code lands under `sglang_tpu/`. Flag anything added
+  under `python/sglang/srt/` or inside one of the re-export shims there.
+- Core debt: flag any new `is_tpu()` / `_is_tpu` branch, `sglang_tpu` import,
+  TPU-named module, or TPU default in shared code. Accept one only when the PR
+  links the upstream seam issue or PR that will remove it and the ratchet
+  baseline change (`tools/plugin/tpu_debt_baseline.json`) is explicit.
+- Mechanism: for a core change TPU needs, verify the lowest rung that fits was
+  used, in order: an existing `SRTPlatform` method or capability flag; a
+  registry filled from `init_backend()`; a `register_resolution_hook`; a
+  subclass returned through a `get_*_cls()` factory; a seam PR upstream carried
+  as a `sglang_tpu/hooks/` entry. Ask for the simpler rung when it fits.
+- Hooks and patches (`sglang_tpu/hooks/`, `sglang_tpu/patches.py`) are tracked
+  debt: require the header (Why / How / Upstream PR or issue / Remove when).
+  A REPLACE on a method longer than ~30 lines means "write the seam instead".
+- Seam PRs: a change meant for upstream carries no TPU code or naming, keeps
+  the in-tree default byte-for-byte, gates differing behavior on
+  `is_out_of_tree()`, stays under ~300 lines, and ships a CPU unit test with a
+  fake platform. Flag a PR that bundles the seam with the feature using it;
+  ask for the split.
+- Cleanup: once a seam has merged upstream and arrived through the sync, the
+  follow-up must delete the hook and the core branch. A pin bump that leaves
+  them in place is incomplete.
+- Mode A/B: a change to a gate that `is_out_of_tree()` reaches must keep both
+  arms at the same outcome for every configuration that runs, or document the
+  divergence in `sglang_tpu/README.md`. The OOT contract test stays green.
+- Env vars: new TPU-only names in `sglang_tpu/envs.py`; never one name in both
+  registries.
+- Tests: a registered TPU test carries topology, model, and feature labels from
+  `scripts/ci/tpu/support_matrix_vocab.json`; `scripts/ci/tpu/support_matrix.py
+  --strict` passes; a disabled test states a reason with a link. A feature is
+  not "supported" in docs until a registered test backs it.
+
 ### Validation
 
 - Check that tests guard the changed core behavior and relevant boundary cases.

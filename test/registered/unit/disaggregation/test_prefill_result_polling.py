@@ -42,6 +42,10 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang_tpu.kv_free_fence import (
+    KVFreeFence,
+    deferred_dma_read,
+)
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -1426,6 +1430,73 @@ class TestPrefillResultPolling(CustomTestCase):
                     if process.is_alive():
                         process.terminate()
                         process.join(timeout=5)
+
+
+class _BackupScheduler(_Scheduler):
+    """Queues a write-through backup of the pages the in-flight forward writes
+    each time the loop prepares the next batch, as a chunked request's
+    checkpoint does, and flushes backups where the real loop does: on HiCache
+    events and after a result. Records, per issued backup DMA, whether its
+    forward had finished on the device."""
+
+    def __init__(self, *args, fence=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kv_free_fence = fence
+        self.pending_backups = []
+        self.issued = []
+        self.tree_cache = SimpleNamespace(
+            flush_pending_backups=self._flush_backups, finish=Mock()
+        )
+
+    def _process_hicache_events(self, should_retry_storage_prefetch=True):
+        self._flush_backups()
+
+    def process_prefill_chunk(self, last_batch, running_batch):
+        if last_batch is not None:
+            self.pending_backups.append(last_batch.forward_iter)
+        super().process_prefill_chunk(last_batch, running_batch)
+
+    def _flush_backups(self):
+        backups, self.pending_backups = self.pending_backups, []
+        for forward_iter in backups:
+
+            def issue(forward_iter=forward_iter):
+                written = self.copy_events[forward_iter].ready
+                self.issued.append((forward_iter, written))
+
+            deferred_dma_read(self.kv_free_fence, issue)
+
+
+class TestPrefillBackupsUnderPolling(CustomTestCase):
+    """With continuous input polling, a pass can skip an unready result and a
+    later pass flushes HiCache backups before that result is processed, so a
+    backup queued while preparing a batch can be issued while the forward that
+    writes its pages is still running."""
+
+    def _run(self, fence, polling=True):
+        # Pass 1 queues forward 1's backup and forms no batch, which pauses
+        # batch creation; batch 2's arrival at pass 2 resumes it, so pass 2
+        # flushes HiCache backups while forward 1 is still running.
+        scheduler = _BackupScheduler(
+            [_batch(1), None, _batch(2)] + [None] * 8,
+            {name: _result() for name in (1, 2)},
+            {1: 5, 2: 7},
+            fence=fence,
+        )
+        _run_loop(scheduler, enabled=polling)
+        self.assertEqual([forward_iter for forward_iter, _ in scheduler.issued], [1, 2])
+        return scheduler.issued
+
+    def test_unfenced_backup_is_issued_while_its_forward_runs(self):
+        self.assertIn((1, False), self._run(fence=None))
+
+    def test_without_polling_backups_follow_their_forward_result(self):
+        issued = self._run(fence=None, polling=False)
+        self.assertTrue(all(written for _, written in issued), issued)
+
+    def test_fenced_backup_waits_for_its_forward_result(self):
+        issued = self._run(fence=KVFreeFence(lambda: None))
+        self.assertTrue(all(written for _, written in issued), issued)
 
 
 if __name__ == "__main__":

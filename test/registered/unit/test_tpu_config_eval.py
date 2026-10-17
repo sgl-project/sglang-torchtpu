@@ -1,10 +1,13 @@
 """Unit tests for Python recipe dictionaries and CLI flag conversion."""
 
+import importlib
 import json
+import os
 import sys
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -14,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from benchmark.tpu.launch_server import load_recipe, plan_launch
-from benchmark.tpu.recipe.configs import config_eval
+from benchmark.tpu.recipe.configs import base, config_eval
 from benchmark.tpu.recipe.configs.base import CONFIG as BASE_CONFIG
 from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 
@@ -25,7 +28,25 @@ class TestTpuConfigEval(unittest.TestCase):
         self.assertEqual(CONFIG["server_args"]["max_running_requests"], 1)
         self.assertEqual(CONFIG["runtime_env"]["TPU_VISIBLE_CHIPS"], "0")
         self.assertNotIn("model_path", BASE_CONFIG["server_args"])
-        self.assertEqual(BASE_CONFIG["runtime_env"], {"SGLANG_PLATFORM": "tpu"})
+        self.assertEqual(list(BASE_CONFIG["runtime_env"]), ["SGLANG_PLATFORM"])
+
+    def test_inherited_platform_reaches_recipe_servers(self):
+        """A mode-B run (SGLANG_PLATFORM=tpu_oot) must launch mode-B servers;
+        the recipe pinned "tpu", which silently ran them in mode A."""
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_PLATFORM"}
+        try:
+            for inherited, expected in ((None, "tpu"), ("tpu_oot", "tpu_oot")):
+                case = (
+                    env if inherited is None else {**env, "SGLANG_PLATFORM": inherited}
+                )
+                with (
+                    self.subTest(inherited=inherited),
+                    patch.dict(os.environ, case, clear=True),
+                ):
+                    runtime_env = importlib.reload(base).CONFIG["runtime_env"]
+                    self.assertEqual(runtime_env["SGLANG_PLATFORM"], expected)
+        finally:
+            importlib.reload(base)
 
     def test_config_overrides_do_not_modify_shared_defaults(self):
         original = deepcopy(CONFIG)

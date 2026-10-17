@@ -16,6 +16,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 
 if TYPE_CHECKING:
@@ -23,6 +24,10 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
+
+# Platform discovery runs before worker bootstrap configures torch_tpu.
+rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
+traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -701,6 +706,16 @@ class TpuSRTPlatform(SRTPlatform):
 
     supported_quantization: list[str] = []
 
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        return traced_rank(rank, group_size=group_size)
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        return rank_slice(tensor, dim, parts, rank)
+
     # ------------------------------------------------------------------
     # Configuration lifecycle
     # ------------------------------------------------------------------
@@ -1185,6 +1200,9 @@ class TpuSRTPlatform(SRTPlatform):
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        # Resolve after worker setup, before Dynamo can trace either helper.
+        rank_slice._load()
+        traced_rank._load()
         _register_attention_backends()
         self._backend_initialized = True
 

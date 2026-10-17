@@ -4,7 +4,7 @@
 # Sample usage:
 #   ./server.sh                                                  # 8k/1k serving shape
 #   EXTRA_ARGS="--speculative-algorithm EAGLE3 ..." ./server.sh  # + spec decoding
-set -uo pipefail
+set -euo pipefail
 
 # HF id by default; CI tests supply the /weights path explicitly.
 export MODEL=${MODEL:-Qwen/Qwen3-VL-8B-Instruct}

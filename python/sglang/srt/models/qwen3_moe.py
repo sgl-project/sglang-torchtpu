@@ -17,9 +17,6 @@
 
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
-# TODO(#1065): the FP8 fused-RS MoE backend is kept out of `auto` because the
-# decoder layer sums its output twice. Re-enable it in fp8.py once #1122 lands.
-
 import logging
 import math
 from functools import lru_cache
@@ -966,9 +963,17 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(
+            hidden_states, forward_batch, summed_by_compute=self._ffn_summed_by_compute
+        )
 
         return hidden_states
+
+    @property
+    def _ffn_summed_by_compute(self) -> bool:
+        # TPU fused-RS experts return the summed output.
+        experts = getattr(self.mlp, "experts", None)
+        return getattr(experts, "handles_moe_reduction", False)
 
     def op_comm_prepare_attn(
         self,
@@ -999,7 +1004,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
     def op_comm_postprocess_layer(self, state):
         hidden_states = self.ffn_boundary.complete_now(
-            state.pop("hidden_states_mlp_output"), state.forward_batch
+            state.pop("hidden_states_mlp_output"),
+            state.forward_batch,
+            summed_by_compute=self._ffn_summed_by_compute,
         )
 
         output = dict(

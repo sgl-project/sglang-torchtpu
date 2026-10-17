@@ -6,6 +6,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.platforms import current_platform
+
 # SGLANG_TPU_INT4_MOE_MODE values; None = default W4A16 group products.
 INT4_MOE_MODE_VMEM_BF16 = "vmem-bf16"
 INT4_MOE_MODE_VMEM_FP8 = "vmem-fp8"
@@ -44,7 +46,9 @@ def mask_tpu_moe_non_local_experts(
     expert IDs here, so shift IDs into this rank's local range and mark the
     rest -1 (dropped by the kernel) with zero routing weight.
     """
-    local_ids = topk_ids - moe_ep_rank * num_local_experts
+    traced = current_platform.get_traced_rank(moe_ep_rank)
+    rank = moe_ep_rank if traced is None else traced
+    local_ids = topk_ids - rank * num_local_experts
     valid = (local_ids >= 0) & (local_ids < num_local_experts)
     return (
         topk_weights * valid.to(topk_weights.dtype),
