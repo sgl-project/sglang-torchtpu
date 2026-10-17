@@ -26,6 +26,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.moe.pallas.gmm_v2 import _FP32_MOE_SCALES, _scale_quantized_partial
+
 _LHS_QUANT_BLOCK = 512
 # One expert's FP8 w1 + w2 blocks, double-buffered; larger experts keep gmm_v2.
 _EXPERT_BLOCK_BUDGET = 24 * 1024 * 1024
@@ -45,7 +47,7 @@ def _block_quant_dot(x, w, w_scale, *, fp8_dtype):
     """gmm_v2's quantized matmul for one row: x [1, K] in the activation dtype,
     w [K, N]. The lhs scale, its reciprocal and the accumulator are in the
     activation dtype, as gmm_v2 runs a quantized lhs (bf16 accumulation); each
-    block partial is rescaled in f32 and rounded back before accumulating."""
+    block partial is rescaled with gmm_v2's own helper and scale dtype."""
     fp8_max = float(jnp.finfo(fp8_dtype).max)
     dt = x.dtype
     k = x.shape[1]
@@ -61,9 +63,12 @@ def _block_quant_dot(x, w, w_scale, *, fp8_dtype):
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         ).astype(dt)
-        partial = (
-            partial.astype(jnp.float32) * scale.astype(jnp.float32) * w_scale
-        ).astype(dt)
+        partial = _scale_quantized_partial(
+            partial,
+            scale,
+            w_scale,
+            scales_dtype=jnp.float32 if _FP32_MOE_SCALES else dt,
+        )
         acc = partial if acc is None else acc + partial
     return acc
 
