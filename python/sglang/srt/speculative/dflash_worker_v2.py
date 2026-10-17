@@ -3258,7 +3258,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits, dim=-1
                 ).view(bs, int(self.block_size))
             apply_dflash_simulated_acceptance(
-                candidates=candidates,
+                # The bucketed accept returns bucket-sized candidates; the accept
+                # outputs are already trimmed to the live batch.
+                candidates=candidates[:bs],
                 target_predict=target_predict,
                 accept_len=accept_len,
                 commit_lens=commit_lens,

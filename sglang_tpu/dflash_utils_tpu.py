@@ -337,7 +337,7 @@ def _select_verify_cache_locs(
       Slot ids, [bs, block_size].
     """
     device = candidates.device
-    # Binds only on the uninitialized bucket-padding rows; live rows stay inside
+    # Binds only on the zero-filled bucket-padding rows; live rows stay inside
     # [0, block_size] by the one-commit lag.
     offsets = (seq_lens.to(torch.int64) - committed_lens.to(torch.int64)).clamp_(
         0, block_size
@@ -376,9 +376,9 @@ class DeviceVerifyBlockSelector:
     """Bucket-padded driver for select_dflash_verify_cache_locs_tpu.
 
     The op is specialized per physical batch bucket, so live rows are staged into
-    buffers sized to that bucket. Rows past the live batch stay uninitialized:
-    the selection clamps its offsets, so they only ever produce in-bounds garbage
-    that the caller trims off.
+    buffers sized to that bucket. Rows past the live batch stay zero: the selection
+    clamps its offsets, so they only produce in-bounds slots that the caller trims
+    off.
     """
 
     def __init__(
@@ -445,13 +445,16 @@ class DeviceVerifyBlockSelector:
         cap = 0 if self._candidates is None else int(self._candidates.shape[0])
         if cap >= pad_bs:
             return
-        self._candidates = torch.empty(
+        # zeros, not empty: rows past the live batch are never written, and torch_tpu
+        # fails a compiled read of a never-written buffer ("a required argument is in
+        # a failed state").
+        self._candidates = torch.zeros(
             (pad_bs, 2 * self.block_size), dtype=torch.int64, device=self._device
         )
-        self._committed_lens = torch.empty(
+        self._committed_lens = torch.zeros(
             (pad_bs,), dtype=torch.int64, device=self._device
         )
-        self._prefix_lens = torch.empty(
+        self._prefix_lens = torch.zeros(
             (pad_bs,), dtype=torch.int64, device=self._device
         )
 
