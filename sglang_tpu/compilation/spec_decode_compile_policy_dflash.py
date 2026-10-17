@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -38,6 +39,7 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
@@ -140,8 +142,34 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         model = self.model_runner.model
         fc = getattr(model, "fc", None)
         if fc is not None:
-            return int(fc.in_features)
+            # LinearBase (row-parallel included) reports the full input width.
+            return int(fc.input_size if isinstance(fc, LinearBase) else fc.in_features)
         return self.dflash_hidden_size or 1
+
+    def install(self) -> bool:
+        if self.is_draft_worker:
+            self._rewrite_draft_layers()
+        return super().install()
+
+    def _rewrite_draft_layers(self) -> None:
+        """Swap draft layers for their TPU decode variants before the forward is traced."""
+        from sglang.srt.environ import envs
+        from sglang.srt.runtime_context import get_parallel
+
+        # The TPU KV appender projects target hidden states outside draft_tp_context,
+        # so a row-parallel fc would reduce over the wrong group under DP attention.
+        if envs.SGLANG_DFLASH_ROW_PARALLEL_FC.get() and get_parallel().attn_dp_enabled:
+            raise NotImplementedError(
+                "SGLANG_DFLASH_ROW_PARALLEL_FC is not supported with DP attention on TPU"
+            )
+        model = self.model_runner.model
+        if tpu_envs.SGLANG_TPU_DFLASH_FP8_DRAFT.get():
+            from sglang_tpu.fp8_weight_linear import install_fp8_linears
+
+            logger.info(
+                "[spec compile policy] DFLASH draft: %d linears as fp8 weight-only.",
+                install_fp8_linears(model),
+            )
 
     def _ensure_kv_appender(self, dflash_worker: DFlashWorkerV2 | None = None) -> None:
         """Initialize, compile and install the draft KV appender on the worker."""

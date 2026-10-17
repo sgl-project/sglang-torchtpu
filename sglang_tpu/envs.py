@@ -73,6 +73,9 @@ class TpuEnvs:
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
     # to TpuEagle3Worker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+    # DFLASH draft linears as fp8 weight-only (fp8_weight_linear.py) for decode-sized
+    # calls; prefill-sized calls keep the bf16 weights.
+    SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
 
     # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
