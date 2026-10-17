@@ -27,6 +27,7 @@ when the batch composition changes; only the scheduler-facing result is live bs.
 from __future__ import annotations
 
 import contextlib
+import itertools
 from abc import abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -93,10 +95,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
     map_carry,
 )
-from sglang_tpu.experimental.speculative.spec_utils import (
-    apply_verify_logits_adjustments,
-    overridden_fields,
-)
+from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampling_mask import tpu_filter_probs
 
@@ -105,6 +104,13 @@ if TYPE_CHECKING:
 
 # apply_dflash_simulated_acceptance's fixed_token_id, so both paths emit the same tokens.
 _SIMULATED_TOKEN = 100
+
+
+# The target sampler compiles one filter program per need_* combination.
+_SAMPLING_WARMUP_VARIANTS = [{"greedy": True}] + [
+    {"greedy": False, "top_k": top_k, "top_p": top_p, "min_p": min_p}
+    for top_k, top_p, min_p in itertools.product((False, True), repeat=3)
+]
 
 
 class TpuSpecWorker(BaseSpecWorker):
@@ -132,6 +138,7 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "TpuSpecWorker does not support custom logit processors."
             )
+        self._bsearch_filtering = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
         if not isinstance(runner.sampler, HostPaddedTpuSampler):
             # HOST_PADDED sampling params stay on host until TpuSampler uploads
             # them; with full logits it samples exactly like a plain Sampler
@@ -661,16 +668,14 @@ class TpuSpecWorker(BaseSpecWorker):
         vocab_size = runner.model_config.vocab_size
         with torch.no_grad():
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
-                for greedy, top_k in ((True, False), (False, False), (False, True)):
+                for variant in _SAMPLING_WARMUP_VARIANTS:
                     # Materialized like the compiled output, then the finalize trim.
                     logits = torch.zeros((cap, vocab_size), dtype=torch.float32).to(
                         self.device
                     )
                     runner.sampler(
                         LogitsProcessorOutput(next_token_logits=logits[:pbs]),
-                        self._warmup_sampling_info(
-                            pbs, vocab_size, greedy=greedy, top_k=top_k
-                        ),
+                        self._warmup_sampling_info(pbs, vocab_size, **variant),
                         False,
                         None,
                         None,
@@ -796,19 +801,26 @@ class TpuSpecWorker(BaseSpecWorker):
                     ).cpu()
 
     def _warmup_sampling_info(
-        self, padded_bs: int, vocab_size: int, *, greedy: bool, top_k: bool
+        self,
+        padded_bs: int,
+        vocab_size: int,
+        *,
+        greedy: bool,
+        top_k: bool = False,
+        top_p: bool = False,
+        min_p: bool = False,
     ) -> SamplingBatchInfo:
         top_k_value = 1 if greedy else 2 if top_k else TOP_K_ALL
         return HostPaddedSamplingInfo(
             temperatures=torch.ones((padded_bs, 1)),
-            top_ps=torch.ones((padded_bs,)),
+            top_ps=torch.full((padded_bs,), 0.9 if top_p else 1.0),
             top_ks=torch.full((padded_bs,), top_k_value, dtype=torch.int32),
-            min_ps=torch.zeros((padded_bs,)),
+            min_ps=torch.full((padded_bs,), 0.1 if min_p else 0.0),
             is_all_greedy=greedy,
             is_any_greedy=greedy,
-            need_top_p_sampling=False,
+            need_top_p_sampling=top_p,
             need_top_k_sampling=top_k_value != TOP_K_ALL,
-            need_min_p_sampling=False,
+            need_min_p_sampling=min_p,
             vocab_size=vocab_size,
             device=self.device,
             host_pad_bs=self._pad_bs,
@@ -924,17 +936,8 @@ class TpuSpecWorker(BaseSpecWorker):
             # prepare_for_verify leaves TPU attention metadata to the runner.
             skip_attn_backend_init=False,
         )
-        logits_output = target_out.logits_output
-        if not batch.reqs:
-            return logits_output
-        # Custom logit processors address live rows only; penalties / logit bias are
-        # rejected in _check_supported.
-        apply_verify_logits_adjustments(
-            next_token_logits=logits_output.next_token_logits,
-            sampling_info=batch.sampling_info,
-            num_verify_rows=self.num_verify_rows,
-        )
-        return logits_output
+        # Custom logit processors, penalties and logit bias are rejected up front.
+        return target_out.logits_output
 
     def _pack_decode_result(
         self,
@@ -1012,6 +1015,17 @@ class TpuSpecWorker(BaseSpecWorker):
         ):
             raise NotImplementedError(
                 "TpuSpecWorker does not support penalties or logit_bias."
+            )
+        # The sort-based target filter keeps different boundary ties than the
+        # verify filter, so filtered sampling needs the sort-free path on both.
+        if not self._bsearch_filtering and (
+            sampling_info.need_top_k_sampling
+            or sampling_info.need_top_p_sampling
+            or sampling_info.need_min_p_sampling
+        ):
+            raise NotImplementedError(
+                "TpuSpecWorker needs SGLANG_TPU_ENABLE_BSEARCH_SAMPLING for "
+                "top-k/top-p/min-p sampling."
             )
         # Seeded sampling reads live-bs positions against bucket-padded seeds.
         if sampling_info.sampling_seed is not None:

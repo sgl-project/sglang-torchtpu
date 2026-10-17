@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.plugins.hook_registry import HookRegistry, _propagate_patch
@@ -31,6 +32,19 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 def _pad(bs):
     return 4 if bs <= 4 else 8
+
+
+def _module_init(self):
+    # Sampler.__init__ needs the TP group.
+    torch.nn.Module.__init__(self)
+
+
+def _host_padded_sampler():
+    from sglang.srt.layers.sampler import Sampler
+    from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
+
+    with patch.object(Sampler, "__init__", _module_init):
+        return HostPaddedTpuSampler()
 
 
 def _req(temperature=0.5):
@@ -289,32 +303,120 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertTrue(left.tpu_host_seq_lens_is_committed)
         self.assertIs(left.future_indices, merged_rows)
 
-    def test_sampler_pads_live_logits_to_the_host_bucket(self):
+    def test_sampler_samples_live_logits_at_the_host_bucket(self):
         """An outer logits processor emits 3 live rows; HOST_PADDED sampling
-        params sit at bucket 4, so the sampler pads before TpuSampler runs."""
+        params sit at bucket 4, and sampling still returns the bucket rows."""
         from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
-        from sglang_tpu.sampler import TpuSampler
 
-        seen = []
-
-        def record(self, logits_output, sampling_info, *args, **kwargs):
-            seen.append(logits_output.next_token_logits)
-
-        info = object.__new__(HostPaddedSamplingInfo)
-        info.temperatures = torch.ones((_pad(3), 1))
+        sampler = _host_padded_sampler()
+        info = HostPaddedSamplingInfo(
+            temperatures=torch.ones((4, 1)),
+            top_ps=torch.ones(4),
+            top_ks=torch.ones(4, dtype=torch.int32),
+            min_ps=torch.zeros(4),
+            is_all_greedy=True,
+            is_any_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=True,
+            need_min_p_sampling=False,
+            vocab_size=8,
+            device="cpu",
+            host_pad_bs=_pad,
+            real_batch_size=3,
+        )
         logits = torch.randn(3, 8)
-        with patch.object(TpuSampler, "forward", record):
-            # Skips Sampler.__init__, which needs the TP group.
-            sampler = object.__new__(HostPaddedTpuSampler)
-            plain = object.__new__(SamplingBatchInfo)
-            for sampling_info in (info, plain):
-                sampler.forward(
-                    SimpleNamespace(next_token_logits=logits), sampling_info
-                )
-        self.assertEqual(seen[0].shape, (4, 8))
-        torch.testing.assert_close(seen[0][:3], logits)
-        self.assertEqual(seen[0][3].abs().sum().item(), 0)
-        self.assertIs(seen[1], logits)
+        tokens = sampler(
+            LogitsProcessorOutput(next_token_logits=logits),
+            info,
+            False,
+            None,
+            None,
+            torch.zeros(4, dtype=torch.int64),
+        )
+        self.assertIsInstance(sampler, HostPaddedTpuSampler)
+        self.assertEqual(tokens.shape, (4,))
+        self.assertEqual(tokens[:3].tolist(), logits.argmax(-1).tolist())
+
+    def test_worker_installs_the_host_padded_sampler_and_rejects_processors(self):
+        """A plain Sampler (--sampling-backend pytorch) cannot read HOST_PADDED
+        host params; custom logit processors expect live rows."""
+        from sglang.srt.layers.sampler import Sampler
+        from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
+        from sglang_tpu.experimental.speculative import base_spec_worker
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        class _Stop(Exception):
+            pass
+
+        def init(custom_processors):
+            runner = SimpleNamespace(sampler=object.__new__(Sampler))
+            worker = object.__new__(TpuBlockSpecWorker)
+            features = SimpleNamespace(enable_custom_logit_processor=custom_processors)
+            with (
+                patch.object(
+                    base_spec_worker,
+                    "get_parallel",
+                    return_value=SimpleNamespace(pp_size=1),
+                ),
+                patch.object(
+                    base_spec_worker,
+                    "get_exec",
+                    return_value=SimpleNamespace(features=features),
+                ),
+                patch.object(Sampler, "__init__", _module_init),
+                # Stop right after the sampler is installed.
+                patch.object(base_spec_worker, "get_dp_tp_group", side_effect=_Stop),
+            ):
+                with self.assertRaises(_Stop):
+                    base_spec_worker.TpuSpecWorker.__init__(
+                        worker,
+                        SimpleNamespace(model_runner=runner, device="cpu"),
+                        None,
+                        3,
+                    )
+            return runner
+
+        self.assertIsInstance(init(False).sampler, HostPaddedTpuSampler)
+        with self.assertRaisesRegex(NotImplementedError, "custom logit processors"):
+            init(True)
+
+    def test_filtered_sampling_needs_the_sort_free_filter(self):
+        """Verify always filters sort-free; with the target on the sort-based
+        fallback the two keep different boundary ties, so filtering is refused."""
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._bsearch_filtering = False
+
+        def batch(**need):
+            sampling_info = SimpleNamespace(
+                logit_bias=None,
+                acc_additive_penalties=None,
+                acc_scaling_penalties=None,
+                penalizer_orchestrator=None,
+                sampling_seed=None,
+                need_top_k_sampling=False,
+                need_top_p_sampling=False,
+                need_min_p_sampling=False,
+            )
+            sampling_info.__dict__.update(need)
+            return SimpleNamespace(
+                has_grammar=False, return_logprob=False, sampling_info=sampling_info
+            )
+
+        worker._check_supported(batch=batch(), pp_proxy_tensors=None)
+        with self.assertRaisesRegex(NotImplementedError, "BSEARCH"):
+            worker._check_supported(
+                batch=batch(need_top_p_sampling=True), pp_proxy_tensors=None
+            )
+        worker._bsearch_filtering = True
+        worker._check_supported(
+            batch=batch(need_top_p_sampling=True), pp_proxy_tensors=None
+        )
 
     def test_decode_prep_reserves_two_windows_and_keeps_committed_host_lengths(self):
         """prepare_for_decode reserves 2 * N tokens past the committed length,
