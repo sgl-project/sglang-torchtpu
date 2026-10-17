@@ -238,6 +238,36 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         max_diff = (out - ref).abs().max().item()
         self.assertLess(max_diff, 5e-2, f"gelu vs reference max diff = {max_diff}")
 
+    def test_silu_unaligned_k_padded_weights_matches_reference(self):
+        """k=2880 with load-padded w1/w2 K=2944 exercises SparseCore gather/reduce column alignment."""
+        m, k, k_pad, n, g, topk = 32, 2880, 2944, 128, 4, 4
+        hidden, w1_unpadded, w2_unpadded, w_tk, ids = _make_inputs(
+            m, k, n, g, topk, self.device, self.dtype, seed=11
+        )
+        w1 = torch.nn.functional.pad(w1_unpadded, (0, 0, 0, k_pad - k))
+        w2 = torch.nn.functional.pad(w2_unpadded, (0, k_pad - k))
+
+        out = self._run(hidden, w1, w2, w_tk, ids, "silu").cpu().float()
+        torch.tpu.synchronize()
+
+        ref = _ref_moe_torch(
+            hidden.cpu(),
+            w1_unpadded.cpu(),
+            w2_unpadded.cpu(),
+            w_tk.cpu(),
+            ids.cpu(),
+            "silu",
+        ).float()
+
+        self.assertEqual(out.shape, ref.shape)
+        self.assertTrue(torch.isfinite(out).all().item())
+        max_diff = (out - ref).abs().max().item()
+        self.assertLess(
+            max_diff,
+            5e-2,
+            f"unaligned-k (2880->2944) vs reference max diff = {max_diff}",
+        )
+
     def test_silu_through_process_weights_after_loading(self):
         """Pin the full ``process_weights_after_loading`` -> ``fused_moe_call`` contract.
 

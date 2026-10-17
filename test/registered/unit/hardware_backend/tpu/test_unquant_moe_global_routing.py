@@ -83,10 +83,11 @@ class TestUnquantGlobalRouting(CustomTestCase):
             patch.dict(sys.modules, fake_modules),
             self.assertRaises(GatherCalled),
         ):
+            # Unquantized weights reach the op with K padded to a lane multiple.
             fused_moe_op._fused_moe_jax(
-                hidden_states=np.ones((4, 2), dtype=np.float32),
-                w1=np.ones((2, 2, 4), dtype=np.float32),
-                w2=np.ones((2, 2, 2), dtype=np.float32),
+                hidden_states=np.ones((4, 128), dtype=np.float32),
+                w1=np.ones((2, 128, 4), dtype=np.float32),
+                w2=np.ones((2, 2, 128), dtype=np.float32),
                 topk_weights=np.ones((4, 4), dtype=np.float32),
                 topk_ids=topk_ids,
                 w1_scale=None,

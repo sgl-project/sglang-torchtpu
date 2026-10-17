@@ -591,6 +591,22 @@ def _fused_moe_jax(
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
 
+    # bf16 weights arrive with K padded to a 128-lane multiple at load; zero-pad
+    # hidden_states to that K before the gather, which then runs lane-aligned.
+    if w1_scale is None:
+        assert w1.shape[1] % 128 == 0, (
+            f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
+            "to a multiple of 128 at load time"
+        )
+        k_pad = w1.shape[1] - hidden_size
+    elif hidden_size % 128 != 0:
+        raise NotImplementedError(
+            f"Quantized MoE with non-lane-aligned hidden dim ({hidden_size}) "
+            "is unsupported: pad weights AND scales jointly at load time."
+        )
+    else:
+        k_pad = 0
+
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
     # the *input* tokens here keeps the permute/gather operating on an
@@ -600,8 +616,9 @@ def _fused_moe_jax(
     m_orig = m
     topk_ids_orig, topk_weights_orig = topk_ids, topk_weights
     m_pad = _padded_token_count(m, topk, lhs_sublane_tiling(hidden_states.dtype))
+    if m_pad != m or k_pad != 0:
+        hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, k_pad)))
     if m_pad != m:
-        hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
         topk_ids = jnp.pad(
             topk_ids, ((0, m_pad - m), (0, 0)), constant_values=-1
         )  # pad -> dropped
@@ -742,20 +759,6 @@ def _fused_moe_jax(
     gmm1_tiling = _dividing_tile_k(
         _vmem_safe_packed_tile_n(gmm1_tile_info or calculate_tiling)
     )
-    if w1_scale is None:
-        assert w1.shape[1] % 128 == 0, (
-            f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
-            "to a multiple of 128 at load time"
-        )
-        if w1.shape[1] != hidden_size:
-            # activations are born at model width; zero-pad K to the
-            # load-padded weight's width (0 * w = 0, exact)
-            x_sorted = jnp.pad(x_sorted, ((0, 0), (0, w1.shape[1] - hidden_size)))
-    elif hidden_size % 128 != 0:
-        raise NotImplementedError(
-            f"Quantized MoE with non-lane-aligned hidden dim ({hidden_size}) "
-            "is unsupported: pad weights AND scales jointly at load time."
-        )
 
     if single_token:
         group_offset = None
@@ -834,6 +837,8 @@ def _fused_moe_jax(
             _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
         )
     )
+    # gmm2_out keeps the weights' lane-aligned output width through the SparseCore
+    # un-permute; every output is sliced back to hidden_size.
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
@@ -849,10 +854,7 @@ def _fused_moe_jax(
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_int4_in_vmem,
-    )[
-        :,
-        :hidden_size,
-    ]  # [m*topk, k]
+    )  # [m*topk, k_padded]
 
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
@@ -866,11 +868,11 @@ def _fused_moe_jax(
             axis=0,
             keepdims=True,
         )
-        return combined.astype(out_dtype)
+        return combined[:, :hidden_size].astype(out_dtype)
     if use_dense_unpermute:
         if dense_route is not None:
             combined = _dense_route_combine(gmm2_out, dense_route, m)
-            return combined[:m_orig].astype(out_dtype)
+            return combined[:m_orig, :hidden_size].astype(out_dtype)
         # Unpermute using dense matmul.
         w_sorted = topk_weights.reshape(-1)[argsort_idx].astype(jnp.float32)
         unpermute_matrix = (
@@ -878,7 +880,7 @@ def _fused_moe_jax(
         )
         combined = jax.lax.dot_general(
             unpermute_matrix,
-            gmm2_out.astype(jnp.float32),
+            gmm2_out[:, :hidden_size].astype(jnp.float32),
             (((0,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
@@ -915,7 +917,7 @@ def _fused_moe_jax(
                     topk,
                     topk_wgt_zero_nan=True,
                 )
-            return combined[:m_orig].astype(out_dtype)
+            return combined[:m_orig, :hidden_size].astype(out_dtype)
 
         # no_combine: just gather, without the weighted top-k sum.
         from sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2 import (
@@ -928,10 +930,10 @@ def _fused_moe_jax(
             unsort_idx.astype(jnp.int32),
             jnp.array([0], dtype=jnp.int32),
             jnp.array([n_sorted], dtype=jnp.int32),
-        )
+        )[:, :hidden_size]
     else:
         # Gather on the TensorCore.
-        unsorted = gmm2_out[unsort_idx]
+        unsorted = gmm2_out[:, :hidden_size][unsort_idx]
     unsorted = unsorted.reshape(m, topk, hidden_size)
     unsorted = unsorted[:m_orig].astype(out_dtype)
     if no_combine:
