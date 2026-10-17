@@ -329,6 +329,7 @@ class TestGDNPrefixCache(CustomTestCase):
         backend._distribution_cache = {}
         backend._mamba_chunk_size = 64
         backend._extra_buffer_enabled = True
+        backend._spec_window = 1
         backend.req_to_token_pool = SimpleNamespace(
             get_mamba_indices=lambda x: x,
             translate_mamba_indices=lambda x: x,
