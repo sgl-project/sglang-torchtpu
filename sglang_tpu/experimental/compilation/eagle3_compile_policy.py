@@ -10,12 +10,11 @@ import torch
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.utils.common import ceil_align
 from sglang_tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
@@ -27,6 +26,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.experimental.speculative.eagle_info import eagle_verify_input
 
 
 class TpuEagle3SpecDecodeCompilePolicyMixin(Eagle3SpecDecodeCompilePolicyMixin):
@@ -56,15 +56,14 @@ class TpuEagle3SpecDecodeCompilePolicyMixin(Eagle3SpecDecodeCompilePolicyMixin):
             precompile_mm_embed_placement()
         return []
 
-    def make_verify_spec_info(self) -> DFlashVerifyInput:
-        # TpuSpecWorker verifies through DFlashVerifyInput (_build_verify_batch),
-        # and the dynamo tracer guards on the spec_info type.
+    def make_verify_spec_info(self) -> EagleVerifyInput:
+        # The dynamo tracer guards on the spec_info structure, so warm exactly what
+        # TpuEagle3Worker.make_verify_input builds.
         device = self.model_runner.device
-        return DFlashVerifyInput(
+        return eagle_verify_input(
             draft_token=torch.empty(0, device=device, dtype=torch.int64),
             positions=torch.empty(0, device=device, dtype=torch.int64),
-            draft_token_num=self.draft_token_num,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            num_drafts=self.draft_token_num - 1,
         )
 
     def _draft_extend_bs_buckets(self) -> list[int]:

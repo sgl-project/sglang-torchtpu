@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -249,6 +250,18 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         result.new_seq_lens = next_state.seq_lens
         result.next_draft_input = self.state_to_spec_info(next_state)
         return result
+
+    def make_verify_input(
+        self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
+    ) -> DFlashVerifyInput:
+        return DFlashVerifyInput(
+            draft_token=verify_tokens,
+            positions=rows.flat_positions,
+            draft_token_num=self.num_verify_rows,
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
+        )
 
     def state_to_spec_info(self, state: SpecState) -> HostPaddedBlockDraftInput:
         return HostPaddedBlockDraftInput(

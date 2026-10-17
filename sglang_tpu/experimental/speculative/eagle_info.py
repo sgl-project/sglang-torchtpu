@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
@@ -36,3 +38,28 @@ class HostPaddedEagleDraftInput(HostPaddedDraftInput):
     accept_lens_device: torch.Tensor | None = None
     device_accept_candidate_locs: torch.Tensor | None = None
     device_accept_selected_cache_locs: torch.Tensor | None = None
+
+
+def eagle_verify_input(
+    *, draft_token: torch.Tensor, positions: torch.Tensor, num_drafts: int
+) -> EagleVerifyInput:
+    """TARGET_VERIFY spec_info of a top-k 1 chain; the compile policy warms the same structure.
+
+    The window planned the verify slots and accept runs in spec_ops, so the
+    tree fields (custom_mask, retrieve_*) stay unset until tree drafts land.
+    """
+    return EagleVerifyInput(
+        draft_token=draft_token,
+        custom_mask=None,
+        positions=positions,
+        retrieve_index=None,
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_cum_len=None,
+        spec_steps=num_drafts,
+        topk=1,
+        draft_token_num=num_drafts + 1,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        seq_lens_sum=0,
+        seq_lens_cpu=None,
+    )

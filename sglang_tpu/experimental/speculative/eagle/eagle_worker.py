@@ -51,7 +51,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_spec, process_model_config
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_info import EagleDraftExtendInput, EagleDraftInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+)
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.eagle_worker_common import prepare_for_draft
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -62,7 +66,10 @@ from sglang_tpu.compilation.recompilation_checker import (
 )
 from sglang_tpu.eagle_utils_tpu import fused_draft_extend_select_argmax_func
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
-from sglang_tpu.experimental.speculative.eagle_info import HostPaddedEagleDraftInput
+from sglang_tpu.experimental.speculative.eagle_info import (
+    HostPaddedEagleDraftInput,
+    eagle_verify_input,
+)
 from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_target_only,
     finalize_accept,
@@ -394,6 +401,15 @@ class TpuEagle3Worker(TpuSpecWorker):
                 topk_index=draft_input.topk_index,
                 hidden_states=draft_input.hidden_states,
             ),
+        )
+
+    def make_verify_input(
+        self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
+    ) -> EagleVerifyInput:
+        return eagle_verify_input(
+            draft_token=verify_tokens,
+            positions=rows.flat_positions,
+            num_drafts=self.num_drafts,
         )
 
     def state_to_spec_info(self, state: SpecState) -> HostPaddedEagleDraftInput:

@@ -52,7 +52,6 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -60,6 +59,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
     gather_spec_extras_func,
+    prepare_mamba_track_for_verify,
     sample_simulated_acc_len,
 )
 from sglang.srt.utils.common import ceil_align
@@ -302,6 +302,17 @@ class TpuSpecWorker(BaseSpecWorker):
 
         Why: the inverse of get_spec_state; the scheduler stores the result and
         hands it back next step.
+        Noop: never.
+        """
+
+    @abstractmethod
+    def make_verify_input(
+        self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
+    ) -> SpecInput:
+        """The algorithm's own TARGET_VERIFY spec_info for [pbs * (N + 1)] verify rows.
+
+        Why: attention backends and the dynamo tracer key on the algorithm's
+        verify type; its compile policy must warm the same structure.
         Noop: never.
         """
 
@@ -906,15 +917,8 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_input: TpuSpecVerifyInput,
     ) -> ForwardBatch:
         """TARGET_VERIFY ForwardBatch already at the [pbs, N + 1] bucket; the shim pads nothing."""
-        # A chain verify is a causal block, so DFlash's linear verify input serves
-        # every algorithm; the TPU compile policy warms exactly this structure.
-        spec_info = DFlashVerifyInput(
-            draft_token=verify_tokens,
-            positions=rows.flat_positions,
-            draft_token_num=self.num_verify_rows,
-            custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            live_seq_lens_cpu=batch.seq_lens_cpu,
+        spec_info = self.make_verify_input(
+            batch=batch, verify_tokens=verify_tokens, rows=rows
         )
         batch.out_cache_loc = rows.flat_cache_locs
         with self._bucket_view(
@@ -923,10 +927,33 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input=verify_input,
             kv_rows=self.num_verify_rows,
         ) as view:
-            verify_forward_batch, _ = spec_info.prepare_for_verify(
-                view, self.target_worker
-            )
-        return verify_forward_batch
+            return self._prepare_verify_forward_batch(view, spec_info)
+
+    def _prepare_verify_forward_batch(
+        self, batch: ScheduleBatch, spec_info: SpecInput
+    ) -> ForwardBatch:
+        # The window already owns the verify slots (batch.out_cache_loc), so this
+        # never calls a verify input's prepare_for_verify, which may allocate.
+        # Attention metadata is left to the runner, which pads to buckets first.
+        batch.input_ids = spec_info.draft_token
+        batch.spec_info = spec_info
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        if not batch.forward_mode.is_idle():
+            prepare_mamba_track_for_verify(batch)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.target_worker.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
+        graph_runner = self.target_worker.model_runner.decode_cuda_graph_runner
+        if graph_runner and graph_runner.can_run_graph(forward_batch):
+            graph_runner.load_batch(forward_batch)
+        return forward_batch
 
     def _forward_target_verify(
         self,

@@ -465,6 +465,52 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual(input_ids.tolist(), [5, 6, 0, 0, 0, 0])
         self.assertEqual(post.tolist(), [13, 3])
 
+    def test_verify_uses_each_algorithms_own_input_and_warms_its_structure(self):
+        """EAGLE3 verifies with EagleVerifyInput (top-k 1 now, trees later), DFlash
+        keeps DFlashVerifyInput; the dynamo tracer guards the spec_info structure,
+        so EAGLE3's warmup must build the same one as serving."""
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = _eagle_worker()
+        worker.num_drafts = 2
+        rows = SimpleNamespace(flat_positions=torch.arange(6))
+        batch = SimpleNamespace(seq_lens_cpu=torch.tensor([5, 7]))
+        served = worker.make_verify_input(
+            batch=batch, verify_tokens=torch.arange(6), rows=rows
+        )
+        policy = object.__new__(TpuEagle3SpecDecodeCompilePolicyMixin)
+        policy.draft_token_num = 3
+        policy.model_runner = SimpleNamespace(device="cpu")
+        warmed = policy.make_verify_spec_info()
+
+        def structure(spec_info):
+            return {
+                name: (
+                    type(value).__name__
+                    if value is None or not isinstance(value, (int, bool))
+                    else value
+                )
+                for name, value in vars(spec_info).items()
+            }
+
+        self.assertIsInstance(served, EagleVerifyInput)
+        self.assertEqual(type(warmed), type(served))
+        self.assertEqual(structure(warmed), structure(served))
+        self.assertEqual((served.topk, served.draft_token_num), (1, 3))
+
+        block = object.__new__(TpuBlockSpecWorker)
+        block.num_verify_rows = 3
+        self.assertIsInstance(
+            block.make_verify_input(
+                batch=batch, verify_tokens=torch.arange(6), rows=rows
+            ),
+            DFlashVerifyInput,
+        )
+
     def test_host_padded_prefill_keeps_bucket_rows(self):
         policy = object.__new__(TpuEagle3SpecDecodeCompilePolicyMixin)
         sampling_info = SimpleNamespace(temperatures=torch.ones((4, 1)))
