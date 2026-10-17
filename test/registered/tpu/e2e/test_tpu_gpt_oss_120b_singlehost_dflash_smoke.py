@@ -80,6 +80,7 @@ LAUNCH_ENV = {
     "TPU_COMPILE_TOKENS": "512 1024 2048",
     "TPU_COMPILE_BS": "1 2 4",
     "ENABLE_PROFILER_ENDPOINT": "0",
+    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "
