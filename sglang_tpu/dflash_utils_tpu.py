@@ -349,6 +349,38 @@ def _select_verify_cache_locs(
     return candidates[rows[:, None], columns]
 
 
+def build_dflash_draft_block(
+    *,
+    embed: Callable[..., torch.Tensor],
+    bonus_tokens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    candidates: torch.Tensor,
+    committed_lens: torch.Tensor,
+    block_pos_offsets: torch.Tensor,
+    mask_token_id: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Everything the draft step needs from the previous accept, as one program.
+
+    Returns block ids and positions [bs, block_size], the verify slots picked out of
+    the candidate window [bs, block_size], and the embedded block [bs * block_size,
+    hidden]; step by step these are about eight separately launched programs.
+    """
+    bs = bonus_tokens.shape[0]
+    masked = torch.full(
+        (bs, block_size - 1),
+        mask_token_id,
+        dtype=torch.long,
+        device=bonus_tokens.device,
+    )
+    block_ids = torch.cat([bonus_tokens.view(bs, 1), masked], dim=1)
+    positions = prefix_lens.view(bs, 1) + block_pos_offsets
+    slots = _select_verify_cache_locs(
+        candidates, prefix_lens, committed_lens, block_size
+    )
+    return block_ids, positions, slots, embed(block_ids=block_ids)
+
+
 @compiled_op(warmup=make_dflash_verify_cache_locs_args)
 def select_dflash_verify_cache_locs_tpu(
     candidates: torch.Tensor,

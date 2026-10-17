@@ -39,6 +39,7 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.dflash_utils_tpu import build_dflash_draft_block
 from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
@@ -89,6 +90,11 @@ def _block_embedder_specialization_key(
     return (tuple(block_ids.shape), block_ids.dtype)
 
 
+def _draft_block_specialization_key(**tensors: torch.Tensor) -> tuple[object, ...]:
+    """Key fused draft-block artifacts on every input's shape and dtype."""
+    return tuple((name, tuple(t.shape), t.dtype) for name, t in sorted(tensors.items()))
+
+
 class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     """DFlash speculative decoding compile policy mixin."""
 
@@ -104,6 +110,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self._dflash_worker: DFlashWorkerV2 | None = None
         self._compiled_kv_appender: Callable[..., None] | None = None
         self._compiled_block_embedder: Callable[..., torch.Tensor] | None = None
+        self._compiled_draft_block: Callable[..., tuple] | None = None
 
     def _infer_dflash_block_size(self) -> int:
         """Infer DFlash block size from the spec config or the draft config."""
@@ -346,6 +353,90 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 embed_module=dflash_worker.ensure_embed_module(),
             )
         dflash_worker.embed_draft_block_ids = self._compiled_block_embedder
+
+    def _ensure_fused_draft_block(self, dflash_worker: DFlashWorkerV2) -> bool:
+        """Compile and install the one-program draft-block prep when enabled.
+
+        Built on the class's own embed method, not the compiled embedder installed on
+        the worker, so the lookup is traced into the same program.
+        """
+        if dflash_worker._full_embed_gpu is not None:
+            return False
+        if self._compiled_draft_block is None:
+            embed = type(dflash_worker).embed_draft_block_ids.__get__(dflash_worker)
+            mask_token_id = int(dflash_worker._mask_token_id)
+            block_size = int(self.draft_token_num)
+
+            def prepare(
+                *,
+                bonus_tokens,
+                prefix_lens,
+                candidates,
+                committed_lens,
+                block_pos_offsets,
+            ):
+                return build_dflash_draft_block(
+                    embed=embed,
+                    bonus_tokens=bonus_tokens,
+                    prefix_lens=prefix_lens,
+                    candidates=candidates,
+                    committed_lens=committed_lens,
+                    block_pos_offsets=block_pos_offsets,
+                    mask_token_id=mask_token_id,
+                    block_size=block_size,
+                )
+
+            self._compiled_draft_block = self._compile_draft_block(
+                prepare, embed_module=dflash_worker.ensure_embed_module()
+            )
+        dflash_worker.prepare_draft_block_fused = self._prepare_draft_block_fused
+        return True
+
+    def _compile_draft_block(
+        self,
+        fn: Callable[..., tuple[torch.Tensor, ...]],
+        *,
+        embed_module: torch.nn.Module,
+    ) -> Callable[..., tuple[torch.Tensor, ...]]:
+        fn = torch.no_grad()(fn)
+        if self.tracer == "direct":
+            from sglang_tpu.compilation.direct_compile import (
+                direct_compile,
+            )
+
+            return direct_compile(
+                fn,
+                specialization_key=_draft_block_specialization_key,
+                model=embed_module,
+            )
+        return torch.compile(
+            fn,
+            backend=self.backend or current_platform.get_compile_backend(),
+            dynamic=self.dynamic,
+        )
+
+    def _prepare_draft_block_fused(
+        self,
+        *,
+        bonus_tokens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        candidates: torch.Tensor,
+        committed_lens: torch.Tensor,
+        block_pos_offsets: torch.Tensor,
+        bs: int,
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Run the fused prep when the live batch fills its bucket; else defer."""
+        if self.b_bucketer is None or int(self.b_bucketer.next_bucket(bs)) != bs:
+            return None
+        # Fixed dtypes: warmup compiled exactly these, and guard skipping after warmup
+        # would not catch a dtype change.
+        return self._compiled_draft_block(
+            bonus_tokens=bonus_tokens.to(torch.long),
+            prefix_lens=prefix_lens.to(torch.long),
+            candidates=candidates.to(torch.long),
+            committed_lens=committed_lens.to(torch.long),
+            block_pos_offsets=block_pos_offsets,
+        )
 
     def _compile_block_embedder(
         self, fn: Callable[..., torch.Tensor], *, embed_module: torch.nn.Module
@@ -596,6 +687,8 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         overall = time.perf_counter()
         if get_disagg().disaggregation_mode != "prefill":
             self._precompile_draft_verify(draft_attn_backend)
+            # A prefill-only engine never builds a draft block.
+            self._precompile_fused_draft_block(dflash_worker)
         self._precompile_append_target_hidden_to_draft_kv_by_loc_tpu(dflash_worker)
         self._precompile_embed_draft_block_ids(dflash_worker)
         logger.info(
@@ -650,6 +743,30 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             return f"bs={bs}"
 
         self._precompile_shapes("DFLASH DRAFT BLOCK EMBED", bs_buckets, run)
+
+    @torch.no_grad()
+    def _precompile_fused_draft_block(self, dflash_worker: DFlashWorkerV2) -> None:
+        """Compile the fused draft-block prep across batch size buckets."""
+        if not self._ensure_fused_draft_block(dflash_worker):
+            return
+        block_size = int(self.draft_token_num)
+        device = self.model_runner.device
+
+        def run(bs: int) -> str:
+            # Must match the serving call exactly: keyword args, long dtypes.
+            long = dict(dtype=torch.long, device=device)
+            self._compiled_draft_block(
+                bonus_tokens=torch.zeros((bs,), **long),
+                prefix_lens=torch.full((bs,), block_size, **long),
+                candidates=torch.zeros((bs, 2 * block_size), **long),
+                committed_lens=torch.zeros((bs,), **long),
+                block_pos_offsets=dflash_worker._block_pos_offsets,
+            )
+            return f"bs={bs}"
+
+        self._precompile_shapes(
+            "DFLASH FUSED DRAFT BLOCK", list(self.b_bucketer.buckets), run
+        )
 
     def _precompile_draft_append_kv_verify(self) -> None:
         """Compile DFLASH draft KV append across batch size buckets (verify/decode)."""

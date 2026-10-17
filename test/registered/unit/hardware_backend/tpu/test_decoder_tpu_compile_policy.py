@@ -3007,11 +3007,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         with get_parallel().override(
@@ -3032,6 +3036,10 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             policy.append_target_hidden_to_draft_kv_by_loc_tpu,
         )
         self.assertEqual(worker.embed_draft_block_ids, mock_block_embedder)
+        self.assertEqual(
+            worker.prepare_draft_block_fused, policy._prepare_draft_block_fused
+        )
+        self.assertEqual(mock_draft_block.call_count, 2)
 
         # Extend call with 10 tokens pads to token bucket 16.
         target_hidden = torch.ones(10, 32)
@@ -3226,11 +3234,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         # precompile_draft branches on get_disagg().disaggregation_mode.
@@ -3254,6 +3266,8 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(mock_append_kernel.call_count, 2)
         # Block embed warmup is not mode-gated: one call per bs bucket.
         self.assertEqual(mock_block_embedder.call_count, 2)
+        # A prefill-only engine never builds a draft block.
+        self.assertEqual(mock_draft_block.call_count, 0)
 
     def test_precompile_draft_pd_decode_mode_skips_extend(self):
         policy, mr = self._make_dflash_policy(
@@ -3263,11 +3277,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         with (
@@ -3289,6 +3307,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(mr.model.forward.call_count, 2)
         self.assertEqual(mock_append_kernel.call_count, 2)
         self.assertEqual(mock_block_embedder.call_count, 2)
+        self.assertEqual(mock_draft_block.call_count, 2)
 
     def test_dflash_build_disagg_draft_input(self):
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
