@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import torch
 
-from sglang_tpu.experimental import get_host_batch_padder, is_experimental_spec
+from sglang_tpu.experimental import (
+    experimental_spec_enabled,
+    get_host_batch_padder,
+    is_experimental_spec,
+)
 
 
 def uses_host_batch(batch):
@@ -215,7 +219,7 @@ def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     schedule = "sglang.srt.managers.schedule_batch.ScheduleBatch."
-    return [
+    hooks = [
         (
             "sglang.srt.models.dspark.DSparkDraftModel.sample_draft_tokens_tpu",
             sample_draft_tokens,
@@ -233,16 +237,6 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",
-            prepare_spec_decode,
-            HookType.AROUND,
-        ),
-        (
-            "sglang.srt.speculative.eagle_disaggregation.build_eagle_disagg_draft_input",
-            build_disagg_eagle_input,
-            HookType.AROUND,
-        ),
-        (
             "sglang.srt.managers.overlap_utils._stage_prefill_tokens",
             stage_prefill_tokens,
             HookType.AROUND,
@@ -253,14 +247,31 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.srt.model_executor.forward_batch_info.ForwardBatch."
-            "post_forward_mlp_sync_batch",
-            keep_host_padded_extend_outputs,
-            HookType.AROUND,
-        ),
-        (
             "sglang.srt.mem_cache.allocation.alloc_paged_token_slots_extend",
             alloc_extend,
             HookType.AROUND,
         ),
     ]
+    if experimental_spec_enabled():
+        # Hot paths every spec batch takes; registered only with the flag on so
+        # the default path runs no extra wrappers.
+        hooks += [
+            (
+                "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",
+                prepare_spec_decode,
+                HookType.AROUND,
+            ),
+            (
+                "sglang.srt.speculative.eagle_disaggregation."
+                "build_eagle_disagg_draft_input",
+                build_disagg_eagle_input,
+                HookType.AROUND,
+            ),
+            (
+                "sglang.srt.model_executor.forward_batch_info.ForwardBatch."
+                "post_forward_mlp_sync_batch",
+                keep_host_padded_extend_outputs,
+                HookType.AROUND,
+            ),
+        ]
+    return hooks

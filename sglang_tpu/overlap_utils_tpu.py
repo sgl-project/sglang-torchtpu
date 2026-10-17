@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import torch
 
+from sglang_tpu.hooks.experimental_spec import uses_host_batch
+
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -207,7 +209,7 @@ def resolve_device_accept_seq_lens_tpu(
 ) -> bool:
     if resolve_direct_handoff_tpu(future_map, batch):
         return True
-    if _keeps_committed_host_lens(batch.spec_info):
+    if uses_host_batch(batch) and _keeps_committed_host_lens(batch.spec_info):
         # The verify window was planned from the committed host lengths; reading
         # the published lengths back would reintroduce the sync it avoids.
         batch.seq_lens = future_map.new_seq_lens_buf[batch.spec_info.future_indices]

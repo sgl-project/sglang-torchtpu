@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs as srt_envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -291,6 +292,23 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     self.assertEqual(
                         is_experimental_spec_worker(algo), experimental or no_d2h
                     )
+
+    def test_hot_path_hooks_register_only_with_the_flag_on(self):
+        """With both flags off the default spec path must run no extra wrappers."""
+        hot = {
+            "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",
+            "sglang.srt.speculative.eagle_disaggregation.build_eagle_disagg_draft_input",
+            "sglang.srt.model_executor.forward_batch_info.ForwardBatch."
+            "post_forward_mlp_sync_batch",
+        }
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
+            off = {target for target, _, _ in hook_specs()}
+        on = {target for target, _, _ in hook_specs()}
+        self.assertFalse(hot & off)
+        self.assertEqual(hot & on, hot)
 
     def test_draft_merge_preserves_right_hand_length_metadata(self):
         left, right = _state([1]), _state([2, 3])

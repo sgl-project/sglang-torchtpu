@@ -149,7 +149,9 @@ class TestExperimentalEagle3(CustomTestCase):
         next_input.future_indices = rows
         next_input.tpu_host_seq_lens_is_committed = True
         committed = torch.tensor([10, 20])
-        batch = SimpleNamespace(spec_info=next_input, seq_lens_cpu=committed)
+        batch = SimpleNamespace(
+            spec_info=next_input, seq_lens_cpu=committed, host_pad_bs=lambda bs: bs
+        )
         with (
             patch.object(overlap_utils, "_is_tpu", True),
             # sglang_tpu.patches installs this on TPU.
