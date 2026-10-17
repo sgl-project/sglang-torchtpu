@@ -50,6 +50,7 @@ from sglang_tpu.attention_pallas_rpa_base import (
 from sglang_tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
+from sglang_tpu.kv_pool import NOPE_MLA_ROPE_DIM
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 if TYPE_CHECKING:
@@ -317,9 +318,16 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         # every input must be made dense explicitly or the kernel reads
         # scrambled data.
         ql_nope = q.reshape(num_tokens, layer.tp_q_head_num, kv_lora_rank).contiguous()
-        q_pe = q_rope.reshape(num_tokens, layer.tp_q_head_num, rope_dim).contiguous()
         new_kv_c = k.reshape(num_tokens, kv_lora_rank).contiguous()
-        new_k_pe = k_rope.reshape(num_tokens, rope_dim).contiguous()
+        if rope_dim == 0:
+            # NoPE model: the kernels need a rope segment, so attend with zeros.
+            q_pe = q.new_zeros(num_tokens, layer.tp_q_head_num, NOPE_MLA_ROPE_DIM)
+            new_k_pe = k.new_zeros(num_tokens, NOPE_MLA_ROPE_DIM)
+        else:
+            q_pe = q_rope.reshape(
+                num_tokens, layer.tp_q_head_num, rope_dim
+            ).contiguous()
+            new_k_pe = k_rope.reshape(num_tokens, rope_dim).contiguous()
 
         # fp8 KV cache: the kernel writes new_kv_c / new_k_pe into the cache
         # itself and requires them in the cache dtype. Quantize per-tensor with

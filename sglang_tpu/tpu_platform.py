@@ -7,6 +7,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
@@ -479,6 +480,7 @@ def _validate_dsa(server_args) -> None:
             cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=cfg.revision,
+            model_override_args=json.loads(cfg.json_model_override_args or "{}"),
         )
     except Exception:
         # A model that cannot be loaded here fails later with its real error.
@@ -697,6 +699,13 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
 
 
+def _experimental_spec_enabled() -> bool:
+    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    return experimental_spec_enabled()
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -869,6 +878,9 @@ class TpuSRTPlatform(SRTPlatform):
                         "EAGLE-family topk > 1 is not supported on TPU yet."
                     )
             elif spec_algo == "DFLASH":
+                pass
+            elif spec_algo == "DSPARK" and _experimental_spec_enabled():
+                # Served by sglang_tpu.experimental.TpuDsparkWorker.
                 pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

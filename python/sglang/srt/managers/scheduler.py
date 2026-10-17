@@ -460,6 +460,8 @@ class Scheduler(
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     kv_free_fence: Optional["KVFreeFence"] = None
+    # Draft KV pools cpu_tensor retraction backs up with the target KV.
+    retraction_draft_kv_pools: tuple = ()
 
     def __init__(
         self,
@@ -1084,6 +1086,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
+            self.retraction_draft_kv_pools = self.draft_worker.retraction_draft_kv_pools
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -4556,7 +4559,9 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                draft_kv_pools=self.retraction_draft_kv_pools
+            )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (

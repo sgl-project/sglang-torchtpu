@@ -13,7 +13,7 @@ from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
@@ -38,6 +38,8 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
+    # (draft pool, payload) per carried draft pool, at the target's token ids.
+    draft_cpu: tuple = ()
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -234,6 +236,7 @@ def backup_kv_cache(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
+    draft_kv_pools: tuple[KVCache, ...] = (),
 ) -> bool:
     """Returns False when no backup can be taken ('none' backend, or the host
     pool cannot hold it); the caller aborts the request."""
@@ -245,7 +248,11 @@ def backup_kv_cache(
     if backend == "none":
         return False
     if backend == "cpu_tensor":
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        req.offload_kv_cache(
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            draft_kv_pools=draft_kv_pools,
+        )
         return True
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")

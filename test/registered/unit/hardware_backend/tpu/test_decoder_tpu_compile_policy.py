@@ -1124,6 +1124,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=8,
+            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
         )
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=model_runner, owner=model_runner.model
@@ -1141,6 +1142,14 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(len(args), 3)
         self.assertIs(args[0], forward_batch.input_ids)
         self.assertIs(args[2], forward_batch)
+
+        # Direct compilation must accept this exact positional call too, and
+        # must not reuse its token-ID artifact for an embedding-input program.
+        ids_key = policy._direct_compile_specialization_key(None, *args, **kwargs)
+        embeds_key = policy._direct_compile_specialization_key(
+            None, None, args[1], forward_batch, input_embeds=torch.zeros(8, 4)
+        )
+        self.assertNotEqual(ids_key, embeds_key)
 
     def test_slices_hidden_and_aux_tuple(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
@@ -1414,6 +1423,7 @@ class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
             out_cache_loc=torch.empty((0,), dtype=torch.int32),
             req_pool_indices=torch.empty((0,), dtype=torch.int32),
             spec_info=spec_info,
+            sampling_info=None,
         )
 
         with (

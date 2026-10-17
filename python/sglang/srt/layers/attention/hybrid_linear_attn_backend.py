@@ -1254,6 +1254,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
         return None
 
+    def forward_indexer(self, indexer, *, layer_id: int, **kwargs):
+        # Only full-attention layers have a DSA indexer.
+        return self.full_attn_backend.forward_indexer(
+            indexer, layer_id=layer_id, **kwargs
+        )
+
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()

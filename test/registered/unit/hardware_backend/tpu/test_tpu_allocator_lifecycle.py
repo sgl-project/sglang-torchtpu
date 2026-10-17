@@ -13,6 +13,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
+    host_return_allocators,
 )
 from sglang_tpu.kv_free_fence import install_kv_free_fence
 from sglang_tpu.tpu_platform import TpuSRTPlatform
@@ -278,6 +279,118 @@ class TestTpuAllocatorLifecycle(CustomTestCase):
         self.assertEqual(
             allocator.available_size(), len(available) * allocator.page_size
         )
+
+
+class TestHostExtendAllocation(CustomTestCase):
+    def test_host_return_is_explicit_and_preserves_page_ownership(self):
+        allocator = TpuPagedTokenToKVPoolAllocator(
+            size=24,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="meta",
+            kvcache=None,
+            need_sort=False,
+        )
+        prefix = torch.tensor([0, 0])
+        lengths = torch.tensor([3, 2])
+        mirror = torch.empty(5, dtype=torch.int32)
+        # A supplied mirror alone must not change the old device-return contract.
+        result = allocator.alloc_extend(
+            prefix,
+            prefix,
+            lengths,
+            lengths,
+            prefix - 1,
+            5,
+            out_indices_cpu=mirror,
+        )
+        self.assertEqual(result.device.type, "meta")
+        self.assertEqual(mirror.tolist(), [4, 5, 6, 8, 9])
+        grown = torch.tensor([5, 5])
+        result = allocator.alloc_extend(
+            lengths,
+            lengths,
+            grown,
+            grown,
+            mirror[[2, 4]],
+            5,
+            return_host=True,
+        )
+        self.assertEqual(result.tolist(), [7, 12, 10, 11, 16])
+        self.assertEqual(allocator.available_size(), 8)
+        allocator.free(torch.cat([mirror, result]))
+        allocator.merge_and_sort_free()
+        self.assertEqual(allocator.available_size(), 24)
+
+    def test_swa_host_return_reaches_both_inner_allocators(self):
+        """SWA extend and decode return host locations once opted in.
+
+        Device-resident locations at the live batch size compiled a transfer for
+        every new decode batch size under host padding.
+        """
+        page_size, size = 4, 32
+        with (
+            patch.object(swa, "_is_tpu", True),
+            patch.object(swa, "current_platform", TpuSRTPlatform()),
+            patch.object(
+                swa,
+                "TpuPagedTokenToKVPoolAllocator",
+                TpuPagedTokenToKVPoolAllocator,
+                create=True,
+            ),
+        ):
+            kv_pool = SWAKVPool(
+                size=size,
+                size_swa=size,
+                page_size=page_size,
+                dtype=torch.bfloat16,
+                head_num=1,
+                head_dim=8,
+                swa_attention_layer_ids=[1],
+                full_attention_layer_ids=[0],
+                device="cpu",
+            )
+            # "meta" stands in for TPU: only host returns produce CPU tensors.
+            allocator = swa.SWATokenToKVPoolAllocator(
+                size=size,
+                size_swa=size,
+                page_size=page_size,
+                dtype=torch.bfloat16,
+                device="meta",
+                kvcache=kv_pool,
+                need_sort=False,
+            )
+            inner = host_return_allocators(allocator)
+            self.assertEqual(
+                inner, [allocator.full_attn_allocator, allocator.swa_attn_allocator]
+            )
+            mapping = allocator.full_to_swa_index_mapping
+
+            zero = torch.zeros(2, dtype=torch.int64)
+            lengths = torch.tensor([3, 2])
+            full = allocator.alloc_extend(
+                zero, zero, lengths, lengths, zero - 1, 5, return_host=True
+            )
+            self.assertEqual(full.device.type, "cpu")
+            self.assertTrue((mapping[full.long()] > 0).all())
+
+            for a in inner:
+                a.defer_decode_upload = True
+            last = full[[2, 4]].long()
+            grown = lengths + 1
+            decoded = allocator.alloc_decode(grown, grown, last)
+            self.assertEqual(decoded.device.type, "cpu")
+            swa_slots = mapping[decoded.long()]
+            self.assertTrue((swa_slots > 0).all())
+            self.assertEqual(
+                torch.unique(swa_slots).numel(), decoded.numel(), "SWA slots alias"
+            )
+
+        self.assertEqual(
+            host_return_allocators(allocator.full_attn_allocator),
+            [allocator.full_attn_allocator],
+        )
+        self.assertEqual(host_return_allocators(object()), [])
 
 
 if __name__ == "__main__":

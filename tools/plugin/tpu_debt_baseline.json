@@ -9,7 +9,7 @@
     "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py": 3,
     "python/sglang/srt/disaggregation/prefill.py": 7,
     "python/sglang/srt/distributed/parallel_state.py": 5,
-    "python/sglang/srt/layers/attention/attention_registry.py": 5,
+    "python/sglang/srt/layers/attention/attention_registry.py": 4,
     "python/sglang/srt/layers/attention/dsv4/compressor.py": 3,
     "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py": 3,
     "python/sglang/srt/layers/attention/vision.py": 5,

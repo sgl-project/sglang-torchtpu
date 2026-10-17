@@ -23,12 +23,21 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk
+from sglang.srt.configs.model_config import (
+    get_dsa_index_kpool,
+    get_dsa_index_topk,
+    get_dsa_mtp_topk_width,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
-from sglang_tpu.dsa_indexer_tpu import build_dsa_index_topk_op, indexer_forward
+from sglang_tpu.dsa_indexer_tpu import (
+    build_dsa_index_topk_op,
+    build_dsa_kpool_topk_op,
+    indexer_forward,
+    kpool_indexer_forward,
+)
 from sglang_tpu.pallas_export import (
     argnums,
     tpu_info_for_cpu_export,
@@ -177,8 +186,16 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
     ) -> None:
         super().__init__(model_runner, speculative_step_id)
-        self._topk = get_dsa_index_topk(model_runner.model_config.hf_config)
-        self._index_topk_op = build_dsa_index_topk_op()
+        hf_config = model_runner.model_config.hf_config
+        self._topk = get_dsa_index_topk(hf_config)
+        self._kpool = get_dsa_index_kpool(hf_config)
+        if self._kpool > 1:
+            # Pooled tokens plus the open pool's tail, padded with -1 to whole
+            # lanes for the sparse kernel's gather (SparseCore RoPE packing).
+            self._kpool_width = -(-get_dsa_mtp_topk_width(hf_config) // 128) * 128
+            self._index_topk_op = build_dsa_kpool_topk_op()
+        else:
+            self._index_topk_op = build_dsa_index_topk_op()
 
     def _build_kernel_op(self):
         # The base class constructor calls this to set self._op.
@@ -194,6 +211,10 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         layer_id: int,
     ) -> torch.Tensor:
         """Run one layer's indexer. ``Indexer.forward_tpu`` calls this."""
+        if self._kpool > 1:
+            return kpool_indexer_forward(
+                indexer, backend=self, x=x, q_lora=q_lora, layer_id=layer_id
+            )
         return indexer_forward(
             indexer,
             backend=self,
@@ -232,6 +253,41 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             metadata.distribution,
             weight_scale,
             self._topk,
+            metadata.decode_query_size,
+        )
+
+    def index_topk_kpool(
+        self,
+        *,
+        layer_id: int,
+        query: torch.Tensor,  # [num_tokens, index_n_heads, index_head_dim]
+        key: torch.Tensor,  # [num_tokens, index_head_dim]
+        gate: torch.Tensor,  # [num_tokens, index_head_dim]
+        head_weights: torch.Tensor,  # [num_tokens, index_n_heads], f32
+        ape: torch.Tensor,  # [kpool, index_head_dim], f32
+        weight_scale: float,
+        kpool: int,
+    ) -> torch.Tensor:
+        """Pooled indexer (GLM-5.3-Flash): store raw keys, close pools, return
+        ``i32[num_tokens, width]`` rows in the format of index_topk."""
+        metadata = self.forward_metadata
+        pool = self.token_to_kv_pool
+        return self._index_topk_op(
+            query.contiguous(),
+            key.contiguous(),
+            gate.contiguous(),
+            head_weights.contiguous(),
+            ape.contiguous(),
+            pool.get_kpool_raw_cache(layer_id),
+            pool.get_index_key_cache(layer_id),
+            metadata.kv_lens,
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            weight_scale,
+            self._topk,
+            kpool,
+            self._kpool_width,
             metadata.decode_query_size,
         )
 

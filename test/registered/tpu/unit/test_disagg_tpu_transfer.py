@@ -1543,6 +1543,9 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
 class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
     def test_prepare_for_prebuilt_padding(self):
         class MockScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+            def metadata_device(self):
+                return self.device
+
             def __init__(self):
                 self.device = torch.device("cpu")
                 self.forward_mode = None

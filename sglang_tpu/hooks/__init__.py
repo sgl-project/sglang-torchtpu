@@ -11,11 +11,14 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.experimental_spec import hook_specs
+from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +40,16 @@ HOOKS: list[tuple] = [
         skip_spec_op_precompile_without_draft,
         HookType.AROUND,
     ),
+    (
+        "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_worker",
+        select_experimental_spec_worker,
+        HookType.AFTER,
+    ),
 ]
+
+HOOKS.extend(host_padding_hooks())
+
+HOOKS.extend(hook_specs())
 
 _registered = False
 

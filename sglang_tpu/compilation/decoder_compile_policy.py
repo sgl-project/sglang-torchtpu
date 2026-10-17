@@ -51,8 +51,11 @@ from sglang_tpu.compilation.attention_rank_inputs import (
 )
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
+    _BS_FIELDS,
+    _MAMBA_TRACK_FIELDS,
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    _TOKEN_FIELDS,
     CompiledForwardShim,
     _extend_batch_cap,
     _pad_forward_batch_inputs,
@@ -69,6 +72,7 @@ from sglang_tpu.cp_forward import (
     wrap_cp_embedding_forward,
 )
 from sglang_tpu.cp_layout import warmup_request_lengths
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
@@ -957,6 +961,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.b_bucketer,
                 extend_bs=self.extend_bs,
             )
+            self._upload_host_padded_inputs(forward_batch)
+        self._upload_host_inputs(forward_batch)
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
         spec_info = forward_batch.spec_info
@@ -967,6 +973,101 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 logical_num_tokens=real_q,
                 physical_num_tokens=int(forward_batch.input_ids.shape[0]),
             )
+
+    def _supports_padded_sampling_outputs(self) -> bool:
+        return self._compiles_logits_processor()
+
+    def keep_outputs_padded(self, batch: ForwardBatch) -> bool:
+        from sglang_tpu.sampler import supports_padded_sampling
+
+        # EAGLE warmup and serving have different sampling_info values. Avoid
+        # guarding that metadata in compiled paths which cannot use this mode.
+        if not envs.SGLANG_TPU_HOST_PADDING.get() or batch.spec_info is not None:
+            return False
+        info = getattr(batch, "sampling_info", None)
+        if info is None or not supports_padded_sampling(info):
+            return False
+        parallel = get_parallel()
+        config = self.model_runner.model_config
+        observer = getattr(self.model_runner, "sampling_observer", None)
+        return (
+            # Beam-member tails are sliced by the worker before sampling.
+            len(info) == getattr(batch, _REAL_B_KEY, batch.seq_lens.shape[0])
+            and (
+                batch.forward_mode.is_decode()
+                or batch.forward_mode.is_extend_without_speculative()
+            )
+            and not batch.is_prefill_only
+            and not batch.return_logprob
+            and batch.capture_hidden_mode == CaptureHiddenMode.NULL
+            and not batch.return_pooled_hidden_states
+            and not batch.return_hidden_states_before_norm
+            and parallel.pp_size == 1
+            and parallel.attn_cp_size == 1
+            and parallel.attn_dp_size == 1
+            and parallel.attn_dcp_size == 1
+            and not get_schedule().enable_mixed_chunk
+            and not config.use_ngram_embedding
+            and not config.use_engram
+            and not config.is_encoder_decoder
+            and (observer is None or not observer.is_active(info))
+            and self._supports_padded_sampling_outputs()
+        )
+
+    def _upload_host_inputs(self, forward_batch: ForwardBatch) -> None:
+        if (
+            not envs.SGLANG_TPU_HOST_PADDING.get()
+            or forward_batch.spec_info is not None
+        ):
+            return
+        staged_metadata = forward_batch.seq_lens.device.type == "cpu"
+        staged_prefill = (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.input_ids.device.type == "cpu"
+        )
+        mrope = getattr(forward_batch, "mrope_positions", None)
+        staged_mrope = isinstance(mrope, torch.Tensor) and mrope.device.type == "cpu"
+        if not (staged_metadata or staged_prefill or staged_mrope):
+            return
+        # Only staged forward inputs move here; CPU mirrors stay on the host.
+        # Mamba tracking followed seq_lens.device during padding, so host-owned
+        # lengths defer those uploads to this boundary as well.
+        for name in (
+            *_MAMBA_TRACK_FIELDS,
+            "seq_lens",
+            "orig_seq_lens",
+            "req_pool_indices",
+            "input_ids",
+            "positions",
+            "mrope_positions",
+            "out_cache_loc",
+            "extend_seq_lens",
+            "extend_prefix_lens",
+            "extend_start_loc",
+        ):
+            value = getattr(forward_batch, name, None)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                setattr(
+                    forward_batch,
+                    name,
+                    value.to(self.model_runner.device, non_blocking=True),
+                )
+
+    def _upload_host_padded_inputs(self, forward_batch: ForwardBatch) -> None:
+        """HOST_PADDED inputs were padded on host above; upload them at the bucket shape."""
+        sampling_info = forward_batch.sampling_info
+        if sampling_info is None or not is_host_padded(sampling_info):
+            return
+        for name in (*_TOKEN_FIELDS, *_BS_FIELDS):
+            if name == "req_pool_indices_cpu":
+                continue
+            value = getattr(forward_batch, name, None)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                setattr(
+                    forward_batch,
+                    name,
+                    value.to(self.model_runner.device, non_blocking=True),
+                )
 
     def _cp_batch_active(self, forward_batch: ForwardBatch) -> bool:
         """Whether this extend batch runs the context-parallel program."""
@@ -1153,11 +1254,80 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self._assert_cp_family_compiled()
         if disagg_mode != "prefill":
             pending += self._precompile_decode()
+        spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
+        if (
+            envs.SGLANG_TPU_HOST_PADDING.get()
+            and spec_algorithm is not None
+            and spec_algorithm.is_none()
+            and get_exec().kernel.sampling_backend == "tpu"
+            and get_parallel().pp_size == 1
+            and get_parallel().attn_dp_size == 1
+            and get_parallel().attn_cp_size == 1
+            and get_parallel().attn_dcp_size == 1
+            and not get_schedule().enable_mixed_chunk
+        ):
+            # Execute after queued model warmups, before the checker is armed.
+            pending.append(PendingCall(self._warmup_host_padding))
         logger.info(
             "[decoder compile policy] queued precompile in %.1fs.",
             time.perf_counter() - overall,
         )
         return pending
+
+    def _warmup_host_padding(self) -> None:
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang_tpu.compilation.host_padding_warmup import (
+            warmup_host_relay,
+            warmup_sequence_lengths,
+        )
+        from sglang_tpu.sampling.warmup import warmup_host_sampling
+
+        runner = self.model_runner
+        config = runner.model_config
+        if (
+            not config.is_generation
+            or config.use_ngram_embedding
+            or config.use_engram
+            or config.is_encoder_decoder
+            or resolving_view(runner.server_args).dllm_algorithm is not None
+            or runner.req_to_token_pool.req_to_token.device.type != "cpu"
+        ):
+            return
+        buckets = sorted(set(self.b_bucketer.buckets) | {self._extend_compile_cap()})
+        backends = (
+            runner.attn_backend,
+            runner.decode_attn_backend,
+            *(runner.decode_attn_backend_group or ()),
+        )
+        max_live = min(runner.max_running_requests, max(buckets))
+        runner.req_to_token_pool._tpu_relay_bucketer = self.b_bucketer
+        from sglang_tpu.allocator_tpu import host_return_allocators
+
+        for allocator in host_return_allocators(runner.token_to_kv_pool_allocator):
+            allocator.defer_decode_upload = True
+        warmup_sequence_lengths(runner.device, buckets)
+        for backend in {id(value): value for value in backends}.values():
+            warmup = getattr(backend, "warmup_distributions", None)
+            if warmup is not None:
+                warmup(max_live, runner.device)
+        warmup_host_sampling(
+            runner.sampler,
+            buckets,
+            runner.model_config.vocab_size,
+            runner.device,
+            make_logits=self._sampling_warmup_logits,
+        )
+        warmup_host_relay(
+            runner,
+            self.b_bucketer,
+            min(max_live, self.b_bucketer.max_val),
+            extend_cap=self._extend_compile_cap(),
+        )
+
+    def _sampling_warmup_logits(self, rows: int) -> torch.Tensor:
+        return torch.zeros(
+            (rows, self.model_runner.model_config.vocab_size), dtype=torch.float32
+        ).to(self.model_runner.device)
 
     def _assert_cp_family_compiled(self) -> None:
         """Raise if prefill context parallelism is on but warmup compiled no
@@ -1738,6 +1908,38 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
 
+    def _warmup_host_padding(self) -> None:
+        # The compiled inner decoder excludes eager prompt embedding and logits.
+        if not self._compiles_logits_processor():
+            with torch.no_grad():
+                for tokens, rows, mode in self._extend_compile_cases():
+                    embedding = self.owner.get_input_embeddings()
+                    ids = torch.zeros(tokens, dtype=torch.int64).to(
+                        self.model_runner.device
+                    )
+                    ids.clamp_(min=0, max=embedding.num_embeddings - 1)
+                    embedding(ids).cpu()
+                    self._eager_warmup_logits(tokens, rows, mode).cpu()
+        super()._warmup_host_padding()
+
+    def _sampling_warmup_logits(self, rows: int) -> torch.Tensor:
+        if self._compiles_logits_processor():
+            return super()._sampling_warmup_logits(rows)
+        return self._eager_warmup_logits(rows, rows, ForwardMode.DECODE)
+
+    def _eager_warmup_logits(
+        self, tokens: int, rows: int, mode: ForwardMode
+    ) -> torch.Tensor:
+        runner = self.model_runner
+        batch = self._make_dummy_forward_batch(tokens, rows, mode)
+        batch.logits_output_mode = LogitsOutputMode.FULL_VOCAB
+        hidden = torch.zeros(
+            (tokens, runner.model_config.hidden_size), dtype=runner.dtype
+        ).to(runner.device)
+        return runner.model.logits_processor(
+            batch.input_ids, hidden, runner.model.lm_head, batch
+        ).next_token_logits
+
     def install(self) -> bool:
         outer = getattr(self.model_runner, "model", None)
         if (
@@ -1780,7 +1982,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         positions: torch.Tensor,
         forward_batch: Any,
         *,
-        input_embeds: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
         **_kwargs: Any,
     ) -> tuple[Any, ...]:
@@ -1793,7 +1995,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
-            input_embeds.shape[0],
+            (input_embeds if input_embeds is not None else input_ids).shape[0],
+            input_embeds is not None,
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
@@ -1826,6 +2029,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         unhidden.
         """
         return t if t.shape[0] == real_q else t[:real_q]
+
+    def _supports_padded_sampling_outputs(self) -> bool:
+        # Qwen-VL runs its logits processor outside the inner decoder. Both
+        # hidden states and ForwardBatch must retain matching physical rows.
+        return True
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""

@@ -30,6 +30,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (
     _warmup_progress,
 )
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 
 logger = get_logger(__name__)
 
@@ -288,11 +289,22 @@ class BaseSpecDecodeCompilePolicyMixin:
         ):
             return super().finalize_forward_batch(outputs, forward_batch)
 
+        fm = getattr(forward_batch, "forward_mode", None)
+        sampling_info = forward_batch.sampling_info
+        host_padded = sampling_info is not None and is_host_padded(sampling_info)
+        is_verify = fm is not None and fm.is_target_verify()
         if next_token_logits is not None and real_b < next_token_logits.shape[0]:
-            fm = getattr(forward_batch, "forward_mode", None)
-            logit_rows = (
-                real_q if (fm is not None and fm.is_target_verify()) else real_b
-            )
+            if is_verify:
+                logit_rows = real_q
+            elif host_padded:
+                # HOST_PADDED sampling rows are padded to the batch bucket; sample at that shape.
+                logit_rows = sampling_info.temperatures.shape[0]
+                assert logit_rows <= next_token_logits.shape[0], (
+                    logit_rows,
+                    next_token_logits.shape,
+                )
+            else:
+                logit_rows = real_b
             if logit_rows < next_token_logits.shape[0]:
                 outputs.next_token_logits = next_token_logits[:logit_rows]
 
@@ -301,8 +313,15 @@ class BaseSpecDecodeCompilePolicyMixin:
 
         cap = getattr(forward_batch, "capture_hidden_mode", None)
         n_real = real_b if (cap is not None and cap.is_last()) else real_q
+        # HOST_PADDED extend hands its hidden to the draft KV writer at the token
+        # bucket; a [:real_q] trim would re-pad per prompt length.
+        keep_hidden_padded = host_padded and not is_verify
 
-        if hidden_states is not None and n_real < hidden_states.shape[0]:
+        if (
+            hidden_states is not None
+            and n_real < hidden_states.shape[0]
+            and not keep_hidden_padded
+        ):
             outputs.hidden_states = hidden_states[:n_real]
 
         _restore_forward_batch_inputs(forward_batch, real_q, real_b)

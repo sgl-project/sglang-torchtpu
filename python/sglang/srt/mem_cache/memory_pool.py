@@ -4250,6 +4250,10 @@ class HybridLinearKVPool(KVCache):
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         self.use_dsa = use_dsa
+        # TPU is in-tree but supplies its own pool classes, like OOT platforms.
+        uses_platform_pools = (
+            current_platform.is_out_of_tree() or current_platform.is_tpu()
+        )
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
             # aliasing the shared byte buffer.
@@ -4260,7 +4264,7 @@ class HybridLinearKVPool(KVCache):
 
             # TPU is a known-enum platform (is_out_of_tree() is False) but still
             # overrides the MHA pool class (fused RPA-v3 layout), so include it.
-            if current_platform.is_out_of_tree() or current_platform.is_tpu():
+            if uses_platform_pools:
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
                 quant_method_kwarg = {}
             elif _is_npu:
@@ -4304,27 +4308,45 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            self.full_kv_pool = DSATokenToKVPool(
-                size=size,
-                page_size=self.page_size,
-                kv_lora_rank=kv_lora_rank,
-                dtype=dtype,
-                qk_rope_head_dim=qk_rope_head_dim,
-                layer_num=self.full_layer_nums,
-                device=device,
-                index_head_dim=index_head_dim,
-                enable_memory_saver=enable_memory_saver,
-                kv_cache_dim=kv_cache_dim,
-                index_kpool=index_kpool,
-                index_kpool_compress=index_kpool_compress,
-                tail_extra_slots=tail_extra_slots,
-                max_running_requests=max_running_requests,
-                skip_topk_layers=skip_topk_layers,
-            )
+            if current_platform.is_tpu():
+                # TPU's split MLA pool, built as in
+                # kv_cache_configurator._build_tpu_dsa_kv_pool.
+                skips = skip_topk_layers or [False] * self.full_layer_nums
+                self.full_kv_pool = current_platform.get_dsa_kv_pool_cls()(
+                    size=size,
+                    page_size=self.page_size,
+                    dtype=dtype,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    layer_num=self.full_layer_nums,
+                    device=device,
+                    enable_memory_saver=enable_memory_saver,
+                    index_head_dim=index_head_dim,
+                    index_key_layers=[not skip for skip in skips],
+                    index_kpool=index_kpool,
+                )
+            else:
+                self.full_kv_pool = DSATokenToKVPool(
+                    size=size,
+                    page_size=self.page_size,
+                    kv_lora_rank=kv_lora_rank,
+                    dtype=dtype,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    layer_num=self.full_layer_nums,
+                    device=device,
+                    index_head_dim=index_head_dim,
+                    enable_memory_saver=enable_memory_saver,
+                    kv_cache_dim=kv_cache_dim,
+                    index_kpool=index_kpool,
+                    index_kpool_compress=index_kpool_compress,
+                    tail_extra_slots=tail_extra_slots,
+                    max_running_requests=max_running_requests,
+                    skip_topk_layers=skip_topk_layers,
+                )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
 
-            if current_platform.is_out_of_tree() or current_platform.is_tpu():
+            if uses_platform_pools:
                 TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
             elif _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -4496,6 +4518,27 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id)
+
+    # Split sparse-MLA pool buffers, by global layer id.
+    def get_nope_cache(self, layer_id: int):
+        return self.full_kv_pool.get_nope_cache(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_rope_cache(self, layer_id: int):
+        return self.full_kv_pool.get_rope_cache(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_index_key_cache(self, layer_id: int):
+        return self.full_kv_pool.get_index_key_cache(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_kpool_raw_cache(self, layer_id: int):
+        return self.full_kv_pool.get_kpool_raw_cache(
+            self._transfer_full_attention_id(layer_id)
+        )
 
     def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.full_kv_pool.get_dequant_workspace()

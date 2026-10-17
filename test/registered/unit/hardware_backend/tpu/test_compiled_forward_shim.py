@@ -776,6 +776,69 @@ class TestCompiledForwardShim(CustomTestCase):
         shim("ids", "pos", fb, "extra1", kw="extra2")
         compiled.assert_called_once_with("ids", "pos", fb, "extra1", kw="extra2")
 
+    def test_non_spec_sampling_keeps_physical_outputs_and_metadata(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            Qwen3VLDecoderTpuCompilePolicy,
+        )
+
+        # A full decoder returns logits; Qwen-VL returns hidden states to an
+        # outer logits processor. Neither may unpad the forward metadata.
+        for hidden_boundary in (False, True):
+            with self.subTest(hidden_boundary=hidden_boundary):
+                tensor = torch.arange(80).reshape(8, 10).float()
+                padded = (
+                    tensor
+                    if hidden_boundary
+                    else LogitsProcessorOutput(next_token_logits=tensor)
+                )
+                policy_cls = (
+                    Qwen3VLDecoderTpuCompilePolicy
+                    if hidden_boundary
+                    else DecoderTpuCompilePolicy
+                )
+                policy = policy_cls()
+                policy.keep_outputs_padded = MagicMock(return_value=True)
+                shim = CompiledForwardShim(lambda *args: padded, policy=policy)
+                fb = self._forward_batch(
+                    _tpu_real_q=3,
+                    _tpu_real_b=3,
+                    batch_size=8,
+                    input_ids=torch.arange(8),
+                    positions=torch.arange(8),
+                    out_cache_loc=torch.arange(8),
+                    seq_lens=torch.ones(8),
+                    orig_seq_lens=torch.ones(8),
+                    mm_input_embeds=torch.ones(8, 4),
+                )
+                original = {
+                    name: getattr(fb, name)
+                    for name in (
+                        "input_ids",
+                        "positions",
+                        "out_cache_loc",
+                        "seq_lens",
+                        "orig_seq_lens",
+                        "mm_input_embeds",
+                    )
+                }
+                slices = []
+
+                class ObserveSlices(TorchDispatchMode):
+                    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                        if func == torch.ops.aten.slice.Tensor:
+                            slices.append(func)
+                        return func(*args, **(kwargs or {}))
+
+                with ObserveSlices():
+                    out = shim(None, None, fb)
+                self.assertIs(out, padded)
+                self.assertEqual(fb.batch_size, 8)
+                for name, value in original.items():
+                    self.assertIs(getattr(fb, name), value)
+                self.assertEqual(slices, [])
+
     def test_preserves_compiled_signature_for_later_inspection(self):
         def forward(input_ids, positions, forward_batch, pp_proxy_tensors=None):
             pass
@@ -1335,6 +1398,7 @@ class TestHiCacheReloadGate(CustomTestCase):
                 token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
             ),
             finalize_forward_batch=lambda out, fb: out,
+            keep_outputs_padded=lambda fb: False,
         )
         return CompiledForwardShim(lambda *a, **k: "out", policy=policy)
 
