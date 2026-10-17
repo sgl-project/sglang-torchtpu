@@ -48,6 +48,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, process_model_config
 from sglang.srt.utils import add_prefix
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
@@ -649,6 +650,20 @@ class MuseSparkForConditionalGeneration(nn.Module):
         # The checkpoint's output GEMM accumulates in fp32.
         self.logits_processor.use_fp32_lm_head = True
         self.capture_aux_hidden_states = False
+        self._megakernel_enabled = tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.get()
+        self._megakernel = None
+
+    def precompile_kernels_after_loading(self) -> None:
+        """Build the megakernel's weights once quant post-processing has laid out the
+        experts it reads, and before the KV pool is sized, so the budget counts them."""
+        if not self._megakernel_enabled:
+            return
+        from sglang_tpu.fp8_lm_head import TpuFp8LmHeadMethod
+        from sglang_tpu.muse_megakernel.ops import MuseMegakernel
+
+        self._megakernel = MuseMegakernel.from_model(self)
+        # The megakernel path also takes the fp8 weight-only LM head.
+        self.lm_head.quant_method = TpuFp8LmHeadMethod(self.lm_head)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
@@ -665,6 +680,25 @@ class MuseSparkForConditionalGeneration(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        megakernel = self._megakernel
+        if (
+            megakernel is not None
+            and input_embeds is None
+            and megakernel.handles(forward_batch, input_ids.shape[0])
+        ):
+            hidden_states, aux_hidden_states = megakernel.forward(
+                embeds=self.model.embed_tokens(input_ids),
+                positions=positions,
+                forward_batch=forward_batch,
+                capture=(
+                    tuple(sorted(self.model.layers_to_capture))
+                    if self.capture_aux_hidden_states
+                    else ()
+                ),
+            )
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds=input_embeds
         )
