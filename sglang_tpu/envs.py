@@ -53,6 +53,13 @@ class TpuEnvs:
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
 
+    # PD disaggregation (raiden)
+    # TCP connections per rank pair for raiden KV reads and resharding pushes,
+    # not the pipeline path. Set the same value on prefill and decode. More can
+    # raise throughput but opens more connections, and above 4 is unlikely to
+    # help much. Benchmark first; in a large prefill-decode mesh, consider 1 or 2.
+    SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM = EnvInt(4)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

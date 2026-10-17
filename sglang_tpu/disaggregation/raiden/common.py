@@ -27,11 +27,6 @@ logger = logging.getLogger("sglang_tpu.disaggregation.raiden.conn")
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
 
-# Parallelism of a resharding push: the blocks of one push are spread over this
-# many TCP connections, the count raiden's same-layout reads use per rank. On a
-# single connection a push fills only a fraction of the prefill rank's NIC.
-RESHARD_PUSH_PARALLELISM = 4
-
 # Base of the per-rank control ports (`base + 4*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
 # uvicorn then dies with EADDRINUSE and takes the server down before any

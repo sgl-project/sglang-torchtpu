@@ -1966,6 +1966,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.attn_tp_size = 8
         mgr._local_rank = 1
         mgr._timeout_s = 5
+        mgr._transfer_parallelism = 4
         mgr._push_executor = _InlineExecutor()
         mgr._make_geometry = self._geometry
         mgr._read_leases = {}

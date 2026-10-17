@@ -67,6 +67,7 @@ def _bare_manager(mode):
     mgr._swa_engine = None
     mgr._send_reads = {}
     mgr.chunked_transfer = False
+    mgr._transfer_parallelism = 4
     return mgr
 
 
