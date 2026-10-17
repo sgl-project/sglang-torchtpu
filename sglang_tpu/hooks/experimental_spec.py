@@ -76,7 +76,7 @@ def merge_model_inputs(original, batch, other):
 def filter_spec_input(original, batch, keep_indices, keep_indices_device):
     if not uses_host_batch(batch):
         return original(batch, keep_indices, keep_indices_device)
-    from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
+    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.filter_batch(
@@ -89,19 +89,19 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
 def merge_spec_input(original, batch, other):
     if not uses_host_batch(batch):
         return original(batch, other)
-    from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
+    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.merge_batch(other.spec_info, future_indices=batch.req_pool_indices)
 
 
 def prepare_spec_decode(original, batch):
-    # Core routes only DFlash-family decode prep to the stateful draft input.
-    # Host-padded EAGLE3 carries the same HostPaddedDraftInput, which reserves
-    # KV and plans the bucketed verify window; mamba targets are rejected.
+    # Core routes only DFlash-family decode prep to the stateful draft input;
+    # every TpuSpecWorker input is a HostPaddedDraftInput, which reserves KV and
+    # plans the bucketed verify window.
     if not uses_host_batch(batch) or batch.spec_algorithm.is_dflash_family():
         return original(batch)
-    from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
+    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.prepare_for_decode(batch)

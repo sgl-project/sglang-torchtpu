@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from dataclasses import fields
 from typing import NamedTuple
 
 import torch
@@ -52,8 +51,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_spec, process_model_config
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput, EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.eagle_worker_common import prepare_for_draft
@@ -397,21 +394,13 @@ class TpuEagle3Worker(TpuSpecWorker):
         )
 
     def state_to_spec_info(self, state: SpecState) -> HostPaddedEagleDraftInput:
-        draft_input = make_draft_input_v2(
-            bonus_tokens=state.bonus_tokens, new_seq_lens=state.seq_lens
-        )
         seed = state.draft_carry
         return HostPaddedEagleDraftInput(
-            **{
-                field.name: getattr(draft_input, field.name)
-                for field in fields(DFlashDraftInputV2)
-                if field.init
-            }
-            | {
-                "topk_p": seed.topk_p,
-                "topk_index": seed.topk_index,
-                "hidden_states": seed.hidden_states,
-            }
+            bonus_tokens=state.bonus_tokens.to(torch.int64),
+            new_seq_lens=state.seq_lens.to(torch.int64),
+            topk_p=seed.topk_p,
+            topk_index=seed.topk_index,
+            hidden_states=seed.hidden_states,
         )
 
     def make_dummy_carry(self, rows: int) -> EagleSeed:

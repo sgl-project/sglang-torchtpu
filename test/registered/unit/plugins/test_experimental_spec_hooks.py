@@ -21,7 +21,9 @@ from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental import register_host_batch_padder
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
+from sglang_tpu.experimental.speculative.block_info import (
+    HostPaddedBlockDraftInput,
+)
 from sglang_tpu.hooks.experimental_spec import alloc_extend, hook_specs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -48,12 +50,9 @@ def _req(temperature=0.5):
 
 def _state(rows):
     bs = len(rows)
-    return HostPaddedDraftInput(
-        topk_p=torch.empty(bs, 0),
-        topk_index=torch.empty(bs, 0, dtype=torch.int64),
+    return HostPaddedBlockDraftInput(
         bonus_tokens=torch.ones(bs, dtype=torch.int64),
         new_seq_lens=torch.arange(bs),
-        hidden_states=torch.empty(bs, 0),
         future_indices=torch.tensor(rows),
         nxt_kv_lens_cpu=torch.arange(bs) + 10,
         tpu_host_seq_lens_is_committed=True,
@@ -221,7 +220,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             torch.tensor([4, 5]), torch.tensor([10, 20]), torch.tensor([1, 2])
         )
         draft = TpuBlockSpecWorker.state_to_spec_info(None, state)
-        self.assertIsInstance(draft, HostPaddedDraftInput)
+        self.assertIsInstance(draft, HostPaddedBlockDraftInput)
         torch.testing.assert_close(draft.bonus_tokens, state.bonus_tokens)
         torch.testing.assert_close(draft.new_seq_lens, state.seq_lens)
 
@@ -289,6 +288,72 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(left.nxt_kv_lens_sum, right.nxt_kv_lens_sum)
         self.assertTrue(left.tpu_host_seq_lens_is_committed)
         self.assertIs(left.future_indices, merged_rows)
+
+    def test_decode_prep_reserves_two_windows_and_keeps_committed_host_lengths(self):
+        """prepare_for_decode reserves 2 * N tokens past the committed length,
+        seeds the committed host lengths the window is planned from, and refuses
+        a device-resident pool."""
+        from sglang_tpu.experimental.speculative import draft_info
+
+        page_size, num_draft_tokens = 4, 3
+        reqs = [
+            SimpleNamespace(
+                kv=SimpleNamespace(kv_committed_len=c, kv_allocated_len=a),
+                decode_batch_idx=0,
+            )
+            for c, a in ((5, 8), (10, 20))
+        ]
+        batch = SimpleNamespace(
+            reqs=reqs,
+            batch_size=lambda: len(reqs),
+            maybe_evict_swa=lambda: None,
+            req_to_token_pool=SimpleNamespace(host_resident=True),
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=page_size),
+            tree_cache=None,
+            req_pool_indices=torch.tensor([1, 2]),
+            req_pool_indices_cpu=torch.tensor([1, 2]),
+            device="cpu",
+        )
+        allocations = []
+        plan = SimpleNamespace(
+            verify_cache_candidates=torch.zeros(2, 8),
+            committed_lens=torch.tensor([5, 10]),
+            req_pool_indices=torch.tensor([1, 2]),
+        )
+        spec = SimpleNamespace(
+            speculative_num_draft_tokens=num_draft_tokens,
+            speculative_draft_window_size=None,
+        )
+        draft = HostPaddedBlockDraftInput(
+            bonus_tokens=torch.zeros(2, dtype=torch.int64),
+            new_seq_lens=torch.zeros(2, dtype=torch.int64),
+        )
+        with (
+            patch.object(draft_info, "get_spec", return_value=spec),
+            patch.object(
+                draft_info,
+                "allocate_and_assign_decode_cache",
+                lambda **kwargs: allocations.append(kwargs),
+            ),
+            patch(
+                "sglang_tpu.dflash_utils_tpu.plan_dflash_device_accept",
+                return_value=plan,
+            ),
+        ):
+            draft.prepare_for_decode(batch)
+            # Committed 5 + 6 rounds up to 12; 20 already covers 10 + 6.
+            self.assertEqual(allocations[0]["nxt_kv_lens_cpu"].tolist(), [12, 20])
+            self.assertEqual(allocations[0]["num_needed_tokens"], 4)
+            self.assertEqual([r.kv.kv_allocated_len for r in reqs], [12, 20])
+            self.assertEqual([r.decode_batch_idx for r in reqs], [1, 1])
+            self.assertEqual(batch.seq_lens_cpu.tolist(), [5, 10])
+            self.assertEqual(batch.seq_lens_sum, 15)
+            self.assertTrue(draft.tpu_host_seq_lens_is_committed)
+            self.assertIs(draft.tpu_committed_lens, plan.committed_lens)
+
+            batch.req_to_token_pool.host_resident = False
+            with self.assertRaisesRegex(RuntimeError, "host-resident"):
+                draft.prepare_for_decode(batch)
 
 
 if __name__ == "__main__":

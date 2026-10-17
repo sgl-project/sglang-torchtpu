@@ -442,6 +442,11 @@ class SpecInput(ABC):
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: torch.Tensor | None = None
 
+    # TPU: this draft input planned its verify window on host from the committed
+    # lengths, so FutureMap must keep that host mirror instead of reading the
+    # published lengths back. Class-level default, as above.
+    tpu_host_seq_lens_is_committed: bool = False
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
         self.padding_state: SpecPaddingState | None = None

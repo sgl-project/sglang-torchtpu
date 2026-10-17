@@ -14,8 +14,6 @@ Not ported yet: hybrid (mamba) targets.
 
 from __future__ import annotations
 
-from dataclasses import fields
-
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
@@ -34,11 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.draft_worker_common import (
-    make_draft_block_spec_info,
-    make_draft_input_v2,
-)
+from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -53,10 +47,10 @@ from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
 )
 from sglang_tpu.experimental.speculative.block_draft_worker import TpuBlockDraftWorker
+from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
 from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
     TpuDflashDraftWorker,
 )
-from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
@@ -256,22 +250,18 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         result.next_draft_input = self.state_to_spec_info(next_state)
         return result
 
-    def state_to_spec_info(self, state: SpecState) -> DFlashDraftInputV2:
-        draft_input = make_draft_input_v2(
-            bonus_tokens=state.bonus_tokens, new_seq_lens=state.seq_lens
-        )
-        return HostPaddedDraftInput(
-            **{
-                field.name: getattr(draft_input, field.name)
-                for field in fields(draft_input)
-                if field.init
-            }
+    def state_to_spec_info(self, state: SpecState) -> HostPaddedBlockDraftInput:
+        return HostPaddedBlockDraftInput(
+            bonus_tokens=state.bonus_tokens.to(torch.int64),
+            new_seq_lens=state.seq_lens.to(torch.int64),
         )
 
     def get_spec_state(self, batch: ScheduleBatch) -> SpecState:
         draft_input = batch.spec_info
-        if not isinstance(draft_input, DFlashDraftInputV2):
-            raise TypeError(f"Expected DFlashDraftInputV2, got {type(draft_input)}.")
+        if not isinstance(draft_input, HostPaddedBlockDraftInput):
+            raise TypeError(
+                f"Expected HostPaddedBlockDraftInput, got {type(draft_input)}."
+            )
         return SpecState(
             bonus_tokens=draft_input.bonus_tokens,
             seq_lens=batch.seq_lens,
