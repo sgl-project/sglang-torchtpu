@@ -16,7 +16,6 @@ from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
 
 logger = logging.getLogger(__name__)
 
-_SMALL_M_ENABLED = tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get()
 _SMALL_M_OP: Callable | None = None
 
 
@@ -258,7 +257,7 @@ def apply_tpu_fp8_linear(
     x_2d = x.reshape(-1, x.shape[-1])
     num_tokens = x_2d.shape[0]
     if (
-        _SMALL_M_ENABLED
+        tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get()
         and bias is None
         and _small_m_supports(num_tokens, weight.shape[0], weight.shape[1])
     ):
