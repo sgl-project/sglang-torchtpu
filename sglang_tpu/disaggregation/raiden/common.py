@@ -8,6 +8,7 @@ that turns a device pool into the per-namespace tensor lists raiden registers.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -38,6 +39,10 @@ RESHARD_PUSH_PARALLELISM = 4
 # transfer is attempted.
 DEFAULT_KV_PORT = 31000
 
+# A handshake step slower than this logs at INFO, faster ones at DEBUG: normal
+# traffic stays quiet, and a pair that is slow to hand a room over shows up.
+SLOW_HANDSHAKE_S = 30.0
+
 
 def _tcp_endpoint(ip: str, port: int) -> str:
     """``tcp://`` endpoint of a peer rank's rendezvous socket.
@@ -49,6 +54,20 @@ def _tcp_endpoint(ip: str, port: int) -> str:
     option on.
     """
     return NetworkAddress(host=ip, port=int(port)).to_tcp()
+
+
+def log_handshake_step(
+    room: int, step: str, since: Optional[float], since_what: str
+) -> None:
+    """Log one handshake step of ``room`` with the time since the previous one."""
+    if since is None:
+        logger.debug("Raiden room %s: %s", room, step)
+        return
+    elapsed = time.time() - since
+    level = logging.INFO if elapsed >= SLOW_HANDSHAKE_S else logging.DEBUG
+    logger.log(
+        level, "Raiden room %s: %s, %.1fs after %s", room, step, elapsed, since_what
+    )
 
 
 @dataclass(frozen=True)

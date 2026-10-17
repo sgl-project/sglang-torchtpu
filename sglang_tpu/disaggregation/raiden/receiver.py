@@ -21,7 +21,11 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
-from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.common import (
+    _tcp_endpoint,
+    log_handshake_step,
+    logger,
+)
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -110,6 +114,7 @@ class RaidenReceiverMixin:
         with self._state_lock:
             if room in self._aborted or room in self._decode.final_seen:
                 return
+            since = self._decode.handshake_at.pop(room, None)
             self._decode.remote_blocks[room] = remote_blocks
             self._decode.remote_endpoint[room] = endpoint
             self._decode.remote_swa_blocks[room] = remote_swa_blocks
@@ -159,6 +164,7 @@ class RaidenReceiverMixin:
                         )
                     )
                 self._decode.final_seen.add(room)
+        log_handshake_step(room, "received BLOCKS from the prefill", since, "its ask")
         if self._listener_start_read and self.chunked_transfer:
             self._start_chunked_pull(room)
 
@@ -230,6 +236,8 @@ class RaidenReceiverMixin:
             self._decode.local_swa_blocks[room] = local_swa_blocks
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
+            self._decode.handshake_at[room] = time.time()
+        log_handshake_step(room, "decode asking the prefill for its KV", None, "")
         payload = PullReq(
             room=room,
             decode_ip=self.local_ip,

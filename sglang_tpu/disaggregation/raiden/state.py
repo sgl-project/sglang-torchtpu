@@ -15,6 +15,9 @@ class PrefillState:
 
     announce_pages: int
 
+    # Time of the room's last handshake step, for log_handshake_step.
+    handshake_at: Dict[int, float] = field(default_factory=dict)
+
     # Accumulated page ids and aux data, keyed by room.
     send_blocks: Dict[int, List[int]] = field(default_factory=dict)
     # The pages of send_blocks, for the repeated-page check.
@@ -70,6 +73,9 @@ class PrefillState:
 @dataclass
 class DecodeState:
     """Decode protocol bookkeeping for one manager."""
+
+    # Time the room's PULL_REQ was sent, for log_handshake_step.
+    handshake_at: Dict[int, float] = field(default_factory=dict)
 
     # Local and remote page ids, endpoints, and aux slots, keyed by room.
     local_blocks: Dict[int, List[int]] = field(default_factory=dict)

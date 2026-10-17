@@ -29,6 +29,7 @@ from sglang_tpu.disaggregation.raiden.chunk_plan import (
 from sglang_tpu.disaggregation.raiden.common import (
     RESHARD_PUSH_PARALLELISM,
     _tcp_endpoint,
+    log_handshake_step,
     logger,
 )
 from sglang_tpu.disaggregation.raiden.serde import (
@@ -90,6 +91,8 @@ class RaidenSenderMixin:
         with self._state_lock:
             failed_reason = self._tombstone_reason_locked(room)
             if failed_reason is None:
+                since = self._prefill.handshake_at.get(room)
+                self._prefill.handshake_at[room] = time.time()
                 self._prefill.decode_addr[room] = (decode_ip, decode_port)
                 self._prefill.decode_pages[room] = decode_pages
                 self._prefill.decode_swa_pages[room] = decode_swa_pages
@@ -102,6 +105,7 @@ class RaidenSenderMixin:
                 reason=failed_reason,
             )
             return
+        log_handshake_step(room, "decode asked for its KV", since, "registration")
         for start, block_ids in held:
             self._announce_chunk(room, start, block_ids, total_pages)
         self._maybe_reply(room)
@@ -677,12 +681,14 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted:
                 return
+            since = self._prefill.handshake_at.pop(room, None)
             if not read_blocks:
                 # Full prefix hit: no read follows, so BLOCKS on the wire
                 # completes the send.
                 self._completed_send.add(str(room))
             if self._swa_engine is not None and not swa_read_blocks:
                 self._completed_send.add(self._swa_req_id(room))
+        log_handshake_step(room, "sent BLOCKS to the decode", since, "its ask")
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
         req = ReshardReq.from_frames(msg)
@@ -1217,6 +1223,9 @@ class RaidenKVSender(CommonKVSender):
         # It is sent only after the decode reserved the request's KV pages, so
         # the prefill never computes KV that no decode can take yet.
         self.init_time = time.time()
+        with mgr._state_lock:
+            mgr._prefill.handshake_at[bootstrap_room] = self.init_time
+        log_handshake_step(bootstrap_room, "registered on the prefill", None, "")
         # An ABORT that outran this sender only tombstoned the room (_on_abort
         # saw no status). The status now exists, so _on_abort and this check
         # are ordered by _state_lock: one of them fails the room.
