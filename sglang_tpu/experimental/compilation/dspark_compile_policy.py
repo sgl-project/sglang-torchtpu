@@ -1,0 +1,138 @@
+"""TPU compile policy for TpuDsparkWorker's target and draft runners."""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.models.dspark import DSparkDraftModel
+from sglang.srt.runtime_context import get_disagg
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
+from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.recompilation_checker import (
+    install_recompilation_checker,
+)
+from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecodeCompilePolicyMixin,
+)
+
+logger = get_logger(__name__)
+
+
+class TpuDsparkSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
+    """Target warms TARGET_VERIFY and EXTEND(FULL); the draft warms its block forward and KV writer.
+
+    DSpark's dense draft shares DFlash's spec inputs and K/V layout, so the target
+    verify grid and the draft KV writer carry over. The target scores
+    [r, d_1..d_gamma] (draft_token_num = gamma + 1 rows); the draft forwards
+    [r, m, ..., m] (draft_block_width rows) and never runs EXTEND.
+    """
+
+    algo_label = "DSPARK"
+
+    # TpuSpecWorker never sends the target DECODE (decode is TARGET_VERIFY) or a
+    # capture-NULL EXTEND (extend always captures hidden for the draft KV).
+    def _precompile_decode(self) -> list[PendingCall]:
+        return []
+
+    def _precompile_extend(self) -> list[PendingCall]:
+        return []
+
+    @property
+    def draft_block_width(self) -> int:
+        """Rows per request in the draft block forward; must match TpuDsparkWorker."""
+        model = self.model_runner.model
+        if not isinstance(model, DSparkDraftModel):
+            raise TypeError(f"Expected a DSparkDraftModel draft, got {type(model)}.")
+        gamma = self.draft_token_num - 1
+        return gamma if model.sample_from_anchor else gamma + 1
+
+    def make_null_spec_info(self) -> DFlashVerifyInput:
+        # Same structure as TpuDsparkWorker's draft block input, so the draft trace matches.
+        width = self.draft_block_width if self.is_draft_worker else self.draft_token_num
+        return make_draft_block_spec_info(
+            draft_token_num=width, device=self.model_runner.device
+        )
+
+    def _make_dummy_forward_batch(
+        self,
+        num_tokens: int,
+        bs: int,
+        mode: ForwardMode,
+        *,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: DFlashVerifyInput | None = None,
+    ) -> ForwardBatch:
+        batch = super()._make_dummy_forward_batch(
+            num_tokens=num_tokens,
+            bs=bs,
+            mode=mode,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
+        )
+        # DFlash feeds the draft input_embeds; DSpark embeds input_ids in-graph.
+        if self.is_draft_worker:
+            batch.input_embeds = None
+        return batch
+
+    def precompile_draft(
+        self,
+        draft_attn_backend: AttentionBackend,
+        *,
+        kv_writer: Callable[..., None],
+    ) -> None:
+        """Compile the draft block forward and the draft KV writer."""
+        if not self.is_draft_worker:
+            raise ValueError("precompile_draft runs on the DSpark draft runner only.")
+        if self.b_bucketer is None:
+            raise ValueError("b_bucketer must be initialized before precompile_draft.")
+        start = time.perf_counter()
+        if self._compiled_kv_appender is None:
+            self._compiled_kv_appender = self._compile_kv_appender(kv_writer)
+        disagg_mode = get_disagg().disaggregation_mode
+        if disagg_mode != "prefill":
+            self._precompile_draft_block(draft_attn_backend)
+            self._precompile_draft_append_kv_verify()
+        if disagg_mode != "decode":
+            self._precompile_draft_append_kv_extend()
+        logger.info(
+            "[spec compile policy] DSPARK DRAFT precompile done in %.1fs.",
+            time.perf_counter() - start,
+        )
+        install_recompilation_checker(
+            policies=(self,),
+            model_label=f"draft {type(self.model_runner.model).__name__}",
+        )
+
+    def _precompile_draft_block(self, draft_attn_backend: AttentionBackend) -> None:
+        assert self.b_bucketer is not None
+        width = self.draft_block_width
+        shapes = [(bs, bs * width) for bs in self.b_bucketer.buckets]
+        logger.info(
+            "[spec compile policy] DSPARK DRAFT BLOCK: %d shapes (bs=%s, width=%d)",
+            len(shapes),
+            list(self.b_bucketer.buckets),
+            width,
+        )
+
+        def run(shape: tuple[int, int]) -> str:
+            bs, num_tokens = shape
+            self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=ForwardMode.TARGET_VERIFY,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                spec_info=self.make_null_spec_info(),
+                attn_backend=draft_attn_backend,
+            )
+            return f"bs={bs}, tokens={num_tokens}"
+
+        self._precompile_shapes("DSPARK DRAFT BLOCK", shapes, run)

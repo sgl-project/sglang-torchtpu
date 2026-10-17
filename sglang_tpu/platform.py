@@ -86,7 +86,13 @@ class TpuOOTPlatform(TpuSRTPlatform):
         return None
 
     def supports_speculative_algorithm(self, algorithm: str) -> bool:
-        return str(algorithm).upper() in _SUPPORTED_SPEC_ALGORITHMS
+        name = str(algorithm).upper()
+        if name == "DSPARK":
+            # Served by sglang_tpu.experimental.TpuDsparkWorker.
+            from sglang_tpu.experimental import experimental_spec_enabled
+
+            return experimental_spec_enabled()
+        return name in _SUPPORTED_SPEC_ALGORITHMS
 
     def supports_speculative_draft_attention_backend(
         self, algorithm: str, backend: str

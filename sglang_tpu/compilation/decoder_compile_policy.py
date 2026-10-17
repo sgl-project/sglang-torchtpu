@@ -51,9 +51,11 @@ from sglang_tpu.compilation.attention_rank_inputs import (
 )
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
+    _BS_FIELDS,
     _MAMBA_TRACK_FIELDS,
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    _TOKEN_FIELDS,
     CompiledForwardShim,
     _extend_batch_cap,
     _pad_forward_batch_inputs,
@@ -70,6 +72,7 @@ from sglang_tpu.cp_forward import (
     wrap_cp_embedding_forward,
 )
 from sglang_tpu.cp_layout import warmup_request_lengths
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
@@ -958,6 +961,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.b_bucketer,
                 extend_bs=self.extend_bs,
             )
+            self._upload_host_padded_inputs(forward_batch)
         self._upload_host_inputs(forward_batch)
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
@@ -1041,6 +1045,22 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             "extend_prefix_lens",
             "extend_start_loc",
         ):
+            value = getattr(forward_batch, name, None)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                setattr(
+                    forward_batch,
+                    name,
+                    value.to(self.model_runner.device, non_blocking=True),
+                )
+
+    def _upload_host_padded_inputs(self, forward_batch: ForwardBatch) -> None:
+        """HOST_PADDED inputs were padded on host above; upload them at the bucket shape."""
+        sampling_info = forward_batch.sampling_info
+        if sampling_info is None or not is_host_padded(sampling_info):
+            return
+        for name in (*_TOKEN_FIELDS, *_BS_FIELDS):
+            if name == "req_pool_indices_cpu":
+                continue
             value = getattr(forward_batch, name, None)
             if isinstance(value, torch.Tensor) and value.device.type == "cpu":
                 setattr(

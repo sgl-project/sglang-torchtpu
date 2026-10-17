@@ -190,6 +190,7 @@ class TestHostPadFieldSelection(CustomTestCase):
             extend_prefix_lens_cpu=[11, 50],
             extend_logprob_start_lens_cpu=[0, 0],
             spec_info=None,
+            sampling_info=None,
             mm_inputs=None,
         )
 
@@ -201,6 +202,7 @@ class TestHostPadFieldSelection(CustomTestCase):
             out_cache_loc=torch.arange(3, dtype=torch.int32),
             seq_lens=torch.tensor([14, 52, 8], dtype=torch.int32),
             spec_info=None,
+            sampling_info=None,
             mm_inputs=None,
         )
 
@@ -294,6 +296,7 @@ class TestHostPadFieldSelection(CustomTestCase):
                 hidden_states=None,
                 record_padding=lambda **kwargs: None,
             ),
+            sampling_info=None,
             mm_inputs=None,
         )
 
@@ -436,6 +439,7 @@ class TestHostPadFieldSelection(CustomTestCase):
                     forward = SimpleNamespace(
                         forward_mode=ForwardMode.DECODE,
                         spec_info=None,
+                        sampling_info=None,
                         seq_lens_cpu=lengths,
                         seq_lens=lengths.to("meta"),
                         input_ids=torch.empty(size, dtype=torch.int64, device="meta"),

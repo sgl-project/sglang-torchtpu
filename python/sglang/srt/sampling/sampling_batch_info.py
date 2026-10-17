@@ -132,7 +132,7 @@ class SamplingBatchInfo:
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
-        param_device = "cpu" if sampling_params_on_cpu else device
+        param_device = "cpu" if sampling_params_on_cpu else cls.parameter_device(batch)
         # Match the [B, 1] device allocation produced by merging/filtering.
         # A device-side view of [B] gives TorchTPU a different compiled input.
         temperatures = (
@@ -355,6 +355,37 @@ class SamplingBatchInfo:
             return None
         return _rows_to_device_indices(indices, device)
 
+    @classmethod
+    def parameter_device(cls, batch):
+        """Device on which request sampling parameters are initially materialized."""
+        return batch.device
+
+    def _filter_params(self, keep_indices, keep_indices_device):
+        indices = keep_indices if self.sampling_params_on_cpu else keep_indices_device
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+            "sampling_seed",
+        ]:
+            value = getattr(self, item, None)
+            if value is not None:
+                setattr(self, item, value[indices])
+
+    def _merge_params(self, other):
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+            "sampling_seed",
+        ]:
+            self_val = getattr(self, item, None)
+            other_val = getattr(other, item, None)
+            if self_val is not None and other_val is not None:
+                setattr(self, item, torch.cat([self_val, other_val]))
+
     def __len__(self):
         return len(self.temperatures)
 
@@ -448,17 +479,7 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
-        indices = keep_indices if self.sampling_params_on_cpu else keep_indices_device
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            value = getattr(self, item, None)
-            if value is not None:
-                setattr(self, item, value[indices])
+        self._filter_params(keep_indices, keep_indices_device)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -583,17 +604,7 @@ class SamplingBatchInfo:
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            self_val = getattr(self, item, None)
-            other_val = getattr(other, item, None)
-            if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
+        self._merge_params(other)
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy

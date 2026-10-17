@@ -21,6 +21,7 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
 logger = logging.getLogger(__name__)
@@ -485,6 +486,8 @@ class TpuSampler(Sampler):
     ):
         """Sample from exact global TopK when full logits gathering was skipped.
         Full-logit outputs retain the base sampler's processing and return contract."""
+        if is_host_padded(sampling_info):
+            sampling_info = sampling_info.on_device()
 
         live_rows = None
         if sampling_info.sampling_params_on_cpu:
@@ -584,6 +587,8 @@ class TpuSampler(Sampler):
         if (
             top_k is not None
             and 1 < top_k <= MAX_DISTRIBUTED_TOP_K
+            # A Python k compiles per value; HOST_PADDED stays on the warmed tensor-k path.
+            and not is_host_padded(sampling_info)
             and sampling_info.sampling_seed is None
             and sampling_info.need_top_k_sampling
             and (not needs_top_p_or_min_p or _use_bsearch_filtering(probs))

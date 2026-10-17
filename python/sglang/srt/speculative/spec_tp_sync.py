@@ -37,6 +37,10 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_ACCEPT_GREEDY = 15
     DFLASH_TARGET = 16
 
+    # -- TpuSpecWorker: one accept shared by every algorithm --
+    SPEC_ACCEPT_GREEDY = 17
+    SPEC_ACCEPT_SAMPLE = 18
+
     @property
     def slug(self) -> str:
         return self.name.lower().replace("_", "-")
@@ -55,6 +59,7 @@ _RNG = frozenset(
         SpecTpSyncSite.DFLASH_SELECTOR,
         SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE,
         SpecTpSyncSite.DFLASH_TARGET,
+        SpecTpSyncSite.SPEC_ACCEPT_SAMPLE,
     }
 )
 

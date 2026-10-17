@@ -3798,26 +3798,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[
-            keep_indices
-            if self.req_pool_indices.device.type == "cpu"
-            else keep_indices_device
-        ]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
-        self.seq_lens = self.seq_lens[
-            keep_indices if self.seq_lens.device.type == "cpu" else keep_indices_device
-        ]
-        self.orig_seq_lens = self.orig_seq_lens[
-            keep_indices
-            if self.orig_seq_lens.device.type == "cpu"
-            else keep_indices_device
-        ]
+        self._filter_model_inputs(keep_indices, keep_indices_device)
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
-        if self.input_ids is not None:
-            self.input_ids = self.input_ids[keep_indices_device]
         # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
@@ -3849,10 +3835,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(
-                new_indices=keep_indices_device,
-                new_indices_cpu=keep_indices,
-            )
+            self._filter_spec_input(keep_indices, keep_indices_device)
 
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
@@ -3866,14 +3849,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
-        )
         self.req_pool_indices_cpu = torch.cat(
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
-        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self._merge_model_inputs(other)
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3922,7 +3901,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
-            self.spec_info.merge_batch(other.spec_info)
+            self._merge_spec_input(other)
+
+    def _filter_model_inputs(self, keep_indices, keep_indices_device):
+        """Filter model-facing rows after the host pool-index mirror is updated."""
+
+        def keep(t):
+            return t[keep_indices if t.device.type == "cpu" else keep_indices_device]
+
+        self.req_pool_indices = keep(self.req_pool_indices)
+        self.seq_lens = keep(self.seq_lens)
+        self.orig_seq_lens = keep(self.orig_seq_lens)
+        if self.input_ids is not None:
+            self.input_ids = self.input_ids[keep_indices_device]
+
+    def _merge_model_inputs(self, other):
+        """Merge model-facing rows after the host pool-index mirror is updated."""
+        self.req_pool_indices = torch.cat(
+            [self.req_pool_indices, other.req_pool_indices]
+        )
+        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+
+    def _filter_spec_input(self, keep_indices, keep_indices_device):
+        self.spec_info.filter_batch(
+            new_indices=keep_indices_device, new_indices_cpu=keep_indices
+        )
+
+    def _merge_spec_input(self, other):
+        self.spec_info.merge_batch(other.spec_info)
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.

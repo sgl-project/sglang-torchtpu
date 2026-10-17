@@ -604,9 +604,9 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
+    if not cfg.device.startswith(("cuda", "npu", "tpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA or NPU device."
+            "DSpark speculative decoding only supports CUDA, NPU, or TPU device."
         )
 
     if cfg.attn_dp_size > 1:
