@@ -35,6 +35,7 @@ def test_post_sync_startup_excludes_existing_pre_load_sync(
     )
     instance = scheduler.Scheduler.__new__(scheduler.Scheduler)
     instance.init_startup_timing_begin()
+    instance.distributed_init_time = 30
     now += 40
 
     target = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
@@ -69,6 +70,7 @@ def test_post_sync_startup_excludes_existing_pre_load_sync(
 
     assert memory_checks == [(device, False), (device, True)]
     assert instance.startup_time["scheduler_e2e"] == now
+    assert instance.startup_time["distributed_init"] == 30
     if device == "tpu":
         assert instance.startup_time["post_sync_startup"] == 20
     else:

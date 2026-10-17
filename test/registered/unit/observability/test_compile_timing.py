@@ -41,9 +41,11 @@ def test_compile_timing_is_added_to_scheduler_startup_time(post_sync_startup) ->
         target_compile_steps=target.snapshot(),
         draft_compile_steps=draft.snapshot(),
         post_sync_startup=post_sync_startup,
+        distributed_init=5.0,
     )
 
     assert startup_time["scheduler_e2e"] == 20.0
+    assert startup_time["distributed_init"] == 5.0
     if post_sync_startup is None:
         assert "post_sync_startup" not in startup_time
     else:
@@ -71,6 +73,7 @@ def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
         [
             {
                 "scheduler_e2e": 100.0,
+                "distributed_init": 70.0,
                 "post_sync_startup": 15.0,
                 "compile": {
                     "schema_version": 1,
@@ -79,6 +82,7 @@ def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
             },
             {
                 "scheduler_e2e": 50.0,
+                "distributed_init": 10.0,
                 "post_sync_startup": 20.0,
                 "compile": {
                     "schema_version": 1,
@@ -89,6 +93,7 @@ def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
     )
 
     assert result["scheduler_e2e"] == 100.0
+    assert result["distributed_init"] == 70.0
     assert result["post_sync_startup"] == 20.0
     assert "total_seconds" not in result["compile"]
     assert [step["duration_seconds"] for step in result["compile"]["steps"]] == [

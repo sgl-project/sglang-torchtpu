@@ -534,7 +534,7 @@ class Scheduler(
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
-        bootstrap.init_parallel_runtime(
+        self.distributed_init_time = bootstrap.init_parallel_runtime(
             server_args=server_args,
             device=get_device().device,
             dist_port=self.nccl_port,
@@ -736,6 +736,7 @@ class Scheduler(
             ),
             kv_cache_allocation=self.kv_cache_allocation_time,
             scheduler_e2e=startup_end - self.scheduler_startup_begin,
+            distributed_init=self.distributed_init_time,
             post_sync_startup=(
                 None
                 if post_sync_startup_begin is None

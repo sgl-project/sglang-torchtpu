@@ -37,6 +37,7 @@ from sglang.srt.arg_groups.overrides import (
     resolution_result,
     resolved_view,
 )
+from sglang.srt.distributed import bootstrap
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -2649,11 +2650,10 @@ class TestTheParallelPhase(CustomTestCase):
         tp_group.all_reduce.assert_not_called()
 
     def test_building_twice_is_refused(self):
-        from sglang.srt.distributed import bootstrap
-
         bootstrap.reset_parallel_initialised()
         self.addCleanup(bootstrap.reset_parallel_initialised)
         with (
+            patch.object(bootstrap.time, "perf_counter", side_effect=[3.0, 7.5]),
             patch.object(bootstrap, "_resolve_backend", return_value="gloo"),
             patch.object(bootstrap, "_resolve_dist_init_method", return_value="env://"),
             patch.object(bootstrap, "_set_all_reduce_flags"),
@@ -2675,7 +2675,7 @@ class TestTheParallelPhase(CustomTestCase):
                 device="cpu",
                 dist_port=12345,
             )
-            bootstrap.init_parallel_runtime(**kwargs)
+            self.assertEqual(bootstrap.init_parallel_runtime(**kwargs), 4.5)
             with self.assertRaises(RuntimeError) as caught:
                 bootstrap.init_parallel_runtime(**kwargs)
         self.assertIn("ran twice", str(caught.exception))
