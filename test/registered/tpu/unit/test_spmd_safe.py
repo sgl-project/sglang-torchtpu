@@ -47,7 +47,7 @@ class TestSPMDSafe(CustomTestCase):
                     def launch_recipe(recipe, directory):
                         command = (
                             "unset RANK LOCAL_RANK LOCAL_WORLD_SIZE WORLD_SIZE; "
-                            f"eval $({python} -m torch_tpu._internal.distributed.launchers.singlehost_wrapper); "
+                            f"eval $({python} -m torch.tpu.distributed); "
                             "export TORCH_TPU_TOPOLOGY TORCH_TPU_SLICEBUILDER_ADDRESSES WORLD_SIZE; "
                             f'{python} -m torch.distributed.run --standalone --nproc_per_node="$WORLD_SIZE" '
                             f"{worker} --spmd-safe-worker {shlex.quote(recipe)}"
