@@ -4484,7 +4484,10 @@ class TestDraftRankInputVocabBounds(CustomTestCase):
         from sglang.srt.layers import vocab_parallel_embedding
 
         # TPU backend initialization unwraps this dynamic CPU/CUDA compile wrapper.
-        self.enterContext(
+        # ExitStack rather than enterContext, which is 3.11+.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
             patch.object(
                 vocab_parallel_embedding,
                 "get_masked_input_and_mask",

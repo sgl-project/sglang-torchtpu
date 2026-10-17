@@ -817,7 +817,10 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         worker.speculative_num_steps = 3
         from sglang.srt.runtime_context import get_flags
 
-        self.enterContext(get_flags().capture.override(enable_torch_compile=True))
+        # ExitStack rather than enterContext, which is 3.11+.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(get_flags().capture.override(enable_torch_compile=True))
         worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
         worker.draft_tp_context = lambda _group, **_kwargs: contextlib.nullcontext()
         worker.draft_owns_attention = False
