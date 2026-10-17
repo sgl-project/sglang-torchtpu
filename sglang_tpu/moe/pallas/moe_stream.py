@@ -292,10 +292,6 @@ def maybe_moe_stream(
     enough for VMEM. Plain SiLU fuses the activation into gmm_v2 and keeps that
     path.
     """
-    from sglang_tpu.envs import envs as tpu_envs
-
-    if not tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get():
-        return None
     if not activation_name.startswith("silu_and_mul_clamp:"):
         return None
     clamp_limit = float(activation_name.split(":", 1)[1])

@@ -591,26 +591,29 @@ def _fused_moe_jax(
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
 
-    from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
+    from sglang_tpu.envs import envs as tpu_envs
 
-    # One kernel streaming the selected experts' weights; None outside its case.
-    out = maybe_moe_stream(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        activation_name=activation_name,
-        no_combine=no_combine,
-        use_group_offset=global_num_experts > num_experts,
-        w_quant_bits=w_quant_bits,
-    )
-    if out is not None:
-        return out
+    if tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get():
+        from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
+
+        # One kernel streaming the selected experts' weights; None outside its case.
+        out = maybe_moe_stream(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation_name=activation_name,
+            no_combine=no_combine,
+            use_group_offset=global_num_experts > num_experts,
+            w_quant_bits=w_quant_bits,
+        )
+        if out is not None:
+            return out
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
