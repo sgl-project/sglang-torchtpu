@@ -14,7 +14,7 @@ from typing import Callable, Optional
 import torch
 
 # Kernel limits: hc_mult = 4, d % 128 == 0 and d <= 4096, post_mult = 2.0, and
-# an unfolded bf16 hc_fn.
+# an unfolded hc_fn.
 _HC_MULT = 4
 _MAX_HIDDEN = 4096
 _LANES = 128

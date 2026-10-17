@@ -3,8 +3,8 @@
 torch path on CPU.
 
 The reference runs in fp32 on CPU: torch_tpu evaluates its fp32 projection at
-bf16 precision (gate errors ~3e-3), while the kernel's single bf16 pass is exact
-for an hc_fn that holds bf16 values, as the checkpoint's does.
+bf16 precision (gate errors ~3e-3), while the kernel's bf16 hi + lo split of
+hc_fn tracks the fp32 projection.
 """
 
 import unittest
@@ -83,7 +83,7 @@ class TestMhcKernel(unittest.TestCase):
 
     def test_pre_post_pre_post_match_torch_path(self):
         norm = dict(out_norm_weight=tpu(self.norm_weight), out_norm_eps=RMS_EPS)
-        # 200 tokens exercises the padded multi-block prefill path.
+        # 200 tokens exercises the multi-block prefill path with a partial block.
         for tokens in (1, 16, 200):
             with self.subTest(tokens=tokens):
                 res = torch.randn(tokens, HC * HIDDEN, generator=self.gen).bfloat16()
@@ -137,6 +137,24 @@ class TestMhcKernel(unittest.TestCase):
                     hc_mult=HC,
                 )
                 self.assertClose(last, ref_res, 4e-3)
+
+    def test_pre_tracks_an_fp32_hc_fn(self):
+        # Not bf16-representable: one bf16 pass would round the weight.
+        mix = (2 + HC) * HC
+        self.fn = torch.randn(mix, HC * HIDDEN, generator=self.gen) * 0.02
+        self.assertFalse(torch.equal(self.fn, self.fn.bfloat16().float()))
+        res = torch.randn(16, HC * HIDDEN, generator=self.gen).bfloat16()
+        _, ref_comb, ref_post, _ = hc_pre(res, *self.params(), **SITE)
+        _, comb, post, _ = kernel.hc_pre(
+            x=tpu(res),
+            **self.kernel_params(),
+            **KERNEL_SITE,
+            hc_norm_weight=None,
+            out_norm_weight=None,
+            out_norm_eps=None,
+        )
+        self.assertClose(post, ref_post, 1e-5)
+        self.assertClose(comb, ref_comb, 1e-5)
 
     def test_unsupported_sites_take_the_torch_path(self):
         res = tpu(torch.randn(4, HC * HIDDEN, generator=self.gen).bfloat16())

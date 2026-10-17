@@ -74,22 +74,20 @@ def _gates_and_collapse(
     )
     rms = jax.lax.rsqrt(sq / (hc * d) + rms_eps)
     dims = (((1,), (1,)), ((), ()))
-    # bf16 streams and weights: one bf16 pass with f32 accumulation is exact.
-    mixes = (
-        functools.reduce(
-            jnp.add,
-            [
-                jax.lax.dot_general(
-                    s.astype(jnp.bfloat16),
-                    fn_ref[:, i * d : (i + 1) * d],
-                    dims,
-                    preferred_element_type=jnp.float32,
-                )
-                for i, s in enumerate(streams)
-            ],
-        )
-        * rms
-    )
+
+    def project(s, w):
+        return jax.lax.dot_general(s, w, dims, preferred_element_type=jnp.float32)
+
+    # The streams are bf16-exact; the f32 weight is split into bf16 hi + lo, so
+    # two bf16 passes with f32 accumulation track the f32 projection.
+    terms = []
+    for i, s in enumerate(streams):
+        s = s.astype(jnp.bfloat16)
+        w = fn_ref[:, i * d : (i + 1) * d]
+        hi = w.astype(jnp.bfloat16)
+        lo = (w - hi.astype(jnp.float32)).astype(jnp.bfloat16)
+        terms += [project(s, hi), project(s, lo)]
+    mixes = functools.reduce(jnp.add, terms) * rms
     vec = vec_ref[...]
     base = vec[:, :mix]
     s0, s1, s2 = (
@@ -205,15 +203,9 @@ def mhc_site(
     tokens, width = res.shape
     d = width // hc
     mix = (2 + hc) * hc
+    # A partial last block is safe: every reduction is within a token, and
+    # Pallas drops the out-of-bounds rows' writes.
     bt = tokens if tokens <= _MAX_BLOCK_TOKENS else _MAX_BLOCK_TOKENS
-    padded = pl.cdiv(tokens, bt) * bt
-
-    def pad(a):
-        return (
-            a
-            if a is None or padded == tokens
-            else jnp.pad(a, ((0, padded - tokens), (0, 0)))
-        )
 
     def rows_spec(cols):
         return pl.BlockSpec((bt, cols), lambda t: (t, 0))
@@ -223,28 +215,23 @@ def mhc_site(
 
     operands, in_specs, out_shape, out_specs = [], [], [], []
     if has_post:
-        operands += [
-            pad(x),
-            pad(res),
-            pad(post.astype(jnp.float32)),
-            pad(comb.astype(jnp.float32)),
-        ]
+        operands += [x, res, post.astype(jnp.float32), comb.astype(jnp.float32)]
         in_specs += [rows_spec(d), rows_spec(width), rows_spec(hc), rows_spec(hc * hc)]
-        out_shape.append(jax.ShapeDtypeStruct((padded, width), res.dtype))
+        out_shape.append(jax.ShapeDtypeStruct((tokens, width), res.dtype))
         out_specs.append(rows_spec(width))
     else:
-        operands.append(pad(res))
+        operands.append(res)
         in_specs.append(rows_spec(width))
     if has_pre:
-        operands += [fn.astype(jnp.bfloat16), vec]
+        operands += [fn.astype(jnp.float32), vec]
         in_specs += [full_spec((mix, width)), full_spec((1, VEC_WIDTH))]
         if norm_weight is not None:
             operands.append(norm_weight.astype(jnp.float32).reshape(1, d))
             in_specs.append(full_spec((1, d)))
         out_shape += [
-            jax.ShapeDtypeStruct((padded, d), res.dtype),
-            jax.ShapeDtypeStruct((padded, hc), jnp.float32),
-            jax.ShapeDtypeStruct((padded, hc * hc), jnp.float32),
+            jax.ShapeDtypeStruct((tokens, d), res.dtype),
+            jax.ShapeDtypeStruct((tokens, hc), jnp.float32),
+            jax.ShapeDtypeStruct((tokens, hc * hc), jnp.float32),
         ]
         out_specs += [rows_spec(d), rows_spec(hc), rows_spec(hc * hc)]
 
@@ -264,11 +251,11 @@ def mhc_site(
             hc_eps=hc_eps,
             norm_eps=norm_eps,
         ),
-        grid=(padded // bt,),
+        grid=(pl.cdiv(tokens, bt),),
         in_specs=in_specs,
         out_specs=out_specs,
         out_shape=out_shape,
         compiler_params=pltpu.CompilerParams(**params),
         name=f"mhc_{'post' if has_post else ''}{'pre' if has_pre else ''}",
     )(*operands)
-    return tuple(o[:tokens] for o in outs)
+    return tuple(outs)
