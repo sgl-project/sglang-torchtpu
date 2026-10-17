@@ -28,6 +28,6 @@ def experimental_spec_enabled() -> bool:
     )
 
 
-def is_experimental_dspark(spec_algorithm: SpeculativeAlgorithm) -> bool:
-    """Whether DSPARK is served by sglang_tpu.experimental.TpuDsparkWorker."""
-    return spec_algorithm.is_dspark() and experimental_spec_enabled()
+def is_experimental_spec_worker(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    """Whether DFLASH/DSPARK is served by sglang_tpu.experimental.TpuBlockSpecWorker."""
+    return spec_algorithm.is_dflash_family() and experimental_spec_enabled()

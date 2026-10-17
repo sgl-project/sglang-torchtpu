@@ -72,10 +72,48 @@ from sglang_tpu.cp_forward import (
     wrap_cp_embedding_forward,
 )
 from sglang_tpu.cp_layout import warmup_request_lengths
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
+
+
+def _guard_filter_options(server_args: Any) -> dict[str, Any] | None:
+    """torch.compile options that skip guards on nn.Module state, or None.
+
+    Every decode step evaluates the decoder graph's Dynamo guards on the host
+    before the graph runs: about 9k guards and 0.7 ms per step for a 13-layer
+    Kimi-K3, growing with depth. Most guard module attributes and parameters,
+    which are fixed once warmup ends: TPU serving freezes compilation with
+    fail_on_recompile, so a guard miss can only raise. Skipping them keeps the
+    guards on the forward inputs and globals, which choose between the
+    precompiled graphs. In exchange, a module attribute changed after warmup
+    is no longer noticed, so the filter stays off for features that rebuild
+    module state at runtime.
+    """
+    if not tpu_envs.SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER.get():
+        return None
+    enable_lora = getattr(server_args, "enable_lora", None)
+    blockers = []
+    if enable_lora or (
+        enable_lora is None and getattr(server_args, "lora_paths", None)
+    ):
+        blockers.append("LoRA")
+    if getattr(server_args, "enable_eplb", False):
+        blockers.append("EPLB")
+    if getattr(server_args, "elastic_ep_backend", None) is not None:
+        blockers.append("elastic EP")
+    if blockers:
+        logger.warning(
+            "[TPU] SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER ignored: %s changes "
+            "module state after warmup.",
+            ", ".join(blockers),
+        )
+        return None
+    logger.info("[TPU] Skipping Dynamo guards on nn.Module state for the decoder.")
+    return {"guard_filter_fn": torch.compiler.skip_guard_on_all_nn_modules_unsafe}
+
 
 # Pure-text progress format (no animated bar) so log files and
 # multi-process wrappers don't garble the output.
@@ -728,11 +766,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             or server_args.unsafe_load_torch_compile_bundle is not None
         )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        # The bundle Compiler installs its own guard filter for restorable guards.
+        options = None if use_bundle else _guard_filter_options(server_args)
         return compiler(
             torch.no_grad()(fn),
             backend=self.backend or current_platform.get_compile_backend(),
             fullgraph=self.fullgraph,
             dynamic=self.dynamic,
+            **({"options": options} if options else {}),
         )
 
     def _direct_compile(

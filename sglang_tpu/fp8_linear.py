@@ -4,15 +4,19 @@
 """TPU FP8 dense linear helpers."""
 
 import logging
+from typing import Callable
 
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.srt.runtime_context import get_parallel
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
 
 logger = logging.getLogger(__name__)
+
+_SMALL_M_OP: Callable | None = None
 
 
 def compute_tpu_fp8_linear_scale_shape(
@@ -252,6 +256,13 @@ def apply_tpu_fp8_linear(
     out_shape = (*x.shape[:-1], weight.shape[1])
     x_2d = x.reshape(-1, x.shape[-1])
     num_tokens = x_2d.shape[0]
+    if (
+        tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get()
+        and bias is None
+        and _small_m_supports(num_tokens, weight.shape[0], weight.shape[1])
+    ):
+        out = _get_fp8_linear_small_m_op()(x_2d, weight, weight_scale)
+        return out.reshape(out_shape)
     x_2d, pad = _pad_rows_to_scaled_mm_alignment(x_2d)
     x_q, x_scale = _quantize_activation_per_row(x_2d, weight.dtype)
 
@@ -334,3 +345,39 @@ def tpu_w8a8_block_fp8_linear(
     if bias is not None:
         out = out + bias
     return out
+
+
+def _small_m_supports(tokens: int, k: int, n: int) -> bool:
+    from sglang_tpu.kernels.fp8_linear_small_m import supports
+
+    return supports(tokens, k, n)
+
+
+def _get_fp8_linear_small_m_op() -> Callable:
+    global _SMALL_M_OP
+    if _SMALL_M_OP is not None:
+        return _SMALL_M_OP
+
+    import jax
+
+    from sglang_tpu.kernels.fp8_linear_small_m import fp8_linear_small_m
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+    def _op(x: jax.Array, weight: jax.Array, weight_scale: jax.Array) -> jax.Array:
+        return fp8_linear_small_m(x, weight, weight_scale)
+
+    op = cpu_export_jax_op("sglang_tpu_pallas::fp8_linear_small_m", _op)
+
+    def _fake(x, weight, weight_scale):
+        del weight_scale
+        return x.new_empty((x.shape[0], weight.shape[1]))
+
+    op.register_fake(_fake)
+    _SMALL_M_OP = op
+    return op
+
+
+def register_fp8_linear_small_m_op() -> None:
+    """Register the op before torch.compile traces a model."""
+
+    _get_fp8_linear_small_m_op()

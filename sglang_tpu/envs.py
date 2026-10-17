@@ -27,6 +27,9 @@ class TpuEnvs:
     # MoE: one kernel streaming the selected FP8 experts' weights for 1..8 tokens
     # (moe/pallas/moe_stream.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL = EnvBool(False)
+    # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
+    # False keeps the XLA path.
+    SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
@@ -37,9 +40,14 @@ class TpuEnvs:
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not
     # bit-exact with it: the kernel scores in f32, the torch path in bf16.
     SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
+    # Drop Dynamo guards on nn.Module state (attributes, submodules, parameters)
+    # for the decoder graph; input and global guards stay (see
+    # decoder_compile_policy._guard_filter_options). Assumes module state is
+    # fixed after warmup.
+    SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
 
     # Speculative decoding
-    # Route DSPARK to sglang_tpu.experimental.TpuDsparkWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
 
     @classmethod

@@ -141,7 +141,7 @@ Each slot fills the lane its MMMU-Pro legs leave idle:
 
 | Slot | 1-host lane | 2-host lane |
 |---|---|---|
-| `day-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
+| `day-10am` | single-host accuracy (gpt-oss, Gemma 4, Qwen3.8) | Kimi-K2.6 MMMU shards |
 | `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
 
 Each stage is a reusable workflow (the nightly calls feature validation and perf with the
@@ -273,7 +273,7 @@ _TODO._
 | `.github/workflows/feature-validation-tpu.yml` | Feature-validation stage, also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
 | `.github/workflows/accuracy-test-tpu.yml` | Accuracy stage, on its own 10 AM / 5 PM schedule and dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |
 | `.github/workflows/perf-test-tpu.yml` | Perf stage, also dispatchable alone: one job per model via run_suite |
-| `.github/tpu-ci/dashboard_aliases.json` | Series-id rename registry: old-id → new-id, applied by keel at render time (pr-gate lint) |
+| `.github/tpu-ci/dashboard_aliases.json` | Series-id rename registry: old-id → new-id, applied by the dashboard at render time (pr-gate lint) |
 
 ## Cluster infra
 
@@ -492,9 +492,8 @@ use it as a multi-host launch model. Multi-host tests use Qwen3-30B-A3B-FP8.
 
 ## Dashboard — making a new test show up
 
-The nightly dashboard is generated **outside this repo** (`ci-monitor/src/tpu_ci.py`
-and `tpu_dashboard.py` in `radixark/keel`, reusing the same parsers as the upstream
-sglang CI dashboard). Nothing here renders it, and nothing here needs to change to add
+The nightly dashboard is generated **outside this repo**, reusing the same parsers as
+the upstream sglang CI dashboard. Nothing here renders it, and nothing here needs to change to add
 a test to it — its **only** input is the job log this repo already prints. What follows
 is the contract that log has to satisfy.
 
@@ -550,13 +549,13 @@ with a label some test already uses.
 
 **Test-list and chart filters come from `register_tpu_ci(labels=[...])`** — free-form
 topology / model / feature tags (`multihost`, `gpt-oss-120b`, `pd`, `spec`, …),
-AST-scanned from source by keel and rendered as filter dropdowns on every tab. These
+AST-scanned from source by the dashboard and rendered as filter dropdowns on every tab. These
 are *test* properties, one declaration per file; `dump_metric` labels are
 *measurement* properties — don't restate one in the other.
 
 **Series identity.** `id` is the join key across nights: never renamed, never shown.
 `display_name` is cosmetic and free to change. When an `id` truly must change, record
-it once in [`dashboard_aliases.json`](dashboard_aliases.json) (old → new; keel merges
+it once in [`dashboard_aliases.json`](dashboard_aliases.json) (old → new; the dashboard merges
 at render time, so history needs no rewrite). A pr-gate lint keeps the map acyclic,
 its targets live, and every live `id` unique. `labels["model"]` groups a model's
 charts, so keep it stable too — the canonical HF id, not a mount path.
@@ -606,18 +605,6 @@ plus `update-dashboard` dispatches on main, so a test that lives solely in
 trends no matter how well-formed its log is. It needs a leg in the nightly's
 feature-validation stage too — that is what the `pd-mh-gpt-120b-pc-offload` and
 `pd-mh-gpt-120b-tp-reshard` jobs in `feature-validation-tpu.yml` are.
-
-Sanity-check a new test's log against the parser before waiting a night for it:
-
-```bash
-# from a keel checkout, against nightlies that already ran (needs repo read scope)
-export GITHUB_TOKEN=$(gh auth token)
-python3 ci-monitor/src/tpu_ci.py sync --limit 3 --db-dir /tmp/tpu-ci
-python3 ci-monitor/src/tpu_dashboard.py --db-dir /tmp/tpu-ci --out /tmp/tpu-ci.html
-```
-
-`sync` is idempotent — records are keyed by run, so re-running over the same window
-converges instead of duplicating.
 
 ## Local validation helpers
 

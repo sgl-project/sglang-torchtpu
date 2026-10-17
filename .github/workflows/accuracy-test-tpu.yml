@@ -34,7 +34,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b]
+        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b, qwen3-8-27b]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -205,6 +205,36 @@ jobs:
       nightly: true
       weights_pvc: model-weights
       timeout_per_file: 7200
+    permissions:
+      contents: read
+      id-token: write
+
+  accuracy-qwen3-8:
+    needs: [build, plan]
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","full-set","day-10am","qwen3-8-27b"]'), needs.plan.outputs.model) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: nightly-tpu-accuracy-qwen3-8-27b-gpqa
+            run_name: accuracy-qwen3-8-27b-gpqa
+          - suite: nightly-tpu-accuracy-qwen3-8-27b-aime
+            run_name: accuracy-qwen3-8-27b-aime
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      run_name: ${{ matrix.run_name }}
+      nightly: true
+      weights_pvc: model-weights
+      # GPQA's four 80k-budget passes measured 5113 s with a warm compile cache.
+      timeout_per_file: 10800
     permissions:
       contents: read
       id-token: write

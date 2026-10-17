@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
@@ -12,16 +12,21 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_linear import (
     _requantize_tpu_block_fp8_to_channelwise,
+    _small_m_supports,
     apply_tpu_fp8_linear,
     compute_tpu_fp8_linear_scale_shape,
     prepare_tpu_fp8_linear_weights,
+    register_fp8_linear_small_m_op,
     tpu_w8a8_block_fp8_linear,
 )
 from sglang_tpu.fp8_moe import (
     _requantize_tpu_fp8_moe_block_to_channelwise,
 )
+
+_SMALL_M_KERNEL = tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL
 
 
 class _FakeBlockFp8Config:
@@ -79,6 +84,68 @@ class TestTpuFp8Linear(CustomTestCase):
         self.assertEqual(eager_out.dtype, torch.bfloat16)
         torch.testing.assert_close(eager_out.cpu(), ref.cpu(), rtol=0.25, atol=0.25)
         torch.testing.assert_close(compiled_out.cpu(), eager_out.cpu())
+
+    def _small_m_inputs(self, gen, tokens, k, n):
+        x = torch.randn(tokens, k, generator=gen).bfloat16().to("tpu")
+        w = (torch.randn(k, n, generator=gen) * 0.5).to(torch.float8_e4m3fn).to("tpu")
+        ws = (torch.rand(n, generator=gen) * 0.01 + 1e-3).to("tpu")
+        return x, w, ws
+
+    def _xla_path(self, x, w, ws):
+        with _SMALL_M_KERNEL.override(False):
+            return apply_tpu_fp8_linear(x, w, ws).cpu()
+
+    def test_fp8_linear_small_m_kernel_matches_xla_path(self):
+        register_fp8_linear_small_m_op()
+        gen = torch.Generator().manual_seed(3)
+        # 5 tokens: a row block that is not a sublane multiple, with no pad.
+        for tokens in (1, 5, 16):
+            for k, n in ((4096, 512), (256, 4096), (4096, 2048), (1536, 4096)):
+                with self.subTest(tokens=tokens, k=k, n=n):
+                    x, w, ws = self._small_m_inputs(gen, tokens, k, n)
+                    expected = self._xla_path(x, w, ws)
+                    with _SMALL_M_KERNEL.override(True):
+                        actual = apply_tpu_fp8_linear(x, w, ws).cpu()
+                    self.assertTrue(torch.equal(actual, expected))
+
+    def test_fp8_linear_small_m_kernel_scale_shapes(self):
+        register_fp8_linear_small_m_op()
+        gen = torch.Generator().manual_seed(4)
+        x, w, ws = self._small_m_inputs(gen, 4, 1536, 4096)
+        for name, scale in (
+            ("per-channel [N, 1]", ws.reshape(-1, 1)),
+            ("per-tensor scalar", ws[0].clone()),
+        ):
+            with self.subTest(scale=name):
+                expected = self._xla_path(x, w, scale)
+                with _SMALL_M_KERNEL.override(True):
+                    actual = apply_tpu_fp8_linear(x, w, scale).cpu()
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_fp8_linear_small_m_kernel_compiled(self):
+        register_fp8_linear_small_m_op()
+        gen = torch.Generator().manual_seed(5)
+
+        def run_small_m(x, weight, weight_scale):
+            return apply_tpu_fp8_linear(x, weight, weight_scale)
+
+        with _SMALL_M_KERNEL.override(True):
+            compiled = torch.compile(
+                run_small_m, backend="tpu", fullgraph=True, dynamic=False
+            )
+            for tokens in (1, 16):
+                with self.subTest(tokens=tokens):
+                    x, w, ws = self._small_m_inputs(gen, tokens, 4096, 2048)
+                    actual = compiled(x, w, ws).cpu()
+                    self.assertTrue(torch.equal(actual, self._xla_path(x, w, ws)))
+
+    def test_fp8_linear_small_m_declines_unsupported_shapes(self):
+        self.assertTrue(_small_m_supports(16, 4096, 512))
+        self.assertFalse(_small_m_supports(17, 4096, 512))
+        self.assertFalse(_small_m_supports(1, 4096, 100))
+        self.assertFalse(_small_m_supports(1, 4000, 512))
+        # No N tile whose double-buffered FP8 block fits the VMEM budget.
+        self.assertFalse(_small_m_supports(1, 131072, 128))
 
     def test_fp8_linear_rejects_unaligned_weight(self):
         x = torch.randn(1, 15, dtype=torch.bfloat16)

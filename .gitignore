@@ -174,6 +174,8 @@ benchmark/llava_bench/mme_pack
 # TPU benchmark run artifacts (results/profiles/HLO dumps land next to cwd)
 benchmark/tpu/**/results/
 benchmark/tpu/**/profile/
+# The Python launcher writes <repo root>/profile/recipe.
+/profile/
 benchmark/tpu/**/hlo_dump/
 tmp*.txt
 /tmp/

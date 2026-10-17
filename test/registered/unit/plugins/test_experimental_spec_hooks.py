@@ -212,15 +212,15 @@ class TestExperimentalSpecHooks(CustomTestCase):
             )
 
     def test_worker_publishes_plugin_owned_draft_state(self):
-        from sglang_tpu.experimental.speculative.dspark.dspark_worker import (
-            TpuDsparkWorker,
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
         )
         from sglang_tpu.experimental.speculative.spec_types import SpecState
 
         state = SpecState(
             torch.tensor([4, 5]), torch.tensor([10, 20]), torch.tensor([1, 2])
         )
-        draft = TpuDsparkWorker.state_to_spec_info(None, state)
+        draft = TpuBlockSpecWorker.state_to_spec_info(None, state)
         self.assertIsInstance(draft, HostPaddedDraftInput)
         torch.testing.assert_close(draft.bonus_tokens, state.bonus_tokens)
         torch.testing.assert_close(draft.new_seq_lens, state.seq_lens)
@@ -267,15 +267,17 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
     def test_either_flag_enables_the_experimental_worker(self):
         from sglang.srt.environ import envs as srt_envs
-        from sglang_tpu.experimental import is_experimental_dspark
+        from sglang_tpu.experimental import is_experimental_spec_worker
 
-        dspark = SpeculativeAlgorithm.DSPARK
         for experimental, no_d2h in ((True, False), (False, True), (False, False)):
             with (
                 envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(experimental),
                 srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(no_d2h),
             ):
-                self.assertEqual(is_experimental_dspark(dspark), experimental or no_d2h)
+                for algo in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+                    self.assertEqual(
+                        is_experimental_spec_worker(algo), experimental or no_d2h
+                    )
 
     def test_draft_merge_preserves_right_hand_length_metadata(self):
         left, right = _state([1]), _state([2, 3])
