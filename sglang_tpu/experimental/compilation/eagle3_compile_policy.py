@@ -96,6 +96,10 @@ class TpuEagle3SpecDecodeCompilePolicyMixin(Eagle3SpecDecodeCompilePolicyMixin):
             req_pool_indices_cpu=layout.req_pool_indices_cpu % pool_rows,
         )
 
+    def keeps_padded_mm_embeds(self, batch: ForwardBatch) -> bool:
+        # The draft prefill reads the target's embeds at the token bucket.
+        return is_host_padded(batch.sampling_info)
+
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
         sampling_info = forward_batch.sampling_info
         if (

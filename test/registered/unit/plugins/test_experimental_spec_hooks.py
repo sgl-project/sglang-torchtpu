@@ -289,9 +289,36 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertTrue(left.tpu_host_seq_lens_is_committed)
         self.assertIs(left.future_indices, merged_rows)
 
+    def test_sampler_pads_live_logits_to_the_host_bucket(self):
+        """An outer logits processor emits 3 live rows; HOST_PADDED sampling
+        params sit at bucket 4, so the sampler pads before TpuSampler runs."""
+        from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
+        from sglang_tpu.sampler import TpuSampler
+
+        seen = []
+
+        def record(self, logits_output, sampling_info, *args, **kwargs):
+            seen.append(logits_output.next_token_logits)
+
+        info = object.__new__(HostPaddedSamplingInfo)
+        info.temperatures = torch.ones((_pad(3), 1))
+        logits = torch.randn(3, 8)
+        with patch.object(TpuSampler, "forward", record):
+            # Skips Sampler.__init__, which needs the TP group.
+            sampler = object.__new__(HostPaddedTpuSampler)
+            plain = object.__new__(SamplingBatchInfo)
+            for sampling_info in (info, plain):
+                sampler.forward(
+                    SimpleNamespace(next_token_logits=logits), sampling_info
+                )
+        self.assertEqual(seen[0].shape, (4, 8))
+        torch.testing.assert_close(seen[0][:3], logits)
+        self.assertEqual(seen[0][3].abs().sum().item(), 0)
+        self.assertIs(seen[1], logits)
+
     def test_decode_prep_reserves_two_windows_and_keeps_committed_host_lengths(self):
         """prepare_for_decode reserves 2 * N tokens past the committed length,
-        seeds the committed host lengths the window is planned from, and refuses
+        plans the verify window on host from the committed lengths, and refuses
         a device-resident pool."""
         from sglang_tpu.experimental.speculative import draft_info
 
@@ -300,6 +327,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             SimpleNamespace(
                 kv=SimpleNamespace(kv_committed_len=c, kv_allocated_len=a),
                 decode_batch_idx=0,
+                lora_id=None,
             )
             for c, a in ((5, 8), (10, 20))
         ]
@@ -307,19 +335,20 @@ class TestExperimentalSpecHooks(CustomTestCase):
             reqs=reqs,
             batch_size=lambda: len(reqs),
             maybe_evict_swa=lambda: None,
-            req_to_token_pool=SimpleNamespace(host_resident=True),
+            req_to_token_pool=SimpleNamespace(
+                host_resident=True,
+                req_to_token=torch.arange(3 * 32).reshape(3, 32),
+            ),
             token_to_kv_pool_allocator=SimpleNamespace(page_size=page_size),
             tree_cache=None,
             req_pool_indices=torch.tensor([1, 2]),
             req_pool_indices_cpu=torch.tensor([1, 2]),
             device="cpu",
+            enable_overlap=True,
+            return_logprob=False,
+            has_grammar=False,
         )
         allocations = []
-        plan = SimpleNamespace(
-            verify_cache_candidates=torch.zeros(2, 8),
-            committed_lens=torch.tensor([5, 10]),
-            req_pool_indices=torch.tensor([1, 2]),
-        )
         spec = SimpleNamespace(
             speculative_num_draft_tokens=num_draft_tokens,
             speculative_draft_window_size=None,
@@ -335,10 +364,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 "allocate_and_assign_decode_cache",
                 lambda **kwargs: allocations.append(kwargs),
             ),
-            patch(
-                "sglang_tpu.dflash_utils_tpu.plan_dflash_device_accept",
-                return_value=plan,
-            ),
         ):
             draft.prepare_for_decode(batch)
             # Committed 5 + 6 rounds up to 12; 20 already covers 10 + 6.
@@ -349,7 +374,19 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertEqual(batch.seq_lens_cpu.tolist(), [5, 10])
             self.assertEqual(batch.seq_lens_sum, 15)
             self.assertTrue(draft.tpu_host_seq_lens_is_committed)
-            self.assertIs(draft.tpu_committed_lens, plan.committed_lens)
+            # Window [committed, committed + 2N) of each request's pool row.
+            self.assertEqual(
+                draft.tpu_verify_cache_candidates.tolist(),
+                [list(range(32 + 5, 32 + 11)), list(range(64 + 10, 64 + 16))],
+            )
+            self.assertEqual(draft.tpu_committed_lens.tolist(), [5, 10])
+            self.assertEqual(draft.tpu_req_pool_indices.tolist(), [1, 2])
+
+            # Logprobs can commit past the window's bound: stay on the sync path.
+            batch.return_logprob = True
+            draft.prepare_for_decode(batch)
+            self.assertFalse(draft.tpu_host_seq_lens_is_committed)
+            self.assertIsNone(draft.tpu_verify_cache_candidates)
 
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):

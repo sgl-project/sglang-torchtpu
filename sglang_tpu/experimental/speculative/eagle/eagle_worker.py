@@ -76,7 +76,10 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
     map_carry,
 )
-from sglang_tpu.experimental.speculative.spec_utils import pad_rows
+from sglang_tpu.experimental.speculative.spec_utils import (
+    overridden_fields,
+    pad_rows,
+)
 
 
 class EagleSeed(NamedTuple):
@@ -353,7 +356,7 @@ class TpuEagle3Worker(TpuSpecWorker):
             num_tokens_for_logprob_per_req=1,
         )
         with self._draft_context():
-            with _overridden(batch, spec_info=spec_info):
+            with overridden_fields(batch, spec_info=spec_info):
                 forward_batch = ForwardBatch.init_new(
                     batch,
                     self._draft_runner,
@@ -531,7 +534,9 @@ class TpuEagle3Worker(TpuSpecWorker):
         with self._draft_context():
             # init_new reads the live token count off input_ids; the draft then
             # reads the shifted tokens already at the token bucket.
-            with _overridden(batch, input_ids=live_input_ids, spec_info=spec_info):
+            with overridden_fields(
+                batch, input_ids=live_input_ids, spec_info=spec_info
+            ):
                 forward_batch = ForwardBatch.init_new(
                     batch,
                     self._draft_runner,
@@ -666,7 +671,8 @@ class TpuEagle3Worker(TpuSpecWorker):
                         device=self.device,
                     ),
                 )
-        # The wrapper's eager logits processor emits live rows; TpuSampler pads them.
+        # The wrapper's eager logits processor emits live rows;
+        # HostPaddedTpuSampler pads them.
         vocab_size = runner.model_config.vocab_size
         for bs in range(1, cap + 1):
             logits = torch.zeros((bs, vocab_size), dtype=torch.float32).to(self.device)
@@ -726,15 +732,3 @@ def _shifted_prompt(
                 tail_src[last_rows[i]] = -1
                 break
     return input_ids, tail_src
-
-
-@contextlib.contextmanager
-def _overridden(batch: ScheduleBatch, **overrides) -> Iterator[ScheduleBatch]:
-    live = {name: getattr(batch, name) for name in overrides}
-    for name, value in overrides.items():
-        setattr(batch, name, value)
-    try:
-        yield batch
-    finally:
-        for name, value in live.items():
-            setattr(batch, name, value)

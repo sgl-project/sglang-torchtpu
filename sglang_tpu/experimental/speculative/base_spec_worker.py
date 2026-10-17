@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import contextlib
 from abc import abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -46,7 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -66,8 +66,8 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
-from sglang_tpu.eagle_utils_tpu import top_k_renorm_prob_tpu, top_p_renorm_prob_tpu
 from sglang_tpu.experimental import register_host_batch_padder
+from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
@@ -95,10 +95,10 @@ from sglang_tpu.experimental.speculative.spec_types import (
 )
 from sglang_tpu.experimental.speculative.spec_utils import (
     apply_verify_logits_adjustments,
-    min_p_renorm_prob_tpu,
+    overridden_fields,
 )
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
-from sglang_tpu.sampler import TpuSampler
+from sglang_tpu.sampling_mask import tpu_filter_probs
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -127,11 +127,16 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError("TpuSpecWorker does not support PP.")
         self._target_worker = target_worker
         runner = target_worker.model_runner
-        if not isinstance(runner.sampler, TpuSampler):
-            # HOST_PADDED sampling params stay on host until TpuSampler uploads them
-            # (--sampling-backend pytorch builds a plain Sampler); with full logits
-            # TpuSampler samples exactly like that Sampler.
-            runner.sampler = TpuSampler()
+        if get_exec().features.enable_custom_logit_processor:
+            # Processors expect len(sampling_info) live rows, not bucket rows.
+            raise NotImplementedError(
+                "TpuSpecWorker does not support custom logit processors."
+            )
+        if not isinstance(runner.sampler, HostPaddedTpuSampler):
+            # HOST_PADDED sampling params stay on host until TpuSampler uploads
+            # them; with full logits it samples exactly like a plain Sampler
+            # (--sampling-backend pytorch).
+            runner.sampler = HostPaddedTpuSampler()
         self._draft_worker = draft_worker
         self.num_drafts = num_drafts
         self.num_verify_rows = num_drafts + 1
@@ -394,10 +399,10 @@ class TpuSpecWorker(BaseSpecWorker):
     def _filtered_target_probs(
         self, target_logits: torch.Tensor, bucket: BucketState
     ) -> torch.Tensor:
-        """Target p [pbs * (N + 1), V]: temperature, then top-k, top-p, min-p renorms.
+        """Target p [pbs * (N + 1), V]: temperature, then the target sampler's filter.
 
-        top-k then top-p follows TPU EAGLE's verify; min-p is relative to the max
-        probability, which the renorms scale away, so applying it last is exact.
+        Like TpuSampler, every cutoff is taken on the unfiltered probabilities and
+        the survivors are normalized once.
         """
         assert bucket.temperatures is not None and bucket.top_ks is not None
         assert bucket.top_ps is not None and bucket.min_ps is not None
@@ -409,13 +414,7 @@ class TpuSpecWorker(BaseSpecWorker):
             bucket.min_ps,
             self.num_verify_rows,
         )
-        if bucket.need_top_k:
-            probs = top_k_renorm_prob_tpu(probs, top_ks_rows)
-        if bucket.need_top_p:
-            probs = top_p_renorm_prob_tpu(probs, top_ps_rows)
-        if bucket.need_min_p:
-            probs = min_p_renorm_prob_tpu(probs, min_ps_rows)
-        return probs
+        return _joint_filter_renorm(probs, top_ks_rows, top_ps_rows, min_ps_rows)
 
     def step(
         self,
@@ -580,7 +579,7 @@ class TpuSpecWorker(BaseSpecWorker):
             state.seq_lens,
         )
         # The forwards' preparation writes these; the idle batch must stay idle.
-        with _overridden(
+        with overridden_fields(
             batch,
             forward_mode=ForwardMode.DECODE,
             spec_info=batch.spec_info,
@@ -691,7 +690,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 ].cpu()
 
     def _warmup_filtered_target(self) -> None:
-        """Sampled-verify target probs and their top-k/top-p/min-p filters per batch bucket."""
+        """Sampled-verify target probs and their joint filter per batch bucket."""
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         rows = self.num_verify_rows
         with torch.no_grad():
@@ -707,9 +706,12 @@ class TpuSpecWorker(BaseSpecWorker):
                 warmup_compiled_op(
                     target_sampling_probs, probs, ones, top_ks, ones, ones, rows
                 )
-                top_k_renorm_prob_tpu(probs, top_ks.repeat_interleave(rows))
-                top_p_renorm_prob_tpu(probs, ones.repeat_interleave(rows))
-                min_p_renorm_prob_tpu(probs, ones.repeat_interleave(rows))
+                _joint_filter_renorm(
+                    probs,
+                    top_ks.repeat_interleave(rows),
+                    ones.repeat_interleave(rows),
+                    ones.repeat_interleave(rows),
+                )
             # Run the eager filters without copying [pbs * (N + 1), V] rows back.
             torch.accelerator.synchronize()
 
@@ -827,7 +829,6 @@ class TpuSpecWorker(BaseSpecWorker):
         return b_bucketer
 
     @staticmethod
-    @contextlib.contextmanager
     def _bucket_view(
         batch: ScheduleBatch,
         *,
@@ -835,7 +836,7 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_input: TpuSpecVerifyInput,
         kv_rows: int,
         **overrides: Any,
-    ) -> Iterator[ScheduleBatch]:
+    ) -> contextlib.AbstractContextManager[ScheduleBatch]:
         """batch with its row fields at the bucket, restored on exit, for code that reads them.
 
         init_new snapshots these; feeding the bucket rows leaves the shim nothing
@@ -863,14 +864,7 @@ class TpuSpecWorker(BaseSpecWorker):
             "req_pool_indices_cpu": verify_input.req_pool_indices_cpu,
             **overrides,
         }
-        live_fields = {name: getattr(batch, name) for name in view_fields}
-        for name, value in view_fields.items():
-            setattr(batch, name, value)
-        try:
-            yield batch
-        finally:
-            for name, value in live_fields.items():
-                setattr(batch, name, value)
+        return overridden_fields(batch, **view_fields)
 
     def _build_verify_batch(
         self,
@@ -1026,14 +1020,21 @@ class TpuSpecWorker(BaseSpecWorker):
             )
 
 
-@contextlib.contextmanager
-def _overridden(batch: ScheduleBatch, **overrides: Any) -> Iterator[ScheduleBatch]:
-    """batch with overrides set, restored on exit."""
-    live = {name: getattr(batch, name) for name in overrides}
-    for name, value in overrides.items():
-        setattr(batch, name, value)
-    try:
-        yield batch
-    finally:
-        for name, value in live.items():
-            setattr(batch, name, value)
+def _joint_filter_renorm(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+) -> torch.Tensor:
+    # Every flag on: disabled rows carry no-op values (TOP_K_ALL, 1.0, 0.0), so
+    # this is one program per shape instead of one per flag combination.
+    kept = tpu_filter_probs(
+        probs,
+        top_ks,
+        top_ps,
+        min_ps,
+        need_top_k=True,
+        need_top_p=True,
+        need_min_p=True,
+    )
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)

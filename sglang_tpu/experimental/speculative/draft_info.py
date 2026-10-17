@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_len
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import allocate_and_assign_decode_cache
+from sglang_tpu.dflash_utils_tpu import gather_dflash_candidate_window
 
 
 @dataclass
@@ -89,21 +90,29 @@ class HostPaddedDraftInput(SpecInput):
     def _plan_verify_window(
         self, batch: ScheduleBatch, *, bs: int, block_size: int, committed_lens_cpu
     ) -> None:
-        from sglang_tpu.dflash_utils_tpu import plan_dflash_device_accept
-
-        plan = plan_dflash_device_accept(
-            batch,
-            bs=bs,
-            block_size=block_size,
-            committed_lens_cpu=committed_lens_cpu,
-            compact_draft_cache=get_spec().speculative_draft_window_size is not None,
-        )
-        self.tpu_verify_cache_candidates = (
-            plan.verify_cache_candidates if plan is not None else None
-        )
-        self.tpu_committed_lens = plan.committed_lens if plan is not None else None
-        self.tpu_req_pool_indices = plan.req_pool_indices if plan is not None else None
-        self.tpu_host_seq_lens_is_committed = plan is not None
+        # Kept on host: TpuSpecVerifyInput.from_batch uploads it at the forward's
+        # bucket, which DP attention only fixes after this point.
+        if not _verify_window_eligible(batch):
+            self.tpu_verify_cache_candidates = None
+            self.tpu_committed_lens = None
+            self.tpu_req_pool_indices = None
+            self.tpu_host_seq_lens_is_committed = False
+            return
+        # The 2 * block_size reservation above maps the whole window.
+        assert all(
+            int(committed_lens_cpu[i]) + 2 * block_size <= req.kv.kv_allocated_len
+            for i, req in enumerate(batch.reqs)
+        ), "TpuSpecWorker verify window needs two windows of reserved KV"
+        req_pool_indices_cpu = batch.req_pool_indices_cpu[:bs].to(torch.int64)
+        self.tpu_verify_cache_candidates = gather_dflash_candidate_window(
+            batch.req_to_token_pool.req_to_token,
+            req_pool_indices_cpu,
+            committed_lens_cpu,
+            block_size,
+        ).to(torch.int64)
+        self.tpu_committed_lens = committed_lens_cpu
+        self.tpu_req_pool_indices = req_pool_indices_cpu
+        self.tpu_host_seq_lens_is_committed = True
 
     def _drop_window(self):
         # prepare_for_decode replans bucketed windows after composition changes.
@@ -154,3 +163,17 @@ class HostPaddedDraftInput(SpecInput):
             setattr(
                 self, name, torch.cat([getattr(self, name), getattr(spec_info, name)])
             )
+
+
+def _verify_window_eligible(batch: ScheduleBatch) -> bool:
+    # A verify commits at most one window, the single offset the plan enumerates.
+    # grammar_retained_tokens can commit less, and the compact draft cache maps
+    # its own window from host lengths.
+    return (
+        batch.enable_overlap
+        and isinstance(batch.req_pool_indices_cpu, torch.Tensor)
+        and get_spec().speculative_draft_window_size is None
+        and not batch.return_logprob
+        and not batch.has_grammar
+        and all(req.lora_id is None for req in batch.reqs)
+    )

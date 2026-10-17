@@ -19,7 +19,6 @@ from torch import nn
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.runtime_context import get_parallel
-from sglang_tpu.experimental import is_experimental_spec
 from sglang_tpu.spec_op_warmup import (
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
@@ -293,9 +292,8 @@ def _dflash_device_accept_eligible(
 ) -> bool:
     """Whether this batch may address its verify block without a host sync.
 
-    DFLASH (and the experimental TpuSpecWorker chains, same block) commits at
-    most one block, which is the single bounded offset the window enumerates.
-    Grammar is excluded because grammar_retained_tokens can
+    DFLASH commits at most one block, which is the single bounded offset the
+    window enumerates. Grammar is excluded because grammar_retained_tokens can
     be shorter than commit_lens, which breaks that bound. The compact draft
     cache rebuilds its own windowed mapping from host lengths and is left on
     the synchronizing path.
@@ -312,10 +310,7 @@ def _dflash_device_accept_eligible(
         bs > 0
         and not compact_draft_cache
         and batch.enable_overlap
-        and (
-            batch.spec_algorithm.is_dflash()
-            or is_experimental_spec(batch.spec_algorithm)
-        )
+        and batch.spec_algorithm.is_dflash()
         and batch.req_to_token_pool.host_resident
         and not batch.return_logprob
         and not batch.has_grammar
@@ -496,14 +491,10 @@ class DFlashDeviceAcceptPlan(msgspec.Struct, frozen=True):
       verify_cache_candidates: Slot ids for [base, base + 2 * block_size),
         [bs, 2 * block_size] int64 on device.
       committed_lens: Device mirror of the host base, [bs] int64.
-      req_pool_indices: TpuSpecWorker only, [bs] int64 pool rows. When set, every
-        field stays on host; the worker pads and uploads them at the batch
-        bucket of the forward, which DP attention fixes only after the plan.
     """
 
     verify_cache_candidates: torch.Tensor
     committed_lens: torch.Tensor
-    req_pool_indices: Optional[torch.Tensor] = None
 
 
 def plan_dflash_device_accept(
@@ -553,14 +544,6 @@ def plan_dflash_device_accept(
         committed_lens_cpu[:bs],
         block_size,
     )
-    if is_experimental_spec(batch.spec_algorithm):
-        # TpuSpecWorker uploads the plan at its forward's batch bucket, which DP
-        # attention shares across ranks (TpuSpecVerifyInput.from_batch).
-        return DFlashDeviceAcceptPlan(
-            verify_cache_candidates=candidates.to(torch.int64),
-            committed_lens=committed_lens_cpu[:bs].to(torch.int64),
-            req_pool_indices=req_pool_indices_cpu[:bs].to(torch.int64),
-        )
     return DFlashDeviceAcceptPlan(
         verify_cache_candidates=candidates.to(
             batch.device, dtype=torch.int64, non_blocking=True

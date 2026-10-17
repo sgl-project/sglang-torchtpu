@@ -49,7 +49,10 @@ from sglang_tpu.hooks.experimental_spec import (
     prepare_spec_decode,
 )
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
-from sglang_tpu.overlap_utils_tpu import device_accept_resolved_tpu
+from sglang_tpu.overlap_utils_tpu import (
+    device_accept_resolved_tpu,
+    resolve_device_accept_seq_lens_tpu,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -149,10 +152,12 @@ class TestExperimentalEagle3(CustomTestCase):
         batch = SimpleNamespace(spec_info=next_input, seq_lens_cpu=committed)
         with (
             patch.object(overlap_utils, "_is_tpu", True),
+            # sglang_tpu.patches installs this on TPU.
+            patch.object(FutureMap, "tpu_direct_handoff", None, create=True),
             patch.object(
                 overlap_utils,
                 "resolve_device_accept_seq_lens_tpu",
-                lambda future_map, batch: False,
+                resolve_device_accept_seq_lens_tpu,
                 create=True,
             ),
             patch.object(
@@ -390,44 +395,49 @@ class TestExperimentalEagle3(CustomTestCase):
         freq = torch.bincount(first, minlength=4).float() / rows
         torch.testing.assert_close(freq, p0, atol=0.01, rtol=0)
 
-    def test_sampled_verify_filters_target_in_eagle_order(self):
-        """Sampled verify filters p per request: top-k, then top-p (TPU EAGLE's
-        order), then min-p, each with its request's value on all N + 1 rows."""
+    def test_sampled_verify_filters_target_like_the_target_sampler(self):
+        """Sampled verify keeps what the target sampler keeps: every cutoff on the
+        unfiltered p, each request's values on all its N + 1 rows, one renorm."""
         worker = _eagle_worker()
         worker.num_verify_rows = 2
-        order = []
 
-        def stage(name):
-            def apply(probs, values):
-                order.append((name, values))
-                return probs
+        def joint_filter(probs, top_ks, top_ps, min_ps, **need):
+            # CPU reference of tpu_filter_probs with every filter enabled.
+            del need
+            desc = probs.sort(dim=-1, descending=True).values
+            rows = torch.arange(probs.shape[0])
+            k = top_ks.clamp(1, probs.shape[1]).long() - 1
+            nucleus = (
+                (desc.cumsum(-1) < top_ps[:, None])
+                .sum(-1)
+                .clamp_max(probs.shape[1] - 1)
+            )
+            cutoff = torch.maximum(desc[rows, k], desc[rows, nucleus])
+            cutoff = torch.maximum(cutoff, desc[:, 0] * min_ps)
+            return torch.where(probs >= cutoff[:, None], probs, 0.0)
 
-            return apply
-
+        p = torch.tensor([[0.40, 0.25, 0.20, 0.15], [0.50, 0.30, 0.15, 0.05]])
         bucket = BucketState(
             key=None,
             state=None,
             live_mask=None,
             temperatures=torch.ones(2),
-            top_ks=torch.tensor([3, 5], dtype=torch.int32),
-            top_ps=torch.tensor([0.5, 0.9]),
-            min_ps=torch.tensor([0.1, 0.2]),
+            # Renormalizing after top-k would push 0.40 past top_p and drop 0.25.
+            top_ks=torch.tensor([2, 1 << 30], dtype=torch.int32),
+            top_ps=torch.tensor([0.6, 1.0]),
+            min_ps=torch.tensor([0.0, 0.5]),
             need_top_k=True,
             need_top_p=True,
             need_min_p=True,
         )
-        with (
-            patch.object(base_spec_worker, "top_k_renorm_prob_tpu", stage("top_k")),
-            patch.object(base_spec_worker, "top_p_renorm_prob_tpu", stage("top_p")),
-            patch.object(base_spec_worker, "min_p_renorm_prob_tpu", stage("min_p")),
-        ):
-            worker._filtered_target_probs(torch.zeros((4, 8)), bucket)
-        self.assertEqual([name for name, _ in order], ["top_k", "top_p", "min_p"])
-        torch.testing.assert_close(
-            order[0][1], torch.tensor([3, 3, 5, 5], dtype=torch.int32)
-        )
-        torch.testing.assert_close(order[1][1], torch.tensor([0.5, 0.5, 0.9, 0.9]))
-        torch.testing.assert_close(order[2][1], torch.tensor([0.1, 0.1, 0.2, 0.2]))
+        with patch.object(base_spec_worker, "tpu_filter_probs", joint_filter):
+            filtered = worker._filtered_target_probs(
+                p.log().repeat_interleave(2, dim=0), bucket
+            )
+        expected = torch.tensor(
+            [[0.40 / 0.65, 0.25 / 0.65, 0, 0], [0.50 / 0.80, 0.30 / 0.80, 0, 0]]
+        ).repeat_interleave(2, dim=0)
+        torch.testing.assert_close(filtered, expected)
 
     def test_draft_prefill_shift_keeps_chunks_consistent(self):
         """Each request's last row takes its own sampled token, except a non-final

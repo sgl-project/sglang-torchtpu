@@ -613,9 +613,13 @@ class FutureMap:
             return
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if _is_tpu and draft_input.tpu_host_seq_lens_is_committed:
-            # The verify window was pre-gathered from the committed base, so the
-            # host mirror prepare_for_decode seeded must survive: reading the
+        if (
+            _is_tpu
+            and self.spec_algo.is_dflash_family()
+            and draft_input.tpu_host_seq_lens_is_committed
+        ):
+            # DFLASH pre-gathered its verify window from the committed base, so
+            # the host mirror prepare_for_decode seeded must survive: reading the
             # published length back would reintroduce the sync this avoids.
             return
 

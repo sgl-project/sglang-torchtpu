@@ -1022,6 +1022,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _supports_padded_sampling_outputs(self) -> bool:
         return self._compiles_logits_processor()
 
+    def keeps_padded_mm_embeds(self, batch: ForwardBatch) -> bool:
+        """Whether the shim hands mm_input_embeds back at the token bucket."""
+        return False
+
     def keep_outputs_padded(self, batch: ForwardBatch) -> bool:
         from sglang_tpu.sampler import supports_padded_sampling
 
