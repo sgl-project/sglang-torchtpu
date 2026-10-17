@@ -175,6 +175,17 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 "[spec compile policy] DFLASH draft: %d linears as fp8 weight-only.",
                 num_fp8,
             )
+        from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.twoshot_all_reduce import install_twoshot_all_reduce
+
+        logger.info(
+            "[spec compile policy] DFLASH draft: %d two-shot all-reduces.",
+            install_twoshot_all_reduce(
+                model,
+                ("o_proj", "down_proj"),
+                world_size=get_parallel().world_group.world_size,
+            ),
+        )
 
     def _ensure_kv_appender(self, dflash_worker: DFlashWorkerV2 | None = None) -> None:
         """Initialize, compile and install the draft KV appender on the worker."""
