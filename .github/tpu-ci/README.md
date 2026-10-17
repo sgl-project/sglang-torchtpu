@@ -78,6 +78,11 @@ container branches on `NNODES` (from GKE's `TPU_WORKER_HOSTNAMES`):
   group's test files in **live-server mode** (`SGLANG_TPU_USE_LIVE_SERVER=1` + `BASE_URL`),
   so tests assert on real results. Workers serve until the leader tears down, exit 0.
 
+`--platform` (the `platform` input of `_tpu-test.yml`) sets the pods'
+`SGLANG_PLATFORM`. The PR gate and the single-host nightly (`nightly-tpu-4-v7`)
+pass `tpu_oot` (mode B, the plugin platform); every other lane keeps the
+default `tpu` (mode A). Each test runs in one mode only.
+
 ### Multi-host = test-owned launch, grouped by setup
 
 The model+config is **not** bound to a suite — each multi-host test file declares its

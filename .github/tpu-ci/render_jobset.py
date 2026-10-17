@@ -179,6 +179,8 @@ def main():
         help="KSA for the pod; Workload Identity uses it to read weights from GCS.",
     )
     ap.add_argument("--name", default="")  # multi-host run label
+    # SGLANG_PLATFORM for the pods: tpu (mode A, in-tree) or tpu_oot (mode B, plugin).
+    ap.add_argument("--platform", choices=("tpu", "tpu_oot"), default="tpu")
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
     ap.add_argument(
@@ -251,6 +253,10 @@ def main():
             ap.error("P/D mode needs both --pd-prefill-hosts and --pd-decode-hosts")
         if not a.exec_cmd:
             ap.error("P/D mode needs --exec")
+        if a.platform != "tpu":
+            ap.error(
+                "P/D mode runs mode A only; jobset-tpu-pd.yaml pins SGLANG_PLATFORM=tpu"
+            )
         # The pod script announces --files and reports the run's verdict against
         # them in TIMINGS format, which is the only thing that gives a P/D run a
         # test name on the dashboard. Without it the run lands there named after
@@ -398,6 +404,7 @@ def main():
         "QUEUE": sl["queue"],
         "RUN_NAME": run_name,
         "SUITE": suite,
+        "PLATFORM": a.platform,
         # --continue-on-error only on the nightly, matching the CUDA nightly: a
         # scheduled run should report every file's verdict, where the PR gate still
         # fast-fails to give the slice back. Without it the suite stops at the first

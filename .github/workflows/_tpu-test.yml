@@ -72,6 +72,12 @@ on:
         required: false
         type: string
         default: ""
+      # SGLANG_PLATFORM for the pods: tpu (mode A) or tpu_oot (mode B, the plugin
+      # platform). P/D runs accept only tpu.
+      platform:
+        required: false
+        type: string
+        default: tpu
       # Names this job. Nested two deep (nightly -> stage -> here) the Actions
       # sidebar shows ONLY this job's name per leg, so it must be the test; the
       # fallbacks cover callers whose suite already is the test.
@@ -163,6 +169,7 @@ jobs:
             --partition-id '${{ inputs.partition_id }}' \
             --partition-size '${{ inputs.partition_size }}' \
             --name '${{ inputs.run_name }}' \
+            --platform '${{ inputs.platform }}' \
             --service-account '${{ vars.TPU_CI_POD_KSA }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
