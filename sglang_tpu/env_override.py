@@ -8,12 +8,21 @@ imported. libtpu reads ``LIBTPU_INIT_ARGS`` at load time.
 from __future__ import annotations
 
 import os
+import sys
 
 from sglang_tpu._logging import get_logger
 
 logger = get_logger(__name__)
 
 _LIBTPU_INIT_ARGS = "LIBTPU_INIT_ARGS"
+
+_TPU_PREMAPPED_BUFFER_SIZE = "TPU_PREMAPPED_BUFFER_SIZE"
+# Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
+_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
+# PID of the process that wrote the default after it had imported torch. In
+# that process torch_tpu has already read the variable as unset. Spawned
+# workers import this module again, so they start with None.
+_premapped_default_writer_pid: int | None = None
 
 # Mirror legacy compilation-cache env vars to their renamed counterparts.
 # TODO(wyzhang): Remove after the TorchTPU upgrade completes.
@@ -117,8 +126,47 @@ def _set_renamed_compilation_cache_envs() -> list[str]:
     return added
 
 
+def _set_default_premapped_buffer_size() -> bool:
+    """Default ``TPU_PREMAPPED_BUFFER_SIZE`` for processes spawned after this call.
+
+    torch_tpu reads the variable once, when ``import torch`` autoloads it, and
+    if it is unset writes ``"0"`` to the C environment, which turns the pool
+    off. ``os.environ`` does not see that write, but child processes inherit
+    it. So a worker that sets the variable itself is too late. The launcher
+    has to set it before it spawns workers; the ``os.environ`` write also
+    replaces the inherited ``"0"`` through ``putenv``. A value the user set,
+    including ``0``, is kept. Returns whether the default was written.
+    """
+    global _premapped_default_writer_pid
+    if _TPU_PREMAPPED_BUFFER_SIZE in os.environ:
+        return False
+    os.environ[_TPU_PREMAPPED_BUFFER_SIZE] = str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
+    if "torch" in sys.modules:
+        _premapped_default_writer_pid = os.getpid()
+    return True
+
+
+def premapped_buffer_size_seen_by_torch_tpu() -> str | None:
+    """``TPU_PREMAPPED_BUFFER_SIZE`` as torch_tpu read it in this process.
+
+    Returns None when torch_tpu read it unset and turned the pool off. That
+    includes the case where this process wrote the default only after
+    importing torch, even though ``os.environ`` now holds the default.
+    """
+    if _premapped_default_writer_pid == os.getpid():
+        return None
+    return os.environ.get(_TPU_PREMAPPED_BUFFER_SIZE)
+
+
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
+    if _set_default_premapped_buffer_size():
+        logger.info(
+            "TPU env_override set %s=%d for spawned workers.",
+            _TPU_PREMAPPED_BUFFER_SIZE,
+            _DEFAULT_TPU_PREMAPPED_BUFFER_SIZE,
+        )
+
     added = _set_renamed_compilation_cache_envs()
     if added:
         logger.info(

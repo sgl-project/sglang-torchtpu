@@ -1,9 +1,10 @@
-"""Unit tests for TPU LIBTPU_INIT_ARGS env overrides.
+"""Unit tests for TPU env overrides.
 
-Covers the override contract: default flags are appended, the VMEM
-prefetch serialization applies only to small explicit KV pools, and a
+Covers the LIBTPU_INIT_ARGS override contract: default flags are appended, the
+VMEM prefetch serialization applies only to small explicit KV pools, and a
 caller-supplied value for the same flag name — even a different value —
-is never clobbered or duplicated.
+is never clobbered or duplicated. Also covers the TPU_PREMAPPED_BUFFER_SIZE
+default that the launcher writes for spawned workers.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -11,18 +12,25 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import os
+import subprocess
+import sys
+import textwrap
 import unittest
 from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import env_override
 from sglang_tpu.env_override import (
     _DECODE_CP_SPARSE_CORE_OVERRIDES,
+    _DEFAULT_TPU_PREMAPPED_BUFFER_SIZE,
+    _TPU_PREMAPPED_BUFFER_SIZE,
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
     apply_decode_cp_sparse_core_override,
     apply_small_kv_pool_vmem_prefetch_override,
     apply_tpu_env_overrides,
+    premapped_buffer_size_seen_by_torch_tpu,
 )
 
 
@@ -98,6 +106,90 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
                     args = os.environ["LIBTPU_INIT_ARGS"].split()
                 for flag in _DECODE_CP_SPARSE_CORE_OVERRIDES:
                     self.assertEqual(flag in args, expected)
+
+
+class TestPremappedBufferSizeDefault(CustomTestCase):
+    """The launcher writes the premapped-pool default so spawned workers
+    have it when ``import torch`` loads torch_tpu (issue #1394)."""
+
+    def setUp(self):
+        # Writing the default records this process's PID; keep it per-test.
+        # (start/addCleanup rather than enterContext, which needs Python 3.11.)
+        patcher = patch.object(env_override, "_premapped_default_writer_pid", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _apply(self, initial: str | None) -> tuple[str | None, str | None]:
+        """Return the env value after the override and what torch_tpu saw."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(_TPU_PREMAPPED_BUFFER_SIZE, None)
+            if initial is not None:
+                os.environ[_TPU_PREMAPPED_BUFFER_SIZE] = initial
+            apply_tpu_env_overrides()
+            return (
+                os.environ.get(_TPU_PREMAPPED_BUFFER_SIZE),
+                premapped_buffer_size_seen_by_torch_tpu(),
+            )
+
+    def test_unset_gets_default(self):
+        env_value, _ = self._apply(None)
+        self.assertEqual(env_value, str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE))
+
+    def test_user_value_wins(self):
+        # 0 is a valid user choice: it turns the pool off on purpose.
+        for value in ("17179869184", "0"):
+            with self.subTest(value=value):
+                self.assertEqual(self._apply(value), (value, value))
+
+    def test_default_written_after_torch_import_is_not_seen_in_process(self):
+        # torch is already imported here, as in any sglang process, so
+        # torch_tpu read the variable as unset. Only spawned children get the
+        # default; this process must not report it.
+        self.assertIn("torch", sys.modules)
+        default = str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
+        with self.subTest("writer process"):
+            self.assertEqual(self._apply(None), (default, None))
+        with self.subTest("other process"):
+            other_pid = os.getpid() + 1
+            with (
+                patch.object(env_override, "_premapped_default_writer_pid", other_pid),
+                patch.dict(os.environ, {_TPU_PREMAPPED_BUFFER_SIZE: default}),
+            ):
+                self.assertEqual(premapped_buffer_size_seen_by_torch_tpu(), default)
+
+    def test_spawned_child_overrides_torch_tpus_zero(self):
+        # When the variable is unset, torch_tpu's import writes "0" with C
+        # setenv. os.environ never sees that write, but child processes
+        # inherit it. The launcher's default must replace the "0" for children
+        # spawned after the call. Run in a subprocess so the C-level write does
+        # not reach this test process.
+        script = textwrap.dedent(
+            f"""
+            import ctypes, os, subprocess, sys
+            ctypes.CDLL(None).setenv(b"{_TPU_PREMAPPED_BUFFER_SIZE}", b"0", 1)
+            assert "{_TPU_PREMAPPED_BUFFER_SIZE}" not in os.environ
+            from sglang_tpu.env_override import apply_tpu_env_overrides
+            apply_tpu_env_overrides()
+            child = subprocess.run(
+                [sys.executable, "-c",
+                 "import os; print(os.environ['{_TPU_PREMAPPED_BUFFER_SIZE}'])"],
+                capture_output=True, text=True, check=True,
+            )
+            print(child.stdout.strip())
+            """
+        )
+        env = {k: v for k, v in os.environ.items() if k != _TPU_PREMAPPED_BUFFER_SIZE}
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(
+            out.stdout.strip().splitlines()[-1],
+            str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE),
+        )
 
 
 if __name__ == "__main__":

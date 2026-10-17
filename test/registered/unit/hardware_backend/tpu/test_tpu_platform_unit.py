@@ -153,6 +153,64 @@ class TestTpuPlatformInitialization(CustomTestCase):
             ],
         )
 
+    def _init_backend_with_premapped(
+        self, value: str | None, default_writer_pid: int | None = None
+    ):
+        """Run init_backend with the premapped env var set to ``value``
+        (None: unset) and return its final value and the platform's logs.
+        ``default_writer_pid`` is the PID env_override recorded when it wrote
+        the default."""
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
+            patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
+            compiler_config.patch(cache_key_tag=""),
+            patch(
+                "sglang_tpu.env_override._premapped_default_writer_pid",
+                default_writer_pid,
+            ),
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch("sglang_tpu.patches.apply_tpu_patches"),
+            self.assertLogs("sglang_tpu.tpu_platform", level="INFO") as logs,
+        ):
+            os.environ.pop("TPU_PREMAPPED_BUFFER_SIZE", None)
+            if value is not None:
+                os.environ["TPU_PREMAPPED_BUFFER_SIZE"] = value
+            # Fresh instance: init_backend is a no-op once it has run.
+            TpuSRTPlatform().init_backend()
+            return os.environ.get("TPU_PREMAPPED_BUFFER_SIZE"), logs.output
+
+    def test_worker_reports_disabled_pool_instead_of_late_default(self):
+        # torch_tpu has already read the unset variable and turned the pool
+        # off. The worker must not log a 4 GiB default that never took effect.
+        default = "4294967296"
+        for case, value, writer_pid, expected_env in (
+            # torch_tpu's "0" is mirrored into os.environ.
+            ("unset", None, None, "0"),
+            # The launcher hook wrote the default in this same process after
+            # torch was imported: the pool is off here, but the default stays
+            # in the environment for workers this process spawns.
+            ("default written in this process", default, os.getpid(), default),
+        ):
+            with self.subTest(case):
+                final, logs = self._init_backend_with_premapped(value, writer_pid)
+                self.assertEqual(final, expected_env)
+                self.assertTrue(
+                    any("WARNING" in line and "pool off" in line for line in logs),
+                    logs,
+                )
+                self.assertFalse(any("4.00 GiB" in line for line in logs), logs)
+
+    def test_worker_keeps_inherited_premapped_size(self):
+        # Inherited from the launcher (a different PID) or set by the user.
+        for writer_pid in (None, os.getpid() + 1):
+            with self.subTest(writer_pid=writer_pid):
+                final, logs = self._init_backend_with_premapped(
+                    "17179869184", writer_pid
+                )
+                self.assertEqual(final, "17179869184")
+                self.assertTrue(any("16.00 GiB" in line for line in logs), logs)
+                self.assertFalse(any("WARNING" in line for line in logs), logs)
+
 
 class TestTpuCompileCache(CustomTestCase):
     def test_reports_tier1_cache_misses(self):

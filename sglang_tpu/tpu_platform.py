@@ -30,8 +30,6 @@ rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
 
 
-# Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
-_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 # Flush torch_tpu's lazy host->device weight-copy graph once this much work accumulates,
 # so it materializes in chunks rather than all at once, which may cause HBM OOMs.
 _LOAD_WEIGHT_SYNC_BYTES = 2 << 30  # 2 GiB
@@ -1166,19 +1164,35 @@ class TpuSRTPlatform(SRTPlatform):
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
         )
 
-        # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
-        # read by libtpu at init, so it MUST be set before `import torch_tpu`.
-        os.environ.setdefault(
-            "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
-        )
-        premapped_bytes = int(os.environ["TPU_PREMAPPED_BUFFER_SIZE"])
-        # Log the effective size so it's in hand when debugging KV-offload OOMs.
-        logger.info(
-            "libtpu premapped host staging pool: %.2f GiB "
-            "(TPU_PREMAPPED_BUFFER_SIZE=%d); raise it if KV-offload H2D OOMs.",
-            premapped_bytes / (1024 * 1024 * 1024),
-            premapped_bytes,
-        )
+        # libtpu's premapped (pinned, DMA-mapped) host staging pool. torch_tpu
+        # read TPU_PREMAPPED_BUFFER_SIZE when this process imported torch, so
+        # setting it here would not change the pool. The launcher sets the
+        # default before it spawns workers (env_override.apply_tpu_env_overrides).
+        # Here we only report the size torch_tpu used.
+        from sglang_tpu.env_override import premapped_buffer_size_seen_by_torch_tpu
+
+        premapped = premapped_buffer_size_seen_by_torch_tpu()
+        if premapped is None:
+            # torch_tpu read the variable unset and turned this process's pool
+            # off. If it is still unset, torch_tpu's "0" is only in the C
+            # environment; copy it into os.environ so Python readers (the
+            # Raiden staging check) see it. If this process wrote the default
+            # after importing torch, keep it: workers it spawns do get the pool.
+            os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", "0")
+            logger.warning(
+                "TPU_PREMAPPED_BUFFER_SIZE was unset when this process imported "
+                "torch, so torch_tpu turned libtpu's premapped host staging pool "
+                "off. Set it in the launch environment to enable the pool."
+            )
+        else:
+            premapped_bytes = int(premapped)
+            # Log the effective size so it's in hand when debugging KV-offload OOMs.
+            logger.info(
+                "libtpu premapped host staging pool: %.2f GiB "
+                "(TPU_PREMAPPED_BUFFER_SIZE=%d); raise it if KV-offload H2D OOMs.",
+                premapped_bytes / (1024 * 1024 * 1024),
+                premapped_bytes,
+            )
 
         from sglang_tpu.patches import (
             _prepare_tpu_env,
