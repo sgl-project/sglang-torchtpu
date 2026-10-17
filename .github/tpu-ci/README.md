@@ -142,7 +142,7 @@ Each slot fills the lane its MMMU-Pro legs leave idle:
 | Slot | 1-host lane | 2-host lane |
 |---|---|---|
 | `day-10am` | single-host accuracy (gpt-oss, Gemma 4, Qwen3.8) | Kimi-K2.6 MMMU shards |
-| `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
+| `day-5pm` | Gemma 4 / Qwen3.5 / Qwen3.8 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
 
 Each stage is a reusable workflow (the nightly calls feature validation and perf with the
 shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one

@@ -255,6 +255,7 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-qwen3-5-397b-mmmupro",
         "nightly-tpu-accuracy-qwen3-8-27b-gpqa",
         "nightly-tpu-accuracy-qwen3-8-27b-aime",
+        "nightly-tpu-accuracy-qwen3-8-27b-mmmupro",
         "nightly-tpu-accuracy-gpt-oss-120b-aime",
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
