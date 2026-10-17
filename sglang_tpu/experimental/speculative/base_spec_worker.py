@@ -704,7 +704,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 ].cpu()
 
     def _warmup_filtered_target(self) -> None:
-        """Sampled-verify target probs and their joint filter per batch bucket."""
+        """Sampled-verify target probs and their joint filter per batch bucket, chained as served."""
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         rows = self.num_verify_rows
         with torch.no_grad():
@@ -721,20 +721,13 @@ class TpuSpecWorker(BaseSpecWorker):
                     for _ in range(3)
                 )
                 top_ks = torch.ones((padded_bs,), dtype=torch.int32, device=self.device)
-                warmup_compiled_op(
-                    target_sampling_probs,
-                    probs,
-                    temperatures,
-                    top_ks,
-                    top_ps,
-                    min_ps,
-                    rows,
-                )
+                # Feed the op's own outputs to the filter, as serving does: under
+                # Dynamo they carry the compiled graph's layout, which the eager
+                # renorm after the filter compiles against.
                 _joint_filter_renorm(
-                    probs,
-                    top_ks.repeat_interleave(rows),
-                    top_ps.repeat_interleave(rows),
-                    min_ps.repeat_interleave(rows),
+                    *target_sampling_probs(
+                        probs, temperatures, top_ks, top_ps, min_ps, rows
+                    )
                 )
             # Run the eager filters without copying [pbs * (N + 1), V] rows back.
             torch.accelerator.synchronize()

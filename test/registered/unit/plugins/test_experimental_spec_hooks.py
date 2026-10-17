@@ -462,8 +462,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertNotEqual(live.data_ptr(), full.data_ptr())
 
     def test_filtered_target_warmup_matches_serving_inputs(self):
-        """Serving uploads temperatures, top-p and min-p as separate tensors; an
-        aliased warmup would leave Dynamo an alias guard serving never satisfies."""
+        """Warmup runs the served chain: separate param tensors (Dynamo guards on
+        aliasing) and the filter fed the op's own outputs, whose layout the eager
+        renorm compiles against."""
         from sglang_tpu.experimental.speculative import base_spec_worker
         from sglang_tpu.experimental.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
@@ -475,29 +476,36 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(model_config=SimpleNamespace(vocab_size=8))
         )
-        calls = []
+        op_calls, filter_calls = [], []
+        outputs = tuple(torch.zeros(1) for _ in range(4))
+
+        def op(*args):
+            op_calls.append(args)
+            return outputs
+
         with (
             patch.object(
                 TpuBlockSpecWorker,
                 "_b_bucketer",
                 return_value=SimpleNamespace(buckets=[4]),
             ),
+            patch.object(base_spec_worker, "target_sampling_probs", op),
             patch.object(
                 base_spec_worker,
-                "warmup_compiled_op",
-                lambda op, *args: calls.append(args),
+                "_joint_filter_renorm",
+                lambda *a: filter_calls.append(a),
             ),
-            patch.object(base_spec_worker, "_joint_filter_renorm", lambda *a: None),
             patch.object(torch.accelerator, "synchronize", lambda: None),
         ):
             worker._warmup_filtered_target()
-        probs, temperatures, top_ks, top_ps, min_ps, rows = calls[0]
+        probs, temperatures, top_ks, top_ps, min_ps, rows = op_calls[0]
         self.assertEqual(len({id(t) for t in (temperatures, top_ps, min_ps)}), 3)
         self.assertEqual(
             (temperatures.shape, temperatures.dtype), ((4,), torch.float32)
         )
         self.assertEqual(top_ks.dtype, torch.int32)
-        self.assertEqual(probs.shape, (8, 8))
+        self.assertEqual((probs.shape, rows), ((8, 8), 2))
+        self.assertTrue(all(a is b for a, b in zip(filter_calls[0], outputs)))
 
     def test_pd_seed_reaches_decode_as_the_host_padded_input(self):
         """A PD decode server's prebuilt batch must carry the experimental input
