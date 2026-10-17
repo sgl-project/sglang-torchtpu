@@ -98,6 +98,7 @@ from sglang_tpu.experimental.speculative.spec_utils import (
     min_p_renorm_prob_tpu,
 )
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
+from sglang_tpu.sampler import TpuSampler
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -125,6 +126,12 @@ class TpuSpecWorker(BaseSpecWorker):
         if parallel.pp_size > 1:
             raise NotImplementedError("TpuSpecWorker does not support PP.")
         self._target_worker = target_worker
+        runner = target_worker.model_runner
+        if not isinstance(runner.sampler, TpuSampler):
+            # HOST_PADDED sampling params stay on host until TpuSampler uploads them
+            # (--sampling-backend pytorch builds a plain Sampler); with full logits
+            # TpuSampler samples exactly like that Sampler.
+            runner.sampler = TpuSampler()
         self._draft_worker = draft_worker
         self.num_drafts = num_drafts
         self.num_verify_rows = num_drafts + 1
