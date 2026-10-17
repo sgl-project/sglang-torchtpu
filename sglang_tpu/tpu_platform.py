@@ -1219,6 +1219,12 @@ class TpuSRTPlatform(SRTPlatform):
         rank_slice._load()
         traced_rank._load()
         _register_attention_backends()
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
+            from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
+
+            register_fp8_linear_small_m_op()
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:

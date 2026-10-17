@@ -65,6 +65,7 @@ CONFIG["runtime_env"].update(
         "SGLANG_OPT_USE_TILELANG_MHC_POST": "0",
         "SGLANG_OPT_FUSE_MHC_POST_PRE": "0",
         "SGLANG_TPU_ENABLE_GLM5_NEXT_FUSED_MHC": "1",
+        "SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL": "1",
     }
 )
 # libtpu >= 0.0.46 bug (#1137, fixed in 0.0.51): with large KV pools the fast-merge
