@@ -19,6 +19,7 @@ from sglang_tpu.hooks.attn_residual import (
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.kda_weights import bind_glm5_next_kda_weights
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -36,6 +37,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.hooks.spec_verify import fused_greedy_chain_verify
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,16 @@ HOOKS: list[tuple] = [
         "sglang.srt.layers.layer_boundary.residual.mhc.MHCState.__init__",
         wire_hc_ffn_post_pre,
         HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.speculative.eagle_utils.fused_greedy_chain_verify",
+        fused_greedy_chain_verify,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
+        bind_glm5_next_kda_weights,
+        HookType.AFTER,
     ),
     (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",

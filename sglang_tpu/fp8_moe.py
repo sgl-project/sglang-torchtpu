@@ -131,9 +131,12 @@ def _own_storage(t: torch.Tensor) -> torch.Tensor:
     ``base[:, None, None, :]`` on a contiguous ``[E, N]`` tensor is *already*
     contiguous, so ``.contiguous()`` returns the view unchanged and the
     parameter keeps the base's 2-D device buffer while declaring a 4-D shape.
-    torch_tpu then has to reconcile the two on every use.
+    torch_tpu then has to reconcile the two on every use. On torch_tpu 0.2 even
+    a device-side clone (or ``empty().copy_()``) of that shape is relaid out by
+    an ``execute_as_strided`` program at every compiled call; a buffer moved
+    from the host is not, so the copy goes through the host (load time only).
     """
-    return t if t._base is None else t.clone()
+    return t.cpu().to(t.device)
 
 
 def _to_tpu_fp8_moe_scale_layout(

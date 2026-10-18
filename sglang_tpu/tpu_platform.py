@@ -1272,7 +1272,7 @@ class TpuSRTPlatform(SRTPlatform):
         """Freeze torch.compile so serving-time recompiles raise.
 
         SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP also skips most guard checks (see
-        environ.py), except with speculative decoding or DP attention.
+        environ.py), except with DP attention.
         """
         from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
         from sglang_tpu.compilation.recompilation_checker import (
@@ -1285,14 +1285,6 @@ class TpuSRTPlatform(SRTPlatform):
             return
         speculative = get_spec().speculative_algorithm is not None
         skip_guard_eval = envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.get()
-        if skip_guard_eval and speculative:
-            # Draft / verify warmups have diverged from serving before; an
-            # unchecked divergence would run a stale graph silently.
-            logger.warning(
-                "Ignoring SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP with speculative "
-                "decoding."
-            )
-            skip_guard_eval = False
         if skip_guard_eval and get_parallel().enable_dp_attention:
             # Its traced code reads global state (gathered buffers, batch mode),
             # whose guards need not tell the warmed variants apart.
@@ -1313,6 +1305,16 @@ class TpuSRTPlatform(SRTPlatform):
                 "[tpu] Warmup complete; froze torch.compile via "
                 "set_stance('fail_on_recompile', skip_guard_eval_unsafe=True)."
             )
+            if speculative:
+                # Draft / verify warmups have diverged from serving before, and
+                # a divergence now runs a stale graph silently instead of
+                # raising. Validate a recipe with full guards first.
+                logger.warning(
+                    "[tpu] SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP with speculative "
+                    "decoding: serving shapes that warmup did not compile are no "
+                    "longer detected. Check the recipe with "
+                    "SGLANG_TPU_CHECK_RECOMPILATION=1 and the skip off."
+                )
             return
         torch.compiler.set_stance("fail_on_recompile")
         logger.info(

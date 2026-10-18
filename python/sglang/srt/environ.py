@@ -1937,8 +1937,9 @@ class Envs:
     # (e.g. a module global only one variant reads). SGLANG_TPU_CHECK_RECOMPILATION
     # sees neither. Applies to every Dynamo region in the process; frames
     # restored from a torch.compile bundle keep full guards, and the
-    # --tpu-compile-tracer direct decoder has none. Ignored with speculative
-    # decoding and DP attention.
+    # --tpu-compile-tracer direct decoder has none. Ignored with DP attention.
+    # With speculative decoding, set it only for recipes whose draft and verify
+    # shapes are fully warmed (e.g. GLM-5.3-Flash MTP).
     SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill

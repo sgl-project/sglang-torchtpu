@@ -22,9 +22,9 @@ import torch
 # Batch sizes the kernel serves; larger batches keep the sort.
 MAX_TOKENS = 64
 # Expert counts validated against biased_topk_impl on TPU: Kimi-K3 (top-16 of
-# 896). Other sigmoid routers (e.g. Kimi-K2.x with 384) keep the sort until
-# they are measured.
-VALIDATED_NUM_EXPERTS = frozenset({896})
+# 896) and GLM-5.3-Flash (top-8 of 288). Other sigmoid routers (e.g. Kimi-K2.x
+# with 384) keep the sort until they are measured.
+VALIDATED_NUM_EXPERTS = frozenset({288, 896})
 
 _OP: list = []
 _OP_LOCK = Lock()

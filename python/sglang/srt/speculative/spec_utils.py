@@ -1694,6 +1694,9 @@ def _verify_commit_step_indices(
     mamba-track interval-crossing step (-1 = no crossing; None when tracking
     is off)."""
     bs = accept_lens.shape[0]
+    if batch.mamba_track_indices is None and get_spec().speculative_eagle_topk == 1:
+        # A top-1 chain accepts a prefix: accept_index[i, a - 1] - i * W == a - 1.
+        return accept_lens - 1, None
     if accept_index.is_cuda:
         from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
             fused_commit_track_indices,

@@ -347,7 +347,16 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             skip_spec_op_precompile_without_draft,
         )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+        from sglang_tpu.hooks.spec_verify import fused_greedy_chain_verify
 
+        self.assertIn(
+            (
+                "sglang.srt.speculative.eagle_utils.fused_greedy_chain_verify",
+                fused_greedy_chain_verify,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
         self.assertIn(
             (
                 "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",

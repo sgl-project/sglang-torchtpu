@@ -64,6 +64,7 @@ def compiled_op(
     warmup: WarmupArgsFactory | None = None,
     model: torch.nn.Module | None = None,
     uses_rng: bool = False,
+    direct: bool = False,
 ):
     """Compile a tensor helper with the selected TPU tracer.
 
@@ -80,12 +81,23 @@ def compiled_op(
     Direct helper warmups compile without executing; the queue joins compilation
     futures without retaining example inputs. Dynamo warmups still execute to
     trigger tracing and compilation.
+
+    ``direct=True`` uses direct compilation even under the Dynamo tracer: a call
+    then costs a key lookup instead of Dynamo's frame evaluation and runtime
+    wrappers. Only for
+    pure helpers: direct compilation requires that ``fn`` mutates none of its
+    inputs and captures no tensors.
     """
 
     def decorator(fn):
         compiled_fn = None
         use_direct = False
         signature = inspect.signature(fn)
+        num_params = len(signature.parameters)
+        positional_only_ok = all(
+            p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            for p in signature.parameters.values()
+        )
 
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
@@ -96,16 +108,28 @@ def compiled_op(
                 or not envs.SGLANG_ENABLE_TORCH_COMPILE.get()
             ):
                 return fn(*args, **kwargs)
-            from jax import tree_util
+            if (
+                not kwargs
+                and positional_only_ok
+                and len(args) == num_params
+                and all(not isinstance(a, (list, tuple, dict)) for a in args)
+            ):
+                # Hot path: a full flat positional call already matches what
+                # bind() would produce, so canonicalize the leaves directly.
+                args = tuple(_canonical_tensor(a) for a in args)
+            else:
+                from jax import tree_util
 
-            # Bind to fn's signature: positional warmups and keyword callers share a key.
-            bound = signature.bind(*args, **kwargs)
-            bound.apply_defaults()
-            args, kwargs = tree_util.tree_map(
-                _canonical_tensor, (bound.args, bound.kwargs)
-            )
+                # Bind to fn's signature: positional warmups and keyword callers share a key.
+                bound = signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                args, kwargs = tree_util.tree_map(
+                    _canonical_tensor, (bound.args, bound.kwargs)
+                )
             if compiled_fn is None:
-                use_direct = get_exec().graph.tpu_compile_tracer == "direct"
+                use_direct = (
+                    direct and model is None
+                ) or get_exec().graph.tpu_compile_tracer == "direct"
                 if use_direct:
                     from sglang_tpu.compilation.direct_compile import (
                         direct_compile,

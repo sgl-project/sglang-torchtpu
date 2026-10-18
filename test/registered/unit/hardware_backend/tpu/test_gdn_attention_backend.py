@@ -48,6 +48,7 @@ class _BackendNoInit(TpuGDNAttnBackend):
     def __init__(self):  # noqa: D107  (deliberately skips super().__init__)
         self._distribution_cache = {}
         self._query_start_loc_cache = {}
+        self._slot_memo = None
         self._spec_window = 1
         self._read_offsets_pool = None
         self._read_offsets = None
@@ -126,6 +127,9 @@ class TestGDNSinglePassFlags(CustomTestCase):
             mamba2_layer_cache=lambda _: cache,
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
+            # Read by the slot-id memo (TpuGDNAttnBackend._slot_indices).
+            req_index_to_mamba_index_mapping=torch.zeros(1, dtype=torch.int32),
+            mamba_v2p_table=None,
         )
         batch = SimpleNamespace(
             seq_lens=torch.full((bs,), 5),
@@ -184,6 +188,9 @@ class TestGDNVerifyMetadata(CustomTestCase):
             mamba_pool=SimpleNamespace(select_checkpoints=Mock()),
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
+            # Read by the slot-id memo (TpuGDNAttnBackend._slot_indices).
+            req_index_to_mamba_index_mapping=torch.zeros(1, dtype=torch.int32),
+            mamba_v2p_table=None,
         )
         return backend
 
@@ -221,14 +228,14 @@ class TestGDNVerifyMetadata(CustomTestCase):
     def test_commit_selects_checkpoints_for_the_verified_slots(self):
         backend = self._backend(torch.zeros(3, dtype=torch.int32))
         steps = torch.tensor([1, -1])
-        # A DP pad slot (-1) maps to the null slot, which the pool keeps inert.
+        # A DP pad slot (-1) goes to the pool, which maps it to the inert null slot.
         backend.commit_verified_states(
             None, torch.tensor([2, -1]), steps, None, None, None
         )
         slots, got_steps = (
             backend.req_to_token_pool.mamba_pool.select_checkpoints.call_args.args
         )
-        self.assertEqual(slots.tolist(), [2, 0])
+        self.assertEqual(slots.tolist(), [2, -1])
         self.assertIs(got_steps, steps)
 
     def test_commit_rejects_radix_tracking(self):

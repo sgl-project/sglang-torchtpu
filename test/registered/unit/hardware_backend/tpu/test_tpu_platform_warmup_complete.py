@@ -91,7 +91,7 @@ class TestTpuWarmupCompleteStance(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("DP attention", warnings[0].getMessage())
 
-    def test_unsafe_guard_skip_is_ignored_with_speculative_decoding(self):
+    def test_unsafe_guard_skip_applies_with_speculative_decoding(self):
         self._publish_args(speculative_algorithm="EAGLE3")
         for allow_spec_recompile in (False, True):
             with self.subTest(allow_spec_recompile=allow_spec_recompile):
@@ -105,13 +105,12 @@ class TestTpuWarmupCompleteStance(unittest.TestCase):
                 if allow_spec_recompile:
                     set_stance.assert_not_called()
                 else:
-                    set_stance.assert_called_once_with("fail_on_recompile")
-                warnings = [r for r in logs.records if r.levelno == logging.WARNING]
-                self.assertEqual(len(warnings), 1)
-                self.assertIn(
-                    "Ignoring SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP",
-                    warnings[0].getMessage(),
-                )
+                    set_stance.assert_called_once_with(
+                        "fail_on_recompile", skip_guard_eval_unsafe=True
+                    )
+                    self.assertIn(
+                        "with speculative decoding", logs.records[-1].getMessage()
+                    )
 
     def test_mode_b_inherits_the_override(self):
         self.assertIs(

@@ -3497,6 +3497,20 @@ class TestSpecUnpadOutputs(_SpecPolicyTestCase):
         self.assertIsNone(unpadded[2])
         self.assertEqual(fb.batch_size, 2)
 
+    def test_final_draft_outputs_trim_flat_rows_by_draft_width(self):
+        # The fused top-1 draft returns positions / verify tokens flat,
+        # draft_token_num rows per request; per-request outputs keep one row.
+        policy = _make_spec_policy()
+        policy.draft_token_num = 3
+        fb = SimpleNamespace(_tpu_real_b=2, batch_size=4, spec_info=None)
+        outputs = (torch.arange(12), torch.arange(12).reshape(4, 3), torch.arange(4))
+
+        flat, per_req, rows = policy.finalize_spec_forward_batch(outputs, fb)
+
+        self.assertEqual(flat.tolist(), list(range(6)))
+        self.assertEqual(per_req.shape, (2, 3))
+        self.assertEqual(rows.tolist(), [0, 1])
+
     def test_final_draft_outputs_stay_padded_until_draft_loop_finishes(self):
         policy = _make_spec_policy()
         spec_info = SimpleNamespace(keep_outputs_padded=True)
