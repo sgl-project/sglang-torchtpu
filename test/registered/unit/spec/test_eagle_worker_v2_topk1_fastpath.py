@@ -387,6 +387,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             out_cache_loc=torch.arange(6, device=DEVICE),
             batch_size=2,
             seq_lens=torch.tensor([5, 10], device=DEVICE),
+            positions=None,
             is_prefill_only=True,
         )
         per_step_cache = torch.arange(4, device=DEVICE).reshape(2, 2)
@@ -403,7 +404,8 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         ):
             tree = worker._fused_draft_forward(forward_batch)
 
-        self.assertEqual(tree[-1].tolist(), [[7, 0, 1, 2], [8, 0, 1, 2]])
+        # Verify tokens come back flat, W per request.
+        self.assertEqual(tree[-1].tolist(), [7, 0, 1, 2, 8, 0, 1, 2])
         self.assertIsNone(spec_info.rpa_draft_kv_lens)
         self.assertEqual(observed_prefill_only, [False])
         self.assertTrue(forward_batch.is_prefill_only)

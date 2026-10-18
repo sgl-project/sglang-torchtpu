@@ -32,7 +32,7 @@ class TestTpuWarmupCompleteStance(unittest.TestCase):
         override = get_context().override_server_args(
             enable_torch_compile=True,
             speculative_algorithm=speculative_algorithm,
-            enable_dp_attention=enable_dp_attention,
+            attn_dp_size=2 if enable_dp_attention else 1,
         )
         override.install()
         self.addCleanup(override.restore)

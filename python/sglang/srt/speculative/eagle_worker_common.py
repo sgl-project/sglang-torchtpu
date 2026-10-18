@@ -189,7 +189,7 @@ def prepare_for_draft_extend(
     extend_position_info = None
     if (
         not widen
-        and draft_extend_input.positions is not None
+        and getattr(draft_extend_input, "positions", None) is not None
         and not batch.forward_mode.is_idle()
     ):
         # Uniform window with known positions: hand init_new the layout so it

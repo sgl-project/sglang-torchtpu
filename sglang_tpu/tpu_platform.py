@@ -1285,7 +1285,7 @@ class TpuSRTPlatform(SRTPlatform):
             return
         speculative = get_spec().speculative_algorithm is not None
         skip_guard_eval = envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.get()
-        if skip_guard_eval and get_parallel().enable_dp_attention:
+        if skip_guard_eval and get_parallel().attn_dp_size > 1:
             # Its traced code reads global state (gathered buffers, batch mode),
             # whose guards need not tell the warmed variants apart.
             logger.warning(
