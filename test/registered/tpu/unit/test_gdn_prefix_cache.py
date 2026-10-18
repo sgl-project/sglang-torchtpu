@@ -330,9 +330,14 @@ class TestGDNPrefixCache(CustomTestCase):
         backend._mamba_chunk_size = 64
         backend._extra_buffer_enabled = True
         backend._spec_window = 1
+        backend._slot_memo = None
         backend.req_to_token_pool = SimpleNamespace(
             get_mamba_indices=lambda x: x,
             translate_mamba_indices=lambda x: x,
+            req_index_to_mamba_index_mapping=torch.arange(
+                4, dtype=torch.int32, device="tpu"
+            ),
+            mamba_v2p_table=None,
         )
 
         def t(x, dtype=torch.int64):
