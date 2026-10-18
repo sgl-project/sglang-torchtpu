@@ -53,6 +53,12 @@ class TpuEnvs:
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
 
+    # P/D /health_generate: 503 once held requests produced nothing for WINDOW
+    # seconds; COLD_WINDOW applies until the first output after start.
+    SGLANG_TPU_PD_HEALTH_READINESS_ENABLED = EnvBool(True)
+    SGLANG_TPU_PD_HEALTH_WINDOW_S = EnvFloat(600.0)
+    SGLANG_TPU_PD_HEALTH_COLD_WINDOW_S = EnvFloat(1200.0)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

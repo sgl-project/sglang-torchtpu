@@ -741,9 +741,10 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
-        from sglang_tpu.patches import _prepare_tpu_env
+        from sglang_tpu.patches import _prepare_tpu_env, apply_tpu_http_patches
 
         cfg = resolving_view(server_args)
+        apply_tpu_http_patches(disaggregation_mode=cfg.disaggregation_mode)
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
