@@ -2,8 +2,7 @@
 
 All TPU-only code of `sglang-torchtpu` lives in this package (dist `sglang-tpu`).
 The sglang fork in `python/` shrinks toward a pinned upstream commit as its TPU
-edits move here or go upstream as seams. The plan is `plugin-refactor-proposal.md`
-(the launch-plan doc set); this file is the operational summary.
+edits move here or go upstream as seams. This file is the operational summary.
 
 ## Install
 
