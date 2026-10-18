@@ -204,10 +204,8 @@ class TestDeviceAcceptCacheSelection(CustomTestCase):
                 expected = _select_device_accept_cache_locs(
                     candidates, accept, width=width
                 )
-                selected, draft, per_step, verify = (
-                    select_device_accept_windows_tpu.__wrapped__(
-                        candidates, accept, width - 1
-                    )
+                selected, draft, per_step, verify = select_device_accept_windows_tpu(
+                    candidates, accept, width - 1
                 )
                 self.assertTrue(torch.equal(selected, expected))
                 self.assertTrue(

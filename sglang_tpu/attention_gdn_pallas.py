@@ -628,7 +628,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
                 "prefix cache."
             )
         self.req_to_token_pool.mamba_pool.select_checkpoints(
-            state_indices_tensor, last_correct_step_indices
+            state_indices_tensor.clamp(min=0), last_correct_step_indices
         )
 
     def _run(

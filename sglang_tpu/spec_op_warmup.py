@@ -81,28 +81,6 @@ def make_greedy_verify_chain_args(
     )
 
 
-def make_device_accept_select_args(
-    context: SpecOpWarmupContext,
-) -> tuple:
-    width = context.num_verify_tokens
-    return (
-        torch.zeros(
-            (context.physical_bs, 2 * width - 1),
-            dtype=torch.int64,
-            device=context.device,
-        ),
-        torch.ones((context.physical_bs,), dtype=torch.int32, device=context.device),
-        width - 1,  # draft steps of a top-1 chain
-    )
-
-
-def make_verify_kv_lens_args(context: SpecOpWarmupContext) -> tuple:
-    return (
-        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
-        context.num_verify_tokens,
-    )
-
-
 def make_verify_bookkeeping_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor, ...]:

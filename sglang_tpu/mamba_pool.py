@@ -37,7 +37,6 @@ from typing import List, Optional
 import msgspec
 import torch
 
-from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.configs.mamba_utils import (
     BaseLinearStateParams,
     KimiLinearStateShape,
@@ -48,18 +47,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 GB = 1024**3
-
-
-@compiled_op(direct=True)
-def _committed_read_offsets(read_offsets, indices, steps):
-    """(int64 slots, int32 read offsets) to commit after a verify, in one launch
-    instead of about seven eager ones per speculative round. Pad slots (-1)
-    clamp to the null slot; negative steps (inactive requests) and the null
-    slot keep their previous offset."""
-    indices = indices.clamp(min=0).to(torch.int64)
-    steps = steps.to(torch.int32)
-    previous = read_offsets.index_select(0, indices)
-    return indices, torch.where((indices > 0) & (steps >= 0), steps, previous)
 
 
 class TpuPerLayerState(msgspec.Struct, frozen=True):
@@ -252,11 +239,11 @@ class TpuMambaPool(MambaPool):
         """Record the state after the final accepted verify input, without copying HBM."""
         if self.checkpoint_read_offsets is None:
             raise RuntimeError("GDN checkpoint storage was not allocated")
-        indices, offsets = _committed_read_offsets(
-            self.checkpoint_read_offsets,
-            indices.to(self.device),
-            last_correct_step_indices.to(self.device),
-        )
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        offsets = last_correct_step_indices.to(device=self.device, dtype=torch.int32)
+        previous = self.checkpoint_read_offsets.index_select(0, indices)
+        # Negative steps denote inactive requests. The null slot stays inert.
+        offsets = torch.where((indices > 0) & (offsets >= 0), offsets, previous)
         self.checkpoint_read_offsets.index_copy_(0, indices, offsets)
 
     def clear_slots(self, indices: torch.Tensor):

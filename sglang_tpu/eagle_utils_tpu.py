@@ -13,10 +13,8 @@ from sglang_tpu.spec_op_warmup import (
     SIM_FIXED,
     SIM_OFF,
     SIM_REAL,
-    make_device_accept_select_args,
     make_draft_extend_select_args,
     make_greedy_verify_chain_args,
-    make_verify_kv_lens_args,
 )
 
 if TYPE_CHECKING:
@@ -352,7 +350,6 @@ class DeviceAcceptLayouts(NamedTuple):
     verify_kv_lens: Optional[torch.Tensor] = None
 
 
-@compiled_op(warmup=make_device_accept_select_args, direct=True)
 def select_device_accept_windows_tpu(
     candidate_locs: torch.Tensor,  # [bs, 2 * width - 1]
     accept_lens: torch.Tensor,  # [bs]
@@ -362,7 +359,8 @@ def select_device_accept_windows_tpu(
 
     Readers consumed slices, reshapes and a transpose of the window, each
     materialized by its own launch; returning dense tensors removes them.
-    Returns (selected [bs, width], draft flat, draft per step, verify flat).
+    Eager: it runs at the live request count, which the bucketed spec-op
+    warmup does not cover. Returns (selected [bs, width], draft flat, draft per step, verify flat).
     """
     width = (candidate_locs.shape[1] + 1) // 2
     offsets = torch.arange(width, device=candidate_locs.device, dtype=torch.int64)
@@ -377,7 +375,6 @@ def select_device_accept_windows_tpu(
     )
 
 
-@compiled_op(warmup=make_verify_kv_lens_args, direct=True)
 def verify_kv_lens_tpu(seq_lens: torch.Tensor, width: int) -> torch.Tensor:
     return (seq_lens + width).to(torch.int32)
 
