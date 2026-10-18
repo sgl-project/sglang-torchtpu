@@ -70,9 +70,11 @@ def make_greedy_verify_chain_args(
             device=context.device,
         ),
         torch.zeros((num_verify_rows,), dtype=torch.int64, device=context.device),
-        torch.arange(num_verify_rows, dtype=torch.int64, device=context.device).view(
-            context.physical_bs, context.num_verify_tokens
-        ),
+        # Built on the host: a device view of a 1-D arange keeps the 1-D
+        # buffer layout, so every call would relayout it.
+        torch.arange(num_verify_rows, dtype=torch.int64)
+        .view(context.physical_bs, context.num_verify_tokens)
+        .to(context.device),
         torch.ones((1,), dtype=torch.int32, device=context.device),
         torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
         simulate_mode,
