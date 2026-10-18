@@ -149,10 +149,9 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
         or published.indices is not indices
         # Only the EAGLE/EAGLE3 (incl. NEXTN MTP) topk-1 decode path keeps
         # acceptance on device; FROZEN_KV_MTP is not scheduled this way.
-        or future_map.spec_algo
-        not in (
-            SpeculativeAlgorithm.EAGLE,
-            SpeculativeAlgorithm.EAGLE3,
+        or not (
+            future_map.spec_algo.is_eagle3()
+            or future_map.spec_algo == SpeculativeAlgorithm.EAGLE
         )
         or payload.topk_index is None
         or payload.topk_index.shape[1] != 1

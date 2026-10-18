@@ -404,8 +404,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         ):
             tree = worker._fused_draft_forward(forward_batch)
 
-        # Verify tokens come back flat, W per request.
-        self.assertEqual(tree[-1].tolist(), [7, 0, 1, 2, 8, 0, 1, 2])
+        self.assertEqual(tree[-1].tolist(), [[7, 0, 1, 2], [8, 0, 1, 2]])
         self.assertIsNone(spec_info.rpa_draft_kv_lens)
         self.assertEqual(observed_prefill_only, [False])
         self.assertTrue(forward_batch.is_prefill_only)

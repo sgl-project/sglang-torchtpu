@@ -136,7 +136,7 @@ def _own_storage(t: torch.Tensor) -> torch.Tensor:
     an ``execute_as_strided`` program at every compiled call; a buffer moved
     from the host is not, so the copy goes through the host (load time only).
     """
-    return t.cpu().to(t.device)
+    return t.detach().to("cpu", copy=True).to(t.device)
 
 
 def _to_tpu_fp8_moe_scale_layout(
