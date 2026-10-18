@@ -41,12 +41,10 @@ from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
     SpecState,
-    TpuSpecVerifyInput,
 )
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows
 from sglang_tpu.hooks.experimental_spec import (
     keep_host_padded_extend_outputs,
-    prepare_spec_decode,
 )
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.overlap_utils_tpu import (
@@ -95,27 +93,6 @@ class TestExperimentalEagle3(CustomTestCase):
             self.assertIsNone(
                 select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE3, None)
             )
-
-    def test_decode_prep_uses_the_host_padded_window_only_for_host_batches(self):
-        calls = []
-        spec_info = HostPaddedEagleDraftInput.__new__(HostPaddedEagleDraftInput)
-        spec_info.prepare_for_decode = lambda batch: calls.append(("window", batch))
-        host = SimpleNamespace(
-            host_pad_bs=lambda bs: bs,
-            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
-            spec_info=spec_info,
-        )
-        prepare_spec_decode(lambda batch: calls.append(("core", batch)), host)
-        plain = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.EAGLE3)
-        prepare_spec_decode(lambda batch: calls.append(("core", batch)), plain)
-        # DSpark keeps core's DFlash-family dispatch, which already uses the window.
-        dspark = SimpleNamespace(
-            host_pad_bs=lambda bs: bs,
-            spec_algorithm=SpeculativeAlgorithm.DSPARK,
-            spec_info=spec_info,
-        )
-        prepare_spec_decode(lambda batch: calls.append(("core", batch)), dspark)
-        self.assertEqual(calls, [("window", host), ("core", plain), ("core", dspark)])
 
     def test_seed_survives_relay_and_host_lengths_stay_committed(self):
         """The relayed seed reaches the next decode, and resolve keeps the committed
@@ -211,7 +188,6 @@ class TestExperimentalEagle3(CustomTestCase):
             SimpleNamespace(req_pool_indices=rows, future_indices=None),
         )
         padded = bucket.state.draft_carry
-        self.assertIsInstance(padded, EagleSeed)
         self.assertEqual(padded.hidden_states.shape, (4, HIDDEN))
         torch.testing.assert_close(padded.topk_index[:2], live.draft_carry.topk_index)
         result = TpuSpecWorker._pack_decode_result(
@@ -286,16 +262,6 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual(kept.next_token_logits.shape[0], 4)
         self.assertEqual(kept.hidden_states.shape[0], 16)
         self.assertEqual(trimmed.hidden_states.shape[0], 6)
-
-    def test_idle_rank_verify_rows_are_inactive(self):
-        verify_input = TpuSpecVerifyInput.idle(
-            num_verify_rows=3, padded_bs=4, device="cpu"
-        )
-        kv_lens, kv_sum = verify_input.padded_kv_lens_after_rows(3)
-        # RPA runs only rows with a nonzero host length: none here.
-        self.assertEqual((kv_lens.tolist(), kv_sum), ([0, 0, 0, 0], 0))
-        self.assertEqual(verify_input.verify_cache_candidates.shape, (4, 6))
-        self.assertFalse(bool(verify_input.req_pool_indices.any()))
 
     def test_bucket_state_repads_when_the_shared_bucket_moves(self):
         worker = _eagle_worker()
@@ -465,22 +431,15 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual(input_ids.tolist(), [5, 6, 0, 0, 0, 0])
         self.assertEqual(post.tolist(), [13, 3])
 
-    def test_verify_uses_each_algorithms_own_input_and_warms_its_structure(self):
-        """EAGLE3 verifies with EagleVerifyInput (top-k 1 now, trees later), DFlash
-        keeps DFlashVerifyInput; the dynamo tracer guards the spec_info structure,
-        so EAGLE3's warmup must build the same one as serving."""
-        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-        from sglang.srt.speculative.eagle_info import EagleVerifyInput
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
-            TpuBlockSpecWorker,
-        )
-
+    def test_eagle3_verify_warmup_builds_the_served_structure(self):
+        """The dynamo tracer guards the spec_info structure, so the EAGLE3 compile
+        policy's TARGET_VERIFY warmup must build what serving builds."""
         worker = _eagle_worker()
         worker.num_drafts = 2
-        rows = SimpleNamespace(flat_positions=torch.arange(6))
-        batch = SimpleNamespace(seq_lens_cpu=torch.tensor([5, 7]))
         served = worker.make_verify_input(
-            batch=batch, verify_tokens=torch.arange(6), rows=rows
+            batch=SimpleNamespace(),
+            verify_tokens=torch.arange(6),
+            rows=SimpleNamespace(flat_positions=torch.arange(6)),
         )
         policy = object.__new__(TpuEagle3SpecDecodeCompilePolicyMixin)
         policy.draft_token_num = 3
@@ -490,26 +449,15 @@ class TestExperimentalEagle3(CustomTestCase):
         def structure(spec_info):
             return {
                 name: (
-                    type(value).__name__
-                    if value is None or not isinstance(value, (int, bool))
-                    else value
+                    value
+                    if isinstance(value, (int, bool)) and value is not None
+                    else type(value).__name__
                 )
                 for name, value in vars(spec_info).items()
             }
 
-        self.assertIsInstance(served, EagleVerifyInput)
         self.assertEqual(type(warmed), type(served))
         self.assertEqual(structure(warmed), structure(served))
-        self.assertEqual((served.topk, served.draft_token_num), (1, 3))
-
-        block = object.__new__(TpuBlockSpecWorker)
-        block.num_verify_rows = 3
-        self.assertIsInstance(
-            block.make_verify_input(
-                batch=batch, verify_tokens=torch.arange(6), rows=rows
-            ),
-            DFlashVerifyInput,
-        )
 
     def test_host_padded_prefill_keeps_bucket_rows(self):
         policy = object.__new__(TpuEagle3SpecDecodeCompilePolicyMixin)

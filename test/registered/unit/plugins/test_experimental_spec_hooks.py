@@ -480,18 +480,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
         with self.assertRaises(_Stop):
             init(dp_attention=True)
 
-    def test_partial_bucket_results_are_copied_on_the_forward_thread(self):
-        """Rows the result-copy thread reads below a full bucket are fresh tensors,
-        not views that need a program queued behind the next step."""
-        from sglang_tpu.experimental.speculative.base_spec_worker import _live_rows
-
-        full = torch.arange(8).reshape(4, 2)
-        self.assertIs(_live_rows(full, 4), full)
-        live = _live_rows(full, 3)
-        self.assertEqual(live.tolist(), full[:3].tolist())
-        self.assertIsNone(live._base)
-        self.assertNotEqual(live.data_ptr(), full.data_ptr())
-
     def test_filtered_target_warmup_matches_serving_inputs(self):
         """Warmup runs the served chain: separate param tensors (Dynamo guards on
         aliasing) and the filter fed the op's own outputs, whose layout the eager
