@@ -110,7 +110,7 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
                 "speculative_num_steps": 3,
                 "speculative_eagle_topk": 1,
                 "speculative_num_draft_tokens": 4,
-                "disable_overlap_schedule": True,
+                "disable_overlap_schedule": False,
                 "disable_radix_cache": True,
                 "context_length": 512,
                 "max_total_tokens": 512,
