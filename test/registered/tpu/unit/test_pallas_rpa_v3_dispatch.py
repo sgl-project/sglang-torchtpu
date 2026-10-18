@@ -26,7 +26,7 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -107,24 +107,34 @@ class TestBatchedRpaSpecBackend(CustomTestCase):
         )
 
     def test_decode_backend_registered(self):
+        from sglang.srt.layers.attention.attention_registry import (
+            DRAFT_ATTENTION_BACKENDS,
+        )
+
         factory = self._factory()
         expected = types.SimpleNamespace(attn_backends=[])
-        with patch.object(
-            factory,
-            "_create_tpu_pallas_rpa_batched_decode_backend",
-            return_value=("tpu_pallas_rpa_batched", expected),
-        ):
+        create = Mock(return_value=expected)
+        with patch.dict(DRAFT_ATTENTION_BACKENDS, {"pallas_tpu_rpa_batched": create}):
             self.assertIs(factory.create_decode_backend(), expected)
+        create.assert_called_once_with(
+            runner=factory.draft_model_runner, topk=1, speculative_num_steps=3
+        )
 
     def test_draft_extend_backend_registered(self):
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
+            DRAFT_ATTENTION_BACKENDS,
+        )
+
         factory = self._factory()
         expected = types.SimpleNamespace(attn_backends=[])
-        with patch.object(
-            factory,
-            "_create_tpu_pallas_rpa_batched_prefill_backend",
-            return_value=("tpu_pallas_rpa_batched", expected),
+        create = Mock(return_value=expected)
+        with (
+            patch.dict(DRAFT_ATTENTION_BACKENDS, {"pallas_tpu_rpa_batched": Mock()}),
+            patch.dict(ATTENTION_BACKENDS, {"pallas_tpu_rpa_batched": create}),
         ):
             self.assertIs(factory.create_draft_extend_backend(), expected)
+        create.assert_called_once_with(factory.draft_model_runner)
 
 
 if __name__ == "__main__":

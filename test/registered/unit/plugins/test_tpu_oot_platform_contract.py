@@ -215,14 +215,17 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         """DSPARK is in flight; delete this test when it is tested on TPU."""
         self.assertFalse(self.platform.supports_speculative_algorithm("DSPARK"))
 
-    def test_claimed_draft_backends_are_registered_by_draft_utils(self):
+    def test_claimed_draft_backends_are_registered(self):
         from sglang_tpu.platform import _SUPPORTED_DRAFT_ATTENTION_BACKENDS
 
-        missing = _SUPPORTED_DRAFT_ATTENTION_BACKENDS - self._draft_backend_keys()
+        missing = _SUPPORTED_DRAFT_ATTENTION_BACKENDS - (
+            self._draft_backend_keys() | self._registered_draft_backends()
+        )
         self.assertEqual(
             missing,
             set(),
-            f"claimed draft backends draft_utils does not register: {sorted(missing)}",
+            "claimed draft backends neither draft_utils nor the plugin's draft "
+            f"registry provides: {sorted(missing)}",
         )
 
     def test_default_draft_backend_matches_the_core_default(self):
@@ -334,11 +337,23 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             prepare_attn_residual_kernel,
             register_attn_residual_ops,
         )
+        from sglang_tpu.hooks.moe_topk import (
+            biased_grouped_topk,
+            biased_topk,
+            register_router_topk,
+        )
         from sglang_tpu.hooks.pipeline_parallel import (
             check_pipeline_parallel_compat,
             skip_spec_op_precompile_without_draft,
         )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+        from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
+        from sglang_tpu.hooks.twolevel_allreduce import (
+            all_reduce as twolevel_all_reduce,
+        )
+        from sglang_tpu.hooks.twolevel_allreduce import (
+            merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
+        )
 
         self.assertIn(
             (
@@ -362,6 +377,54 @@ class TestTpuOOTPlatformContract(CustomTestCase):
                 "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
                 skip_spec_op_precompile_without_draft,
                 HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
+                twolevel_all_reduce,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
+                twolevel_merged_moe_all_reduce,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.TopK.__init__",
+                register_router_topk,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.biased_topk_impl",
+                biased_topk,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.biased_grouped_topk_impl",
+                biased_grouped_topk,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+                bind_kimi_k3_static_fp8,
+                HookType.AFTER,
             ),
             HOOKS,
         )
@@ -404,6 +467,23 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         path = os.path.join(_REPO_ROOT, "python", "sglang", "srt", relpath)
         with open(path, "r", encoding="utf-8") as handle:
             return handle.read()
+
+    def _registered_draft_backends(self) -> set:
+        """Names sglang_tpu registers with register_draft_attention_backend."""
+        path = os.path.join(_REPO_ROOT, "sglang_tpu", "tpu_platform.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        names = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "register_draft_attention_backend"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                names.add(node.args[0].value)
+        return names
 
     def _draft_backend_keys(self) -> set:
         """Dispatch-dict keys in speculative/draft_utils.py, parsed not imported."""

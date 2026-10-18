@@ -83,6 +83,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     RoomFailed,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
@@ -194,6 +195,11 @@ class RaidenKVManager(
         )
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
+        self._transfer_parallelism = (
+            tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.get()
+        )
+        if self._transfer_parallelism < 1:
+            raise ValueError("SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM must be >= 1")
         # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
         # built in this process. Store the resolved value back so later reads
         # do not mistake the variable set here for the deprecated alias.
@@ -400,19 +406,21 @@ class RaidenKVManager(
             max_blocks=max_blocks,
             num_slots=num_slots,
             timeout_s=self._timeout_s,
+            parallelism=self._transfer_parallelism,
         )
         self._full_engine_max_blocks = max_blocks
         pool_pages = num_slots * max_blocks
         swa_pool_pages = None
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
-            "num_slots=%d pool_pages=%d chunked=%d",
+            "num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
             self.attn_tp_rank,
             self.raiden_endpoint,
             max_blocks,
             num_slots,
             pool_pages,
             int(self.chunked_transfer),
+            self._transfer_parallelism,
         )
         if self._swa_kv_caches:
             self.swa_raiden_endpoint = NetworkAddress(
@@ -427,6 +435,7 @@ class RaidenKVManager(
                 max_blocks=swa_max_blocks,
                 num_slots=swa_num_slots,
                 timeout_s=self._timeout_s,
+                parallelism=self._transfer_parallelism,
             )
             self._swa_engine_max_blocks = swa_max_blocks
             swa_pool_pages = swa_num_slots * swa_max_blocks

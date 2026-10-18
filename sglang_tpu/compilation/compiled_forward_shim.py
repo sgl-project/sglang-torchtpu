@@ -1213,7 +1213,12 @@ class CompiledForwardShim:
                 ]
         if mm_embeds is not None:
             real_q = getattr(forward_batch, _REAL_Q_KEY, None)
-            if not keep_padded and real_q is not None and mm_embeds.shape[0] > real_q:
+            if (
+                not keep_padded
+                and real_q is not None
+                and mm_embeds.shape[0] > real_q
+                and not self.policy.keeps_padded_mm_embeds(forward_batch)
+            ):
                 mm_embeds = mm_embeds[:real_q]
             forward_batch.mm_input_embeds = mm_embeds
 

@@ -2,9 +2,11 @@
 
 draft: d_j ~ softmax(lm_head(h_j) / T) independently per row, so q_j is that
        softmax; greedy drafts are the in-graph argmax (sample_draft_tokens_tpu).
+DFlash2 instead walks its candidate selector (models/dflash2.py): q_j is the
+       softmax over the K candidates of the row d_{j-1} selects, -inf elsewhere.
 
-Not supported: DFlash2 candidate selector, LiLiCorr, Domino projector and
-trained mask embeddings (mask_embedding.pt).
+Not supported: LiLiCorr, Domino projector and trained mask embeddings
+(mask_embedding.pt).
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from torch import nn
 
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.models.dflash import DFlash2DraftModel, DFlashDraftModel
 from sglang.srt.models.dspark import (
     DSparkDraftModel,
     gather_and_crop_vocab,
@@ -29,6 +31,9 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang_tpu.experimental.compilation.block_compile_policy import block_draft_width
+from sglang_tpu.experimental.models.dflash2 import (
+    sample_drafts as sample_dflash2_drafts,
+)
 from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftSampler,
     TpuBlockDraftWorker,
@@ -76,12 +81,19 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
         bonus_tokens: torch.Tensor,
         sampler: DraftSampler,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del bonus_tokens
         # Row 0 is the root; draft_hidden[:, j - 1] predicts d_j at position n + j.
-        bs = block_hidden.shape[0]
-        draft_hidden = block_hidden[:, 1:].reshape(bs * self.num_drafts, -1)
         lm_head = self._dflash_model.lm_head
         assert lm_head is not None
+        if isinstance(self._dflash_model, DFlash2DraftModel):
+            return sample_dflash2_drafts(
+                draft_model=self._dflash_model,
+                draft_hidden=block_hidden[:, 1:],
+                anchor_tokens=bonus_tokens,
+                vocab_size=int(lm_head.org_vocab_size),
+                sampler=sampler,
+            )
+        bs = block_hidden.shape[0]
+        draft_hidden = block_hidden[:, 1:].reshape(bs * self.num_drafts, -1)
         with torch.no_grad():
             draft_logits = gather_and_crop_vocab(
                 project_through_lm_head(draft_hidden, lm_head), lm_head
@@ -96,8 +108,6 @@ def _check_supported(
     *, draft_model: DFlashDraftModel, draft_config: DFlashDraftConfig
 ) -> None:
     # Core's TPU DFlash bypasses these silently; reject them instead.
-    if draft_model.candidate_selector is not None:
-        raise NotImplementedError("TpuDflashDraftWorker does not support DFlash2.")
     if draft_model.lilicorr is not None:
         raise NotImplementedError("TpuDflashDraftWorker does not support LiLiCorr.")
     if draft_config.is_domino:

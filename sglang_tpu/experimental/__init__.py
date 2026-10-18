@@ -15,6 +15,11 @@ def register_host_batch_padder(padder: Callable[[int], int]) -> None:
     _host_batch_padder = padder
 
 
+def uses_host_batch(batch) -> bool:
+    """Whether batch is a HOST_PADDED TpuSpecWorker batch (the init_new hook set its padder)."""
+    return getattr(batch, "host_pad_bs", None) is not None
+
+
 def get_host_batch_padder() -> Callable[[int], int]:
     assert _host_batch_padder is not None, "TpuSpecWorker has not registered a padder"
     return _host_batch_padder
@@ -31,3 +36,15 @@ def experimental_spec_enabled() -> bool:
 def is_experimental_spec_worker(spec_algorithm: SpeculativeAlgorithm) -> bool:
     """Whether DFLASH/DSPARK is served by sglang_tpu.experimental.TpuBlockSpecWorker."""
     return spec_algorithm.is_dflash_family() and experimental_spec_enabled()
+
+
+def is_experimental_eagle3(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    """Whether EAGLE3 is served by sglang_tpu.experimental.TpuEagle3Worker."""
+    return spec_algorithm.is_eagle3() and experimental_spec_enabled()
+
+
+def is_experimental_spec(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    """Whether a TpuSpecWorker serves this algorithm (host-padded batches)."""
+    return is_experimental_spec_worker(spec_algorithm) or is_experimental_eagle3(
+        spec_algorithm
+    )

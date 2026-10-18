@@ -1,0 +1,350 @@
+# Release the TPU image and wheels.
+#
+#   build -> smoke (TPU) -> scan -> wheels ─┬─> publish-image (approval) ─> release
+#                                           └─> release (draft, target=none)
+#
+# The image that passed smoke and scan is the one published: publish-image copies
+# that digest from the private CI registry to Docker Hub instead of rebuilding.
+#
+# `target` picks how far a run goes:
+#   none     build, smoke, scan, wheels; draft GitHub Release. Nothing leaves the
+#            private registry, so this needs no Docker Hub credential.
+#   staging  also copies the image to lmsysorg/sglang-staging; draft Release.
+#   prod     copies the image to lmsysorg/sglang; published Release.
+#
+# Wheels go to the GitHub Release, not PyPI: the fork's sglang cannot take the
+# `sglang` name there, and sglang-tpu alone would pull upstream sglang from PyPI.
+name: Release (TPU)
+run-name: "Release (TPU) v${{ inputs.version }}-tpu [${{ inputs.target }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to release"
+        required: true
+        default: main
+      version:
+        description: "Upstream sglang version this tree tracks, e.g. 0.5.22 (image tag becomes v0.5.22-tpu)"
+        required: true
+      target:
+        description: "none = dry run (private only), staging = lmsysorg/sglang-staging, prod = lmsysorg/sglang"
+        required: true
+        default: none
+        type: choice
+        options: [none, staging, prod]
+      allow_vulnerabilities:
+        description: "Publish even if the scan finds fixable CRITICAL vulnerabilities"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tpu-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: sglang-torchtpu
+  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
+  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+  CRANE_VERSION: v0.20.2
+  # Trivy removes old releases (0.56.2 is gone); bump both together.
+  TRIVY_VERSION: 0.75.0
+  TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+
+jobs:
+  resolve:
+    if: github.repository == 'sgl-project/sglang-torchtpu'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      version: ${{ steps.r.outputs.version }}
+      image_tag: ${{ steps.r.outputs.image_tag }}
+      image_repo: ${{ steps.r.outputs.image_repo }}
+      release_tag: ${{ steps.r.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - id: r
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_TARGET: ${{ inputs.target }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          version="${IN_VERSION#v}"
+          # X.Y.Z or X.Y.Z.postN, the forms upstream release tags use.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
+            echo "::error::version must look like 0.5.22 or 0.5.22.post1, got '$IN_VERSION'"
+            exit 1
+          fi
+          case "$IN_TARGET" in
+            prod)    image_repo=lmsysorg/sglang ;;
+            staging) image_repo=lmsysorg/sglang-staging ;;
+            *)       image_repo="" ;;
+          esac
+          # `tpu-` keeps the git tag clear of the upstream v* tags synced into this repo.
+          if [ "$IN_TARGET" = prod ]; then
+            release_tag="tpu-v${version}"
+          else
+            release_tag="tpu-v${version}-${IN_TARGET}.${RUN_ID}"
+          fi
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "version=${version}"
+            echo "image_tag=v${version}-tpu"
+            echo "image_repo=${image_repo}"
+            echo "release_tag=${release_tag}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $(git rev-parse HEAD) as v${version}-tpu (target: ${IN_TARGET})"
+
+  build:
+    needs: resolve
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      version: ${{ needs.resolve.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Serve Qwen3-0.6B through the out-of-tree plugin path (SGLANG_PLATFORM=tpu_oot),
+  # which is how the published image is meant to be used.
+  smoke:
+    needs: [resolve, build]
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: stage-b-test-tpu-4-v7
+      test_file: test/registered/tpu/e2e/test_tpu_qwen3_0_6b_singlehost_smoke.py
+      platform: tpu_oot
+      weights_pvc: model-weights
+      run_name: release-smoke
+      display_name: release-smoke
+    permissions:
+      contents: read
+      id-token: write
+
+  scan:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_SA }}
+          token_format: access_token
+          create_credentials_file: false
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tarball}"
+          echo "${TRIVY_SHA256}  ${tarball}" | sha256sum -c -
+          sudo tar -xzf "${tarball}" -C /usr/local/bin trivy
+          trivy --version
+      - name: Scan image
+        env:
+          IMAGE: ${{ needs.build.outputs.digest }}
+          TRIVY_USERNAME: oauth2accesstoken
+          TRIVY_PASSWORD: ${{ steps.auth.outputs.access_token }}
+          ALLOW: ${{ inputs.allow_vulnerabilities }}
+        run: |
+          set -euo pipefail
+          # Full report for the record; the gate below only counts what a fix exists for.
+          trivy image --quiet --scanners vuln --severity HIGH,CRITICAL \
+            --format table --output trivy.txt "$IMAGE"
+          { echo '### Trivy (HIGH, CRITICAL)'; echo '```'; head -c 60000 trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if ! trivy image --quiet --scanners vuln --severity CRITICAL --ignore-unfixed \
+                 --exit-code 1 --format table "$IMAGE"; then
+            if [ "$ALLOW" = true ]; then
+              echo "::warning::fixable CRITICAL vulnerabilities found; continuing (allow_vulnerabilities)"
+            else
+              echo "::error::fixable CRITICAL vulnerabilities found; see the summary"
+              exit 1
+            fi
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy.txt
+          if-no-files-found: ignore
+
+  wheels:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sglang (fork) and sglang-tpu
+        env:
+          # Both packages read their version from setuptools-scm; pin it so the pair matches.
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet build
+          mkdir -p dist
+          # Same manifest swap as docker/tpu.Dockerfile: the TPU dependency set.
+          cp python/pyproject_tpu.toml python/pyproject.toml
+          cp README.md LICENSE python/
+          python -m build --wheel --outdir dist python
+          python -m build --wheel --outdir dist .
+          ls -l dist
+      - name: Check the wheels
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Pure-Python wheels: the TPU manifest builds no Rust extensions. A
+          # platform tag here means that changed and one wheel no longer fits all.
+          for name in sglang sglang_tpu; do
+            f="dist/${name}-${VERSION}-py3-none-any.whl"
+            [ -f "$f" ] || { echo "::error::missing $f"; ls dist; exit 1; }
+          done
+          # Install without dependencies (torch-tpu is not on a public index yet)
+          # and check the metadata the runtime relies on. Imports are covered by
+          # the TPU smoke on the image built from the same commit.
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --quiet --no-deps dist/*.whl
+          /tmp/v/bin/python - <<'EOF'
+          import os
+          from importlib.metadata import entry_points, requires, version
+
+          want = os.environ["VERSION"]
+          for dist in ("sglang", "sglang-tpu"):
+              assert version(dist) == want, (dist, version(dist), want)
+          names = {ep.name for ep in entry_points(group="sglang.srt.platforms")}
+          assert "tpu_oot" in names, names
+          deps = " ".join(requires("sglang") or [])
+          assert "torch-tpu" in deps, "fork sglang wheel lost its torch-tpu pin"
+          print("ok:", want, sorted(names))
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-image:
+    needs: [resolve, build, smoke, scan, wheels]
+    if: inputs.target != 'none'
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment are the approval step. It also holds
+    # the Docker Hub credential, so no other job can read it.
+    environment: tpu-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_SA }}
+          token_format: access_token
+          create_credentials_file: false
+      - name: Copy the tested image
+        env:
+          SRC: ${{ needs.build.outputs.digest }}
+          REPO: ${{ needs.resolve.outputs.image_repo }}
+          TAG: ${{ needs.resolve.outputs.image_tag }}
+          GAR_TOKEN: ${{ steps.auth.outputs.access_token }}
+          DOCKERHUB_USERNAME: ${{ secrets.LMSYS_DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.LMSYS_DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # lmsysorg/sglang also carries the CUDA tags (latest, vX.Y.Z); only ever
+          # write a -tpu tag there.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?-tpu$ ]]; then
+            echo "::error::refusing to push non-TPU tag '$TAG'"
+            exit 1
+          fi
+          curl -sSfL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xz crane
+          ./crane auth login "${SRC%%/*}" -u oauth2accesstoken --password-stdin <<< "$GAR_TOKEN"
+          ./crane auth login index.docker.io -u "$DOCKERHUB_USERNAME" --password-stdin <<< "$DOCKERHUB_TOKEN"
+          dst="docker.io/${REPO}:${TAG}"
+          if ./crane digest "$dst" >/dev/null 2>&1; then
+            echo "::error::$dst already exists; bump the version (e.g. .post1) instead of overwriting"
+            exit 1
+          fi
+          # A copy, not a rebuild: the bytes that passed smoke and scan.
+          ./crane copy "$SRC" "$dst"
+          want="${SRC#*@}"
+          got="$(./crane digest "$dst")"
+          [ "$got" = "$want" ] || { echo "::error::digest mismatch: pushed $got, tested $want"; exit 1; }
+          echo "published $dst ($got)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: [resolve, build, smoke, scan, wheels, publish-image]
+    # Runs when every gate passed; publish-image is skipped (not failed) on a dry run.
+    if: >-
+      !cancelled()
+      && needs.smoke.result == 'success'
+      && needs.scan.result == 'success'
+      && needs.wheels.result == 'success'
+      && (needs.publish-image.result == 'success'
+          || (inputs.target == 'none' && needs.publish-image.result == 'skipped'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ inputs.target }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          IMAGE_REPO: ${{ needs.resolve.outputs.image_repo }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}"
+          if [ -n "$IMAGE_REPO" ]; then
+            image="docker pull ${IMAGE_REPO}:${IMAGE_TAG}"
+          else
+            image="(dry run, not published) ${DIGEST}"
+          fi
+          cat > notes.md <<EOF
+          SGLang on TPU, tracking upstream sglang ${VERSION}. Commit: ${SHA}
+
+          ## Docker
+          \`\`\`
+          ${image}
+          \`\`\`
+          Image digest: \`${DIGEST#*@}\`
+
+          ## Wheels
+          Install both together; \`sglang\` here is this repository's build, not the PyPI one.
+          \`\`\`
+          pip install ${base}/sglang-${VERSION}-py3-none-any.whl ${base}/sglang_tpu-${VERSION}-py3-none-any.whl
+          \`\`\`
+          EOF
+          flags=(--target "$SHA" --title "TPU v${VERSION}" --notes-file notes.md)
+          # Drafts create no git tag and are visible to maintainers only.
+          [ "$TARGET" = prod ] || flags+=(--draft --prerelease)
+          gh release create "$RELEASE_TAG" "${flags[@]}" dist/*.whl
+          echo "release: $(gh release view "$RELEASE_TAG" --json url -q .url)" | tee -a "$GITHUB_STEP_SUMMARY"

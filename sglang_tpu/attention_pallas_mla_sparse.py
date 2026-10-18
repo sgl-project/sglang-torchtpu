@@ -208,12 +208,18 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         x: torch.Tensor,
         q_lora: torch.Tensor,
         positions: torch.Tensor,
+        forward_batch: ForwardBatch,
         layer_id: int,
     ) -> torch.Tensor:
         """Run one layer's indexer. ``Indexer.forward_tpu`` calls this."""
         if self._kpool > 1:
             return kpool_indexer_forward(
-                indexer, backend=self, x=x, q_lora=q_lora, layer_id=layer_id
+                indexer,
+                backend=self,
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
             )
         return indexer_forward(
             indexer,
@@ -221,12 +227,14 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             x=x,
             q_lora=q_lora,
             positions=positions,
+            forward_batch=forward_batch,
             layer_id=layer_id,
         )
 
     def index_topk(
         self,
         *,
+        forward_batch: ForwardBatch,
         layer_id: int,
         query: torch.Tensor,  # [num_tokens, index_n_heads, index_head_dim]
         key: torch.Tensor,  # [num_tokens, index_head_dim]
@@ -247,7 +255,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             key.contiguous(),
             head_weights.contiguous(),
             self.token_to_kv_pool.get_index_key_cache(layer_id),
-            metadata.kv_lens,
+            self._kv_lens(forward_batch),
             metadata.page_indices,
             metadata.cu_q_lens,
             metadata.distribution,
@@ -259,6 +267,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     def index_topk_kpool(
         self,
         *,
+        forward_batch: ForwardBatch,
         layer_id: int,
         query: torch.Tensor,  # [num_tokens, index_n_heads, index_head_dim]
         key: torch.Tensor,  # [num_tokens, index_head_dim]
@@ -280,7 +289,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             ape.contiguous(),
             pool.get_kpool_raw_cache(layer_id),
             pool.get_index_key_cache(layer_id),
-            metadata.kv_lens,
+            self._kv_lens(forward_batch),
             metadata.page_indices,
             metadata.cu_q_lens,
             metadata.distribution,
@@ -308,7 +317,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             "indexer's top-k rows."
         )
         args = self._mla_kernel_args(
-            q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope
+            q=q,
+            k=k,
+            layer=layer,
+            forward_batch=forward_batch,
+            q_rope=q_rope,
+            k_rope=k_rope,
         )
         out = self._op(*args, topk_indices)
         # TODO(sglang-torchtpu#1072): avoid this reshape, as in pallas_tpu_mla.

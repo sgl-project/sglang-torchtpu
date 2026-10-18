@@ -933,14 +933,18 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
         self._precompile_shapes("FUSED DRAFT", bs_buckets, run)
 
+    def _draft_extend_bs_buckets(self) -> list[int]:
+        """The DRAFT_EXTEND_V2 batch buckets a serving step can reach."""
+        assert self.b_bucketer is not None
+        return _draft_extend_precompile_bs_buckets(
+            list(self.b_bucketer.buckets),
+            int(self.model_runner.req_to_token_pool.size),
+        )
+
     def _precompile_draft_extend(self, attn_backend: Any) -> None:
         """Compile DRAFT_EXTEND_V2(FULL) across the bs buckets."""
-        assert self.b_bucketer is not None
-        all_bs_buckets = list(self.b_bucketer.buckets)
         local_req_capacity = int(self.model_runner.req_to_token_pool.size)
-        bs_buckets = _draft_extend_precompile_bs_buckets(
-            all_bs_buckets, local_req_capacity
-        )
+        bs_buckets = self._draft_extend_bs_buckets()
         tokens_per_req = self.draft_token_num
         logger.info(
             "[spec compile policy] DRAFT_EXTEND_V2(FULL): %d shapes "

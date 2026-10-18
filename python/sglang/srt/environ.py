@@ -1857,6 +1857,10 @@ class Envs:
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # Reduce K3's TP-partial routed latent and shared-expert output with one
+    # collective (kimi_k3.merged_moe_all_reduce) instead of two. Platforms may
+    # serve it with a multi-tensor collective; the default concatenates.
+    SGLANG_K3_MERGE_MOE_ALLREDUCE = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention

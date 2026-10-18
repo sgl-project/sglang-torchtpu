@@ -474,14 +474,18 @@ Topology-Aware Scheduling instead.
   from the original **ReadOnlyMany** Hyperdisk (both hosts mount concurrently),
   rank-0 asserting on real inference.
 - **Filestore weights** — `model-weights-filestore` mounts the existing 10Ti
-  NFSv3 share `10.93.193.130:/weights` read-only at `/weights`.
+  NFSv3 share `<FILESTORE_IP>:/weights` read-only at `/weights`. The manifest keeps the
+  address as a placeholder; substitute the Filestore instance IP when applying it.
 
 Apply the claim before running CI from this revision:
 
 ```bash
 gcloud container clusters get-credentials tpu-cluster \
   --project sglang-torchtpu --zone us-central1-c
-kubectl apply -f .github/tpu-ci/pvc-model-weights-filestore.yaml
+# The internal Filestore IP; see `gcloud filestore instances list --project sglang-torchtpu`.
+FILESTORE_IP=...
+sed "s/<FILESTORE_IP>/${FILESTORE_IP}/" .github/tpu-ci/pvc-model-weights-filestore.yaml \
+  | kubectl apply -f -
 kubectl -n tpu-ci wait pvc/model-weights-filestore \
   --for=jsonpath='{.status.phase}'=Bound --timeout=60s
 ```

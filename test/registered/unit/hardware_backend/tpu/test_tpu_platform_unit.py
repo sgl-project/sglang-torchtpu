@@ -957,6 +957,51 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
         cls = self.platform.get_dsa_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
 
+    def test_draft_backends_run_their_target_backend_per_step(self):
+        from sglang.srt.layers.attention import attention_registry as registry
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+        from sglang_tpu.tpu_platform import _register_attention_backends
+
+        expected = {
+            "pallas_tpu_rpa_v3": TpuPallasRpaV3AttnBackend,
+            "pallas_tpu_rpa_batched": TpuPallasRpaBatchedAttnBackend,
+            "pallas_tpu_mla": TpuPallasMlaAttnBackend,
+            "pallas_tpu_mla_sparse": TpuPallasSparseMlaAttnBackend,
+        }
+        with (
+            patch.dict(registry.ATTENTION_BACKENDS),
+            patch.dict(registry.DRAFT_ATTENTION_BACKENDS, clear=True),
+        ):
+            _register_attention_backends()
+            self.assertEqual(set(registry.DRAFT_ATTENTION_BACKENDS), set(expected))
+            for name, attn_backend_cls in expected.items():
+                with self.subTest(backend=name):
+                    # The draft extend builds the target backend of the same name.
+                    self.assertIn(name, registry.ATTENTION_BACKENDS)
+                    with patch.object(
+                        attn_backend_cls, "__init__", return_value=None
+                    ) as init:
+                        container = registry.DRAFT_ATTENTION_BACKENDS[name](
+                            "runner", 1, 4
+                        )
+                    self.assertEqual(len(container.attn_backends), 3)
+                    self.assertTrue(
+                        all(
+                            type(c) is attn_backend_cls for c in container.attn_backends
+                        )
+                    )
+                    self.assertEqual(
+                        [c.kwargs["speculative_step_id"] for c in init.call_args_list],
+                        [0, 1, 2],
+                    )
+
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
             self.platform.get_piecewise_backend_cls()

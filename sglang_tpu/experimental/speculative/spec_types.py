@@ -8,14 +8,15 @@ result is cut back to the live bs.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import msgspec
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
-from sglang_tpu.experimental.speculative.spec_utils import pad_rows
+from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+from sglang_tpu.experimental.speculative.spec_utils import pad_rows, padded_h2d
 
 
 class SpecState(NamedTuple):
@@ -25,15 +26,21 @@ class SpecState(NamedTuple):
       bonus_tokens: [pbs] root token r of the next draft chain, not yet in target KV.
       seq_lens: [pbs] committed prefix length n; r sits at position n. 0 on padded rows.
       req_pool_indices: [pbs] handle to the per-request KV. 0 (reserved) on padded rows.
-      draft_carry: Draft conditioning not held in a KV cache, e.g. EAGLE3's
-        [pbs, H] target feature of the last committed row. None when the draft
-        context lives in draft KV (DFlash, DSpark).
+      draft_carry: Draft conditioning not held in a KV cache, as a NamedTuple of
+        row-aligned [pbs, ...] tensors, e.g. EAGLE3's first draft token and draft
+        hidden state. None when the draft context lives in draft KV (DSpark).
     """
 
     bonus_tokens: torch.Tensor
     seq_lens: torch.Tensor
     req_pool_indices: torch.Tensor
-    draft_carry: torch.Tensor | None = None
+    draft_carry: Any = None
+
+
+def map_carry(carry: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> Any:
+    """Apply fn to every row-aligned tensor of a draft_carry NamedTuple."""
+    # A list, not a generator: Dynamo cannot reconstruct a generator in pad_state_rows.
+    return None if carry is None else carry._make([fn(t) for t in carry])
 
 
 class BucketState(NamedTuple):
@@ -46,6 +53,11 @@ class BucketState(NamedTuple):
       live_mask: [pbs] bool, False on padded rows.
       temperatures: [pbs] float32, 1 on padded rows; None when all greedy.
       top_ks: [pbs] int32, 1 on padded rows; None when all greedy.
+      top_ps: [pbs] float32, 1 on padded rows; None when all greedy.
+      min_ps: [pbs] float32, 0 on padded rows; None when all greedy.
+      need_top_k: Some request restricts top_k; the target is filtered for it.
+      need_top_p: Some request restricts top_p; the target is filtered for it.
+      need_min_p: Some request restricts min_p; the target is filtered for it.
     """
 
     key: torch.Tensor
@@ -53,6 +65,15 @@ class BucketState(NamedTuple):
     live_mask: torch.Tensor
     temperatures: torch.Tensor | None
     top_ks: torch.Tensor | None
+    top_ps: torch.Tensor | None = None
+    min_ps: torch.Tensor | None = None
+    need_top_k: bool = False
+    need_top_p: bool = False
+    need_min_p: bool = False
+
+    @property
+    def need_filters(self) -> bool:
+        return self.need_top_k or self.need_top_p or self.need_min_p
 
 
 class VerifyRows(NamedTuple):
@@ -87,11 +108,14 @@ class DraftResult(NamedTuple):
         None only when the batch is all greedy.
       num_verify_drafts: [pbs] int32 in [0, N]; only the first k drafts are
         verified (DSpark budget). Equals N when no pruning applies.
+      verify_tokens: Optional flat [pbs * (N + 1)] [r, d_1, ..., d_N] rows when
+        the draft already built them; verify concatenates them otherwise.
     """
 
     draft_tokens: torch.Tensor
     draft_logits: torch.Tensor | None
     num_verify_drafts: torch.Tensor
+    verify_tokens: torch.Tensor | None = None
 
 
 class AcceptResult(NamedTuple):
@@ -103,6 +127,9 @@ class AcceptResult(NamedTuple):
       accept_tokens: [pbs, N + 1] correct drafts then bonus, padded with -1.
       accept_lens: [pbs] int32 committed tokens, 0 on padded rows.
       next_seq_lens: [pbs] seq_lens + accept_lens.
+      window_tokens: flat [pbs * (N + 1)] accept_tokens with 0 for -1, for a
+        commit that rewrites the whole verify window (EAGLE3 draft extend).
+      window_seq_lens: [pbs] seq_lens + N + 1, the length once that window is written.
     """
 
     num_correct_drafts: torch.Tensor
@@ -110,6 +137,8 @@ class AcceptResult(NamedTuple):
     accept_tokens: torch.Tensor
     accept_lens: torch.Tensor
     next_seq_lens: torch.Tensor
+    window_tokens: torch.Tensor
+    window_seq_lens: torch.Tensor
 
 
 class DraftBlockInputs(NamedTuple):
@@ -171,7 +200,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         req_pool_indices = draft_input.tpu_req_pool_indices
         if candidates is None or committed_lens is None or req_pool_indices is None:
             raise NotImplementedError(
-                "TpuSpecWorker needs the device verify window (overlap schedule, "
+                "TpuSpecWorker needs the verify window (overlap schedule, "
                 "host-resident req_to_token, no grammar/logprob/LoRA)."
             )
         req_pool_indices_cpu = batch.req_pool_indices_cpu
@@ -184,22 +213,41 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
             )
         assert req_pool_indices_cpu.device.type == "cpu", req_pool_indices_cpu.device
         assert seq_lens_cpu.device.type == "cpu", seq_lens_cpu.device
-        assert req_pool_indices.shape[0] == padded_bs, (
-            req_pool_indices.shape,
-            padded_bs,
-        )
+        assert req_pool_indices.device.type == "cpu", req_pool_indices.device
         # With the window the host mirror holds the committed base, one unread
-        # commit (<= N + 1 tokens) behind the device length.
+        # commit (<= N + 1 tokens) behind the device length. The plan stays on
+        # host until the forward fixes its bucket; 0 is the reserved row and slot.
         return cls(
-            verify_cache_candidates=candidates,
-            committed_lens=committed_lens,
-            req_pool_indices=req_pool_indices,
+            verify_cache_candidates=padded_h2d(candidates, padded_bs, batch.device),
+            committed_lens=padded_h2d(committed_lens, padded_bs, batch.device),
+            req_pool_indices=padded_h2d(req_pool_indices, padded_bs, batch.device),
             req_pool_indices_cpu=pad_rows(req_pool_indices_cpu, padded_bs),
             seq_lens_cpu=seq_lens_cpu,
             host_len_slack=(
                 num_verify_rows if draft_input.tpu_host_seq_lens_is_committed else 0
             ),
             future_indices=draft_input.future_indices,
+        )
+
+    @classmethod
+    def idle(
+        cls, *, num_verify_rows: int, padded_bs: int, device: str
+    ) -> TpuSpecVerifyInput:
+        """All-padding addressing for a DP-attention rank with no requests.
+
+        Every row holds pool row 0, slot 0 and host length 0, so RPA runs none.
+        """
+        zeros = torch.zeros((padded_bs,), dtype=torch.int64)
+        return cls(
+            verify_cache_candidates=torch.zeros(
+                (padded_bs, 2 * num_verify_rows), dtype=torch.int64
+            ).to(device, non_blocking=True),
+            committed_lens=zeros.to(device, non_blocking=True),
+            req_pool_indices=zeros.to(device, non_blocking=True),
+            req_pool_indices_cpu=zeros,
+            seq_lens_cpu=torch.zeros((0,), dtype=torch.int64),
+            host_len_slack=0,
+            future_indices=None,
         )
 
     def kv_lens_after_rows(self, num_rows: int) -> tuple[torch.Tensor, int]:

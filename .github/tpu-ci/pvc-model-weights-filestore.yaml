@@ -17,7 +17,7 @@ spec:
     - nfsvers=3
     - hard
   nfs:
-    server: 10.93.193.130
+    server: <FILESTORE_IP>  # internal Filestore address; substituted at apply time (see README)
     path: /weights
     readOnly: true
 ---

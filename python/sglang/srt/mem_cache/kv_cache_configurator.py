@@ -1899,12 +1899,15 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+            # A draft computes its own top-k: TPU rejects DSA index sharing.
             index_key_layers=[
-                not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                self.is_draft_worker
+                or not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
                 for layer_id in range(
                     self.layer_info.start_layer, self.layer_info.end_layer
                 )
             ],
+            index_kpool=get_dsa_index_kpool(self.model_config.hf_config),
         )
 
     def _build_dsa_kv_pool(
