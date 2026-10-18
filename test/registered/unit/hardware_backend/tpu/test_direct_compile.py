@@ -602,8 +602,8 @@ class TestDirectCompile(CustomTestCase):
                         args = registered.make_warmup_args(context)
                         warmup_compiled_op(registered.op, *args)
                         cases.append((registered.op, args))
-            # 7 registered spec helpers x 2 verify widths.
-            self.assertEqual(len(cases), 14)
+            # 9 registered spec helpers x 2 verify widths.
+            self.assertEqual(len(cases), 18)
             with torch.compiler.set_stance("fail_on_recompile"):
                 for op, args in cases:
                     cpu_args = tree_util.tree_map(

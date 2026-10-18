@@ -84,7 +84,8 @@ def compiled_op(
 
     ``direct=True`` uses direct compilation even under the Dynamo tracer: a call
     then costs a key lookup instead of Dynamo's frame evaluation and runtime
-    wrappers. Only for
+    wrappers. Such helpers never compile while serving: a call whose shapes no
+    warmup compiled runs ``fn`` eagerly. Only for
     pure helpers: direct compilation requires that ``fn`` mutates none of its
     inputs and captures no tensors.
     """
@@ -154,6 +155,10 @@ def compiled_op(
                     async_compile=envs.SGLANG_DIRECT_COMPILE_ASYNC.get(),
                     **kwargs,
                 )
+            if direct and _specialization_key(*args, **kwargs) not in compiled_fn.cache:
+                # direct helpers compile only in their warmups: a shape no
+                # warmup covered (a live batch between buckets) runs eagerly.
+                return fn(*args, **kwargs)
             return compiled_fn(*args, **kwargs)
 
         if warmup is not None:
