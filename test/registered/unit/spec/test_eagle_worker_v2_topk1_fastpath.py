@@ -16,6 +16,7 @@ from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.experimental.speculative.eagle.draft_worker import TpuEagleDraftWorker
 
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
@@ -59,8 +60,8 @@ def _make_chain_lists(num_steps: int, bs: int):
     return score_list, token_list, parents_list
 
 
-def _make_worker(num_steps: int, num_draft_tokens: int):
-    worker = object.__new__(EagleDraftWorker)
+def _make_worker(num_steps: int, num_draft_tokens: int, *, worker_cls=EagleDraftWorker):
+    worker = object.__new__(worker_cls)
     worker.topk = 1
     worker.device = DEVICE
     worker.speculative_num_steps = num_steps
@@ -169,9 +170,10 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         self.assertEqual(result, (None, None, None, None))
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
-    @patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True)
     def test_tpu_draft_owns_per_step_cache_loc(self):
-        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker = _make_worker(
+            num_steps=3, num_draft_tokens=4, worker_cls=TpuEagleDraftWorker
+        )
         worker.hot_token_id = None
         worker.index_share_for_mtp_iteration = False
         worker.seed_dsa_topk_from_draft_extend = False
@@ -219,12 +221,13 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
 class TestEagleWorkerV2FusedDraft(CustomTestCase):
     def test_fused_steps_support_both_compile_tracers(self):
-        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker = _make_worker(
+            num_steps=3, num_draft_tokens=4, worker_cls=TpuEagleDraftWorker
+        )
 
         with (
-            patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True),
             patch(
-                "sglang.srt.speculative.eagle_worker_v2.get_flags",
+                "sglang_tpu.experimental.speculative.eagle.draft_worker.get_flags",
                 return_value=SimpleNamespace(
                     capture=SimpleNamespace(enable_torch_compile=True)
                 ),
@@ -238,11 +241,12 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
 
     def test_eager_tpu_does_not_enter_compiled_draft_loop(self):
         """Eager MTP must not call methods missing from NoopCompilePolicy."""
-        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker = _make_worker(
+            num_steps=3, num_draft_tokens=4, worker_cls=TpuEagleDraftWorker
+        )
         with (
-            patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True),
             patch(
-                "sglang.srt.speculative.eagle_worker_v2.get_flags",
+                "sglang_tpu.experimental.speculative.eagle.draft_worker.get_flags",
                 return_value=SimpleNamespace(
                     capture=SimpleNamespace(enable_torch_compile=False)
                 ),
@@ -255,7 +259,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             build_topk1_verify_chain_torch,
         )
 
-        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker = _make_worker(
+            num_steps=3, num_draft_tokens=4, worker_cls=TpuEagleDraftWorker
+        )
         worker.hot_token_id = None
 
         calls = []
@@ -300,11 +306,11 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
+                "sglang_tpu.experimental.speculative.eagle.draft_worker.select_top_k_tokens",
                 side_effect=select_step,
             ),
             patch(
-                "sglang.srt.speculative.eagle_worker_v2.build_topk1_verify_chain_torch",
+                "sglang_tpu.experimental.speculative.eagle.draft_worker.build_topk1_verify_chain_torch",
                 new=build_topk1_verify_chain_torch,
                 create=True,
             ),
@@ -335,7 +341,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         self.assertEqual(calls[1][5].item(), 6)
 
     def test_fused_forward_builds_topk1_chain(self):
-        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker = _make_worker(
+            num_steps=3, num_draft_tokens=4, worker_cls=TpuEagleDraftWorker
+        )
         worker._topk1_parents_prealloc = torch.tensor(
             [-1, 0, 1], dtype=torch.long, device=DEVICE
         ).repeat(2, 1)
@@ -392,11 +400,11 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.speculative.eagle_worker_v2.per_step_draft_out_cache_loc",
+                "sglang_tpu.experimental.speculative.eagle.draft_worker.per_step_draft_out_cache_loc",
                 return_value=per_step_cache,
             ),
             patch(
-                "sglang.srt.speculative.eagle_worker_v2.forward_context",
+                "sglang_tpu.experimental.speculative.eagle.draft_worker.forward_context",
                 return_value=contextlib.nullcontext(),
             ),
         ):
@@ -412,7 +420,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         )
 
     def test_fused_draft_unpads_verify_tree_to_logical_batch(self):
-        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker = _make_worker(
+            num_steps=3, num_draft_tokens=4, worker_cls=TpuEagleDraftWorker
+        )
         worker.req_to_token_pool = None
         worker.cuda_graph_runner = None
         worker.seed_dsa_topk_from_draft_extend = False
@@ -456,9 +466,8 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
         with (
-            patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True),
             patch(
-                "sglang.srt.speculative.eagle_worker_v2.get_flags",
+                "sglang_tpu.experimental.speculative.eagle.draft_worker.get_flags",
                 return_value=SimpleNamespace(
                     capture=SimpleNamespace(enable_torch_compile=True)
                 ),

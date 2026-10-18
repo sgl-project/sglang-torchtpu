@@ -1,16 +1,16 @@
-"""Narrow hook adapters for the experimental host-padded spec path.
+"""Narrow hook adapters for the plugin host-padded spec path.
 
 Why: filter/merge and H2D staging must be intercepted before device operations,
-not repaired afterward. All non-experimental calls delegate unchanged.
+not repaired afterward. Compatibility batches delegate unchanged.
 kimi_spec_defaults: core refuses speculation for Kimi hybrid (KDA) targets on
-TPU and otherwise pins GPU verify/draft backends; the experimental worker
-serves DSPARK on the TPU KDA checkpoint verify, so it skips both.
+TPU and otherwise pins GPU verify/draft backends; the plugin worker serves
+DSPARK on the TPU KDA checkpoint verify, so it skips both.
 materialize_future_map (applied by TpuSchedulerExtension.create_future_map): the
 live FutureMap's lazy torch.empty buffers would fuse into their first store,
 compiling at whatever shape the first batch has.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
 replace these hooks with agreed factories/overrides for the extracted operations.
-Remove when: the experiment is removed or those upstream seams are available.
+Remove when: those upstream seams provide host-padded batch operations.
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ import torch
 
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.runtime_context import get_context, get_spec
+from sglang.srt.runtime_context import get_context, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu.experimental import (
     experimental_spec_enabled,
     get_host_batch_padder,
     is_experimental_chain,
     is_experimental_spec,
+    is_experimental_spec_worker,
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
@@ -318,10 +319,17 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
     return result
 
 
-def sample_draft_tokens(original, model, hidden_states, input_ids):
-    from sglang_tpu.experimental import experimental_spec_enabled
+def _uses_plugin_block_worker() -> bool:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    if not experimental_spec_enabled():
+    return is_experimental_spec_worker(
+        SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm),
+        pp_size=get_parallel().pp_size,
+    )
+
+
+def sample_draft_tokens(original, model, hidden_states, input_ids):
+    if not _uses_plugin_block_worker():
         return original(model, hidden_states, input_ids)
     from sglang_tpu.experimental.models.dspark import sample_draft_tokens as sample
 
@@ -329,9 +337,7 @@ def sample_draft_tokens(original, model, hidden_states, input_ids):
 
 
 def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
-    from sglang_tpu.experimental import experimental_spec_enabled
-
-    if not experimental_spec_enabled():
+    if not _uses_plugin_block_worker():
         return original(model, hidden_states, input_ids)
     from sglang_tpu.experimental.models.dflash2 import sample_draft_tokens as sample
 
@@ -447,8 +453,7 @@ def hook_specs():
         ),
     ]
     if experimental_spec_enabled():
-        # Hot paths every spec batch takes; registered only with the flag on so
-        # the default path runs no extra wrappers.
+        # Each adapter still checks the batch route: PP-prefill uses compatibility metadata.
         hooks += [
             (
                 "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",

@@ -44,7 +44,7 @@ def get_host_batch_padder() -> Callable[[int], int] | None:
 
 
 def experimental_spec_enabled() -> bool:
-    """Either flag opts in: host-staged metadata without a D2H copy is what this worker serves."""
+    """Plugin workers are the default; the host-padding alias also selects them."""
     return (
         tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.get()
         or tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()

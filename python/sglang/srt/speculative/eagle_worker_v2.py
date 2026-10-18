@@ -63,7 +63,6 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
-    get_flags,
     get_model,
     get_parallel,
     get_schedule,
@@ -134,7 +133,6 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
-    is_tpu,
     is_xpu,
     log_info_on_rank0,
 )
@@ -144,14 +142,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
-_is_tpu = is_tpu()
 _is_xpu = is_xpu()
-
-if _is_tpu:
-    from sglang_tpu.eagle_utils_tpu import (
-        build_topk1_verify_chain_torch,
-        fused_draft_extend_select_argmax_func,
-    )
 
 
 logger = logging.getLogger(__name__)
@@ -782,129 +773,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
 
-    def _fused_draft_forward(self, forward_batch: ForwardBatch):
-        """Run all draft steps in one compiled call."""
-        spec_info: EagleDraftInput = forward_batch.spec_info
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
-        )
-        maybe_detect_nan(topk_p, "fused_draft: NaN in initial topk_p")
-        if self.hot_token_id is not None:
-            topk_index = self.hot_token_id[topk_index]
-
-        attn_backends = self.draft_attn_backend.attn_backends
-        # The loop derives step i's KV length as seq_lens + i + 1 in-graph
-        # instead of stacking each step backend's eagerly built metadata. That
-        # holds only while step i's backend carries speculative_step_id == i,
-        # which is how TpuPallasRpaMultiStepDraftBackend constructs them.
-        assert all(b.speculative_step_id == i for i, b in enumerate(attn_backends))
-        out_cache_loc = per_step_draft_out_cache_loc(
-            forward_batch.out_cache_loc,
-            forward_batch.batch_size,
-            self.topk,
-            self.speculative_num_steps,
-        )
-
-        steps_fn = self._compiled_fused_steps
-        if steps_fn is None:
-            steps_fn = self.draft_runner.compile_policy.compile_fused_draft_steps(
-                self._fused_draft_steps
-            )
-            self._compiled_fused_steps = steps_fn
-
-        # The fused loop inlines CompiledForwardShim into an outer Dynamo
-        # graph. Gate the batch's HiCache reload eagerly so the shim can omit
-        # the mutable transfer counter while that graph is being traced.
-        compiled_forward_shim = getattr(
-            self.draft_runner.compile_policy, "compiled_forward_shim", None
-        )
-        if compiled_forward_shim is not None:
-            compiled_forward_shim.wait_for_hicache_reload()
-
-        # Draft decode is never a prefill-only operation. A request completing
-        # chunked prefill may retain that scheduler marker. Pin the whole fused
-        # loop to decode while preserving the scheduler-owned value afterward.
-        orig_prefill_only = forward_batch.is_prefill_only
-        forward_batch.is_prefill_only = False
-        try:
-            with forward_context(ForwardContext(attn_backend=attn_backends[0])):
-                tree_outputs = steps_fn(
-                    forward_batch,
-                    topk_p,
-                    topk_index,
-                    hidden_states,
-                    out_cache_loc,
-                    self.hot_token_id,
-                    spec_info.bonus_tokens,
-                    forward_batch.seq_lens,
-                )
-        finally:
-            forward_batch.is_prefill_only = orig_prefill_only
-        spec_info.rpa_draft_kv_lens = None
-
-        return tree_outputs
-
     def _should_fuse_draft_steps(self) -> bool:
-        return (
-            _is_tpu
-            and get_flags().capture.enable_torch_compile
-            and self.speculative_num_steps > 1
-        )
+        return False
 
-    def _fused_draft_steps(
-        self,
-        forward_batch: ForwardBatch,
-        topk_p: torch.Tensor,
-        topk_index: torch.Tensor,
-        hidden_states: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        hot_token_id: torch.Tensor | None,
-        bonus_tokens: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        """Run the compiled draft loop."""
-        num_steps = self.speculative_num_steps
-        model = self.draft_runner.model
-        # The draft policy compiles this loop, so its tracer -- not the global
-        # server arg -- decides whether hidden states may be rebound. The two
-        # agree while tracer selection is global; a per-worker split would
-        # silently desync them and drop the mutation below.
-        draft_tracer = getattr(self.draft_runner.compile_policy, "tracer", "dynamo")
-        base_positions = forward_batch.positions
-        base_kv_lens = seq_lens.to(torch.int32)
-        tokens: tuple = ()
-        scores = None
-        for i in range(num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            tokens += (tree_info[1],)
-            if i == num_steps - 1:
-                break
+    def _fused_draft_forward(self, forward_batch: ForwardBatch):
+        raise NotImplementedError
 
-            forward_batch.spec_info.rpa_draft_kv_lens = base_kv_lens + i + 1
-            if draft_tracer == "direct":
-                # direct_compile treats explicit inputs as immutable graph
-                # arguments. Rebind the traced ForwardBatch field instead of
-                # turning its hidden-state input into a deferred in-place op.
-                forward_batch.spec_info.hidden_states = hidden_states
-            else:
-                forward_batch.spec_info.hidden_states.copy_(hidden_states)
-            forward_batch.input_ids = input_ids
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            logits_output = model.forward(input_ids, base_positions + i, forward_batch)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if hot_token_id is not None:
-                topk_index = hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
-        return build_topk1_verify_chain_torch(
-            bonus_tokens,
-            torch.cat(tokens, dim=1),
-            seq_lens,
-        )
+    def _prepare_step_cache_loc(self, cache_loc: torch.Tensor) -> torch.Tensor:
+        return cache_loc
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -995,11 +871,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
-                # This becomes a compiled graph input. XLA cannot handle its storage
-                # offset changing between calls, so clone it. See
-                # https://github.com/google-pytorch/torch_tpu/issues/3370 for details.
-                if _is_tpu:
-                    forward_batch.out_cache_loc = forward_batch.out_cache_loc.clone()
+                forward_batch.out_cache_loc = self._prepare_step_cache_loc(
+                    forward_batch.out_cache_loc
+                )
                 spec_info.hidden_states = hidden_states
 
                 canary_index_ctx = (
@@ -1269,6 +1143,71 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 
+    def _draft_extend_select_index(
+        self, accept_lens: torch.Tensor
+    ) -> torch.Tensor | None:
+        return (
+            torch.arange(
+                0,
+                accept_lens.shape[0] * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                device=self.device,
+            )
+            + accept_lens
+            - 1
+        )
+
+    def _select_draft_extend_output(
+        self,
+        draft_logits_output,
+        *,
+        forward_batch,
+        select_index,
+        sampling_info,
+        can_run_decode_cuda_graph,
+    ):
+        if not can_run_decode_cuda_graph:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
+        if get_spec().speculative_use_rejection_sampling:
+            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                draft_logits_output.next_token_logits,
+                sampling_info.temperatures,
+                sampling_info.top_ks,
+            )
+        elif self.topk == 1 and _is_hip:
+            ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
+                draft_logits_output.next_token_logits
+            )
+            ret_draft_probs = None
+        elif self.topk == 1 and not _is_hip:
+            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+            # MTP draft selection on FP8 logits.
+            ret_topk_index = torch.argmax(
+                draft_logits_output.next_token_logits, dim=-1, keepdim=True
+            )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        else:
+            probs = renorm_draft_probs(
+                draft_logits_output.next_token_logits,
+                sampling_info,
+                get_spec().speculative_use_rejection_sampling,
+            )
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret_draft_probs = None
+        return (
+            ret_draft_probs,
+            ret_topk_p,
+            ret_topk_index,
+            draft_logits_output.hidden_states,
+        )
+
     def _draft_extend_for_decode(
         self,
         batch: ScheduleBatch,
@@ -1294,21 +1233,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
         else:
             num_correct_drafts = batch_result.accept_lens - 1
-            # TPU builds the selection index inside the compiled select/argmax
-            # executable from the acceptance counts, so the eager index is needed
-            # only by the non-TPU selection below and by the DSA seed gather.
-            select_index = None
-            if not _is_tpu or self.seed_dsa_topk_from_draft_extend:
-                select_index = (
-                    torch.arange(
-                        0,
-                        len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                        self.speculative_num_draft_tokens,
-                        device=self.device,
-                    )
-                    + batch_result.accept_lens
-                    - 1
-                )
+            select_index = self._draft_extend_select_index(batch_result.accept_lens)
 
             next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
@@ -1399,64 +1324,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        if _is_tpu:
-            (
-                draft_logits_output.next_token_logits,
-                draft_logits_output.hidden_states,
-                ret_topk_p,
-                ret_topk_index,
-            ) = self.draft_runner.compile_policy.finalize_spec_forward_batch(
-                outputs=fused_draft_extend_select_argmax_func(
-                    draft_logits_output.next_token_logits,
-                    draft_logits_output.hidden_states,
-                    forward_batch.spec_info.num_accept_tokens,
-                ),
+        ret_draft_probs, ret_topk_p, ret_topk_index, ret_hidden_states = (
+            self._select_draft_extend_output(
+                draft_logits_output,
                 forward_batch=forward_batch,
+                select_index=select_index,
+                sampling_info=batch.sampling_info,
+                can_run_decode_cuda_graph=can_run_decode_cuda_graph,
             )
-            ret_draft_probs = None
-        # CUDA graphs now return selected rows directly. The eager non-TPU
-        # path still needs to apply the selection here; TPU keeps selection
-        # and top-1 sampling fused in its compile policy above.
-        elif not can_run_decode_cuda_graph:
-            draft_logits_output.next_token_logits = (
-                draft_logits_output.next_token_logits[select_index]
-            )
-            if draft_logits_output.hidden_states is not None:
-                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                    select_index
-                ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
-        if _is_tpu:
-            pass
-        elif get_spec().speculative_use_rejection_sampling:
-            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
-                batch.sampling_info.top_ks,
-            )
-        elif self.topk == 1 and _is_hip:
-            ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
-                draft_logits_output.next_token_logits
-            )
-            ret_draft_probs = None
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
-            ret_draft_probs = None
-        else:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                get_spec().speculative_use_rejection_sampling,
-            )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
-        ret_hidden_states = draft_logits_output.hidden_states
+        )
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
@@ -1479,6 +1355,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    draft_worker_cls = EagleDraftWorker
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1509,7 +1387,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # return proxies so scheduler dispatch remains rank-uniform.
         self._hosts_draft = get_parallel().pp_group.is_last_rank
         self._draft_worker = (
-            EagleDraftWorker(
+            self.draft_worker_cls(
                 server_args,
                 gpu_id,
                 nccl_port,

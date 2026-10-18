@@ -343,6 +343,9 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             max_total_tokens=None,
             speculative_algorithm=None,
             speculative_eagle_topk=None,
+            speculative_num_steps=None,
+            enable_multi_layer_eagle=False,
+            speculative_adaptive=False,
             speculative_use_rejection_sampling=False,
             disaggregation_mode="null",
             disaggregation_transfer_backend="mooncake",
@@ -440,6 +443,53 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         # scheduler_overlap_mixin; the platform must NOT force-disable it.
         self.assertFalse(self._resolved(args, "disable_overlap_schedule"))
         self.assertEqual(self._resolved(args, "mem_fraction_static"), 0.40)
+
+    def test_plugin_spec_resolves_compile_and_rejects_non_overlap_before_load(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            for algo in ("EAGLE3", "DFLASH", "DSPARK"):
+                with self.subTest(algorithm=algo):
+                    args = self._args(
+                        speculative_algorithm=algo, speculative_num_steps=3
+                    )
+                    self._apply(args)
+                    self.assertTrue(self._resolved(args, "enable_torch_compile"))
+                    self.assertFalse(args.enable_torch_compile)
+                    with self.assertRaisesRegex(
+                        ValueError, "requires overlap scheduling"
+                    ):
+                        self._apply(
+                            self._args(
+                                speculative_algorithm=algo,
+                                disable_overlap_schedule=True,
+                            )
+                        )
+            with self.assertRaisesRegex(ValueError, "speculative_num_steps >= 2"):
+                self._apply(
+                    self._args(speculative_algorithm="EAGLE3", speculative_num_steps=1)
+                )
+            for flag in ("enable_multi_layer_eagle", "speculative_adaptive"):
+                with self.assertRaisesRegex(
+                    NotImplementedError, "multi-layer or adaptive"
+                ):
+                    self._apply(
+                        self._args(speculative_algorithm="EAGLE3", **{flag: True})
+                    )
+
+    def test_compatibility_route_keeps_eager_configuration(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
+            args = self._args(
+                speculative_algorithm="EAGLE3", disable_overlap_schedule=True
+            )
+            self._apply(args)
+            self.assertFalse(self._resolved(args, "enable_torch_compile"))
+            self.assertTrue(self._resolved(args, "disable_overlap_schedule"))
 
     def test_resolved_cuda_graphs_disabled_without_disabling_tpu_compile(self):
         graph_config = default_cuda_graph_config()

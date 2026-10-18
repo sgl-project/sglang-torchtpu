@@ -65,7 +65,6 @@
     "python/sglang/srt/speculative/eagle_info.py": 8,
     "python/sglang/srt/speculative/eagle_utils.py": 15,
     "python/sglang/srt/speculative/eagle_worker_common.py": 7,
-    "python/sglang/srt/speculative/eagle_worker_v2.py": 8,
     "python/sglang/srt/speculative/spec_utils.py": 6,
     "python/sglang/srt/utils/common.py": 9
   },
@@ -112,8 +111,7 @@
     "python/sglang/srt/speculative/dflash_worker_v2.py": 2,
     "python/sglang/srt/speculative/eagle_info.py": 1,
     "python/sglang/srt/speculative/eagle_utils.py": 3,
-    "python/sglang/srt/speculative/eagle_worker_common.py": 1,
-    "python/sglang/srt/speculative/eagle_worker_v2.py": 1
+    "python/sglang/srt/speculative/eagle_worker_common.py": 1
   },
   "modules": [
     "python/sglang/multimodal_gen/runtime/platforms/tpu.py",

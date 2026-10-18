@@ -925,9 +925,30 @@ class TpuSRTPlatform(SRTPlatform):
             disable_cuda_graph=True,
             cuda_graph_config=graph_config,
         )
-        # ``enable_torch_compile`` is honored on TPU and wired up by
-        # ``TpuGraphRunner`` (see ``ModelRunner.init_device_graphs``). Off by
-        # default (the SGLang-wide default); opt in with ``--enable-torch-compile``.
+        # Plugin speculative workers require bucketed compiled forwards.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.experimental import is_experimental_spec
+
+        if is_experimental_spec(
+            SpeculativeAlgorithm.__members__.get(
+                cfg.speculative_algorithm, SpeculativeAlgorithm.NONE
+            ),
+            pp_size=cfg.pp_size,
+        ):
+            if cfg.disable_overlap_schedule:
+                raise ValueError(
+                    "The TPU plugin spec worker requires overlap scheduling; remove "
+                    "--disable-overlap-schedule or select the compatibility worker with "
+                    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0 and "
+                    "SGLANG_TPU_HOST_PADDING_NO_D2H=0."
+                )
+            if cfg.enable_multi_layer_eagle or cfg.speculative_adaptive:
+                raise NotImplementedError(
+                    "The TPU plugin spec worker does not support multi-layer or adaptive EAGLE."
+                )
+            declare_resolution(
+                server_args, "tpu.apply_server_args_defaults", enable_torch_compile=True
+            )
         # TPU runs SGLang's regular event-based overlap scheduling, minus the
         # CUDA-style forward/copy/schedule streams: torch_tpu serialises on a
         # single PJRT queue so cross-stream ordering is a no-op (see
@@ -974,7 +995,11 @@ class TpuSRTPlatform(SRTPlatform):
                     )
             elif spec_algo == "DFLASH":
                 pass
-            elif spec_algo == "DSPARK" and _experimental_spec_enabled():
+            elif (
+                spec_algo == "DSPARK"
+                and cfg.pp_size == 1
+                and _experimental_spec_enabled()
+            ):
                 # Served by sglang_tpu.experimental.TpuBlockSpecWorker.
                 pass
             else:
@@ -986,7 +1011,7 @@ class TpuSRTPlatform(SRTPlatform):
                 if spec_algo.upper() in SpeculativeAlgorithm.__members__:
                     raise NotImplementedError(
                         f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                        "yet (only EAGLE, EAGLE3, NEXTN and DFLASH among builtin algorithms)."
+                        "yet (only EAGLE, EAGLE3, NEXTN, DFLASH and plugin DSPARK among builtin algorithms)."
                     )
 
         # Platform defaults run after handle_deprecated_dp_attention, so the
@@ -1074,6 +1099,14 @@ class TpuSRTPlatform(SRTPlatform):
             )
 
             return TpuBlockSpecWorker
+        from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+
+        if default is EAGLEWorkerV2:
+            from sglang_tpu.experimental.speculative.eagle.draft_worker import (
+                TpuEagleWorker,
+            )
+
+            return TpuEagleWorker
         return default
 
     def get_quantization_config(

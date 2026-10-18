@@ -8,9 +8,12 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs as srt_envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -36,6 +39,10 @@ from sglang_tpu.experimental.speculative.chain_spec_worker import (
 from sglang_tpu.experimental.speculative.eagle3 import eagle3_draft_worker
 from sglang_tpu.experimental.speculative.eagle3.eagle3_draft_worker import (
     TpuEagle3DraftWorker,
+)
+from sglang_tpu.experimental.speculative.eagle.draft_worker import (
+    TpuEagleDraftWorker,
+    TpuEagleWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
     _filtered_target_probs,
@@ -105,6 +112,163 @@ class TestExperimentalEagle3(CustomTestCase):
             )
         with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
             self.assertIsNone(_select_worker(SpeculativeAlgorithm.EAGLE3))
+
+    def test_unset_default_routes_factory_policy_and_host_metadata_together(self):
+        from sglang_tpu.experimental import register_host_batch_padder
+        from sglang_tpu.experimental.compilation.block_compile_policy import (
+            TpuBlockSpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.experimental.compilation.chain_compile_policy import (
+            TpuChainSpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.graph_runner.tpu_graph_runner import (
+            _resolve_spec_compile_policy_mixin,
+        )
+        from sglang_tpu.hooks.experimental_spec import (
+            _uses_plugin_block_worker,
+            initialize_host_batch,
+        )
+        from sglang_tpu.platform import TpuOOTPlatform
+
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            patch("sglang_tpu.experimental._host_batch_padder", None),
+        ):
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.clear()
+            for platform in (TpuSRTPlatform(), TpuOOTPlatform()):
+                with patch("sglang.srt.platforms.current_platform", platform):
+                    for algo, worker, policy in (
+                        (
+                            SpeculativeAlgorithm.EAGLE3,
+                            TpuChainSpecWorker,
+                            TpuChainSpecDecodeCompilePolicyMixin,
+                        ),
+                        (
+                            SpeculativeAlgorithm.DFLASH,
+                            TpuBlockSpecWorker,
+                            TpuBlockSpecDecodeCompilePolicyMixin,
+                        ),
+                        (
+                            SpeculativeAlgorithm.DSPARK,
+                            TpuBlockSpecWorker,
+                            TpuBlockSpecDecodeCompilePolicyMixin,
+                        ),
+                    ):
+                        with self.subTest(
+                            platform=platform.device_name, algorithm=algo.name
+                        ):
+                            with get_context().override_server_args(
+                                speculative_algorithm=algo.name
+                            ):
+                                args = ServerArgs(model_path="dummy")
+                                self.assertIs(algo.create_worker(args), worker)
+                                self.assertIs(
+                                    _resolve_spec_compile_policy_mixin(
+                                        algo, pp_size=1
+                                    ),
+                                    policy,
+                                )
+                                self.assertEqual(
+                                    _uses_plugin_block_worker(), algo.is_dflash_family()
+                                )
+                    with get_context().override_server_args(
+                        pp_size=2, speculative_algorithm="EAGLE3"
+                    ):
+                        args = ServerArgs(model_path="dummy", pp_size=2)
+                        self.assertIs(
+                            SpeculativeAlgorithm.EAGLE3.create_worker(args),
+                            TpuEagleWorker,
+                        )
+                        self.assertIs(
+                            TpuEagleWorker.draft_worker_cls, TpuEagleDraftWorker
+                        )
+                        # Only a TpuSpecWorker registers the host-batch padder.
+                        self.assertFalse(issubclass(TpuEagleWorker, TpuSpecWorker))
+                        batch = SimpleNamespace(
+                            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+                            enable_overlap=True,
+                        )
+                        self.assertNotIn(
+                            "host_pad_bs", vars(initialize_host_batch(batch))
+                        )
+                        self.assertFalse(_uses_plugin_block_worker())
+            register_host_batch_padder(lambda bs: 4)
+            batch = SimpleNamespace(
+                spec_algorithm=SpeculativeAlgorithm.EAGLE3, enable_overlap=True
+            )
+            self.assertEqual(initialize_host_batch(batch).host_pad_bs(2), 4)
+
+    def test_rollback_eagle_keeps_plugin_drafter_and_shared_defaults_stay_generic(self):
+        from sglang.srt.platforms.interface import SRTPlatform
+
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            get_context().override_server_args(),
+        ):
+            args = ServerArgs(model_path="dummy")
+            for platform in (TpuSRTPlatform(), SRTPlatform()):
+                with patch("sglang.srt.platforms.current_platform", platform):
+                    for algo in (
+                        SpeculativeAlgorithm.EAGLE3,
+                        SpeculativeAlgorithm.EAGLE,
+                    ):
+                        self.assertIs(
+                            algo.create_worker(args),
+                            TpuEagleWorker if platform.is_tpu() else EAGLEWorkerV2,
+                        )
+            self.assertIs(EAGLEWorkerV2.draft_worker_cls, EagleDraftWorker)
+
+    def test_plugin_and_shared_draft_extend_select_same_partial_accept_rows(self):
+        accept = torch.tensor([1, 4, 2])
+        logits = torch.arange(84, dtype=torch.float32).reshape(12, 7).remainder(11)
+        hidden = torch.arange(36, dtype=torch.float32).reshape(12, 3)
+        expected_rows = torch.tensor([0, 7, 9])
+        with get_context().override_server_args(
+            speculative_use_rejection_sampling=False
+        ):
+            for cls in (EagleDraftWorker, TpuEagleDraftWorker):
+                with self.subTest(worker=cls.__name__):
+                    worker = object.__new__(cls)
+                    worker.device = "cpu"
+                    worker.topk = 1
+                    worker.speculative_num_draft_tokens = 4
+                    worker.seed_dsa_topk_from_draft_extend = False
+                    worker.draft_runner = SimpleNamespace(
+                        compile_policy=SimpleNamespace(
+                            finalize_spec_forward_batch=lambda *, outputs, forward_batch: (
+                                outputs
+                            )
+                        )
+                    )
+                    output = LogitsProcessorOutput(
+                        next_token_logits=logits.clone(), hidden_states=hidden.clone()
+                    )
+                    probs, topk_p, tokens, selected = (
+                        worker._select_draft_extend_output(
+                            output,
+                            forward_batch=SimpleNamespace(
+                                spec_info=SimpleNamespace(num_accept_tokens=accept)
+                            ),
+                            select_index=worker._draft_extend_select_index(accept),
+                            sampling_info=None,
+                            can_run_decode_cuda_graph=False,
+                        )
+                    )
+                    self.assertIsNone(probs)
+                    torch.testing.assert_close(selected, hidden[expected_rows])
+                    torch.testing.assert_close(
+                        tokens[:, 0], logits[expected_rows].argmax(-1)
+                    )
+                    torch.testing.assert_close(topk_p, torch.ones(3, 1))
+                    torch.testing.assert_close(
+                        output.next_token_logits, logits[expected_rows]
+                    )
+                    worker.seed_dsa_topk_from_draft_extend = True
+                    torch.testing.assert_close(
+                        worker._draft_extend_select_index(accept), expected_rows
+                    )
 
     def test_dp_ranks_agree_on_a_bucket_the_draft_padding_keeps(self):
         """Every DP rank derives the same decode bucket from the synced sizes, equal

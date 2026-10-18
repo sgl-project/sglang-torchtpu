@@ -54,6 +54,23 @@ Unreachable today: MLA with hybrid SWA or an FP4 KV cache takes the plain OOT
 MLA builder in mode B and the generic builders in mode A; no TPU model uses
 either.
 
+## Speculative worker selection
+
+Both platform identities select `TpuChainSpecWorker` for EAGLE3 and native MTP
+(NEXTN) top-k-1 chains and `TpuBlockSpecWorker` for DFlash/DSpark at PP=1 by
+default. These paths require overlap scheduling; argument resolution enables torch
+compilation for them. Unsupported tree, adaptive/multi-layer, draft M-RoPE,
+mixed-phase attention-DP and block attention-DP combinations keep their explicit
+errors. PP-prefill retains the compatibility driver. TPU PP decode remains
+unsupported.
+
+For the compatibility route set both
+`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0` and
+`SGLANG_TPU_HOST_PADDING_NO_D2H=0` before launch. DSpark requires the plugin route.
+The existing environment name is retained for deployment compatibility. The
+default switch does not establish TPU compilation or serving parity: validate the
+selected model, topology, request features and warmup on TPU before deployment.
+
 ## Layout
 
 ```
