@@ -1,9 +1,9 @@
 # PR gate: runs the registered TPU per-commit suite on a single-host 2x2x1 slice.
 #
-# On demand only: a push never claims a slice. Each `/tag-and-rerun-ci` or
-# `/rerun-failed-ci` from a user listed in .github/CI_PERMISSIONS.json or the PR
-# author, or "Re-run failed jobs" from anyone with write access, runs the suite once
-# for the current head commit. A new push needs a new trigger. Applies when EITHER:
+# On demand only: a push never claims a slice. Adding `run-ci`, or rerunning
+# failed jobs via `/tag-and-rerun-ci`, `/rerun-failed-ci` or the Actions UI, runs
+# the suite once for the current head commit. A new push needs a new trigger,
+# even if `run-ci` remains on the PR. Applies to any PR base when EITHER:
 #   * the PR touches a TPU-explicit path (auto), OR
 #   * the PR carries the `tpu` label (manual opt-in -- for shared-code changes a
 #     maintainer judges need TPU coverage but that don't match those paths).
@@ -19,16 +19,25 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 concurrency:
-  group: pr-test-tpu-${{ github.event.pull_request.number }}
+  # Non-trigger label events must not cancel a requested run or replace its
+  # pending slot. An explicit rerun of one joins the active PR group.
+  group: >-
+    pr-test-tpu-${{ github.event.pull_request.number }}-${{
+      github.event.action == 'labeled' &&
+      github.event.label.name != 'run-ci' &&
+      github.run_attempt == 1 && github.run_id || 'active' }}
   cancel-in-progress: true
 
 jobs:
   decide:
-    # Only the `tpu` label can make a PR TPU-relevant. Labels are fetched live
-    # below so label-then-rerun is not tied to the original event payload.
+    # `tpu` adds relevance; `run-ci` requests this attempt. An explicit rerun
+    # must also recover a run originally skipped for an unrelated label.
+    # Live labels below let label-then-rerun see current TPU relevance.
     if: >-
       github.event.action != 'labeled' ||
-      github.event.label.name == 'tpu'
+      github.event.label.name == 'tpu' ||
+      github.event.label.name == 'run-ci' ||
+      github.run_attempt > 1
     runs-on: ubuntu-latest
     # dorny/paths-filter lists the PR's changed files via the GitHub API (read);
     # write lets the gate post its on-demand notice on the PR.
@@ -95,16 +104,17 @@ jobs:
               - '.github/workflows/feature-validation-tpu.yml'
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
-      # A TPU-relevant first attempt FAILS here rather than skipping: a skip would
-      # leave the required pr-test-tpu-finish green, and a failed decide is what
-      # /tag-and-rerun-ci re-runs. Only that re-run (attempt > 1) claims a slice.
+      # A TPU-relevant push FAILS here rather than silently passing without tests.
+      # Adding run-ci requests one attempt; a label left on a later push does not.
+      # Failed-job reruns remain an explicit request for the original event.
       - name: Gate on an explicit trigger and TPU relevance
         id: gate
         run: |
           if [[ "${{ steps.paths.outputs.tpu }}" != "true" && \
                 "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" != "true" ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.run_attempt }}" == "1" ]]; then
+          elif [[ "${{ github.run_attempt }}" == "1" && \
+                  "${{ github.event.action == 'labeled' && github.event.label.name == 'run-ci' }}" != "true" ]]; then
             echo "run=needs-trigger" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -127,13 +137,13 @@ jobs:
             if (comments.some(c => c.body && c.body.includes(marker))) return;
             await github.rest.issues.createComment({
               owner, repo, issue_number,
-              body: `${marker}\nA user listed in .github/CI_PERMISSIONS.json must comment **\`/tag-and-rerun-ci\`** to trigger the required TPU checks. Repeat this after every new push, including rebases.`,
+              body: `${marker}\nAdd **\`run-ci\`** or comment **\`/tag-and-rerun-ci\`** when this commit is ready. Each request runs the TPU suite once; later pushes need a new request.`,
             });
 
       - name: Require an explicit trigger
         if: steps.gate.outputs.run == 'needs-trigger'
         run: |
-          echo "::error::TPU CI runs on demand. A user listed in .github/CI_PERMISSIONS.json must comment /tag-and-rerun-ci to trigger the required TPU checks. Repeat this after every new push, including rebases."
+          echo "::error::TPU CI runs on demand. Add run-ci or comment /tag-and-rerun-ci on the PR to run it for this commit."
           exit 1
 
   # Build the image once (keyless WIF). Fork PRs can't get WIF secrets, so keep the

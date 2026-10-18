@@ -363,8 +363,23 @@ def _latest_run_per_workflow(runs):
     latest = {}
     for run in runs:
         current = latest.get(run.workflow_id)
-        if current is None or run.id > current.id:
-            latest[run.workflow_id] = run
+        if current is not None and run.id <= current.id:
+            continue
+        # An unrelated label creates a successful TPU run with a skipped gate.
+        # It did not replace the requested attempt: keep looking for that run,
+        # otherwise /tag-and-rerun-ci can silently overlook the failed gate.
+        if run.name == "PR Test (TPU)" and run.conclusion == "success":
+            try:
+                if any(
+                    job.name == "decide" and job.conclusion == "skipped"
+                    for job in run.jobs()
+                ):
+                    continue
+            except Exception as e:
+                # Conservatively keep a successful run when its jobs cannot be
+                # inspected, rather than starting potentially duplicate TPU work.
+                print(f"Could not inspect TPU gate for run {run.id}: {e}")
+        latest[run.workflow_id] = run
     return list(latest.values())
 
 
