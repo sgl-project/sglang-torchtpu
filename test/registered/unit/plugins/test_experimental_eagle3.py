@@ -305,9 +305,6 @@ class TestExperimentalEagle3(CustomTestCase):
                                 enabled
                             ),
                             srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(alias),
-                            get_context().override_server_args(pp_size=pp),
-                            # Selection follows configuration even inside a draft group scope.
-                            get_context().parallel.override(pp_size=3 - pp),
                         ):
                             for (
                                 name,
@@ -325,8 +322,11 @@ class TestExperimentalEagle3(CustomTestCase):
                                 )
                                 expected_worker = worker if selected else legacy
                                 expected_policy = policy if selected else legacy_policy
-                                with get_context().override_server_args(
-                                    speculative_algorithm=name
+                                with (
+                                    get_context().override_server_args(
+                                        pp_size=pp, speculative_algorithm=name
+                                    ),
+                                    get_context().parallel.override(pp_size=3 - pp),
                                 ):
                                     for platform in (
                                         TpuSRTPlatform(),

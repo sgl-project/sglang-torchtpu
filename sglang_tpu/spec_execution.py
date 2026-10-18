@@ -94,26 +94,32 @@ def resolve_spec_execution(
     return _COMPATIBILITY
 
 
-def is_experimental_spec_worker(algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
+def is_experimental_spec_worker(
+    spec_algorithm: SpeculativeAlgorithm, *, pp_size=1
+) -> bool:
     """Whether DFLASH/DSPARK is served by TpuBlockSpecWorker."""
-    return resolve_spec_execution(algorithm, pp_size=pp_size).block_worker
+    return resolve_spec_execution(spec_algorithm, pp_size=pp_size).block_worker
 
 
-def is_experimental_chain(algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
+def is_experimental_chain(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
     """Whether TpuChainSpecWorker serves this algorithm (MTP or EAGLE3)."""
-    return resolve_spec_execution(algorithm, pp_size=pp_size).chain_worker
+    return resolve_spec_execution(spec_algorithm, pp_size=pp_size).chain_worker
 
 
-def is_experimental_mtp(algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
+def is_experimental_mtp(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
     """Whether MTP is served by TpuChainSpecWorker."""
-    return _is_mtp(algorithm) and is_experimental_chain(algorithm, pp_size=pp_size)
+    return _is_mtp(spec_algorithm) and is_experimental_chain(
+        spec_algorithm, pp_size=pp_size
+    )
 
 
-def is_experimental_eagle3(algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
+def is_experimental_eagle3(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
     """Whether EAGLE3 is served by TpuChainSpecWorker."""
-    return algorithm.is_eagle3() and is_experimental_chain(algorithm, pp_size=pp_size)
+    return spec_algorithm.is_eagle3() and is_experimental_chain(
+        spec_algorithm, pp_size=pp_size
+    )
 
 
-def is_experimental_spec(algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
+def is_experimental_spec(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
     """Whether a TpuSpecWorker serves this algorithm (host-padded batches)."""
-    return resolve_spec_execution(algorithm, pp_size=pp_size).host_padded
+    return resolve_spec_execution(spec_algorithm, pp_size=pp_size).host_padded
