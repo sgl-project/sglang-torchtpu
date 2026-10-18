@@ -81,6 +81,11 @@ class TpuEnvs:
     # help much. Benchmark first; in a large prefill-decode mesh, consider 1 or 2.
     SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM = EnvInt(4)
 
+    # HiCache write_back on raiden (see hicache_write_back_copy_ahead.py): tokens
+    # of the next eviction victims kept copied to host. Unset: four chunked-prefill
+    # chunks. 0: evictions back up their victims synchronously, as upstream does.
+    SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

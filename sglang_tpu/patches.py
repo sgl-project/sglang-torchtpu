@@ -879,6 +879,16 @@ def _patch_pd_decode_swa_hicache() -> None:
     pd_decode_swa_hicache.install()
 
 
+def _patch_hicache_write_back_copy_ahead() -> None:
+    """Copy the next eviction victims to host ahead of raiden write_back evictions.
+
+    See ``hicache_write_back_copy_ahead``.
+    """
+    from sglang_tpu import hicache_write_back_copy_ahead
+
+    hicache_write_back_copy_ahead.install()
+
+
 def _patch_pd_decode_async_prefill_info() -> None:
     """Fetch PD prefill parallel info off the decode scheduler thread.
 
@@ -965,6 +975,7 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _patch_hicache_write_back_copy_ahead()
     _patch_pd_decode_async_prefill_info()
     _patch_host_heap_trim()
     _patch_profile_auto()
