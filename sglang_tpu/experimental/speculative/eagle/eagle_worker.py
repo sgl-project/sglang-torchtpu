@@ -49,7 +49,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_spec, process_model_config
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_spec,
+    process_model_config,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -702,6 +706,12 @@ def _check_eagle3_config(target_worker: TpModelWorker) -> None:
     if spec.speculative_num_steps < 2:
         raise NotImplementedError(
             "TpuEagle3Worker needs speculative_num_steps >= 2 (the fused draft loop)."
+        )
+    if not get_flags().capture.enable_torch_compile:
+        # The draft always runs the compiled fused loop, which core precompiles
+        # only under torch compile (EagleDraftWorker._should_fuse_draft_steps).
+        raise NotImplementedError(
+            "TpuEagle3Worker needs --enable-torch-compile (the fused draft loop)."
         )
     if spec.speculative_num_draft_tokens != spec.speculative_num_steps + 1:
         raise ValueError(
