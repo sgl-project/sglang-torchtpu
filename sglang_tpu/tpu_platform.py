@@ -1233,8 +1233,10 @@ class TpuSRTPlatform(SRTPlatform):
             from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
             register_fp8_linear_small_m_op()
-        _register_models()
+        # Set before registering: importing the model registry imports model_runner,
+        # which calls init_backend again on the OOT path.
         self._backend_initialized = True
+        _register_models()
 
     def on_warmup_complete(self) -> None:
         """Freeze torch.compile so serving-time recompiles raise."""
