@@ -15,6 +15,11 @@ def register_host_batch_padder(padder: Callable[[int], int]) -> None:
     _host_batch_padder = padder
 
 
+def uses_host_batch(batch) -> bool:
+    """Whether batch is a HOST_PADDED TpuSpecWorker batch (the init_new hook set its padder)."""
+    return getattr(batch, "host_pad_bs", None) is not None
+
+
 def get_host_batch_padder() -> Callable[[int], int]:
     assert _host_batch_padder is not None, "TpuSpecWorker has not registered a padder"
     return _host_batch_padder

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import torch
 
-from sglang_tpu.hooks.experimental_spec import uses_host_batch
+from sglang_tpu.experimental import uses_host_batch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap

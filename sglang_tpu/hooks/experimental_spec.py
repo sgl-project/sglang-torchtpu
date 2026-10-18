@@ -15,11 +15,8 @@ from sglang_tpu.experimental import (
     experimental_spec_enabled,
     get_host_batch_padder,
     is_experimental_spec,
+    uses_host_batch,
 )
-
-
-def uses_host_batch(batch):
-    return getattr(batch, "host_pad_bs", None) is not None
 
 
 def initialize_host_batch(result, *args, **kwargs):

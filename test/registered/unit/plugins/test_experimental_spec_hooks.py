@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pkgutil
+import subprocess
+import sys
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -292,6 +294,17 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     self.assertEqual(
                         is_experimental_spec_worker(algo), experimental or no_d2h
                     )
+
+    def test_overlap_utils_tpu_imports_without_the_hook_package(self):
+        """Core overlap_utils imports overlap_utils_tpu while the scheduler module
+        is still initializing; pulling in sglang_tpu.hooks there (whose PP hooks
+        import Scheduler) killed every TPU scheduler with a circular import."""
+        code = (
+            "import sys, sglang_tpu.overlap_utils_tpu; "
+            "sys.exit(int(any(m.startswith('sglang_tpu.hooks') for m in sys.modules)))"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode()[-2000:])
 
     def test_hot_path_hooks_register_only_with_the_flag_on(self):
         """With both flags off the default spec path must run no extra wrappers."""
