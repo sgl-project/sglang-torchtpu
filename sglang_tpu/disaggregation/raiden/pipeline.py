@@ -1896,9 +1896,8 @@ class PipelineTransfer:
             if entry["done"] and entry["aux"] is not None:
                 self.done_send.add(room)
         for room in (self.done_send | self.failed) - self.retired:
-            if room in self.sent:
-                self.client.complete_request_blocks(str(room), room, self.unit)
-            self.retired.add(room)
+            if self._complete_room(room):
+                self.retired.add(room)
         for room, item in self.sent.items():
             self._try_release(room)
             if room in self.done_send | self.failed:
@@ -1912,6 +1911,25 @@ class PipelineTransfer:
                     else:
                         self.failed.add(room)
                     self.retired.add(room)
+
+    def _complete_room(self, room) -> bool:
+        """Conclude a finished or failed room's closing registration; False
+        while it must wait. A share registered before its result point (early
+        close) may still be unclaimed here: a failed room cancels it, and a
+        finished room completes it once the decode has claimed it."""
+        item = self.sent.get(room)
+        if item is None or not item["registered"]:
+            return True
+        if room in self.failed and room not in self.done_send:
+            if self.client.cancel_request_blocks_if_unclaimed(str(room), room):
+                return True
+        try:
+            self.client.complete_request_blocks(str(room), room, self.unit)
+        except RuntimeError as error:
+            if _EARLY_COMPLETION not in str(error):
+                raise
+            return False
+        return True
 
     def _poll_receive(self, room, request) -> None:
         mgr = self.manager

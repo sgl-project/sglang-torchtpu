@@ -29,6 +29,7 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
     legacy_mirror_slots,
     legacy_slot_host_bytes,
     materialized_storage_layout,
+    part_req_id,
     pool_manifest,
     source_spans,
     warn_if_staging_exceeds_premapped,
@@ -916,6 +917,60 @@ class TestPipelineLifetimes(unittest.TestCase):
         pipe.engine.poll_stats_with_details.return_value = _polled()
         pipe.poll()
         pipe.client.complete_request_blocks.assert_called_once_with("7", 7, pipe.unit)
+
+    def test_failed_room_cancels_its_unclaimed_closing_registration(self):
+        """Early close registers the closing share before the decode claims
+        it. A room that then failed natively (here an early part) completed
+        that unclaimed registration, and the registry's refusal escaped into
+        the prefill scheduler."""
+        pipe = transfer(producer=True)
+        pipe.sent[7] = sent()
+        pipe.client.complete_request_blocks.side_effect = RuntimeError(
+            "Only an empty producer registration may complete before the request block snapshot is claimed"
+        )
+        pipe.client.cancel_request_blocks_if_unclaimed.return_value = True
+        pipe.engine.poll_stats_with_details.return_value = _polled(
+            failed=[part_req_id(7, 0)]
+        )
+        _, _, failed = pipe.poll()
+        self.assertIn("7", failed)
+        self.assertIn(7, pipe.retired)
+        pipe.client.cancel_request_blocks_if_unclaimed.assert_called_once_with("7", 7)
+        pipe.client.complete_request_blocks.assert_not_called()
+
+    def test_failed_claimed_room_completes_its_closing_registration(self):
+        pipe = transfer(producer=True)
+        pipe.sent[7] = sent()
+        pipe.client.cancel_request_blocks_if_unclaimed.return_value = False
+        pipe.engine.poll_stats_with_details.return_value = _polled(
+            failed=[part_req_id(7, 0)]
+        )
+        pipe.poll()
+        self.assertIn(7, pipe.retired)
+        pipe.client.complete_request_blocks.assert_called_once_with("7", 7, pipe.unit)
+
+    def test_finished_room_completes_once_its_registration_is_claimed(self):
+        pipe = transfer(producer=True)
+        pipe.sent[7] = sent()
+        pipe.done_send.add(7)
+        pipe.client.complete_request_blocks.side_effect = RuntimeError(
+            "Only an empty producer registration may complete before the request block snapshot is claimed"
+        )
+        pipe.poll()
+        self.assertNotIn(7, pipe.retired)
+        pipe.client.cancel_request_blocks_if_unclaimed.assert_not_called()
+        pipe.client.complete_request_blocks.side_effect = None
+        pipe.poll()
+        self.assertIn(7, pipe.retired)
+        self.assertEqual(pipe.client.complete_request_blocks.call_count, 2)
+
+    def test_other_completion_errors_still_raise(self):
+        pipe = transfer(producer=True)
+        pipe.sent[7] = sent()
+        pipe.done_send.add(7)
+        pipe.client.complete_request_blocks.side_effect = RuntimeError("unreachable")
+        with self.assertRaisesRegex(RuntimeError, "unreachable"):
+            pipe.poll()
 
     def test_full_prefix_hit_releases_source_without_starting_transfer(self):
         pipe = transfer()
