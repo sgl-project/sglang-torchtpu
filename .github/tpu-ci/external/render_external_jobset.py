@@ -32,7 +32,7 @@ Modes:
       ordered `groups`, run back-to-back on that slice. P/D groups that need two slices get
       rows of their own, one per slice PAIR:
         [{"name","suite","hosts","topology","nodepool_var",["nodepool_var_decode"],"groups"}]
-      `nodepool_var` is the NAME of the repo secret holding that slice's nodepool; the
+      `nodepool_var` is the NAME of the environment secret holding that slice's nodepool; the
       workflow resolves it so the value never appears in source or the matrix.
   render (default)
       Render ONE group's JobSet (the workflow calls this once per group in a row):
@@ -282,7 +282,7 @@ def render(cfg, a):
         )
     if not a.nodepool:
         sys.exit(
-            "render needs --nodepool (the resolved slice nodepool, from a repo secret)"
+            "render needs --nodepool (the resolved slice nodepool, from a environment secret)"
         )
 
     sl = suites[g["suite"]]
@@ -359,7 +359,7 @@ def main():
     ap.add_argument(
         "--nodepool",
         default="",
-        help="Resolved slice nodepool (the workflow reads it from the row's repo secret).",
+        help="Resolved slice nodepool (the workflow reads it from the row's environment secret).",
     )
     ap.add_argument(
         "--nodepool-decode",

@@ -24,7 +24,7 @@ on:
         type: string            # e.g. external-nightly-2x2x2-s0 (labels + artifact name)
       nodepool_var:
         required: true
-        type: string            # NAME of the repo secret holding this slice's nodepool
+        type: string            # NAME of the environment secret holding this slice's nodepool
       nodepool_var_decode:
         required: false
         type: string
@@ -49,19 +49,19 @@ concurrency:
   group: external-slice-${{ inputs.nodepool_var }}${{ inputs.nodepool_var_decode && format('-{0}', inputs.nodepool_var_decode) || '' }}
   cancel-in-progress: false
 
-env:
-  # The runner authenticates as the in-project CI SA; the external cluster grants that SA access
-  # to their cluster (RBAC + roles/container.developer) and its DNS endpoint. See README "Access".
-  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
-  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
-  # Partner-internal identifiers come from repo secrets (masked in logs, out of source).
-  EXTERNAL_CLUSTER: ${{ secrets.EXTERNAL_CLUSTER }}
-  EXTERNAL_PROJECT: ${{ secrets.EXTERNAL_PROJECT }}
-  EXTERNAL_LOCATION: us-central1        # public GCP region; not a partner identifier
-  EXTERNAL_NAMESPACE: default
-
 jobs:
   test:
+    environment: external-tpu
+    env:
+      # The runner authenticates as the in-project CI SA; the external cluster grants that SA access
+      # to their cluster (RBAC + roles/container.developer) and its DNS endpoint. See README "Access".
+      WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
+      CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+      # Partner-internal identifiers come from environment secrets (masked in logs, out of source).
+      EXTERNAL_CLUSTER: ${{ secrets.EXTERNAL_CLUSTER }}
+      EXTERNAL_PROJECT: ${{ secrets.EXTERNAL_PROJECT }}
+      EXTERNAL_LOCATION: us-central1        # public GCP region; not a partner identifier
+      EXTERNAL_NAMESPACE: default
     # The Actions sidebar shows only this name under the slice row, so name the tests it runs.
     name: ${{ join(fromJSON(inputs.groups_json).*.name, ', ') }}
     runs-on: ubuntu-latest
@@ -71,6 +71,11 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
+      - name: Validate external cluster configuration
+        run: |
+          for key in EXTERNAL_CLUSTER EXTERNAL_PROJECT; do
+            [ -n "${!key}" ] || { echo "::error::Missing external-tpu secret: $key"; exit 1; }
+          done
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
@@ -117,6 +122,16 @@ jobs:
           PODS_PRINT_EVERY=12         # print the pod table every POLL x this seconds
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           : > "$RUNNER_TEMP/external-pod-logs.txt"
+          sanitize_logs() { python3 -u .github/tpu-ci/external/sanitize_logs.py; }
+          # Explicit fields avoid exposing node names, pod IPs, or free-form event messages.
+          pod_status() {
+            kubectl -n "$ns" get pods -l "$sel" \
+              -o custom-columns=NAME:.metadata.name,PHASE:.status.phase 2>/dev/null || true
+          }
+          event_status() {
+            kubectl -n "$ns" get events --sort-by=.lastTimestamp \
+              -o custom-columns=TYPE:.type,REASON:.reason,COUNT:.count 2>/dev/null | tail -n 30 || true
+          }
 
           # Mirror the accumulating pod log to the CI artifacts bucket every 10 min:
           # GitHub only serves a job's log blob AFTER the job completes, and the
@@ -137,11 +152,11 @@ jobs:
           # Resolve this slice's nodepool from the secret named by nodepool_var (GitHub masks
           # the value in logs). Fail closed if the secret is unset.
           NODEPOOL="${!NODEPOOL_VAR:-}"
-          [ -n "$NODEPOOL" ] || { echo "❌ repo secret ${NODEPOOL_VAR} is not set -- see external/README.md 'Configuration'"; exit 1; }
+          [ -n "$NODEPOOL" ] || { echo "❌ environment secret ${NODEPOOL_VAR} is not set -- see external/README.md 'Configuration'"; exit 1; }
           NODEPOOL_DECODE=""
           if [ -n "$NODEPOOL_VAR_DECODE" ]; then
             NODEPOOL_DECODE="${!NODEPOOL_VAR_DECODE:-}"
-            [ -n "$NODEPOOL_DECODE" ] || { echo "❌ repo secret ${NODEPOOL_VAR_DECODE} is not set"; exit 1; }
+            [ -n "$NODEPOOL_DECODE" ] || { echo "❌ environment secret ${NODEPOOL_VAR_DECODE} is not set"; exit 1; }
           fi
 
           # Re-mint the CI SA token from a fresh GitHub OIDC token (same exchange the auth action
@@ -219,19 +234,19 @@ jobs:
               fatal_events="$(kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep "${short}" | grep -v "already exists" || true)"
               if [ -n "$fatal_events" ]; then
                 echo "❌ ${label}: Job creation rejected -- no pod will ever start:"
-                echo "$fatal_events" | tail -n 3
+                echo "JobCreationFailed; inspect detailed events through authorized cluster access."
                 kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
                 CUR=""
                 return 1
               fi
               if [ "$(date +%s)" -ge "$running_deadline" ]; then
                 echo "⚠️  ${label}: pods not all Running ${POD_RUNNING_DEADLINE}s after apply; continuing anyway"
-                kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
+                event_status
                 break
               fi
               sleep "$POLL"
             done
-            kubectl -n "$ns" get pods -l "$sel" -o wide || true
+            pod_status
 
             refresh_cluster_token || echo "credential refresh failed; continuing"
             # Stream logs in the background, re-attaching if the stream dies while
@@ -248,7 +263,7 @@ jobs:
                 if [ "$first" = 1 ]; then tailn=-1; first=0; else tailn=20; fi
                 kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
                   --max-log-requests="$LOG_STREAM_MAX" --pod-running-timeout=20m --tail="$tailn" \
-                  2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
+                  2>&1 | sanitize_logs | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
                 sleep 20
               done ) &
             local stream_pid=$!
@@ -263,7 +278,7 @@ jobs:
               fi
               if [ $(( iter % PODS_PRINT_EVERY )) -eq 0 ]; then
                 echo "--- [$(date +%T)] ${label} pods ---"
-                kubectl -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName 2>/dev/null || true
+                pod_status
               fi
               iter=$(( iter + 1 ))
               if ! kubectl -n "$ns" get "$name" >/dev/null 2>&1; then
@@ -278,10 +293,9 @@ jobs:
               if [ "$ok" = "True" ]; then echo "✅ ${label} PASSED"; rc=0; break; fi
               if [ "$bad" = "True" ]; then
                 echo "❌ ${label} FAILED"
-                kubectl -n "$ns" get pods -l "$sel" -o wide || true
-                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 --max-log-requests=64 2>/dev/null || true
-                kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
-                kubectl -n "$ns" describe "$name" | tail -n 120 || true
+                pod_status
+                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 --max-log-requests=64 2>&1 | sanitize_logs || true
+                event_status
                 rc=1; break
               fi
               sleep "$POLL"
@@ -318,7 +332,7 @@ jobs:
               --nodepool "$NODEPOOL" \
               --nodepool-decode "$NODEPOOL_DECODE" \
               --extra-args "$IN_EXTRA_ARGS" > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
-            grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|MODE|SINGLE_HOST|bash "benchmark' /tmp/external-job.yaml | head -20
+            grep -nE 'generateName:|completions:|gke-tpu-topology:|bucketName:|MODE|SINGLE_HOST|bash "benchmark' /tmp/external-job.yaml | head -20
             # Waiting outlasts the rendered activeDeadlineSeconds (same formula + slack).
             wait_budget=$(( WAIT_SLACK + nf * tpf )); (( wait_budget < WAIT_FLOOR )) && wait_budget=$WAIT_FLOOR
             run_group /tmp/external-job.yaml "$gname" "$wait_budget" || overall=1

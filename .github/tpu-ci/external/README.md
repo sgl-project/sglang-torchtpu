@@ -112,7 +112,8 @@ python3 .github/tpu-ci/external/render_external_jobset.py --list-groups  # what 
 ## Configuration
 
 Non-sensitive structure lives in [`external-topology.yaml`](external-topology.yaml). Partner-internal
-identifiers are **repo secrets** (masked in logs, out of source) — set once:
+identifiers are **environment secrets** in the GitHub environment `external-tpu`
+(masked in Actions logs, out of source):
 
 | Secret | Value |
 |---|---|
@@ -120,6 +121,51 @@ identifiers are **repo secrets** (masked in logs, out of source) — set once:
 | `EXTERNAL_PROJECT` | external GCP project id |
 | `EXTERNAL_NODEPOOL_2X2X2_0..3` | the **4** nodepools backing the `2x2x2` slices |
 | `EXTERNAL_NODEPOOL_2X2X4_0..1` | the **2** nodepools backing the `2x2x4` slices |
+
+### Set up the environment before merging the migration
+
+1. Create `external-tpu` in repository **Settings → Environments**. Configure the
+   allowed deployment branches and any required reviewers for external cluster access.
+   Scheduled runs must be able to deploy from `main`; required reviewers will also
+   gate unattended nightly runs. Only dispatch trusted test refs: deployment branch
+   rules apply to the workflow ref, not the separately checked-out `inputs.ref`.
+2. Populate all eight secrets above from the authorized infrastructure configuration.
+   GitHub does not return existing secret values, so repository secrets cannot be
+   downloaded and copied. For example, `gh secret set EXTERNAL_CLUSTER --env external-tpu`
+   prompts for a value without putting it in shell history. Repeat for the other keys.
+3. The reusable workflow sets `jobs.test.environment: external-tpu` and resolves
+   cluster credentials in that job. Keep `secrets: inherit` on both nightly callers.
+   Same-named environment secrets take precedence over repository secrets; see
+   [GitHub's reusable workflow documentation](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow).
+4. Validate an authorized manual run, then remove the eight repository-level copies
+   once all consumers use the environment. Until removed, repository copies remain
+   available to other workflows and can hide missing environment configuration.
+
+The region, namespace, in-project WIF provider, CI service-account address, and CI
+bucket are non-secret configuration. Authentication uses OIDC; do not add a
+long-lived service-account key. If the WIF trust policy constrains the GitHub OIDC
+`sub` claim, check the configured subject format and update it for the environment
+before switching the job. For the traditional default format this is
+`repo:sgl-project/sglang-torchtpu:environment:external-tpu`; see the
+[GitHub OIDC reference](https://docs.github.com/en/actions/reference/security/oidc#example-subject-claims)
+for customized or immutable subject formats.
+
+### Logs and historical disclosures
+
+Pod status output includes names and phases only. Event summaries omit free-form
+messages, and the workflow does not print full JobSet descriptions or node selectors.
+Pod logs pass through `sanitize_logs.py` **before** display and before writing the
+file uploaded as an Actions artifact or copied to GCS. The filter removes configured
+cluster/project/nodepool values, GKE node hostnames, and IPv4/IPv6 addresses while
+preserving benchmark metrics. GitHub's console masking alone does not sanitize
+uploaded files. Inspect detailed infrastructure diagnostics through authorized
+cluster access instead.
+
+This is a targeted infrastructure filter, not a general secret scanner: tests must
+still avoid printing credentials or other confidential content. These changes do
+not redact existing artifacts, GCS logs, commits, branch names, PRs, or reports.
+Review previously published material separately; use secret **names**, not values
+or partner-identifying details, in shareable reports.
 
 The cluster provides **4× `2x2x2`** and **2× `2x2x4`** slices. There is no Kueue, so discovery
 **round-robins** the launch groups across a shape's slices (`nodepool_vars` in
