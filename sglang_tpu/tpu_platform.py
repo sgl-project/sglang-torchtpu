@@ -927,14 +927,14 @@ class TpuSRTPlatform(SRTPlatform):
         )
         # Plugin speculative workers require bucketed compiled forwards.
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.experimental import is_experimental_spec
+        from sglang_tpu.spec_execution import resolve_spec_execution
 
-        if is_experimental_spec(
+        if resolve_spec_execution(
             SpeculativeAlgorithm.__members__.get(
                 cfg.speculative_algorithm, SpeculativeAlgorithm.NONE
             ),
             pp_size=cfg.pp_size,
-        ):
+        ).host_padded:
             if cfg.disable_overlap_schedule:
                 raise ValueError(
                     "The TPU plugin spec worker requires overlap scheduling; remove "
@@ -1075,35 +1075,12 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_spec_worker_cls(self, algorithm, server_args, *, default: type) -> type:
         from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang_tpu.spec_execution import resolve_spec_execution
 
-        # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
-        from sglang_tpu.experimental import (
-            is_experimental_chain,
-            is_experimental_spec_worker,
+        binding = resolve_spec_execution(
+            algorithm, pp_size=resolving_view(server_args).pp_size
         )
-
-        pp_size = resolving_view(server_args).pp_size
-        if is_experimental_chain(algorithm, pp_size=pp_size):
-            from sglang_tpu.experimental.speculative.chain_spec_worker import (
-                TpuChainSpecWorker,
-            )
-
-            return TpuChainSpecWorker
-        if is_experimental_spec_worker(algorithm, pp_size=pp_size):
-            from sglang_tpu.experimental.speculative.block_spec_worker import (
-                TpuBlockSpecWorker,
-            )
-
-            return TpuBlockSpecWorker
-        from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
-
-        if default is EAGLEWorkerV2:
-            from sglang_tpu.experimental.speculative.eagle.draft_worker import (
-                TpuEagleWorker,
-            )
-
-            return TpuEagleWorker
-        return default
+        return binding.worker_cls(default=default)
 
     def get_quantization_config(
         self, quantization: str

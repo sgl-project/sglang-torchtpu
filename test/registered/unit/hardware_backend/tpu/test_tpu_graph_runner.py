@@ -535,7 +535,7 @@ class TestTpuGraphRunner(CustomTestCase):
         # No speculative decoding -> plain (unmixed) policy.
         no_spec = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            server_args=SimpleNamespace(),
+            server_args=SimpleNamespace(pp_size=1),
         )
         self.assertIs(
             _augment_spec_policy(DecoderTpuCompilePolicy, no_spec),

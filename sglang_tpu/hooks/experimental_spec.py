@@ -28,10 +28,10 @@ from sglang_tpu.experimental import (
     get_host_batch_padder,
     is_experimental_chain,
     is_experimental_spec,
-    is_experimental_spec_worker,
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+from sglang_tpu.spec_execution import resolve_spec_execution
 
 
 def _target_pp_size() -> int:
@@ -322,10 +322,10 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
 def _uses_plugin_block_worker() -> bool:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    return is_experimental_spec_worker(
+    return resolve_spec_execution(
         SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm),
         pp_size=_target_pp_size(),
-    )
+    ).block_worker
 
 
 def sample_draft_tokens(original, model, hidden_states, input_ids):

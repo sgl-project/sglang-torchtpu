@@ -213,6 +213,220 @@ class TestExperimentalEagle3(CustomTestCase):
             )
             self.assertEqual(initialize_host_batch(batch).host_pad_bs(2), 4)
 
+    def _selection_routes(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+        from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+            DFlashSpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
+            Eagle3SpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.experimental.compilation.block_compile_policy import (
+            TpuBlockSpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.experimental.compilation.chain_compile_policy import (
+            TpuChainSpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        return (
+            (
+                "EAGLE3",
+                EAGLEWorkerV2,
+                TpuEagleWorker,
+                Eagle3SpecDecodeCompilePolicyMixin,
+                TpuChainSpecWorker,
+                TpuChainSpecDecodeCompilePolicyMixin,
+            ),
+            # NEXTN resolves to EAGLE; on the plugin route both are native MTP.
+            (
+                "EAGLE",
+                EAGLEWorkerV2,
+                TpuEagleWorker,
+                Eagle3SpecDecodeCompilePolicyMixin,
+                TpuChainSpecWorker,
+                TpuChainSpecDecodeCompilePolicyMixin,
+            ),
+            (
+                "NEXTN",
+                EAGLEWorkerV2,
+                TpuEagleWorker,
+                Eagle3SpecDecodeCompilePolicyMixin,
+                TpuChainSpecWorker,
+                TpuChainSpecDecodeCompilePolicyMixin,
+            ),
+            (
+                "DFLASH",
+                DFlashWorkerV2,
+                DFlashWorkerV2,
+                DFlashSpecDecodeCompilePolicyMixin,
+                TpuBlockSpecWorker,
+                TpuBlockSpecDecodeCompilePolicyMixin,
+            ),
+            (
+                "DSPARK",
+                DSparkWorkerV2,
+                DSparkWorkerV2,
+                None,
+                TpuBlockSpecWorker,
+                TpuBlockSpecDecodeCompilePolicyMixin,
+            ),
+            (None, object, object, None, None, None),
+            ("FROZEN_KV_MTP", object, object, None, None, None),
+            ("NGRAM", object, object, None, None, None),
+        )
+
+    def test_selection_matrix_keeps_worker_policy_and_metadata_on_target_topology(self):
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            DecoderTpuCompilePolicy,
+        )
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+        from sglang_tpu.graph_runner.tpu_graph_runner import _augment_spec_policy
+        from sglang_tpu.hooks.experimental_spec import (
+            _uses_plugin_block_worker,
+            initialize_host_batch,
+        )
+        from sglang_tpu.platform import TpuOOTPlatform
+
+        # No worker is built yet; each case registers its selected worker's padder.
+        with patch("sglang_tpu.experimental._host_batch_padder", None):
+            for enabled in (False, True):
+                for alias in (False, True):
+                    for pp in (1, 2):
+                        with (
+                            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(
+                                enabled
+                            ),
+                            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(alias),
+                            get_context().override_server_args(pp_size=pp),
+                            # Selection follows configuration even inside a draft group scope.
+                            get_context().parallel.override(pp_size=3 - pp),
+                        ):
+                            for (
+                                name,
+                                default,
+                                legacy,
+                                legacy_policy,
+                                worker,
+                                policy,
+                            ) in self._selection_routes():
+                                algo = SpeculativeAlgorithm.from_string(name)
+                                selected = (
+                                    pp == 1
+                                    and (enabled or alias)
+                                    and worker is not None
+                                )
+                                expected_worker = worker if selected else legacy
+                                expected_policy = policy if selected else legacy_policy
+                                with get_context().override_server_args(
+                                    speculative_algorithm=name
+                                ):
+                                    for platform in (
+                                        TpuSRTPlatform(),
+                                        TpuOOTPlatform(),
+                                    ):
+                                        with self.subTest(
+                                            enabled=enabled,
+                                            alias=alias,
+                                            pp=pp,
+                                            algorithm=name,
+                                            platform=platform.device_name,
+                                        ):
+                                            args = SimpleNamespace(pp_size=pp)
+                                            self.assertIs(
+                                                platform.get_spec_worker_cls(
+                                                    algo, args, default=default
+                                                ),
+                                                expected_worker,
+                                            )
+                                            runner = SimpleNamespace(
+                                                spec_algorithm=algo, server_args=args
+                                            )
+                                            composed = _augment_spec_policy(
+                                                DecoderTpuCompilePolicy, runner
+                                            )
+                                            if expected_policy is None:
+                                                self.assertIs(
+                                                    composed, DecoderTpuCompilePolicy
+                                                )
+                                            else:
+                                                self.assertTrue(
+                                                    issubclass(
+                                                        composed, expected_policy
+                                                    )
+                                                )
+                                            # Only a TpuSpecWorker registers the padder
+                                            # that host pads this process's batches.
+                                            registers_padder = issubclass(
+                                                expected_worker, TpuSpecWorker
+                                            )
+                                            self.assertEqual(registers_padder, selected)
+                                            batch = SimpleNamespace(
+                                                spec_algorithm=algo, enable_overlap=True
+                                            )
+                                            with patch(
+                                                "sglang_tpu.experimental._host_batch_padder",
+                                                (lambda bs: 4)
+                                                if registers_padder
+                                                else None,
+                                            ):
+                                                self.assertEqual(
+                                                    "host_pad_bs"
+                                                    in vars(
+                                                        initialize_host_batch(batch)
+                                                    ),
+                                                    selected,
+                                                )
+                                            self.assertEqual(
+                                                _uses_plugin_block_worker(),
+                                                selected
+                                                and worker is TpuBlockSpecWorker,
+                                            )
+
+    def test_block_selection_is_traceable_with_scoped_parallel_groups(self):
+        from sglang_tpu.hooks.experimental_spec import _uses_plugin_block_worker
+
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            for pp in (1, 2):
+                with (
+                    self.subTest(target_pp=pp),
+                    get_context().override_server_args(
+                        pp_size=pp, speculative_algorithm="DSPARK"
+                    ),
+                    get_context().parallel.override(pp_size=3 - pp),
+                ):
+
+                    def forward(value):
+                        return value + int(_uses_plugin_block_worker())
+
+                    actual = torch.compile(forward, fullgraph=True, backend="eager")(
+                        torch.tensor([2])
+                    )
+                    torch.testing.assert_close(
+                        actual, torch.tensor([3 if pp == 1 else 2])
+                    )
+
+    def test_selection_discovery_does_not_import_workers_or_torch_tpu(self):
+        import subprocess
+        import sys
+
+        code = """
+import sys
+from sglang_tpu import spec_execution
+assert 'torch_tpu' not in sys.modules
+assert 'sglang.srt.speculative.eagle_worker_v2' not in sys.modules
+assert not any(name.startswith('sglang_tpu.experimental.speculative') for name in sys.modules)
+assert not any(name.startswith('sglang_tpu.graph_runner') for name in sys.modules)
+"""
+        subprocess.run([sys.executable, "-c", code], check=True)
+
     def test_block_model_hook_keeps_target_route_inside_draft_pp_scope(self):
         from sglang.srt.runtime_context import get_parallel
         from sglang_tpu.hooks.experimental_spec import _uses_plugin_block_worker
