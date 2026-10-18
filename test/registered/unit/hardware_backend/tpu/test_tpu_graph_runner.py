@@ -426,6 +426,19 @@ class TestTpuGraphRunner(CustomTestCase):
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
 
+    def test_compile_enablement_uses_resolution_without_mutating_raw_args(self):
+        """A platform-enabled compile default must reach graph-runner startup."""
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        model = _model_with(forward=lambda *a, **k: None)
+        runner = self._runner_for(model, enable_torch_compile=False)
+        declare_resolution(
+            runner.server_args, "test.platform_default", enable_torch_compile=True
+        )
+        TpuGraphRunner(runner)
+        self.assertFalse(runner.server_args.enable_torch_compile)
+        self.assertIsNotNone(runner.compile_policy)
+
     def test_pp_draft_scope_keeps_target_compatibility_policy(self):
         from sglang_tpu.envs import envs as tpu_envs
 

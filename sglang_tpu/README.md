@@ -66,8 +66,9 @@ unsupported.
 
 For the compatibility route set both
 `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0` and
-`SGLANG_TPU_HOST_PADDING_NO_D2H=0` before launch. DSpark requires the plugin route.
-The existing environment name is retained for deployment compatibility. The
+`SGLANG_TPU_HOST_PADDING_NO_D2H=0` before launch.
+At PP=1, DSpark requires the plugin route. The existing environment name is
+retained for deployment compatibility. The
 default switch does not establish TPU compilation or serving parity: validate the
 selected model, topology, request features and warmup on TPU before deployment.
 

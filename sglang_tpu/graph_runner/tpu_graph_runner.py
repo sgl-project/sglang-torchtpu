@@ -171,7 +171,7 @@ class TpuGraphRunner:
     capture_bs: tuple[int, ...] = ()
 
     def __init__(self, model_runner: ModelRunner) -> None:
-        assert model_runner.server_args.enable_torch_compile, (
+        assert resolving_view(model_runner.server_args).enable_torch_compile, (
             "TpuGraphRunner should only be initialized when enable_torch_compile=True."
         )
 

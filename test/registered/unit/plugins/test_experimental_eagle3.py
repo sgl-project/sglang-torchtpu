@@ -193,6 +193,20 @@ class TestExperimentalEagle3(CustomTestCase):
                             "host_pad_bs", vars(initialize_host_batch(batch))
                         )
                         self.assertFalse(_uses_plugin_block_worker())
+                        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+                            DSparkWorkerV2,
+                        )
+
+                        self.assertIs(
+                            SpeculativeAlgorithm.DSPARK.create_worker(args),
+                            DSparkWorkerV2,
+                        )
+                        self.assertIsNot(
+                            _resolve_spec_compile_policy_mixin(
+                                SpeculativeAlgorithm.DFLASH, pp_size=2
+                            ),
+                            TpuBlockSpecDecodeCompilePolicyMixin,
+                        )
             register_host_batch_padder(lambda bs: 4)
             batch = SimpleNamespace(
                 spec_algorithm=SpeculativeAlgorithm.EAGLE3, enable_overlap=True

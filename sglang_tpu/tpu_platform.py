@@ -995,11 +995,7 @@ class TpuSRTPlatform(SRTPlatform):
                     )
             elif spec_algo == "DFLASH":
                 pass
-            elif (
-                spec_algo == "DSPARK"
-                and cfg.pp_size == 1
-                and _experimental_spec_enabled()
-            ):
+            elif spec_algo == "DSPARK" and _experimental_spec_enabled():
                 # Served by sglang_tpu.experimental.TpuBlockSpecWorker.
                 pass
             else:

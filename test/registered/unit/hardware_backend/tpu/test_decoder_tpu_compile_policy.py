@@ -495,6 +495,13 @@ def _cpu_mamba_pool(num_layers: int) -> TpuMambaPool:
 
 
 class TestHybridLinearDirectCompile(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # The compiler is mocked; this fixture owns no distributed groups.
+        patcher = patch("torch.distributed.is_initialized", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_trace_binds_each_child_metadata_and_restores_it(self):
         """HybridLinearAttnBackend has no forward_metadata of its own.
 
