@@ -21,7 +21,7 @@ import torch
 
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.runtime_context import get_context, get_parallel, get_spec
+from sglang.srt.runtime_context import get_context, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu.experimental import (
     experimental_spec_enabled,
@@ -324,7 +324,7 @@ def _uses_plugin_block_worker() -> bool:
 
     return is_experimental_spec_worker(
         SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm),
-        pp_size=get_parallel().pp_size,
+        pp_size=_target_pp_size(),
     )
 
 

@@ -89,6 +89,8 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        # Mocked compilation owns no process groups, even after another module built them.
+        enter_scope(self, patch("torch.distributed.is_initialized", return_value=False))
         # Flush init's lazy imports before the torch.compile patch: their
         # import-time @torch.compile decorators must not hit the recorder.
         import sglang.kernels.ops.lora.moe.virtual_experts  # noqa: F401
@@ -899,7 +901,6 @@ class TestDraftTorchCompileInstall(CustomTestCase):
                 f"{self._SETUP_MOD}.capture_decode_graph",
                 side_effect=lambda **_: events.append("decode") or MagicMock(),
             ),
-            # The TPU platform installs torch.compile through decode capture.
             patch(f"{self._SETUP_MOD}.current_platform", TpuSRTPlatform()),
             get_context().override_server_args(forward_hooks=[{"name": "capture"}]),
             get_flags().capture.override(enable_torch_compile=True),
@@ -921,10 +922,12 @@ class TestDraftPrecompileOrdering(CustomTestCase):
     def test_precompile_runs_after_draft_init_cuda_graphs(self):
         import contextlib
 
-        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+        from sglang_tpu.experimental.speculative.eagle.draft_worker import (
+            TpuEagleDraftWorker,
+        )
 
         events = []
-        worker = object.__new__(EagleDraftWorker)
+        worker = object.__new__(TpuEagleDraftWorker)
         worker.speculative_num_steps = 3
         from sglang.srt.runtime_context import get_flags
 
@@ -970,10 +973,6 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
                 return_value=False,
-            ),
-            patch(
-                "sglang.srt.speculative.eagle_worker_v2._is_tpu",
-                True,
             ),
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.draft_pp_context",

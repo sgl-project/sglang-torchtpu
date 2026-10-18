@@ -213,6 +213,19 @@ class TestExperimentalEagle3(CustomTestCase):
             )
             self.assertEqual(initialize_host_batch(batch).host_pad_bs(2), 4)
 
+    def test_block_model_hook_keeps_target_route_inside_draft_pp_scope(self):
+        from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.hooks.experimental_spec import _uses_plugin_block_worker
+
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+            get_context().override_server_args(
+                pp_size=2, speculative_algorithm="DSPARK"
+            ),
+            get_parallel().override(pp_size=1),
+        ):
+            self.assertFalse(_uses_plugin_block_worker())
+
     def test_rollback_eagle_keeps_plugin_drafter_and_shared_defaults_stay_generic(self):
         from sglang.srt.platforms.interface import SRTPlatform
 
