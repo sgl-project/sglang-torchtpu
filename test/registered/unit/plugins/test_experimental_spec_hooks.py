@@ -342,6 +342,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         torch.testing.assert_close(draft.new_seq_lens, state.seq_lens)
 
     def test_model_hook_uses_anchor_width_without_changing_parent(self):
+        from sglang.srt.runtime_context import get_context
+
+        enter_scope(
+            self, get_context().override_server_args(speculative_algorithm="DSPARK")
+        )
         from sglang.srt.models.dflash import DFlashDraftModel
         from sglang.srt.models.dspark import DSparkDraftModel
         from sglang_tpu.hooks.experimental_spec import sample_draft_tokens
