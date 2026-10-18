@@ -337,6 +337,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             prepare_attn_residual_kernel,
             register_attn_residual_ops,
         )
+        from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
         from sglang_tpu.hooks.moe_topk import (
             biased_grouped_topk,
             biased_topk,
@@ -354,6 +355,16 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
         from sglang_tpu.hooks.twolevel_allreduce import (
             merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
+        )
+
+        self.assertIn(
+            (
+                "sglang.srt.layers.layer_boundary.adapters.attention."
+                "_device_supports_input_scattered",
+                device_supports_input_scattered,
+                HookType.AROUND,
+            ),
+            HOOKS,
         )
 
         self.assertIn(

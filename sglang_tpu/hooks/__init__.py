@@ -17,6 +17,7 @@ from sglang_tpu.hooks.attn_residual import (
     prepare_attn_residual_kernel,
     register_attn_residual_ops,
 )
+from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.kda_weights import bind_glm5_next_kda_weights
@@ -99,6 +100,12 @@ HOOKS: list[tuple] = [
         "sglang.srt.layers.layer_boundary.residual.mhc.MHCState.__init__",
         wire_hc_ffn_post_pre,
         HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.layers.layer_boundary.adapters.attention."
+        "_device_supports_input_scattered",
+        device_supports_input_scattered,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.speculative.eagle_utils.fused_greedy_chain_verify",

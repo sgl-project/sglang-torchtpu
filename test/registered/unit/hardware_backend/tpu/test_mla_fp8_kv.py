@@ -225,6 +225,7 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
         backend = SimpleNamespace(
             kv_cache_quant_dtype=FP8,
             _op=op,
+            _prefill_op=None,
             # _mla_kernel_args passes these through, so names stand in for them.
             forward_metadata=SimpleNamespace(
                 kv_lens="kv_lens",

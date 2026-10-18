@@ -118,6 +118,59 @@ def _run(
     )
 
 
+def _large_batch_eligible(
+    gating_output, correction_bias, topk, num_fused_shared_experts
+):
+    """Batches past the kernel's MAX_TOKENS (prefill) with one expert group.
+    Gated like the kernel (SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL via _OP_READY,
+    validated expert counts), though this path does not run the op."""
+    return (
+        _OP_READY
+        and num_fused_shared_experts == 0
+        and correction_bias is not None
+        and correction_bias.dim() == 1
+        and gating_output.dim() == 2
+        and gating_output.shape[0] > MAX_TOKENS
+        and gating_output.shape[1] in VALIDATED_NUM_EXPERTS
+        and topk <= 8
+    )
+
+
+def _large_batch_topk(
+    gating_output,
+    correction_bias,
+    topk,
+    renormalize,
+    routed_scaling_factor,
+    apply_routed_scaling_factor_on_output,
+):
+    """``biased_topk_impl`` for prefill-sized batches without XLA's TopK and
+    the row gather it lowers to a general gather: k argmax-and-mask rounds,
+    each pick's weight by a one-hot reduce
+    (one nonzero term, so exact). Same picks as the sort; exact score ties go
+    to the lowest expert id."""
+    from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
+
+    scores = gating_output.sigmoid()
+    remaining = scores + correction_bias.view(1, -1)
+    experts = torch.arange(scores.shape[1], device=scores.device)
+    picks, weights = [], []
+    for _ in range(topk):
+        pick = remaining.argmax(dim=-1, keepdim=True)
+        hit = experts == pick
+        picks.append(pick)
+        weights.append(torch.where(hit, scores, 0).sum(dim=-1, keepdim=True))
+        remaining = remaining.masked_fill(hit, float("-inf"))
+    topk_ids = torch.cat(picks, dim=-1)
+    topk_weights = torch.cat(weights, dim=-1)
+    if renormalize:
+        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
+        if apply_routed_scaling_factor_on_output:
+            topk_weights *= routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
 def biased_topk_around(
     original,
     hidden_states,
@@ -133,6 +186,21 @@ def biased_topk_around(
     apply_routed_scaling_factor_on_output=False,
 ):
     """AROUND hook for ``topk.biased_topk_impl``."""
+    if (
+        scoring_func == "sigmoid"
+        and expert_location_dispatch_info is None
+        and _large_batch_eligible(
+            gating_output, correction_bias, topk, num_fused_shared_experts
+        )
+    ):
+        return _large_batch_topk(
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
     if not (
         scoring_func == "sigmoid"
         and expert_location_dispatch_info is None
@@ -176,6 +244,21 @@ def biased_grouped_topk_around(
 ):
     """AROUND hook for ``topk.biased_grouped_topk_impl``: with one expert group
     the group mask keeps every expert, so it is the plain biased top-k."""
+    if (
+        num_expert_group in (None, 1)
+        and topk_group in (None, 1)
+        and _large_batch_eligible(
+            gating_output, correction_bias, topk, num_fused_shared_experts
+        )
+    ):
+        return _large_batch_topk(
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
     if not (
         num_expert_group in (None, 1)
         and topk_group in (None, 1)

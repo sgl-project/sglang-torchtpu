@@ -27,6 +27,19 @@ from typing import Any, Callable
 _kernel: ModuleType | None = None
 
 
+def _kernel_for_batch() -> ModuleType | None:
+    """The kernel, except on input-scattered (sequence-parallel) prefill
+    batches: there the residual is this rank's token slice, which the kernel's
+    site wiring does not handle, and the torch path runs on 1/tp of the tokens."""
+    from sglang.srt.layers.layer_boundary.adapters.attention import (
+        get_attn_tp_context,
+    )
+
+    if _kernel is None or get_attn_tp_context().input_scattered:
+        return None
+    return _kernel
+
+
 def _enabled() -> bool:
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -84,8 +97,9 @@ def hc_pre(
     out_norm_eps,
 ):
     """AROUND Glm5NextDecoderLayer._hc_pre."""
-    if _kernel is not None:
-        out = _kernel.hc_pre(
+    kernel = _kernel_for_batch()
+    if kernel is not None:
+        out = kernel.hc_pre(
             x=hidden_states,
             hc_fn=hc_fn,
             hc_scale=hc_scale,
@@ -115,8 +129,9 @@ def hc_ffn_post_pre(
     """AROUND Glm5NextDecoderLayer.hc_ffn_post_pre. With the kernel on, a site
     it declines returns None and MHCState runs hc_post then hc_ffn_pre, as with
     the fusion off; the original's fused paths are GPU-only."""
-    if _kernel is not None:
-        return _kernel.hc_post_pre(
+    kernel = _kernel_for_batch()
+    if kernel is not None:
+        return kernel.hc_post_pre(
             x=hidden_states,
             residual=residual,
             h_post=h_post,
@@ -135,8 +150,9 @@ def hc_ffn_post_pre(
 
 def hc_post(original: Callable, self, hidden_states, residual, h_res, h_post):
     """AROUND Glm5NextDecoderLayer.hc_post."""
-    if _kernel is not None:
-        out = _kernel.hc_post(
+    kernel = _kernel_for_batch()
+    if kernel is not None:
+        out = kernel.hc_post(
             x=hidden_states,
             residual=residual,
             h_post=h_post,

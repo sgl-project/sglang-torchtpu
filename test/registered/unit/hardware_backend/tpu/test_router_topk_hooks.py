@@ -66,6 +66,27 @@ class TestRouterTopkHooks(CustomTestCase):
                 self.assertEqual(self._grouped(**case), ("sort_w", "sort_ids"))
                 self.original.assert_called_once()
 
+    def test_large_batch_matches_the_sort(self):
+        # GLM-5.3-Flash prefill: top-8 of 288, one group, past the kernel's MAX_TOKENS.
+        from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
+
+        logits, bias = _logits(tokens=rt.MAX_TOKENS + 7, experts=288), _bias(288)
+        args = (logits, logits, bias, 8, True, 1, 1, 0, 2.5, True)
+        w, ids = rt.biased_grouped_topk_around(self.original, *args)
+        self.original.assert_not_called()
+        # The eager function, as TPU runs it: on CPU the module-level
+        # torch.compile (Inductor) keeps the bf16 sigmoid in f32 and can flip
+        # near-ties.
+        eager = getattr(
+            biased_grouped_topk_impl,
+            "_torchdynamo_orig_callable",
+            biased_grouped_topk_impl,
+        )
+        ref_w, ref_ids = eager(*args)
+        order, ref_order = ids.argsort(dim=-1), ref_ids.argsort(dim=-1)
+        torch.testing.assert_close(ids.gather(1, order), ref_ids.gather(1, ref_order))
+        torch.testing.assert_close(w.gather(1, order), ref_w.gather(1, ref_order))
+
     def test_softmax_scoring_keeps_the_sort(self):
         out = rt.biased_topk_around(
             self.original, None, _logits(), _bias(), K, True, scoring_func="softmax"
