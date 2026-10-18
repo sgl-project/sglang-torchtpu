@@ -162,7 +162,7 @@ def accept_drafts_sampled(
     temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
     p = torch.softmax(target_logits.float() / temps, dim=-1)
     q = torch.softmax(draft_logits.float() / temps, dim=-1)
-    return _leviathan_accept(
+    return _accept_drafts_rejection_sampling(
         p,
         q,
         torch.argmax(target_logits, dim=-1),
@@ -195,7 +195,7 @@ def accept_drafts_sampled_filtered(
     p = _filtered_target_probs(
         target_logits, temperatures, top_ks, top_ps, min_ps, num_verify_rows=n + 1
     )
-    return _leviathan_accept(
+    return _accept_drafts_rejection_sampling(
         p.view(bs, n + 1, -1),
         q,
         torch.argmax(target_logits.view(bs, n + 1, -1), dim=-1),
@@ -205,7 +205,7 @@ def accept_drafts_sampled_filtered(
     )
 
 
-def _leviathan_accept(
+def _accept_drafts_rejection_sampling(
     p: torch.Tensor,
     q: torch.Tensor,
     target_argmax: torch.Tensor,
@@ -213,7 +213,7 @@ def _leviathan_accept(
     num_verify_drafts: torch.Tensor,
     top_ks: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Leviathan acceptance over p [bs, N + 1, V] and q [bs, N, V]; greedy rows where top_k <= 1.
+    """Rejection-sampling acceptance over p [bs, N + 1, V] and q [bs, N, V]; greedy rows where top_k <= 1.
 
     target_argmax [bs, N + 1] comes from the raw logits: argmax over p can flip
     on probabilities that round equal.
