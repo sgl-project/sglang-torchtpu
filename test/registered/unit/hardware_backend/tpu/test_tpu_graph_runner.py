@@ -760,11 +760,6 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertIs(getattr(modules[sampling_path], target), eager)
 
     def test_shared_graph_setup_accepts_compile_only_runner(self):
-        from sglang.srt.model_executor.cuda_graph_config import (
-            Backend,
-            CudaGraphConfig,
-            PhaseConfig,
-        )
         from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 
         for can_compile in (True, False):
@@ -777,12 +772,7 @@ class TestTpuGraphRunner(CustomTestCase):
                 model_runner.gpu_id = 0
                 model_runner.is_generation = True
                 with (
-                    get_context().override_server_args(
-                        enable_torch_compile=True,
-                        cuda_graph_config=CudaGraphConfig(
-                            decode=PhaseConfig(backend=Backend.DISABLED)
-                        ),
-                    ),
+                    get_context().override_server_args(enable_torch_compile=True),
                     patch.object(
                         cuda_graph_setup,
                         "current_platform",
