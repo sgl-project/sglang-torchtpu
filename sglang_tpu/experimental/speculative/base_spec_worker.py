@@ -199,6 +199,13 @@ class TpuSpecWorker(BaseSpecWorker):
                 ).to(self.device)
                 for pbs in self._b_bucketer().buckets
             }
+        self._snapshot_warm_baseline()
+
+    @staticmethod
+    def _snapshot_warm_baseline() -> None:
+        # torch_tpu compiles asynchronously: wait for the warmups' compiles to land
+        # in the cache, or the checker counts them as serving-time compiles.
+        torch.accelerator.synchronize()
         snapshot_recompilation_baseline()
 
     def _warmup_logical_bs_ops(self) -> None:

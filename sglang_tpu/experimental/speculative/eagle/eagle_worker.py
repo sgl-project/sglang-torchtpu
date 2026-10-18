@@ -61,9 +61,6 @@ from sglang.srt.speculative.eagle_worker_common import prepare_for_draft
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils.common import is_pin_memory_available
-from sglang_tpu.compilation.recompilation_checker import (
-    snapshot_recompilation_baseline,
-)
 from sglang_tpu.eagle_utils_tpu import fused_draft_extend_select_argmax_func
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.eagle_info import (
@@ -185,7 +182,7 @@ class TpuEagle3Worker(TpuSpecWorker):
         self._warmup_target_only_accept()
         self._warmup_prefill_glue()
         # The base snapshot ran before these EAGLE-only warmups.
-        snapshot_recompilation_baseline()
+        self._snapshot_warm_baseline()
 
     def draft(
         self,
