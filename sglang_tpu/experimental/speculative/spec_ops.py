@@ -161,12 +161,20 @@ def accept_drafts_sampled(
     temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
     p = torch.softmax(target_logits.float() / temps, dim=-1)
     q = torch.softmax(draft_logits.float() / temps, dim=-1)
-    return _leviathan_accept(p, q, draft_tokens, num_verify_drafts, top_ks)
+    return _leviathan_accept(
+        p,
+        q,
+        torch.argmax(target_logits, dim=-1),
+        draft_tokens,
+        num_verify_drafts,
+        top_ks,
+    )
 
 
 @compiled_op(uses_rng=True)
 def accept_drafts_sampled_filtered(
     target_probs: torch.Tensor,
+    target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
     num_verify_drafts: torch.Tensor,
     draft_logits: torch.Tensor,
@@ -176,28 +184,38 @@ def accept_drafts_sampled_filtered(
     """accept_drafts_sampled against the filtered target probs [pbs * (N + 1), V].
 
     Filtering only p keeps the rule lossless for the filtered target: q is the
-    distribution the draft actually sampled from. The owning worker warms it.
+    distribution the draft actually sampled from. Greedy rows still compare
+    against the raw target_logits. The owning worker warms it.
     """
     bs, n = draft_tokens.shape
     temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
     q = torch.softmax(draft_logits.float() / temps, dim=-1)
     return _leviathan_accept(
-        target_probs.view(bs, n + 1, -1), q, draft_tokens, num_verify_drafts, top_ks
+        target_probs.view(bs, n + 1, -1),
+        q,
+        torch.argmax(target_logits.view(bs, n + 1, -1), dim=-1),
+        draft_tokens,
+        num_verify_drafts,
+        top_ks,
     )
 
 
 def _leviathan_accept(
     p: torch.Tensor,
     q: torch.Tensor,
+    target_argmax: torch.Tensor,
     draft_tokens: torch.Tensor,
     num_verify_drafts: torch.Tensor,
     top_ks: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Leviathan acceptance over p [bs, N + 1, V] and q [bs, N, V]; greedy rows where top_k <= 1."""
+    """Leviathan acceptance over p [bs, N + 1, V] and q [bs, N, V]; greedy rows where top_k <= 1.
+
+    target_argmax [bs, N + 1] comes from the raw logits: argmax over p can flip
+    on probabilities that round equal.
+    """
     n = draft_tokens.shape[1]
     verify_mask = _verify_mask(num_verify_drafts, n)
 
-    target_argmax = torch.argmax(p, dim=-1)
     greedy_ok = (draft_tokens == target_argmax[:, :n]) & verify_mask
     greedy_num_correct = _leading_true(greedy_ok)
     greedy_bonus = _pick(target_argmax, greedy_num_correct)

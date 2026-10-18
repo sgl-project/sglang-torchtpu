@@ -688,7 +688,7 @@ class TpuEagle3Worker(TpuSpecWorker):
                     ),
                 )
         # The wrapper's eager logits processor emits live rows;
-        # HostPaddedTpuSampler pads them.
+        # TpuSampler pads them.
         vocab_size = runner.model_config.vocab_size
         for bs in range(1, cap + 1):
             logits = torch.zeros((bs, vocab_size), dtype=torch.float32).to(self.device)

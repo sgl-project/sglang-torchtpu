@@ -48,7 +48,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -69,7 +69,6 @@ from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
 from sglang_tpu.experimental import register_host_batch_padder
-from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
@@ -97,6 +96,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
 )
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
+from sglang_tpu.sampler import TpuSampler
 from sglang_tpu.sampling_mask import tpu_filter_probs
 
 if TYPE_CHECKING:
@@ -133,17 +133,12 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError("TpuSpecWorker does not support PP.")
         self._target_worker = target_worker
         runner = target_worker.model_runner
-        if get_exec().features.enable_custom_logit_processor:
-            # Processors expect len(sampling_info) live rows, not bucket rows.
-            raise NotImplementedError(
-                "TpuSpecWorker does not support custom logit processors."
-            )
         self._bsearch_filtering = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
-        if not isinstance(runner.sampler, HostPaddedTpuSampler):
+        if not isinstance(runner.sampler, TpuSampler):
             # HOST_PADDED sampling params stay on host until TpuSampler uploads
             # them; with full logits it samples exactly like a plain Sampler
             # (--sampling-backend pytorch).
-            runner.sampler = HostPaddedTpuSampler()
+            runner.sampler = TpuSampler()
         self._draft_worker = draft_worker
         self.num_drafts = num_drafts
         self.num_verify_rows = num_drafts + 1
@@ -372,6 +367,7 @@ class TpuSpecWorker(BaseSpecWorker):
         elif bucket.need_filters:
             num_correct_drafts, bonus_tokens = accept_drafts_sampled_filtered(
                 self._filtered_target_probs(target_logits, bucket),
+                target_logits,
                 draft_result.draft_tokens,
                 draft_result.num_verify_drafts,
                 draft_result.draft_logits.float(),
@@ -575,9 +571,7 @@ class TpuSpecWorker(BaseSpecWorker):
             min_ps=(
                 params["min_ps"].to(self.device, non_blocking=True) if sampled else None
             ),
-            need_top_k=sampled and sampling_info.need_top_k_sampling,
-            need_top_p=sampled and sampling_info.need_top_p_sampling,
-            need_min_p=sampled and sampling_info.need_min_p_sampling,
+            **(_sampled_row_filters(sampling_info) if sampled else {}),
         )
 
     def _forward_idle_decode(self, batch: ScheduleBatch) -> None:
@@ -1063,20 +1057,42 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         # The sort-based target filter keeps different boundary ties than the
         # verify filter, so filtered sampling needs the sort-free path on both.
-        if not self._bsearch_filtering and (
-            sampling_info.need_top_k_sampling
-            or sampling_info.need_top_p_sampling
-            or sampling_info.need_min_p_sampling
+        if not self._bsearch_filtering and any(
+            _sampled_row_filters(sampling_info).values()
         ):
             raise NotImplementedError(
                 "TpuSpecWorker needs SGLANG_TPU_ENABLE_BSEARCH_SAMPLING for "
                 "top-k/top-p/min-p sampling."
+            )
+        # Processors expect len(sampling_info) live rows, not bucket rows.
+        if sampling_info.has_custom_logit_processor:
+            raise NotImplementedError(
+                "TpuSpecWorker does not support custom logit processors."
             )
         # Seeded sampling reads live-bs positions against bucket-padded seeds.
         if sampling_info.sampling_seed is not None:
             raise NotImplementedError(
                 "TpuSpecWorker does not support deterministic sampling."
             )
+
+
+def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:
+    """Which filters a sampled (top_k > 1) row restricts, from the host params.
+
+    Core's need_*_sampling also counts greedy rows (top_k = 1); those take the
+    greedy rule, so they must not switch the whole batch onto the filter.
+    """
+    top_ks, top_ps, min_ps = (
+        sampling_info.top_ks,
+        sampling_info.top_ps,
+        sampling_info.min_ps,
+    )
+    sampled = top_ks > 1
+    return {
+        "need_top_k": bool((sampled & (top_ks < sampling_info.vocab_size)).any()),
+        "need_top_p": bool((sampled & (top_ps < 1.0)).any()),
+        "need_min_p": bool((sampled & (min_ps > 0.0)).any()),
+    }
 
 
 def _live_rows(tensor: torch.Tensor, bs: int) -> torch.Tensor:

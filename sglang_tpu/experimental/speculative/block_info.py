@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
@@ -11,3 +13,9 @@ from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 @dataclass
 class HostPaddedBlockDraftInput(HostPaddedDraftInput):
     SPEC_INPUT_TYPE = SpecInputType.DFLASH_DRAFT
+
+    # RelayPayload.from_draft_input reads these for every draft input; a block
+    # drafter has no seed beyond the bonus token.
+    topk_p: torch.Tensor | None = None
+    topk_index: torch.Tensor | None = None
+    hidden_states: torch.Tensor | None = None

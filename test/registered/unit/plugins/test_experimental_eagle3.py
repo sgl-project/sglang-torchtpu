@@ -34,6 +34,7 @@ from sglang_tpu.experimental.speculative.eagle.eagle_worker import (
 )
 from sglang_tpu.experimental.speculative.eagle_info import HostPaddedEagleDraftInput
 from sglang_tpu.experimental.speculative.spec_ops import (
+    accept_drafts_sampled,
     accept_drafts_sampled_filtered,
     accept_drafts_target_only,
 )
@@ -351,8 +352,10 @@ class TestExperimentalEagle3(CustomTestCase):
         p0 = torch.tensor([0.0, 0.5, 0.5, 0.0])  # e.g. top-k 2 of the target
         q_logits = torch.log(torch.tensor([0.4, 0.3, 0.2, 0.1]))
         drafts = torch.multinomial(q_logits.exp(), rows, replacement=True)[:, None]
+        target_probs = torch.stack([p0, torch.full((4,), 0.25)]).repeat(rows, 1)
         num_correct, bonus = accept_drafts_sampled_filtered(
-            torch.stack([p0, torch.full((4,), 0.25)]).repeat(rows, 1),
+            target_probs,
+            target_probs.log(),
             drafts,
             torch.ones(rows, dtype=torch.int32),
             q_logits.expand(rows, 1, 4),
@@ -362,6 +365,48 @@ class TestExperimentalEagle3(CustomTestCase):
         first = torch.where(num_correct > 0, drafts[:, 0], bonus)
         freq = torch.bincount(first, minlength=4).float() / rows
         torch.testing.assert_close(freq, p0, atol=0.01, rtol=0)
+
+    def test_greedy_rows_in_a_sampled_batch_compare_raw_logits(self):
+        """A greedy row (top_k = 1) sharing a batch with sampled rows takes the
+        greedy rule on the raw target logits; probabilities can round equal."""
+        # Temperature 1e9 makes both target probs 0.5; the logits still pick 1.
+        target_logits = torch.tensor([[0.0, 1.0], [0.0, 1.0]])
+        args = dict(
+            draft_tokens=torch.tensor([[1]]),
+            num_verify_drafts=torch.ones(1, dtype=torch.int32),
+            draft_logits=torch.zeros(1, 1, 2),
+            temperatures=torch.tensor([1e9]),
+            top_ks=torch.ones(1, dtype=torch.int32),
+        )
+        probs = torch.full((2, 2), 0.5)
+        for num_correct, bonus in (
+            accept_drafts_sampled(target_logits, **args),
+            accept_drafts_sampled_filtered(probs, target_logits, **args),
+        ):
+            self.assertEqual((num_correct.item(), bonus.item()), (1, 1))
+
+    def test_greedy_rows_do_not_switch_the_batch_onto_the_filter(self):
+        """Greedy rows set core's need_top_k_sampling (top_k = 1); only sampled
+        rows' filters may route verify through the full-vocab target filter."""
+        from sglang_tpu.experimental.speculative.base_spec_worker import (
+            _sampled_row_filters,
+        )
+
+        def filters(top_ks, top_ps=(1.0, 1.0), min_ps=(0.0, 0.0)):
+            return _sampled_row_filters(
+                SimpleNamespace(
+                    vocab_size=32,
+                    top_ks=torch.tensor(top_ks, dtype=torch.int32),
+                    top_ps=torch.tensor(top_ps),
+                    min_ps=torch.tensor(min_ps),
+                )
+            )
+
+        none = {"need_top_k": False, "need_top_p": False, "need_min_p": False}
+        self.assertEqual(filters([1, 1 << 30]), none)
+        self.assertEqual(filters([1, 1 << 30], top_ps=(0.5, 1.0)), none)
+        self.assertEqual(filters([1, 8])["need_top_k"], True)
+        self.assertEqual(filters([1, 1 << 30], min_ps=(0.0, 0.1))["need_min_p"], True)
 
     def test_sampled_verify_filters_target_like_the_target_sampler(self):
         """Sampled verify keeps what the target sampler keeps: every cutoff on the

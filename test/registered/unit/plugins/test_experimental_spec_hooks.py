@@ -42,12 +42,12 @@ def _module_init(self):
     torch.nn.Module.__init__(self)
 
 
-def _host_padded_sampler():
+def _tpu_sampler():
     from sglang.srt.layers.sampler import Sampler
-    from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
+    from sglang_tpu.sampler import TpuSampler
 
     with patch.object(Sampler, "__init__", _module_init):
-        return HostPaddedTpuSampler()
+        return TpuSampler()
 
 
 def _req(temperature=0.5):
@@ -337,9 +337,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_sampler_samples_live_logits_at_the_host_bucket(self):
         """An outer logits processor emits 3 live rows; HOST_PADDED sampling
         params sit at bucket 4, and sampling still returns the bucket rows."""
-        from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
+        from sglang_tpu.sampler import TpuSampler
 
-        sampler = _host_padded_sampler()
+        sampler = _tpu_sampler()
         info = HostPaddedSamplingInfo(
             temperatures=torch.ones((4, 1)),
             top_ps=torch.ones(4),
@@ -364,19 +364,19 @@ class TestExperimentalSpecHooks(CustomTestCase):
             None,
             torch.zeros(4, dtype=torch.int64),
         )
-        self.assertIsInstance(sampler, HostPaddedTpuSampler)
+        self.assertIsInstance(sampler, TpuSampler)
         self.assertEqual(tokens.shape, (4,))
         self.assertEqual(tokens[:3].tolist(), logits.argmax(-1).tolist())
 
-    def test_worker_installs_the_host_padded_sampler_and_rejects_processors(self):
+    def test_worker_installs_the_tpu_sampler(self):
         """A plain Sampler (--sampling-backend pytorch) cannot read HOST_PADDED
-        host params; custom logit processors expect live rows."""
+        host params, so the worker swaps in TpuSampler."""
         from sglang.srt.layers.sampler import Sampler
-        from sglang_tpu.experimental.sampling.sampler import HostPaddedTpuSampler
         from sglang_tpu.experimental.speculative import base_spec_worker
         from sglang_tpu.experimental.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
+        from sglang_tpu.sampler import TpuSampler
 
         class _Stop(Exception):
             pass
@@ -384,17 +384,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         def init(custom_processors):
             runner = SimpleNamespace(sampler=object.__new__(Sampler))
             worker = object.__new__(TpuBlockSpecWorker)
-            features = SimpleNamespace(enable_custom_logit_processor=custom_processors)
             with (
                 patch.object(
                     base_spec_worker,
                     "get_parallel",
                     return_value=SimpleNamespace(pp_size=1),
-                ),
-                patch.object(
-                    base_spec_worker,
-                    "get_exec",
-                    return_value=SimpleNamespace(features=features),
                 ),
                 patch.object(Sampler, "__init__", _module_init),
                 # Stop right after the sampler is installed.
@@ -409,9 +403,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     )
             return runner
 
-        self.assertIsInstance(init(False).sampler, HostPaddedTpuSampler)
-        with self.assertRaisesRegex(NotImplementedError, "custom logit processors"):
-            init(True)
+        self.assertIsInstance(init(False).sampler, TpuSampler)
+        # Enabling the server feature alone must not stop startup.
+        self.assertIsInstance(init(True).sampler, TpuSampler)
 
     def test_worker_rejects_mixed_phase_dp_steps(self):
         """Under DP attention, prefill coordination or a skipped MLP sync lets one
@@ -434,18 +428,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 raise _Stop
 
         def init(*, dp_attention, coordination=False, skip_mlp_sync=False):
-            runner = SimpleNamespace(sampler=_host_padded_sampler())
+            runner = SimpleNamespace(sampler=_tpu_sampler())
             worker = object.__new__(TpuBlockSpecWorker)
             with (
                 patch.object(
                     base_spec_worker, "get_parallel", return_value=_Parallel()
-                ),
-                patch.object(
-                    base_spec_worker,
-                    "get_exec",
-                    return_value=SimpleNamespace(
-                        features=SimpleNamespace(enable_custom_logit_processor=False)
-                    ),
                 ),
                 patch.object(base_spec_worker, "get_dp_tp_group", return_value=None),
                 patch.object(base_spec_worker, "SpecTpSync", lambda group: None),
@@ -562,9 +549,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             build_disagg_eagle_input(lambda *a: core, batch, None, None), core
         )
 
-    def test_filtered_sampling_needs_the_sort_free_filter(self):
-        """Verify always filters sort-free; with the target on the sort-based
-        fallback the two keep different boundary ties, so filtering is refused."""
+    def test_per_batch_checks_refuse_only_unsupported_requests(self):
+        """Filtered sampling needs the sort-free filter (the sort-based target
+        keeps different boundary ties), but greedy rows (top_k = 1) do not; custom
+        logit processors are refused per batch, not at startup."""
         from sglang_tpu.experimental.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
@@ -572,31 +560,43 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker = object.__new__(TpuBlockSpecWorker)
         worker._bsearch_filtering = False
 
-        def batch(**need):
+        def batch(top_k=1, top_p=1.0, custom=False):
             sampling_info = SimpleNamespace(
                 logit_bias=None,
                 acc_additive_penalties=None,
                 acc_scaling_penalties=None,
                 penalizer_orchestrator=None,
                 sampling_seed=None,
-                need_top_k_sampling=False,
-                need_top_p_sampling=False,
-                need_min_p_sampling=False,
+                has_custom_logit_processor=custom,
+                vocab_size=32,
+                top_ks=torch.tensor([1, top_k], dtype=torch.int32),
+                top_ps=torch.tensor([1.0, top_p]),
+                min_ps=torch.zeros(2),
             )
-            sampling_info.__dict__.update(need)
             return SimpleNamespace(
                 has_grammar=False, return_logprob=False, sampling_info=sampling_info
             )
 
-        worker._check_supported(batch=batch(), pp_proxy_tensors=None)
+        check = worker._check_supported
+        check(batch=batch(), pp_proxy_tensors=None)
+        # Temperature-only sampled row: no filter needed.
+        check(batch=batch(top_k=1 << 30), pp_proxy_tensors=None)
         with self.assertRaisesRegex(NotImplementedError, "BSEARCH"):
-            worker._check_supported(
-                batch=batch(need_top_p_sampling=True), pp_proxy_tensors=None
-            )
+            check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
+        with self.assertRaisesRegex(NotImplementedError, "custom logit processors"):
+            check(batch=batch(custom=True), pp_proxy_tensors=None)
         worker._bsearch_filtering = True
-        worker._check_supported(
-            batch=batch(need_top_p_sampling=True), pp_proxy_tensors=None
-        )
+        check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
+
+    def test_block_draft_input_relays_through_the_future_map(self):
+        """RelayPayload.from_draft_input reads the EAGLE seed slots of every draft
+        input; the block input left them out and every DFlash/DSpark startup died."""
+        from sglang.srt.managers.overlap_utils import RelayPayload
+
+        payload = RelayPayload.from_draft_input(_state([1, 2]))
+        self.assertEqual(payload.bonus_tokens.tolist(), [1, 1])
+        self.assertIsNone(payload.topk_p)
+        self.assertIsNone(payload.hidden_states)
 
     def test_decode_prep_reserves_two_windows_and_keeps_committed_host_lengths(self):
         """prepare_for_decode reserves 2 * N tokens past the committed length,
