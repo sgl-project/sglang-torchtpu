@@ -3471,8 +3471,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+        # Not every device module has empty_cache (torch.tpu does not); without
+        # CUDA the call is a no-op.
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.get_device_module().synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

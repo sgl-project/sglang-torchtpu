@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -116,6 +117,13 @@ def duplicate_prefix_tail_to_draft_branches(
         token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
 
 
+@functools.cache
+def _uniform_extend_start_loc(bs: int, width: int, device) -> torch.Tensor:
+    """Start row of each request in a uniform-width extend: i * width, int32.
+    Cached: the same few shapes recur every round."""
+    return (torch.arange(bs, dtype=torch.int32) * width).to(device)
+
+
 def prepare_for_draft_extend(
     draft_extend_input: EagleDraftExtendInput,
     batch: ScheduleBatch,
@@ -161,7 +169,11 @@ def prepare_for_draft_extend(
             )
     else:
         batch.input_ids = predict
-        if _is_tpu and not batch.forward_mode.is_idle():
+        if (
+            _is_tpu
+            and not batch.forward_mode.is_idle()
+            and draft_extend_input.positions is None
+        ):
             draft_extend_input.positions = draft_extend_positions_tpu(
                 batch.seq_lens, num_window_tokens
             )
@@ -175,6 +187,20 @@ def prepare_for_draft_extend(
     # The fused CUDA layout kernels keep the length arithmetic on the device too.
     fused_lengths = device_lens_only and batch.seq_lens.is_cuda
     extend_position_info = None
+    if (
+        not widen
+        and getattr(draft_extend_input, "positions", None) is not None
+        and not batch.forward_mode.is_idle()
+    ):
+        # Uniform window with known positions: hand init_new the layout so it
+        # skips compute_position's length readbacks and uploads.
+        extend_position_info = (
+            draft_extend_input.positions,
+            _uniform_extend_start_loc(
+                bs, num_window_tokens, draft_extend_input.positions.device
+            ),
+            None,
+        )
     if fused_lengths and not widen and draft_extend_input.positions is None:
         batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
             prepare_draft_extend_layout(
@@ -520,6 +546,12 @@ def build_eagle_verify_input(
             bs=batch.seq_lens.shape[0],
             num_verify_tokens=num_draft_tokens,
         )
+        layouts = draft_input.device_accept_layouts
+        if (
+            layouts is not None
+            and verify_input.device_accept_cache_locs is layouts.verify
+        ):
+            verify_input.verify_kv_lens = layouts.verify_kv_lens
     return verify_input
 
 
@@ -721,6 +753,13 @@ def run_eagle_verify(
     # CUDA fuses the commit bookkeeping (and a chain's next draft-extend inputs)
     # into one post-sampling kernel, replacing the generic bookkeeping below.
     fused_commit_outputs = batch.seq_lens.is_cuda and not batch.forward_mode.is_idle()
+    # A fused top-1 chain verify (fused_greedy_chain_verify) also returns the
+    # commit outputs; they are taken only when no padding has to be trimmed off
+    # them afterwards.
+    want_chain_commit = (
+        topk == 1 and verify_padding is None and batch.mamba_track_indices is None
+    )
+    chain_commit = None
     verify_result = (None, None, None)
     verify_bookkeeping_result = (None, None)
     try:
@@ -730,11 +769,17 @@ def run_eagle_verify(
             logits_output,
             grammar_mask,
             uno_target_max_top_k=uno_target_max_top_k,
+            with_commit_outputs=want_chain_commit,
         )
+        if want_chain_commit:
+            *verify_result, chain_commit = verify_result
+            verify_result = tuple(verify_result)
         post_predict, post_accept_lens, post_accept_index = verify_result
         # Sampling and bookkeeping must use the same physical rows, including
         # padded idle DP peers. finalize_spec_verify restores the logical batch.
-        if not fused_commit_outputs:
+        if chain_commit is not None:
+            verify_bookkeeping_result = chain_commit[:2]
+        elif not fused_commit_outputs:
             verify_bookkeeping_result = verify_bookkeeping_func(
                 batch.seq_lens,
                 post_accept_lens,
@@ -777,6 +822,10 @@ def run_eagle_verify(
         )
     else:
         new_seq_lens, bonus_tokens = verify_bookkeeping_result
+        if chain_commit is not None:
+            _, _, last_step, select_index, predict_i64 = chain_commit
+            prepared_commit_steps = (last_step, None)
+            prepared_draft_inputs = (last_step, select_index, predict_i64)
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",

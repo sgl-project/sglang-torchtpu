@@ -164,6 +164,16 @@ def _qsa_index_share_requested(hf_config) -> bool:
     )
 
 
+def _contiguous_strides(shape) -> tuple:
+    """Row-major strides of ``shape``, size-1 dims included (is_contiguous()
+    ignores those, Dynamo guards on them)."""
+    strides, step = [], 1
+    for size in reversed(shape):
+        strides.append(step)
+        step *= max(size, 1)
+    return tuple(reversed(strides))
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -706,10 +716,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 return tensor
 
             if prebuilt_tree is not None:
-                # Trim rows before flattening so verify pads each request once.
+                # Trim rows so verify pads each request once; positions and
+                # verify tokens arrive flat, num_draft_tokens per request.
+                width = self.speculative_num_draft_tokens
                 prebuilt_tree = (
                     prebuilt_tree[0],
-                    *(tensor[:real_bs] for tensor in prebuilt_tree[1:]),
+                    *(
+                        tensor[: real_bs * width]
+                        if tensor.dim() == 1
+                        else tensor[:real_bs]
+                        for tensor in prebuilt_tree[1:]
+                    ),
                 )
             else:
                 parent_list = _unpad_rows(parent_list)
@@ -753,7 +770,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.compile_policy.refresh_fused_draft_dp_metadata(
                 forward_batch
             )
-        self.draft_attn_backend.init_forward_metadata(forward_batch)
+            # The fused loop attends through step 0's backend and derives step
+            # i's KV length in-graph, so the other steps' metadata is never read.
+            self.draft_attn_backend.attn_backends[0].init_forward_metadata(
+                forward_batch
+            )
+        else:
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
 
     def _fused_draft_forward(self, forward_batch: ForwardBatch):
@@ -774,12 +797,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # holds only while step i's backend carries speculative_step_id == i,
         # which is how TpuPallasRpaMultiStepDraftBackend constructs them.
         assert all(b.speculative_step_id == i for i, b in enumerate(attn_backends))
-        out_cache_loc = per_step_draft_out_cache_loc(
-            forward_batch.out_cache_loc,
-            forward_batch.batch_size,
-            self.topk,
-            self.speculative_num_steps,
-        )
+        layouts = getattr(spec_info, "device_accept_layouts", None)
+        if layouts is not None and forward_batch.out_cache_loc is layouts.draft:
+            # The device-accept select op already emitted the per-step rows.
+            out_cache_loc = layouts.draft_per_step
+        else:
+            out_cache_loc = per_step_draft_out_cache_loc(
+                forward_batch.out_cache_loc,
+                forward_batch.batch_size,
+                self.topk,
+                self.speculative_num_steps,
+            )
+        # Dynamo guards on strides, size-1 dims included, so a [steps, 1] view
+        # with stride (1, steps) and a dense one are different graphs. Present
+        # one layout whichever path built the rows.
+        if out_cache_loc.stride() != _contiguous_strides(out_cache_loc.shape):
+            out_cache_loc = out_cache_loc.clone(memory_format=torch.contiguous_format)
 
         steps_fn = self._compiled_fused_steps
         if steps_fn is None:
@@ -802,6 +835,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # loop to decode while preserving the scheduler-owned value afterward.
         orig_prefill_only = forward_batch.is_prefill_only
         forward_batch.is_prefill_only = False
+        # A top-1 draft's positions are its seq_lens. Whether they arrive as
+        # the same tensor depends on upstream padding and input resolution, and
+        # Dynamo compiles aliased and distinct inputs as separate graphs: warmup
+        # covered one, batched serving produced the other, and the frozen
+        # compiler raised. Alias them whenever they agree so every call matches.
+        orig_positions = forward_batch.positions
+        if (
+            self.topk == 1
+            and orig_positions is not None
+            and orig_positions.shape == forward_batch.seq_lens.shape
+            and orig_positions.dtype == forward_batch.seq_lens.dtype
+        ):
+            forward_batch.positions = forward_batch.seq_lens
         try:
             with forward_context(ForwardContext(attn_backend=attn_backends[0])):
                 tree_outputs = steps_fn(
@@ -816,6 +862,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
+            forward_batch.positions = orig_positions
         spec_info.rpa_draft_kv_lens = None
 
         return tree_outputs
@@ -869,15 +916,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
             logits_output = model.forward(input_ids, base_positions + i, forward_batch)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            logits = logits_output.next_token_logits
+            if self.topk == 1:
+                # A top-1 chain reads only the token; skip the full-vocab softmax.
+                topk_index = logits.argmax(dim=-1, keepdim=True)
+                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if hot_token_id is not None:
                 topk_index = hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
-        return build_topk1_verify_chain_torch(
+        tree = build_topk1_verify_chain_torch(
             bonus_tokens,
             torch.cat(tokens, dim=1),
             seq_lens,
+        )
+        # Flatten positions and verify tokens in-graph: flattening the outputs
+        # afterwards hands the verify graph views, which cost a program each.
+        mask, positions, retrieve_index, next_token, next_sibling, verify_tokens = tree
+        return (
+            mask,
+            positions.reshape(-1),
+            retrieve_index,
+            next_token,
+            next_sibling,
+            verify_tokens.reshape(-1),
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -1289,6 +1353,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
+        verify_input = batch.spec_info
+        if (
+            self.topk == 1
+            and isinstance(verify_input, EagleVerifyInput)
+            and verify_input.verify_kv_lens is not None
+            and verify_input.positions is not None
+            and verify_input.positions.shape[0]
+            == len(batch.seq_lens) * self.speculative_num_draft_tokens
+        ):
+            # The draft extend rewrites the top-1 verify window: same positions
+            # and kv lengths, so reuse them instead of recomputing. Only flows
+            # that built the verify's kv lengths on device set verify_kv_lens.
+            draft_extend_input.positions = verify_input.positions
+            draft_extend_input.verify_kv_lens = verify_input.verify_kv_lens
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
             self.plan_stream.wait_stream(

@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+import functools
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang_tpu.spec_op_warmup import (
+    SIM_FIXED,
+    SIM_OFF,
+    SIM_REAL,
     make_draft_extend_select_args,
+    make_greedy_verify_chain_args,
 )
 
 if TYPE_CHECKING:
@@ -159,6 +164,7 @@ def prepare_device_accept_tpu(
     if draft_input is not None:
         draft_input.device_accept_candidate_locs = None
         draft_input.device_accept_selected_cache_locs = None
+        draft_input.device_accept_layouts = None
 
     accept_lens = draft_input.accept_lens_device if draft_input is not None else None
     if accept_lens is not None:
@@ -222,6 +228,175 @@ def draft_extend_positions_tpu(
     return (seq_lens.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
 
 
+@compiled_op(warmup=make_greedy_verify_chain_args, direct=True)
+def greedy_verify_chain_tpu(
+    next_token_logits: torch.Tensor,
+    draft_token: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    sim_accept_len: torch.Tensor,
+    seq_lens: torch.Tensor,
+    simulate_mode: int,
+):
+    """Greedy verify of a top-1 draft chain, simulated acceptance included.
+
+    Returns (predicts int32 [bs * W], accept_lens int32 [bs] counting the bonus
+    token, accept_index int32 [bs, W]) followed by the commit outputs (see
+    chain_commit_outputs). One dispatch replaces the eager buffer
+    preallocation, slice copies and simulated-index ops of eagle_sample, plus
+    the bookkeeping and draft-extend input ops that used to follow it.
+    sim_accept_len is a device int32 [1] (the host-sampled length) so a
+    different length per round does not recompile.
+    """
+    from sglang.srt.speculative.eagle_utils import _verify_tree_greedy_torch
+
+    bs, w = retrieve_index.shape
+    candidates = draft_token.reshape(bs, w)
+    predicts, accept_index, accept_len = _verify_tree_greedy_torch.__wrapped__(
+        next_token_logits, candidates, retrieve_index
+    )
+    if simulate_mode != SIM_OFF:
+        k = sim_accept_len.to(torch.int32)
+        cols = torch.arange(w, device=draft_token.device, dtype=torch.int32)[None, :]
+        first = retrieve_index[:, :1].to(torch.int32)
+        accept_index = torch.where(cols < k, first + cols, -1).to(torch.int32)
+        accept_len = k.expand(bs).to(torch.int32)
+        if simulate_mode == SIM_FIXED:
+            predicts = torch.full_like(predicts, 100)
+        else:
+            target = torch.argmax(next_token_logits, dim=-1).reshape(bs, w)
+            drafts = torch.cat([candidates[:, 1:], candidates[:, -1:]], dim=1)
+            grid = predicts.reshape(bs, w)
+            grid = torch.where(cols < k - 1, drafts.to(grid.dtype), grid)
+            grid = torch.where(cols == k - 1, target.to(grid.dtype), grid)
+            predicts = grid.reshape(-1).clone()
+    return (
+        predicts,
+        accept_len,
+        accept_index,
+        *chain_commit_outputs(predicts, accept_len, seq_lens, w),
+    )
+
+
+def chain_commit_outputs(predicts, accept_len, seq_lens, w):
+    """Post-verify values of a top-1 chain, traced inside the verify op.
+
+    (new_seq_lens, bonus_tokens int64, last_step int32 [the state-commit step
+    and the draft extend's correct-draft count], select_index int64 [each
+    request's last accepted row], predicts int64 [draft extend input ids]).
+    A chain accepts a prefix, so row i * W + accept_len - 1 holds the bonus.
+    """
+    bs = accept_len.shape[0]
+    last_step = (accept_len - 1).to(torch.int32)
+    rows = torch.arange(bs, device=predicts.device, dtype=torch.int64) * w
+    select_index = rows + last_step.to(torch.int64)
+    predicts64 = predicts.to(torch.int64)
+    return (
+        seq_lens + accept_len.to(seq_lens.dtype),
+        predicts64[select_index],
+        last_step,
+        select_index,
+        predicts64,
+    )
+
+
+def fused_greedy_chain_verify_tpu(verify_input, next_token_logits, seq_lens):
+    """``eagle_utils.fused_greedy_chain_verify`` on TPU: the verify op above."""
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_METHOD,
+        SIMULATE_ACC_TOKEN_MODE,
+        sample_simulated_acc_len,
+    )
+
+    device = next_token_logits.device
+    if SIMULATE_ACC_LEN > 0:
+        if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+            raise ValueError(
+                "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or 'real-draft-token'."
+            )
+        k = sample_simulated_acc_len(
+            SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, verify_input.max_tree_depth
+        )
+        mode = SIM_FIXED if SIMULATE_ACC_TOKEN_MODE == "fixed" else SIM_REAL
+        # Host value uploaded as data, so each round's length reuses one graph.
+        sim_k = torch.tensor([k], dtype=torch.int32).to(device, non_blocking=True)
+    else:
+        mode = SIM_OFF
+        sim_k = _sim_len_placeholder(device)
+    return greedy_verify_chain_tpu(
+        next_token_logits,
+        verify_input.draft_token,
+        verify_input.retrieve_index,
+        sim_k,
+        seq_lens,
+        mode,
+    )
+
+
+@functools.cache
+def _sim_len_placeholder(device) -> torch.Tensor:
+    return torch.ones((1,), dtype=torch.int32).to(device)
+
+
+class DeviceAcceptLayouts(NamedTuple):
+    """Contiguous layouts of the selected device-accept window."""
+
+    draft: torch.Tensor  # [bs * num_steps], the draft steps' write slots
+    draft_per_step: torch.Tensor  # [num_steps, bs], one row per draft step
+    verify: torch.Tensor  # [bs * width], the verify window's slots
+    # int32 [bs] RPA kv_lens of the verify forward (committed prefix + width),
+    # or None when the prefix was not known at selection.
+    verify_kv_lens: Optional[torch.Tensor] = None
+
+
+def select_device_accept_windows_tpu(
+    candidate_locs: torch.Tensor,  # [bs, 2 * width - 1]
+    accept_lens: torch.Tensor,  # [bs]
+    num_steps: int,
+) -> tuple[torch.Tensor, ...]:
+    """Select each row's next window and emit every layout its readers take.
+
+    Readers consumed slices, reshapes and a transpose of the window, each
+    materialized by its own launch; returning dense tensors removes them.
+    Eager: it runs at the live request count, which the bucketed spec-op
+    warmup does not cover. Returns (selected [bs, width], draft flat, draft per step, verify flat).
+    """
+    width = (candidate_locs.shape[1] + 1) // 2
+    offsets = torch.arange(width, device=candidate_locs.device, dtype=torch.int64)
+    cols = accept_lens.to(torch.int64)[:, None] - 1 + offsets[None, :]
+    selected = torch.gather(candidate_locs, 1, cols)
+    draft = selected[:, :num_steps]
+    return (
+        selected,
+        draft.reshape(-1).clone(),
+        draft.t().contiguous(),
+        selected.reshape(-1).clone(),
+    )
+
+
+def verify_kv_lens_tpu(seq_lens: torch.Tensor, width: int) -> torch.Tensor:
+    return (seq_lens + width).to(torch.int32)
+
+
+def select_device_accept_tpu(
+    draft_input, candidate_locs, accept_lens, seq_lens=None
+) -> None:
+    """Store the selected window and its layouts on the draft input. With the
+    committed prefix lengths known, also the verify forward's RPA kv_lens."""
+    width = (candidate_locs.shape[1] + 1) // 2
+    selected, draft, per_step, verify = select_device_accept_windows_tpu(
+        candidate_locs, accept_lens, width - 1
+    )
+    draft_input.device_accept_selected_cache_locs = selected
+    draft_input.device_accept_layouts = DeviceAcceptLayouts(
+        draft,
+        per_step,
+        verify,
+        None if seq_lens is None else verify_kv_lens_tpu(seq_lens, width),
+    )
+
+
 def prepare_draft_cache_locs_tpu(
     batch: ScheduleBatch,
     draft_input: EagleDraftInput,
@@ -242,7 +417,11 @@ def prepare_draft_cache_locs_tpu(
     assert selected.shape[1] >= max(draft_width, num_verify_tokens), (
         "selected cache window must cover draft and verify tokens"
     )
-    batch.out_cache_loc = selected[:, :draft_width].reshape(-1)
+    layouts = draft_input.device_accept_layouts
+    if layouts is not None and layouts.draft.shape[0] == bs * draft_width:
+        batch.out_cache_loc = layouts.draft
+    else:
+        batch.out_cache_loc = selected[:, :draft_width].reshape(-1)
     return True
 
 
@@ -258,6 +437,9 @@ def device_accept_verify_cache_locs_tpu(
     assert selected.shape[1] >= num_verify_tokens, (
         "selected cache window must cover verify tokens"
     )
+    layouts = draft_input.device_accept_layouts
+    if layouts is not None and layouts.verify.shape[0] == bs * num_verify_tokens:
+        return layouts.verify
     return selected[:, :num_verify_tokens].reshape(-1)
 
 
@@ -270,6 +452,8 @@ def filter_device_accept_tpu(
         draft_input.device_accept_candidate_locs = (
             draft_input.device_accept_candidate_locs[new_indices]
         )
+    # Layouts are for the whole selected batch; readers re-slice after a filter.
+    draft_input.device_accept_layouts = None
     if draft_input.device_accept_selected_cache_locs is not None:
         draft_input.device_accept_selected_cache_locs = (
             draft_input.device_accept_selected_cache_locs[new_indices]
@@ -298,6 +482,7 @@ def merge_device_accept_tpu(
         draft_input.accept_lens_device = None
         draft_input.device_accept_candidate_locs = None
     draft_input.device_accept_selected_cache_locs = None
+    draft_input.device_accept_layouts = None
 
 
 def last_accepted_row_indices(
@@ -327,7 +512,7 @@ def last_accepted_row_indices(
     return row_starts + num_accept_tokens.to(torch.int64).clamp_min(1) - 1
 
 
-@compiled_op(warmup=make_draft_extend_select_args)
+@compiled_op(warmup=make_draft_extend_select_args, direct=True)
 def fused_draft_extend_select_argmax_func(
     next_token_logits: torch.Tensor,
     hidden_states: Optional[torch.Tensor],

@@ -320,7 +320,8 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 torch.tensor([5], dtype=torch.long, device=DEVICE),
             )
 
-        self.assertEqual(tree[-1].tolist(), [[99, 100, 101, 102]])
+        # Verify tokens and positions come back flat, W per request.
+        self.assertEqual(tree[-1].tolist(), [99, 100, 101, 102])
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
         self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
@@ -386,6 +387,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             out_cache_loc=torch.arange(6, device=DEVICE),
             batch_size=2,
             seq_lens=torch.tensor([5, 10], device=DEVICE),
+            positions=None,
             is_prefill_only=True,
         )
         per_step_cache = torch.arange(4, device=DEVICE).reshape(2, 2)

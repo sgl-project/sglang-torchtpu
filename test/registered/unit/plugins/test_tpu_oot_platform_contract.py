@@ -347,6 +347,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             skip_spec_op_precompile_without_draft,
         )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+        from sglang_tpu.hooks.spec_verify import fused_greedy_chain_verify
         from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
         from sglang_tpu.hooks.twolevel_allreduce import (
             all_reduce as twolevel_all_reduce,
@@ -355,6 +356,14 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
         )
 
+        self.assertIn(
+            (
+                "sglang.srt.speculative.eagle_utils.fused_greedy_chain_verify",
+                fused_greedy_chain_verify,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
         self.assertIn(
             (
                 "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",

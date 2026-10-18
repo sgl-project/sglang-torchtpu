@@ -7,6 +7,10 @@ from typing import Any
 
 import torch
 
+# simulate_mode of eagle_utils_tpu.greedy_verify_chain_tpu: off, fixed tokens,
+# real draft tokens.
+SIM_OFF, SIM_FIXED, SIM_REAL = 0, 1, 2
+
 
 @dataclass(frozen=True)
 class SpecOpWarmupContext:
@@ -41,6 +45,39 @@ def make_verify_tree_greedy_args(
             dtype=torch.int64,
             device=context.device,
         ),
+    )
+
+
+def make_greedy_verify_chain_args(
+    context: SpecOpWarmupContext,
+) -> tuple:
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
+    )
+
+    if SIMULATE_ACC_LEN <= 0:
+        simulate_mode = SIM_OFF
+    elif SIMULATE_ACC_TOKEN_MODE == "fixed":
+        simulate_mode = SIM_FIXED
+    else:
+        simulate_mode = SIM_REAL
+    num_verify_rows = context.physical_bs * context.num_verify_tokens
+    return (
+        torch.zeros(
+            (num_verify_rows, context.vocab_size),
+            dtype=torch.float32,
+            device=context.device,
+        ),
+        torch.zeros((num_verify_rows,), dtype=torch.int64, device=context.device),
+        # Built on the host: a device view of a 1-D arange keeps the 1-D
+        # buffer layout, so every call would relayout it.
+        torch.arange(num_verify_rows, dtype=torch.int64)
+        .view(context.physical_bs, context.num_verify_tokens)
+        .to(context.device),
+        torch.ones((1,), dtype=torch.int32, device=context.device),
+        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
+        simulate_mode,
     )
 
 

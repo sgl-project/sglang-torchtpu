@@ -1279,11 +1279,26 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             if spec_info is not None:
                 spec_info.keep_outputs_padded = False
             return outputs
+        pad_b = forward_batch.batch_size
         forward_batch.batch_size = real_bs
         if spec_info is not None:
             spec_info.keep_outputs_padded = False
+        if pad_b == real_bs:
+            return outputs
+
+        # Outputs lead with one row per request, except the fused top-1 draft's
+        # flat positions and verify tokens: draft_token_num rows per request.
         # draft_probs is absent when rejection sampling is disabled.
-        return tuple(t[:real_bs] if t is not None else None for t in outputs)
+        width = self.draft_token_num
+
+        def _trim(t):
+            if t is None or t.dim() == 0:
+                return t
+            if t.dim() == 1 and width > 1 and t.shape[0] == pad_b * width:
+                return t[: real_bs * width]
+            return t[:real_bs]
+
+        return tuple(_trim(t) for t in outputs)
 
     def _pad_draft_extend(self, forward_batch: ForwardBatch) -> None:
         """Bucket V2 draft-extend before attention metadata is constructed."""

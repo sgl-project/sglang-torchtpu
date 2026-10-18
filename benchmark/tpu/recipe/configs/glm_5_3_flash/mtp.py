@@ -27,6 +27,8 @@ _args.update(
         "speculative_eagle_topk": 1,
         "speculative_num_steps": NUM_STEPS,
         "speculative_num_draft_tokens": NUM_STEPS + 1,
+        # Linear-chain KDA speculation keeps one state slot per running request.
+        "max_mamba_cache_size": _args["max_running_requests"],
         "json_model_override_args": json.dumps(_overrides),
     }
 )

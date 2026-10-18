@@ -43,6 +43,8 @@ class TestRouterTopk(CustomTestCase):
             (1, 896, 16, True, 2.5, jnp.bfloat16),
             (4, 896, 16, True, 1.0, jnp.bfloat16),
             (16, 256, 8, False, 1.0, jnp.bfloat16),
+            (1, 288, 8, True, 2.5, jnp.bfloat16),
+            (4, 288, 8, True, 2.5, jnp.bfloat16),
             # f32 logits: the sigmoid stays in f32, as it would with an f32 router.
             (1, 896, 16, True, 2.5, jnp.float32),
             (2, 896, 16, True, 1.0, jnp.float32),

@@ -42,6 +42,10 @@ _NUM_KV_PAGES_PER_BLOCK = (2, 2, 2)
 _NUM_QUERIES_PER_BLOCK = (1, 128, 128)
 # Query rows per scoring chunk: the kernel's score buffer is rows x positions.
 _CHUNK_TOKENS = 2048
+# Row-chunk only when one pass's f32 score buffer would exceed this. The chunked
+# path's overlap annotations do not compile on libtpu 0.0.50 ("annotation groups
+# with gaps"), and an unchunked 8k prefill at 10k context is ~84 MiB.
+_MAX_UNCHUNKED_SCORE_BYTES = 512 << 20
 
 
 def _hadamard_matrix(n: int) -> np.ndarray:
@@ -218,7 +222,11 @@ def kpool_indexer_step(
     q_fp8, q_scale, _ = quantize_ue8m0(query)
     w = head_weights.astype(jnp.float32) * q_scale[..., 0] * weight_scale  # [T, H]
     n_pick = topk // kpool
-    chunked = num_tokens > _CHUNK_TOKENS and num_tokens % _CHUNK_TOKENS == 0
+    chunked = (
+        num_tokens > _CHUNK_TOKENS
+        and num_tokens % _CHUNK_TOKENS == 0
+        and num_tokens * pool_pages * page_size * 4 > _MAX_UNCHUNKED_SCORE_BYTES
+    )
     # causal_offset = kpool - 1: a query at pos sees pools < (pos + 1) // kpool,
     # the ones closed at or before it.
     picked = streamindex_topk(

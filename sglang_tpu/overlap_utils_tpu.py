@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import torch
 
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.experimental import uses_host_batch
 
 if TYPE_CHECKING:
@@ -69,7 +70,6 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
     )
 
     hidden_buf = future_map.hidden_states_buf if future_map.need_hidden_states else None
-    width = (candidate_locs.shape[1] + 1) // 2
     from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 
     probs, topk, bonus, hidden = gather_spec_extras_func(
@@ -79,13 +79,14 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
         future_map.output_tokens_buf,
         hidden_buf,
     )
-    selected = _select_device_accept_cache_locs(candidate_locs, accept_lens, width)
+    from sglang_tpu.eagle_utils_tpu import select_device_accept_tpu
+
+    select_device_accept_tpu(draft_input, candidate_locs, accept_lens)
     draft_input.topk_p = probs
     draft_input.topk_index = topk
     draft_input.bonus_tokens = bonus
     if hidden is not None:
         draft_input.hidden_states = hidden
-    draft_input.device_accept_selected_cache_locs = selected
     draft_input.dsa_topk_indices = None
 
     from sglang.srt.managers.overlap_utils import (
@@ -132,7 +133,7 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
     """Flush any pending handoff, then defer this store when the next step can
     consume the payload directly. Returns True when the store was deferred.
 
-    Only EAGLE3 top-k-1 payloads stashed right after a publish qualify.
+    Only EAGLE/EAGLE3 top-k-1 payloads stashed right after a publish qualify.
     """
     # Take the publish before flushing: the flush re-enters stash and must fall
     # through to the normal store.
@@ -147,8 +148,12 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
         # No paired publish (prefill seed, beam tail slice): nothing to hand off.
         published is None
         or published.indices is not indices
-        # Only the EAGLE3 topk-1 decode path keeps acceptance on device.
-        or not future_map.spec_algo.is_eagle3()
+        # Only the EAGLE/EAGLE3 (incl. NEXTN MTP) topk-1 decode path keeps
+        # acceptance on device; FROZEN_KV_MTP is not scheduled this way.
+        or not (
+            future_map.spec_algo.is_eagle3()
+            or future_map.spec_algo == SpeculativeAlgorithm.EAGLE
+        )
         or payload.topk_index is None
         or payload.topk_index.shape[1] != 1
         # DP idle stub: an empty payload has nothing to relay.
@@ -186,8 +191,10 @@ def resolve_direct_handoff_tpu(future_map: FutureMap, batch: ScheduleBatch) -> b
         return False
     candidates = draft.device_accept_candidate_locs
     assert candidates.shape[1] >= 3 and candidates.shape[1] % 2 == 1
-    draft.device_accept_selected_cache_locs = _select_device_accept_cache_locs(
-        candidates, draft.accept_lens_device, (candidates.shape[1] + 1) // 2
+    from sglang_tpu.eagle_utils_tpu import select_device_accept_tpu
+
+    select_device_accept_tpu(
+        draft, candidates, draft.accept_lens_device, pending.seq_lens
     )
     draft.bonus_tokens = pending.payload.bonus_tokens.to(
         future_map.output_tokens_buf.dtype
