@@ -70,24 +70,10 @@ def spec_decoding_runner(base_url: str):
     }
 
 
+# The gate resolves the checkpoints; the serving config is the recipe's.
 LAUNCH_ENV = {
     "MODEL": MODEL_PATH,
-    "ISL": "2048",
-    "OSL": "512",
-    "CONCUR": "4",
-    "CONTEXT_LEN": "4096",
-    "MAX_TOTAL_TOKENS": "8192",
-    "TPU_COMPILE_TOKENS": "512 1024 2048",
-    "TPU_COMPILE_BS": "1 2 4",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--speculative-algorithm DFLASH "
-        f"--speculative-draft-model-path {DRAFT_MODEL_PATH} "
-        f"--speculative-dflash-block-size {DFLASH_BLOCK_SIZE}"
-    ),
+    "DRAFT_MODEL": DRAFT_MODEL_PATH,
 }
 
 MODEL_CONFIG = {
@@ -95,7 +81,7 @@ MODEL_CONFIG = {
     "test_name": "gpt-oss-120b-dflash-smoke",
     "variant": "TP8+EP8+DFLASH",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
+        "config": "recipe/configs/gpt_oss_120b/dflash_smoke.py",
         "env": LAUNCH_ENV,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-120b-dflash-smoke-e2e",

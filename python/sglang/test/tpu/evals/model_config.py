@@ -57,7 +57,7 @@ launch
                   tests take; a human reproduces a red run with
                   `python -m benchmark.tpu.launch_server --config <it>`.
     recipe        Shell script under benchmark/tpu/ that brings the server up, e.g.
-                  "recipe/gpt_oss_120b/server.sh". Legacy, and mutually exclusive
+                  "recipe/qwen3_coder_480b/server.sh". Legacy, and mutually exclusive
                   with `config`.
     env           Environment for the recipe. The launcher logs it on boot, so a red run
                   stays reproducible by hand. Config describing *how* the model is

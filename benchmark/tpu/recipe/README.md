@@ -88,9 +88,15 @@ diverge on serving says why in a comment.
 | --- | --- |
 | `server.py` | the deployment; what the cookbook page renders from |
 | `accuracy.py`, `accuracy_<benchmark>.py` | the nightly accuracy gates |
-| `perf.py` | the nightly throughput sweep |
+| `perf.py`, `perf_<shape>.py` | the nightly throughput sweeps |
 | `pd_*.py` | disaggregated prefill/decode gates |
 | `singlehost_spec.py`, `pcp.py`, `pp4_*.py` | one feature's gate |
+
+A throughput variant states its shape through `configs/profiles.py` rather than
+by arithmetic: `apply_profile(SERVER_CONFIG, PROFILES["long_8k1k"])` sets the
+context, pool and compile buckets for 8k in / 1k out at that concurrency. The
+cookbook renders its launch commands from the same profiles, so the published
+command and the measured one are one configuration.
 
 ## Index
 
@@ -101,7 +107,7 @@ diverge on serving says why in a comment.
 | `deepseek_v4_flash.py` | (flat) | `stage-b-test-tpu-4-v7` |
 | `gemma4_26b_a4b/` | `accuracy`, `perf` | `nightly-tpu-accuracy-gemma4-26b-a4b-*`, `nightly-tpu-perf-gemma4-26b-a4b` |
 | `gemma4_31b/` | `server`, `accuracy`, `perf` | `nightly-tpu-accuracy-gemma4-31b-*`, `nightly-tpu-perf-gemma4-31b` |
-| `gpt_oss_120b/` | `server`, `accuracy`, `accuracy_{aime,gpqa,gsm8k,mmlupro}`, `singlehost_spec`, `pd_singlehost`, `pd_singlehost_{spec,decode_radix,kv_offload,kv_offload_spec,mxint8_multiturn}` | `nightly-tpu-accuracy-gpt-oss-120b-*`, `tpu-integration`, `external-nightly-1host` |
+| `gpt_oss_120b/` | `server`, `accuracy`, `accuracy_{aime,gpqa,gsm8k,mmlupro}`, `perf`, `perf_c64`, `perf_{eagle3,dflash}_c64`, `singlehost_spec`, `spec_dpa`, `dflash`, `dflash_smoke`, `dpa`, `dpa_hybrid`, `dpa_idle_group`, `prefix_cache_kv_offload`, `prefix_cache_kv_offload_{dpa,spec,spec_dpa}`, `pd_singlehost`, `pd_singlehost_{spec,decode_radix,kv_offload,kv_offload_spec,mxint8_multiturn}` | `nightly-tpu-accuracy-gpt-oss-120b-*`, `nightly-tpu-perf-gpt-oss-120b*`, `tpu-integration`, `external-nightly-1host` |
 | `gpt_oss_20b/` | `server`, `accuracy`, `perf`, `spec`, `spec_dpa`, `prefix_cache_kv_offload`, `pcp`, `pp4_pcp2`, `pp4_tp2` | `nightly-tpu-accuracy-gpt-oss-20b`, `nightly-tpu-perf-gpt-oss-20b`, `stage-b-test-tpu-4-v7` |
 | `kimi_k26/` | `mmmu`, `perf` | `nightly-tpu-multihost-accuracy`, `nightly-tpu-perf-kimi-k26` |
 | `qwen3_0_6b.py` | (flat) | the compile-tracer e2e; single chip |
@@ -132,7 +138,6 @@ its tests move to a Python config; do not add more.
 
 | Recipe | Tests |
 | --- | --- |
-| `gpt_oss_120b/server.sh` | the gpt-oss-120b single-host perf and feature gates |
 | `qwen3_coder_480b/server.sh` | Qwen3-Coder-480B single-host gates |
 | `qwen3_vl_8b/server.sh` | Qwen3-VL-8B EAGLE3 |
 | `qwen3_vl_30b_a3b/server.sh` | the single-host MMMU-Pro gate; paired with `configs/qwen3_vl_30b_a3b/pd_singlehost.py` |

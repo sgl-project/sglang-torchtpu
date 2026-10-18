@@ -18,6 +18,7 @@ import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+from sglang.test.tpu.utils.accuracy_base import recipe_server_args
 from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
 
 # Bring-up plus the offload probe's ~26k tokens of filler prefill plus 200 GSM8K
@@ -30,6 +31,7 @@ register_tpu_ci(
 )
 
 SERVED_MODEL_NAME = "gpt-oss-120b"
+CONFIG_MODULE = "recipe/configs/gpt_oss_120b/prefix_cache_kv_offload.py"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
@@ -37,57 +39,23 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 # the model computes, so a drop here is a corrupted host round-trip.
 GSM8K_ACCURACY = 0.70
 
-# The device pool has to be small enough that a handful of filler prefills evict the
-# probe to host, and large enough that GSM8K at CONCUR=8 still fits (short prompts
-# plus 512 output tokens each). Both hold at 16k.
-DEVICE_POOL_TOKENS = 16384
-HICACHE_RATIO = 3.0
+# The probe divides by the pool it is actually served, so read these from the
+# recipe, which sizes the device pool small enough to evict quickly.
+_SERVER_ARGS = recipe_server_args(CONFIG_MODULE)
+DEVICE_POOL_TOKENS = _SERVER_ARGS["max_total_tokens"]
+HICACHE_RATIO = _SERVER_ARGS["hicache_ratio"]
+# A prefix match is floored to a page multiple, which the gate's "at least one
+# page" checks are in terms of.
+PAGE_SIZE = _SERVER_ARGS["page_size"]
 PROBE_TOKENS = 2048
-# The recipe's default, restated here because the gate's "at least one page" checks
-# are in terms of it -- a prefix match is floored to a page multiple.
-PAGE_SIZE = 64
 
-LAUNCH_ENV = {
-    "MODEL": "/weights/gpt-oss-120b",
-    "ISL": "4096",
-    "OSL": "512",
-    "CONCUR": "64",
-    "CONTEXT_LEN": "8192",
-    "MAX_TOTAL_TOKENS": str(DEVICE_POOL_TOKENS),
-    "PAGE_SIZE": str(PAGE_SIZE),
-    "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "TPU_COMPILE_BS": "1 2 4 8 16 32 64",
-    # This gate runs gpt-oss on RPA v3, and raiden needs the fused
-    # page-first layout; server_args rejects other offload combinations. Both
-    # are already the recipe's default -- pinned here so a recipe change cannot
-    # silently take the offload path away from this gate.
-    "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-    "HICACHE_MEM_LAYOUT": "page_first_fused",
-    # Prefix caching is the substrate HiCache is built on, and launch_server.sh
-    # defaults it OFF.
-    "DISABLE_RADIX_CACHE": "0",
-    "KV_OFFLOAD": "1",
-    "HICACHE_IO_BACKEND": "raiden",
-    "HICACHE_RATIO": str(HICACHE_RATIO),
-    # Write through on every prefill so the probe is already on host by the time the
-    # fillers evict it. write_back would race that eviction and drop it instead.
-    "HICACHE_WRITE_POLICY": "write_through",
-    # cached_tokens_details in meta_info is how the gate tells a device hit from a
-    # host reload. Without this flag both read 0.
-    "ENABLE_CACHE_REPORT": "1",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "EXTRA_ARGS": (
-        f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}"
-    ),
-}
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-prefix-cache-kv-offload",
     "variant": "TP8+EP8+HiCache-raiden",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        "config": CONFIG_MODULE,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-prefix-cache-kv-offload-e2e",
     },

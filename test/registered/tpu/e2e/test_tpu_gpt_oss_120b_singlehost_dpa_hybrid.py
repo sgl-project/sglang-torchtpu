@@ -17,35 +17,14 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
 GSM8K_ACCURACY = 0.70
-DP_SIZE = 4
 
-LAUNCH_ENV = {
-    "MODEL": "/weights/gpt-oss-120b",
-    "ISL": "4096",
-    "OSL": "512",
-    "CONCUR": "16",
-    "CONTEXT_LEN": "8192",
-    "TPU_COMPILE_TOKENS": "512 1024 2048 4096",
-    # Four requests per DP rank at the configured global concurrency.
-    "TPU_COMPILE_BS": "1 2 4",
-    "MAX_TOTAL_TOKENS": "8192",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    # TP8 / DP4 gives four replicas whose attention is sharded TP2.
-    "DP_SIZE": str(DP_SIZE),
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--tpu-compile-tracer direct"
-    ),
-}
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-dpa-hybrid-gsm8k",
     "variant": "TP8+EP8+DP4(attn-tp2)",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        "config": "recipe/configs/gpt_oss_120b/dpa_hybrid.py",
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-dpa-hybrid-gsm8k-e2e",
     },

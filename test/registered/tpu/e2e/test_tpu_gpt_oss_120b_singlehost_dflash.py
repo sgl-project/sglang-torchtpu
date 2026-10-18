@@ -33,30 +33,10 @@ SPEC_ACCEPT_LENGTH_THRESHOLD = float(
     os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "3.0")
 )
 
+# The gate resolves the checkpoints; the serving config is the recipe's.
 LAUNCH_ENV = {
     "MODEL": MODEL_PATH,
     "DRAFT_MODEL": DRAFT_MODEL_PATH,
-    "ISL": "4096",
-    "OSL": "512",
-    "CONCUR": "16",
-    "CONTEXT_LEN": "8192",
-    "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "TPU_COMPILE_BS": "1 2 4 16",
-    "MAX_TOTAL_TOKENS": "8192",
-    "MEM_FRACTION_STATIC": os.environ.get("MEM_FRACTION_STATIC", "0.6"),
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    # Broadcast only the sites that can genuinely differ across ranks -- memory
-    # init and the RNG draws. The deterministic ones (greedy accept) compute the
-    # same answer everywhere, so syncing them costs a collective per step.
-    "SGLANG_SPEC_TP_SYNC": "rng",
-    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--speculative-algorithm DFLASH "
-        f"--speculative-draft-model-path {DRAFT_MODEL_PATH} "
-        f"--speculative-dflash-block-size {DFLASH_BLOCK_SIZE}"
-    ),
 }
 
 MODEL_CONFIG = {
@@ -64,7 +44,7 @@ MODEL_CONFIG = {
     "test_name": "gpt-oss-120b-dflash-gsm8k",
     "variant": "TP8+EP8+DFLASH",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
+        "config": "recipe/configs/gpt_oss_120b/dflash.py",
         "env": LAUNCH_ENV,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-dflash-gsm8k-e2e",

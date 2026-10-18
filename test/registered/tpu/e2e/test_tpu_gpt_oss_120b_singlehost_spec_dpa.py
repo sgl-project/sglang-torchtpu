@@ -21,38 +21,13 @@ SPEC_ACCEPT_LENGTH_THRESHOLD = float(
     os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90")
 )
 
-LAUNCH_ENV = {
-    "MODEL": "/weights/gpt-oss-120b",
-    "DRAFT_MODEL": "lmsys/EAGLE3-gpt-oss-120b-bf16",
-    "ISL": "4096",
-    "OSL": "512",
-    "CONCUR": "16",
-    "CONTEXT_LEN": "8192",
-    "TPU_COMPILE_TOKENS": "512 1024 2048 4096",
-    # DP-local buckets: DP4 turns the global concurrency of 16 into four per rank.
-    "TPU_COMPILE_BS": "1 2 4",
-    "MAX_TOTAL_TOKENS": "8192",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "DP_SIZE": "4",
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--speculative-algorithm EAGLE3 "
-        "--speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 "
-        "--speculative-num-steps 3 "
-        "--speculative-eagle-topk 1 "
-        "--speculative-num-draft-tokens 4 "
-        "--tpu-compile-tracer dynamo"
-    ),
-}
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-spec-dpa-gsm8k",
     "variant": "TP8+EP8+DP4+EAGLE3",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        "config": "recipe/configs/gpt_oss_120b/spec_dpa.py",
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-spec-dpa-gsm8k-e2e",
     },

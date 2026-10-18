@@ -27,9 +27,9 @@ def _profile(
 ) -> dict:
     """One profile, with the sizing derived from the shape it names.
 
-    The context is the shape plus a chat-template allowance; the pool holds every
-    in-flight request at full length plus one prefill chunk of slack, which keeps
-    a late arrival from waiting on an eviction.
+    The context is the shape plus a chat-template allowance. The pool is twice
+    the in-flight requirement: the extra half is what the radix cache retains
+    shared prefixes with instead of evicting them between requests.
     """
     context_length = input_tokens + output_tokens + 64
     return {
@@ -43,7 +43,7 @@ def _profile(
             "torch_compile_max_bs": concurrency,
             "tpu_compile_tokens": [prefill_tokens],
             "tpu_compile_bs": [concurrency],
-            "max_total_tokens": concurrency * context_length + prefill_tokens,
+            "max_total_tokens": 2 * concurrency * context_length,
         },
     }
 

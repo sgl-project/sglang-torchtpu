@@ -14,8 +14,10 @@ ADDING A MODEL: copy this file, and change six things.
   3. `est_time` -- one bring-up (weight load + per-shape compile) plus the sweep.
      It drives the JobSet poll budget, so an under-estimate kills the run. Not
      auto-refreshed: update_est_time.py omits tpu.
-  4. `MODEL` and `launch.recipe` -- point at the recipe that already knows how to
-     serve this model, then list ONLY the deltas the measurement needs in `env`.
+  4. `MODEL` and `launch.config` -- point at the model's Python recipe. A perf
+     recipe is its `server.py` sized by one of the profiles in
+     benchmark/tpu/recipe/configs/profiles.py; it departs from the deployment
+     only where the measurement needs it to.
   5. the shape (ISL/OSL/CONCUR/WORKLOAD), if this model is measured at a
      different one. `WORKLOAD` is the name the dashboard's dropdown shows.
   6. `launch.tag` -- what the boot line is labelled with in the log.
@@ -38,9 +40,10 @@ bench_serving_runner, and is what separates "slower" from "the server served
 nothing".
 
 This model serves from a mounted checkpoint rather than an HF id, so the served
-name has to be set explicitly in both the launch and the bench; and its recipe
-derives its whole shape from ISL/OSL/CONCUR, so those go in `env` rather than a
-context length being computed here.
+name is set explicitly in the recipe and in the bench. The recipe sizes the
+server from the `long_8k1k` profile, and the sweep below drives that same shape:
+the published cookbook command, the server CI measures, and this number are one
+configuration.
 
 (Qwen3-Coder-480B is measured elsewhere: its perf source is the multi-turn
 agentic sweep in e2e/test_tpu_qwen3_coder_480b_multihost_agentic.py, which runs
@@ -52,6 +55,7 @@ import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+from sglang.test.tpu.utils.accuracy_base import recipe_server_args
 
 # One bring-up (weight load + per-shape compile, ~10 min with the single-bucket
 # compile below) plus one sweep leg. Drives the JobSet poll budget, so an
@@ -68,7 +72,11 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
 # 8192 in + 1024 out, named for the dashboard's Workload dropdown.
 WORKLOAD = "8k1k"
-ISL, OSL, CONCUR = 8192, 1024, 16
+CONFIG_MODULE = "recipe/configs/gpt_oss_120b/perf.py"
+ISL, OSL = 8192, 1024
+# The server is sized for exactly this concurrency, so drive what it was sized
+# for: the recipe's profile is the one source of the number.
+CONCUR = recipe_server_args(CONFIG_MODULE)["max_running_requests"]
 
 # Serves from the shared read-only Filestore PVC (model-weights-filestore at /weights), but the
 # canonical HF id is what the server is told to serve as and what the dashboard
@@ -89,38 +97,7 @@ MODEL_CONFIG = {
     "display_name": "GPT-OSS 120B",
     "variant": "TP8+EP8",
     "launch": {
-        # server.sh's own sample usage is `ISL=8192 OSL=1024 CONCUR=N ./server.sh`
-        # -- it derives context, prefill chunk, KV pool and compile buckets from
-        # exactly those three. Delta on top of the recipe:
-        #   MODEL         the Filestore PVC mount; server.sh defaults to the HF id.
-        #   EXTRA_ARGS    serve under the canonical HF name (see MODEL).
-        #   ISL/OSL/CONCUR  the shape. These give CONTEXT_LEN = 9280, an
-        #                 8192-token prefill chunk (a cold 8k prompt is one
-        #                 chunk), MAX_RUNNING/TORCH_COMPILE_MAX_BS = CONCUR, and
-        #                 a 2*CONCUR*CONTEXT_LEN = 297k-token fp8 KV pool -- far
-        #                 below the ~1.5M where its extend precompile OOMs.
-        #   DISABLE_RADIX_CACHE  the recipe leaves prefix caching ON because it
-        #                 is paired with a deliberate cache-hit sweep. This is
-        #                 the opposite measurement: random-prompt throughput at
-        #                 InferenceX parity, where a cache hit would let a
-        #                 request skip a real prefill and drift the trend upward
-        #                 for no serving reason.
-        #   TPU_COMPILE_*  one prefill and one decode bucket, keeping bring-up
-        #                 ~10 min; the derived default is powers of two up to
-        #                 CONCUR. Same trade the accuracy nightly makes.
-        #   ENABLE_PROFILER_ENDPOINT  a nightly captures no traces.
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "EXTRA_ARGS": f"--served-model-name {MODEL}",
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-            "DISABLE_RADIX_CACHE": "1",
-            "TPU_COMPILE_TOKENS": str(ISL),
-            "TPU_COMPILE_BS": str(CONCUR),
-            "ENABLE_PROFILER_ENDPOINT": "0",
-        },
+        "config": CONFIG_MODULE,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-gpt-oss",
     },

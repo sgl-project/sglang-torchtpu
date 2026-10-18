@@ -15,6 +15,7 @@ import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+from sglang.test.tpu.utils.accuracy_base import recipe_server_args
 
 # One bring-up plus one sweep leg. Longer than the c16 file's 1800: a 64-wide
 # decode bucket compiles slower and the KV pool is 4x. Drives the JobSet poll
@@ -30,7 +31,11 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
 WORKLOAD = "8k1k"
-ISL, OSL, CONCUR = 8192, 1024, 64
+CONFIG_MODULE = "recipe/configs/gpt_oss_120b/perf_c64.py"
+ISL, OSL = 8192, 1024
+# The server is sized for exactly this concurrency, so drive what it was
+# sized for: the recipe's profile is the one source of the number.
+CONCUR = recipe_server_args(CONFIG_MODULE)["max_running_requests"]
 
 MODEL = "openai/gpt-oss-120b"
 WEIGHTS = "/weights/gpt-oss-120b"
@@ -48,18 +53,7 @@ MODEL_CONFIG = {
         # TORCH_COMPILE_MAX_BS and a 2*CONCUR*CONTEXT_LEN = 1.19M-token fp8 KV
         # pool -- still under the ~1.5M where its extend precompile OOMs, but
         # with far less slack than c16's 297k.
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "EXTRA_ARGS": f"--served-model-name {MODEL}",
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-            "DISABLE_RADIX_CACHE": "1",
-            "TPU_COMPILE_TOKENS": str(ISL),
-            "TPU_COMPILE_BS": str(CONCUR),
-            "ENABLE_PROFILER_ENDPOINT": "0",
-        },
+        "config": CONFIG_MODULE,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-gpt-oss-c64",
     },

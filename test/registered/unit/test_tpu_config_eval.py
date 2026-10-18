@@ -118,6 +118,20 @@ class TestAccuracyRecipes(unittest.TestCase):
         "recipe/configs/gpt_oss_120b/accuracy_gpqa.py",
         "recipe/configs/gpt_oss_120b/accuracy_gsm8k.py",
         "recipe/configs/gpt_oss_120b/accuracy_mmlupro.py",
+        "recipe/configs/gpt_oss_120b/perf.py",
+        "recipe/configs/gpt_oss_120b/perf_c64.py",
+        "recipe/configs/gpt_oss_120b/perf_eagle3_c64.py",
+        "recipe/configs/gpt_oss_120b/perf_dflash_c64.py",
+        "recipe/configs/gpt_oss_120b/dflash.py",
+        "recipe/configs/gpt_oss_120b/dflash_smoke.py",
+        "recipe/configs/gpt_oss_120b/dpa.py",
+        "recipe/configs/gpt_oss_120b/dpa_hybrid.py",
+        "recipe/configs/gpt_oss_120b/dpa_idle_group.py",
+        "recipe/configs/gpt_oss_120b/prefix_cache_kv_offload.py",
+        "recipe/configs/gpt_oss_120b/prefix_cache_kv_offload_dpa.py",
+        "recipe/configs/gpt_oss_120b/prefix_cache_kv_offload_spec.py",
+        "recipe/configs/gpt_oss_120b/prefix_cache_kv_offload_spec_dpa.py",
+        "recipe/configs/gpt_oss_120b/spec_dpa.py",
     )
 
     def test_multihost_rank_resolves_from_jobset_topology(self):
@@ -141,6 +155,25 @@ class TestAccuracyRecipes(unittest.TestCase):
                 else:
                     self.assertNotIn("--dp-size", plan.command)
                     self.assertNotIn("--enable-dp-attention", plan.command)
+
+    def test_dp_attention_recipes_split_the_lm_head(self):
+        """attention_tp > 1 under DP attention needs --enable-dp-lm-head on TPU.
+
+        Without it the LM head stays replicated while attention is sharded, and
+        the server comes up serving one attention group instead of dp_size.
+        """
+        for recipe in self.SINGLE_HOST:
+            with self.subTest(recipe=recipe):
+                args = load_recipe(recipe)["server_args"]
+                dp_size = args.get("dp_size", 1)
+                if dp_size == 1:
+                    continue
+                self.assertTrue(args.get("enable_dp_attention"), recipe)
+                self.assertEqual(args["tp_size"] % dp_size, 0, recipe)
+                attention_tp = args["tp_size"] // dp_size
+                self.assertEqual(
+                    args.get("enable_dp_lm_head", False), attention_tp > 1, recipe
+                )
 
     def test_derived_recipe_does_not_mutate_its_base(self):
         from benchmark.tpu.recipe.configs.deepseek_r1_0528.accuracy import CONFIG as R1
