@@ -100,11 +100,8 @@ class TestTpuMambaPool(CustomTestCase):
         # Reordered batch, null padding, and inactive rows do not change another request.
         pool.select_checkpoints(torch.tensor([3, 1, 0]), torch.tensor([3, -1, 2]))
         self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 2, 0, 3])
-        # A DP pad slot (-1) lands on the inert null slot.
-        pool.select_checkpoints(torch.tensor([-1, 3]), torch.tensor([1, 1]))
-        self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 2, 0, 1])
         pool.clear_slots(torch.tensor([1]))
-        self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 0, 0, 1])
+        self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 0, 0, 3])
         # fp32 accounting covers all allocated checkpoint buffers conservatively.
         self.assertEqual(
             pool.get_kv_size_bytes(),

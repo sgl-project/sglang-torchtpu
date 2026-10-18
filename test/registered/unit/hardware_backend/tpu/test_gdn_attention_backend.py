@@ -228,14 +228,14 @@ class TestGDNVerifyMetadata(CustomTestCase):
     def test_commit_selects_checkpoints_for_the_verified_slots(self):
         backend = self._backend(torch.zeros(3, dtype=torch.int32))
         steps = torch.tensor([1, -1])
-        # A DP pad slot (-1) goes to the pool, which maps it to the inert null slot.
+        # A DP pad slot (-1) maps to the null slot, which the pool keeps inert.
         backend.commit_verified_states(
             None, torch.tensor([2, -1]), steps, None, None, None
         )
         slots, got_steps = (
             backend.req_to_token_pool.mamba_pool.select_checkpoints.call_args.args
         )
-        self.assertEqual(slots.tolist(), [2, -1])
+        self.assertEqual(slots.tolist(), [2, 0])
         self.assertIs(got_steps, steps)
 
     def test_commit_rejects_radix_tracking(self):
