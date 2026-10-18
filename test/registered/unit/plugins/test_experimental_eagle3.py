@@ -23,24 +23,24 @@ from sglang_tpu.experimental.compilation.eagle3_compile_policy import (
     TpuEagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import base_spec_worker
+from sglang_tpu.experimental.speculative import spec_ops
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.eagle.eagle_worker import (
     EagleSeed,
     TpuEagle3Worker,
     _shifted_prompt,
-    draft_extend_inputs,
     fill_prefill_tail,
 )
 from sglang_tpu.experimental.speculative.eagle_info import HostPaddedEagleDraftInput
 from sglang_tpu.experimental.speculative.spec_ops import (
+    _filtered_target_probs,
     accept_drafts_sampled,
     accept_drafts_sampled_filtered,
     accept_drafts_target_only,
+    finalize_accept,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
-    BucketState,
     SpecState,
 )
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows
@@ -66,6 +66,27 @@ def _eagle_worker() -> TpuEagle3Worker:
     worker._hidden_dtype = torch.bfloat16
     worker.num_verify_rows = 3
     return worker
+
+
+def _cpu_joint_filter(probs, top_ks, top_ps, min_ps, **need):
+    """CPU reference of tpu_filter_probs with every filter enabled (ties kept)."""
+    del need
+    desc = probs.sort(dim=-1, descending=True).values
+    rows = torch.arange(probs.shape[0])
+    k = top_ks.clamp(1, probs.shape[1]).long() - 1
+    nucleus = (desc.cumsum(-1) < top_ps[:, None]).sum(-1).clamp_max(probs.shape[1] - 1)
+    cutoff = torch.maximum(desc[rows, k], desc[rows, nucleus])
+    cutoff = torch.maximum(cutoff, desc[:, 0] * min_ps)
+    return torch.where(probs >= cutoff[:, None], probs, 0.0)
+
+
+def _unfiltered(rows: int) -> dict[str, torch.Tensor]:
+    """Sampling params that keep the whole target distribution at temperature 1."""
+    return dict(
+        temperatures=torch.ones(rows),
+        top_ps=torch.ones(rows),
+        min_ps=torch.zeros(rows),
+    )
 
 
 def _seed(rows: int, offset: int = 0) -> EagleSeed:
@@ -202,6 +223,8 @@ class TestExperimentalEagle3(CustomTestCase):
                 accept_tokens=torch.zeros((4, 3), dtype=torch.int64),
                 accept_lens=torch.ones(4, dtype=torch.int32),
                 next_seq_lens=torch.zeros(4, dtype=torch.int64),
+                window_tokens=torch.zeros(12, dtype=torch.int64),
+                window_seq_lens=torch.zeros(4, dtype=torch.int64),
             ),
         )
         exported = result.next_draft_input
@@ -319,28 +342,32 @@ class TestExperimentalEagle3(CustomTestCase):
         rows = 40000
         probs = torch.stack([p0, torch.full((4,), 0.25)]).repeat(rows, 1)
         drafts = torch.full((rows, 1), 2)
-        num_correct, bonus = accept_drafts_target_only(
-            probs,
-            drafts,
-            torch.ones(rows, dtype=torch.int32),
-            torch.full((rows,), 4, dtype=torch.int32),
-            1.0,
-            1.0,
-        )
+        with patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter):
+            num_correct, bonus = accept_drafts_target_only(
+                probs.log(),
+                drafts,
+                torch.ones(rows, dtype=torch.int32),
+                top_ks=torch.full((rows,), 4, dtype=torch.int32),
+                threshold_single=1.0,
+                threshold_acc=1.0,
+                **_unfiltered(rows),
+            )
         first = torch.where(num_correct > 0, drafts[:, 0], bonus)
         freq = torch.bincount(first, minlength=4).float() / rows
         torch.testing.assert_close(freq, p0, atol=0.01, rtol=0)
         rejected = num_correct == 0
         self.assertFalse(bool((bonus[rejected] == 2).any()))
 
-        greedy_correct, greedy_bonus = accept_drafts_target_only(
-            probs[:4],
-            torch.tensor([[3], [1]]),
-            torch.ones(2, dtype=torch.int32),
-            torch.ones(2, dtype=torch.int32),
-            1.0,
-            1.0,
-        )
+        with patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter):
+            greedy_correct, greedy_bonus = accept_drafts_target_only(
+                probs[:4].log(),
+                torch.tensor([[3], [1]]),
+                torch.ones(2, dtype=torch.int32),
+                top_ks=torch.ones(2, dtype=torch.int32),
+                threshold_single=1.0,
+                threshold_acc=1.0,
+                **_unfiltered(2),
+            )
         self.assertEqual(greedy_correct.tolist(), [1, 0])
         self.assertEqual(greedy_bonus.tolist(), [0, 3])
 
@@ -349,19 +376,20 @@ class TestExperimentalEagle3(CustomTestCase):
         token follows the filtered p_0, including tokens the filter dropped from q."""
         torch.manual_seed(0)
         rows = 40000
-        p0 = torch.tensor([0.0, 0.5, 0.5, 0.0])  # e.g. top-k 2 of the target
+        target = torch.tensor([0.1, 0.4, 0.4, 0.1])
+        p0 = torch.tensor([0.0, 0.5, 0.5, 0.0])  # top-k 2 of the target
         q_logits = torch.log(torch.tensor([0.4, 0.3, 0.2, 0.1]))
         drafts = torch.multinomial(q_logits.exp(), rows, replacement=True)[:, None]
-        target_probs = torch.stack([p0, torch.full((4,), 0.25)]).repeat(rows, 1)
-        num_correct, bonus = accept_drafts_sampled_filtered(
-            target_probs,
-            target_probs.log(),
-            drafts,
-            torch.ones(rows, dtype=torch.int32),
-            q_logits.expand(rows, 1, 4),
-            torch.ones(rows),
-            torch.full((rows,), 2, dtype=torch.int32),
-        )
+        target_logits = torch.stack([target, torch.full((4,), 0.25)]).log()
+        with patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter):
+            num_correct, bonus = accept_drafts_sampled_filtered(
+                target_logits.repeat(rows, 1),
+                drafts,
+                torch.ones(rows, dtype=torch.int32),
+                q_logits.expand(rows, 1, 4),
+                top_ks=torch.full((rows,), 2, dtype=torch.int32),
+                **_unfiltered(rows),
+            )
         first = torch.where(num_correct > 0, drafts[:, 0], bonus)
         freq = torch.bincount(first, minlength=4).float() / rows
         torch.testing.assert_close(freq, p0, atol=0.01, rtol=0)
@@ -378,10 +406,13 @@ class TestExperimentalEagle3(CustomTestCase):
             temperatures=torch.tensor([1e9]),
             top_ks=torch.ones(1, dtype=torch.int32),
         )
-        probs = torch.full((2, 2), 0.5)
+        with patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter):
+            filtered = accept_drafts_sampled_filtered(
+                target_logits, top_ps=torch.ones(1), min_ps=torch.zeros(1), **args
+            )
         for num_correct, bonus in (
             accept_drafts_sampled(target_logits, **args),
-            accept_drafts_sampled_filtered(probs, target_logits, **args),
+            filtered,
         ):
             self.assertEqual((num_correct.item(), bonus.item()), (1, 1))
 
@@ -411,41 +442,16 @@ class TestExperimentalEagle3(CustomTestCase):
     def test_sampled_verify_filters_target_like_the_target_sampler(self):
         """Sampled verify keeps what the target sampler keeps: every cutoff on the
         unfiltered p, each request's values on all its N + 1 rows, one renorm."""
-        worker = _eagle_worker()
-        worker.num_verify_rows = 2
-
-        def joint_filter(probs, top_ks, top_ps, min_ps, **need):
-            # CPU reference of tpu_filter_probs with every filter enabled.
-            del need
-            desc = probs.sort(dim=-1, descending=True).values
-            rows = torch.arange(probs.shape[0])
-            k = top_ks.clamp(1, probs.shape[1]).long() - 1
-            nucleus = (
-                (desc.cumsum(-1) < top_ps[:, None])
-                .sum(-1)
-                .clamp_max(probs.shape[1] - 1)
-            )
-            cutoff = torch.maximum(desc[rows, k], desc[rows, nucleus])
-            cutoff = torch.maximum(cutoff, desc[:, 0] * min_ps)
-            return torch.where(probs >= cutoff[:, None], probs, 0.0)
-
         p = torch.tensor([[0.40, 0.25, 0.20, 0.15], [0.50, 0.30, 0.15, 0.05]])
-        bucket = BucketState(
-            key=None,
-            state=None,
-            live_mask=None,
-            temperatures=torch.ones(2),
-            # Renormalizing after top-k would push 0.40 past top_p and drop 0.25.
-            top_ks=torch.tensor([2, 1 << 30], dtype=torch.int32),
-            top_ps=torch.tensor([0.6, 1.0]),
-            min_ps=torch.tensor([0.0, 0.5]),
-            need_top_k=True,
-            need_top_p=True,
-            need_min_p=True,
-        )
-        with patch.object(base_spec_worker, "tpu_filter_probs", joint_filter):
-            filtered = worker._filtered_target_probs(
-                p.log().repeat_interleave(2, dim=0), bucket
+        with patch.object(spec_ops, "tpu_filter_probs", _cpu_joint_filter):
+            filtered = _filtered_target_probs(
+                p.log().repeat_interleave(2, dim=0),
+                torch.ones(2),
+                # Renormalizing after top-k would push 0.40 past top_p and drop 0.25.
+                torch.tensor([2, 1 << 30], dtype=torch.int32),
+                torch.tensor([0.6, 1.0]),
+                torch.tensor([0.0, 0.5]),
+                num_verify_rows=2,
             )
         expected = torch.tensor(
             [[0.40 / 0.65, 0.25 / 0.65, 0, 0], [0.50 / 0.80, 0.30 / 0.80, 0, 0]]
@@ -471,10 +477,49 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual(filled.tolist(), [63, 12, 7, 21, 22, 0, 0, 0])
 
     def test_draft_extend_reads_valid_tokens_at_post_write_lengths(self):
-        accept_tokens = torch.tensor([[5, 6, -1], [-1, -1, -1]])
-        input_ids, post = draft_extend_inputs(accept_tokens, torch.tensor([10, 0]))
-        self.assertEqual(input_ids.tolist(), [5, 6, 0, 0, 0, 0])
-        self.assertEqual(post.tolist(), [13, 3])
+        """Draft extend rewrites the whole verify window: rows past the accepted
+        prefix must be valid ids, and the length counts every window row."""
+        accept = finalize_accept(
+            torch.tensor([[5, 7], [8, 9]]),
+            torch.tensor([1, 0]),
+            torch.tensor([6, 4]),
+            torch.tensor([10, 0]),
+            torch.tensor([True, False]),
+        )
+        self.assertEqual(accept.window_tokens.tolist(), [5, 6, 0, 4, 0, 0])
+        self.assertEqual(accept.window_seq_lens.tolist(), [13, 3])
+
+    def test_filtered_accept_warmup_passes_unaliased_params(self):
+        """Serving uploads each sampling param separately; a warmup passing one
+        tensor for two of them leaves a Dynamo alias guard serving never meets."""
+        worker = _eagle_worker()
+        worker.num_drafts = 2
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(model_config=SimpleNamespace(vocab_size=8))
+        )
+        worker._all_drafts = {4: torch.full((4,), 2, dtype=torch.int32)}
+        worker._accept_threshold_single = worker._accept_threshold_acc = 1.0
+        calls = []
+        with (
+            patch.object(
+                TpuEagle3Worker,
+                "_b_bucketer",
+                return_value=SimpleNamespace(buckets=[4]),
+            ),
+            patch(
+                "sglang_tpu.experimental.speculative.eagle.eagle_worker."
+                "warmup_compiled_op",
+                lambda op, *args: calls.append(args),
+            ),
+        ):
+            worker._warmup_target_only_accept()
+        logits, _, _, temperatures, top_ks, top_ps, min_ps, *_ = calls[0]
+        self.assertEqual((logits.shape, logits.dtype), ((12, 8), torch.float32))
+        self.assertEqual(len({id(t) for t in (temperatures, top_ps, min_ps)}), 3)
+        self.assertEqual(
+            [t.dtype for t in (temperatures, top_ks, top_ps, min_ps)],
+            [torch.float32, torch.int32, torch.float32, torch.float32],
+        )
 
     def test_eagle3_verify_warmup_builds_the_served_structure(self):
         """The dynamo tracer guards the spec_info structure, so the EAGLE3 compile

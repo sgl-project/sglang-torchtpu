@@ -415,12 +415,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 warmup_compiled_op(
                     accept_drafts_sampled_filtered,
                     torch.zeros(verify_rows, dtype=torch.float32, device=self.device),
-                    torch.zeros(verify_rows, dtype=torch.float32, device=self.device),
                     draft_tokens,
                     self._all_drafts[padded_bs],
                     draft_logits.float(),
-                    torch.ones((padded_bs,), dtype=torch.float32, device=self.device),
-                    torch.ones((padded_bs,), dtype=torch.int32, device=self.device),
+                    *self._sampling_param_warmup_args(padded_bs),
                 )
 
     # The base default reads draft_worker.draft_runners, which TpuBlockDraftWorker lacks.

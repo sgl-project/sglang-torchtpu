@@ -111,18 +111,6 @@ def split_draft_chain(chain: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @compiled_op()
-def draft_extend_inputs(
-    accept_tokens: torch.Tensor, seq_lens: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Flat [pbs * (N + 1)] draft-extend tokens and the post-write lengths [pbs].
-
-    Rows past the accepted prefix hold -1; they only write draft KV past the new
-    length, which later steps overwrite before reading, so any valid id serves.
-    """
-    return accept_tokens.clamp_min(0).reshape(-1), seq_lens + accept_tokens.shape[1]
-
-
-@compiled_op()
 def fill_prefill_tail(
     input_ids: torch.Tensor, tail_src: torch.Tensor, tail_tokens: torch.Tensor
 ) -> torch.Tensor:
@@ -455,9 +443,6 @@ class TpuEagle3Worker(TpuSpecWorker):
         """DRAFT_EXTEND_V2 over the verify rows, prepared like prepare_for_draft_extend."""
         padded_bs = state.seq_lens.shape[0]
         width = self.num_verify_rows
-        input_ids, post_seq_lens = draft_extend_inputs(
-            accept.accept_tokens, state.seq_lens
-        )
         spec_info = EagleDraftExtendInput(
             hidden_states=target_hidden,
             num_correct_drafts=accept.num_correct_drafts,
@@ -473,11 +458,11 @@ class TpuEagle3Worker(TpuSpecWorker):
             # RPA backend ignores the (host, committed-base) prefix lengths.
             with self._bucket_view(
                 batch,
-                bucket_state=state._replace(seq_lens=post_seq_lens),
+                bucket_state=state._replace(seq_lens=accept.window_seq_lens),
                 verify_input=verify_input,
                 kv_rows=width,
                 spec_info=spec_info,
-                input_ids=input_ids,
+                input_ids=accept.window_tokens,
                 out_cache_loc=rows.flat_cache_locs,
                 forward_mode=ForwardMode.DRAFT_EXTEND_V2,
                 prefix_lens=verify_input.seq_lens_cpu.tolist() + [0] * num_pad,
@@ -604,7 +589,6 @@ class TpuEagle3Worker(TpuSpecWorker):
                 cache_locs[:, : self.num_drafts].reshape(-1).cpu()
                 seq_lens.repeat_interleave(1, dim=0).cpu()
                 warmup_compiled_op(split_draft_chain, cache_locs)
-                warmup_compiled_op(draft_extend_inputs, cache_locs, seq_lens)
                 if self.target_worker.model_runner.model_config.model_is_mrope:
                     # compute_spec_mrope_positions on the verify rows: text-only
                     # batches, then batches with per-request deltas.
@@ -616,7 +600,7 @@ class TpuEagle3Worker(TpuSpecWorker):
                     ).cpu()
 
     def _warmup_target_only_accept(self) -> None:
-        """Target-only acceptance per batch bucket; the base warms the target filters."""
+        """Target-only acceptance, target filter included, per batch bucket."""
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         with torch.no_grad():
             for padded_bs in self._b_bucketer().buckets:
@@ -633,7 +617,7 @@ class TpuEagle3Worker(TpuSpecWorker):
                         device=self.device,
                     ),
                     self._all_drafts[padded_bs],
-                    torch.ones((padded_bs,), dtype=torch.int32, device=self.device),
+                    *self._sampling_param_warmup_args(padded_bs),
                     self._accept_threshold_single,
                     self._accept_threshold_acc,
                 )

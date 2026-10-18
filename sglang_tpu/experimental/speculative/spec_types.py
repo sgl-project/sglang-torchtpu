@@ -127,6 +127,9 @@ class AcceptResult(NamedTuple):
       accept_tokens: [pbs, N + 1] correct drafts then bonus, padded with -1.
       accept_lens: [pbs] int32 committed tokens, 0 on padded rows.
       next_seq_lens: [pbs] seq_lens + accept_lens.
+      window_tokens: flat [pbs * (N + 1)] accept_tokens with 0 for -1, for a
+        commit that rewrites the whole verify window (EAGLE3 draft extend).
+      window_seq_lens: [pbs] seq_lens + N + 1, the length once that window is written.
     """
 
     num_correct_drafts: torch.Tensor
@@ -134,6 +137,8 @@ class AcceptResult(NamedTuple):
     accept_tokens: torch.Tensor
     accept_lens: torch.Tensor
     next_seq_lens: torch.Tensor
+    window_tokens: torch.Tensor
+    window_seq_lens: torch.Tensor
 
 
 class DraftBlockInputs(NamedTuple):

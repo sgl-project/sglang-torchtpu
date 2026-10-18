@@ -19,6 +19,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
     map_carry,
 )
+from sglang_tpu.sampling_mask import tpu_filter_probs
 from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
 
 
@@ -173,15 +174,16 @@ def accept_drafts_sampled(
 
 @compiled_op(uses_rng=True)
 def accept_drafts_sampled_filtered(
-    target_probs: torch.Tensor,
     target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
     num_verify_drafts: torch.Tensor,
     draft_logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """accept_drafts_sampled against the filtered target probs [pbs * (N + 1), V].
+    """accept_drafts_sampled against the target filtered like the target sampler.
 
     Filtering only p keeps the rule lossless for the filtered target: q is the
     distribution the draft actually sampled from. Greedy rows still compare
@@ -190,8 +192,11 @@ def accept_drafts_sampled_filtered(
     bs, n = draft_tokens.shape
     temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
     q = torch.softmax(draft_logits.float() / temps, dim=-1)
+    p = _filtered_target_probs(
+        target_logits, temperatures, top_ks, top_ps, min_ps, num_verify_rows=n + 1
+    )
     return _leviathan_accept(
-        target_probs.view(bs, n + 1, -1),
+        p.view(bs, n + 1, -1),
         q,
         torch.argmax(target_logits.view(bs, n + 1, -1), dim=-1),
         draft_tokens,
@@ -245,36 +250,45 @@ def _leviathan_accept(
     )
 
 
-@compiled_op()
-def target_sampling_probs(
+def _filtered_target_probs(
     target_logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
+    *,
     num_verify_rows: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Temperature-scaled target probs [pbs * (N + 1), V] and the per-row top-k/top-p/min-p.
+) -> torch.Tensor:
+    """Target p [pbs * (N + 1), V]: temperature, then the target sampler's filter.
 
-    The filters are applied to these rows outside the op (the sort-free TPU
-    filter is its own exported program); the owning worker warms this op.
+    Like TpuSampler, every cutoff is taken on the unfiltered probabilities and
+    the survivors are normalized once. Runs inside the accept op's program.
     """
     temps = temperatures.view(-1).float().clamp_min(1e-5)
     temps = temps.repeat_interleave(num_verify_rows)[:, None]
-    return (
+    # Every flag on: disabled rows carry no-op values (TOP_K_ALL, 1.0, 0.0), so
+    # this is one program per shape instead of one per flag combination.
+    kept = tpu_filter_probs(
         torch.softmax(target_logits.float() / temps, dim=-1),
         top_ks.repeat_interleave(num_verify_rows),
         top_ps.repeat_interleave(num_verify_rows),
         min_ps.repeat_interleave(num_verify_rows),
+        need_top_k=True,
+        need_top_p=True,
+        need_min_p=True,
     )
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 @compiled_op(uses_rng=True)
 def accept_drafts_target_only(
-    target_probs: torch.Tensor,
+    target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
     num_verify_drafts: torch.Tensor,
+    temperatures: torch.Tensor,
     top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
     threshold_single: float,
     threshold_acc: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -284,12 +298,14 @@ def accept_drafts_target_only(
     p_j(d_j); at the first rejection k the bonus is drawn from p_k with d_k
     zeroed, else from p_k. This is TPU EAGLE's target-only rule, including the
     speculative_accept_threshold_{single,acc} relaxations (1.0 disables them).
-    target_probs are the flat [pbs * (N + 1), V] rows after temperature, top-k
-    and top-p. Rows with top_k <= 1 take the greedy rule.
+    target_logits are the flat [pbs * (N + 1), V] verify rows; p is filtered
+    like the target sampler. Rows with top_k <= 1 take the greedy rule.
     Returns num_correct_drafts and bonus_tokens, [pbs] each.
     """
     bs, n = draft_tokens.shape
-    p = target_probs.view(bs, n + 1, -1)
+    p = _filtered_target_probs(
+        target_logits, temperatures, top_ks, top_ps, min_ps, num_verify_rows=n + 1
+    ).view(bs, n + 1, -1)
     verify_mask = _verify_mask(num_verify_drafts, n)
 
     target_argmax = torch.argmax(p, dim=-1)
@@ -346,6 +362,10 @@ def finalize_accept(
         accept_tokens=accept_tokens,
         accept_lens=accept_lens.to(torch.int32),
         next_seq_lens=seq_lens + accept_lens,
+        # Rows past the accepted prefix only write KV past the new length, which
+        # later steps overwrite before reading, so any valid id serves.
+        window_tokens=accept_tokens.clamp_min(0).reshape(-1),
+        window_seq_lens=seq_lens + (n + 1),
     )
 
 

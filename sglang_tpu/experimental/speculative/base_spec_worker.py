@@ -83,7 +83,6 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     finalize_accept,
     pad_state_rows,
     select_verify_rows,
-    target_sampling_probs,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -97,7 +96,6 @@ from sglang_tpu.experimental.speculative.spec_types import (
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
-from sglang_tpu.sampling_mask import tpu_filter_probs
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -190,7 +188,6 @@ class TpuSpecWorker(BaseSpecWorker):
         }
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
-        self._warmup_filtered_target()
         self._warmup_relay_and_results()
         if self._simulate_acc_len > 0:
             self._simulated_drafts = {
@@ -363,23 +360,27 @@ class TpuSpecWorker(BaseSpecWorker):
         elif draft_result.draft_logits is None:
             # A deterministic draft is a one-hot q: TPU EAGLE's target-only rule.
             num_correct_drafts, bonus_tokens = accept_drafts_target_only(
-                self._filtered_target_probs(target_logits, bucket),
+                target_logits,
                 draft_result.draft_tokens,
                 draft_result.num_verify_drafts,
+                bucket.temperatures,
                 bucket.top_ks,
+                bucket.top_ps,
+                bucket.min_ps,
                 self._accept_threshold_single,
                 self._accept_threshold_acc,
             )
             site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
         elif bucket.need_filters:
             num_correct_drafts, bonus_tokens = accept_drafts_sampled_filtered(
-                self._filtered_target_probs(target_logits, bucket),
                 target_logits,
                 draft_result.draft_tokens,
                 draft_result.num_verify_drafts,
                 draft_result.draft_logits.float(),
                 bucket.temperatures,
                 bucket.top_ks,
+                bucket.top_ps,
+                bucket.min_ps,
             )
             site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
         else:
@@ -425,26 +426,6 @@ class TpuSpecWorker(BaseSpecWorker):
             self.device, non_blocking=True
         )
         return num_correct_drafts, bonus_tokens, self._simulated_drafts[padded_bs]
-
-    def _filtered_target_probs(
-        self, target_logits: torch.Tensor, bucket: BucketState
-    ) -> torch.Tensor:
-        """Target p [pbs * (N + 1), V]: temperature, then the target sampler's filter.
-
-        Like TpuSampler, every cutoff is taken on the unfiltered probabilities and
-        the survivors are normalized once.
-        """
-        assert bucket.temperatures is not None and bucket.top_ks is not None
-        assert bucket.top_ps is not None and bucket.min_ps is not None
-        probs, top_ks_rows, top_ps_rows, min_ps_rows = target_sampling_probs(
-            target_logits,
-            bucket.temperatures,
-            bucket.top_ks,
-            bucket.top_ps,
-            bucket.min_ps,
-            self.num_verify_rows,
-        )
-        return _joint_filter_renorm(probs, top_ks_rows, top_ps_rows, min_ps_rows)
 
     def step(
         self,
@@ -715,34 +696,20 @@ class TpuSpecWorker(BaseSpecWorker):
                     :bs
                 ].cpu()
 
-    def _warmup_filtered_target(self) -> None:
-        """Sampled-verify target probs and their joint filter per batch bucket, chained as served."""
-        vocab_size = self.target_worker.model_runner.model_config.vocab_size
-        rows = self.num_verify_rows
-        with torch.no_grad():
-            for padded_bs in self._b_bucketer().buckets:
-                # Must match the serving call: float32 logits and params, int32 top-k.
-                probs = torch.zeros(
-                    (padded_bs * rows, vocab_size),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                # Serving uploads each param separately; Dynamo guards on aliasing.
-                temperatures, top_ps, min_ps = (
-                    torch.ones((padded_bs,), dtype=torch.float32, device=self.device)
-                    for _ in range(3)
-                )
-                top_ks = torch.ones((padded_bs,), dtype=torch.int32, device=self.device)
-                # Feed the op's own outputs to the filter, as serving does: under
-                # Dynamo they carry the compiled graph's layout, which the eager
-                # renorm after the filter compiles against.
-                _joint_filter_renorm(
-                    *target_sampling_probs(
-                        probs, temperatures, top_ks, top_ps, min_ps, rows
-                    )
-                )
-            # Run the eager filters without copying [pbs * (N + 1), V] rows back.
-            torch.accelerator.synchronize()
+    def _sampling_param_warmup_args(
+        self, padded_bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """[pbs] temperatures, top_ks, top_ps, min_ps typed as _bucket_state uploads them.
+
+        Distinct tensors: serving uploads each param separately, and Dynamo
+        guards on aliased inputs.
+        """
+        temperatures, top_ps, min_ps = (
+            torch.ones((padded_bs,), dtype=torch.float32, device=self.device)
+            for _ in range(3)
+        )
+        top_ks = torch.ones((padded_bs,), dtype=torch.int32, device=self.device)
+        return temperatures, top_ks, top_ps, min_ps
 
     def _warmup_relay_and_results(self) -> None:
         """FutureMap relay and result D2H run per live bs outside any compiled op."""
@@ -1106,23 +1073,3 @@ def _live_rows(tensor: torch.Tensor, bs: int) -> torch.Tensor:
     # The result-copy thread reads these after the next step is queued; a [:bs]
     # view would then need its own program behind that step, so copy it here.
     return tensor if tensor.shape[0] == bs else tensor[:bs].clone()
-
-
-def _joint_filter_renorm(
-    probs: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
-    min_ps: torch.Tensor,
-) -> torch.Tensor:
-    # Every flag on: disabled rows carry no-op values (TOP_K_ALL, 1.0, 0.0), so
-    # this is one program per shape instead of one per flag combination.
-    kept = tpu_filter_probs(
-        probs,
-        top_ks,
-        top_ps,
-        min_ps,
-        need_top_k=True,
-        need_top_p=True,
-        need_min_p=True,
-    )
-    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
