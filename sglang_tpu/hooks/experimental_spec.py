@@ -28,10 +28,10 @@ from sglang_tpu.experimental import (
     get_host_batch_padder,
     is_experimental_chain,
     is_experimental_spec,
+    plugin_block_draft_sampling,
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
-from sglang_tpu.spec_execution import resolve_spec_execution
 
 
 def _target_pp_size() -> int:
@@ -319,17 +319,9 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
     return result
 
 
-def _uses_plugin_block_worker() -> bool:
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-    return resolve_spec_execution(
-        SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm),
-        pp_size=_target_pp_size(),
-    ).block_worker
-
-
 def sample_draft_tokens(original, model, hidden_states, input_ids):
-    if not _uses_plugin_block_worker():
+    # Traced inside the draft graph: read the plugin worker's construction-time choice.
+    if not plugin_block_draft_sampling():
         return original(model, hidden_states, input_ids)
     from sglang_tpu.experimental.models.dspark import sample_draft_tokens as sample
 
@@ -337,7 +329,7 @@ def sample_draft_tokens(original, model, hidden_states, input_ids):
 
 
 def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
-    if not _uses_plugin_block_worker():
+    if not plugin_block_draft_sampling():
         return original(model, hidden_states, input_ids)
     from sglang_tpu.experimental.models.dflash2 import sample_draft_tokens as sample
 
@@ -452,6 +444,9 @@ def hook_specs():
             HookType.AROUND,
         ),
     ]
+    # Hooks install before arguments are resolved, so the route is unknown here.
+    # Argument resolution turns the flag off for launches the plugin worker cannot
+    # serve, which scheduler processes inherit before they install these.
     if experimental_spec_enabled():
         # Each adapter still checks the batch route: PP-prefill uses compatibility metadata.
         hooks += [

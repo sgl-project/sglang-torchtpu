@@ -18,6 +18,21 @@ PdCarrySeeder = Callable[[torch.Tensor, torch.Tensor], None]
 
 _host_batch_padder: Callable[[int], int] | None = None
 _pd_carry_seeder: PdCarrySeeder | None = None
+_plugin_block_draft_sampling = False
+
+
+def use_plugin_block_draft_sampling() -> None:
+    """Route the DFlash-family draft graph's sampling to the plugin sampler.
+
+    TpuBlockSpecWorker calls this before it builds its draft model, so every
+    trace of that graph reads a decision already made rather than resolving one.
+    """
+    global _plugin_block_draft_sampling
+    _plugin_block_draft_sampling = True
+
+
+def plugin_block_draft_sampling() -> bool:
+    return _plugin_block_draft_sampling
 
 
 def register_host_batch_padder(padder: Callable[[int], int]) -> None:

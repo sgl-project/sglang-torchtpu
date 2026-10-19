@@ -53,7 +53,6 @@ from sglang_tpu.experimental.speculative.spec_ops import (
 )
 from sglang_tpu.experimental.speculative.spec_types import SpecState
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows
-from sglang_tpu.future_map import TpuFutureMap
 from sglang_tpu.hooks.experimental_spec import (
     keep_host_padded_extend_outputs,
 )
@@ -124,10 +123,7 @@ class TestExperimentalEagle3(CustomTestCase):
         from sglang_tpu.graph_runner.tpu_graph_runner import (
             _resolve_spec_compile_policy_mixin,
         )
-        from sglang_tpu.hooks.experimental_spec import (
-            _uses_plugin_block_worker,
-            initialize_host_batch,
-        )
+        from sglang_tpu.hooks.experimental_spec import initialize_host_batch
         from sglang_tpu.platform import TpuOOTPlatform
 
         with (
@@ -169,9 +165,6 @@ class TestExperimentalEagle3(CustomTestCase):
                                     ),
                                     policy,
                                 )
-                                self.assertEqual(
-                                    _uses_plugin_block_worker(), algo.is_dflash_family()
-                                )
                     with get_context().override_server_args(
                         pp_size=2, speculative_algorithm="EAGLE3"
                     ):
@@ -192,7 +185,6 @@ class TestExperimentalEagle3(CustomTestCase):
                         self.assertNotIn(
                             "host_pad_bs", vars(initialize_host_batch(batch))
                         )
-                        self.assertFalse(_uses_plugin_block_worker())
                         from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
                             DSparkWorkerV2,
                         )
@@ -285,14 +277,8 @@ class TestExperimentalEagle3(CustomTestCase):
         from sglang_tpu.compilation.decoder_compile_policy import (
             DecoderTpuCompilePolicy,
         )
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
-            TpuBlockSpecWorker,
-        )
         from sglang_tpu.graph_runner.tpu_graph_runner import _augment_spec_policy
-        from sglang_tpu.hooks.experimental_spec import (
-            _uses_plugin_block_worker,
-            initialize_host_batch,
-        )
+        from sglang_tpu.hooks.experimental_spec import initialize_host_batch
         from sglang_tpu.platform import TpuOOTPlatform
 
         # No worker is built yet; each case registers its selected worker's padder.
@@ -384,34 +370,31 @@ class TestExperimentalEagle3(CustomTestCase):
                                                     ),
                                                     selected,
                                                 )
-                                            self.assertEqual(
-                                                _uses_plugin_block_worker(),
-                                                selected
-                                                and worker is TpuBlockSpecWorker,
-                                            )
 
-    def test_block_selection_is_traceable_with_scoped_parallel_groups(self):
-        from sglang_tpu.hooks.experimental_spec import _uses_plugin_block_worker
+    def test_block_draft_sampling_is_decided_before_tracing(self):
+        from sglang_tpu import experimental
+        from sglang_tpu.hooks.experimental_spec import sample_draft_tokens
 
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
-            for pp in (1, 2):
-                with (
-                    self.subTest(target_pp=pp),
-                    get_context().override_server_args(
-                        pp_size=pp, speculative_algorithm="DSPARK"
-                    ),
-                    get_context().parallel.override(pp_size=3 - pp),
+        for chosen in (False, True):
+            with (
+                self.subTest(plugin=chosen),
+                patch.object(experimental, "_plugin_block_draft_sampling", chosen),
+            ):
+
+                def forward(value):
+                    return value + int(experimental.plugin_block_draft_sampling())
+
+                actual = torch.compile(forward, fullgraph=True, backend="eager")(
+                    torch.tensor([2])
+                )
+                torch.testing.assert_close(actual, torch.tensor([3 if chosen else 2]))
+                shared, plugin = object(), object()
+                with patch(
+                    "sglang_tpu.experimental.models.dspark.sample_draft_tokens",
+                    return_value=plugin,
                 ):
-
-                    def forward(value):
-                        return value + int(_uses_plugin_block_worker())
-
-                    actual = torch.compile(forward, fullgraph=True, backend="eager")(
-                        torch.tensor([2])
-                    )
-                    torch.testing.assert_close(
-                        actual, torch.tensor([3 if pp == 1 else 2])
-                    )
+                    routed = sample_draft_tokens(lambda *args: shared, None, None, None)
+                self.assertIs(routed, plugin if chosen else shared)
 
     def test_selection_discovery_does_not_import_workers_or_torch_tpu(self):
         import subprocess
@@ -427,18 +410,38 @@ assert not any(name.startswith('sglang_tpu.graph_runner') for name in sys.module
 """
         subprocess.run([sys.executable, "-c", code], check=True)
 
-    def test_block_model_hook_keeps_target_route_inside_draft_pp_scope(self):
-        from sglang.srt.runtime_context import get_parallel
-        from sglang_tpu.hooks.experimental_spec import _uses_plugin_block_worker
+    def test_block_worker_chooses_plugin_sampling_before_building_its_draft(self):
+        """The draft model may trace its graph while it is built, so the choice
+        has to exist before then; compatibility workers never make it."""
+        from sglang_tpu import experimental
+        from sglang_tpu.experimental.speculative import block_spec_worker
 
+        seen = []
+
+        class StopConstruction(Exception):
+            pass
+
+        class FakeDraftWorker:
+            def __init__(self, target_runner):
+                seen.append(experimental.plugin_block_draft_sampling())
+                raise StopConstruction
+
+        target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.DSPARK)
+        )
         with (
-            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
-            get_context().override_server_args(
-                pp_size=2, speculative_algorithm="DSPARK"
+            patch.object(experimental, "_plugin_block_draft_sampling", False),
+            patch.object(
+                block_spec_worker, "is_dp_attention_enabled", return_value=False
             ),
-            get_parallel().override(pp_size=1),
+            patch.dict(
+                block_spec_worker._DRAFT_WORKER_CLS,
+                {SpeculativeAlgorithm.DSPARK: FakeDraftWorker},
+            ),
         ):
-            self.assertFalse(_uses_plugin_block_worker())
+            with self.assertRaises(StopConstruction):
+                block_spec_worker.TpuBlockSpecWorker(None, 0, 0, target_worker)
+            self.assertEqual(seen, [True])
 
     def test_rollback_eagle_keeps_plugin_drafter_and_shared_defaults_stay_generic(self):
         from sglang.srt.platforms.interface import SRTPlatform

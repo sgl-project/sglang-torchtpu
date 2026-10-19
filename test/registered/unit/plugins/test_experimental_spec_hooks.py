@@ -355,6 +355,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
             DSparkDraftModel.sample_draft_tokens_tpu,
             DFlashDraftModel.sample_draft_tokens_tpu,
         )
+        enter_scope(
+            self, patch("sglang_tpu.experimental._plugin_block_draft_sampling", True)
+        )
         for anchor in (True, False):
             width = 2 if anchor else 3
             hidden = torch.arange(2 * width * 4, dtype=torch.float32).view(-1, 4)
@@ -388,7 +391,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
             # Each step reads the token drafted before it and the head's carried state.
             torch.testing.assert_close(seen["prev"][1], torch.tensor([3, 3]))
             self.assertEqual(seen["states"], [0, 1])
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        # A compatibility worker never chose plugin sampling for its draft model.
+        with patch("sglang_tpu.experimental._plugin_block_draft_sampling", False):
             sentinel = object()
             self.assertIs(
                 sample_draft_tokens(lambda *args: sentinel, None, None, None), sentinel
