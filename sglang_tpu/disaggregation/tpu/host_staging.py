@@ -25,7 +25,7 @@ dropped** (GC reclaims it), so pinned RAM is released, not leaked. Pinning is
 best-effort: if ``mlock`` is unavailable (no ``CAP_IPC_LOCK`` / no libc),
 buffers are still aligned and reused, just not locked.
 
-(Contrast: torchtpu-vllm's ``HostKVShmPool`` instead pre-allocates a fixed set
+(Contrast: vllm-torchtpu's ``HostKVShmPool`` instead pre-allocates a fixed set
 of *max-size* slots and uses a prefix per transfer — no per-size buckets. We
 keep per-layer bucketed buffers here and bound them by the byte budget.)
 """

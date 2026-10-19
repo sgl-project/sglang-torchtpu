@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Flash Attention TPU kernel.
 
-Vendored verbatim from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/flash_attention/kernel.py.
+Vendored verbatim from https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/kernels/flash_attention/kernel.py.
 Copied rather than imported because the upstream package imports ``vllm`` at
 package init, which is not a dependency of this SGLang fork. This file is pure
 JAX/Pallas with no vllm coupling — re-sync from upstream if the kernel changes.

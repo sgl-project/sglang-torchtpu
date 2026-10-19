@@ -3,9 +3,8 @@
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/qwen3_5_397b/perf.py
 
-Ported from the measured recipe on branch haolin/qwen35-recipe-dp-attention
-(benchmark/tpu/recipe/qwen3_5_397b/server.sh), which published this model's
-numbers at this exact 8k1k shape. Every value below that departs from the base
+Ported from a measured serving recipe for this model at this exact 8k1k
+shape. Every value below that departs from the base
 config came from a measurement there; the comments say which.
 
 A hybrid model: 45 of 60 layers are GDN linear attention with a fixed-size

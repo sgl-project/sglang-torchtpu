@@ -232,7 +232,7 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
     def test_deepseek_v4_pro_61_layers_with_trailing_mtp_compress_ratios(self):
         """Verify DeepSeek-V4-Pro's 61-layer config (`[128, 128, 4, ..., 4, 0, 0, 0]`).
 
-        In DeepSeek-V4-Pro (`gs://tpu-commons-ci/deepseek-v4-pro-0813`):
+        In DeepSeek-V4-Pro:
         - `num_hidden_layers = 61`, while `compress_ratios` has 64 entries
           (`[128] + [128, 4] * 30 + [0, 0, 0]`, where the 3 trailing `0`s are
           for MTP / DSpark draft layers 61..63).

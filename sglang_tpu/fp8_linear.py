@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/layers/common/quantization.py
+# Adapted from https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/layers/common/quantization.py
 # Copyright 2025 Google LLC
 """TPU FP8 dense linear helpers."""
 
@@ -415,7 +415,7 @@ def tpu_w8a8_block_fp8_linear(
     out_shape = (*input.shape[:-1], n)
     # TODO(torch_tpu#1831): try torch._scaled_mm_v2 once torch_tpu registers a
     # native block-scaled matmul op. Until then, keep true blockwise FP8 behind
-    # one Pallas custom op, matching torchtpu-vllm's serving path.
+    # one Pallas custom op, matching vllm-torchtpu's serving path.
     from sglang_tpu.quantized_matmul import (
         blockwise_quantized_matmul,
     )

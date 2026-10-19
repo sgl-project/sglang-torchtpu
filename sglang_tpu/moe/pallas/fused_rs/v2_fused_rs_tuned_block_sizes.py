@@ -619,7 +619,7 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
 FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM = {
     "TPU7x": {
         "lhs_bfloat16_rhs_float8_e4m3fn": {
-            # H4096-I4096 per-tensor fp8, EP=16 -> g=16 (multi-host, prod).
+            # H4096-I4096 per-tensor fp8, EP=16 -> g=16 (multi-host).
             (
                 "k-4096_n-8192_g-16_lhs_quant_rhs_bs-4096"
                 "+k-4096_n-4096_g-16_lhs_quant_rhs_bs-4096"

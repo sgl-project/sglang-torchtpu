@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/layers/vllm/quantization/fp8.py
+# Adapted from https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/layers/vllm/quantization/fp8.py
 # Copyright 2025 Google LLC
 """TPU FP8 MoE helpers.
 
@@ -579,7 +579,7 @@ def apply_tpu_fp8_moe(
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu
     # registers those ops. Until then, keep MoE on the same backend-dispatched
-    # fused grouped-GEMM model used by upstream CUDA paths and torchtpu-vllm.
+    # fused grouped-GEMM model used by upstream CUDA paths and vllm-torchtpu.
     if swiglu_limit is not None:
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")

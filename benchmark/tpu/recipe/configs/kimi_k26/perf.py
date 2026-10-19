@@ -24,8 +24,8 @@ CONTEXT_LENGTH = INPUT_TOKENS + OUTPUT_TOKENS + 64
 CONFIG = deepcopy(_FP8_BASE_CONFIG)
 CONFIG["server_args"].update(
     {
-        # No public HF id for this checkpoint, so the mount is also the served
-        # name; the dashboard joins the series on the test's `id` regardless.
+        # The mount path is also the served name. The dashboard joins the
+        # series on the test's `id` regardless.
         "model_path": "/weights/Kimi-K2.6",
         "tp_size": 8,
         # ep=tp. The tp16 recipe's warning against ep8 is about
