@@ -10,6 +10,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     late_layer_tail_layout,
 )
+from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -466,6 +467,32 @@ class TestFoldMlpSync(CustomTestCase):
         )
         # One sampled row per replayed request, as the scheduler would count it.
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [2])
+
+
+class _PastEncoderReplayChecks(Exception):
+    """Validation read a field the encoder replay checks do not need."""
+
+
+class _View(SimpleNamespace):
+    def __getattr__(self, name):
+        raise _PastEncoderReplayChecks(name)
+
+
+class TestEncoderReplayChunkFloor(CustomTestCase):
+    def _validate(self, chunked_prefill_size):
+        view = _View(
+            enable_encoder_swa_bounded_replay=True,
+            max_running_requests=8,
+            chunked_prefill_size=chunked_prefill_size,
+            page_size=256,
+        )
+        with patch.object(deepseek_v4_hook, "resolving_view", return_value=view):
+            deepseek_v4_hook.validate_deepseek_v41_encoder_replay_budget(object())
+
+    def test_chunk_holds_the_replay_rows_and_a_page(self):
+        self._validate(384)
+        with self.assertRaisesRegex(ValueError, "at least 384 chunked prefill"):
+            self._validate(383)
 
 
 if __name__ == "__main__":
