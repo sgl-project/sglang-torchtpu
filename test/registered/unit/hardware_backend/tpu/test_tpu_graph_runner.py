@@ -910,13 +910,8 @@ class TestDraftPrecompileOrdering(CustomTestCase):
                 refresh_fused_draft_dp_metadata=lambda _batch: events.append("dp"),
             ),
         )
-        # The fused loop reads only step 0's metadata.
         worker.draft_attn_backend = SimpleNamespace(
-            attn_backends=[
-                SimpleNamespace(
-                    init_forward_metadata=lambda _batch: events.append("metadata")
-                )
-            ]
+            init_forward_metadata=lambda _batch: events.append("metadata")
         )
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False),

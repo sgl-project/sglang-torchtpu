@@ -105,12 +105,9 @@ class EagleSeed(NamedTuple):
 
 
 @compiled_op()
-def split_draft_chain(
-    verify_tokens: torch.Tensor, width: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Flat chain rows [r, d_1, ..., d_N] of ``width`` tokens each -> drafts
-    [pbs, N] and the flat verify rows."""
-    return verify_tokens.view(-1, width)[:, 1:].contiguous(), verify_tokens.reshape(-1)
+def split_draft_chain(chain: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """[pbs, N + 1] chain [r, d_1, ..., d_N] -> drafts [pbs, N] and flat verify rows."""
+    return chain[:, 1:].contiguous(), chain.reshape(-1)
 
 
 @compiled_op()
@@ -239,8 +236,8 @@ class TpuEagle3Worker(TpuSpecWorker):
             )
             with torch.no_grad():
                 tree = self._eagle._fused_draft_forward(forward_batch)
-        # The fused draft returns the chain [r, d_1, ..., d_N] last, flattened.
-        return split_draft_chain(tree[-1], self.num_verify_rows)
+        # build_topk1_verify_chain_torch returns the chain [r, d_1, ..., d_N] last.
+        return split_draft_chain(tree[-1])
 
     def commit(
         self,
@@ -591,13 +588,7 @@ class TpuEagle3Worker(TpuSpecWorker):
                 # prepare_for_draft: the draft-step slots and positions.
                 cache_locs[:, : self.num_drafts].reshape(-1).cpu()
                 seq_lens.repeat_interleave(1, dim=0).cpu()
-                warmup_compiled_op(
-                    split_draft_chain,
-                    torch.zeros(
-                        (padded_bs * width,), dtype=torch.int64, device=self.device
-                    ),
-                    width,
-                )
+                warmup_compiled_op(split_draft_chain, cache_locs)
                 if self.target_worker.model_runner.model_config.model_is_mrope:
                     # compute_spec_mrope_positions on the verify rows: text-only
                     # batches, then batches with per-request deltas.

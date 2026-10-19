@@ -1,7 +1,7 @@
 import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -729,8 +729,6 @@ class EagleDraftInput(SpecInput):
     accept_lens_device: Optional[torch.Tensor] = None
     device_accept_candidate_locs: Optional[torch.Tensor] = None
     device_accept_selected_cache_locs: Optional[torch.Tensor] = None
-    # Dense layouts of the selected window (sglang_tpu DeviceAcceptLayouts).
-    device_accept_layouts: Optional[Any] = None
 
     # TPU RPA KV lengths for the current fused draft step.
     rpa_draft_kv_lens: Optional[torch.Tensor] = None
@@ -874,7 +872,6 @@ class EagleDraftInput(SpecInput):
                 self.device_accept_selected_cache_locs = (
                     spec_info.device_accept_selected_cache_locs
                 )
-                self.device_accept_layouts = spec_info.device_accept_layouts
             return
         if len(spec_info.topk_index) == 0:
             return

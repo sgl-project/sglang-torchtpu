@@ -192,28 +192,6 @@ class TestDeviceAcceptCacheSelection(CustomTestCase):
                 )
                 self.assertTrue(torch.equal(actual, expected))
 
-    def test_window_layouts_match_the_selection(self):
-        # The serving path selects through select_device_accept_windows_tpu and
-        # reads its dense layouts; they must agree with the plain selection.
-        from sglang_tpu.eagle_utils_tpu import select_device_accept_windows_tpu
-
-        for width in (2, 4):
-            with self.subTest(width=width):
-                candidates = torch.arange(width * (2 * width - 1)).view(width, -1)
-                accept = torch.arange(1, width + 1, dtype=torch.int32)
-                expected = _select_device_accept_cache_locs(
-                    candidates, accept, width=width
-                )
-                selected, draft, per_step, verify = select_device_accept_windows_tpu(
-                    candidates, accept, width - 1
-                )
-                self.assertTrue(torch.equal(selected, expected))
-                self.assertTrue(
-                    torch.equal(draft, expected[:, : width - 1].reshape(-1))
-                )
-                self.assertTrue(torch.equal(per_step, expected[:, : width - 1].t()))
-                self.assertTrue(torch.equal(verify, expected.reshape(-1)))
-
 
 if __name__ == "__main__":
     unittest.main()
