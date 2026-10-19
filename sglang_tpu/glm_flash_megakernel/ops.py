@@ -229,7 +229,8 @@ class GlmFlashMegakernel:
         slot = lin._slot_indices(forward_batch.req_pool_indices)[0][:1].to(device)
         row = slot
         if self.Q > 1:
-            row = slot * self.Q + lin._read_offsets.to(device).index_select(0, slot)
+            offsets = req_pool.mamba_pool.checkpoint_read_offsets
+            row = slot * self.Q + offsets.to(device).index_select(0, slot)
         recur, conv = self.kda_caches
         k1 = spec.linear_conv_kernel_dim - 1
         for k, L in enumerate(spec.kda_layers):

@@ -67,17 +67,27 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
     model._tpu_glm_flash_mk = mk
     compiled = model.forward
 
-    # Skip only the full-attention metadata; the mamba-state commit reads the linear one.
-    full = getattr(runner.model_runner.attn_backend, "full_attn_backend", None)
-    if full is not None:
-        init_full = full.init_forward_metadata
+    # While the kernel holds the request, serving's attention metadata and KDA
+    # checkpoint offsets are never read.
+    backend = runner.model_runner.attn_backend
+    init_metadata = backend.init_forward_metadata
 
-        def init_forward_metadata(forward_batch):
-            if mk.handles(forward_batch, forward_batch.input_ids):
-                return None
-            return init_full(forward_batch)
+    def init_forward_metadata(forward_batch):
+        if mk.handles(forward_batch, forward_batch.input_ids):
+            return None
+        return init_metadata(forward_batch)
 
-        full.init_forward_metadata = init_forward_metadata
+    backend.init_forward_metadata = init_forward_metadata
+    commit = getattr(backend, "update_mamba_state_after_mtp_verify", None)
+    if commit is not None:
+
+        def update_mamba_state_after_mtp_verify(*args, **kwargs):
+            if not mk.active:
+                commit(*args, **kwargs)
+
+        backend.update_mamba_state_after_mtp_verify = (
+            update_mamba_state_after_mtp_verify
+        )
 
     def forward(input_ids, positions, forward_batch, *args, **kwargs):
         if mk.handles(forward_batch, input_ids):

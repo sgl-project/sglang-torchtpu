@@ -18,6 +18,7 @@ from sglang_tpu.hooks.attn_residual import (
     register_attn_residual_ops,
 )
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
+from sglang_tpu.hooks.cpu_pinning import pin_scheduler_main_thread
 from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
@@ -59,6 +60,11 @@ logger = logging.getLogger(__name__)
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.managers.scheduler.Scheduler.run_event_loop",
+        pin_scheduler_main_thread,
+        HookType.BEFORE,
+    ),
     (
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
         initialize_dense_moe_config,

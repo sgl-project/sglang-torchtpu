@@ -78,6 +78,9 @@ class TpuEnvs:
     # request length.
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(16384)
+    # Pin each scheduler's main thread to one CPU of its rank's set and keep its
+    # other threads off that physical core (hooks/cpu_pinning.py).
+    SGLANG_TPU_PIN_SCHEDULER_MAIN_THREAD = EnvBool(False)
 
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
