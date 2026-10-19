@@ -693,7 +693,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # max_b is the reconciled compile-batch ceiling, already grown to cover
         # scheduler concurrency in ServerArgs.__post_init__ via
         # reconcile_tpu_batch_limits, so the grid covers every decode batch the
-        # scheduler can form (Task #40).
+        # scheduler can form.
         max_b = get_exec().graph.torch_compile_max_bs
         t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer

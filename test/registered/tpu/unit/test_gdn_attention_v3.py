@@ -30,7 +30,7 @@ Plus two state-plumbing invariants:
 The kernel is pure JAX/Pallas and requires a TPU device; tests are skipped
 otherwise, except the race test, which runs in CPU interpret mode. They do **not** depend on torch_tpu or the SGLang server runtime.
 
-Adapted from torchtpu-vllm ``tests/kernels/test_gdn_attention_v3.py``.
+Adapted from vllm-torchtpu ``tests/kernels/test_gdn_attention_v3.py``.
 
 Usage:
     python test/registered/tpu/unit/test_gdn_attention_v3.py

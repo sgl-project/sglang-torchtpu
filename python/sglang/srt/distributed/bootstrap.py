@@ -227,7 +227,7 @@ def _resolve_backend(*, device: str, tp_size: int, pp_size: int = 1) -> str:
     backend = get_default_distributed_backend(device)
     # tpu_dist bootstrap requires exactly one TPU device per process.
     # On multi-chip hosts with world_size==1, PJRT sees multiple chips
-    # and raises. Match torchtpu-vllm: use gloo for a single-process TPU
+    # and raises. Match vllm-torchtpu: use gloo for a single-process TPU
     # world. A pipeline-parallel world (tp_size * pp_size > 1) is a real
     # slice with one device per process and keeps tpu_dist.
     if device == "tpu" and tp_size * pp_size == 1:

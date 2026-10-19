@@ -1045,10 +1045,8 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     why the accessors of the flat MLA pool, which address tokens by index, are
     not supported here.
 
-    TODO(sglang-torchtpu#1072): the core pool sizer counts 132 bytes per index
-    key, not this pool's 256, so a pool sized from free memory comes out too
-    large (about 2.5% for GLM-5.2). Pass --max-total-tokens until the sizer can
-    ask the pool for its bytes per token.
+    The core pool sizer counts the GPU DSA layout; hooks/dsa_kv_pool.py hands
+    it ``bytes_per_token`` instead.
     """
 
     NOPE_BYTES = 512
@@ -1125,6 +1123,17 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
         self._create_buffers()
         self._finalize_allocation_log(size)
+
+    @classmethod
+    def bytes_per_token(
+        cls, *, index_head_dim: int, index_key_layers: list[bool], index_kpool: int
+    ) -> int:
+        """Bytes one token takes across all layers' buffers, as allocated."""
+        index_bytes = cls.index_key_record_bytes(index_head_dim)
+        if index_kpool > 1:
+            index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
+        layer_bytes = cls.NOPE_BYTES + cls.LANE_BYTES
+        return len(index_key_layers) * layer_bytes + sum(index_key_layers) * index_bytes
 
     @classmethod
     def index_key_record_bytes(cls, index_head_dim: int) -> int:

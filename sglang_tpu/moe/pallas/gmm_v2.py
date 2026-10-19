@@ -1,5 +1,5 @@
-# Uses the latest torchtpu-vllm gmm_v2 kernel
-#   (https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
+# Uses the latest vllm-torchtpu gmm_v2 kernel
+#   (https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
 # This cut adds in-kernel fused activation (``fuse_act``: silu / gelu /
 # swigluoai / situ) and fused gate+up weight support over the prior sglang-jax
 # vendor.

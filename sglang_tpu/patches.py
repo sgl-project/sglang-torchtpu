@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU compatibility patches for SGLang.
 
-Ported from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/platforms/tpu_platform.py.
+Ported from https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/platforms/tpu_platform.py.
 Must run in every process (including spawned workers) because
 module-level state is re-initialized on import in spawned processes.
 All patches are idempotent.

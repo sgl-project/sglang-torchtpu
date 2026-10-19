@@ -23,6 +23,7 @@ from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
 )
+from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
@@ -191,6 +192,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._tpu_mha_pool_class",
         draft_mha_pool_class,
         HookType.AROUND,
+    ),
+    (
+        "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
+        size_tpu_dsa_kv_pool,
+        HookType.AFTER,
     ),
     (
         "sglang.srt.speculative.dflash_utils.dflash_draft_cell_size_per_token",

@@ -963,7 +963,7 @@ def kernel_main_fused_rs(
     # (0.5 B/param); fp8 (1 B) / bf16 (2 B) weight buffers are 2-4x larger and, on
     # tight configs (e.g. EP8 E_32 M_256), leave less than the bucket transient of
     # VMEM free -> scoped-VMEM OOM. All measured bucketing gains are on fp4 (the
-    # prod decode dtype) anyway, so only bucket when the weights are fp4.
+    # usual decode dtype) anyway, so only bucket when the weights are fp4.
     _w_qdt = cfgs1.rhs_cfgs.quant_dtype
     _weight_is_fp4 = _w_qdt is not None and jax.dtypes.itemsize_bits(_w_qdt) <= 4
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4

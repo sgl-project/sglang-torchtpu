@@ -50,7 +50,6 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
-    accept_drafts_sampled_filtered,
     build_draft_block_inputs,
     sample_tokens,
 )
@@ -372,16 +371,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 )
                 draft_logits.float().cpu()
                 torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
-                # Sampled verify when requests restrict top-k/top-p/min-p.
-                verify_rows = (padded_bs * self.num_verify_rows, draft_logits.shape[-1])
-                warmup_compiled_op(
-                    accept_drafts_sampled_filtered,
-                    torch.zeros(verify_rows, dtype=torch.float32, device=self.device),
-                    draft_tokens,
-                    self._all_drafts[padded_bs],
-                    draft_logits.float(),
-                    *self._sampling_param_warmup_args(padded_bs),
-                )
+                self._warmup_sampled_accept(padded_bs, draft_tokens, draft_logits)
 
     def _warmup_extend_draft_inputs(self) -> None:
         """extend's draft positions / cache_loc uploads at every token bucket."""

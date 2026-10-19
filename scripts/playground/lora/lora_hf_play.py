@@ -4,7 +4,7 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 
 MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
 # ADAPTER = "winddude/wizardLM-LlaMA-LoRA-7B"
-ADAPTER = "/home/ying/test_lora"
+ADAPTER = "/path/to/lora-adapter"
 HF_TOKEN = "..."
 
 
