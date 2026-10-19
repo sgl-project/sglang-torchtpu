@@ -26,6 +26,7 @@ from safetensors.torch import load_file
 from transformers.utils import cached_file
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
@@ -34,7 +35,10 @@ from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.compilation.support_torch_compile import support_torch_compile
 
 # Configs
-from sglang.srt.configs.model_config import load_decision_config
+from sglang.srt.configs.model_config import (
+    load_decision_config,
+    load_joint_head_config,
+)
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -43,6 +47,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
+from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -55,6 +60,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.joint_schema_head import JointSchemaHead, JointSchemaPooler
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -66,6 +72,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
 # Layers - Others
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    NORM_QUANT_READOUT,
     Fp8Input,
     NormQuantReadout,
 )
@@ -74,9 +81,12 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 # Layers - Linear
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -92,7 +102,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -127,10 +137,12 @@ from sglang.srt.models.utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_lora,
     get_model,
     get_parallel,
     get_stream,
+    linear_attn_parallel_group,
 )
 
 # Utils
@@ -166,6 +178,11 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
+
+    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import (
+        smallm_fp8_gemm_config,
+        smallm_fp8_gemm_enabled,
+    )
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
@@ -246,6 +263,27 @@ def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
     return None
 
 
+def _qwen3_5_is_moe(config: Qwen3_5TextConfig) -> bool:
+    """Whether the model's layers run sparse MoE blocks rather than dense MLPs:
+    every layer of either kind alike."""
+    return config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES
+
+
+def _qwen3_5_stage_facts(
+    config: Qwen3_5TextConfig, layer_id: int, *, attn_read=NORM_QUANT_READOUT
+):
+    """The attention and FFN stages a Qwen3.5 layer of either kind declares:
+    the model's shared declaration function (see make_layers), which the
+    layer declares itself with. ``attn_read`` is the layer's own attention
+    read, which declares what the plain one does and also hands on the
+    quantized input its projection takes."""
+    sparse = _qwen3_5_is_moe(config)
+    return (
+        declare_attn(read=attn_read),
+        declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+    )
+
+
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
@@ -283,6 +321,22 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
         getattr(quant_method, "block_quant", False)
         or getattr(quant_method, "use_mxfp8", False)
+    )
+
+
+def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
+    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair (SGLANG_ROCM_SMALLM_FP8_PROJ)."""
+    scheme = getattr(linear, "scheme", None)
+    return (
+        _use_aiter
+        and num_tokens > 0
+        and type(scheme).__name__ == "QuarkW8A8Fp8"
+        and scheme.per_token
+        and scheme.weight_qscheme == "per_channel"
+        and smallm_fp8_gemm_config(num_tokens, *linear.weight.shape[::-1]) is not None
+        and not torch.compiler.is_compiling()
+        and not get_forward().sp_active
+        and smallm_fp8_gemm_enabled()
     )
 
 
@@ -328,8 +382,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_tp_size = get_parallel().attn_tp_size
+        parallel_group = linear_attn_parallel_group()
+        self.attn_tp_rank, self.attn_tp_size = resolve_linear_parallel_group(
+            parallel_group
+        )
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -360,8 +416,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             output_size=self.conv_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group=parallel_group,
             prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -373,8 +428,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_qkvz", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group=parallel_group,
         )
 
         self.in_proj_ba = self.create_ba_proj(
@@ -382,8 +436,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             num_v_heads=self.num_v_heads,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_ba", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group=parallel_group,
         )
 
         # Override weight loaders for packed checkpoint format.
@@ -440,8 +493,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
 
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -493,8 +552,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             input_is_parallel=True,
             reduce_results=False,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
 
@@ -609,8 +667,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         value_dim: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> MergedColumnParallelLinear:
         return MergedColumnParallelLinear(
             input_size=hidden_size,
@@ -618,8 +676,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
 
     def create_ba_proj(
@@ -628,8 +685,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         num_v_heads: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> MergedColumnParallelLinear:
         # Qwen3.5 has separate in_proj_b and in_proj_a weights in the
         # checkpoint, which are loaded into the fused in_proj_ba parameter
@@ -640,8 +697,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
 
     def fix_query_key_value_ordering(
@@ -974,16 +1030,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
         use_strided_prefill_z = False
-        use_fused_decode_proj_conv = (
+        packed_verify = False
+        if forward_batch.forward_mode.is_target_verify():
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            packed_verify = getattr(backend, "supports_packed_verify", False)
+        use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
-            and forward_batch.forward_mode.is_decode()
+            and (forward_batch.forward_mode.is_decode() or packed_verify)
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
         )
         use_fused_contiguous_unpack = (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
-        if use_fused_decode_proj_conv:
+        if use_fused_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
             # it replaces these temporary B/A placeholders before recurrence.
             mixed_qkv = (projected_states_qkvz, projected_states_ba)
@@ -998,8 +1061,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            # The strided views feed only prefill GDN; DP-relabeled decode rows
+            # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+                _is_cuda
+                and forward_batch.logical_forward_mode.is_extend_without_speculative()
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1032,11 +1098,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             a=a,
             b=b,
         )
-        if use_fused_decode_proj_conv:
+        if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(
-                    "Fused GDN decode projection/Conv1D backend must return "
-                    "(core_attn_out, z)"
+                    "Fused GDN projection/Conv1D backend must return (core_attn_out, z)"
                 )
             core_attn_out, z = attn_result
         else:
@@ -1058,6 +1123,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
+        nv = self.num_v_heads // self.attn_tp_size
+        if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
+            fp8, _, _ = _layer_norm_fwd(
+                core_attn_out,
+                self.norm.weight,
+                None,
+                self.norm.eps,
+                z=z,
+                is_rms_norm=True,
+                activation=self.norm.activation,
+                quant_heads=nv,
+            )
+            return self.out_proj(fp8)[0]
+
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
@@ -1071,6 +1150,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
+
+    stage_facts = staticmethod(_qwen3_5_stage_facts)
 
     def __init__(
         self,
@@ -1092,7 +1173,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
+        if _qwen3_5_is_moe(config):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1108,8 +1189,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            is_layer_sparse = True
-            is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -1121,8 +1200,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 reduce_results=False,
             )
             _maybe_enable_silu_fp4_quant_fusion(self.mlp)
-            is_layer_sparse = False
-            is_next_layer_sparse = False
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
@@ -1137,28 +1214,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
+            attn, ffn = self.stage_facts(
+                config,
+                layer_id,
+                attn_read=NormQuantReadout(
+                    fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
+                ),
+            )
             self.attn_boundary, self.ffn_boundary = append_stages(
-                (
-                    declare_attn(
-                        read=NormQuantReadout(
-                            fp8_input=Fp8Input.TUPLE_AND_BF16
-                            if accepts_fp8_input
-                            else None
-                        )
-                    ),
-                    self.input_layernorm,
-                    {
-                        "fusions": boundary_fusions,
-                    },
-                ),
-                (
-                    declare_ffn(
-                        sparse=is_layer_sparse,
-                        next_layer_sparse=is_next_layer_sparse,
-                    ),
-                    self.post_attention_layernorm,
-                    {"fusions": boundary_fusions},
-                ),
+                (attn, self.input_layernorm, {"fusions": boundary_fusions}),
+                (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
             )
 
     def forward(
@@ -1198,6 +1263,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return ffn_exit.finish(hidden_states)
 
 
+<<<<<<< HEAD
 def _rope_cache_positions(max_position_embeddings: int) -> int:
     """Rows to build the RoPE cos/sin cache with.
 
@@ -1229,10 +1295,37 @@ def _restore_full_rope_cache(*, model: nn.Module, max_position_embeddings: int) 
     for module in model.modules():
         if isinstance(module, RotaryEmbedding):
             module._ensure_cos_sin_cache_length(max_position_embeddings - 1)
+=======
+def _refreshes_rope_cos_sin(
+    config: Qwen3_5TextConfig, layer_id: int, is_nextn: bool
+) -> bool:
+    """rotary_emb is shared by all layers, so its per-forward cos/sin is refreshed
+    once, at the first full-attention layer this PP stage owns.
+
+    layer_id must be a full-attention layer; linear-attention layers near the
+    stage start would also pass the check below. Only Qwen3_5AttentionDecoderLayer
+    calls this, and it is built only for "attention" entries of layers_block_type.
+    """
+    # Drafts keep the unsplit numbering.
+    stage_start = 0
+    if not is_nextn:
+        stage_start, _ = get_pp_indices(
+            config.num_hidden_layers,
+            get_parallel().pp_rank,
+            get_parallel().pp_size,
+        )
+    owned_by_stage = layer_id >= stage_start
+    # Full-attention layers are interval apart, so only the stage's first one
+    # lies within interval of its start.
+    first_in_stage = layer_id < stage_start + config.full_attention_interval
+    return owned_by_stage and first_in_stage
+>>>>>>> upstream/main
 
 
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
+
+    stage_facts = staticmethod(_qwen3_5_stage_facts)
 
     def __init__(
         self,
@@ -1249,11 +1342,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
+        self.refreshes_rope_cos_sin = _refreshes_rope_cos_sin(
+            config, layer_id, is_nextn
+        )
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
         # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
         dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
-        self.kv_tp_size = self.attn_tp_size // dcp_size
-        self.kv_tp_rank = self.attn_tp_rank // dcp_size
+        kv_parallel_group = ReplicatedParallelGroup("attn_tp", dcp_size)
+        self.kv_tp_rank, self.kv_tp_size = resolve_linear_parallel_group(
+            kv_parallel_group
+        )
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
@@ -1301,10 +1399,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            kv_tp_rank=self.kv_tp_rank,
-            kv_tp_size=self.kv_tp_size,
+            parallel_group="attn_tp",
+            kv_parallel_group=kv_parallel_group,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -1314,8 +1410,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -1325,6 +1420,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            # Noncausal decision checkpoints let full attention see the whole prompt.
+            attn_type=(
+                AttentionType.DECODER
+                if getattr(config, "is_causal", True)
+                else AttentionType.ENCODER_ONLY
+            ),
             prefix=f"{prefix}.attn",
             quant_config=quant_config,
         )
@@ -1340,9 +1441,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            is_layer_sparse = False
-            is_next_layer_sparse = False
-        elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
+        elif _qwen3_5_is_moe(config):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1358,8 +1457,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            is_layer_sparse = True
-            is_next_layer_sparse = True
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
@@ -1377,26 +1474,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
+            attn, ffn = self.stage_facts(
+                config,
+                layer_id,
+                attn_read=NormQuantReadout(
+                    fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                ),
+            )
             self.attn_boundary, self.ffn_boundary = append_stages(
-                (
-                    declare_attn(
-                        read=NormQuantReadout(
-                            fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
-                        )
-                    ),
-                    self.input_layernorm,
-                    {
-                        "fusions": boundary_fusions,
-                    },
-                ),
-                (
-                    declare_ffn(
-                        sparse=is_layer_sparse,
-                        next_layer_sparse=is_next_layer_sparse,
-                    ),
-                    self.post_attention_layernorm,
-                    {"fusions": boundary_fusions},
-                ),
+                (attn, self.input_layernorm, {"fusions": boundary_fusions}),
+                (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
             )
 
         self.alt_stream = alt_stream
@@ -1522,8 +1609,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+        if self.refreshes_rope_cos_sin:
             self.rotary_emb.get_cos_sin_with_position(positions)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
@@ -1587,7 +1673,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
+<<<<<<< HEAD
             if _is_npu:
+=======
+            if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
+                attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
+            elif not _is_npu:
+                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+            else:
+>>>>>>> upstream/main
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
             elif _is_tpu:
@@ -1767,6 +1861,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             config.num_hidden_layers,
             get_layer,
             prefix=f"{prefix}.layers",
+            # The layer type chosen for each index declares its stages.
+            stage_facts=lambda idx: self.decoder_layer_types[
+                config.layers_block_type[idx]
+            ].stage_facts(config, idx),
         )
 
         self.flashinfer_mnnvl_cutedsl_fusion = None
@@ -2380,6 +2478,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+        if config.architectures == ["Qwen3_5ForConditionalGeneration"]:
+            model = get_model()
+            joint_head_config = load_joint_head_config(model.model_path, model.revision)
+            if joint_head_config is not None:
+                # A Clef checkpoint, whose joint schema head scores every option
+                # of every question from the final hidden states and LM head rows.
+                self.pooler = JointSchemaPooler(
+                    JointSchemaHead(**joint_head_config), lambda: self.lm_head.weight
+                )
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
@@ -2520,7 +2628,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if bare_backbone and self.pp_group.is_last_rank:
             self._load_decision_readout()
             loaded_params.add("lm_head.weight")
+        if isinstance(self.pooler, JointSchemaPooler):
+            self._load_joint_head()
+            loaded_params.update(
+                f"pooler.head.{name}" for name, _ in self.pooler.head.named_parameters()
+            )
         return loaded_params
+
+    def _load_joint_head(self) -> None:
+        """Load joint_head.safetensors, which the checkpoint index leaves out."""
+        model = get_model()
+        state_dict = load_file(
+            cached_file(
+                model.model_path, "joint_head.safetensors", revision=model.revision
+            )
+        )
+        self.pooler.head.load_state_dict(state_dict, strict=True)
 
     def _load_decision_readout(self) -> None:
         """Place the checkpoint's decision readout in the LM head rows of its codes."""

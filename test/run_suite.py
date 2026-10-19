@@ -1,6 +1,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 from typing import Dict, List, Optional
@@ -269,10 +270,11 @@ NIGHTLY_SUITES = {
         "external-nightly-2x2x4",
     ],
     HWBackend.XPU: [
-        "nightly-xpu-1-gpu",
-        "nightly-xpu-2-gpu",
-        "nightly-xpu-4-gpu",
-        "nightly-xpu-8-gpu",
+        "nightly-xpu-kernel-main-1-gpu",
+        "nightly-xpu-kernel-main-2-gpu",
+        "nightly-xpu-kernel-main-4-gpu",
+        "nightly-xpu-kernel-main-8-gpu",
+        "nightly-xpu-kernel-wheel-1-gpu",
     ],
 }
 
@@ -551,8 +553,20 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        timeout_overrides=dict(args.timeout_override),
     )
     return rest if pinned_ok else -1
+
+
+def _parse_timeout_override(value: str) -> tuple[str, float]:
+    path, sep, seconds = value.rpartition("=")
+    try:
+        timeout = float(seconds)
+    except ValueError:
+        timeout = 0
+    if not sep or not path or not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError(f"expected PATH=SECONDS, got {value!r}")
+    return path, timeout
 
 
 def main():
@@ -594,6 +608,14 @@ def main():
         type=int,
         default=1200,
         help="The time limit for running one file in seconds (default: 1200).",
+    )
+    parser.add_argument(
+        "--timeout-override",
+        type=_parse_timeout_override,
+        action="append",
+        default=[],
+        metavar="PATH=SECONDS",
+        help="First-attempt timeout matched by path suffix; retries use --timeout-per-file. Repeatable.",
     )
     parser.add_argument(
         "--timeout-from-est-time",

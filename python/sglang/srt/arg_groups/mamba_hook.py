@@ -99,12 +99,26 @@ def handle_int8_mamba_checkpoint(server_args: Any):
         )
 
 
+def _platform_supports_mamba_cache_extra_buffer() -> bool:
+    if current_platform.is_out_of_tree():
+        return current_platform.support_mamba_cache_extra_buffer()
+    platform = get_platform()
+    return (
+        platform.is_cuda
+        or platform.is_musa
+        or platform.is_npu
+        or platform.is_hip
+        or platform.is_xpu
+    )
+
+
 def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
 
     current_platform.validate_mamba_prefix_cache(view, hf_config)
     assert supports_mamba_cache_extra_buffer(view, hf_config), (
         f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     )
+<<<<<<< HEAD
     assert (
         get_platform().is_cuda
         or get_platform().is_musa
@@ -113,6 +127,11 @@ def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_
         or get_platform().is_xpu
         or current_platform.supports_mamba_extra_buffer
     ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU/TPU."
+=======
+    assert _platform_supports_mamba_cache_extra_buffer(), (
+        "extra_buffer requires platform support for Mamba cache state snapshots."
+    )
+>>>>>>> upstream/main
     if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
         # The PD-disagg decode pool is not wired for lazy slots.
         assert view.disaggregation_mode == "null", (

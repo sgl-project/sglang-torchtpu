@@ -108,6 +108,13 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             batch.mm_input_ids_cpu = batch.prefill_input_ids_cpu
         prefill_gpu = _stage_prefill_tokens(batch)
         if batch.mix_running_indices is not None:
+            # Keep mix_running_indices (= the mixed-in running batch's req_pool_indices, freed
+            # after merge_batch) alive on the forward stream until this gather completes.
+            # CPU has no cross-stream reuse hazard (and record_stream rejects CPU tensors).
+            if batch.mix_running_indices.device.type != "cpu":
+                batch.mix_running_indices.record_stream(
+                    torch.get_device_module(batch.device).current_stream()
+                )
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
@@ -438,6 +445,26 @@ class FutureMap:
             device=self.device,
         )
 
+    def make_staged_spec_input(self, future_indices: torch.Tensor):
+        """Build the relay handle for a request leaving HiSparse staging."""
+        if not (self.spec_algo.is_eagle() or self.spec_algo.is_standalone()):
+            raise RuntimeError(
+                "HiSparse staging only supports EAGLE-family speculative inputs."
+            )
+
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        return EagleDraftInput(
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL
+                if self.spec_algo.is_standalone()
+                else CaptureHiddenMode.LAST
+            ),
+            future_indices=future_indices,
+            future_dsa_topk_indices_available=(self.dsa_topk_indices_buf is not None),
+        )
+
     def resolve_confidence_cpu(
         self, batch: ScheduleBatch
     ) -> Optional[ResolvedConfidence]:
@@ -472,7 +499,11 @@ class FutureMap:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
+<<<<<<< HEAD
         if not _is_tpu:
+=======
+        if indices.device.type != "cpu":
+>>>>>>> upstream/main
             indices.record_stream(torch.get_device_module(self.device).current_stream())
         if self.need_topk:
             # Function-local: spec_utils imports schedule_batch, which imports
@@ -497,7 +528,10 @@ class FutureMap:
             draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
-            if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
+            # A staged HiSparse request carries only future_indices.  The
+            # rejection-sampling probabilities live in this relay buffer, so
+            # checking the empty draft_input would silently drop them.
+            if self.draft_probs_buf is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
@@ -587,7 +621,9 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
-    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+    def resolve_seq_lens_cpu(
+        self, batch: ScheduleBatch, stream_ordered: bool = False
+    ) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
@@ -598,7 +634,9 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
-        if self.publish_ready is not None:
+        if self.publish_ready is not None and stream_ordered:
+            self._publish_fresh = False
+        elif self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
                 # forward publish; a stale consume means a publish went missing.
@@ -701,6 +739,7 @@ class FutureMap:
             indices,
             payload.bonus_tokens.to(self.output_tokens_buf.dtype),
         )
+<<<<<<< HEAD
         if self.need_topk:
             self._store(
                 self.topk_p_buf, indices, payload.topk_p.to(self.topk_p_buf.dtype)
@@ -715,6 +754,20 @@ class FutureMap:
                 self.hidden_states_buf,
                 indices,
                 payload.hidden_states.to(self.hidden_states_buf.dtype),
+=======
+
+        # Staging transitions refresh only the bonus token. Preserve top-k and
+        # hidden state already published by the preceding target forward.
+        if self.need_topk and payload.topk_p is not None:
+            assert payload.topk_index is not None
+            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
+            self.topk_index_buf[indices] = payload.topk_index.to(
+                self.topk_index_buf.dtype
+            )
+        if self.need_hidden_states and payload.hidden_states is not None:
+            self.hidden_states_buf[indices] = payload.hidden_states.to(
+                self.hidden_states_buf.dtype
+>>>>>>> upstream/main
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self._store(self.draft_probs_buf, indices, payload.draft_probs)

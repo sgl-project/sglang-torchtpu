@@ -50,11 +50,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    enable_tc_piecewise_cuda_graph,
-    set_tc_piecewise_forward_context,
-)
-from sglang.srt.model_executor.runner_utils import (
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.platforms import current_platform
@@ -358,13 +354,11 @@ class EagerRunner(BaseRunner):
             else "extend"
         )
         with device_timer_ctx(model_runner.device_timer, category):
-            pcg_runner = model_runner.prefill_cuda_graph_runner
-            if (
-                _is_hip
-                and pcg_runner is not None
-                and not isinstance(pcg_runner, EagerRunner)
-                and not cp_active
+            if cp_active and (
+                not get_parallel().enable_cp_tp_group_sharing
+                or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):
+<<<<<<< HEAD
                 # HIP PCG eager fallback: enter the PCG context so Dynamo guards
                 # and PCG-specific MoE/attention paths stay consistent.
                 with (
@@ -386,6 +380,10 @@ class EagerRunner(BaseRunner):
                         **kwargs,
                     )
             elif cp_active and current_platform.runs_eager_extend_cp():
+=======
+                # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
+                # Other group-sharing models keep owning the layout in forward().
+>>>>>>> upstream/main
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
@@ -404,18 +402,26 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
-        input_embeds = kwargs.get("input_embeds")
-        if input_embeds is None:
-            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+        if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
+            input_embeds, positions, model_kwargs = prepare_inputs(
+                forward_batch, **kwargs
+            )
+        else:
+            input_embeds = kwargs.get("input_embeds")
+            if input_embeds is None:
+                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+            positions = forward_batch.positions
+            model_kwargs = {}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
         with cp_shard_model_inputs(
             input_embeds,
-            forward_batch.positions,
+            positions,
             forward_batch,
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
-            model_kwargs = {"input_embeds": sharded_input_embeds}
-            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
-                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            model_kwargs["input_embeds"] = sharded_input_embeds
             hidden_states = model.model(
                 model_input_ids,
                 sharded_positions,

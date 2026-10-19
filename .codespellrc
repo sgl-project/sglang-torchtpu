@@ -1,3 +1,7 @@
 [codespell]
+<<<<<<< HEAD
 ignore-words-list = ans,als,hel,boostrap,childs,te,vas,hsa,ment,cann,thi,makro,wil,rouge,PRIS,ather,MIS,medias,allready,inout,nd,fo,visibles,nothink,renderD,ond,tbe,sems,CopyIn,notin,subtile,subtiles,dout,IST,kInf,datas,abl,valu
+=======
+ignore-words-list = ans,als,hel,boostrap,childs,te,vas,hsa,ment,cann,thi,makro,wil,rouge,PRIS,ather,MIS,medias,allready,inout,nd,fo,visibles,nothink,renderD,ond,tbe,CopyIn,notin,subtile,subtiles,dout,IST,kInf,datas,abl,valu,ser
+>>>>>>> upstream/main
 skip = *.json, *.jsonl, *.patch, *.txt, *.lock

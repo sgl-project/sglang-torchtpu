@@ -533,7 +533,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     max_context_len=1,
                 )
                 worker.target_worker = SimpleNamespace(
-                    model_runner=SimpleNamespace(attn_backend=attn_backend)
+                    model_runner=SimpleNamespace(
+                        attn_backend=attn_backend, kv_index_translator=None
+                    )
                 )
                 draft_input = SimpleNamespace(
                     bonus_tokens=torch.zeros((1,), dtype=torch.long, device=DEVICE),
@@ -558,7 +560,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     ),
                     patch(
                         "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                        return_value=(forward_batch, True),
+                        return_value=(forward_batch, True, None),
                     ),
                 ):
                     worker.draft(batch)
@@ -574,7 +576,11 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+<<<<<<< HEAD
             compile_policy=NoopCompilePolicy(),
+=======
+            kv_index_translator=SimpleNamespace(is_translating=False),
+>>>>>>> upstream/main
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -600,7 +606,11 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+<<<<<<< HEAD
             compile_policy=NoopCompilePolicy(),
+=======
+            kv_index_translator=SimpleNamespace(is_translating=False),
+>>>>>>> upstream/main
         )
         worker.topk = 1
         worker.speculative_num_steps = 2

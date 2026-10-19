@@ -43,6 +43,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import require_out_of_tree_impl
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -95,6 +96,25 @@ def has_standard_gqa_for_all_local_layers(
     return attention_layer_count >= end_layer - start_layer
 
 
+def has_hybrid_graph_handlers(
+    *,
+    attention_layers: list[Any],
+    moe_layers: list[Any],
+    start_layer: int,
+    end_layer: int,
+) -> bool:
+    """Accept pure MoE layers while rejecting gaps in the local decoder range."""
+    return (
+        0 <= start_layer < end_layer
+        and end_layer <= len(attention_layers)
+        and end_layer <= len(moe_layers)
+        and all(
+            attention_layers[i] is not None or moe_layers[i] is not None
+            for i in range(start_layer, end_layer)
+        )
+    )
+
+
 def index_attention_layers_by_global_id(
     attention_layers: list[Any],
     mha_companion_layers: list[Any],
@@ -117,8 +137,13 @@ def index_attention_layers_by_global_id(
             )
         return attention_layers, mha_companion_layers
     max_layer_id = max(int(layer.layer_id) for layer in populated)
-    indexed_attention = [None] * (max_layer_id + 1)
-    indexed_companions = [None] * (max_layer_id + 1)
+    # Keep trailing pure MoE layers represented as well. Their graph handler
+    # lives in moe_layers, and shrinking this list loses decoder alignment.
+    indexed_size = max(
+        max_layer_id + 1, len(layer_model.layers) if layer_model is not None else 0
+    )
+    indexed_attention = [None] * indexed_size
+    indexed_companions = [None] * indexed_size
     has_reused_layers = False
     for attention, companion in zip(attention_layers, mha_companion_layers):
         if attention is None:
@@ -421,11 +446,15 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
+<<<<<<< HEAD
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu", "tpu"):
             decode = capture_decode_graph(model_runner=model_runner)
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
+=======
+        if current_platform.capabilities.graph_capture:
+>>>>>>> upstream/main
             decode = capture_decode_graph(model_runner=model_runner)
     elif model_runner.device == "tpu" and get_flags().capture.enable_torch_compile:
         # EAGLE draft workers own their decode-style graph capture, but TPU
@@ -644,7 +673,17 @@ def capture_prefill_graph(
         layer_model,
     )
 
-    if not has_standard_gqa_for_all_local_layers(
+    supports_hybrid_graph = (
+        getattr(layer_model, "supports_hybrid_prefill_graph", False)
+        and prefill_backend == Backend.BREAKABLE
+        and has_hybrid_graph_handlers(
+            attention_layers=model_runner.attention_layers,
+            moe_layers=model_runner.moe_layers,
+            start_layer=model_runner.layer_info.start_layer,
+            end_layer=model_runner.layer_info.end_layer,
+        )
+    )
+    if not supports_hybrid_graph and not has_standard_gqa_for_all_local_layers(
         attention_layer_count=sum(
             layer is not None for layer in model_runner.attention_layers
         ),
@@ -771,20 +810,29 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     else:
         capture_name = f"{role} decode"
         num_tokens_per_req = 1
-    capture_bs, _ = get_batch_sizes_to_capture(model_runner, num_tokens_per_req)
     decode_backend = get_exec().graph.cuda_graph_config.decode.backend
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} begin. "
         f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "
-        f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
+        f"avail mem={before_mem:.2f} GB"
     )
 
+<<<<<<< HEAD
     # TPU is an in-tree PlatformEnum, so is_out_of_tree() is False for it; it
     # still resolves its graph runner (TpuGraphRunner) through the platform.
     if current_platform.is_out_of_tree() or current_platform.is_tpu():
         GraphRunnerCls = current_platform.get_graph_runner_cls()
         runner = GraphRunnerCls(model_runner)
     else:
+=======
+    GraphRunnerCls = current_platform.get_graph_runner_cls()
+    if GraphRunnerCls is None:
+        require_out_of_tree_impl(
+            current_platform,
+            hook="get_graph_runner_cls()",
+            subsystem="CUDA graph runner",
+        )
+>>>>>>> upstream/main
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {
@@ -793,13 +841,17 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
                 "xpu": XPUGraphRunner,
             },
         )
-        runner = graph_runners[model_runner.device](model_runner)
+        GraphRunnerCls = graph_runners[model_runner.device]
+    runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem
     capture_time = time.perf_counter() - tic
+    # The runner owns the bucket list: a dp-local draft aligns by its local
+    # batch, which a global re-derivation here would reject as empty.
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} end. "
+        f"bs={runner.capture_bs}, "
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={memory_usage_gb:.2f} GB, avail mem={after_mem:.2f} GB."
     )

@@ -122,11 +122,15 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
+<<<<<<< HEAD
     # The TPU KV free fence and raiden release hooks in the prefill loop;
     # none here, and no CUDA overlap streams.
     kv_free_fence = None
     transfer_backend = None
     use_overlap_streams = False
+=======
+    _copy_result_to_cpu = Scheduler._copy_result_to_cpu
+>>>>>>> upstream/main
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
 
@@ -178,6 +182,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_overlap = True
+        self.enable_async_d2h_copy = False
+        self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
             pop_bootstrapped=lambda: []
         )
@@ -567,7 +573,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,
                     supports_fast_match_prefix=lambda: True,
-                    swa_reprefill_tail_tokens=lambda: 0,
+                    swa_reprefill_tail_tokens=lambda req=None: 0,
                     match_prefix=match_prefix,
                 )
                 scheduler.policy = SchedulePolicy(
@@ -819,7 +825,7 @@ class TestPrefillResultPolling(CustomTestCase):
         ):
             _run_loop(scheduler)
 
-        release_kv.assert_called_once_with(prior, scheduler.tree_cache)
+        release_kv.assert_called_once_with(prior, scheduler.tree_cache, checkpoint=True)
         self.assertEqual(prior.metadata_buffer_index, -1)
         self.assertEqual(second.reqs[0].metadata_buffer_index, 0)
         self.assertIn((6, "launch", 2), scheduler.actions)
@@ -1266,7 +1272,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 class ChunkScheduler(_Scheduler):
                     def run_batch(self, batch):
                         end = int(batch.forward_iter)
-                        req.extend_range = SimpleNamespace(end=end)
+                        req.extend_end = end
                         self.chunked_req = req if end < 12 else None
                         batch.chunked_req = self.chunked_req
                         if self.chunked_req is not None:
@@ -1274,7 +1280,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         return super().run_batch(batch)
 
                     def checkpoint_disagg_prefill(self, req):
-                        checkpoint_ends.append(req.extend_range.end)
+                        checkpoint_ends.append(req.extend_end)
                         super().checkpoint_disagg_prefill(req)
 
                 if pause_at == 1:
@@ -1345,7 +1351,7 @@ class TestPrefillResultPolling(CustomTestCase):
 
                     def run_batch(self, batch):
                         if req in batch.reqs:
-                            req.extend_range = SimpleNamespace(end=batch.forward_iter)
+                            req.extend_end = batch.forward_iter
                             self.chunked_req = batch.chunked_req = req
                             req.inflight_middle_chunks += 1
                         return super().run_batch(batch)
@@ -1376,7 +1382,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 scheduler.metrics_reporter.enable_metrics = False
                 release_steps = []
 
-                def release(req, tree_cache, is_insert):
+                def release(req, tree_cache, checkpoint):
                     self.assertEqual(req.inflight_middle_chunks, 0)
                     release_steps.append(scheduler.iteration)
                     req.kv.req_pool_idx = None
@@ -1392,7 +1398,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     _run_loop(scheduler, optimistic_prefill_attempts=2)
 
                 release_kv.assert_called_once_with(
-                    req, scheduler.tree_cache, is_insert=False
+                    req, scheduler.tree_cache, checkpoint=False
                 )
                 self.assertEqual(
                     release_steps, [3 if depth == 1 or yield_before_pause else 5]
