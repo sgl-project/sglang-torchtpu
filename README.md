@@ -15,7 +15,7 @@ SGLang-torchtpu runs the SGLang engine on TPUs through torch_tpu and Pallas kern
 - **Models:** Gemma 4, GLM, Kimi, gpt-oss, DeepSeek, Qwen, at full size on multi-host TPU. Tiers in [SUPPORT.md](SUPPORT.md).
 - **Parallelism:** TP, EP, DPA, PP, CP.
 - **Caching:** prefix cache, HiCache KV offload to host memory, prefill/decode disaggregation with TP resharding.
-- **Speculative decoding:** EAGLE3, DFlash, DSPark.
+- **Speculative decoding:** EAGLE3, DFlash, DFlash2, DSPark, MTP. Serve with `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`, which selects the [experimental spec worker](sglang_tpu/experimental/speculative/README.md); DFlash2 and MTP run only on it. The legacy spec worker is in maintenance mode.
 - **Quantization:** FP8 channelwise and blockwise, MXFP4, INT4 W4A16, fp8 KV cache.
 - **Compilation:** torch.compile/direct_compile with a TPU backend.
 
@@ -81,6 +81,7 @@ Where to file what: TPU-specific bugs and feature requests here; engine bugs tha
   python test/run_suite.py --suite base-a-test-cpu
   ```
 
+- Develop speculative decoding in the experimental spec worker, which has no CUDA dependency: see its [developer guide](sglang_tpu/experimental/speculative/README.md). The legacy spec worker only takes fixes.
 - Kernel and end-to-end tests need a TPU. A maintainer applies the `run-ci` label and comments `/tag-and-rerun-ci` to run them on your pull request.
 - CONTRIBUTING.md covers the branch-and-PR flow, adding a test to the support matrix, and the policy for changes outside `sglang_tpu/`.
 
