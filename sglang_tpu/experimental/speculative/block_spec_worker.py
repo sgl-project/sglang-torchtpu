@@ -340,9 +340,6 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                             dtype=torch.int64,
                             device=self.device,
                         ),
-                        verify_kv_lens=torch.zeros(
-                            (padded_bs,), dtype=torch.int32, device=self.device
-                        ),
                     ),
                     torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
                     torch.ones((padded_bs,), dtype=torch.bool, device=self.device),

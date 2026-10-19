@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -42,7 +43,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_draft_input import (
-    ChainVerifyInput,
     chain_draft_forward_input,
 )
 from sglang_tpu.experimental.speculative.chain_draft_worker import (
@@ -217,9 +217,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
             offset=0,
             width=width,
             spec_info=chain_draft_forward_input(
-                hidden_states=target_hidden,
-                width=width,
-                verify_kv_lens=rows.verify_kv_lens,
+                hidden_states=target_hidden, width=width
             ),
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -315,15 +313,14 @@ class TpuChainSpecWorker(TpuSpecWorker):
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
-    ) -> ChainVerifyInput:
-        return ChainVerifyInput(
+    ) -> DFlashVerifyInput:
+        return DFlashVerifyInput(
             draft_token=verify_tokens,
             positions=rows.flat_positions,
             draft_token_num=self.num_verify_rows,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
-            verify_kv_lens=rows.verify_kv_lens,
         )
 
     def state_to_spec_info(self, state: SpecState) -> HostPaddedChainDraftInput:
@@ -502,9 +499,5 @@ def _dummy_verify_rows(pbs: int, width: int, device: torch.device) -> VerifyRows
     grid = torch.zeros((pbs, width), dtype=torch.int64, device=device)
     flat = torch.zeros((pbs * width,), dtype=torch.int64, device=device)
     return VerifyRows(
-        positions=grid,
-        cache_locs=grid,
-        flat_positions=flat,
-        flat_cache_locs=flat,
-        verify_kv_lens=torch.zeros((pbs,), dtype=torch.int32, device=device),
+        positions=grid, cache_locs=grid, flat_positions=flat, flat_cache_locs=flat
     )
