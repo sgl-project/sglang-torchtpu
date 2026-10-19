@@ -49,7 +49,7 @@ import time
 import numpy as np
 
 from .config import WEIGHT_PREFIX, Glm53FlashSpec, validate_against_manifest
-from .layout import FORMAT_VERSION, PackedLayout, pad_to
+from .layout import FORMAT_VERSION, PackedLayout
 from .weights import SHARD_AXIS
 
 # checkpoint dtype -> raw storage dtype (same itemsize, bits untouched)

@@ -13,7 +13,6 @@ import json
 import os
 
 import jax
-import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -259,8 +258,6 @@ def to_oracle_dict(packed_dir: str, spec, layers: list[int], tp: int = 8) -> dic
     than by the checkpoint, which is the comparison that actually tests the packing
     and the reference path against the same numbers.
     """
-    import ml_dtypes
-
     manifest = json.load(open(os.path.join(packed_dir, "manifest.json")))
     if manifest["format_version"] != FORMAT_VERSION:
         raise FormatMismatch(manifest["format_version"])
@@ -364,7 +361,6 @@ def to_oracle_dict(packed_dir: str, spec, layers: list[int], tp: int = 8) -> dic
             w[A + "f_a_proj.weight"] = slab(L, "f_a_proj")
             w[A + "g_a_proj.weight"] = slab(L, "g_a_proj")
             w[A + "b_proj.weight"] = f64(F("kda_b")[k])
-            cvq = F("kda_conv").shape[1] // 3
             for j, nm in enumerate(("q_conv1d", "k_conv1d", "v_conv1d")):
                 w[A + nm + ".weight"] = f64(
                     unstack("kda_conv", 3, 1)[j][k])[:, None, :]

@@ -1,14 +1,7 @@
-"""Wire the decode megakernel into a callable: one `pallas_call` per step.
-
-Keeps the argument order in one place, so the kernel signature and the call site
-cannot drift apart silently, and reports the compiled memory accounting -- argument,
-output, alias and temp sizes -- because donation being honoured and a full extra
-copy of the cache still being materialised are both true at once often enough that
-neither answers the question on its own.
-"""
+"""Wire the megakernel into a sharded, jitted step: the kernel's `pallas_call`,
+then `row_write_call` for the DSA caches.  Owns the kernel's argument order."""
 
 from __future__ import annotations
-
 
 import jax
 import jax.numpy as jnp
@@ -65,13 +58,11 @@ def make_decode(spec, W, mesh, cfg: D.KernelConfig):
         + [pl.BlockSpec(memory_space=pltpu.VMEM)]          # init streams
         + [pl.BlockSpec(memory_space=pl.ANY)] * (n_w + len(KERNEL_CACHES))
     )
-    def cache_struct(c):
-        return jax.ShapeDtypeStruct(_local_shape(c, mesh), c.dtype)
 
     def make_call(cache_structs):
         # The KDA states are written in place (aliased); the DSA caches are only
         # read, and their new rows come out as three small outputs for
-        # `row_write_call`.  `memory_report` shows whether a copy remains.
+        # `row_write_call`.
         # A kernel with remote DMA is a collective to XLA, which copies every
         # aliased operand; the KDA states are therefore fresh outputs, written
         # whole by every layer.  A capped run (n_layers) skips layers, so it
@@ -330,16 +321,7 @@ def make_decode(spec, W, mesh, cfg: D.KernelConfig):
     run.shard = shard
     run.wspec, run.dspec, run.kspec = wspec, dspec, kspec
     run.dsa_names, run.kda_names, run.step_caches = dsa_names, kda_names, step_caches
-    run.lower_args = lambda tok, pos, warrays, caches, s_: (
-        tok, pos, s_, {n: warrays[n] for n in WEIGHT_ORDER},
-        {n: caches[n] for n in dsa_names}, {n: caches[n] for n in kda_names})
-    run.jitted = jshard
-    run.state = state      # the compiled AUTO-layout step, once run
     return run
-
-
-def _local_shape(x, mesh):
-    return x.shape
 
 
 def warr_ndim(W, name):
@@ -352,18 +334,3 @@ def shard_spec(W, name):
     parts[ax] = D.AXIS
     return P(*parts)
 
-
-def memory_report(fn, *args) -> dict:
-    """Compiled argument / output / alias / temp sizes.
-
-    Donation can be honoured and a full extra copy of a large buffer still be
-    materialised as a temporary; both facts show up here together, and neither one
-    alone answers whether the layout is paying for itself.
-    """
-    m = fn.lower(*args).compile().memory_analysis()
-    return {
-        "argument_GiB": m.argument_size_in_bytes / 2**30,
-        "output_GiB": m.output_size_in_bytes / 2**30,
-        "alias_GiB": m.alias_size_in_bytes / 2**30,
-        "temp_GiB": m.temp_size_in_bytes / 2**30,
-    }

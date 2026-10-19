@@ -249,6 +249,11 @@ class GlmFlashMegakernel:
             return mode.is_target_verify()
         return mode.is_decode() and forward_batch.spec_info is None
 
+    @property
+    def active(self) -> bool:
+        """A request's caches live in the kernel (serving's pools lag behind)."""
+        return self.req is not None
+
     def invalidate(self):
         """A target step the kernel did not run (a prefill): reload next time."""
         self.req = None

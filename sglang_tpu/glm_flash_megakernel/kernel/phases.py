@@ -594,24 +594,13 @@ def kda_step(state, q, k, v, g_log, beta):
     return state, out
 
 
-def conv_step_cl(conv_state, x_new, weight):
-    """`conv_step`, channels-last: conv_state [K-1, C], x_new [1, C], weight [K, C].
+def conv_step(conv_state, x_new, weight):
+    """Causal depthwise conv over [state, x_new] for one token, then SiLU.
+    Channels-last: conv_state [K-1, C], x_new [1, C], weight [K, C].
     Returns (out [1, C], new_state [K-1, C])."""
     window = jnp.concatenate([conv_state, x_new], axis=0)                   # [K, C]
     out = jnp.sum(window * weight, axis=0, keepdims=True)
     return jax.nn.silu(out), window[1:]
-
-
-def conv_step(conv_state, x_new, weight):
-    """Causal depthwise conv over [state, x_new] for one token, then SiLU.
-
-    conv_state [C, K-1], x_new [1, C], weight [C, K].
-    Returns (out [1, C], new_state [C, K-1]).
-    """
-    k = weight.shape[-1]
-    window = jnp.concatenate([conv_state, x_new.reshape(-1, 1)], axis=1)   # [C, K]
-    out = jnp.sum(window * weight, axis=1).reshape(1, -1)
-    return jax.nn.silu(out), window[:, 1:]
 
 
 # --------------------------------------------------------------------- DSA

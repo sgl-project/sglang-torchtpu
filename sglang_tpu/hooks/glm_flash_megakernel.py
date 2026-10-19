@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 
 def load_glm_flash_megakernel_weights(model: Any, *args, **kwargs) -> None:
@@ -55,6 +55,13 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
     from sglang_tpu.envs import envs as tpu_envs
 
     args = runner.model_runner.server_args
+    # The kernel keeps a request's caches itself and does not write serving's
+    # pools, so a request must never fall back to the native decoder mid-way
+    # (a second running request) or share a prefix (the radix cache).
+    if args.max_running_requests != 1 or not args.disable_radix_cache:
+        raise NotImplementedError(
+            "SGLANG_TPU_GLM_FLASH_MEGAKERNEL needs --max-running-requests 1 and "
+            "--disable-radix-cache")
     # With MTP every target decode step is a verify of all the draft tokens.
     n_query = (args.speculative_num_draft_tokens or 1) if args.speculative_algorithm else 1
     mk = ops.GlmFlashMegakernel(
@@ -72,6 +79,11 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
     def forward(input_ids, positions, forward_batch, *args, **kwargs):
         if mk.handles(forward_batch, input_ids):
             return mk.forward(input_ids, positions, forward_batch)
+        mode = forward_batch.forward_mode
+        if mk.active and (mode.is_decode() or mode.is_target_verify()):
+            raise RuntimeError(
+                "GLM-Flash megakernel: a decode step it cannot take arrived for a "
+                "request it is serving; serving's caches for it are stale")
         mk.invalidate()
         return compiled(input_ids, positions, forward_batch, *args, **kwargs)
 

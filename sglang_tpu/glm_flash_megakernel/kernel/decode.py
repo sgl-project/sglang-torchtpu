@@ -1,41 +1,20 @@
-"""The GLM-5.3-Flash decode megakernel: one Pallas program per device per step.
+"""The GLM-5.3-Flash megakernel: one Pallas program per device per target step.
 
-Fusion boundary
----------------
 Inside the program: the embedding lookup, every decoder layer (mHC, KDA or DSA
-attention including the indexer, MoE or dense MLP), the per-layer tensor-parallel
-reductions as in-kernel remote DMA, the final norm and the LM head.  Outside: token
-sampling and the host loop that advances the position. Verify the fusion boundary
-by counting Pallas calls and outside operations in the compiled program.
+attention with its indexer, MoE or dense MLP), the tensor-parallel reductions as
+in-kernel remote DMA, the final norm and the LM head.  A step can carry several
+query positions (an MTP verify); the KDA states then keep one checkpoint per query.
 
-Layer schedule
---------------
-Read from the spec, not assumed.  For this checkpoint: three dense-MLP KDA layers,
-then ten repetitions of `[DSA, KDA, KDA, KDA]` with MoE, then `DSA, KDA`.  The
-repetitions are a `fori_loop`, so the emitted program is one period rather than
-forty layers; prefix and suffix are straight-line.  Every weight the loop reads is
-indexed by a traced ordinal, and `kda_ord(L) = L - (L+1)//4` and its siblings are
-affine in L precisely so that works against the stacked packed layout.
+The layer schedule comes from the spec: three dense-MLP KDA layers, then
+repetitions of [DSA, KDA, KDA, KDA] with MoE as a fori_loop over traced ordinals
+(kda_ord / dsa_ord / moe_ord are affine in the layer index), then the remainder.
 
-Absorbed latent attention
--------------------------
-Expanding the compressed KV into per-head keys and values costs
-`L * kv_lora * n_heads * (qk + v)` multiply-adds per DSA layer per step, more than
-the rest of the step combined once a few thousand tokens are cached.  Folding the
-key half of `kv_b` into the query and the value half into the output is the same
-function by reassociation. Validate both forms against an independent oracle
-at the required shapes, including rounding and cache visibility.
+DSA attention is absorbed: the key half of kv_b folds into the query and the value
+half into the output, so attention runs on the 512-wide latent cache.
 
-Memory and scheduling constraints
----------------------------------
-* Every projection streams row tiles through a fixed buffer. Measure the
-  usable VMEM limit and compiled padded allocation on the assigned device.
-* A dynamic single-row slice of a tiled **bf16** HBM array fails the alignment
-  check (it happens to work for f32), so the per-layer cache slice is brought into
-  VMEM, updated there, and written back, rather than poking one row in HBM.
-
-The synchronous configuration starts and waits for each tile before consuming it.
-Use it as the numerical and timing control when testing rings and prefetch.
+Weights stream from HBM through VMEM rings.  The DSA caches are only read here; a
+step's new rows come out as small outputs that `row_write_call` stores, because
+XLA copies every operand that a kernel with remote DMA aliases.
 """
 
 from __future__ import annotations
@@ -373,9 +352,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
     eps = spec.rms_norm_eps
     kexp, nexp = spec.num_experts_per_tok, spec.n_routed_experts
     Lcap = cfg.max_len
-    npool = Lcap // kp
     selk = spec.index_select_k
-    vsh = layout.vocab_padded // tp
     TR = cfg.tile_rows
     f8 = jnp.float8_e4m3fn
     n_layers = cfg.layers(spec)
@@ -469,14 +446,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 return jnp.sum(_round(rows, H), axis=0)[: rows.shape[0]]
 
         def dma_batch(items):
-            """Start every transfer, then wait for all of them.
-
-            Eight blocking round trips per layer across forty-five layers is
-            three hundred and sixty full DMA latencies that no tile choice can
-            remove; issuing them together and waiting once removes the
-            serialisation instead.  Each item gets its own semaphore index --
-            two in-flight transfers must never share one.
-            """
+            """Start every transfer, then wait for all of them.  Each item gets its
+            own semaphore index: two in-flight transfers must never share one."""
             cps = [pltpu.make_async_copy(src, dst, sgrp.at[i])
                    for i, (src, dst) in enumerate(items)]
             for c in cps:
@@ -485,11 +456,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 _wait(c, "ld_wait")
 
         # --- streamed matvecs -------------------------------------------
-        # Each projection streams row tiles through a ring.  Version 1 started and
-        # waited every tile, which serialises every transfer behind the compute
-        # that consumes the previous one; with `ring` the window is open so the
-        # next tile is already in flight.  `prefetch <= slots - 2` is enforced in
-        # the config, and each ring has its own semaphore array.
+        # Each projection streams row tiles through an S-slot ring, PF tiles ahead
+        # (prefetch <= slots - 2, checked by the config); each ring has its own
+        # semaphore array.
         S = cfg.slots if cfg.ring else 1
         PF = cfg.prefetch if cfg.ring else 0
 
@@ -821,7 +790,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 if Q > 1:
                     for c in ck_out[slot]:
                         c.wait()
-                conv_out, new_conv = K.conv_step_cl(
+                conv_out, new_conv = K.conv_step(
                     cv[...] if qi == 0 else cvq[prev], qkv[qi : qi + 1],
                     cwv[...].astype(F32))
                 if Q == 1:

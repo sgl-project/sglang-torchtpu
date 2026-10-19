@@ -14,6 +14,8 @@ from copy import deepcopy
 from benchmark.tpu.recipe.configs.glm_5_3_flash.server import CONFIG as BASE_CONFIG
 
 CONFIG = deepcopy(BASE_CONFIG)
+# The kernel serves one request at a time (see the hook in sglang_tpu/hooks).
+CONFIG["server_args"]["max_running_requests"] = 1
 CONFIG["runtime_env"].update(
     {
         "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": "1",
