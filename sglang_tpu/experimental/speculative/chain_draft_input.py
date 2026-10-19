@@ -1,4 +1,5 @@
-"""Draft forward input of the chain worker: verify-shaped rows plus the hidden the draft reads."""
+"""Forward inputs of the chain worker: the target verify rows, and the draft's
+verify-shaped rows plus the hidden it reads."""
 
 from __future__ import annotations
 
@@ -10,9 +11,21 @@ import torch
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
 
-# A dataclass because it extends core's DFlashVerifyInput and registers as a jax pytree.
+# Dataclasses because they extend core's DFlashVerifyInput and register as jax pytrees.
 @dataclass
-class ChainDraftForwardInput(DFlashVerifyInput):
+class ChainVerifyInput(DFlashVerifyInput):
+    """Verify rows of the chain worker.
+
+    Attributes:
+      verify_kv_lens: [pbs] int32 RPA KV length of a forward over the verify
+        rows (select_verify_rows builds it); None derives it from seq_lens.
+    """
+
+    verify_kv_lens: torch.Tensor | None = None
+
+
+@dataclass
+class ChainDraftForwardInput(ChainVerifyInput):
     """Per-row draft conditioning, plus the KV length RPA reads during the fused draft.
 
     Attributes:
@@ -27,19 +40,23 @@ class ChainDraftForwardInput(DFlashVerifyInput):
 
 @functools.cache
 def register_chain_draft_pytree() -> None:
-    """Register ChainDraftForwardInput as a pytree, as direct_compile does DFlashVerifyInput.
+    """Register the chain inputs as pytrees, as direct_compile does DFlashVerifyInput.
 
     A subclass is its own pytree type, so direct_compile would otherwise not
-    trace hidden_states as a graph input. jax is imported here, not at module
+    trace its fields as graph inputs. jax is imported here, not at module
     load: CPU runs import this module without jax installed.
     """
     from jax import tree_util
 
+    tree_util.register_dataclass(ChainVerifyInput)
     tree_util.register_dataclass(ChainDraftForwardInput)
 
 
 def chain_draft_forward_input(
-    *, hidden_states: torch.Tensor, width: int
+    *,
+    hidden_states: torch.Tensor,
+    width: int,
+    verify_kv_lens: torch.Tensor | None = None,
 ) -> ChainDraftForwardInput:
     device = hidden_states.device
     return ChainDraftForwardInput(
@@ -48,4 +65,5 @@ def chain_draft_forward_input(
         draft_token_num=width,
         custom_mask=None,
         hidden_states=hidden_states,
+        verify_kv_lens=verify_kv_lens,
     )
