@@ -15,7 +15,7 @@
 # Wheels go to the GitHub Release, not PyPI: the fork's sglang cannot take the
 # `sglang` name there, and sglang-tpu alone would pull upstream sglang from PyPI.
 name: Release (TPU)
-run-name: "Release (TPU) v${{ inputs.version }}-tpu [${{ inputs.target }}]"
+run-name: "Release (TPU) v${{ inputs.version }}-tpu, sglang ${{ inputs.sglang_version }} [${{ inputs.target }}]"
 
 on:
   workflow_dispatch:
@@ -25,7 +25,10 @@ on:
         required: true
         default: main
       version:
-        description: "Upstream sglang version this tree tracks, e.g. 0.5.22 (image tag becomes v0.5.22-tpu)"
+        description: "TPU release version, e.g. 0.1.0 (sglang-tpu wheel; image tag v0.1.0-tpu)"
+        required: true
+      sglang_version:
+        description: "Upstream sglang version this tree tracks, e.g. 0.5.22 (the fork's sglang wheel)"
         required: true
       target:
         description: "none = dry run (private only), staging = lmsysorg/sglang-staging, prod = lmsysorg/sglang"
@@ -62,6 +65,7 @@ jobs:
     outputs:
       sha: ${{ steps.r.outputs.sha }}
       version: ${{ steps.r.outputs.version }}
+      sglang_version: ${{ steps.r.outputs.sglang_version }}
       image_tag: ${{ steps.r.outputs.image_tag }}
       image_repo: ${{ steps.r.outputs.image_repo }}
       release_tag: ${{ steps.r.outputs.release_tag }}
@@ -73,16 +77,20 @@ jobs:
       - id: r
         env:
           IN_VERSION: ${{ inputs.version }}
+          IN_SGLANG_VERSION: ${{ inputs.sglang_version }}
           IN_TARGET: ${{ inputs.target }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           version="${IN_VERSION#v}"
+          sglang_version="${IN_SGLANG_VERSION#v}"
           # X.Y.Z or X.Y.Z.postN, the forms upstream release tags use.
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
-            echo "::error::version must look like 0.5.22 or 0.5.22.post1, got '$IN_VERSION'"
-            exit 1
-          fi
+          for v in "$version" "$sglang_version"; do
+            if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
+              echo "::error::versions must look like 0.1.0 or 0.1.0.post1, got '$v'"
+              exit 1
+            fi
+          done
           case "$IN_TARGET" in
             prod)    image_repo=lmsysorg/sglang ;;
             staging) image_repo=lmsysorg/sglang-staging ;;
@@ -97,11 +105,12 @@ jobs:
           {
             echo "sha=$(git rev-parse HEAD)"
             echo "version=${version}"
+            echo "sglang_version=${sglang_version}"
             echo "image_tag=v${version}-tpu"
             echo "image_repo=${image_repo}"
             echo "release_tag=${release_tag}"
           } >> "$GITHUB_OUTPUT"
-          echo "Releasing $(git rev-parse HEAD) as v${version}-tpu (target: ${IN_TARGET})"
+          echo "Releasing $(git rev-parse HEAD) as v${version}-tpu, sglang ${sglang_version} (target: ${IN_TARGET})"
 
   build:
     needs: resolve
@@ -109,6 +118,7 @@ jobs:
     with:
       ref: ${{ needs.resolve.outputs.sha }}
       version: ${{ needs.resolve.outputs.version }}
+      sglang_version: ${{ needs.resolve.outputs.sglang_version }}
     permissions:
       contents: read
       id-token: write
@@ -194,8 +204,10 @@ jobs:
           python-version: "3.12"
       - name: Build sglang (fork) and sglang-tpu
         env:
-          # Both packages read their version from setuptools-scm; pin it so the pair matches.
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.resolve.outputs.version }}
+          # Both packages read their version from setuptools-scm: the fork carries the
+          # upstream version it tracks, the plugin the TPU release version.
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG: ${{ needs.resolve.outputs.sglang_version }}
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG_TPU: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
           python -m pip install --quiet build
@@ -204,8 +216,8 @@ jobs:
           cp python/pyproject_tpu.toml python/pyproject.toml
           # Pin the plugin to the fork wheel it ships with; a bare `sglang` lets
           # `pip install -U` swap in upstream sglang from PyPI.
-          sed -i 's/^dependencies = \["sglang"\]$/dependencies = ["sglang==${{ needs.resolve.outputs.version }}"]/' pyproject.toml
-          grep -qx 'dependencies = \["sglang==${{ needs.resolve.outputs.version }}"\]' pyproject.toml
+          sed -i 's/^dependencies = \["sglang"\]$/dependencies = ["sglang==${{ needs.resolve.outputs.sglang_version }}"]/' pyproject.toml
+          grep -qx 'dependencies = \["sglang==${{ needs.resolve.outputs.sglang_version }}"\]' pyproject.toml
           cp README.md LICENSE python/
           python -m build --wheel --outdir dist python
           python -m build --wheel --outdir dist .
@@ -213,12 +225,12 @@ jobs:
       - name: Check the wheels
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
+          SGLANG_VERSION: ${{ needs.resolve.outputs.sglang_version }}
         run: |
           set -euo pipefail
           # Pure-Python wheels: the TPU manifest builds no Rust extensions. A
           # platform tag here means that changed and one wheel no longer fits all.
-          for name in sglang sglang_tpu; do
-            f="dist/${name}-${VERSION}-py3-none-any.whl"
+          for f in "dist/sglang-${SGLANG_VERSION}-py3-none-any.whl" "dist/sglang_tpu-${VERSION}-py3-none-any.whl"; do
             [ -f "$f" ] || { echo "::error::missing $f"; ls dist; exit 1; }
           done
           # The install command the Release notes give must resolve from public
@@ -237,16 +249,17 @@ jobs:
           from importlib.metadata import entry_points, requires, version
 
           want = os.environ["VERSION"]
-          for dist in ("sglang", "sglang-tpu"):
-              assert version(dist) == want, (dist, version(dist), want)
+          want_sglang = os.environ["SGLANG_VERSION"]
+          assert version("sglang") == want_sglang, (version("sglang"), want_sglang)
+          assert version("sglang-tpu") == want, (version("sglang-tpu"), want)
           names = {ep.name for ep in entry_points(group="sglang.srt.platforms")}
           assert "tpu_oot" in names, names
           # Compare normalized names: the pin may be spelled torch-tpu or torch_tpu.
           deps = {re.split(r"[^A-Za-z0-9._-]", r, maxsplit=1)[0].lower().replace("_", "-")
                   for r in requires("sglang") or []}
           assert "torch-tpu" in deps, "fork sglang wheel lost its torch-tpu pin"
-          assert requires("sglang-tpu") == [f"sglang=={want}"], requires("sglang-tpu")
-          print("ok:", want, sorted(names))
+          assert requires("sglang-tpu") == [f"sglang=={want_sglang}"], requires("sglang-tpu")
+          print("ok:", want, want_sglang, sorted(names))
           EOF
       - uses: actions/upload-artifact@v4
         with:
@@ -329,6 +342,7 @@ jobs:
           TARGET: ${{ inputs.target }}
           SHA: ${{ needs.resolve.outputs.sha }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          SGLANG_VERSION: ${{ needs.resolve.outputs.sglang_version }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
           IMAGE_REPO: ${{ needs.resolve.outputs.image_repo }}
           IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
@@ -342,7 +356,7 @@ jobs:
             image="(dry run, not published) ${DIGEST}"
           fi
           cat > notes.md <<EOF
-          SGLang on TPU, tracking upstream sglang ${VERSION}. Commit: ${SHA}
+          SGLang on TPU v${VERSION}, tracking upstream sglang ${SGLANG_VERSION}. Commit: ${SHA}
 
           ## Docker
           \`\`\`
@@ -354,7 +368,7 @@ jobs:
           Install both together; \`sglang\` here is this repository's build, not the PyPI one.
           \`\`\`
           pip install --extra-index-url https://download.pytorch.org/whl/cpu \\
-            ${base}/sglang-${VERSION}-py3-none-any.whl ${base}/sglang_tpu-${VERSION}-py3-none-any.whl
+            ${base}/sglang-${SGLANG_VERSION}-py3-none-any.whl ${base}/sglang_tpu-${VERSION}-py3-none-any.whl
           \`\`\`
           EOF
           flags=(--target "$SHA" --title "TPU v${VERSION}" --notes-file notes.md)

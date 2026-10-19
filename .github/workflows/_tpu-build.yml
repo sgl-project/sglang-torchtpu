@@ -9,10 +9,14 @@ on:
       ref:
         required: true
         type: string
-      # Release version baked into the image's sglang / sglang-tpu metadata.
-      # Empty for CI builds, which keep setuptools-scm's 0.0.0.dev0 fallback
-      # (the build context has no .git to read a version from).
+      # Release versions baked into the image's sglang-tpu (version) and fork
+      # sglang (sglang_version) metadata. Empty for CI builds, which keep
+      # setuptools-scm's 0.0.0.dev0 fallback (the build context has no .git).
       version:
+        required: false
+        type: string
+        default: ""
+      sglang_version:
         required: false
         type: string
         default: ""
@@ -58,6 +62,7 @@ jobs:
           # not the workflow's github.sha (the caller's commit, which can differ).
           INPUT_REF: ${{ inputs.ref }}
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SGLANG_VERSION: ${{ inputs.sglang_version }}
           # Both actors, passed via env rather than inline interpolation so neither
           # can be shell-interpreted. They differ on a re-run: triggering_actor is
           # whoever pressed re-run, actor stays the original initiator (and is the
@@ -119,6 +124,7 @@ jobs:
             --project "$GCP_PROJECT" --config docker/cloudbuild.tpu.yaml \
             --bucket "$bucket" --object "$object" --tag "$tag" --token-file "$tokfile" \
             --substitutions "_BASE_IMAGE=${AR_BASE_IMAGE}:${base_tag}" "_VERSION=${INPUT_VERSION}" \
+              "_SGLANG_VERSION=${INPUT_SGLANG_VERSION}" \
             --max-attempts 2)"
           echo "digest=${AR_IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
           echo "built ${AR_IMAGE}@${digest}"
