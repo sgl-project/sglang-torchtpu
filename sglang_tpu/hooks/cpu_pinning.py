@@ -6,7 +6,7 @@ Why: TP ranks step in lockstep, so the slowest rank's host paces every chip. The
      thread's core or its SMT sibling slows that rank's launches for the whole run.
 How: BEFORE Scheduler.run_event_loop (init and warmup done, threads started); pin
      the main thread to one CPU of the rank's set and move the process's other
-     threads off that physical core. SGLANG_TPU_PIN_SCHEDULER_MAIN_THREAD gates it;
+     threads off that physical core. SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING gates it;
      it needs the per-rank CPU set of SGLANG_SET_CPU_AFFINITY.
 Upstream PR or issue: none.
 Remove when: core pins the scheduler main thread itself.
@@ -37,7 +37,7 @@ def _core_of(cpu: int) -> set[int]:
 def pin_scheduler_main_thread(scheduler, *args, **kwargs) -> None:
     from sglang_tpu.envs import envs as tpu_envs
 
-    if not tpu_envs.SGLANG_TPU_PIN_SCHEDULER_MAIN_THREAD.get() or not hasattr(
+    if not tpu_envs.SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING.get() or not hasattr(
         os, "sched_getaffinity"
     ):
         return None

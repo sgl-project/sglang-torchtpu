@@ -17,4 +17,4 @@ CONFIG["server_args"].update(
 CONFIG["runtime_env"].update(
     {k: v for k, v in MK_CONFIG["runtime_env"].items() if "GLM_FLASH_MEGAKERNEL" in k}
 )
-CONFIG["runtime_env"]["SGLANG_TPU_PIN_SCHEDULER_MAIN_THREAD"] = "1"
+CONFIG["runtime_env"]["SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING"] = "1"

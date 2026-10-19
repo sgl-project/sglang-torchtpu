@@ -41,7 +41,7 @@ class TestCpuPinningHook(CustomTestCase):
                 cpu_pinning, "_core_of", side_effect=lambda c: {c, c + 112}
             ),
         ]
-        with tpu_envs.SGLANG_TPU_PIN_SCHEDULER_MAIN_THREAD.override(enabled):
+        with tpu_envs.SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING.override(enabled):
             for p in patches:
                 p.start()
             try:
