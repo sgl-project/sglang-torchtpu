@@ -500,8 +500,14 @@ def _draft_logits_and_hidden(
 
 
 def _dummy_verify_rows(pbs: int, width: int, device: torch.device) -> VerifyRows:
-    grid = torch.zeros((pbs, width), dtype=torch.int64, device=device)
-    flat = torch.zeros((pbs * width,), dtype=torch.int64, device=device)
+    """Distinct tensors, as select_verify_rows returns: Dynamo guards on aliased inputs."""
+
+    def zeros(*shape: int) -> torch.Tensor:
+        return torch.zeros(shape, dtype=torch.int64, device=device)
+
     return VerifyRows(
-        positions=grid, cache_locs=grid, flat_positions=flat, flat_cache_locs=flat
+        positions=zeros(pbs, width),
+        cache_locs=zeros(pbs, width),
+        flat_positions=zeros(pbs * width),
+        flat_cache_locs=zeros(pbs * width),
     )
