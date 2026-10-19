@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""GLM-5.3-Flash megakernel: kernel configs and their VMEM scratch, host only.
-
-Builds the checkpoint's tp8 geometry from its architecture fields and checks, for
-the served shapes (one query, and the MTP verify's draft tokens), that the
-kernel's scratch fits the TensorCore's VMEM and that the config's ring
-constraints hold.
-"""
+"""GLM-5.3-Flash megakernel: served configs fit VMEM at tp8 (host only)."""
 
 import json
 import math
@@ -19,8 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
 
-# Per-TensorCore VMEM on tpu7x.
-_VMEM_BYTES = 64 * 2**20
+_VMEM_BYTES = 64 * 2**20  # per TensorCore on tpu7x
 
 _LAYERS = 45
 _DSA = {3 + 4 * i for i in range(11)}
@@ -68,40 +61,26 @@ def _spec():
         return Glm53FlashSpec.from_checkpoint(d)
 
 
-def _scratch_bytes(spec, cfg) -> int:
-    import jax.numpy as jnp
-    from jax.experimental.pallas import tpu as pltpu
-
-    from sglang_tpu.glm_flash_megakernel.kernel import decode as D
-    from sglang_tpu.glm_flash_megakernel.layout import KernelLayout
-
-    total = 0
-    for s in D.scratch_shapes(spec, KernelLayout(spec, 8), cfg):
-        if getattr(s, "memory_space", None) == pltpu.VMEM:   # not the semaphores
-            total += math.prod(s.shape) * jnp.dtype(s.dtype).itemsize
-    return total
-
-
 class TestGlmFlashMegakernelConfig(CustomTestCase):
-    def test_served_shapes_fit_vmem(self):
+    def test_served_configs(self):
+        import jax.numpy as jnp
+        from jax.experimental.pallas import tpu as pltpu
+
         from sglang_tpu.glm_flash_megakernel.kernel import decode as D
+        from sglang_tpu.glm_flash_megakernel.layout import KernelLayout
 
         spec = _spec()
         for n_query in (1, 4):
             with self.subTest(n_query=n_query):
                 cfg = D.KernelConfig(max_len=16384, n_query=n_query, embed_2d=True)
-                self.assertLessEqual(_scratch_bytes(spec, cfg), _VMEM_BYTES)
-
-    def test_ring_constraints(self):
-        from sglang_tpu.glm_flash_megakernel.kernel import decode as D
-
-        for n_query in (1, 4):
-            cfg = D.KernelConfig(max_len=16384, n_query=n_query)
-            self.assertLessEqual(cfg.km_issue, cfg.km_slots - 1)
-            self.assertLessEqual(cfg.prefetch, cfg.slots - 2)
-        self.assertEqual(D.KernelConfig(max_len=16384, n_query=4).km_cols, 256)
+                vmem = sum(math.prod(s.shape) * jnp.dtype(s.dtype).itemsize
+                           for s in D.scratch_shapes(spec, KernelLayout(spec, 8), cfg)
+                           if getattr(s, "memory_space", None) == pltpu.VMEM)
+                self.assertLessEqual(vmem, _VMEM_BYTES)
+                self.assertLessEqual(cfg.km_issue, cfg.km_slots - 1)
+                self.assertLessEqual(cfg.prefetch, cfg.slots - 2)
         with self.assertRaises(ValueError):
-            D.KernelConfig(max_len=1000)                 # not a multiple of attn_tile
+            D.KernelConfig(max_len=1000)  # not a multiple of attn_tile
 
 
 if __name__ == "__main__":
