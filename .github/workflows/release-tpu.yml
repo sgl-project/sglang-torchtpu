@@ -233,6 +233,7 @@ jobs:
           /tmp/v/bin/pip install --quiet --no-deps dist/*.whl
           /tmp/v/bin/python - <<'EOF'
           import os
+          import re
           from importlib.metadata import entry_points, requires, version
 
           want = os.environ["VERSION"]
@@ -240,7 +241,9 @@ jobs:
               assert version(dist) == want, (dist, version(dist), want)
           names = {ep.name for ep in entry_points(group="sglang.srt.platforms")}
           assert "tpu_oot" in names, names
-          deps = " ".join(requires("sglang") or [])
+          # Compare normalized names: the pin may be spelled torch-tpu or torch_tpu.
+          deps = {re.split(r"[^A-Za-z0-9._-]", r, maxsplit=1)[0].lower().replace("_", "-")
+                  for r in requires("sglang") or []}
           assert "torch-tpu" in deps, "fork sglang wheel lost its torch-tpu pin"
           assert requires("sglang-tpu") == [f"sglang=={want}"], requires("sglang-tpu")
           print("ok:", want, sorted(names))
