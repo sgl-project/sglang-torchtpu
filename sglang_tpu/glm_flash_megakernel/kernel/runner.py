@@ -196,9 +196,35 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
         ]
         return D.init_pool_keys(spec, ik, ig, apes)
 
+    def pool_records(ik, ig, smalls, pools):
+        """Serving's index-key records of `pools` [P], one row per target DSA layer."""
+        from sglang_tpu.attention.pallas.dsa_kpool_topk import (
+            _pool_records,
+            compress_pools,
+            pooled_record_bytes,
+        )
+
+        kp, d = spec.index_kpool, spec.index_head_dim
+        rows = (pools[:, None] * kp + jnp.arange(kp)[None, :]).reshape(-1)
+        out = []
+        for i, L in enumerate(spec.dsa_layers):
+            ape = (
+                smalls[L, ape_off : ape_off + ape_rows]
+                .reshape(-1)[:ape_n]
+                .reshape(ape_shape)
+                .astype(jnp.float32)
+            )
+            keys = ik[i][rows].reshape(-1, kp, d)
+            gates = ig[i][rows].reshape(-1, kp, d)
+            out.append(
+                _pool_records(compress_pools(keys, gates, ape), pooled_record_bytes(d))
+            )
+        return jnp.stack(out)
+
     return _Step(
         shard=shard,
         init_ip=init_ip,
+        pool_records=pool_records,
         wspec=wspec,
         dspec=dspec,
         kspec=kspec,

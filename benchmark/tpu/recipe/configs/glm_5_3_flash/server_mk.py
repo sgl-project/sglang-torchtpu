@@ -10,12 +10,4 @@ from benchmark.tpu.recipe.configs.glm_5_3_flash.server import CONFIG as BASE_CON
 
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"]["max_running_requests"] = 1
-CONFIG["runtime_env"].update(
-    {
-        "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": "1",
-        # Must be a multiple of the kernel's 512-token attention tile.
-        "SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN": str(
-            -(-CONFIG["server_args"]["context_length"] // 512) * 512
-        ),
-    }
-)
+CONFIG["runtime_env"]["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"] = "1"

@@ -273,7 +273,7 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         pltpu.VMEM((2, cfg.attn_tile, kvl), BF16),
         pltpu.VMEM((32, idh), BF16),
         pltpu.VMEM((32, idh), BF16),
-        pltpu.VMEM((L // spec.index_kpool, idh), F32),
+        pltpu.VMEM((2, cfg.attn_tile // spec.index_kpool, idh), F32),
         pltpu.VMEM(
             (cfg.n_query, L // cfg.attn_tile, cfg.attn_tile // spec.index_kpool), F32
         ),
@@ -851,8 +851,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         def dsa(x, d_i):
             kvb_cp = pltpu.make_async_copy(w_kvb.at[d_i], kvb, sgrp.at[3])
             kvb_cp.start()
-            pka_cp = pltpu.make_async_copy(c_ip.at[d_i], pka, sgrp.at[7])
-            pka_cp.start()
+
+            def pk_cp(t, b):
+                return pltpu.make_async_copy(
+                    c_ip.at[d_i, pl.ds(pl.multiple_of(t * PT, PT), PT)],
+                    pka.at[b],
+                    sgrp.at[6 + b],
+                )
+
+            pk_cp(0, 0).start()
             psc_cp = pltpu.make_async_copy(w_dsc.at[d_i], psc, sem_async.at[7])
             psc_cp.start()
             w_qakv_n, w_qb_n, _ = dsa_scale_widths(spec, tp)
@@ -936,8 +943,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             o_npk[d_i] = jnp.concatenate(fresh_keys, axis=0)
             pcol = jax.lax.broadcasted_iota(jnp.int32, (PT, 1), 0)
 
-            _wait(pka_cp, "kv_wait")
-
             if Q > 1:
                 iq_cat = jnp.concatenate(
                     [iq_all[qi].reshape(hi, idh) for qi in range(Q)], axis=0
@@ -949,7 +954,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 ).astype(F32)
 
             def score_tile(t, c):
-                pk = pka[pl.ds(pl.multiple_of(t * PT, PT), PT), :]
+                b = jax.lax.rem(t, 2)
+                _wait(pk_cp(t, b), "kv_wait")
+
+                @pl.when(t + 1 < nt)
+                def _():
+                    pk_cp(t + 1, 1 - b).start()
+
+                pk = pka[b]
                 for i in range(Q):
                     pk = jnp.where(
                         (pcol + t * PT == fp0 + i) & (i < fresh), fresh_keys[i], pk

@@ -37,7 +37,9 @@ def _core_of(cpu: int) -> set[int]:
 def pin_scheduler_main_thread(scheduler, *args, **kwargs) -> None:
     from sglang_tpu.envs import envs as tpu_envs
 
-    if not tpu_envs.SGLANG_TPU_PIN_SCHEDULER_MAIN_THREAD.get():
+    if not tpu_envs.SGLANG_TPU_PIN_SCHEDULER_MAIN_THREAD.get() or not hasattr(
+        os, "sched_getaffinity"
+    ):
         return None
     allowed = os.sched_getaffinity(0)
     if len(allowed) >= (os.cpu_count() or 0):

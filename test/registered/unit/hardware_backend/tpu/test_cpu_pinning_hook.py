@@ -19,7 +19,10 @@ class TestCpuPinningHook(CustomTestCase):
         placed = {}
         patches = [
             mock.patch.object(
-                cpu_pinning.os, "sched_getaffinity", return_value=set(allowed)
+                cpu_pinning.os,
+                "sched_getaffinity",
+                return_value=set(allowed),
+                create=True,
             ),
             mock.patch.object(cpu_pinning.os, "cpu_count", return_value=cpu_count),
             mock.patch.object(
@@ -29,6 +32,7 @@ class TestCpuPinningHook(CustomTestCase):
                 cpu_pinning.os,
                 "sched_setaffinity",
                 side_effect=lambda tid, cpus: placed.__setitem__(tid, set(cpus)),
+                create=True,
             ),
             mock.patch.object(
                 cpu_pinning.threading, "get_native_id", return_value=MAIN_TID

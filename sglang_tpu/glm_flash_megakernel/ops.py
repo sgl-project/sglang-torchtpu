@@ -2,10 +2,11 @@
 """GLM-5.3-Flash decode megakernel in serving (experimental, opt-in).
 
 Runs single-request target steps (the MTP verify, or plain decode without MTP) as
-one Pallas call per device. A request's caches are gathered from serving's pools at
-its first step and then live in the kernel; serving's pools are not updated, so the
-radix cache must be off. With MTP the KDA states hold one checkpoint per draft
-token, and a verify resumes from the last token the previous verify accepted.
+one Pallas call per device; every other step runs the model as usual. A request's
+caches are copied from serving's pools at its first kernel step and then live in the
+kernel. Before anything else reads serving's pools for that request, `flush` writes
+the kernel's rows and states back in serving's layout. With MTP the KDA states hold
+one checkpoint per draft token, and a verify resumes from the last accepted one.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from sglang_tpu.envs import envs as tpu_envs
 logger = logging.getLogger(__name__)
 
 _AXIS = "tp"
+# Rows per copy between the kernel's caches and serving's pools: one compiled shape.
+_CHUNK = 4096
 
 
 def _owned(t: torch.Tensor) -> torch.Tensor:
@@ -53,6 +56,7 @@ class GlmFlashMegakernel:
         par = get_parallel()
         tp, rank = par.tp_size, par.tp_rank
         device = model.model.norm.weight.device
+        max_len = -(-max_len // _CHUNK) * _CHUNK
         self.spec, self.tp, self.max_len, self.Q = spec, tp, max_len, n_query
         self.vocab = spec.vocab_size
         layout = KernelLayout(spec, tp)
@@ -104,6 +108,12 @@ class GlmFlashMegakernel:
             [rep3],
         )
         self.smalls = self.weights[R.WEIGHT_ORDER.index("smalls")]
+        self.pool_records = export(
+            "jax_glm_flash_mk_pool_records",
+            lambda *a: (run.pool_records(*a),),
+            [rep3, rep3, run.wspec["smalls"], P(None)],
+            [rep3],
+        )
 
         n_dsa, n_kda = len(spec.dsa_layers) + 1, len(spec.kda_layers)
         bf16, f32 = torch.bfloat16, torch.float32
@@ -191,10 +201,14 @@ class GlmFlashMegakernel:
             [P(None, _AXIS), P(None, None), P()] + [cspec[n] for n in run.step_caches],
             donate=tuple(range(4 + nw, 4 + nw + nd)),
         )
-        self.req, self.prev_pos = None, None
+        self.req, self.prev_pos, self.last_steps = None, None, None
 
     def handles(self, forward_batch, input_ids) -> bool:
         if forward_batch.batch_size != 1 or input_ids.shape[0] != self.Q:
+            return False
+        # A request longer than the kernel's caches continues on the model.
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is not None and int(seq_lens_cpu[0]) + self.Q > self.max_len:
             return False
         mode = forward_batch.forward_mode
         if self.Q > 1:
@@ -209,36 +223,56 @@ class GlmFlashMegakernel:
     def invalidate(self):
         self.req = None
 
-    def _load_request(self, forward_batch, req: int, pos: int):
+    def _bind_pools(self):
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
+        backend = get_attn_backend()
+        full = getattr(backend, "full_attn_backend", backend)
+        lin = getattr(backend, "linear_attn_backend", backend)
+        self._pool, self._lin = full.token_to_kv_pool, lin
+        self._req_pool = lin.req_to_token_pool
+
+    def _rows(self, a: int, device):
+        return a + torch.arange(_CHUNK, dtype=torch.int64, device=device)
+
+    def _locs(self, rows, valid):
+        table = self._req_pool.req_to_token[self.req].to(rows.device, torch.int64)
+        locs = table.index_select(0, rows.clamp(max=table.shape[0] - 1))
+        return torch.where(valid, locs, torch.zeros_like(locs))
+
+    def _load_request(self, forward_batch, req: int, pos: int):
         spec = self.spec
         if pos + self.Q > self.max_len:
             raise ValueError(
                 f"position {pos} exceeds the megakernel's max_len {self.max_len}"
             )
-        backend = get_attn_backend()
-        full = getattr(backend, "full_attn_backend", backend)
-        lin = getattr(backend, "linear_attn_backend", backend)
-        pool, req_pool = full.token_to_kv_pool, lin.req_to_token_pool
+        self._bind_pools()
+        pool, req_pool, lin = self._pool, self._req_pool, self._lin
+        self.req = req
         device = self.dsa_caches[0].device
-        locs = req_pool.req_to_token[req, :pos].to(device=device, dtype=torch.int64)
         kv, ik, ig, _ = self.dsa_caches
         idh, kvl = spec.index_head_dim, spec.kv_lora_rank
-        for d, L in enumerate(spec.dsa_layers):
-            nope = pool.get_nope_cache(L).view(-1, kvl).index_select(0, locs)
-            rows = nope.view(torch.float8_e4m3fn).to(torch.float32) * self.k_scales[d]
-            kv[d, :pos] = rows.to(torch.bfloat16)
-            raw = pool.get_kpool_raw_cache(L).view(-1, 2 * idh).index_select(0, locs)
-            ik[d, :pos] = raw[:, :idh]
-            ig[d, :pos] = raw[:, idh:]
+        for a in range(0, pos, _CHUNK):
+            rows = self._rows(a, device)
+            locs = self._locs(rows, rows < pos)
+            for d, L in enumerate(spec.dsa_layers):
+                nope = pool.get_nope_cache(L).view(-1, kvl).index_select(0, locs)
+                vals = (
+                    nope.view(torch.float8_e4m3fn).to(torch.float32) * self.k_scales[d]
+                )
+                kv[d].index_copy_(0, rows, vals.to(torch.bfloat16))
+                raw = (
+                    pool.get_kpool_raw_cache(L).view(-1, 2 * idh).index_select(0, locs)
+                )
+                ik[d].index_copy_(0, rows, raw[:, :idh].contiguous())
+                ig[d].index_copy_(0, rows, raw[:, idh:].contiguous())
         self.dsa_caches[3] = self.init_ip(ik, ig, self.smalls)[0]
         # With MTP the committed state is checkpoint read_offsets[slot] of the slot.
-        slot = lin._slot_indices(forward_batch.req_pool_indices)[0][:1].to(device)
-        row = slot
+        self.slot = lin._slot_indices(forward_batch.req_pool_indices)[0][:1].to(device)
+        row = self.slot
         if self.Q > 1:
             offsets = req_pool.mamba_pool.checkpoint_read_offsets
-            row = slot * self.Q + offsets.to(device).index_select(0, slot)
+            row = self.slot * self.Q + offsets.to(device).index_select(0, self.slot)
         recur, conv = self.kda_caches
         k1 = spec.linear_conv_kernel_dim - 1
         for k, L in enumerate(spec.kda_layers):
@@ -251,7 +285,76 @@ class GlmFlashMegakernel:
             else:
                 recur[k] = st
                 conv[k] = cv
-        self.req = req
+        self.start, self.steps, self.last_steps = pos, 0, None
+
+    def record_commit(self, last_steps: torch.Tensor):
+        """The verify's last accepted step, in place of serving's checkpoint commit."""
+        self.last_steps = last_steps
+
+    def flush(self):
+        """Write the request's kernel-side rows and states into serving's pools."""
+        if self.req is None:
+            return
+        spec, Q = self.spec, self.Q
+        pool, req_pool = self._pool, self._req_pool
+        device = self.dsa_caches[0].device
+        last = self.prev_pos.to(torch.int64)
+        if Q == 1:
+            committed = last + 1
+        elif self.last_steps is not None:
+            committed = last + self.last_steps[:1].to(device, torch.int64) + 1
+        else:
+            committed = last
+        hi = min(self.start + self.steps * Q, self.max_len)
+        kv, ik, ig, _ = self.dsa_caches
+        idh, kvl, kp = spec.index_head_dim, spec.kv_lora_rank, spec.index_kpool
+        ps = pool.page_size
+        for a in range(self.start - self.start % _CHUNK, hi, _CHUNK):
+            rows = self._rows(a, device)
+            valid = (rows >= self.start) & (rows < committed) & (rows < self.max_len)
+            locs = self._locs(rows, valid)
+            idx = (locs // ps, locs % ps)
+            src = rows.clamp(max=self.max_len - 1)
+            for d, L in enumerate(spec.dsa_layers):
+                vals = kv[d].index_select(0, src).to(torch.float32) / self.k_scales[d]
+                nope = (
+                    vals.to(torch.float8_e4m3fn).view(torch.uint8).view(_CHUNK, -1, 128)
+                )
+                pool.get_nope_cache(L).index_put_(idx, nope)
+                raw = torch.cat(
+                    [ik[d].index_select(0, src), ig[d].index_select(0, src)], 1
+                )
+                pool.get_kpool_raw_cache(L).index_put_(idx, raw)
+        # Pools closed while the kernel held the request; pool p sits at position p.
+        p_lo, p_hi = self.start // kp, -(-hi // kp)
+        for a in range(p_lo - p_lo % _CHUNK, p_hi, _CHUNK):
+            pools = self._rows(a, device)
+            end = pools * kp + kp - 1
+            valid = (
+                (end >= self.start) & (end < committed) & (pools * kp < self.max_len)
+            )
+            locs = self._locs(pools, valid)
+            idx = (locs // ps, (locs % ps) // 4, locs % 4)
+            src = pools.clamp(max=self.max_len // kp - 1).to(torch.int32)
+            records = self.pool_records(ik, ig, self.smalls, src)[0]
+            for d, L in enumerate(spec.dsa_layers):
+                pool.get_index_key_cache(L).index_put_(idx, records[d])
+        recur, conv = self.kda_caches
+        if Q > 1:
+            rows = self.slot * Q + torch.arange(Q, dtype=self.slot.dtype, device=device)
+        else:
+            rows = self.slot
+        for k, L in enumerate(spec.kda_layers):
+            c = req_pool.mamba2_layer_cache(L)
+            c.temporal.index_copy_(
+                0, rows, recur[k].reshape(rows.shape[0], *c.temporal.shape[1:])
+            )
+            c.conv[0].index_copy_(
+                0, rows, conv[k].reshape(rows.shape[0], *c.conv[0].shape[1:])
+            )
+        if Q > 1 and self.last_steps is not None:
+            req_pool.mamba_pool.select_checkpoints(self.slot, self.last_steps[:1])
+        self.req = None
 
     def forward(self, input_ids, positions, forward_batch):
         from sglang.srt.distributed import tensor_model_parallel_all_gather
@@ -259,6 +362,7 @@ class GlmFlashMegakernel:
 
         req = int(forward_batch.req_pool_indices_cpu[0])
         if req != self.req:
+            self.flush()
             pos = int(positions.reshape(-1)[0].item())
             self._load_request(forward_batch, req, pos)
             # The first verify resumes from checkpoint 0: prev = pos - 1.
@@ -278,6 +382,8 @@ class GlmFlashMegakernel:
             *self.dsa_caches,
             *self.kda_caches,
         )
+        self.steps += 1
+        self.last_steps = None
         logits, hidden, self.prev_pos, nd = out[0], out[1], out[2], len(self.dsa_caches)
         caches = list(out[3:])
         self.dsa_caches, self.kda_caches = caches[:nd], caches[nd:]

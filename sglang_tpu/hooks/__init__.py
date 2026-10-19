@@ -25,6 +25,7 @@ from sglang_tpu.hooks.draft_kv_pool import (
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
+    drop_freed_glm_flash_megakernel_request,
     reserve_glm_flash_megakernel_experts,
     route_glm_flash_megakernel,
 )
@@ -135,6 +136,11 @@ HOOKS: list[tuple] = [
         "sglang_tpu.graph_runner.tpu_graph_runner.TpuGraphRunner.__init__",
         route_glm_flash_megakernel,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.mem_cache.memory_pool.ReqToTokenPool.free_rows",
+        drop_freed_glm_flash_megakernel_request,
+        HookType.BEFORE,
     ),
     (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",

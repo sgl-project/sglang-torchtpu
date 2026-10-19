@@ -73,11 +73,11 @@ class TpuEnvs:
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
     # GLM-5.3-Flash: single-request target steps (the MTP verify, or decode
-    # without speculation) as one Pallas call per device (glm_flash_megakernel/).
-    # Needs one running request and the radix cache off; ..._MAX_LEN caps the
-    # request length.
+    # without speculation) as one Pallas call per device (glm_flash_megakernel/);
+    # other steps run the model as usual. ..._MAX_LEN caps the request length the
+    # kernel takes (default: the context length).
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
-    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(16384)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(None)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_PIN_SCHEDULER_MAIN_THREAD = EnvBool(False)
