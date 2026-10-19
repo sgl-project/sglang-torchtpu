@@ -4,6 +4,8 @@ substitutions:
   _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu"
   _TAG: "latest"
   _BASE_IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base:latest"
+  # Release version for the packages in the image; empty for CI builds.
+  _VERSION: ""
 
 serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
 
@@ -28,6 +30,7 @@ steps:
         DOCKER_BUILDKIT=1 docker build \
           -f docker/tpu.Dockerfile \
           --build-arg BASE_IMAGE="${_BASE_IMAGE}" \
+          --build-arg SGLANG_VERSION="${_VERSION}" \
           -t "${_IMAGE}:${_TAG}" .
 
 images:

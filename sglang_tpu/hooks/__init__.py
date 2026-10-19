@@ -26,12 +26,22 @@ from sglang_tpu.hooks.mhc import (
     register_mhc_ops,
     wire_hc_ffn_post_pre,
 )
+from sglang_tpu.hooks.moe_topk import (
+    biased_grouped_topk,
+    biased_topk,
+    register_router_topk,
+)
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
+from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
+from sglang_tpu.hooks.twolevel_allreduce import (
+    merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +112,36 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer.hc_post",
         hc_post,
         HookType.AROUND,
+    ),
+    (
+        "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
+        twolevel_all_reduce,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
+        twolevel_merged_moe_all_reduce,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.layers.moe.topk.TopK.__init__",
+        register_router_topk,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.moe.topk.biased_topk_impl",
+        biased_topk,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.layers.moe.topk.biased_grouped_topk_impl",
+        biased_grouped_topk,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+        bind_kimi_k3_static_fp8,
+        HookType.AFTER,
     ),
 ]
 

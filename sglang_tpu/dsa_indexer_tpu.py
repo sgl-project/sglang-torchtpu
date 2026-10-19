@@ -28,6 +28,7 @@ from sglang_tpu.pallas_export import (
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
     from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang_tpu.attention_pallas_mla_sparse import TpuPallasSparseMlaAttnBackend
 
 _PALLAS_DSA_INDEX_TOPK_OP = None
@@ -159,6 +160,7 @@ def indexer_forward(
     x: torch.Tensor,
     q_lora: torch.Tensor,
     positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
     layer_id: int,
 ) -> torch.Tensor:
     """Return the top-k key positions for each query token.
@@ -186,6 +188,7 @@ def indexer_forward(
 
     head_weights, _ = indexer.weights_proj(x)
     return backend.index_topk(
+        forward_batch=forward_batch,
         layer_id=layer_id,
         query=query,
         key=key,
@@ -322,6 +325,7 @@ def kpool_indexer_forward(
     backend: "TpuPallasSparseMlaAttnBackend",
     x: torch.Tensor,
     q_lora: torch.Tensor,
+    forward_batch: "ForwardBatch",
     layer_id: int,
 ) -> torch.Tensor:
     """Top-k token positions for each query of a pooled (kpool) indexer.
@@ -336,6 +340,7 @@ def kpool_indexer_forward(
     gate = torch.nn.functional.linear(x, indexer.index_kpool_compress_gate)
     head_weights, _ = indexer.weights_proj(x.float())
     return backend.index_topk_kpool(
+        forward_batch=forward_batch,
         layer_id=layer_id,
         query=query,
         key=key,

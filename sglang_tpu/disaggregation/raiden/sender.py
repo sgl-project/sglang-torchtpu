@@ -26,11 +26,7 @@ from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
 )
-from sglang_tpu.disaggregation.raiden.common import (
-    RESHARD_PUSH_PARALLELISM,
-    _tcp_endpoint,
-    logger,
-)
+from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -992,7 +988,7 @@ class RaidenSenderMixin:
                         swa_blocks,
                         decode_swa_blocks,
                         layer_idx,
-                        parallelism=RESHARD_PUSH_PARALLELISM,
+                        parallelism=self._transfer_parallelism,
                     )
             # INFO, not debug: this is the only evidence the window actually
             # crossed. Everything else about a hybrid reshard looks identical
@@ -1159,7 +1155,7 @@ class RaidenSenderMixin:
                         prefill_blocks,
                         decode_blocks,
                         layer_idx,
-                        parallelism=RESHARD_PUSH_PARALLELISM,
+                        parallelism=self._transfer_parallelism,
                     )
         finally:
             # Frees the plan's staging on the sender; the receiver's is freed

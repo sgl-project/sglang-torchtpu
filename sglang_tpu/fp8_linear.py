@@ -4,7 +4,7 @@
 """TPU FP8 dense linear helpers."""
 
 import logging
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import torch
 from torch.nn import Module
@@ -13,10 +13,14 @@ from torch.nn.parameter import Parameter
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
+from sglang_tpu.kernels import static_fp8_gemv as _static_fp8_gemv
 
 logger = logging.getLogger(__name__)
 
 _SMALL_M_OP: Callable | None = None
+_STATIC_FP8_GEMV_OP: Callable | None = None
+# Plain bool, not a None check on the op: Dynamo traces the eligibility check.
+_STATIC_FP8_GEMV_READY = False
 
 
 def compute_tpu_fp8_linear_scale_shape(
@@ -289,6 +293,88 @@ def apply_tpu_fp8_linear(
     return out
 
 
+class StaticFp8Weight(NamedTuple):
+    """An fp8 [K, N] weight whose input activation has a fixed scale.
+
+    Calling it applies the GEMV, so a model holds one attribute and needs no
+    import of this module at the call site.
+    """
+
+    weight: torch.Tensor  # float8_e4m3fn [K, N]
+    out_scale: torch.Tensor  # f32 [N]: per-channel weight scale * input scale
+    inv_x_scale: float
+    one: torch.Tensor  # f32 [1], the unit scale torch._scaled_mm requires
+    inv_x: torch.Tensor  # f32 [1], inv_x_scale as a tensor for the Pallas GEMV
+    # Real N when weight / out_scale are zero-padded to a 128 multiple; 0 if not.
+    n_out: int = 0
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return apply_tpu_static_fp8_linear(x, self)
+
+
+def quantize_rmsnorm_fed_weight(
+    weight_kn: torch.Tensor, norm_weight: torch.Tensor
+) -> StaticFp8Weight:
+    """Quantize a [K, N] weight whose input is an RMSNorm output.
+
+    y = x / rms(x) * g gives |y_i| <= sqrt(K) * |g_i| for every input, so a
+    per-tensor input scale of sqrt(K) * max|g| / fp8_max cannot overflow and
+    needs no per-step amax. The weight takes a per-output-channel scale.
+
+    Every returned tensor is a fresh contiguous base tensor: torch_tpu
+    re-materializes a view passed into a compiled graph with an eager
+    as_strided launch on every call.
+    """
+    if weight_kn.shape[0] != norm_weight.shape[0]:
+        raise ValueError(
+            f"weight K={weight_kn.shape[0]} does not match the RMSNorm width "
+            f"{norm_weight.shape[0]}"
+        )
+    if weight_kn.shape[1] % 16 != 0:
+        raise ValueError(
+            f"torch_tpu torch._scaled_mm needs N % 16 == 0, got N={weight_kn.shape[1]}"
+        )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    w_scale = weight_kn.abs().amax(dim=0).float().clamp(min=1e-12) / fp8_max
+    w_fp8 = (weight_kn.float() / w_scale).to(torch.float8_e4m3fn).contiguous()
+    g_max = max(norm_weight.detach().abs().max().float().item(), 1e-12)
+    # 1% margin for the bf16 rounding of the RMSNorm output.
+    x_scale = 1.01 * weight_kn.shape[0] ** 0.5 * g_max / fp8_max
+    return StaticFp8Weight(
+        weight=w_fp8,
+        out_scale=(w_scale * x_scale).clone(),
+        inv_x_scale=1.0 / x_scale,
+        one=torch.ones(1, dtype=torch.float32, device=weight_kn.device),
+        inv_x=torch.full(
+            (1,), 1.0 / x_scale, dtype=torch.float32, device=weight_kn.device
+        ),
+    )
+
+
+def apply_tpu_static_fp8_linear(x: torch.Tensor, w: StaticFp8Weight) -> torch.Tensor:
+    """x [M, K] @ w with the static input scale; returns x.dtype [M, N]."""
+    if _static_fp8_gemv_eligible(x, w):
+        out = _STATIC_FP8_GEMV_OP(x, w.weight, w.out_scale, w.inv_x)
+        return out[:, : w.n_out] if w.n_out else out
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    x_2d, pad = _pad_rows_to_scaled_mm_alignment(x.float())
+    # The clamp is free in the quantize fusion and guards the cast, which
+    # does not saturate (an over-range value would become NaN).
+    x_q = (x_2d * w.inv_x_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    out = torch._scaled_mm(
+        x_q, w.weight, scale_a=w.one, scale_b=w.one, out_dtype=torch.float32
+    )
+    # Scale while still f32 and narrow before the cast: XLA folds scale,
+    # narrow and cast into one fusion. Narrowing a bf16 [16, N] instead adds a
+    # relayout of the tiled rows.
+    out = out * w.out_scale
+    if pad:
+        out = torch.narrow(out, 0, 0, x.shape[0])
+    if w.n_out:
+        out = out[:, : w.n_out]
+    return out.to(x.dtype)
+
+
 def tpu_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -381,3 +467,69 @@ def register_fp8_linear_small_m_op() -> None:
     """Register the op before torch.compile traces a model."""
 
     _get_fp8_linear_small_m_op()
+
+
+def register_static_fp8_gemv_op() -> None:
+    """Register the static fp8 Pallas GEMV when enabled; must run before
+    torch.compile traces the model (the Kimi-K3 static fp8 binder calls it
+    post-load). Left unregistered, every call keeps the XLA fp8 dot."""
+    global _STATIC_FP8_GEMV_OP, _STATIC_FP8_GEMV_READY
+    if not tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.get():
+        return
+    if _STATIC_FP8_GEMV_OP is None:
+        import jax  # noqa: F401  (force loud failure if JAX is missing)
+
+        from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+        def _op(
+            x: jax.Array, w: jax.Array, out_scale: jax.Array, inv_x: jax.Array
+        ) -> jax.Array:
+            return _static_fp8_gemv.static_fp8_gemv_jax(
+                x, w, out_scale, inv_x, _static_fp8_gemv.block_k(x.shape[1], w.shape[1])
+            )
+
+        def _fake(x, w, out_scale, inv_x):
+            return x.new_empty((x.shape[0], w.shape[1]))
+
+        op = cpu_export_jax_op("sglang_tpu_pallas::static_fp8_gemv", _op)
+        op.register_fake(_fake)
+        _STATIC_FP8_GEMV_OP = op
+    _STATIC_FP8_GEMV_READY = True
+
+
+def static_fp8_gemv_enabled() -> bool:
+    """Whether the static fp8 Pallas GEMV is registered."""
+    return _STATIC_FP8_GEMV_READY
+
+
+def _static_fp8_gemv_eligible(x: torch.Tensor, w: StaticFp8Weight) -> bool:
+    return (
+        _STATIC_FP8_GEMV_READY
+        and x.dim() == 2
+        and 0 < x.shape[0] <= _static_fp8_gemv.MAX_TOKENS
+        and x.dtype == torch.bfloat16
+        # The binder pads N to a 128 multiple only when the op is registered.
+        and w.weight.shape[1] % 128 == 0
+        and _static_fp8_gemv.block_k(x.shape[1], w.weight.shape[1]) > 0
+    )
+
+
+def pad_static_fp8_n(w: StaticFp8Weight, force: bool = False) -> StaticFp8Weight:
+    """Zero-pad N to a 128 multiple (``n_out`` keeps the real width).
+
+    An unaligned fp8 [K, N] operand makes XLA relayout the whole weight before
+    every call (Kimi-K3 MLA q_a, N=2112: 166 us per call). Padding is only
+    applied when the kernel is registered (or ``force``). The pad is cloned
+    into a base tensor: a view graph input costs an eager as_strided per step.
+    """
+    n = w.weight.shape[1]
+    if not (_STATIC_FP8_GEMV_READY or force) or n % 128 == 0:
+        return w
+    extra = 128 - n % 128
+    weight = (
+        torch.nn.functional.pad(w.weight.view(torch.uint8), (0, extra))
+        .view(w.weight.dtype)
+        .clone()
+    )
+    out_scale = torch.nn.functional.pad(w.out_scale, (0, extra)).clone()
+    return w._replace(weight=weight, out_scale=out_scale, n_out=n)

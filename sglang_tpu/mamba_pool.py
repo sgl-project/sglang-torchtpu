@@ -268,6 +268,23 @@ class TpuMambaPool(MambaPool):
             for state in states
         ]
 
+    def get_state(self) -> list[torch.Tensor]:
+        """The per-layer conv and recurrent tensors the GDN/KDA kernels mutate."""
+        return self._copy_states()
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Install a list laid out like get_state."""
+        num_layers = self.num_mamba_layers
+        num_kinds = len(self.mamba_cache.conv)
+        assert len(state) == (num_kinds + 1) * num_layers, len(state)
+        self.mamba_cache = TpuPerLayerState(
+            conv=[
+                state[kind * num_layers : (kind + 1) * num_layers]
+                for kind in range(num_kinds)
+            ],
+            temporal=state[num_kinds * num_layers :],
+        )
+
     @torch.no_grad()
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         if src_indices.numel() == 0:

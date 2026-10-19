@@ -114,7 +114,16 @@ class TestQuantizeKvToFp8(CustomTestCase):
         torch.testing.assert_close(q.to(torch.bfloat16), t, rtol=0, atol=0)
 
 
-def _run_forward_mla(*, quant_dtype, k_scale_float):
+def _forward_batch(draft_kv_lens=None):
+    spec_info = (
+        None
+        if draft_kv_lens is None
+        else SimpleNamespace(rpa_draft_kv_lens=draft_kv_lens)
+    )
+    return SimpleNamespace(spec_info=spec_info)
+
+
+def _run_forward_mla(*, quant_dtype, k_scale_float, draft_kv_lens=None):
     """Drive ``_forward_mla`` on a stand-in backend with a mocked kernel op."""
     T, H, R, D = 3, 4, 512, 64
     op = MagicMock(return_value=torch.zeros(T, H, R))
@@ -139,6 +148,7 @@ def _run_forward_mla(*, quant_dtype, k_scale_float):
     backend._kv_cache_buffers = functools.partial(
         TpuPallasMlaAttnBackend._kv_cache_buffers, backend
     )
+    backend._kv_lens = functools.partial(TpuPallasMlaAttnBackend._kv_lens, backend)
     layer = SimpleNamespace(
         v_head_dim=R,
         qk_head_dim=R + D,
@@ -152,7 +162,13 @@ def _run_forward_mla(*, quant_dtype, k_scale_float):
     k = torch.randn(T, 1, R, dtype=torch.bfloat16) * 4
     k_rope = torch.randn(T, 1, D, dtype=torch.bfloat16) * 4
     out = TpuPallasMlaAttnBackend._forward_mla(
-        backend, q, k, layer, forward_batch=None, q_rope=q_rope, k_rope=k_rope
+        backend,
+        q,
+        k,
+        layer,
+        forward_batch=_forward_batch(draft_kv_lens),
+        q_rope=q_rope,
+        k_rope=k_rope,
     )
     return out, op.call_args.args, k, k_rope
 
@@ -192,6 +208,13 @@ class TestForwardMlaFp8Branch(CustomTestCase):
         # Inputs are made dense and contiguous before the pallas bridge.
         self.assertTrue(args[0].is_contiguous() and args[1].is_contiguous())
 
+    def test_fused_draft_step_attends_with_its_own_kv_lens(self):
+        draft_kv_lens = torch.tensor([7], dtype=torch.int32)
+        _, args, _, _ = _run_forward_mla(
+            quant_dtype=None, k_scale_float=None, draft_kv_lens=draft_kv_lens
+        )
+        self.assertIs(args[5], draft_kv_lens)
+
 
 class TestSparseForwardMlaCacheBuffers(CustomTestCase):
     def test_op_gets_two_cache_buffers_in_place_of_the_fused_one(self):
@@ -221,6 +244,9 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
         backend._kv_cache_buffers = functools.partial(
             TpuPallasSparseMlaAttnBackend._kv_cache_buffers, backend
         )
+        backend._kv_lens = functools.partial(
+            TpuPallasSparseMlaAttnBackend._kv_lens, backend
+        )
         layer = SimpleNamespace(
             v_head_dim=R,
             qk_head_dim=R + D,
@@ -234,7 +260,7 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
             torch.randn(T, H, R, dtype=torch.bfloat16),
             torch.randn(T, 1, R, dtype=torch.bfloat16),
             layer,
-            forward_batch=None,
+            forward_batch=_forward_batch(),
             q_rope=torch.randn(T, H, D, dtype=torch.bfloat16),
             k_rope=torch.randn(T, 1, D, dtype=torch.bfloat16),
             topk_indices="topk",
@@ -257,6 +283,67 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
             ),
         )
         self.assertEqual(op.call_args.kwargs, {})
+
+
+class TestSparseIndexerKvLens(CustomTestCase):
+    """A fused draft step picks its top-k over its own KV length, not step 0's."""
+
+    def _backend(self):
+        backend = SimpleNamespace(
+            _index_topk_op=MagicMock(),
+            _topk=4,
+            _kpool_width=8,
+            forward_metadata=SimpleNamespace(
+                kv_lens="kv_lens",
+                page_indices="page_indices",
+                cu_q_lens="cu_q_lens",
+                distribution="distribution",
+                decode_query_size=1,
+            ),
+            token_to_kv_pool=SimpleNamespace(
+                get_index_key_cache=lambda layer_id: f"index{layer_id}",
+                get_kpool_raw_cache=lambda layer_id: f"raw{layer_id}",
+            ),
+        )
+        backend._kv_lens = functools.partial(
+            TpuPallasSparseMlaAttnBackend._kv_lens, backend
+        )
+        return backend
+
+    def test_index_topk(self):
+        backend = self._backend()
+        t = torch.zeros(1)
+        for draft_kv_lens, expected in ((None, "kv_lens"), ("draft", "draft")):
+            with self.subTest(draft_kv_lens=draft_kv_lens):
+                TpuPallasSparseMlaAttnBackend.index_topk(
+                    backend,
+                    forward_batch=_forward_batch(draft_kv_lens),
+                    layer_id=2,
+                    query=t,
+                    key=t,
+                    head_weights=t,
+                    weight_scale=1.0,
+                )
+                args = backend._index_topk_op.call_args.args
+                self.assertEqual(args[3:5], ("index2", expected))
+
+    def test_index_topk_kpool(self):
+        backend = self._backend()
+        t = torch.zeros(1)
+        TpuPallasSparseMlaAttnBackend.index_topk_kpool(
+            backend,
+            forward_batch=_forward_batch("draft"),
+            layer_id=2,
+            query=t,
+            key=t,
+            gate=t,
+            head_weights=t,
+            ape=t,
+            weight_scale=1.0,
+            kpool=4,
+        )
+        args = backend._index_topk_op.call_args.args
+        self.assertEqual(args[5:8], ("raw2", "index2", "draft"))
 
 
 if __name__ == "__main__":
