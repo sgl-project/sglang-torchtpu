@@ -26,6 +26,27 @@ SGLang-TorchTPU brings [SGLang](https://github.com/sgl-project/sglang) to Google
 
 ## Get started
 
+### Docker
+
+Pull the TPU image, which has the engine and TPU plugin installed:
+
+```bash
+docker pull lmsysorg/sglang:v0.1.0-tpu
+```
+
+On a TPU7x host, start a container with access to the TPU chips:
+
+```bash
+docker run -it --rm --privileged --net=host --shm-size=64g \
+  -e SGLANG_PLATFORM=tpu_oot \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  lmsysorg/sglang:v0.1.0-tpu
+```
+
+The container starts in the repository root, `/sgl-workspace/sglang`.
+
+### From source
+
 On a TPU7x host with `torch_tpu` and `libtpu` installed using the versions in [the TPU dependency manifest](python/pyproject_tpu.toml), install the engine and TPU plugin from source:
 
 ```bash
@@ -34,6 +55,8 @@ cd sglang-torchtpu
 pip install -e python/
 pip install --no-deps -e .
 ```
+
+### Launch a server
 
 From the repository root, launch GPT-OSS-20B with the single-host serving recipe, configured for 4 chips and 8 TensorCores:
 
