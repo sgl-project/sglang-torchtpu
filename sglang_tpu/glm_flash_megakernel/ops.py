@@ -26,15 +26,16 @@ def enabled() -> bool:
 
 
 class GlmFlashMegakernel:
-    def __init__(self, model, model_path: str, max_len: int, experts: dict,
-                 n_query: int = 1):
+    def __init__(
+        self, model, model_path: str, max_len: int, experts: dict, n_query: int = 1
+    ):
         import jax
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
-        from sglang.srt.runtime_context import get_parallel
         from torch_tpu._internal.pallas import get_pallas_mesh
         from torch_tpu._internal.pallas import pallas as pallas_impl
 
+        from sglang.srt.runtime_context import get_parallel
         from sglang_tpu.glm_flash_megakernel.build import build_weights, slab_maps
         from sglang_tpu.glm_flash_megakernel.config import Glm53FlashSpec
         from sglang_tpu.glm_flash_megakernel.kernel import decode as D
@@ -62,25 +63,38 @@ class GlmFlashMegakernel:
         weights = build_weights(model, spec, layout, self.cfg, tp, rank, experts)
         self.weights = [weights[n] for n in R.WEIGHT_ORDER]
         nbytes = sum(t.numel() * t.element_size() for t in self.weights)
-        logger.info("GLM-Flash megakernel: %.1f GiB of kernel weights on rank %d",
-                    nbytes / 2**30, rank)
+        logger.info(
+            "GLM-Flash megakernel: %.1f GiB of kernel weights on rank %d",
+            nbytes / 2**30,
+            rank,
+        )
         del weights
 
         def export(name, fn, in_specs, out_specs, donate=()):
             out_sh = tuple(NamedSharding(mesh, s) for s in out_specs)
-            jit_fn = jax.jit(fn, donate_argnums=donate, keep_unused=True,
-                             out_shardings=out_sh)
+            jit_fn = jax.jit(
+                fn, donate_argnums=donate, keep_unused=True, out_shardings=out_sh
+            )
             key = pallas_impl._get_kernel_invocation_key(name, [], {"donate": donate})
             call = _CpuExportJaxCallable(
-                name=name, jit_fn=jit_fn, trace_key=key, mesh=mesh,
-                input_partition_specs=tuple(in_specs), static_argnums=(),
-                donate_argnums=donate)
+                name=name,
+                jit_fn=jit_fn,
+                trace_key=key,
+                mesh=mesh,
+                input_partition_specs=tuple(in_specs),
+                static_argnums=(),
+                donate_argnums=donate,
+            )
             call.sglang_output_shardings = out_sh
             return call
 
         rep3 = P(None, None, None)
-        self.init_ip = export("jax_glm_flash_mk_init_ip", lambda *a: (run.init_ip(*a),),
-                              [rep3, rep3, run.wspec["smalls"]], [rep3])
+        self.init_ip = export(
+            "jax_glm_flash_mk_init_ip",
+            lambda *a: (run.init_ip(*a),),
+            [rep3, rep3, run.wspec["smalls"]],
+            [rep3],
+        )
         self.smalls = self.weights[R.WEIGHT_ORDER.index("smalls")]
 
         n_dsa, n_kda = len(spec.dsa_layers) + 1, len(spec.kda_layers)
@@ -88,21 +102,48 @@ class GlmFlashMegakernel:
         ck = (n_query,) if n_query > 1 else ()
         self.dsa_caches = [
             torch.zeros((n_dsa, max_len, spec.kv_lora_rank), dtype=bf16, device=device),
-            torch.zeros((n_dsa, max_len, spec.index_head_dim), dtype=bf16, device=device),
-            torch.zeros((n_dsa, max_len, spec.index_head_dim), dtype=bf16, device=device),
-            torch.zeros((n_dsa, max_len // spec.index_kpool, spec.index_head_dim),
-                        dtype=f32, device=device),
+            torch.zeros(
+                (n_dsa, max_len, spec.index_head_dim), dtype=bf16, device=device
+            ),
+            torch.zeros(
+                (n_dsa, max_len, spec.index_head_dim), dtype=bf16, device=device
+            ),
+            torch.zeros(
+                (n_dsa, max_len // spec.index_kpool, spec.index_head_dim),
+                dtype=f32,
+                device=device,
+            ),
         ]
         self.kda_caches = [
-            torch.zeros((n_kda, *ck, spec.linear_num_heads // tp, spec.linear_head_dim,
-                         spec.linear_head_dim), dtype=f32, device=device),
-            torch.zeros((n_kda, *ck, spec.linear_conv_kernel_dim - 1,
-                         3 * spec.kda_qkv_dim // tp), dtype=f32, device=device),
+            torch.zeros(
+                (
+                    n_kda,
+                    *ck,
+                    spec.linear_num_heads // tp,
+                    spec.linear_head_dim,
+                    spec.linear_head_dim,
+                ),
+                dtype=f32,
+                device=device,
+            ),
+            torch.zeros(
+                (
+                    n_kda,
+                    *ck,
+                    spec.linear_conv_kernel_dim - 1,
+                    3 * spec.kda_qkv_dim // tp,
+                ),
+                dtype=f32,
+                device=device,
+            ),
         ]
-        assert list(run.dsa_names) == ["kv", "idx_key", "idx_gate", "idx_pool"], run.dsa_names
+        assert list(run.dsa_names) == ["kv", "idx_key", "idx_gate", "idx_pool"], (
+            run.dsa_names
+        )
         assert list(run.kda_names) == ["recur", "conv"], run.kda_names
-        self.init_streams = torch.zeros((n_query * spec.hc_mult, spec.hidden_size),
-                                        dtype=bf16, device=device)
+        self.init_streams = torch.zeros(
+            (n_query * spec.hc_mult, spec.hidden_size), dtype=bf16, device=device
+        )
         self.k_scales = []
         for L in spec.dsa_layers:
             attn = getattr(model.model.layers[L].self_attn, "attn_mqa", None)
@@ -122,19 +163,26 @@ class GlmFlashMegakernel:
             pos = positions.reshape(-1)[:1].astype(jax.numpy.int32)
             pos_in = jax.numpy.concatenate([pos, pos - prev - 1]) if Q > 1 else pos
             logits, _, hidden, out = run.shard(
-                tok.reshape(Q).astype(jax.numpy.int32), pos_in, init, ws, dc, kc)
+                tok.reshape(Q).astype(jax.numpy.int32), pos_in, init, ws, dc, kc
+            )
             return (logits, hidden, pos) + tuple(out[n] for n in run.step_caches)
 
-        in_specs = ([P(), P(), P(), P(None, None)] + [run.wspec[n] for n in R.WEIGHT_ORDER]
-                    + [run.dspec[n] for n in run.dsa_names]
-                    + [run.kspec[n] for n in run.kda_names])
+        in_specs = (
+            [P(), P(), P(), P(None, None)]
+            + [run.wspec[n] for n in R.WEIGHT_ORDER]
+            + [run.dspec[n] for n in run.dsa_names]
+            + [run.kspec[n] for n in run.kda_names]
+        )
         cspec = {**run.dspec, **run.kspec}
         self.call = export(
-            f"jax_glm_flash_mk_L{max_len}_q{n_query}", step, in_specs,
+            f"jax_glm_flash_mk_L{max_len}_q{n_query}",
+            step,
+            in_specs,
             # Keep logits vocab-sharded: replicated here, their mesh sharding leaks into
             # serving's compiled ops, which then fail to compile.
             [P(None, _AXIS), P(None, None), P()] + [cspec[n] for n in run.step_caches],
-            donate=tuple(range(4 + nw, 4 + nw + nd)))
+            donate=tuple(range(4 + nw, 4 + nw + nd)),
+        )
         self.req, self.prev_pos = None, None
 
     def handles(self, forward_batch, input_ids) -> bool:
@@ -158,7 +206,9 @@ class GlmFlashMegakernel:
 
         spec = self.spec
         if pos + self.Q > self.max_len:
-            raise ValueError(f"position {pos} exceeds the megakernel's max_len {self.max_len}")
+            raise ValueError(
+                f"position {pos} exceeds the megakernel's max_len {self.max_len}"
+            )
         backend = get_attn_backend()
         full = getattr(backend, "full_attn_backend", backend)
         lin = getattr(backend, "linear_attn_backend", backend)
@@ -203,14 +253,22 @@ class GlmFlashMegakernel:
             pos = int(positions.reshape(-1)[0].item())
             self._load_request(forward_batch, req, pos)
             # The first verify resumes from checkpoint 0: prev = pos - 1.
-            self.prev_pos = torch.full((1,), pos - 1, dtype=torch.int32,
-                                       device=positions.device)
+            self.prev_pos = torch.full(
+                (1,), pos - 1, dtype=torch.int32, device=positions.device
+            )
         if input_ids.dtype != torch.int32:
             input_ids = input_ids.to(torch.int32)
         if positions.dtype != torch.int32:
             positions = positions.to(torch.int32)
-        out = self.call(input_ids, positions, self.prev_pos, self.init_streams,
-                        *self.weights, *self.dsa_caches, *self.kda_caches)
+        out = self.call(
+            input_ids,
+            positions,
+            self.prev_pos,
+            self.init_streams,
+            *self.weights,
+            *self.dsa_caches,
+            *self.kda_caches,
+        )
         logits, hidden, self.prev_pos, nd = out[0], out[1], out[2], len(self.dsa_caches)
         caches = list(out[3:])
         self.dsa_caches, self.kda_caches = caches[:nd], caches[nd:]

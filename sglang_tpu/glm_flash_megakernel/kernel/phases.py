@@ -27,7 +27,9 @@ def layer_norm(x, weight, bias, eps):
     xf = x.astype(F32)
     mu = jnp.mean(xf, axis=-1, keepdims=True)
     var = jnp.mean(jnp.square(xf - mu), axis=-1, keepdims=True)
-    return weight.astype(F32) * ((xf - mu) * jax.lax.rsqrt(var + eps)) + bias.astype(F32)
+    return weight.astype(F32) * ((xf - mu) * jax.lax.rsqrt(var + eps)) + bias.astype(
+        F32
+    )
 
 
 def l2norm(x, eps=1e-6):
@@ -59,12 +61,18 @@ def matvec_bf16(x, w):
     narrow = w.shape[0] < SUBLANE * 16
     if narrow:
         out = jax.lax.dot_general(
-            xp.astype(F32), w.astype(F32), (((xp.ndim - 1,), (1,)), ((), ())),
-            preferred_element_type=F32)
+            xp.astype(F32),
+            w.astype(F32),
+            (((xp.ndim - 1,), (1,)), ((), ())),
+            preferred_element_type=F32,
+        )
     else:
         out = jax.lax.dot_general(
-            xp.astype(BF16), w.astype(BF16), (((xp.ndim - 1,), (1,)), ((), ())),
-            preferred_element_type=F32)
+            xp.astype(BF16),
+            w.astype(BF16),
+            (((xp.ndim - 1,), (1,)), ((), ())),
+            preferred_element_type=F32,
+        )
     return out[:keep] if keep else out
 
 
@@ -77,8 +85,10 @@ def matvec_fp8_split(x, w_fp8, scale, block):
     for j in range(n_i):
         lo, hi = j * bi, min((j + 1) * bi, in_dim)
         part = jax.lax.dot_general(
-            x[..., lo:hi].astype(BF16), w_fp8[:, lo:hi],
-            (((x.ndim - 1,), (1,)), ((), ())), preferred_element_type=F32,
+            x[..., lo:hi].astype(BF16),
+            w_fp8[:, lo:hi],
+            (((x.ndim - 1,), (1,)), ((), ())),
+            preferred_element_type=F32,
         )
         s = jnp.repeat(scale[:, j], bo)[:out_dim]
         acc = part * s if acc is None else acc + part * s
@@ -99,9 +109,14 @@ def matvec_fp8(x, w_fp8, scale, block):
         for a in range(n_o):
             lo, hi = a * bo, min((a + 1) * bo, out_dim)
             sx = xp.astype(F32) * jnp.repeat(scale[a : a + 1], bi, axis=1)[:, :in_dim]
-            parts.append(jax.lax.dot_general(
-                sx.astype(BF16), w_fp8[lo:hi],
-                (((xp.ndim - 1,), (1,)), ((), ())), preferred_element_type=F32))
+            parts.append(
+                jax.lax.dot_general(
+                    sx.astype(BF16),
+                    w_fp8[lo:hi],
+                    (((xp.ndim - 1,), (1,)), ((), ())),
+                    preferred_element_type=F32,
+                )
+            )
         out = jnp.concatenate(parts, axis=-1)
         return out[:keep] if keep else out
 
@@ -109,8 +124,11 @@ def matvec_fp8(x, w_fp8, scale, block):
     for j in range(n_i):
         lo, hi = j * bi, min((j + 1) * bi, in_dim)
         part = jax.lax.dot_general(
-            xp[..., lo:hi].astype(BF16), w_fp8[:, lo:hi],
-            (((xp.ndim - 1,), (1,)), ((), ())), preferred_element_type=F32)
+            xp[..., lo:hi].astype(BF16),
+            w_fp8[:, lo:hi],
+            (((xp.ndim - 1,), (1,)), ((), ())),
+            preferred_element_type=F32,
+        )
         sc = jnp.repeat(scale[:, j : j + 1], bo, axis=0).reshape(1, -1)[:, :out_dim]
         acc = part * sc if acc is None else acc + part * sc
     return acc[:keep] if keep else acc
@@ -132,7 +150,9 @@ def select_top_k_mask(scores, k, *, score_iters=40, index_iters=24):
     def score_step(_, b):
         lo, hi = b
         mid = 0.5 * (lo + hi)
-        cnt = jnp.sum((eligible & (scores > mid)).astype(jnp.int32), axis=1, keepdims=True)
+        cnt = jnp.sum(
+            (eligible & (scores > mid)).astype(jnp.int32), axis=1, keepdims=True
+        )
         return (jnp.where(cnt >= want, mid, lo), jnp.where(cnt >= want, hi, mid))
 
     lo, hi = jax.lax.fori_loop(0, score_iters, score_step, (lo, hi))
@@ -158,8 +178,9 @@ def select_top_k_mask(scores, k, *, score_iters=40, index_iters=24):
 def select_top_k_mask_2d(scores, k, *, score_iters=40, index_iters=24):
     """`select_top_k_mask` over a [T, P] array as one flat row of T * P."""
     T, P = scores.shape
-    idx = (jax.lax.broadcasted_iota(jnp.int32, scores.shape, 0) * P
-           + jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1))
+    idx = jax.lax.broadcasted_iota(
+        jnp.int32, scores.shape, 0
+    ) * P + jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1)
     ax = (0, 1)
     eligible = jnp.isfinite(scores)
     n_elig = jnp.sum(eligible.astype(jnp.int32), axis=ax, keepdims=True)
@@ -174,7 +195,9 @@ def select_top_k_mask_2d(scores, k, *, score_iters=40, index_iters=24):
     def score_step(_, b):
         lo, hi = b
         mid = 0.5 * (lo + hi)
-        cnt = jnp.sum((eligible & (scores > mid)).astype(jnp.int32), axis=ax, keepdims=True)
+        cnt = jnp.sum(
+            (eligible & (scores > mid)).astype(jnp.int32), axis=ax, keepdims=True
+        )
         return (jnp.where(cnt >= want, mid, lo), jnp.where(cnt >= want, hi, mid))
 
     lo, hi = jax.lax.fori_loop(0, score_iters, score_step, (lo, hi))
@@ -200,8 +223,9 @@ def select_top_k_mask_2d(scores, k, *, score_iters=40, index_iters=24):
 def select_top_k_mask_3d(scores, k, *, score_iters=40, index_iters=24):
     """`select_top_k_mask_2d` for B independent [T, P] arrays ([B, T, P])."""
     B, T, P = scores.shape
-    idx = (jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1) * P
-           + jax.lax.broadcasted_iota(jnp.int32, scores.shape, 2))
+    idx = jax.lax.broadcasted_iota(
+        jnp.int32, scores.shape, 1
+    ) * P + jax.lax.broadcasted_iota(jnp.int32, scores.shape, 2)
     ax = (1, 2)
     eligible = jnp.isfinite(scores)
     n_elig = jnp.sum(eligible.astype(jnp.int32), axis=ax, keepdims=True)
@@ -216,7 +240,9 @@ def select_top_k_mask_3d(scores, k, *, score_iters=40, index_iters=24):
     def score_step(_, b):
         lo, hi = b
         mid = 0.5 * (lo + hi)
-        cnt = jnp.sum((eligible & (scores > mid)).astype(jnp.int32), axis=ax, keepdims=True)
+        cnt = jnp.sum(
+            (eligible & (scores > mid)).astype(jnp.int32), axis=ax, keepdims=True
+        )
         return (jnp.where(cnt >= want, mid, lo), jnp.where(cnt >= want, hi, mid))
 
     lo, hi = jax.lax.fori_loop(0, score_iters, score_step, (lo, hi))
@@ -244,15 +270,30 @@ def sinkhorn_step(c, hc_eps):
     return c / (jnp.sum(c, axis=-2, keepdims=True) + hc_eps)
 
 
-def hyper_connection(streams, fn, base, scale, *, hc_mult, hc_eps, iters, rms_eps,
-                     collapsed_dtype=BF16, defer_sinkhorn=False):
+def hyper_connection(
+    streams,
+    fn,
+    base,
+    scale,
+    *,
+    hc_mult,
+    hc_eps,
+    iters,
+    rms_eps,
+    collapsed_dtype=BF16,
+    defer_sinkhorn=False,
+):
     """streams [N, D] -> (post [N, 1], comb [N, N], collapsed [1, D]); all rank-2 to lower."""
     n = hc_mult
     flat = unweighted_rms_norm(streams.reshape(1, -1), rms_eps)
     # HIGHEST: default-precision f32 runs as bf16 passes, too coarse for these coefficients.
-    coef = jax.lax.dot_general(flat, fn.astype(F32), (((1,), (1,)), ((), ())),
-                               preferred_element_type=F32,
-                               precision=jax.lax.Precision.HIGHEST)
+    coef = jax.lax.dot_general(
+        flat,
+        fn.astype(F32),
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=F32,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
     pre_w, post_w = coef[:, :n], coef[:, n : 2 * n]
     pre_b, post_b = base[:, :n], base[:, n : 2 * n]
@@ -261,9 +302,13 @@ def hyper_connection(streams, fn, base, scale, *, hc_mult, hc_eps, iters, rms_ep
     post = 2.0 * jax.nn.sigmoid(post_w * scale[0, 1] + post_b)
 
     cw = jnp.concatenate(
-        [coef[:, 2 * n + i * n : 2 * n + (i + 1) * n] * scale[0, 2]
-         + base[:, 2 * n + i * n : 2 * n + (i + 1) * n] for i in range(n)],
-        axis=0)
+        [
+            coef[:, 2 * n + i * n : 2 * n + (i + 1) * n] * scale[0, 2]
+            + base[:, 2 * n + i * n : 2 * n + (i + 1) * n]
+            for i in range(n)
+        ],
+        axis=0,
+    )
     comb = jax.nn.softmax(cw, axis=-1) + hc_eps
 
     # The model's asymmetric first step: one column normalisation, then (iters-1) pairs.
@@ -271,19 +316,32 @@ def hyper_connection(streams, fn, base, scale, *, hc_mult, hc_eps, iters, rms_ep
 
     # With defer_sinkhorn the caller runs the (iters-1) pairs via `sinkhorn_step`.
     if not defer_sinkhorn:
-        comb = jax.lax.fori_loop(0, iters - 1, lambda _, c: sinkhorn_step(c, hc_eps),
-                                 comb, unroll=True)
+        comb = jax.lax.fori_loop(
+            0, iters - 1, lambda _, c: sinkhorn_step(c, hc_eps), comb, unroll=True
+        )
 
     pre_col = jnp.concatenate([pre[:, i : i + 1] for i in range(n)], axis=0)
     # Rounded to the stream dtype, as the model rounds the block input.
-    collapsed = jnp.sum(pre_col * streams.astype(F32), axis=0,
-                        keepdims=True).astype(collapsed_dtype)
+    collapsed = jnp.sum(pre_col * streams.astype(F32), axis=0, keepdims=True).astype(
+        collapsed_dtype
+    )
     post_col = jnp.concatenate([post[:, i : i + 1] for i in range(n)], axis=0)
     return post_col, comb, collapsed
 
 
-def hyper_connection_q(streams_list, fn, base, scale, *, hc_mult, hc_eps, iters,
-                       rms_eps, collapsed_dtype=BF16, defer_sinkhorn=False):
+def hyper_connection_q(
+    streams_list,
+    fn,
+    base,
+    scale,
+    *,
+    hc_mult,
+    hc_eps,
+    iters,
+    rms_eps,
+    collapsed_dtype=BF16,
+    defer_sinkhorn=False,
+):
     """`hyper_connection` for several tokens; the f32 HIGHEST dot is three bf16 dots."""
     n = hc_mult
     flats = [unweighted_rms_norm(st.reshape(1, -1), rms_eps) for st in streams_list]
@@ -293,8 +351,12 @@ def hyper_connection_q(streams_list, fn, base, scale, *, hc_mult, hc_eps, iters,
     r1 = flat - hi.astype(F32)
     mid = r1.astype(BF16)
     lo = (r1 - mid.astype(F32)).astype(BF16)
-    coef_all = sum(jax.lax.dot_general(p_, fnb, (((1,), (1,)), ((), ())),
-                                       preferred_element_type=F32) for p_ in (hi, mid, lo))
+    coef_all = sum(
+        jax.lax.dot_general(
+            p_, fnb, (((1,), (1,)), ((), ())), preferred_element_type=F32
+        )
+        for p_ in (hi, mid, lo)
+    )
     outs = []
     for qi, streams in enumerate(streams_list):
         coef = coef_all[qi : qi + 1]
@@ -303,16 +365,23 @@ def hyper_connection_q(streams_list, fn, base, scale, *, hc_mult, hc_eps, iters,
         pre = jax.nn.sigmoid(pre_w * scale[0, 0] + pre_b) + hc_eps
         post = 2.0 * jax.nn.sigmoid(post_w * scale[0, 1] + post_b)
         cw = jnp.concatenate(
-            [coef[:, 2 * n + i * n : 2 * n + (i + 1) * n] * scale[0, 2]
-             + base[:, 2 * n + i * n : 2 * n + (i + 1) * n] for i in range(n)], axis=0)
+            [
+                coef[:, 2 * n + i * n : 2 * n + (i + 1) * n] * scale[0, 2]
+                + base[:, 2 * n + i * n : 2 * n + (i + 1) * n]
+                for i in range(n)
+            ],
+            axis=0,
+        )
         comb = jax.nn.softmax(cw, axis=-1) + hc_eps
         comb = comb / (jnp.sum(comb, axis=0, keepdims=True) + hc_eps)
         if not defer_sinkhorn:
-            comb = jax.lax.fori_loop(0, iters - 1, lambda _, c: sinkhorn_step(c, hc_eps),
-                                     comb, unroll=True)
+            comb = jax.lax.fori_loop(
+                0, iters - 1, lambda _, c: sinkhorn_step(c, hc_eps), comb, unroll=True
+            )
         pre_col = jnp.concatenate([pre[:, i : i + 1] for i in range(n)], axis=0)
-        collapsed = jnp.sum(pre_col * streams.astype(F32), axis=0,
-                            keepdims=True).astype(collapsed_dtype)
+        collapsed = jnp.sum(
+            pre_col * streams.astype(F32), axis=0, keepdims=True
+        ).astype(collapsed_dtype)
         post_col = jnp.concatenate([post[:, i : i + 1] for i in range(n)], axis=0)
         outs.append((post_col, comb, collapsed))
     return outs
@@ -334,10 +403,13 @@ def hyper_combine_vpu(post, comb, block_out, residual, out_dtype=BF16):
 def hyper_combine(post, comb, block_out, residual, out_dtype=BF16):
     """out = post * block_out + comb^T @ residual, rounded to out_dtype as the model does."""
     expanded = post * block_out.reshape(1, -1)
-    mixed = jax.lax.dot_general(comb, residual.astype(F32),
-                                (((0,), (0,)), ((), ())),
-                                preferred_element_type=F32,
-                                precision=jax.lax.Precision.HIGHEST)
+    mixed = jax.lax.dot_general(
+        comb,
+        residual.astype(F32),
+        (((0,), (0,)), ((), ())),
+        preferred_element_type=F32,
+        precision=jax.lax.Precision.HIGHEST,
+    )
     return (expanded + mixed).astype(out_dtype)
 
 
@@ -363,9 +435,27 @@ def _top_k_small(scores, k):
 
 
 # Batcher's 19-comparator network for 8 keys.
-_SORT8 = ((0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (1, 2),
-          (5, 6), (0, 4), (3, 7), (1, 5), (2, 6), (1, 4), (3, 6), (2, 4), (3, 5),
-          (3, 4))
+_SORT8 = (
+    (0, 1),
+    (2, 3),
+    (4, 5),
+    (6, 7),
+    (0, 2),
+    (1, 3),
+    (4, 6),
+    (5, 7),
+    (1, 2),
+    (5, 6),
+    (0, 4),
+    (3, 7),
+    (1, 5),
+    (2, 6),
+    (1, 4),
+    (3, 6),
+    (2, 4),
+    (3, 5),
+    (3, 4),
+)
 
 
 def sort_ascending(xs):
@@ -437,7 +527,7 @@ def mask_to_indices_mxu(mask, k):
 def kda_step(state, q, k, v, g_log, beta):
     """One token of the Kimi delta rule: state [H, Dk, Dv] -> (new_state, out [H, Dv])."""
     dk = q.shape[-1]
-    qn = l2norm(q) * (dk ** -0.5)
+    qn = l2norm(q) * (dk**-0.5)
     kn = l2norm(k)
     state = state * jnp.exp(g_log)[..., None]
     kv_mem = jnp.sum(state * kn[..., None], axis=-2)
@@ -460,9 +550,14 @@ def absorb_q(q_heads, kv_b, *, n_heads, qk_dim, v_dim, kv_lora):
     per = qk_dim + v_dim
     for h in range(n_heads):
         w_kc = kv_b[h * per : h * per + qk_dim]
-        outs.append(jax.lax.dot_general(
-            q_heads[h : h + 1], w_kc, (((1,), (0,)), ((), ())),
-            preferred_element_type=F32)[0])
+        outs.append(
+            jax.lax.dot_general(
+                q_heads[h : h + 1],
+                w_kc,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=F32,
+            )[0]
+        )
     return jnp.stack(outs)
 
 
@@ -472,24 +567,34 @@ def project_out(latent_out, kv_b, *, n_heads, qk_dim, v_dim):
     per = qk_dim + v_dim
     for h in range(n_heads):
         w_vc = kv_b[h * per + qk_dim : (h + 1) * per]
-        outs.append(jax.lax.dot_general(
-            latent_out[h : h + 1], w_vc, (((1,), (1,)), ((), ())),
-            preferred_element_type=F32)[0])
+        outs.append(
+            jax.lax.dot_general(
+                latent_out[h : h + 1],
+                w_vc,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=F32,
+            )[0]
+        )
     return jnp.stack(outs)
 
 
 def latent_attention(q_abs, kv_cache, allowed, scaling):
     """Softmax attention against the latent cache; `allowed` is [1, L], as rank-1 does not lower."""
-    logits = jax.lax.dot_general(q_abs, kv_cache, (((1,), (1,)), ((), ())),
-                                 preferred_element_type=F32) * scaling
+    logits = (
+        jax.lax.dot_general(
+            q_abs, kv_cache, (((1,), (1,)), ((), ())), preferred_element_type=F32
+        )
+        * scaling
+    )
     logits = jnp.where(allowed, logits, -jnp.inf)
     m = jnp.max(logits, axis=1, keepdims=True)
     m = jnp.where(jnp.isfinite(m), m, 0.0)
     p = jnp.exp(logits - m)
     p = jnp.where(allowed, p, 0.0)
     p = p / (jnp.sum(p, axis=1, keepdims=True) + 1e-30)
-    return jax.lax.dot_general(p, kv_cache, (((1,), (0,)), ((), ())),
-                               preferred_element_type=F32)
+    return jax.lax.dot_general(
+        p, kv_cache, (((1,), (0,)), ((), ())), preferred_element_type=F32
+    )
 
 
 def indexer_pool_keys(ik, ig, ape, pos, kpool):
@@ -511,9 +616,11 @@ def indexer_pool_keys(ik, ig, ape, pos, kpool):
 
 def indexer_scores(iq, head_w, pool_keys, scale):
     """iq [Hi, Dh], head_w [Hi] or block-diagonal [B, Hi], pool_keys [P, Dh] -> [1 or B, P]."""
-    sc = jax.lax.dot_general(iq, pool_keys, (((1,), (1,)), ((), ())),
-                             preferred_element_type=F32)
+    sc = jax.lax.dot_general(
+        iq, pool_keys, (((1,), (1,)), ((), ())), preferred_element_type=F32
+    )
     sc = jax.nn.relu(sc * scale)
     hw = head_w if head_w.ndim == 2 else head_w.reshape(1, -1)
-    return jax.lax.dot_general(hw, sc, (((1,), (0,)), ((), ())),
-                               preferred_element_type=F32)
+    return jax.lax.dot_general(
+        hw, sc, (((1,), (0,)), ((), ())), preferred_element_type=F32
+    )

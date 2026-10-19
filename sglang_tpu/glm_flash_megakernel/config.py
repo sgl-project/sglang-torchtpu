@@ -83,12 +83,16 @@ class Glm53FlashSpec:
 
     @property
     def kda_layers(self) -> tuple[int, ...]:
-        return tuple(i for i, t in enumerate(self.layer_types) if t == "linear_attention")
+        return tuple(
+            i for i, t in enumerate(self.layer_types) if t == "linear_attention"
+        )
 
     @property
     def dsa_layers(self) -> tuple[int, ...]:
         return tuple(
-            i for i, t in enumerate(self.layer_types) if t == "deepseek_sparse_attention"
+            i
+            for i, t in enumerate(self.layer_types)
+            if t == "deepseek_sparse_attention"
         )
 
     @property
@@ -120,10 +124,12 @@ class Glm53FlashSpec:
         return len(tail), tuple(tail)
 
     @classmethod
-    def from_checkpoint(cls, ckpt_dir: str) -> "Glm53FlashSpec":
+    def from_checkpoint(cls, ckpt_dir: str) -> Glm53FlashSpec:
         raw = json.load(open(os.path.join(ckpt_dir, "config.json")))
         if raw.get("model_type") != "glm5_next":
-            raise SpecError(f"expected model_type=glm5_next, got {raw.get('model_type')!r}")
+            raise SpecError(
+                f"expected model_type=glm5_next, got {raw.get('model_type')!r}"
+            )
         arch = raw.get("architectures") or []
         if "Glm5NextForConditionalGeneration" not in arch:
             raise SpecError(f"unexpected architectures: {arch}")
@@ -148,7 +154,9 @@ class Glm53FlashSpec:
             rms_norm_eps=need("rms_norm_eps"),
             pad_token_id=need("pad_token_id"),
             eos_token_ids=eos,
-            tie_word_embeddings=t.get("tie_word_embeddings", raw.get("tie_word_embeddings", False)),
+            tie_word_embeddings=t.get(
+                "tie_word_embeddings", raw.get("tie_word_embeddings", False)
+            ),
             layer_types=tuple(need("layer_types")),
             mlp_layer_types=tuple(need("mlp_layer_types")),
             indexer_types=tuple(need("indexer_types")),
@@ -226,7 +234,11 @@ class Glm53FlashSpec:
                 f"num_nextn_predict_layers={self.num_nextn_predict_layers}; the "
                 "speculative path assumes exactly one MTP layer"
             )
-        derived = self.mlp_layer_types.index("sparse") if "sparse" in self.mlp_layer_types else len(self.mlp_layer_types)
+        derived = (
+            self.mlp_layer_types.index("sparse")
+            if "sparse" in self.mlp_layer_types
+            else len(self.mlp_layer_types)
+        )
         if derived != self.first_k_dense_replace:
             raise SpecError(
                 f"first_k_dense_replace={self.first_k_dense_replace} but mlp_layer_types "

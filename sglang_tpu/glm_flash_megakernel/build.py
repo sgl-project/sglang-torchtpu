@@ -50,8 +50,13 @@ def slab_f32_plan(spec) -> dict[str, tuple[int, int]]:
     """tag -> (offset, n) in row 0 of the f32 slab; identical for every layer."""
     nc = (2 + spec.hc_mult) * spec.hc_mult
     m, off = {}, 0
-    for tag, n in (("hc_attn_base", nc), ("hc_attn_scale", 3), ("hc_ffn_base", nc),
-                   ("hc_ffn_scale", 3), ("router_bias", spec.n_routed_experts)):
+    for tag, n in (
+        ("hc_attn_base", nc),
+        ("hc_attn_scale", 3),
+        ("hc_ffn_base", nc),
+        ("hc_ffn_scale", 3),
+        ("router_bias", spec.n_routed_experts),
+    ):
         m[tag] = (off, n)
         off += n
     return m
@@ -80,8 +85,7 @@ def pack_kmajor(w_kn: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     n = N // (cols * k)
     fp8 = w_kn.dtype == _F8
     w = w_kn.view(torch.uint8) if fp8 else w_kn
-    out = (w.reshape(L, K, n, k, cols).permute(0, 2, 3, 1, 4)
-           .reshape(L, n, k * K, cols))
+    out = w.reshape(L, K, n, k, cols).permute(0, 2, 3, 1, 4).reshape(L, n, k * K, cols)
     if k * K < rows:
         out = torch.nn.functional.pad(out, (0, 0, 0, rows - k * K))
     out = out.contiguous()
@@ -111,13 +115,22 @@ def expert_buffers(config, tp: int, device) -> dict[str, torch.Tensor]:
     E, H = config.n_routed_experts, config.hidden_size
     i_sh = config.moe_intermediate_size // tp
     return {
-        "expert_gate_up": torch.empty((n_moe * E, H, 2 * i_sh), dtype=_F8, device=device),
+        "expert_gate_up": torch.empty(
+            (n_moe * E, H, 2 * i_sh), dtype=_F8, device=device
+        ),
         "expert_down": torch.empty((n_moe * E, i_sh, H), dtype=_F8, device=device),
     }
 
 
-def build_weights(model, spec, layout, cfg: D.KernelConfig, tp: int, rank: int,
-                  experts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def build_weights(
+    model,
+    spec,
+    layout,
+    cfg: D.KernelConfig,
+    tp: int,
+    rank: int,
+    experts: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     H = spec.hidden_size
     layers = model.model.layers
     dev = model.model.norm.weight.device
@@ -135,7 +148,9 @@ def build_weights(model, spec, layout, cfg: D.KernelConfig, tp: int, rank: int,
     lm = _gather_vocab(model.lm_head.weight)
     vsh = layout.vocab_padded // tp
     lm = torch.nn.functional.pad(lm, (0, 0, 0, layout.vocab_padded - lm.shape[0]))
-    out["lm_head"] = pack_kmajor(lm[rank * vsh : (rank + 1) * vsh].t()[None], rows16, cols)
+    out["lm_head"] = pack_kmajor(
+        lm[rank * vsh : (rank + 1) * vsh].t()[None], rows16, cols
+    )
     del lm
     out["final_norm"] = model.model.norm.weight.reshape(1, H).to(bf16)
 
@@ -143,7 +158,9 @@ def build_weights(model, spec, layout, cfg: D.KernelConfig, tp: int, rank: int,
     plan = slab_plan(spec, H)
     n_rows = plan.pop("_rows")[0]
     fplan = slab_f32_plan(spec)
-    smalls = torch.zeros((spec.num_hidden_layers + 1, n_rows * H), dtype=bf16, device=dev)
+    smalls = torch.zeros(
+        (spec.num_hidden_layers + 1, n_rows * H), dtype=bf16, device=dev
+    )
     smalls_f = torch.zeros((spec.num_hidden_layers + 1, H), dtype=f32, device=dev)
 
     def put(L, tag, t):
@@ -166,7 +183,7 @@ def build_weights(model, spec, layout, cfg: D.KernelConfig, tp: int, rank: int,
         if spec.mlp_layer_types[L] == "sparse":
             putf(L, "router_bias", lay.mlp.gate.e_score_correction_bias)
 
-    kda = {n: [] for n in ("qkv", "b", "fgb", "o", "dt", "conv", "alog")}
+    kda = {n: [] for n in ("qkv", "b", "fgb", "o", "dt", "conv", "a_log")}
     for L in spec.kda_layers:
         a = layers[L].self_attn
         if hasattr(a, "fused_qkvbfg_a_proj"):
@@ -189,7 +206,7 @@ def build_weights(model, spec, layout, cfg: D.KernelConfig, tp: int, rank: int,
         kda["o"].append(a.o_proj.weight)
         kda["dt"].append(a.dt_bias.reshape(1, qsh).float())
         kda["conv"].append(a.qkv_conv1d.weight[:, 0, :].t().to(bf16))
-        kda["alog"].append(a.A_log.reshape(1, hk).float())
+        kda["a_log"].append(a.A_log.reshape(1, hk).float())
     q8, sq, o8, so = [], [], [], []
     for qkv, o in zip(kda["qkv"], kda["o"]):
         w, s = _quant_channel(qkv)
@@ -200,12 +217,14 @@ def build_weights(model, spec, layout, cfg: D.KernelConfig, tp: int, rank: int,
         so.append(s)
     out["kda_qkv"] = pack_kmajor(torch.stack(q8), rows8, cols)
     out["kda_o"] = pack_kmajor(torch.stack(o8), rows8, cols)
-    out["kda_scale"] = torch.stack([torch.cat([a_, b_]) for a_, b_ in zip(sq, so)])[:, None]
+    out["kda_scale"] = torch.stack([torch.cat([a_, b_]) for a_, b_ in zip(sq, so)])[
+        :, None
+    ]
     out["kda_fg_b"] = torch.stack(kda["fgb"]).to(bf16)
     out["kda_dt_bias"] = torch.stack(kda["dt"])
     out["kda_conv"] = torch.stack(kda["conv"])
     out["kda_b"] = torch.stack(kda["b"]).to(bf16)
-    out["kda_alog"] = torch.stack(kda["alog"])
+    out["kda_a_log"] = torch.stack(kda["a_log"])
 
     # Scale rows follow decode.dsa_scale_widths order.
     width = D.proj_scale_cols(spec, tp)
@@ -224,8 +243,9 @@ def build_weights(model, spec, layout, cfg: D.KernelConfig, tp: int, rank: int,
         qakv.append(a.fused_qkv_a_proj_with_mqa.weight)
         qb.append(a.q_b_proj.weight)
         do.append(a.o_proj.weight)
-        s = torch.cat([_scale(a.fused_qkv_a_proj_with_mqa), _scale(a.q_b_proj),
-                       _scale(a.o_proj)])
+        s = torch.cat(
+            [_scale(a.fused_qkv_a_proj_with_mqa), _scale(a.q_b_proj), _scale(a.o_proj)]
+        )
         dsc.append(torch.nn.functional.pad(s, (0, width - s.numel())))
         kvb.append(a.kv_b_proj.weight)
         iwq.append(ix.wq_b.weight.t())
@@ -248,7 +268,9 @@ def build_weights(model, spec, layout, cfg: D.KernelConfig, tp: int, rank: int,
     out["dense_scale"] = torch.stack(dnsc)[:, None]
 
     E = spec.n_routed_experts
-    moe = [L for L in range(spec.num_hidden_layers) if spec.mlp_layer_types[L] == "sparse"]
+    moe = [
+        L for L in range(spec.num_hidden_layers) if spec.mlp_layer_types[L] == "sparse"
+    ]
     router, egs, eds, sgu, sgs, sdn, sds = [], [], [], [], [], [], []
     for m_i, L in enumerate(moe):
         m = layers[L].mlp

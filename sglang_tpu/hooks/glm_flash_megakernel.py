@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash decode megakernel (experimental, opt-in).
 
-  Why: SGLANG_TPU_GLM_FLASH_MEGAKERNEL runs single-request decode steps (the
-       MTP verify) as one Pallas call per device.
-  How: BEFORE Glm5NextForConditionalGeneration.load_weights reserves the stacked
-       expert arrays while HBM is contiguous; AFTER TpuGraphRunner.__init__ builds
-       the kernel and wraps the compiled model.forward, routing the steps it
-       handles to the kernel.
-  Upstream PR or issue: none (TPU-only kernel).
-  Remove when: the megakernel is a seam of the model, or dropped.
+Why: SGLANG_TPU_GLM_FLASH_MEGAKERNEL runs single-request decode steps (the
+     MTP verify) as one Pallas call per device.
+How: BEFORE Glm5NextForConditionalGeneration.load_weights reserves the stacked
+     expert arrays while HBM is contiguous; AFTER TpuGraphRunner.__init__ builds
+     the kernel and wraps the compiled model.forward, routing the steps it
+     handles to the kernel.
+Upstream PR or issue: none (TPU-only kernel).
+Remove when: the megakernel is a seam of the model, or dropped.
 """
 
 from __future__ import annotations
@@ -24,11 +24,15 @@ def reserve_glm_flash_megakernel_experts(model: Any, *args, **kwargs) -> None:
     from sglang_tpu.glm_flash_megakernel.build import expert_buffers
 
     # The MTP draft loads through this method too; the kernel serves the target.
-    if (not ops.enabled() or hasattr(model, "_tpu_glm_flash_mk_experts")
-            or isinstance(model, Glm5NextForConditionalGenerationNextN)):
+    if (
+        not ops.enabled()
+        or hasattr(model, "_tpu_glm_flash_mk_experts")
+        or isinstance(model, Glm5NextForConditionalGenerationNextN)
+    ):
         return None
     model._tpu_glm_flash_mk_experts = expert_buffers(
-        model.config, get_parallel().tp_size, model.model.embed_tokens.weight.device)
+        model.config, get_parallel().tp_size, model.model.embed_tokens.weight.device
+    )
     return None
 
 
@@ -47,8 +51,11 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
     if args.max_running_requests != 1 or not args.disable_radix_cache:
         raise NotImplementedError(
             "SGLANG_TPU_GLM_FLASH_MEGAKERNEL needs --max-running-requests 1 and "
-            "--disable-radix-cache")
-    n_query = (args.speculative_num_draft_tokens or 1) if args.speculative_algorithm else 1
+            "--disable-radix-cache"
+        )
+    n_query = (
+        (args.speculative_num_draft_tokens or 1) if args.speculative_algorithm else 1
+    )
     mk = ops.GlmFlashMegakernel(
         model,
         args.model_path,
@@ -79,7 +86,8 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
         if mk.active and (mode.is_decode() or mode.is_target_verify()):
             raise RuntimeError(
                 "GLM-Flash megakernel: a decode step it cannot take arrived for a "
-                "request it is serving; serving's caches for it are stale")
+                "request it is serving; serving's caches for it are stale"
+            )
         mk.invalidate()
         return compiled(input_ids, positions, forward_batch, *args, **kwargs)
 

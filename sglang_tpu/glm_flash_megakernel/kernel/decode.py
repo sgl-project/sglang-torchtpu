@@ -73,20 +73,24 @@ class KernelConfig:
 
     def __post_init__(self):
         if self.max_len % self.attn_tile:
-            raise ValueError(f"max_len={self.max_len} must be a multiple of "
-                             f"attn_tile={self.attn_tile}")
+            raise ValueError(
+                f"max_len={self.max_len} must be a multiple of "
+                f"attn_tile={self.attn_tile}"
+            )
         if self.ring and self.prefetch > self.slots - 2:
             raise ValueError(
                 f"prefetch={self.prefetch} needs slots >= {self.prefetch + 2}, got "
                 f"{self.slots}: issuing into a slot that still holds an unwaited "
                 "transfer puts two DMAs on one semaphore, which corrupts results "
                 "and halts the core -- and only once the tile count exceeds the "
-                "ring, so a small shape will not reproduce it")
+                "ring, so a small shape will not reproduce it"
+            )
 
     def layers(self, spec) -> int:
         """How many decoder layers this configuration actually runs."""
-        n = min(spec.num_hidden_layers,
-                spec.first_k_dense_replace + 4 * self.n_periods + 2)
+        n = min(
+            spec.num_hidden_layers, spec.first_k_dense_replace + 4 * self.n_periods + 2
+        )
         return n if self.n_layers is None else min(n, self.n_layers)
 
 
@@ -102,7 +106,8 @@ class SlabIndex:
             if kind in by_kind and by_kind[kind] != m:
                 raise ValueError(
                     f"layer {L} has different float32 slab offsets from another "
-                    f"{kind} layer; the rolled loop assumes they match")
+                    f"{kind} layer; the rolled loop assumes they match"
+                )
             by_kind[kind] = m
         self.f = by_kind
 
@@ -138,8 +143,11 @@ class _Half:
 
 def dsa_scale_widths(spec, tp):
     """Columns of a DSA layer's scale row: [q_a | kv_a], q_b, o."""
-    return (spec.q_lora_rank + spec.kv_lora_rank,
-            spec.num_attention_heads // tp * spec.qk_head_dim, spec.hidden_size)
+    return (
+        spec.q_lora_rank + spec.kv_lora_rank,
+        spec.num_attention_heads // tp * spec.qk_head_dim,
+        spec.hidden_size,
+    )
 
 
 def dense_scale_widths(spec, tp):
@@ -166,8 +174,12 @@ def pack_kmajor(w, rows, tile_n):
     if k < 1 or N % (tile_n * k):
         raise ValueError(f"cannot pack [{N}, {K}] into [{rows}, {tile_n}] slots")
     n = N // (tile_n * k)
-    out = (w.transpose(0, 2, 1).reshape(L, K, n, k, tile_n)
-           .transpose(0, 2, 3, 1, 4).reshape(L, n, k * K, tile_n))
+    out = (
+        w.transpose(0, 2, 1)
+        .reshape(L, K, n, k, tile_n)
+        .transpose(0, 2, 3, 1, 4)
+        .reshape(L, n, k * K, tile_n)
+    )
     if k * K < rows:
         out = jnp.pad(out, ((0, 0), (0, 0), (0, rows - k * K), (0, 0)))
     return out
@@ -178,8 +190,11 @@ def pack_slots(w, tile_rows, hidden):
     L, out, inn = w.shape
     k = hidden // inn
     n = out // (tile_rows * k)
-    return (w.reshape(L, n, k, tile_rows, inn).transpose(0, 1, 3, 2, 4)
-            .reshape(L, n, tile_rows, k * inn))
+    return (
+        w.reshape(L, n, k, tile_rows, inn)
+        .transpose(0, 1, 3, 2, 4)
+        .reshape(L, n, tile_rows, k * inn)
+    )
 
 
 def _dma(src, dst, sem):
@@ -197,8 +212,14 @@ def pick_tile(out_dim: int, want: int) -> int:
 
 
 def _flags(cfg: KernelConfig):
-    return (cfg.fp8_kda, cfg.ch_experts, cfg.bf16_collectives,
-            cfg.km_cols, cfg.km_slots, cfg.km_issue)
+    return (
+        cfg.fp8_kda,
+        cfg.ch_experts,
+        cfg.bf16_collectives,
+        cfg.km_cols,
+        cfg.km_slots,
+        cfg.km_issue,
+    )
 
 
 def scratch_shapes(spec, layout, cfg: KernelConfig):
@@ -220,18 +241,27 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
     S = cfg.slots if cfg.ring else 1
     # A one-query step keeps its state in st / cv; the checkpoint buffers are placeholders.
     ck_st = (2, hkda, dh, dh) if cfg.n_query > 1 else (1, 8, 128)
-    ck_cv = ((2, spec.linear_conv_kernel_dim - 1, 3 * qsh)
-             if cfg.n_query > 1 else (1, 8, 128))
+    ck_cv = (
+        (2, spec.linear_conv_kernel_dim - 1, 3 * qsh)
+        if cfg.n_query > 1
+        else (1, 8, 128)
+    )
     # Positional: the order must match the kernel's scratch arguments.
     return [
         pltpu.VMEM((2, slab_rows, H), BF16),
         pltpu.VMEM((2, 1, H), F32),
         # Each ring has its own semaphore array: two in-flight DMAs must not share a semaphore.
         pltpu.VMEM((KM_SLOTS, H, KM_TILE), BF16),
-        (pltpu.VMEM((S, H, 2 * moesh), f8) if CH_EXPERTS else
-         pltpu.VMEM((S, max(TR, 2 * moesh), H), f8)),
-        (pltpu.VMEM((S, moesh, H), f8) if CH_EXPERTS else
-         pltpu.VMEM((S, H, max(moesh, 128)), f8)),
+        (
+            pltpu.VMEM((S, H, 2 * moesh), f8)
+            if CH_EXPERTS
+            else pltpu.VMEM((S, max(TR, 2 * moesh), H), f8)
+        ),
+        (
+            pltpu.VMEM((S, moesh, H), f8)
+            if CH_EXPERTS
+            else pltpu.VMEM((S, H, max(moesh, 128)), f8)
+        ),
         pltpu.VMEM((S, 1, 2 * moesh) if CH_EXPERTS else (1, 1, 128), F32),
         pltpu.VMEM((S, 1, H) if CH_EXPERTS else (1, 1, 128), F32),
         pltpu.VMEM((hkda, dh, dh), F32),
@@ -244,8 +274,9 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         pltpu.VMEM((32, idh), BF16),
         pltpu.VMEM((32, idh), BF16),
         pltpu.VMEM((L // spec.index_kpool, idh), F32),
-        pltpu.VMEM((cfg.n_query, L // cfg.attn_tile,
-                    cfg.attn_tile // spec.index_kpool), F32),
+        pltpu.VMEM(
+            (cfg.n_query, L // cfg.attn_tile, cfg.attn_tile // spec.index_kpool), F32
+        ),
         pltpu.VMEM((nh * (qk + vd), kvl), BF16),
         pltpu.VMEM((2 * qsh, dh), BF16),
         pltpu.VMEM((1, qsh), F32),
@@ -265,10 +296,8 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         # Exact-size scale buffers: a DMA into a slice of a VMEM buffer must be tile-aligned.
         pltpu.VMEM((max(1, 2 * moesh // 128), H // 128), F32),
         pltpu.VMEM((H // 128, max(1, moesh // 128)), F32),
-        pltpu.VMEM((spec.n_routed_experts, 2 * moesh // 128,
-                    H // 128), F32),
-        pltpu.VMEM((spec.n_routed_experts, H // 128,
-                    max(1, moesh // 128)), F32),
+        pltpu.VMEM((spec.n_routed_experts, 2 * moesh // 128, H // 128), F32),
+        pltpu.VMEM((spec.n_routed_experts, H // 128, max(1, moesh // 128)), F32),
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -308,21 +337,103 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
     Q = cfg.n_query
 
     def kernel(
-        tok_ref, pos_ref, in_streams,
-        w_embed, w_lm, w_fnorm, w_smalls, w_smallsf,
-        w_kqkv, w_ko, w_kfg, w_kdt, w_kconv, w_kb, w_kalog,
-        w_qakv, w_qb, w_kvb, w_do, w_dsc,
-        w_iwq, w_router,
-        w_egu, w_egus, w_edn, w_edns, w_sgu, w_sgus, w_sdn, w_sdns,
-        w_dgu, w_ddn, w_dnsc, w_ksc,
-        c_kv, c_ik, c_ig, c_ip, _crec_in, _cconv_in,
-        o_logits, o_streams, o_hidden, o_nkv, o_nik, o_nig, o_npk,
-        c_recur, c_conv,
-        sm2, smf2, rbf, r8a, r8d, egsr, edsr, st, stq, cv, cvq, kvt, ikb, igb, pka, scr,
-        kvb, fgb, dtv, ksc,
-        cwv, bpv, alv, rtr, fnv, ar, sendv, macc, arb, sendb, embv,
-        psc, s_sgu, s_sdn, egs, eds,
-        sem, sem2, ssem, rsem, sbf, s8a, s8d, sgrp, sasy, sbfn, sslab, s8s,
+        tok_ref,
+        pos_ref,
+        in_streams,
+        w_embed,
+        w_lm,
+        w_fnorm,
+        w_smalls,
+        w_smallsf,
+        w_kqkv,
+        w_ko,
+        w_kfg,
+        w_kdt,
+        w_kconv,
+        w_kb,
+        w_ka_log,
+        w_qakv,
+        w_qb,
+        w_kvb,
+        w_do,
+        w_dsc,
+        w_iwq,
+        w_router,
+        w_egu,
+        w_egus,
+        w_edn,
+        w_edns,
+        w_sgu,
+        w_sgus,
+        w_sdn,
+        w_sdns,
+        w_dgu,
+        w_ddn,
+        w_dnsc,
+        w_ksc,
+        c_kv,
+        c_ik,
+        c_ig,
+        c_ip,
+        _crec_in,
+        _cconv_in,
+        o_logits,
+        o_streams,
+        o_hidden,
+        o_nkv,
+        o_nik,
+        o_nig,
+        o_npk,
+        c_recur,
+        c_conv,
+        sm2,
+        smf2,
+        rbf,
+        r8a,
+        r8d,
+        egsr,
+        edsr,
+        st,
+        stq,
+        cv,
+        cvq,
+        kvt,
+        ikb,
+        igb,
+        pka,
+        scr,
+        kvb,
+        fgb,
+        dtv,
+        ksc,
+        cwv,
+        bpv,
+        alv,
+        rtr,
+        fnv,
+        ar,
+        sendv,
+        macc,
+        arb,
+        sendb,
+        embv,
+        psc,
+        s_sgu,
+        s_sdn,
+        egs,
+        eds,
+        sem,
+        sem2,
+        ssem,
+        rsem,
+        sbf,
+        s8a,
+        s8d,
+        sgrp,
+        sem_async,
+        sbfn,
+        sslab,
+        s8s,
     ):
         me = jax.lax.axis_index(AXIS)
         pos = pos_ref[0]
@@ -331,8 +442,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         sm, smf = _Half(sm2), _Half(smf2)
 
         def slab_copies(L, par):
-            return [pltpu.make_async_copy(w_smalls.at[L], sm2.at[par], sslab.at[par, 0]),
-                    pltpu.make_async_copy(w_smallsf.at[L], smf2.at[par], sslab.at[par, 1])]
+            return [
+                pltpu.make_async_copy(w_smalls.at[L], sm2.at[par], sslab.at[par, 0]),
+                pltpu.make_async_copy(w_smallsf.at[L], smf2.at[par], sslab.at[par, 1]),
+            ]
 
         # Each pad slot has one writer per round: never clear the pad locally, as a peer's
         # DMA may land first. Pads alternate on a static parity: a peer is at most one round
@@ -345,8 +458,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             collective[0] += 1
             if row_full.shape != (Q, H):
                 row_full = jnp.pad(
-                    row_full,
-                    ((0, Q - row_full.shape[0]), (0, H - row_full.shape[1])))
+                    row_full, ((0, Q - row_full.shape[0]), (0, H - row_full.shape[1]))
+                )
             sbuf, rbuf = (sendb, arb) if BF16_COLL else (sendv, ar)
             sbuf[...] = row_full.astype(sbuf.dtype)
             local = pltpu.make_async_copy(sbuf, rbuf.at[par, me], sem)
@@ -355,8 +468,12 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             for d in range(1, tp):
                 peer = jax.lax.rem(me + d, tp)
                 cp = pltpu.make_async_remote_copy(
-                    src_ref=sbuf, dst_ref=rbuf.at[par, me],
-                    send_sem=ssem, recv_sem=rsem, device_id=peer)
+                    src_ref=sbuf,
+                    dst_ref=rbuf.at[par, me],
+                    send_sem=ssem,
+                    recv_sem=rsem,
+                    device_id=peer,
+                )
                 cp.start()
                 cps.append(cp)
             local.wait()
@@ -376,8 +493,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
         def dma_batch(items):
             """Start all transfers, then wait; each has its own semaphore (in-flight DMAs must not share)."""
-            cps = [pltpu.make_async_copy(src, dst, sgrp.at[i])
-                   for i, (src, dst) in enumerate(items)]
+            cps = [
+                pltpu.make_async_copy(src, dst, sgrp.at[i])
+                for i, (src, dst) in enumerate(items)
+            ]
             for c in cps:
                 c.start()
             for c in cps:
@@ -411,7 +530,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             n = w.shape[1]
 
             def mk(s_):
-                return pltpu.make_async_copy(wv.at[idx, s_], rbf.at[s_ % KM_SLOTS], sbf.at[s_ % KM_SLOTS])
+                return pltpu.make_async_copy(
+                    wv.at[idx, s_], rbf.at[s_ % KM_SLOTS], sbf.at[s_ % KM_SLOTS]
+                )
 
             return n, mk
 
@@ -436,8 +557,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
             def use(s_, sl):
                 return jnp.concatenate(
-                    [jnp.dot(xb, km_block(s_, j, K_, fp8), preferred_element_type=F32)
-                     for j in range(k)], axis=1)
+                    [
+                        jnp.dot(
+                            xb, km_block(s_, j, K_, fp8), preferred_element_type=F32
+                        )
+                        for j in range(k)
+                    ],
+                    axis=1,
+                )
 
             out = jnp.concatenate(_stream(n, mk, use, warmed, KM_PF), axis=1)
             return out if scale is None else out * scale
@@ -454,7 +581,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 _wait(mk(s_), "w_wait")
                 for j in range(k):
                     c = s_ * k + j
-                    part = jnp.dot(xb, km_block(s_, j, K_, fp8), preferred_element_type=F32)
+                    part = jnp.dot(
+                        xb, km_block(s_, j, K_, fp8), preferred_element_type=F32
+                    )
                     if scale is not None:
                         part = part * scale[:, c * KM_TILE : (c + 1) * KM_TILE]
                     put_send(pl.ds(c * KM_TILE, KM_TILE), part)
@@ -481,9 +610,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 dst = rbuf.at[par, me, :, pl.ds(c0, width)]
                 cps.append(pltpu.make_async_copy(src, dst, sem))
                 for d in range(1, tp):
-                    cps.append(pltpu.make_async_remote_copy(
-                        src_ref=src, dst_ref=dst, send_sem=ssem, recv_sem=rsem,
-                        device_id=jax.lax.rem(me + d, tp)))
+                    cps.append(
+                        pltpu.make_async_remote_copy(
+                            src_ref=src,
+                            dst_ref=dst,
+                            send_sem=ssem,
+                            recv_sem=rsem,
+                            device_id=jax.lax.rem(me + d, tp),
+                        )
+                    )
                 for c in cps[-tp:]:
                     c.start()
 
@@ -503,10 +638,17 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 if cfg.embed_2d:
                     # DMA offsets must be tile-aligned: fetch the token's 8-row tile, pick the row.
                     t8 = tok_ref[qi]
-                    _dma(w_embed.at[pl.ds(pl.multiple_of((t8 // 8) * 8, 8), 8)], embv, sem)
+                    _dma(
+                        w_embed.at[pl.ds(pl.multiple_of((t8 // 8) * 8, 8), 8)],
+                        embv,
+                        sem,
+                    )
                     r8 = jax.lax.broadcasted_iota(jnp.int32, (8, 1), 0)
-                    row = jnp.sum(jnp.where(r8 == t8 % 8, embv[...].astype(F32), 0.0),
-                                  axis=0, keepdims=True)
+                    row = jnp.sum(
+                        jnp.where(r8 == t8 % 8, embv[...].astype(F32), 0.0),
+                        axis=0,
+                        keepdims=True,
+                    )
                 else:
                     _dma(w_embed.at[tok_ref[qi]], embv, sem)
                     row = embv[...].astype(F32)
@@ -539,35 +681,62 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 slab.get(sm, f"hc_{tag}_fn"),
                 slab.getf(smf, kind, f"hc_{tag}_base"),
                 slab.getf(smf, kind, f"hc_{tag}_scale"),
-                hc_mult=N, hc_eps=spec.hc_eps, iters=iters, rms_eps=eps,
-                defer_sinkhorn=True)
+                hc_mult=N,
+                hc_eps=spec.hc_eps,
+                iters=iters,
+                rms_eps=eps,
+                defer_sinkhorn=True,
+            )
             posts = [post for post, _, _ in res]
             cols = [col for _, _, col in res]
-            entry = [jnp.stack([comb for _, comb, _ in res]) if Q > 1 else res[0][1],
-                     iters - 1]
+            entry = [
+                jnp.stack([comb for _, comb, _ in res]) if Q > 1 else res[0][1],
+                iters - 1,
+            ]
             pending_sinkhorn.append(entry)
             return posts, entry, jnp.concatenate(cols, axis=0)
 
         def combine(posts, combs, block_out, residual):
-            if isinstance(combs, list) and len(combs) == 2 and isinstance(combs[1], int):
+            if (
+                isinstance(combs, list)
+                and len(combs) == 2
+                and isinstance(combs[1], int)
+            ):
                 done = sinkhorn_done(combs)
                 combs = [done[qi] for qi in range(Q)] if Q > 1 else [done]
             outs = []
             for qi in range(Q):
-                comb = combs[qi] if not isinstance(combs[qi], list) else sinkhorn_done(combs[qi])
-                outs.append(K.hyper_combine_vpu(
-                    posts[qi], comb, block_out[qi : qi + 1],
-                    residual[qi * N : (qi + 1) * N]))
+                comb = (
+                    combs[qi]
+                    if not isinstance(combs[qi], list)
+                    else sinkhorn_done(combs[qi])
+                )
+                outs.append(
+                    K.hyper_combine_vpu(
+                        posts[qi],
+                        comb,
+                        block_out[qi : qi + 1],
+                        residual[qi * N : (qi + 1) * N],
+                    )
+                )
             return jnp.concatenate(outs, axis=0)
 
         def kda(x, k_i, kind):
-            loads = [pltpu.make_async_copy(src, dst, sgrp.at[i]) for i, (src, dst) in enumerate([
-                (_crec_in.at[k_i] if Q == 1 else _crec_in.at[k_i, ck], st),
-                (_cconv_in.at[k_i] if Q == 1 else _cconv_in.at[k_i, ck], cv),
-                (w_kfg.at[k_i], fgb), (w_kdt.at[k_i], dtv),
-                (w_kconv.at[k_i], cwv), (w_kb.at[k_i], bpv),
-                (w_kalog.at[k_i], alv), (w_ksc.at[k_i], ksc),
-            ])]
+            loads = [
+                pltpu.make_async_copy(src, dst, sgrp.at[i])
+                for i, (src, dst) in enumerate(
+                    [
+                        (_crec_in.at[k_i] if Q == 1 else _crec_in.at[k_i, ck], st),
+                        (_cconv_in.at[k_i] if Q == 1 else _cconv_in.at[k_i, ck], cv),
+                        (w_kfg.at[k_i], fgb),
+                        (w_kdt.at[k_i], dtv),
+                        (w_kconv.at[k_i], cwv),
+                        (w_kb.at[k_i], bpv),
+                        (w_ka_log.at[k_i], alv),
+                        (w_ksc.at[k_i], ksc),
+                    ]
+                )
+            ]
             for c in loads:
                 c.start()
 
@@ -597,8 +766,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     for c in ck_out[slot]:
                         c.wait()
                 conv_out, new_conv = K.conv_step(
-                    cv[...] if qi == 0 else cvq[prev], qkv[qi : qi + 1],
-                    cwv[...].astype(F32))
+                    cv[...] if qi == 0 else cvq[prev],
+                    qkv[qi : qi + 1],
+                    cwv[...].astype(F32),
+                )
                 if Q == 1:
                     cv[...] = new_conv
                 else:
@@ -608,41 +779,62 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 vv = conv_out[0, 2 * qsh :].reshape(hkda, dh)
 
                 graw = graw_all[qi].reshape(hkda, dh)
-                glog = (lb * jax.nn.sigmoid(decay * graw)) if lb is not None else (
-                    -decay * jnp.where(graw > 20.0, graw,
-                                       jnp.log1p(jnp.exp(jnp.minimum(graw, 20.0)))))
+                glog = (
+                    (lb * jax.nn.sigmoid(decay * graw))
+                    if lb is not None
+                    else (
+                        -decay
+                        * jnp.where(
+                            graw > 20.0,
+                            graw,
+                            jnp.log1p(jnp.exp(jnp.minimum(graw, 20.0))),
+                        )
+                    )
+                )
                 new_state, out = K.kda_step(
-                    st[...] if qi == 0 else stq[prev], qv, kv_, vv, glog,
-                    beta_all[qi])
+                    st[...] if qi == 0 else stq[prev], qv, kv_, vv, glog, beta_all[qi]
+                )
                 if Q == 1:
                     st[...] = new_state
                 else:
                     stq[slot] = new_state
                     ck_out[slot] = [
-                        pltpu.make_async_copy(stq.at[slot], c_recur.at[k_i, qi],
-                                              sgrp.at[2 * slot]),
-                        pltpu.make_async_copy(cvq.at[slot], c_conv.at[k_i, qi],
-                                              sgrp.at[2 * slot + 1])]
+                        pltpu.make_async_copy(
+                            stq.at[slot], c_recur.at[k_i, qi], sgrp.at[2 * slot]
+                        ),
+                        pltpu.make_async_copy(
+                            cvq.at[slot], c_conv.at[k_i, qi], sgrp.at[2 * slot + 1]
+                        ),
+                    ]
                     for c in ck_out[slot]:
                         c.start()
 
                 y = out * jax.lax.rsqrt(
-                    jnp.mean(jnp.square(out), axis=-1, keepdims=True) + eps)
+                    jnp.mean(jnp.square(out), axis=-1, keepdims=True) + eps
+                )
                 y = y * slab.get(sm, "o_norm").reshape(1, dh).astype(F32)
                 y = y * jax.nn.sigmoid(gg_all[qi].reshape(hkda, dh))
                 ys.append(y.reshape(1, qsh))
 
             if Q == 1:
-                saves = [pltpu.make_async_copy(st, c_recur.at[k_i], sgrp.at[0]),
-                         pltpu.make_async_copy(cv, c_conv.at[k_i], sgrp.at[1])]
+                saves = [
+                    pltpu.make_async_copy(st, c_recur.at[k_i], sgrp.at[0]),
+                    pltpu.make_async_copy(cv, c_conv.at[k_i], sgrp.at[1]),
+                ]
                 for c in saves:
                     c.start()
             else:
                 saves = ck_out[0] + ck_out[1]
             with _scope("kda_o"):
-                out = mv_km_allreduce(w_ko, k_i, qsh, jnp.concatenate(ys, axis=0),
-                                      FP8_KDA, warmed=True,
-                                      scale=ksc[:, 3 * qsh :] if FP8_KDA else None)
+                out = mv_km_allreduce(
+                    w_ko,
+                    k_i,
+                    qsh,
+                    jnp.concatenate(ys, axis=0),
+                    FP8_KDA,
+                    warmed=True,
+                    scale=ksc[:, 3 * qsh :] if FP8_KDA else None,
+                )
             for c in saves:
                 c.wait()
             return out
@@ -661,7 +853,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             kvb_cp.start()
             pka_cp = pltpu.make_async_copy(c_ip.at[d_i], pka, sgrp.at[7])
             pka_cp.start()
-            psc_cp = pltpu.make_async_copy(w_dsc.at[d_i], psc, sasy.at[7])
+            psc_cp = pltpu.make_async_copy(w_dsc.at[d_i], psc, sem_async.at[7])
             psc_cp.start()
             w_qakv_n, w_qb_n, _ = dsa_scale_widths(spec, tp)
             ql = spec.q_lora_rank
@@ -670,18 +862,30 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             qakv = mv_km(w_qakv, d_i, H, x, True, warmed=True, n_out=w_qakv_n)
             _wait(psc_cp, "ld_wait")
             qakv = qakv * psc[:, :w_qakv_n]
-            q_resid = K.rms_norm(qakv[:, :ql],
-                                 slab.get(sm, "q_a_layernorm").reshape(1, -1), eps, BF16)
-            q_all = mv_km(w_qb, d_i, ql, q_resid, True, n_out=w_qb_n,
-                          scale=psc[:, w_qakv_n : w_qakv_n + w_qb_n])
-            kv_new = K.rms_norm(qakv[:, ql:],
-                                slab.get(sm, "kv_a_layernorm").reshape(1, -1), eps, BF16)
+            q_resid = K.rms_norm(
+                qakv[:, :ql], slab.get(sm, "q_a_layernorm").reshape(1, -1), eps, BF16
+            )
+            q_all = mv_km(
+                w_qb,
+                d_i,
+                ql,
+                q_resid,
+                True,
+                n_out=w_qb_n,
+                scale=psc[:, w_qakv_n : w_qakv_n + w_qb_n],
+            )
+            kv_new = K.rms_norm(
+                qakv[:, ql:], slab.get(sm, "kv_a_layernorm").reshape(1, -1), eps, BF16
+            )
             ik_new = K.layer_norm(
                 K.matvec_bf16(x, slab.get(sm, "indexer_wk").astype(BF16)),
                 slab.get(sm, "indexer_k_norm_w").reshape(1, -1),
-                slab.get(sm, "indexer_k_norm_b").reshape(1, -1), 1e-6)
+                slab.get(sm, "indexer_k_norm_b").reshape(1, -1),
+                1e-6,
+            )
             ig_new = K.matvec_bf16(
-                x, slab.get(sm, "indexer_compress_gate").astype(BF16))
+                x, slab.get(sm, "indexer_compress_gate").astype(BF16)
+            )
             sc_proj.__exit__(None, None, None)
 
             # row_write_call stores the new rows after the kernel; this step patches them in.
@@ -703,14 +907,17 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             with _scope("dsa_indexq"):
                 iq_all = mv_km(w_iwq, d_i, spec.q_lora_rank, q_resid)
             hw_all = K.matvec_bf16(
-                x, slab.get(sm, "indexer_weights_proj").astype(BF16)) * (hi ** -0.5)
+                x, slab.get(sm, "indexer_weights_proj").astype(BF16)
+            ) * (hi**-0.5)
             ape = slab.get(sm, "indexer_ape").astype(F32)
 
             # Pools this step closes are keyed from the raw rows; older pools come from c_ip.
             fp0, fresh = closing_pools(pos)
             r0 = jnp.minimum(((jnp.maximum(pos - kp + 1, 0)) // 16) * 16, Lcap - 32)
-            raw = [pltpu.make_async_copy(c.at[d_i, pl.ds(r0, 32)], buf, sgrp.at[i])
-                   for i, (c, buf) in enumerate(((c_ik, ikb), (c_ig, igb)))]
+            raw = [
+                pltpu.make_async_copy(c.at[d_i, pl.ds(r0, 32)], buf, sgrp.at[i])
+                for i, (c, buf) in enumerate(((c_ik, ikb), (c_ig, igb)))
+            ]
             for c in raw:
                 c.start()
             for c in raw:
@@ -722,8 +929,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 igv = jnp.where(rr == pos + qi, ig_new[qi], igv)
             pk_blk, _ = K.indexer_pool_keys(ikv, igv, ape, last, kp)
             prow = jax.lax.broadcasted_iota(jnp.int32, (32 // kp, 1), 0) + r0 // kp
-            fresh_keys = [jnp.sum(jnp.where(prow == fp0 + i, pk_blk, 0.0), axis=0,
-                                  keepdims=True) for i in range(Q)]
+            fresh_keys = [
+                jnp.sum(jnp.where(prow == fp0 + i, pk_blk, 0.0), axis=0, keepdims=True)
+                for i in range(Q)
+            ]
             o_npk[d_i] = jnp.concatenate(fresh_keys, axis=0)
             pcol = jax.lax.broadcasted_iota(jnp.int32, (PT, 1), 0)
 
@@ -731,56 +940,75 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
             if Q > 1:
                 iq_cat = jnp.concatenate(
-                    [iq_all[qi].reshape(hi, idh) for qi in range(Q)], axis=0)
+                    [iq_all[qi].reshape(hi, idh) for qi in range(Q)], axis=0
+                )
                 hcol = jax.lax.broadcasted_iota(jnp.int32, (Q, Q * hi), 1)
                 hrow = jax.lax.broadcasted_iota(jnp.int32, (Q, Q * hi), 0)
-                hw_blk = jnp.where(hcol // hi == hrow,
-                                   jnp.tile(hw_all, (1, Q)), 0.0).astype(F32)
+                hw_blk = jnp.where(
+                    hcol // hi == hrow, jnp.tile(hw_all, (1, Q)), 0.0
+                ).astype(F32)
 
             def score_tile(t, c):
                 pk = pka[pl.ds(pl.multiple_of(t * PT, PT), PT), :]
                 for i in range(Q):
-                    pk = jnp.where((pcol + t * PT == fp0 + i) & (i < fresh), fresh_keys[i], pk)
+                    pk = jnp.where(
+                        (pcol + t * PT == fp0 + i) & (i < fresh), fresh_keys[i], pk
+                    )
                 if Q > 1:
-                    sc = K.indexer_scores(iq_cat, hw_blk, pk, idh ** -0.5)
+                    sc = K.indexer_scores(iq_cat, hw_blk, pk, idh**-0.5)
                     scr[:, pl.ds(t, 1), :] = sc.reshape(Q, 1, PT)
                     return c
                 for qi in range(Q):
                     scr[qi, pl.ds(t, 1), :] = K.indexer_scores(
-                        iq_all[qi].reshape(hi, idh), hw_all[qi], pk, idh ** -0.5)
+                        iq_all[qi].reshape(hi, idh), hw_all[qi], pk, idh**-0.5
+                    )
                 return c
 
             with _scope("dsa_scores"):
                 jax.lax.fori_loop(0, nt, score_tile, 0)
 
-            gidx = (jax.lax.broadcasted_iota(jnp.int32, (NT, PT), 0) * PT
-                    + jax.lax.broadcasted_iota(jnp.int32, (NT, PT), 1))
+            gidx = jax.lax.broadcasted_iota(
+                jnp.int32, (NT, PT), 0
+            ) * PT + jax.lax.broadcasted_iota(jnp.int32, (NT, PT), 1)
             pool_end = (gidx + 1) * kp - 1
             eligs = [pool_end <= pos + qi for qi in range(Q)]
             if Q == 1:
                 chosen = K.select_top_k_mask_2d(
-                    jnp.where(eligs[0], scr[0], -jnp.inf), selk)[None]
+                    jnp.where(eligs[0], scr[0], -jnp.inf), selk
+                )[None]
             else:
                 chosen = K.select_top_k_mask_3d(
-                    jnp.where(jnp.stack(eligs), scr[...], -jnp.inf), selk)
-            scr[...] = chosen.astype(F32)         # the scores are not needed again
+                    jnp.where(jnp.stack(eligs), scr[...], -jnp.inf), selk
+                )
+            scr[...] = chosen.astype(F32)  # the scores are not needed again
 
             with _scope("dsa_absorb"):
                 _wait(kvb_cp, "w_wait")
                 kvbf = kvb[...].astype(F32)
-                q_abs = [K.absorb_q(q_all[qi].reshape(nh, qk), kvbf, n_heads=nh,
-                                    qk_dim=qk, v_dim=vd, kv_lora=kvl) for qi in range(Q)]
+                q_abs = [
+                    K.absorb_q(
+                        q_all[qi].reshape(nh, qk),
+                        kvbf,
+                        n_heads=nh,
+                        qk_dim=qk,
+                        v_dim=vd,
+                        kv_lora=kvl,
+                    )
+                    for qi in range(Q)
+                ]
 
             def kv_cp(t, b):
                 return pltpu.make_async_copy(
-                    c_kv.at[d_i, pl.ds(t * TK, TK)], kvt.at[b], sgrp.at[4 + b])
+                    c_kv.at[d_i, pl.ds(t * TK, TK)], kvt.at[b], sgrp.at[4 + b]
+                )
 
             kv_cp(0, 0).start()
-            scaling = qk ** -0.5
+            scaling = qk**-0.5
 
             def dot(a, b, dims):
-                return jax.lax.dot_general(a.astype(BF16), b, (dims, ((), ())),
-                                           preferred_element_type=F32)
+                return jax.lax.dot_general(
+                    a.astype(BF16), b, (dims, ((), ())), preferred_element_type=F32
+                )
 
             q_all = jnp.concatenate(q_abs, axis=0) if Q > 1 else q_abs[0]
             q_bf = q_all.astype(BF16)
@@ -796,7 +1024,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 @pl.when((t * TK <= last) & (pos < (t + 1) * TK))
                 def _():
                     ws = pl.multiple_of(
-                        jnp.clip((pos // 16) * 16 - t * TK, 0, TK - 32), 16)
+                        jnp.clip((pos // 16) * 16 - t * TK, 0, TK - 32), 16
+                    )
                     rows = jax.lax.broadcasted_iota(jnp.int32, (32, 1), 0) + t * TK + ws
                     blk = kvt[b, pl.ds(ws, 32), :]
                     for qi in range(Q):
@@ -828,12 +1057,17 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 a_n = alpha * a_o + dot(pr, kvt_b, ((1,), (0,)))
                 return m_n, l_n, a_n
 
-            init = (jnp.full((Q * nh, 1), -jnp.inf, F32), jnp.zeros((Q * nh, 1), F32),
-                    jnp.zeros((Q * nh, kvl), F32))
+            init = (
+                jnp.full((Q * nh, 1), -jnp.inf, F32),
+                jnp.zeros((Q * nh, 1), F32),
+                jnp.zeros((Q * nh, kvl), F32),
+            )
             with _scope("dsa_attend"):
                 _, l_all, a_all = jax.lax.fori_loop(0, nt, attend_tile, init)
-            fin = [(None, l_all[qi * nh:(qi + 1) * nh], a_all[qi * nh:(qi + 1) * nh])
-                   for qi in range(Q)]
+            fin = [
+                (None, l_all[qi * nh : (qi + 1) * nh], a_all[qi * nh : (qi + 1) * nh])
+                for qi in range(Q)
+            ]
 
             outs = []
             with _scope("dsa_unabsorb"):
@@ -844,17 +1078,29 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     outs.append(head_out.reshape(1, nh * vd))
             with _scope("dsa_o"):
                 o_off = w_qakv_n + w_qb_n
-                return mv_km_allreduce(w_do, d_i, nh * vd, jnp.concatenate(outs, axis=0),
-                                       True, scale=psc[:, o_off : o_off + H])
+                return mv_km_allreduce(
+                    w_do,
+                    d_i,
+                    nh * vd,
+                    jnp.concatenate(outs, axis=0),
+                    True,
+                    scale=psc[:, o_off : o_off + H],
+                )
 
         def moe_early(m_i):
             """Start the router and scale fetches before the FFN-side mHC."""
             fetch = [(w_router.at[m_i], rtr)]
             if not CH_EXPERTS:
-                fetch += [(w_egus.at[m_i], egs), (w_edns.at[m_i], eds),
-                          (w_sgus.at[m_i], s_sgu), (w_sdns.at[m_i], s_sdn)]
-            early = [pltpu.make_async_copy(src, dst, sasy.at[i])
-                     for i, (src, dst) in enumerate(fetch)]
+                fetch += [
+                    (w_egus.at[m_i], egs),
+                    (w_edns.at[m_i], eds),
+                    (w_sgus.at[m_i], s_sgu),
+                    (w_sdns.at[m_i], s_sdn),
+                ]
+            early = [
+                pltpu.make_async_copy(src, dst, sem_async.at[i])
+                for i, (src, dst) in enumerate(fetch)
+            ]
             for c in early:
                 c.start()
             for c in shared_copies(m_i):
@@ -863,38 +1109,57 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
         def expert_copies(sl, gu, dn, gu_s=None, dn_s=None):
             if CH_EXPERTS:
-                return [pltpu.make_async_copy(gu, r8a.at[sl], s8a.at[sl]),
-                        pltpu.make_async_copy(dn, r8d.at[sl], s8d.at[sl]),
-                        pltpu.make_async_copy(gu_s, egsr.at[sl], s8s.at[0, sl]),
-                        pltpu.make_async_copy(dn_s, edsr.at[sl], s8s.at[1, sl])]
-            return [pltpu.make_async_copy(gu, r8a.at[sl, pl.ds(0, 2 * moesh), pl.ds(0, H)],
-                                          s8a.at[sl]),
-                    pltpu.make_async_copy(dn, r8d.at[sl, pl.ds(0, H), pl.ds(0, moesh)],
-                                          s8d.at[sl])]
+                return [
+                    pltpu.make_async_copy(gu, r8a.at[sl], s8a.at[sl]),
+                    pltpu.make_async_copy(dn, r8d.at[sl], s8d.at[sl]),
+                    pltpu.make_async_copy(gu_s, egsr.at[sl], s8s.at[0, sl]),
+                    pltpu.make_async_copy(dn_s, edsr.at[sl], s8s.at[1, sl]),
+                ]
+            return [
+                pltpu.make_async_copy(
+                    gu, r8a.at[sl, pl.ds(0, 2 * moesh), pl.ds(0, H)], s8a.at[sl]
+                ),
+                pltpu.make_async_copy(
+                    dn, r8d.at[sl, pl.ds(0, H), pl.ds(0, moesh)], s8d.at[sl]
+                ),
+            ]
 
         def shared_copies(m_i):
             if CH_EXPERTS:
-                return expert_copies(0, w_sgu.at[m_i], w_sdn.at[m_i],
-                                     w_sgus.at[pl.ds(m_i, 1)], w_sdns.at[pl.ds(m_i, 1)])
+                return expert_copies(
+                    0,
+                    w_sgu.at[m_i],
+                    w_sdn.at[m_i],
+                    w_sgus.at[pl.ds(m_i, 1)],
+                    w_sdns.at[pl.ds(m_i, 1)],
+                )
             return expert_copies(0, w_sgu.at[m_i], w_sdn.at[m_i])
 
         def moe(x, m_i, kind, early):
             with _scope("router_wait"):
                 _wait(early[0], "e_wait")
-            route_kw = dict(top_k=kexp, norm_topk_prob=spec.norm_topk_prob,
-                            routed_scaling_factor=spec.routed_scaling_factor)
+            route_kw = dict(
+                top_k=kexp,
+                norm_topk_prob=spec.norm_topk_prob,
+                routed_scaling_factor=spec.routed_scaling_factor,
+            )
             sc_route = _scope("moe_route")
             sc_route.__enter__()
             if Q == 1 and kexp == 8:
                 mask, wts, idxs = K.route_experts_ids(
-                    x, rtr[...], slab.getf(smf, kind, "router_bias"), **route_kw)
+                    x, rtr[...], slab.getf(smf, kind, "router_bias"), **route_kw
+                )
             else:
                 mask, wts = K.route_experts(
-                    x, rtr[...], slab.getf(smf, kind, "router_bias"), **route_kw)
+                    x, rtr[...], slab.getf(smf, kind, "router_bias"), **route_kw
+                )
                 idxs = None
             n_slot = kexp * Q
-            union = mask if Q == 1 else jnp.max(mask.astype(jnp.int32), axis=0,
-                                                keepdims=True) > 0
+            union = (
+                mask
+                if Q == 1
+                else jnp.max(mask.astype(jnp.int32), axis=0, keepdims=True) > 0
+            )
             if idxs is None:
                 idxs = K.mask_to_indices_mxu(union, n_slot)
             base = m_i * nexp
@@ -919,8 +1184,13 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 if e is None:
                     return shared_copies(m_i)
                 row = base + safe[e]
-                return expert_copies(k % S, w_egu.at[row], w_edn.at[row],
-                                     w_egus.at[pl.ds(row, 1)], w_edns.at[pl.ds(row, 1)])
+                return expert_copies(
+                    k % S,
+                    w_egu.at[row],
+                    w_edn.at[row],
+                    w_egus.at[pl.ds(row, 1)],
+                    w_edns.at[pl.ds(row, 1)],
+                )
 
             n_e = len(entries)
             # Q > 1: union ids are ascending with unused slots last, so only the first n_u run.
@@ -937,6 +1207,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 def go():
                     for c in slot_copies(k):
                         c.start()
+
                 when(k, go)
 
             for k in range(1, min(PF + 1, n_e)):
@@ -956,11 +1227,26 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     if CH_EXPERTS:
                         w_j = None
                         if e is not None:
-                            hit = jax.lax.broadcasted_iota(jnp.int32, (Q, nexp), 1) == idxs[e]
-                            w_j = jnp.sum(jnp.where(hit, wts, 0.0), axis=1, keepdims=True)
-                        h = jnp.dot(x.astype(BF16), r8a[sl], preferred_element_type=F32) * egsr[sl]
-                        act = K.swiglu_clamped(h[:, :moesh], h[:, moesh:], spec.swiglu_limit)
-                        y = jnp.dot(act.astype(BF16), r8d[sl], preferred_element_type=F32) * edsr[sl]
+                            hit = (
+                                jax.lax.broadcasted_iota(jnp.int32, (Q, nexp), 1)
+                                == idxs[e]
+                            )
+                            w_j = jnp.sum(
+                                jnp.where(hit, wts, 0.0), axis=1, keepdims=True
+                            )
+                        h = (
+                            jnp.dot(x.astype(BF16), r8a[sl], preferred_element_type=F32)
+                            * egsr[sl]
+                        )
+                        act = K.swiglu_clamped(
+                            h[:, :moesh], h[:, moesh:], spec.swiglu_limit
+                        )
+                        y = (
+                            jnp.dot(
+                                act.astype(BF16), r8d[sl], preferred_element_type=F32
+                            )
+                            * edsr[sl]
+                        )
                         return y if w_j is None else w_j * y
                     if e is None:
                         early[3].wait()
@@ -969,16 +1255,22 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     else:
                         gs, dsc = egs[safe[e]], eds[safe[e]]
                         # A masked sum, since a dynamic lane extract does not lower.
-                        hit = jax.lax.broadcasted_iota(jnp.int32, (Q, nexp), 1) == idxs[e]
+                        hit = (
+                            jax.lax.broadcasted_iota(jnp.int32, (Q, nexp), 1) == idxs[e]
+                        )
                         w_j = jnp.sum(jnp.where(hit, wts, 0.0), axis=1, keepdims=True)
                     h = K.matvec_fp8(x, r8a[sl, : 2 * moesh, :H], gs, blk)
-                    act = K.swiglu_clamped(h[:, :moesh], h[:, moesh:], spec.swiglu_limit)
+                    act = K.swiglu_clamped(
+                        h[:, :moesh], h[:, moesh:], spec.swiglu_limit
+                    )
                     y = K.matvec_fp8(act, r8d[sl, :H, :moesh], dsc, blk)
                     return y if w_j is None else w_j * y
 
                 if guard:
+
                     def guarded(body=body):
                         macc[...] += body()
+
                     when(k, guarded)
                 else:
                     acc = acc + body()
@@ -990,10 +1282,13 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
         def dense(x, d_i):
             _dma(w_dnsc.at[d_i], psc, sem2)
-            h = mv_km(w_dgu, d_i, H, x, True, n_out=2 * ffnsh, scale=psc[:, : 2 * ffnsh])
+            h = mv_km(
+                w_dgu, d_i, H, x, True, n_out=2 * ffnsh, scale=psc[:, : 2 * ffnsh]
+            )
             act = K.swiglu_clamped(h[:, :ffnsh], h[:, ffnsh:], spec.swiglu_limit)
-            return mv_km_allreduce(w_ddn, d_i, ffnsh, act, True,
-                                   scale=psc[:, 2 * ffnsh : 2 * ffnsh + H])
+            return mv_km_allreduce(
+                w_ddn, d_i, ffnsh, act, True, scale=psc[:, 2 * ffnsh : 2 * ffnsh + H]
+            )
 
         def layer(streams, L, kind, mlp_kind, next_kda=None, prewarmed=False, par=None):
             """`next_kda`: start that KDA layer's qkv during this FFN; `prewarmed`: ours was started so."""
@@ -1022,10 +1317,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 warm_km(w_qakv, dsa_ord(L), True)
             with _scope("mhc_attn"):
                 posts, combs, x = mhc(streams, "attn", slab_kind)
-                x = K.rms_norm(x, slab.get(sm, "input_layernorm").reshape(1, H), eps, BF16)
+                x = K.rms_norm(
+                    x, slab.get(sm, "input_layernorm").reshape(1, H), eps, BF16
+                )
             with _scope(kind):
-                a = (kda(x, kda_ord(L), slab_kind) if kind == "kda"
-                     else dsa(x, dsa_ord(L)))
+                a = (
+                    kda(x, kda_ord(L), slab_kind)
+                    if kind == "kda"
+                    else dsa(x, dsa_ord(L))
+                )
             with _scope("combine"):
                 streams = combine(posts, combs, a, streams)
 
@@ -1035,10 +1335,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             with _scope("mhc_ffn"):
                 posts, combs, x = mhc(streams, "ffn", slab_kind)
                 x = K.rms_norm(
-                    x, slab.get(sm, "post_attention_layernorm").reshape(1, H), eps, BF16)
+                    x, slab.get(sm, "post_attention_layernorm").reshape(1, H), eps, BF16
+                )
             with _scope(mlp_kind):
-                m = (moe(x, moe_ord(L), slab_kind, early) if mlp_kind == "moe"
-                     else dense(x, L))
+                m = (
+                    moe(x, moe_ord(L), slab_kind, early)
+                    if mlp_kind == "moe"
+                    else dense(x, L)
+                )
             with _scope("combine"):
                 return combine(posts, combs, m, streams)
 
@@ -1051,19 +1355,34 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         for L in range(n_dense):
             streams = layer(streams, L, "kda", "dense")
 
-        def period(p, s_):   # noqa: ARG001 - p is the traced period index
+        def period(p, s_):  # noqa: ARG001 - p is the traced period index
             base = spec.first_k_dense_replace + 4 * p
             f0 = spec.first_k_dense_replace
             s_ = layer(s_, base, "dsa", "moe", next_kda=base + 1, par=f0 % 2)
-            s_ = layer(s_, base + 1, "kda", "moe", next_kda=base + 2, prewarmed=True,
-                       par=(f0 + 1) % 2)
-            s_ = layer(s_, base + 2, "kda", "moe", next_kda=base + 3, prewarmed=True,
-                       par=(f0 + 2) % 2)
+            s_ = layer(
+                s_,
+                base + 1,
+                "kda",
+                "moe",
+                next_kda=base + 2,
+                prewarmed=True,
+                par=(f0 + 1) % 2,
+            )
+            s_ = layer(
+                s_,
+                base + 2,
+                "kda",
+                "moe",
+                next_kda=base + 3,
+                prewarmed=True,
+                par=(f0 + 2) % 2,
+            )
             s_ = layer(s_, base + 3, "kda", "moe", prewarmed=True, par=(f0 + 3) % 2)
             return s_
 
-        full_periods = min(cfg.n_periods,
-                           max(0, (n_layers - spec.first_k_dense_replace) // 4))
+        full_periods = min(
+            cfg.n_periods, max(0, (n_layers - spec.first_k_dense_replace) // 4)
+        )
         streams = jax.lax.fori_loop(0, full_periods, period, streams)
 
         for L in range(spec.first_k_dense_replace + 4 * full_periods, n_layers):
@@ -1073,10 +1392,21 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         o_streams[...] = streams
         _dma(w_fnorm, fnv, sem)
         hidden = K.rms_norm(
-            jnp.concatenate([
-                jnp.mean(streams[qi * N : (qi + 1) * N].astype(F32), axis=0,
-                         keepdims=True) for qi in range(Q)], axis=0),
-            fnv[...], eps, BF16)
+            jnp.concatenate(
+                [
+                    jnp.mean(
+                        streams[qi * N : (qi + 1) * N].astype(F32),
+                        axis=0,
+                        keepdims=True,
+                    )
+                    for qi in range(Q)
+                ],
+                axis=0,
+            ),
+            fnv[...],
+            eps,
+            BF16,
+        )
         # The MTP draft reads this hidden (serving captures the same tensor).
         o_hidden[...] = hidden
         o_logits[...] = mv_km(w_lm, 0, H, hidden)
@@ -1095,8 +1425,12 @@ def _closing_pools(pos, Q, kp):
 def init_pool_keys(spec, ik, ig, apes):
     """Pooled-key cache [n_dsa, L/kpool, Dh] f32 from the raw caches, as the kernel computes it."""
     kp = spec.index_kpool
-    return jnp.stack([K.indexer_pool_keys(ik[d], ig[d], apes[d], ik.shape[1], kp)[0]
-                      for d in range(ik.shape[0])])
+    return jnp.stack(
+        [
+            K.indexer_pool_keys(ik[d], ig[d], apes[d], ik.shape[1], kp)[0]
+            for d in range(ik.shape[0])
+        ]
+    )
 
 
 def row_write_call(spec, cfg: KernelConfig):
@@ -1108,14 +1442,36 @@ def row_write_call(spec, cfg: KernelConfig):
     if Q > 16:
         raise ValueError(f"n_query={Q}: the 32-row block holds at most 16 new rows")
 
-    def kernel(pos_ref, nkv, nik, nig, npk, _kv_in, _ik_in, _ig_in, _ip_in,
-               kv, ik, ig, ip, bkv, bik, big, bip, sems):
+    def kernel(
+        pos_ref,
+        nkv,
+        nik,
+        nig,
+        npk,
+        _kv_in,
+        _ik_in,
+        _ig_in,
+        _ip_in,
+        kv,
+        ik,
+        ig,
+        ip,
+        bkv,
+        bik,
+        big,
+        bip,
+        sems,
+    ):
         pos = pos_ref[0]
         r0 = jnp.minimum((pos // 16) * 16, Lcap - 32)
         fp0, fresh = _closing_pools(pos, Q, kp)
         p0 = jnp.minimum((fp0 // 8) * 8, n_pool - 8)
-        blocks = [(kv, bkv, r0, 32), (ik, bik, r0, 32), (ig, big, r0, 32),
-                  (ip, bip, p0, 8)]
+        blocks = [
+            (kv, bkv, r0, 32),
+            (ik, bik, r0, 32),
+            (ig, big, r0, 32),
+            (ip, bip, p0, 8),
+        ]
 
         def copies(to_cache):
             cps = []
@@ -1152,14 +1508,18 @@ def row_write_call(spec, cfg: KernelConfig):
     def call(pos, nkv, nik, nig, npk, kv, ik, ig, ip):
         return pl.pallas_call(
             kernel,
-            out_shape=tuple(jax.ShapeDtypeStruct(c.shape, c.dtype) for c in (kv, ik, ig, ip)),
+            out_shape=tuple(
+                jax.ShapeDtypeStruct(c.shape, c.dtype) for c in (kv, ik, ig, ip)
+            ),
             in_specs=[smem] + [vmem] * 4 + [anyspace] * 4,
             out_specs=(anyspace,) * 4,
-            scratch_shapes=[pltpu.VMEM((n_dsa, 32, kvl), BF16),
-                            pltpu.VMEM((n_dsa, 32, idh), BF16),
-                            pltpu.VMEM((n_dsa, 32, idh), BF16),
-                            pltpu.VMEM((n_dsa, 8, idh), F32),
-                            pltpu.SemaphoreType.DMA((4 * n_dsa,))],
+            scratch_shapes=[
+                pltpu.VMEM((n_dsa, 32, kvl), BF16),
+                pltpu.VMEM((n_dsa, 32, idh), BF16),
+                pltpu.VMEM((n_dsa, 32, idh), BF16),
+                pltpu.VMEM((n_dsa, 8, idh), F32),
+                pltpu.SemaphoreType.DMA((4 * n_dsa,)),
+            ],
             input_output_aliases={5: 0, 6: 1, 7: 2, 8: 3},
         )(pos, nkv, nik, nig, npk, kv, ik, ig, ip)
 
