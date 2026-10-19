@@ -34,7 +34,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -43,6 +42,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_draft_input import (
+    ChainVerifyInput,
     chain_draft_forward_input,
 )
 from sglang_tpu.experimental.speculative.chain_draft_worker import (
@@ -216,9 +216,10 @@ class TpuChainSpecWorker(TpuSpecWorker):
             verify_input=verify_input,
             offset=0,
             width=width,
-            spec_info=_with_verify_kv_lens(
-                chain_draft_forward_input(hidden_states=target_hidden, width=width),
-                rows,
+            spec_info=chain_draft_forward_input(
+                hidden_states=target_hidden,
+                width=width,
+                verify_kv_lens=rows.verify_kv_lens,
             ),
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -314,17 +315,15 @@ class TpuChainSpecWorker(TpuSpecWorker):
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
-    ) -> DFlashVerifyInput:
-        return _with_verify_kv_lens(
-            DFlashVerifyInput(
-                draft_token=verify_tokens,
-                positions=rows.flat_positions,
-                draft_token_num=self.num_verify_rows,
-                custom_mask=None,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                live_seq_lens_cpu=batch.seq_lens_cpu,
-            ),
-            rows,
+    ) -> ChainVerifyInput:
+        return ChainVerifyInput(
+            draft_token=verify_tokens,
+            positions=rows.flat_positions,
+            draft_token_num=self.num_verify_rows,
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
+            verify_kv_lens=rows.verify_kv_lens,
         )
 
     def state_to_spec_info(self, state: SpecState) -> HostPaddedChainDraftInput:
@@ -436,13 +435,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 dtype=self._draft_runner.dtype,
             ).to(self.device)
             self._chain_draft_worker.carry.index_copy_(0, pool_rows, tail_hidden)
-
-
-def _with_verify_kv_lens(spec_info: DFlashVerifyInput, rows: VerifyRows):
-    """Hand the RPA backend the verify rows' KV lengths select_verify_rows
-    already built, so the verify and commit forwards skip their eager seq_lens + width."""
-    spec_info.verify_kv_lens = rows.verify_kv_lens
-    return spec_info
 
 
 @compiled_op()
