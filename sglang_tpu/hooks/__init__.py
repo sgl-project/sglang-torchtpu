@@ -38,7 +38,6 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
-from sglang_tpu.hooks.spec_verify import fused_greedy_chain_verify
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
@@ -105,11 +104,6 @@ HOOKS: list[tuple] = [
         "sglang.srt.layers.layer_boundary.adapters.attention."
         "_device_supports_input_scattered",
         device_supports_input_scattered,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.speculative.eagle_utils.fused_greedy_chain_verify",
-        fused_greedy_chain_verify,
         HookType.AROUND,
     ),
     (

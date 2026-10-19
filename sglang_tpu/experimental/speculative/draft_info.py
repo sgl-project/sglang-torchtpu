@@ -58,17 +58,20 @@ class HostPaddedDraftInput(SpecInput):
             page_size=batch.token_to_kv_pool_allocator.page_size,
         )
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32)
-        allocate_and_assign_decode_cache(
-            tree_cache=batch.tree_cache,
-            req_to_token_pool=batch.req_to_token_pool,
-            req_pool_indices=batch.req_pool_indices,
-            cur_kv_lens_cpu=torch.tensor(cur_kv_lens, dtype=torch.int32),
-            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-            num_needed_tokens=num_needed_tokens,
-            batch_size=bs,
-            device=batch.device,
-            host_req_pool_indices=batch.req_pool_indices_cpu,
-        )
+        # Reservations are page-aligned, so most steps need no new slot; then
+        # the lookup, allocation and table write would all be empty.
+        if num_needed_tokens > 0:
+            allocate_and_assign_decode_cache(
+                tree_cache=batch.tree_cache,
+                req_to_token_pool=batch.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices,
+                cur_kv_lens_cpu=torch.tensor(cur_kv_lens, dtype=torch.int32),
+                nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+                num_needed_tokens=num_needed_tokens,
+                batch_size=bs,
+                device=batch.device,
+                host_req_pool_indices=batch.req_pool_indices_cpu,
+            )
         for req, nxt in zip(batch.reqs, nxt_kv_lens):
             req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, nxt)
             req.decode_batch_idx += 1

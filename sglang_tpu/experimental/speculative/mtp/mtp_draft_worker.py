@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.dspark import gather_and_crop_vocab, project_through_lm_head
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.runtime_context import get_spec
@@ -23,14 +24,21 @@ from sglang_tpu.experimental.speculative.chain_draft_worker import (
     TpuChainDraftWorker,
 )
 
+# Each reads the target hidden from spec_info.hidden_states and returns its own
+# normed hidden, the logits input of its lm_head. DeepseekV3ForCausalLMNextN
+# covers the DeepSeek-style NextN layers (GLM-5.3-Flash included).
+MTP_DRAFT_MODELS = (Qwen3_5ForCausalLMMTP, DeepseekV3ForCausalLMNextN)
+_MtpDraftModel = Qwen3_5ForCausalLMMTP | DeepseekV3ForCausalLMNextN
+
 
 class TpuMtpDraftWorker(TpuChainDraftWorker):
     def __init__(self, target_runner: ModelRunner) -> None:
         super().__init__(target_runner)
         draft_model = self.model_runner.model
-        if not isinstance(draft_model, Qwen3_5ForCausalLMMTP):
+        if not isinstance(draft_model, MTP_DRAFT_MODELS):
             raise TypeError(
-                f"TpuMtpDraftWorker needs Qwen3_5ForCausalLMMTP, got {type(draft_model)}."
+                "TpuMtpDraftWorker needs one of "
+                f"{[cls.__name__ for cls in MTP_DRAFT_MODELS]}, got {type(draft_model)}."
             )
         spec = get_spec()
         if spec.speculative_eagle_topk != 1:
@@ -63,7 +71,7 @@ class TpuMtpDraftWorker(TpuChainDraftWorker):
 
 
 def _share_target_vocab(
-    *, draft_model: Qwen3_5ForCausalLMMTP, target_runner: ModelRunner
+    *, draft_model: _MtpDraftModel, target_runner: ModelRunner
 ) -> None:
     """Bind the target embedding and lm_head, as EAGLEWorkerV2.init_lm_head does for MTP."""
     model_config = target_runner.model_config

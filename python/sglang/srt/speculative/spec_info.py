@@ -431,12 +431,6 @@ class SpecInput(ABC):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
-    # Device int32 kv lengths of a target-verify forward (prefix + width), when
-    # the flow already built them inside a compiled op; None = derive from
-    # seq_lens. A draft extend that rewrites the same window reuses them.
-    # Class-level default for the same reason as ragged_verify_layout.
-    verify_kv_lens: Optional[torch.Tensor] = None
-
     # Dataclasses assign fields before __post_init__ calls this base's __init__;
     # assigning None there would overwrite the constructor's custom_mask.
     custom_mask: Optional[torch.Tensor] = None

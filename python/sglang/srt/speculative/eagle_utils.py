@@ -959,15 +959,10 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
-    with_commit_outputs: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
-
-    with_commit_outputs appends a fourth value: the commit outputs of a fused
-    top-1 chain verify (fused_greedy_chain_verify), or None when another path
-    sampled.
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
@@ -988,8 +983,6 @@ def eagle_sample(
         predict = torch.empty(0, dtype=torch.int32, device=device)
         num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
         accept_index = torch.empty(0, dtype=torch.int32, device=device)
-        if with_commit_outputs:
-            return predict, num_correct_drafts, accept_index, None
         return predict, num_correct_drafts, accept_index
 
     bs = len(batch.seq_lens)
@@ -1027,23 +1020,6 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
-    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if verify_input.tree_topk == 1 and _verify_uses_greedy(
-        is_all_greedy=sampling_info.is_all_greedy,
-        is_cpu=_is_cpu,
-        is_hip=_is_hip,
-        is_xpu=_is_xpu,
-        use_rejection_sampling=use_rejection_sampling,
-    ):
-        fused = fused_greedy_chain_verify(
-            verify_input, next_token_logits, batch.seq_lens
-        )
-        if fused is not None:
-            predict, accept_lens, accept_index, *commit = fused
-            if with_commit_outputs:
-                return predict, accept_lens, accept_index, tuple(commit)
-            return predict, accept_lens, accept_index
-
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
@@ -1054,6 +1030,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
+    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     if _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
@@ -1303,21 +1280,7 @@ def eagle_sample(
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    if with_commit_outputs:
-        return predict, num_correct_drafts + 1, accept_index, None
     return predict, num_correct_drafts + 1, accept_index
-
-
-def fused_greedy_chain_verify(verify_input, next_token_logits, seq_lens):
-    """Greedy verify of a top-1 draft chain in one fused op.
-
-    Returns (predict, accept_lens, accept_index) followed by the commit
-    outputs (new seq_lens, bonus tokens, last accepted step, each request's
-    last accepted row, int64 predicts), simulated acceptance included; or
-    None when the platform has no fused op and eagle_sample takes its generic
-    path. A platform plugin provides the op by hooking this function.
-    """
-    return None
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):

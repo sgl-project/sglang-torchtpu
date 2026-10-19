@@ -463,45 +463,6 @@ class TestVerifyBookkeepingEquivalence(unittest.TestCase):
                 self.assertTrue(torch.equal(got_bonus, want_bonus))
 
 
-class TestChainCommitOutputs(unittest.TestCase):
-    """The top-1 chain verify op's commit outputs must match the generic
-    bookkeeping (fused_verify_bookkeeping) on a chain's accept_index."""
-
-    def test_matches_generic_bookkeeping(self):
-        from sglang.srt.speculative.eagle_utils import fused_verify_bookkeeping
-        from sglang_tpu.eagle_utils_tpu import chain_commit_outputs
-
-        torch.manual_seed(2)
-        for bs, width in ((1, 4), (3, 4), (2, 6)):
-            seq_lens = torch.randint(8, 64, (bs,), dtype=torch.int64)
-            accept_lens = torch.randint(1, width + 1, (bs,), dtype=torch.int32)
-            predict = torch.randint(0, 1000, (bs * width,), dtype=torch.int32)
-            # A top-1 chain accepts a prefix of each request's window.
-            cols = torch.arange(width)[None, :]
-            accept_index = torch.where(
-                cols < accept_lens[:, None],
-                torch.arange(bs)[:, None] * width + cols,
-                -1,
-            ).to(torch.int32)
-
-            new_seq, bonus, last_step, select, pred64 = chain_commit_outputs(
-                predict, accept_lens, seq_lens, width
-            )
-            want_seq, want_bonus = fused_verify_bookkeeping(
-                seq_lens, accept_lens, predict, accept_index
-            )
-
-            with self.subTest(bs=bs, width=width):
-                self.assertTrue(torch.equal(new_seq, want_seq))
-                self.assertTrue(torch.equal(bonus, want_bonus.to(bonus.dtype)))
-                self.assertEqual(last_step.tolist(), (accept_lens - 1).tolist())
-                self.assertEqual(
-                    select.tolist(),
-                    (torch.arange(bs) * width + accept_lens - 1).tolist(),
-                )
-                self.assertTrue(torch.equal(pred64, predict.to(torch.int64)))
-
-
 class TestDraftExtendSelectFused(unittest.TestCase):
     """Fused draft-extend select must match the eager gather + argmax."""
 
