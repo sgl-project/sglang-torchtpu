@@ -16,6 +16,10 @@
 
 SGLang-TorchTPU brings [SGLang](https://github.com/sgl-project/sglang) to Google TPUs through **torch_tpu** and **Pallas kernels**. Serve large language and vision-language models with SGLang's OpenAI-compatible API and scheduling engine, while developing in PyTorch with eager execution and TPU compilation.
 
+<p align="center">
+  <a href="https://docs.sglang.io/docs/hardware-platforms/tpu#sglang-torchtpu">Documentation</a>
+</p>
+
 ## Highlights
 
 **PyTorch-native TPU serving.** Develop with familiar PyTorch workflows and deploy on TPU7x (Ironwood), with `torch.compile` and direct compilation. Tensor, expert, data, pipeline, and context parallelism cover a range of serving configurations.
