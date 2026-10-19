@@ -42,12 +42,17 @@ class PrefillState:
 
     # Pages requested by RESHARD_READY for the closing push.
     reshard_ready_pages: Dict[int, List[int]] = field(default_factory=dict)
+    # Scratch blocks paired with them, when RESHARD_LAND_READY asked (#829).
+    reshard_ready_scratch: Dict[int, List[int]] = field(default_factory=dict)
 
     # Rooms whose closing reshard push has completed.
     reshard_final_pushed: Set[int] = field(default_factory=set)
 
     # Committed pages waiting to reach the chunk announcement threshold.
     pending_offer: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
+    # End page of the room's last offered step: a landing room's closing reply
+    # announces the pages from here (or from pending_offer) as chunks (#829).
+    offered_end: Dict[int, int] = field(default_factory=dict)
     chunk_seq: Dict[int, int] = field(default_factory=dict)
 
     # Decode metadata received in RESHARD_REQ.
