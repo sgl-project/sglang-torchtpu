@@ -122,6 +122,10 @@ class TpuEnvs:
     # Same effect as SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1. Non-speculative
     # batches ignore it.
     SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
+    # Not a user setting: the platform sets it for one launch whose speculative
+    # configuration the plugin workers cannot serve (spec_execution.py), and
+    # clears it at the next; scheduler processes inherit it.
+    SGLANG_TPU_SPEC_WORKER_FALLBACK = EnvBool(False)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.

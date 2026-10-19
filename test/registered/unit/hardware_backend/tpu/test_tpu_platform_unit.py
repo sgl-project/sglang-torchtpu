@@ -316,6 +316,13 @@ def _require_resolved_dp_layout(overrides):
 class TestTpuPlatformServerDefaults(CustomTestCase):
     """apply_server_args_defaults sets correct values."""
 
+    def setUp(self):
+        super().setUp()
+        from sglang_tpu.envs import envs as tpu_envs
+
+        # A launch's speculative fallback lasts until the next launch settles.
+        self.addCleanup(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.clear)
+
     def _args(self, **overrides):
         _require_resolved_dp_layout(overrides)
         # apply_server_args_defaults declares rather than writes, so the assertions read the
@@ -374,12 +381,32 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             model_is_mrope=mrope,
         )
 
-    def _apply(self, args, *, eagle3_draft=None):
+    def _apply(
+        self,
+        args,
+        *,
+        eagle3_draft=None,
+        mtp_draft="Qwen3_5ForCausalLMMTP",
+        dflash_draft=None,
+        dspark_draft=None,
+    ):
         platform = TpuSRTPlatform()
         with (
             patch("sglang_tpu.patches._prepare_tpu_env"),
             patch(
-                "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                "sglang_tpu.spec_execution._dflash_draft_unsupported_reason",
+                return_value=dflash_draft,
+            ),
+            patch(
+                "sglang_tpu.spec_execution._dspark_draft_unsupported_reason",
+                return_value=dspark_draft,
+            ),
+            patch(
+                "sglang_tpu.spec_execution._mtp_draft_architecture",
+                return_value=mtp_draft,
+            ),
+            patch(
+                "sglang_tpu.spec_execution._draft_model_config",
                 return_value=eagle3_draft or self._eagle3_draft(),
             ),
         ):
@@ -521,17 +548,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             ),
             (
                 "EAGLE3",
-                {},
+                dict(speculative_draft_model_path="eagle3-draft"),
                 {},
                 dict(eagle3_draft=self._eagle3_draft("Eagle3DeepseekV2ForCausalLM")),
                 "LlamaForCausalLMEagle3 only",
             ),
             (
                 "EAGLE3",
-                {},
+                dict(speculative_draft_model_path="eagle3-draft"),
                 {},
                 dict(eagle3_draft=self._eagle3_draft(mrope=True)),
                 "M-RoPE drafts",
+            ),
+            (
+                "DFLASH",
+                {},
+                {},
+                dict(dflash_draft="does not support LiLiCorr drafts"),
+                "LiLiCorr",
+            ),
+            (
+                "DSPARK",
+                {},
+                {},
+                dict(dspark_draft="cannot serve this draft (no markov head)"),
+                "cannot serve this draft",
             ),
             (
                 "EAGLE3",
@@ -608,9 +649,10 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                         self._apply(args, **kwargs)
                     continue
                 self._apply(args, **kwargs)
-                # Scheduler processes inherit the flag, so every consumer agrees.
-                self.assertTrue(flag.is_set())
-                self.assertFalse(flag.get())
+                # Scheduler processes inherit the fallback, so every consumer
+                # agrees; the user's own flag is left as set.
+                self.assertTrue(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
+                self.assertFalse(flag.is_set())
                 self.assertFalse(
                     resolve_spec_execution(
                         SpeculativeAlgorithm[algo], pp_size=1
@@ -633,6 +675,252 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 self._apply(args)
                 self.assertFalse(flag.is_set())
                 self.assertTrue(self._resolved(args, "enable_torch_compile"))
+
+    def _mtp_rejections(self):
+        """(args overrides, env, reason) TpuChainSpecWorker rejects at construction."""
+        return [
+            (dict(disable_overlap_schedule=True), {}, "requires overlap scheduling"),
+            (
+                dict(
+                    attn_dp_size=2,
+                    tp_size=4,
+                    enable_dp_lm_head=True,
+                    speculative_skip_dp_mlp_sync=True,
+                ),
+                {},
+                "prefill and decode",
+            ),
+            ({}, {"SGLANG_RAGGED_VERIFY_MODE": "compact"}, "RAGGED_VERIFY_MODE"),
+            (dict(speculative_draft_window_size=64), {}, "draft-window-size"),
+            (dict(enable_multi_layer_eagle=True), {}, "multi-layer or adaptive"),
+            (
+                dict(speculative_num_steps=3, speculative_num_draft_tokens=5),
+                {},
+                "num-draft-tokens",
+            ),
+        ]
+
+    def test_nextn_uses_the_chain_worker_only_where_it_is_supported(self):
+        """Native MTP defaults to TpuChainSpecWorker on the drafts TPU serves, and
+        to the compatibility worker for what the chain worker would reject."""
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.spec_execution import _CHAIN, resolve_spec_execution
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        mtp = SpeculativeAlgorithm.EAGLE
+        with envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False):
+            for draft in (
+                "Qwen3_5ForCausalLMMTP",
+                "Glm5NextForConditionalGenerationNextN",
+            ):
+                with self.subTest(draft=draft), flag.override(True):
+                    flag.clear()
+                    args = self._args(speculative_algorithm="NEXTN")
+                    self._apply(args, mtp_draft=draft)
+                    self.assertFalse(flag.is_set())
+                    self.assertIs(resolve_spec_execution(mtp, pp_size=1), _CHAIN)
+                    self.assertTrue(self._resolved(args, "enable_torch_compile"))
+            # Loaded by the MTP drafter but not yet exercised on TPU.
+            for draft in ("DeepseekV3ForCausalLMNextN",):
+                with self.subTest(draft=draft), flag.override(True):
+                    flag.clear()
+                    args = self._args(speculative_algorithm="NEXTN")
+                    self._apply(args, mtp_draft=draft)
+                    self.assertTrue(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
+                    self.assertFalse(resolve_spec_execution(mtp, pp_size=1).host_padded)
+            for overrides, env, reason in self._mtp_rejections():
+                with (
+                    self.subTest(reason=reason),
+                    patch.dict(os.environ, env),
+                    flag.override(True),
+                ):
+                    flag.clear()
+                    args = self._args(speculative_algorithm="NEXTN", **overrides)
+                    self._apply(args)
+                    self.assertTrue(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
+                    self.assertFalse(flag.is_set())
+                    self.assertFalse(self._resolved(args, "enable_torch_compile"))
+            # The chain worker serves attention DP and either PD role.
+            for overrides in (
+                dict(attn_dp_size=2, tp_size=4, enable_dp_lm_head=True),
+                dict(disaggregation_mode="prefill"),
+                dict(disaggregation_mode="decode"),
+            ):
+                with self.subTest(served=overrides), flag.override(True):
+                    flag.clear()
+                    args = self._args(speculative_algorithm="NEXTN", **overrides)
+                    self._apply(args)
+                    self.assertFalse(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
+                    self.assertIs(resolve_spec_execution(mtp, pp_size=1), _CHAIN)
+            with flag.override(True):
+                # The configured pipeline keeps native MTP on core's EAGLE driver.
+                self.assertFalse(resolve_spec_execution(mtp, pp_size=2).host_padded)
+
+    def test_explicit_nextn_opt_in_keeps_the_chain_worker_or_rejects_before_load(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            # An explicit opt-in serves every draft the MTP drafter loads.
+            args = self._args(speculative_algorithm="NEXTN")
+            self._apply(args, mtp_draft="DeepseekV3ForCausalLMNextN")
+            self.assertTrue(self._resolved(args, "enable_torch_compile"))
+            for overrides, env, reason in self._mtp_rejections():
+                with self.subTest(reason=reason), patch.dict(os.environ, env):
+                    with self.assertRaisesRegex(
+                        ValueError, "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC"
+                    ) as caught:
+                        self._apply(
+                            self._args(speculative_algorithm="NEXTN", **overrides)
+                        )
+                    self.assertRegex(str(caught.exception), reason)
+
+    def test_direct_tracer_cannot_fall_back_to_the_eager_mtp_driver(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        with (
+            flag.override(True),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
+            flag.clear()
+            args = self._args(
+                speculative_algorithm="NEXTN",
+                tpu_compile_tracer="direct",
+                speculative_draft_window_size=64,
+            )
+            with self.assertRaisesRegex(ValueError, "--tpu-compile-tracer direct"):
+                self._apply(args)
+
+    def test_direct_tracer_follows_the_settled_route_under_the_installed_hook(self):
+        """The plugin hook claims direct compile for native MTP whenever the chain
+        worker could serve it; the settled route decides whether it does."""
+        from sglang.srt.plugins.hook_registry import HookType, _wrap_fn
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.hooks import experimental_spec
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        hooked = _wrap_fn(
+            SpeculativeAlgorithm.supports_tpu_direct_compile,
+            experimental_spec.supports_tpu_direct_compile,
+            HookType.AROUND,
+        )
+        with (
+            patch.object(SpeculativeAlgorithm, "supports_tpu_direct_compile", hooked),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
+            with flag.override(True):
+                # The draft TPU has not exercised falls back to core's EAGLE driver.
+                flag.clear()
+                args = self._args(
+                    speculative_algorithm="NEXTN", tpu_compile_tracer="direct"
+                )
+                with self.assertRaisesRegex(ValueError, "--tpu-compile-tracer direct"):
+                    self._apply(args, mtp_draft="DeepseekV3ForCausalLMNextN")
+                self.assertFalse(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
+            with flag.override(True):
+                # Where the chain worker serves it, it is direct-compiled.
+                flag.clear()
+                args = self._args(
+                    speculative_algorithm="NEXTN", tpu_compile_tracer="direct"
+                )
+                self._apply(args)
+                self.assertTrue(self._resolved(args, "enable_torch_compile"))
+
+    def test_a_fallback_lasts_for_its_launch_only(self):
+        """A later launch in the same process decides from the user's setting,
+        not from an earlier launch's fallback."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        fallback = tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK
+        with flag.override(True), envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False):
+            flag.clear()
+            self._apply(
+                self._args(
+                    speculative_algorithm="EAGLE3", speculative_draft_window_size=64
+                )
+            )
+            self.assertTrue(fallback.get())
+            self.assertFalse(flag.is_set())
+            args = self._args(speculative_algorithm="EAGLE3")
+            self._apply(args)
+            self.assertFalse(fallback.get())
+            self.assertTrue(self._resolved(args, "enable_torch_compile"))
+
+    def test_unreadable_model_config_fails_the_launch(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch(
+                "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                side_effect=OSError("no config.json"),
+            ),
+        ):
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.clear()
+            args = self._args(
+                speculative_algorithm="EAGLE3", speculative_draft_model_path="/draft"
+            )
+            with self.assertRaisesRegex(OSError, "no config.json"):
+                TpuSRTPlatform().apply_server_args_defaults(args)
+
+    def _dflash_reason(self, *, path, architectures=("DFlashDraftModel",), **dflash):
+        from sglang_tpu import spec_execution
+
+        hf_config = SimpleNamespace(
+            architectures=list(architectures), dflash_config=dict(dflash)
+        )
+        with (
+            patch.object(
+                spec_execution,
+                "_draft_model_config",
+                return_value=SimpleNamespace(hf_config=hf_config),
+            ),
+            patch.object(
+                spec_execution,
+                "_target_model_config",
+                return_value=SimpleNamespace(vocab_size=1000),
+            ),
+        ):
+            return spec_execution._dflash_draft_unsupported_reason(
+                self._args(
+                    speculative_algorithm="DFLASH", speculative_draft_model_path=path
+                )
+            )
+
+    def test_dflash_draft_checks_run_before_load(self):
+        """What TpuDflashDraftWorker rejects in the checkpoint, read from its config."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as path:
+            self.assertIsNone(self._dflash_reason(path=path, mask_token_id=7))
+            self.assertRegex(
+                self._dflash_reason(
+                    path=path, architectures=("LiLiCorrDraftModel",), mask_token_id=7
+                ),
+                "LiLiCorr",
+            )
+            self.assertRegex(
+                self._dflash_reason(
+                    path=path,
+                    projector_type="domino",
+                    shift_label=True,
+                    mask_token_id=7,
+                ),
+                "Domino",
+            )
+            self.assertRegex(self._dflash_reason(path=path), "mask_token_id")
+            self.assertRegex(
+                self._dflash_reason(path=path, mask_token_id=1000), "vocab size 1000"
+            )
+            open(os.path.join(path, "mask_embedding.pt"), "wb").close()
+            self.assertRegex(
+                self._dflash_reason(path=path, mask_token_id=7), "mask_embedding.pt"
+            )
 
     def test_compatibility_route_keeps_eager_configuration(self):
         from sglang_tpu.envs import envs as tpu_envs
