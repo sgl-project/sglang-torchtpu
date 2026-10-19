@@ -148,5 +148,6 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
         self._check(args, ref, 0.08, 0.75)
 
+
 if __name__ == "__main__":
     unittest.main()
