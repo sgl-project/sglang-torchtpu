@@ -177,7 +177,7 @@ class BaseSpecDecodeCompilePolicyMixin:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
-        variants = self._extend_input_variants()
+        variants = self._extend_serving_variants()
         valid_shapes = [
             (t, bs, has_spec_info, variant)
             for t in self.t_bucketer.buckets

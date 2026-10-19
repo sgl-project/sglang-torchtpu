@@ -1219,6 +1219,9 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_last_match_len: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # Matched prefix length at this request's first radix insert; stale SWA
+        # window demotion stops here (SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST).
+        self.swa_stale_window_floor: Optional[int] = None
         # Logical-page KV sharding: rotation base of the chain this request
         # extends (owner of position-page P is (base + P) % shard_size).
         # Refreshed at every sharded alloc — read through last_node, or drawn
@@ -1990,6 +1993,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
+        self.swa_stale_window_floor = None
         self.swa_branching_seqlen = None
         self.extend_range = None
         self.dllm_initialized = False

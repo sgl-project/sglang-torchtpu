@@ -1427,6 +1427,42 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(result["hidden_states"].shape, (5, 4))
         self.assertEqual(result["residual"].shape, (5, 4))
 
+    def test_spec_full_capture_extend_warms_text_ids(self):
+        """A speculative multimodal target still serves text-only prefills.
+
+        Those take the positional token-ID call with FULL capture. Warming only
+        the input_embeds variant let the server's image warmup request freeze
+        compilation first, so the first text prefill tripped fail_on_recompile.
+        """
+
+        class _SpecQwenPolicy(
+            Eagle3SpecDecodeCompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy
+        ):
+            pass
+
+        policy = object.__new__(_SpecQwenPolicy)
+        policy.model_runner = SimpleNamespace(model=SimpleNamespace())
+        policy.owner = policy.model_runner.model
+        policy.t_bucketer = SimpleNamespace(buckets=(1024,))
+        policy.b_bucketer = SimpleNamespace(buckets=(1,))
+        policy._extend_compile_cap = lambda: 1
+        policy._uses_input_embeds = lambda target: True
+        policy.make_null_spec_info = MagicMock()
+        policy._run_one = MagicMock(return_value=None)
+
+        with patch(
+            "sglang_tpu.compilation.spec_decode_compile_policy.get_parallel",
+            return_value=SimpleNamespace(tp_rank=1),
+        ):
+            policy._precompile_extend_full()
+
+        warmed = {
+            (call.kwargs["variant"], call.kwargs["capture_hidden_mode"])
+            for call in policy._run_one.call_args_list
+        }
+        self.assertIn(("text_ids", CaptureHiddenMode.FULL), warmed)
+        self.assertIn(("text_only", CaptureHiddenMode.FULL), warmed)
+
     def test_spec_policy_delegates_raw_vl_output_unpadding(self):
         class _SpecQwenPolicy(
             Eagle3SpecDecodeCompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy

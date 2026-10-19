@@ -175,11 +175,16 @@ full throughput the controller also needs its own thread pool for worker
 RPCs ([tpu-sync main 6b3e8206](https://github.com/google/tpu-sync/commit/6b3e8206f5a0f4ad7bf4717790bff4c8eb7e1c1c)):
 a transfer coordinates every source stage, and on asyncio's default
 executor concurrent transfers queue behind each other.
-Each engine registers the full-attention and sliding-window layers it owns
-as `fa.lN` and `swa.lN`. By default a single native transfer moves both
-namespaces after the prefill finishes. Full-attention and window page lists
-remain independent, and a cached decode prefix is clipped from each layer's
-transfer.
+Each worker registers the full-attention and sliding-window layers it owns
+as `fa.lN` and `swa.lN`. tpu-sync requires every layer of one engine to hold
+the same number of blocks, so a worker with hybrid SWA memory wraps its
+sliding-window layers in a second engine (control port `+2`, as on the TP
+path) registered with a second controller on stage zero. The window pages of
+the closing transfer and of each stage group move as a twin native transfer
+`swa:<id>` on that engine, announced in the same READY, and a transfer settles
+only once its twin has. By default the closing transfer and its twin move after
+the prefill finishes. Full-attention and window page lists remain independent,
+and a cached decode prefix is clipped from each layer's transfer.
 
 Three opt-in modes overlap the hand-off with the prefill; all are set on the
 prefill (`SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` on the decode):
@@ -205,14 +210,19 @@ announced its share, after its forward, which needs every earlier stage's. A
 request returning logprobs or a sampling mask, using a grammar or a KV
 checksum, or still bootstrapping gets its first token at the result point.
 
-Each worker owns one Raiden engine. Pipeline stages share one controller hosted
-by stage zero; independent attention-DP workers each own one. Pool geometry and
-materialized TPU layouts must match between peers. Every pipeline stage needs
-at least one full-attention layer. Speculative decoding is supported only on
-the decode, and only when its draft has no separate KV pool and takes no draft
-hidden states from the prefill.
+Each worker owns one Raiden engine, and with hybrid SWA memory a second one for
+its sliding-window layers. Pipeline stages share stage zero's controller for
+each kind of engine; independent attention-DP workers each host their own.
+Pool geometry and materialized TPU layouts must match between peers, and
+prefill and decode must both use hybrid SWA memory or both run with
+`--disable-hybrid-swa-memory`. Every pipeline stage needs at least one
+full-attention layer and, with hybrid SWA memory, at least one sliding-window
+layer. Speculative decoding is supported only on the decode, and only when its
+draft has no separate KV pool and takes no draft hidden states from the
+prefill.
 Host staging uses bounded leases when the installed Raiden supports per-pool
-staging. Older PP-capable wheels use full host mirrors; startup measures their
+staging, which hybrid SWA memory requires. Older PP-capable wheels use full
+host mirrors; startup measures their
 materialized block-major page layouts and bounds their
 peak allocation, including a temporary replacement buffer, against each
 rank's share of `SGLANG_RAIDEN_HOST_POOL_GB`. Over-budget mirrors are rejected;
@@ -230,4 +240,5 @@ source pages remain reserved until the unclaimed registration expires
 
 The pipeline unit tests are in
 `test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py`,
-`test_raiden_pipeline_overlap.py` and `test_raiden_pipeline_rank4.py`.
+`test_raiden_pipeline_overlap.py`, `test_raiden_pipeline_rank4.py` and
+`test_raiden_pipeline_swa.py`.

@@ -24,14 +24,16 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
     PipelineTransfer,
     Receive,
     destination_blocks,
-    head_slice_spans,
     layout_fingerprint,
     legacy_mirror_slots,
     legacy_slot_host_bytes,
     materialized_storage_layout,
     pool_manifest,
-    source_spans,
     warn_if_staging_exceeds_premapped,
+)
+from sglang_tpu.disaggregation.raiden.pp_common import (
+    head_slice_spans,
+    source_spans,
 )
 from sglang_tpu.disaggregation.raiden.serde import MessageTag, RoomFailed
 
@@ -971,7 +973,7 @@ class TestPipelineInitialization(unittest.TestCase):
             server_args=SimpleNamespace(speculative_algorithm=None, nnodes=1),
             kv_args=SimpleNamespace(page_size=128),
             _max_request_blocks=lambda: 4,
-            _num_slots=lambda *args: 2,
+            _num_slots=lambda *args, **kwargs: 2,
         )
 
         def layout(tensor):

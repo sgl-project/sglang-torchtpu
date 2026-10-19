@@ -1425,6 +1425,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Input signatures an extend graph must be compiled for."""
         return ("plain",)
 
+    def _extend_serving_variants(self) -> tuple[str, ...]:
+        """Every input signature serving hands the extend graph, for each warmup grid."""
+        return self._extend_input_variants()
+
     def _extend_cp_compile_items(self) -> list[tuple[int, int, ForwardMode, str, Any]]:
         """Warmup items of the context-parallel extend family.
 
@@ -2111,6 +2115,13 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             return ("deepstack", "text_only")
         return ("text_only",)
 
+    def _extend_serving_variants(self) -> tuple[str, ...]:
+        if not self._uses_input_embeds(self.owner):
+            return super()._extend_serving_variants()
+        # "text_ids" warms positional token-ID calls used by text-only serving,
+        # in addition to the input_embeds calls used by multimodal serving.
+        return (*self._extend_input_variants(), "text_ids")
+
     def _direct_compile_specialization_key(
         self,
         attention_metadata: Any,
@@ -2226,9 +2237,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 f"extend batch cap {self._extend_compile_cap()}."
             )
 
-        # "text_ids" warms positional token-ID calls used by text-only serving,
-        # in addition to the input_embeds calls used by multimodal serving.
-        variants = (*self._extend_input_variants(), "text_ids")
+        variants = self._extend_serving_variants()
 
         compile_items = [
             (num_tokens, bs, mode, variant, logits_output_mode)

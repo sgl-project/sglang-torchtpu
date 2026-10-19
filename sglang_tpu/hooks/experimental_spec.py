@@ -2,6 +2,9 @@
 
 Why: filter/merge and H2D staging must be intercepted before device operations,
 not repaired afterward. All non-experimental calls delegate unchanged.
+kimi_spec_defaults: core refuses speculation for Kimi hybrid (KDA) targets on
+TPU and otherwise pins GPU verify/draft backends; the experimental worker
+serves DSPARK on the TPU KDA checkpoint verify, so it skips both.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
 replace these hooks with agreed factories/overrides for the extracted operations.
 Remove when: the experiment is removed or those upstream seams are available.
@@ -256,11 +259,26 @@ def spec_need_hidden_states(original):
     return original()
 
 
+def kimi_spec_defaults(original, server_args):
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    cfg = resolving_view(server_args)
+    if cfg.speculative_algorithm == "DSPARK" and experimental_spec_enabled():
+        return None
+    return original(server_args)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     schedule = "sglang.srt.managers.schedule_batch.ScheduleBatch."
     hooks = [
+        (
+            "sglang.srt.arg_groups.kimi_k3_hook.apply_kimi_k3_spec_backend_defaults",
+            kimi_spec_defaults,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.models.dspark.DSparkDraftModel.sample_draft_tokens_tpu",
             sample_draft_tokens,

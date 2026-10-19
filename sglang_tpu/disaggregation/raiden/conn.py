@@ -496,15 +496,24 @@ class RaidenKVManager(
         return max(1, batch + in_transfer)
 
     def _num_slots(
-        self, kv_caches: List[Any], max_blocks: int, engines: int = 1
+        self,
+        kv_caches: List[Any],
+        max_blocks: int,
+        engines: int = 1,
+        *,
+        reserved_bytes: int = 0,
+        paired_slot_bytes: int = 0,
     ) -> int:
         """Slots this engine can afford within the host staging budget.
 
         The per-node budget is split across the ranks resident on this host
-        and across the engines this rank builds, then divided by what one slot
-        costs. Deriving the count keeps a large context length from turning
-        into a host allocation that fails at startup -- it shrinks the pool
-        instead, and refuses to start when not even one slot fits the budget.
+        and across the engines this rank builds, less ``reserved_bytes``
+        another engine of this rank already took, then divided by what one
+        slot costs, plus ``paired_slot_bytes`` when each slot comes with one
+        of another engine. Deriving the count keeps a large context length
+        from turning into a host allocation that fails at startup -- it
+        shrinks the pool instead, and refuses to start when not even one slot
+        fits the budget.
         """
         budget = float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128")) * 1024**3
         local_ranks = ranks_per_node(
@@ -515,8 +524,8 @@ class RaidenKVManager(
             self.attn_cp_size,
             self.pp_size,
         )
-        budget /= local_ranks * max(1, engines)
-        slot_bytes = slot_host_bytes(kv_caches, max_blocks)
+        budget = budget / (local_ranks * max(1, engines)) - reserved_bytes
+        slot_bytes = slot_host_bytes(kv_caches, max_blocks) + paired_slot_bytes
         slots = slots_within_budget(budget, slot_bytes, self._slot_ceiling())
         logger.info(
             "RaidenKVManager rank%d slot budget | max_blocks=%d slot=%.1fMB "

@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     KVClassType,
     TransferBackend,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.pool_host import base as host_base
@@ -2730,6 +2731,22 @@ class TestRaidenFutureEvent(CustomTestCase):
     def test_synchronize_polls_until_ready(self):
         ev = RaidenFutureEvent(_FakeFuture(ready_after=3))
         ev.synchronize()  # returns once is_ready() flips True
+
+    def test_query_raises_once_pending_past_the_deadline(self):
+        """A copy that never lands must stop the scheduler when polled, as a
+        blocking wait does, instead of holding its pages and every later ack."""
+        monotonic = "sglang_tpu.raiden_transfer.time.monotonic"
+        with envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.override(60.0):
+            with patch(monotonic, return_value=1000.0):
+                pending = RaidenFutureEvent(_FakeFuture(ready_after=10**6))
+                landed = RaidenFutureEvent(_FakeFuture())
+            with patch(monotonic, return_value=1059.0):
+                self.assertFalse(pending.query())
+            with patch(monotonic, return_value=1061.0):
+                with self.assertRaisesRegex(TimeoutError, "still pending"):
+                    pending.query()
+                # A copy that landed is done, however late it is polled.
+                self.assertTrue(landed.query())
 
     def test_record_and_wait_are_noops(self):
         ev = RaidenFutureEvent(_FakeFuture())

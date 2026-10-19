@@ -709,6 +709,7 @@ class TestTpuDebtRatchet(CustomTestCase):
 ADDED_BY_PATCHES = {
     "sglang.srt.managers.overlap_utils.FutureMap.tpu_direct_handoff",
     "sglang.srt.managers.overlap_utils.FutureMap.tpu_published_seq_lens",
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache._write_back_copy_ahead",
 }
 
 

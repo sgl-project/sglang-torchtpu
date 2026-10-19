@@ -691,12 +691,16 @@ class Envs:
     # Hybrid-SWA unified cache: insert a mid-prefill chunk only if it reaches a
     # multiple of this many tokens (0: every chunk); each insert pins an SWA window.
     SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE = EnvInt(0)
+    # Move the stale SWA windows a chunked request leaves behind its sliding window
+    # to the SWA LRU eviction end, ahead of shared windows and prefix tails.
+    SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST = EnvBool(False)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.
     # - Custom component overrides.
+    # - SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST on an SWA cache.
     # - Non-Linux platforms.
     # - Unsupported PyTorch versions.
     # - Devices other than CPU or CUDA.
@@ -2012,6 +2016,9 @@ class Envs:
     # xprof python tracer. Off by default: it dominates host busy time.
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # raiden KV-offload backend
+    # Seconds a raiden DMA may stay pending, from each blocking wait or, when
+    # polled, from issue. Past it the scheduler exits with TimeoutError, so keep
+    # it far above a healthy transfer.
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
     SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)
