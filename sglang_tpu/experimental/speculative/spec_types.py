@@ -87,6 +87,8 @@ class VerifyRows(NamedTuple):
       cache_locs: [pbs, N + 1] int64 KV slots; dummy slot 0 on padded rows.
       flat_positions: [pbs * (N + 1)] positions as its own graph output.
       flat_cache_locs: [pbs * (N + 1)] cache_locs as its own graph output.
+      verify_kv_lens: [pbs] int32 seq_lens + N + 1, the RPA KV length of a
+        forward over the verify rows (read as spec_info.verify_kv_lens).
     """
 
     positions: torch.Tensor
@@ -94,6 +96,7 @@ class VerifyRows(NamedTuple):
     # A reshape view fed to direct_compile costs an eager as_strided program per bucket.
     flat_positions: torch.Tensor
     flat_cache_locs: torch.Tensor
+    verify_kv_lens: torch.Tensor | None = None
 
 
 class DraftResult(NamedTuple):
@@ -130,6 +133,9 @@ class AcceptResult(NamedTuple):
       window_tokens: flat [pbs * (N + 1)] accept_tokens with 0 for -1, for a
         commit that rewrites the whole verify window (EAGLE3 draft extend).
       window_seq_lens: [pbs] seq_lens + N + 1, the length once that window is written.
+      live_mask: [pbs] bool, False on padded rows.
+      last_steps: [pbs] int64 accept_lens - 1, the verify step each row's
+        linear-attention state commits (-1 on padded rows).
     """
 
     num_correct_drafts: torch.Tensor
@@ -139,6 +145,9 @@ class AcceptResult(NamedTuple):
     next_seq_lens: torch.Tensor
     window_tokens: torch.Tensor
     window_seq_lens: torch.Tensor
+    # Computed in finalize_accept so the commit launches no eager ops for them.
+    live_mask: torch.Tensor | None = None
+    last_steps: torch.Tensor | None = None
 
 
 class DraftBlockInputs(NamedTuple):

@@ -79,6 +79,7 @@ def select_verify_rows(
         cache_locs=cache_locs,
         flat_positions=positions.reshape(-1),
         flat_cache_locs=cache_locs.reshape(-1),
+        verify_kv_lens=(seq_lens + num_rows).to(torch.int32),
     )
 
 
@@ -136,8 +137,16 @@ def build_chain_block_inputs(
     tokens = tokens.reshape(seq_lens.shape[0], -1)
     inputs = _block_inputs(tokens, rows, seq_lens, live_mask, offset=offset)
     # TARGET_VERIFY RPA adds the row width to seq_lens itself; the post-row length
-    # would let each row attend width stale draft KV slots past it.
-    return inputs._replace(seq_lens=inputs.extend_prefix_lens.to(seq_lens.dtype))
+    # would let each row attend width stale draft KV slots past it. Built anew
+    # rather than with _replace, which Dynamo cannot trace.
+    return DraftBlockInputs(
+        input_ids=inputs.input_ids,
+        positions=inputs.positions,
+        cache_locs=inputs.cache_locs,
+        seq_lens=inputs.extend_prefix_lens.to(seq_lens.dtype),
+        extend_prefix_lens=inputs.extend_prefix_lens,
+        extend_seq_lens=inputs.extend_seq_lens,
+    )
 
 
 def _block_inputs(
@@ -407,6 +416,8 @@ def finalize_accept(
         # later steps overwrite before reading, so any valid id serves.
         window_tokens=accept_tokens.clamp_min(0).reshape(-1),
         window_seq_lens=seq_lens + (n + 1),
+        live_mask=live_mask,
+        last_steps=accept_lens.to(torch.int64) - 1,
     )
 
 

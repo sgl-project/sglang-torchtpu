@@ -35,5 +35,15 @@ _args.update(
         "gc_threshold": [50000, 100, 100],
     }
 )
-# Module state is fixed after warmup; skip its Dynamo guards (#1472).
-CONFIG["runtime_env"]["SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER"] = "1"
+CONFIG["runtime_env"].update(
+    {
+        # MTP runs on the experimental chain spec worker (TpuChainSpecWorker).
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+        # Module state is fixed after warmup; skip its Dynamo guards (#1472).
+        "SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER": "1",
+        # Greedy draft and accept agree across ranks; sync only random draws.
+        "SGLANG_SPEC_TP_SYNC": "rng",
+        # One scheduler per TP rank on its own NUMA-local cores.
+        "SGLANG_SET_CPU_AFFINITY": "1",
+    }
+)

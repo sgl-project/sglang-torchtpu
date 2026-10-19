@@ -99,7 +99,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     map_carry,
 )
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
-from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.mamba_pool import TpuMambaPool, committed_read_offsets
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
 
@@ -185,6 +185,9 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         # Filled per batch bucket in init_cuda_graphs when simulating.
         self._simulated_drafts: dict[int, torch.Tensor] = {}
+        self._simulated_bonus: dict[int, torch.Tensor] = {}
+        # Per (batch bucket, forced num_correct_drafts).
+        self._simulated_correct: dict[tuple[int, int], torch.Tensor] = {}
         register_host_batch_padder(self._pad_bs)
 
     def init_cuda_graphs(self) -> None:
@@ -201,11 +204,25 @@ class TpuSpecWorker(BaseSpecWorker):
         if self._target_has_linear_attn:
             self._warmup_linear_attn_commit()
         if self._simulate_acc_len > 0:
+            # Uploaded once, so each round only picks one (values stay data,
+            # never baked into a program).
+            buckets = self._b_bucketer().buckets
             self._simulated_drafts = {
                 pbs: torch.full(
                     (pbs, self.num_drafts), _SIMULATED_TOKEN, dtype=torch.int64
                 ).to(self.device)
-                for pbs in self._b_bucketer().buckets
+                for pbs in buckets
+            }
+            self._simulated_bonus = {
+                pbs: torch.full((pbs,), _SIMULATED_TOKEN, dtype=torch.int64).to(
+                    self.device
+                )
+                for pbs in buckets
+            }
+            self._simulated_correct = {
+                (pbs, n): torch.full((pbs,), n, dtype=torch.int64).to(self.device)
+                for pbs in buckets
+                for n in range(self.num_verify_rows)
             }
         self._snapshot_warm_baseline()
 
@@ -446,14 +463,11 @@ class TpuSpecWorker(BaseSpecWorker):
         commit_len = sample_simulated_acc_len(
             self._simulate_acc_len, SIMULATE_ACC_METHOD, self.num_verify_rows
         )
-        # Built on host and uploaded: a device fill would bake the value into the program.
-        num_correct_drafts = torch.full(
-            (padded_bs,), commit_len - 1, dtype=torch.int64
-        ).to(self.device, non_blocking=True)
-        bonus_tokens = torch.full((padded_bs,), _SIMULATED_TOKEN, dtype=torch.int64).to(
-            self.device, non_blocking=True
+        return (
+            self._simulated_correct[(padded_bs, commit_len - 1)],
+            self._simulated_bonus[padded_bs],
+            self._simulated_drafts[padded_bs],
         )
-        return num_correct_drafts, bonus_tokens, self._simulated_drafts[padded_bs]
 
     def step(
         self,
@@ -483,7 +497,7 @@ class TpuSpecWorker(BaseSpecWorker):
         # Slots come from the verify forward's bucket metadata; padded rows accept 0,
         # so their -1 step leaves the slot untouched.
         attn_backend.update_mamba_state_after_mtp_verify(
-            last_correct_step_indices=accept.accept_lens.to(torch.int64) - 1,
+            last_correct_step_indices=accept.last_steps,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=None,
             model=runner.model,
@@ -886,9 +900,14 @@ class TpuSpecWorker(BaseSpecWorker):
                 # int32 like the GDN metadata slots; the null slot 0 is never written.
                 slots = torch.zeros((pbs,), dtype=torch.int32, device=self.device)
                 accept_lens = torch.zeros((pbs,), dtype=torch.int32, device=self.device)
-                mamba_pool.select_checkpoints(
-                    slots.clamp(min=0), accept_lens.to(torch.int64) - 1
+                slots, steps = slots.clamp(min=0), accept_lens.to(torch.int64) - 1
+                warmup_compiled_op(
+                    committed_read_offsets,
+                    mamba_pool.checkpoint_read_offsets,
+                    slots,
+                    steps,
                 )
+                mamba_pool.select_checkpoints(slots, steps)
 
     def _warmup_sampling_info(
         self,
