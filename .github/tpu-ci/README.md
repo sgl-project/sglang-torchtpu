@@ -251,11 +251,11 @@ poll budget, so an inflated value pushes a serialized run toward the next day's 
 
 The gate accepts PRs against any base branch, including stacked PRs. A PR is
 TPU-relevant if it changes a TPU-explicit path or currently carries `tpu`.
-The live `run-ci` label opts the PR into TPU CI for the current head and subsequent
-pushes until removed. `/tag-and-rerun-ci`, `/rerun-failed-ci`, and the Actions UI's
-failed-job rerun also request an attempt. Without opt-in or an explicit rerun,
-the gate fails without claiming a TPU slice. Unrelated label events do not cancel
-an opted-in TPU run and remain recoverable by an explicit rerun.
+Adding `run-ci` requests one attempt for the current head; `/tag-and-rerun-ci`,
+`/rerun-failed-ci`, and the Actions UI's failed-job rerun also request an attempt.
+A later push requires a new request even if `run-ci` is still present. Remove and
+re-add it, or rerun the failed gate. Unrelated label events do not cancel a
+requested TPU run and remain recoverable by an explicit rerun.
 
 The build and both test suites use the immutable PR head SHA. Only same-repository
 heads can build; fork PRs do not receive the build identity. The unit and e2e
@@ -283,7 +283,7 @@ _TODO._
 | `benchmark/tpu/recipe/*_mh.sh` | Per-model multi-host launch recipes (own `MODEL`/`EP_SIZE`/…, exec `launch_server.sh`) |
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
-| `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated, live `run-ci` opt-in or explicitly rerunning failed jobs); decide → build → single-host test |
+| `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated, on demand: adding `run-ci` or explicitly rerunning failed jobs); decide → build → single-host test |
 | `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build once → feature validation and perf stages in parallel |
 | `.github/workflows/feature-validation-tpu.yml` | Feature-validation stage, also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
 | `.github/workflows/accuracy-test-tpu.yml` | Accuracy stage, on its own 10 AM / 5 PM schedule and dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |
