@@ -98,6 +98,34 @@ class TestZerosKvBuffer(CustomTestCase):
             pool.get_index_key_cache(1)
         self.assertEqual(pool.get_kv_size_bytes(), total_bytes)
 
+    def test_split_pool_bytes_per_token_is_what_it_allocates(self):
+        # The KV budget divides free memory by bytes_per_token, so it must count
+        # every buffer, the pooled indexer's bf16 raw buffer included.
+        for index_kpool in (1, 4):
+            with self.subTest(index_kpool=index_kpool):
+                kwargs = dict(
+                    index_head_dim=128,
+                    index_key_layers=[True, False, True],
+                    index_kpool=index_kpool,
+                )
+                pool = TpuSplitMLATokenToKVPool(
+                    size=64,
+                    page_size=32,
+                    dtype=FP8,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=0,
+                    layer_num=3,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    **kwargs,
+                )
+                self.assertEqual(
+                    pool.get_kv_size_bytes(),
+                    TpuSplitMLATokenToKVPool.bytes_per_token(**kwargs)
+                    * pool.num_pages
+                    * pool.page_size,
+                )
+
 
 class TestQuantizeKvToFp8(CustomTestCase):
     def test_divides_by_scale_clamps_and_casts(self):
