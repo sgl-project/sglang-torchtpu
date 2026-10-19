@@ -42,9 +42,8 @@ _NUM_KV_PAGES_PER_BLOCK = (2, 2, 2)
 _NUM_QUERIES_PER_BLOCK = (1, 128, 128)
 # Query rows per scoring chunk: the kernel's score buffer is rows x positions.
 _CHUNK_TOKENS = 2048
-# Row-chunk only when one pass's f32 score buffer would exceed this. The chunked
-# path's overlap annotations do not compile on libtpu 0.0.50 ("annotation groups
-# with gaps"), and an unchunked 8k prefill at 10k context is ~84 MiB.
+# Row-chunk only when one pass's f32 score buffer would exceed this; an
+# unchunked 8k prefill at 10k context is ~84 MiB.
 _MAX_UNCHUNKED_SCORE_BYTES = 512 << 20
 
 
@@ -246,6 +245,10 @@ def kpool_indexer_step(
         enable_early_exit=False,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         chunk_tokens=_CHUNK_TOKENS if chunked else None,
+        # In a model graph the chunks' scheduling groups fail to compile on
+        # libtpu 0.0.50 ("annotation groups with gaps"), and alone they overlap
+        # nothing measurable here.
+        overlap_chunks=False,
     )  # i32[T, n_pick], chosen pools first, then -1
 
     pool_len = (pos + 1) // kpool
