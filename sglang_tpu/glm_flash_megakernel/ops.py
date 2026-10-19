@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 _AXIS = "tp"
 
 
+def _owned(t: torch.Tensor) -> torch.Tensor:
+    # A device-side clone or copy keeps the view; a host round trip uploads a plain buffer.
+    return t.cpu().to(t.device)
+
+
 def enabled() -> bool:
     return tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get()
 
@@ -61,7 +66,10 @@ class GlmFlashMegakernel:
         self.run = run
 
         weights = build_weights(model, spec, layout, self.cfg, tp, rank, experts)
-        self.weights = [weights[n] for n in R.WEIGHT_ORDER]
+        # Packing leaves dtype and shape views, which every call would re-materialise.
+        self.weights = [
+            weights[n] if n in experts else _owned(weights[n]) for n in R.WEIGHT_ORDER
+        ]
         nbytes = sum(t.numel() * t.element_size() for t in self.weights)
         logger.info(
             "GLM-Flash megakernel: %.1f GiB of kernel weights on rank %d",
