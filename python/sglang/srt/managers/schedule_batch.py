@@ -4048,17 +4048,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             ),
                         )
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
+                    # The next query, at seqlen - 1, reads down to seqlen - 1 - W;
+                    # past cache_protected_len the prefix SWA lock is unused, so it
+                    # can become evictable. Skip decode_batch_idx 0, while the
+                    # overlapped prefill may still read it.
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
                         and req.lock_receipt.component_lock_uuids.get(ComponentType.SWA)
                         is not None
                         and req.last_node is not None
-                        and req.decode_batch_idx >= sliding_window_size
+                        and req.decode_batch_idx >= 1
+                        and req.seqlen - 1 - req.kv.cache_protected_len
+                        >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
                             req.last_node, req.lock_receipt
