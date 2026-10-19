@@ -18,7 +18,8 @@ from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 logger = logging.getLogger(__name__)
 
-# What the TPU nightly lanes test. DSPARK is in flight and deliberately absent.
+# What the TPU nightly lanes test. DSPARK has no TPU lane; it is admitted only
+# while the plugin block worker, its sole TPU route, is enabled.
 _SUPPORTED_SPEC_ALGORITHMS = frozenset({"EAGLE", "EAGLE3", "DFLASH"})
 
 # The draft backends speculative/draft_utils.py can construct on TPU.

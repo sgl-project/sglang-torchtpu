@@ -212,6 +212,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
 
     def test_dspark_admission_follows_the_plugin_worker_route(self):
+        """DSPARK runs only on the plugin block worker and has no TPU test lane yet."""
         from sglang.srt.environ import envs as core_envs
         from sglang_tpu.envs import envs as tpu_envs
 
