@@ -20,7 +20,7 @@ from sglang_tpu.hooks.attn_residual import (
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
-    load_glm_flash_megakernel_weights,
+    reserve_glm_flash_megakernel_experts,
     route_glm_flash_megakernel,
 )
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
@@ -123,7 +123,7 @@ HOOKS: list[tuple] = [
     ),
     (
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
-        load_glm_flash_megakernel_weights,
+        reserve_glm_flash_megakernel_experts,
         HookType.BEFORE,
     ),
     (

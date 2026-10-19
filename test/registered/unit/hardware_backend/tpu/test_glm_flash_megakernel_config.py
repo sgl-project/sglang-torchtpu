@@ -73,10 +73,10 @@ def _scratch_bytes(spec, cfg) -> int:
     from jax.experimental.pallas import tpu as pltpu
 
     from sglang_tpu.glm_flash_megakernel.kernel import decode as D
-    from sglang_tpu.glm_flash_megakernel.layout import PackedLayout
+    from sglang_tpu.glm_flash_megakernel.layout import KernelLayout
 
     total = 0
-    for s in D.scratch_shapes(spec, PackedLayout(spec, 8), cfg):
+    for s in D.scratch_shapes(spec, KernelLayout(spec, 8), cfg):
         if getattr(s, "memory_space", None) == pltpu.VMEM:   # not the semaphores
             total += math.prod(s.shape) * jnp.dtype(s.dtype).itemsize
     return total

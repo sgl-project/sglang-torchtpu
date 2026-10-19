@@ -1,20 +1,7 @@
-"""The GLM-5.3-Flash megakernel: one Pallas program per device per target step.
+"""GLM-5.3-Flash megakernel: one Pallas program per device per target step.
 
-Inside the program: the embedding lookup, every decoder layer (mHC, KDA or DSA
-attention with its indexer, MoE or dense MLP), the tensor-parallel reductions as
-in-kernel remote DMA, the final norm and the LM head.  A step can carry several
-query positions (an MTP verify); the KDA states then keep one checkpoint per query.
-
-The layer schedule comes from the spec: three dense-MLP KDA layers, then
-repetitions of [DSA, KDA, KDA, KDA] with MoE as a fori_loop over traced ordinals
-(kda_ord / dsa_ord / moe_ord are affine in the layer index), then the remainder.
-
-DSA attention is absorbed: the key half of kv_b folds into the query and the value
-half into the output, so attention runs on the 512-wide latent cache.
-
-Weights stream from HBM through VMEM rings.  The DSA caches are only read here; a
-step's new rows come out as small outputs that `row_write_call` stores, because
-XLA copies every operand that a kernel with remote DMA aliases.
+The DSA caches are only read here; new rows leave as small outputs for `row_write_call`,
+because XLA copies every operand that a kernel with remote DMA aliases.
 """
 
 from __future__ import annotations
@@ -34,8 +21,7 @@ BF16 = jnp.bfloat16
 AXIS = "tp"
 
 
-# Names in-kernel regions for a device trace (with libtpu's
-# --xla_enable_custom_call_region_trace=true); off in normal builds.
+# Names in-kernel regions for a device trace (libtpu --xla_enable_custom_call_region_trace=true).
 _TRACE = False
 
 
@@ -44,7 +30,6 @@ def _scope(name):
 
 
 def _wait(copy, name):
-    """copy.wait(), named for the trace: how long a phase waits on its DMA."""
     with _scope(name):
         copy.wait()
 
@@ -63,37 +48,24 @@ def moe_ord(L):
 
 @dataclasses.dataclass(frozen=True)
 class KernelConfig:
-    max_len: int                  # cache capacity; must be a multiple of index_kpool
-    n_periods: int = 10           # body repetitions; fewer builds a partial model
+    max_len: int
+    n_periods: int = 10
     tile_rows: int = 256
     vmem_mib: int = 110
-    slots: int = 4                # weight-ring depth
-    prefetch: int = 2             # must satisfy prefetch <= slots - 2
-    ring: bool = True             # False restores the synchronous baseline
-    n_query: int = 1              # query positions per call; 2 verifies an MTP
-                                  # draft alongside the accepted token
-    n_layers: int | None = None   # hard cap, for bisecting a numerical disagreement
-    attn_tile: int = 512          # cache tokens per DSA stream tile (128 pools)
-    # KDA qkv / o projections as fp8 e4m3 with per-output-channel scales (the
-    # runner quantizes them once), streamed through the bf16 ring.
+    slots: int = 4
+    prefetch: int = 2
+    ring: bool = True
+    n_query: int = 1
+    n_layers: int | None = None
+    attn_tile: int = 512
     fp8_kda: bool = True
-    # Experts as per-output-channel fp8, K-major (the pack step's *_ch arrays): one
-    # dot and a scale row per expert matvec instead of folded 128x128 block scales.
     ch_experts: bool = True
-    # Collective payloads in bf16 (each rank's partial rounded before the f32 sum),
-    # as the native TP all-reduce of bf16 activations does.
+    # Round each rank's partial to bf16 before the sum, as serving's all-reduce does.
     bf16_collectives: bool = True
-    # K-major dense stream: [K, km_cols] blocks, km_slots ring slots, km_issue in
-    # flight.  Four queries overflow VMEM with 512-wide blocks.
     km_slots: int = 4
     km_issue: int = 2
-    # The embedding table as [V, D] instead of [V, 1, D]: a caller holding it 2-D
-    # (serving's torch tensor, 8-row tiles) would otherwise re-tile all of it per step.
     embed_2d: bool = False
-    init_streams: bool = False    # take the residual stream as an input instead of
-                                  # embedding a token; lets a single layer be driven
-                                  # from the reference's own input, which is the only
-                                  # comparison that isolates one layer
+    init_streams: bool = False
 
     @property
     def km_cols(self) -> int:
@@ -119,14 +91,7 @@ class KernelConfig:
 
 
 class SlabIndex:
-    """Static offsets into the per-layer small-tensor slab.
-
-    Inside the rolled layer loop the layer index is a traced value, so the float32
-    offsets cannot be looked up per layer.  They do not need to be: the packer
-    appends in a fixed order, so every layer of a given kind has identical offsets.
-    The maps are therefore keyed by kind, and the constructor asserts that all
-    layers of a kind really do agree rather than trusting it.
-    """
+    """Slab offsets keyed by layer kind, since the rolled loop's layer index is traced."""
 
     def __init__(self, small_map, small_f32_map, spec):
         self.m = {k: (v[0], v[1], tuple(v[2])) for k, v in small_map.items()}
@@ -156,8 +121,7 @@ class SlabIndex:
         return ref[off : off + nrows].reshape(-1)[:n].reshape(shape)
 
     def getf(self, ref, kind, tag):
-        """Rank-2 on purpose: rank-1 slices of these feed shape casts that do not
-        lower, and the failure surfaces far from here."""
+        """Rank-2 on purpose: rank-1 slices feed shape casts that do not lower."""
         off, n = self.f[kind][tag]
         return ref[0:1, off : off + n]
 
@@ -172,27 +136,45 @@ class _Half:
         return self.buf.at[self.i][idx]
 
 
-def pack_kmajor(w, rows, tile_n):
-    """[L, N, K] (output-major, as packed) -> K-major ring slots [L, n, rows, tile_n].
+def dsa_scale_widths(spec, tp):
+    """Columns of a DSA layer's scale row: [q_a | kv_a], q_b, o."""
+    return (spec.q_lora_rank + spec.kv_lora_rank,
+            spec.num_attention_heads // tp * spec.qk_head_dim, spec.hidden_size)
 
-    Slot s holds column blocks s*k .. s*k+k-1 (k = rows // K) of W^T [K, N], each
-    [K, tile_n], stacked along rows, so a slot is one contiguous copy and each
-    block feeds a plain x[Q, K] @ W[K, tile_n] dot."""
-    L, N, K = w.shape
+
+def dense_scale_widths(spec, tp):
+    """Columns of a dense-MLP layer's scale row: gate_up, down."""
+    return 2 * spec.intermediate_size // tp, spec.hidden_size
+
+
+def proj_scale_cols(spec, tp):
+    return max(sum(dsa_scale_widths(spec, tp)), sum(dense_scale_widths(spec, tp)))
+
+
+def km_blocks(K, N, rows, tile_n):
+    """Column blocks per K-major slot: the most [K, tile_n] blocks that fit `rows` and divide N."""
     k = rows // K
+    while k > 1 and N % (tile_n * k):
+        k -= 1
+    return k
+
+
+def pack_kmajor(w, rows, tile_n):
+    """[L, N, K] -> K-major ring slots [L, n, rows, tile_n]; a slot is one contiguous copy."""
+    L, N, K = w.shape
+    k = km_blocks(K, N, rows, tile_n)
     if k < 1 or N % (tile_n * k):
         raise ValueError(f"cannot pack [{N}, {K}] into [{rows}, {tile_n}] slots")
     n = N // (tile_n * k)
     out = (w.transpose(0, 2, 1).reshape(L, K, n, k, tile_n)
            .transpose(0, 2, 3, 1, 4).reshape(L, n, k * K, tile_n))
-    if k * K < rows:   # K does not divide the slot (e.g. 1536 of 4096): pad, unread
+    if k * K < rows:
         out = jnp.pad(out, ((0, 0), (0, 0), (0, rows - k * K), (0, 0)))
     return out
 
 
 def pack_slots(w, tile_rows, hidden):
-    """[L, out, in] -> [L, out // (tile_rows * k), tile_rows, hidden], k = hidden // in:
-    ring slot s holds row tiles s*k .. s*k+k-1 side by side, so one copy fills it."""
+    """[L, out, in] -> [L, n, tile_rows, hidden]: k = hidden // in row tiles side by side."""
     L, out, inn = w.shape
     k = hidden // inn
     n = out // (tile_rows * k)
@@ -207,12 +189,7 @@ def _dma(src, dst, sem):
 
 
 def pick_tile(out_dim: int, want: int) -> int:
-    """Largest divisor of `out_dim` that is at most `want` and sublane-aligned.
-
-    A fixed tile only works when it divides every projection's output width.  It
-    does for the real geometry and does not for a small test geometry, and a test
-    shape that cannot be tiled is exactly the shape a bug would hide in.
-    """
+    """Largest divisor of `out_dim` that is at most `want` and sublane-aligned."""
     for d in range(min(want, out_dim), 0, -8):
         if out_dim % d == 0:
             return d
@@ -225,7 +202,6 @@ def _flags(cfg: KernelConfig):
 
 
 def scratch_shapes(spec, layout, cfg: KernelConfig):
-    """VMEM scratch, sized from the spec; the comment on each is why it is that big."""
     FP8_KDA, CH_EXPERTS, BF16_COLL, KM_TILE, KM_SLOTS, KM_PF = _flags(cfg)
     tp = layout.tp
     H = spec.hidden_size
@@ -236,101 +212,75 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
     qk, vd, kvl = spec.qk_head_dim, spec.v_head_dim, spec.kv_lora_rank
     idh = spec.index_head_dim
     moesh = spec.moe_intermediate_size // tp
-    ffnsh = spec.intermediate_size // tp
     TR = cfg.tile_rows
     L = cfg.max_len
     slab_rows = layout.small_rows()
 
     f8 = jnp.float8_e4m3fn
     S = cfg.slots if cfg.ring else 1
-    ffnsh = spec.intermediate_size // tp
-    # A one-query step keeps its state in st / cv; the checkpoints are placeholders.
-    # Two slots: each checkpoint is written out while the next query runs.
+    # A one-query step keeps its state in st / cv; the checkpoint buffers are placeholders.
     ck_st = (2, hkda, dh, dh) if cfg.n_query > 1 else (1, 8, 128)
     ck_cv = ((2, spec.linear_conv_kernel_dim - 1, 3 * qsh)
              if cfg.n_query > 1 else (1, 8, 128))
+    # Positional: the order must match the kernel's scratch arguments.
     return [
-        # Two of each: the next layer's slab is fetched during this layer.
-        pltpu.VMEM((2, slab_rows, H), BF16),           # sm   : the layer's slab
-        pltpu.VMEM((2, 1, H), F32),                    # smf  : its float32 part
-        # One ring per weight shape.  Each ring has its own semaphore array: two
-        # in-flight transfers must never share a semaphore index, and sharing one
-        # array across rings would do exactly that.
-        pltpu.VMEM((KM_SLOTS, H, KM_TILE), BF16),      # rbf  : K-major [K, TN] tiles
-        (pltpu.VMEM((S, H, 2 * moesh), f8) if CH_EXPERTS else      # r8a : expert gate/up
-         pltpu.VMEM((S, max(TR, 2 * moesh), H), f8)),   #        (and fp8 in == H tiles)
-        pltpu.VMEM((S, TR, max(nh * vd, ffnsh, 128)), f8),   # r8b : fp8, out == H
-        (pltpu.VMEM((S, moesh, H), f8) if CH_EXPERTS else          # r8d : expert down
+        pltpu.VMEM((2, slab_rows, H), BF16),
+        pltpu.VMEM((2, 1, H), F32),
+        # Each ring has its own semaphore array: two in-flight DMAs must not share a semaphore.
+        pltpu.VMEM((KM_SLOTS, H, KM_TILE), BF16),
+        (pltpu.VMEM((S, H, 2 * moesh), f8) if CH_EXPERTS else
+         pltpu.VMEM((S, max(TR, 2 * moesh), H), f8)),
+        (pltpu.VMEM((S, moesh, H), f8) if CH_EXPERTS else
          pltpu.VMEM((S, H, max(moesh, 128)), f8)),
-        # With CH_EXPERTS the fp8 in == H projections get their own ring and each
-        # expert slot carries its scale rows; otherwise these are placeholders.
-        pltpu.VMEM((S, TR, H) if CH_EXPERTS else (1, 32, 128), f8),       # r8i
-        pltpu.VMEM((S, 1, 2 * moesh) if CH_EXPERTS else (1, 1, 128), F32),  # egsr
-        pltpu.VMEM((S, 1, H) if CH_EXPERTS else (1, 1, 128), F32),          # edsr
-        pltpu.VMEM((hkda, dh, dh), F32),               # st   : one layer's KDA state
-        # With Q > 1 the state after every query is a checkpoint: the delta rule
-        # has no inverse, so the next step resumes from the last accepted one.
-        pltpu.VMEM(ck_st, F32),                        # stq  : state checkpoints
-        # The conv state and weights are channels-last, [K-1, C] / [K, C]: as
-        # [C, K-1] the short axis pads to 128 lanes (1.5 MiB per state buffer).
-        pltpu.VMEM((spec.linear_conv_kernel_dim - 1, 3 * qsh), F32),   # cv
-        pltpu.VMEM(ck_cv, F32),                        # cvq
-        # The KV cache is streamed from HBM in attn_tile-token tiles (two
-        # buffers each), so VMEM no longer grows with the context.
-        pltpu.VMEM((2, cfg.attn_tile, kvl), BF16),     # kvt  : latent tiles
-        pltpu.VMEM((32, idh), BF16),                   # ikb  : raw indexer key rows
-        pltpu.VMEM((32, idh), BF16),                   # igb    around this step, to
-                                                       #        close its pool(s)
-        # One layer's pooled keys whole: 1.3 MiB at 10k tokens, 4 MiB at 32k.
-        pltpu.VMEM((L // spec.index_kpool, idh), F32), # pka  : pooled indexer keys
+        pltpu.VMEM((S, 1, 2 * moesh) if CH_EXPERTS else (1, 1, 128), F32),
+        pltpu.VMEM((S, 1, H) if CH_EXPERTS else (1, 1, 128), F32),
+        pltpu.VMEM((hkda, dh, dh), F32),
+        # With Q > 1 each query's state is checkpointed: the delta rule cannot be undone.
+        pltpu.VMEM(ck_st, F32),
+        # Channels-last conv state: as [C, K-1] the short axis would pad to 128 lanes.
+        pltpu.VMEM((spec.linear_conv_kernel_dim - 1, 3 * qsh), F32),
+        pltpu.VMEM(ck_cv, F32),
+        pltpu.VMEM((2, cfg.attn_tile, kvl), BF16),
+        pltpu.VMEM((32, idh), BF16),
+        pltpu.VMEM((32, idh), BF16),
+        pltpu.VMEM((L // spec.index_kpool, idh), F32),
         pltpu.VMEM((cfg.n_query, L // cfg.attn_tile,
-                    cfg.attn_tile // spec.index_kpool), F32),   # scr: pool scores
-        pltpu.VMEM((nh * (qk + vd), kvl), BF16),       # kvb  : absorbed both ways
-        pltpu.VMEM((2 * qsh, dh), BF16),               # fgb  : forget/output gate b
-        pltpu.VMEM((1, qsh), F32),                     # dtv  : dt_bias shard
-        pltpu.VMEM((1, 3 * qsh + H), F32),             # ksc  : KDA fp8 channel scales
-        pltpu.VMEM((spec.linear_conv_kernel_dim, 3 * qsh), BF16),  # cwv : conv shard
-        pltpu.VMEM((hkda, H), BF16),                   # bpv  : b_proj shard
-        pltpu.VMEM((1, hkda), F32),                    # alv  : A_log shard
-        pltpu.VMEM((spec.n_routed_experts, H), BF16),  # rtr  : router, replicated
-        pltpu.VMEM((1, H), BF16),                      # fnv  : final norm
-        pltpu.VMEM((2, tp, cfg.n_query, H), F32),      # ar   : double-buffered pad
-        pltpu.VMEM((cfg.n_query, H), F32),             # sendv: this device's rows
-        pltpu.VMEM((cfg.n_query, H), F32),             # macc : MoE accumulator (Q > 1)
-        pltpu.VMEM((2, tp, cfg.n_query, H) if BF16_COLL else (1, 1, 8, 128), BF16),  # arb
-        pltpu.VMEM((cfg.n_query, H) if BF16_COLL else (8, 128), BF16),              # sendb
-        pltpu.VMEM((8 if cfg.embed_2d else 1, H // layout.tp), BF16),   # embv : the
-                                                       #        embedding row (with
-                                                       #        embed_2d, its 8-row tile)
-        # One buffer per scale shape, sized exactly: a DMA into a *slice* of a
-        # VMEM buffer must be tile-aligned (8 sublanes x 128 lanes for f32), and a
-        # block-scale grid is nothing like that shape.  Whole-array DMAs are fine.
-        pltpu.VMEM((spec.q_lora_rank // 128, H // 128), F32),            # s_qa
-        pltpu.VMEM((nh * qk // 128, -(-spec.q_lora_rank // 128)), F32),  # s_qb
-        pltpu.VMEM((max(1, kvl // 128), H // 128), F32),                 # s_kva
-        pltpu.VMEM((H // 128, max(1, nh * vd // 128)), F32),             # s_do
-        pltpu.VMEM((max(1, 2 * moesh // 128), H // 128), F32),           # s_sgu
-        pltpu.VMEM((H // 128, max(1, moesh // 128)), F32),               # s_sdn
-        pltpu.VMEM((max(1, 2 * ffnsh // 128), H // 128), F32),           # s_dgu
-        pltpu.VMEM((H // 128, max(1, ffnsh // 128)), F32),               # s_ddn
+                    cfg.attn_tile // spec.index_kpool), F32),
+        pltpu.VMEM((nh * (qk + vd), kvl), BF16),
+        pltpu.VMEM((2 * qsh, dh), BF16),
+        pltpu.VMEM((1, qsh), F32),
+        pltpu.VMEM((1, 3 * qsh + H), F32),
+        pltpu.VMEM((spec.linear_conv_kernel_dim, 3 * qsh), BF16),
+        pltpu.VMEM((hkda, H), BF16),
+        pltpu.VMEM((1, hkda), F32),
+        pltpu.VMEM((spec.n_routed_experts, H), BF16),
+        pltpu.VMEM((1, H), BF16),
+        pltpu.VMEM((2, tp, cfg.n_query, H), F32),
+        pltpu.VMEM((cfg.n_query, H), F32),
+        pltpu.VMEM((cfg.n_query, H), F32),
+        pltpu.VMEM((2, tp, cfg.n_query, H) if BF16_COLL else (1, 1, 8, 128), BF16),
+        pltpu.VMEM((cfg.n_query, H) if BF16_COLL else (8, 128), BF16),
+        pltpu.VMEM((8 if cfg.embed_2d else 1, H // layout.tp), BF16),
+        pltpu.VMEM((1, proj_scale_cols(spec, tp)), F32),
+        # Exact-size scale buffers: a DMA into a slice of a VMEM buffer must be tile-aligned.
+        pltpu.VMEM((max(1, 2 * moesh // 128), H // 128), F32),
+        pltpu.VMEM((H // 128, max(1, moesh // 128)), F32),
         pltpu.VMEM((spec.n_routed_experts, 2 * moesh // 128,
-                    H // 128), F32),                   # egs  : all experts, one layer
+                    H // 128), F32),
         pltpu.VMEM((spec.n_routed_experts, H // 128,
-                    max(1, moesh // 128)), F32),       # eds
+                    max(1, moesh // 128)), F32),
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,                       # send
-        pltpu.SemaphoreType.DMA,                       # recv
-        pltpu.SemaphoreType.DMA((KM_SLOTS,)),          # sbf  : rbf ring
-        pltpu.SemaphoreType.DMA((S,)),                 # s8a
-        pltpu.SemaphoreType.DMA((S,)),                 # s8b
-        pltpu.SemaphoreType.DMA((S,)),                 # s8d
-        pltpu.SemaphoreType.DMA((8,)),                 # sgrp : batched small fetches
-        pltpu.SemaphoreType.DMA((8,)),                 # sasy : early async fetches
-        pltpu.SemaphoreType.DMA((8 * S,)),             # sbfn : rbf ring, narrow tiles
-        pltpu.SemaphoreType.DMA((2, 2)),               # sslab: slab double buffer
-        pltpu.SemaphoreType.DMA((S,)),                 # s8i  : r8i ring
-        pltpu.SemaphoreType.DMA((2, S)),               # s8s  : expert scale rows
+        pltpu.SemaphoreType.DMA,
+        pltpu.SemaphoreType.DMA,
+        pltpu.SemaphoreType.DMA((KM_SLOTS,)),
+        pltpu.SemaphoreType.DMA((S,)),
+        pltpu.SemaphoreType.DMA((S,)),
+        pltpu.SemaphoreType.DMA((8,)),
+        pltpu.SemaphoreType.DMA((8,)),
+        pltpu.SemaphoreType.DMA((8 * S,)),
+        pltpu.SemaphoreType.DMA((2, 2)),
+        pltpu.SemaphoreType.DMA((2, S)),
     ]
 
 
@@ -353,7 +303,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
     kexp, nexp = spec.num_experts_per_tok, spec.n_routed_experts
     Lcap = cfg.max_len
     selk = spec.index_select_k
-    TR = cfg.tile_rows
     f8 = jnp.float8_e4m3fn
     n_layers = cfg.layers(spec)
     Q = cfg.n_query
@@ -362,55 +311,36 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         tok_ref, pos_ref, in_streams,
         w_embed, w_lm, w_fnorm, w_smalls, w_smallsf,
         w_kqkv, w_ko, w_kfg, w_kdt, w_kconv, w_kb, w_kalog,
-        w_qa, w_qas, w_qb, w_qbs, w_kva, w_kvas, w_kvb, w_do, w_dos,
+        w_qakv, w_qb, w_kvb, w_do, w_dsc,
         w_iwq, w_router,
         w_egu, w_egus, w_edn, w_edns, w_sgu, w_sgus, w_sdn, w_sdns,
-        w_dgu, w_dgus, w_ddn, w_ddns, w_ksc,
-        # The DSA caches are read only: this step's rows go out through o_nkv /
-        # o_nik / o_nig and `row_write_call` stores them.  A kernel with remote DMA
-        # is a collective to XLA, which copies every aliased operand, and these
-        # grow with the context.  The KDA states are read from the input refs and
-        # written whole to the output refs; they are aliased only in a run capped
-        # below the full depth, whose skipped layers must keep their state.
+        w_dgu, w_ddn, w_dnsc, w_ksc,
         c_kv, c_ik, c_ig, c_ip, _crec_in, _cconv_in,
         o_logits, o_streams, o_hidden, o_nkv, o_nik, o_nig, o_npk,
         c_recur, c_conv,
-        sm2, smf2, rbf, r8a, r8b, r8d, r8i, egsr, edsr, st, stq, cv, cvq, kvt, ikb, igb, pka, scr,
+        sm2, smf2, rbf, r8a, r8d, egsr, edsr, st, stq, cv, cvq, kvt, ikb, igb, pka, scr,
         kvb, fgb, dtv, ksc,
         cwv, bpv, alv, rtr, fnv, ar, sendv, macc, arb, sendb, embv,
-        s_qa, s_qb, s_kva, s_do, s_sgu, s_sdn, s_dgu, s_ddn, egs, eds,
-        sem, sem2, ssem, rsem, sbf, s8a, s8b, s8d, sgrp, sasy, sbfn, sslab, s8i, s8s,
+        psc, s_sgu, s_sdn, egs, eds,
+        sem, sem2, ssem, rsem, sbf, s8a, s8d, sgrp, sasy, sbfn, sslab, s8s,
     ):
         me = jax.lax.axis_index(AXIS)
         pos = pos_ref[0]
-        # With Q > 1 the KDA states carry one checkpoint per query; this step
-        # resumes from checkpoint ck (the last token the previous step accepted).
+        # Q > 1: KDA states resume from checkpoint ck, the previous step's last accepted token.
         ck = pos_ref[1] if Q > 1 else None
-        # `sm` / `smf` read the current layer's half of the slab double buffer;
-        # layer() points them at it.
         sm, smf = _Half(sm2), _Half(smf2)
 
         def slab_copies(L, par):
             return [pltpu.make_async_copy(w_smalls.at[L], sm2.at[par], sslab.at[par, 0]),
                     pltpu.make_async_copy(w_smallsf.at[L], smf2.at[par], sslab.at[par, 1])]
 
-        # --- in-kernel collectives -------------------------------------
-        # Two correctness points, both of which cost results rather than crashing:
-        #
-        # 1. Each landing-pad slot has one writer per round: its owner's local
-        #    or remote DMA. Do not clear the whole pad locally, since that can
-        #    erase a peer's contribution that arrives before the local store.
-        # 2. The pad is double buffered on a statically known parity.  A peer can
-        #    be at most one collective ahead -- to finish round k+1 it needs this
-        #    device's round k+1 contribution -- so alternating two pads keeps an
-        #    early arrival for round k+1 away from round k's data.  The number of
-        #    collectives per loop body is even, which is what makes the parity
-        #    static inside the rolled layer loop.
+        # Each pad slot has one writer per round: never clear the pad locally, as a peer's
+        # DMA may land first. Pads alternate on a static parity: a peer is at most one round
+        # ahead, and each loop body runs an even number of collectives.
         collective = [0]
 
         def _round(row_full, width):
-            """`row_full` is [Q, H]; a shorter payload is zero-padded so the
-            landing pad has one fixed shape across every collective."""
+            """`row_full` is [Q, H]; shorter payloads are zero-padded to the pad's fixed shape."""
             par = collective[0] % 2
             collective[0] += 1
             if row_full.shape != (Q, H):
@@ -419,7 +349,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     ((0, Q - row_full.shape[0]), (0, H - row_full.shape[1])))
             sbuf, rbuf = (sendb, arb) if BF16_COLL else (sendv, ar)
             sbuf[...] = row_full.astype(sbuf.dtype)
-            # The local copy runs alongside the remote ones.
             local = pltpu.make_async_copy(sbuf, rbuf.at[par, me], sem)
             local.start()
             cps = []
@@ -433,11 +362,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             local.wait()
             for cp in cps:
                 cp.wait()
-            return rbuf[par].astype(F32)                    # [tp, Q, H]
+            return rbuf[par].astype(F32)
 
         def allgather(row, width):
             """[1, width] on each device -> [1, tp*width] in mesh rank order."""
-            got = _round(row, width)                        # [tp, Q, H]
+            got = _round(row, width)
             return got[:, 0, :width].reshape(1, tp * width)
 
         def allreduce(rows):
@@ -446,8 +375,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 return jnp.sum(_round(rows, H), axis=0)[: rows.shape[0]]
 
         def dma_batch(items):
-            """Start every transfer, then wait for all of them.  Each item gets its
-            own semaphore index: two in-flight transfers must never share one."""
+            """Start all transfers, then wait; each has its own semaphore (in-flight DMAs must not share)."""
             cps = [pltpu.make_async_copy(src, dst, sgrp.at[i])
                    for i, (src, dst) in enumerate(items)]
             for c in cps:
@@ -455,16 +383,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             for c in cps:
                 _wait(c, "ld_wait")
 
-        # --- streamed matvecs -------------------------------------------
-        # Each projection streams row tiles through an S-slot ring, PF tiles ahead
-        # (prefetch <= slots - 2, checked by the config); each ring has its own
-        # semaphore array.
         S = cfg.slots if cfg.ring else 1
         PF = cfg.prefetch if cfg.ring else 0
 
         def _warm(n_tiles, make_copy, pf=None):
-            """Start a stream's first transfers ahead of its compute (the weights
-            do not depend on it); the stream itself is then run `warmed`."""
+            """Start a stream's first transfers early; then run the stream with `warmed=True`."""
             pf = PF if pf is None else pf
             for t in range(min(pf + 1, n_tiles)):
                 make_copy(t).start()
@@ -483,11 +406,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     make_copy(nxt).start()
             return outs
 
-        # --- K-major dense stream ------------------------------------------
-        # Weights the runner packs K-major (pack_kmajor): [L, n, rows, KM_TILE] where a
-        # slot's rows hold rows // K column blocks of [K, KM_TILE] stacked, rows = H
-        # (bf16) or 2H (fp8, through the bf16 ring by bitcast).  One contiguous
-        # copy fills a slot; each block is a plain x[Q, K] @ W[K, KM_TILE] dot.
         def km_copies(w, idx, fp8):
             wv = w.bitcast(BF16) if fp8 else w
             n = w.shape[1]
@@ -505,11 +423,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             n, mk = km_copies(w, idx, fp8)
             _warm(n, mk, KM_PF)
 
-        def mv_km(w, idx, K_, x, fp8=False, warmed=False, scale=None):
-            """x [Q, K] @ W [K, N] for a K-major packed W -> [Q, N] f32; `scale`
-            [1, N] multiplies the result per output channel (fp8 weights)."""
+        def km_k(K_, fp8, n_out):
+            """Blocks per ring slot, as pack_kmajor chose for an N = n_out weight."""
+            rows = (2 if fp8 else 1) * H
+            return rows // K_ if n_out is None else km_blocks(K_, n_out, rows, KM_TILE)
+
+        def mv_km(w, idx, K_, x, fp8=False, warmed=False, scale=None, n_out=None):
+            """x [Q, K] @ K-major W [K, N] -> [Q, N] f32, times the per-channel `scale` if given."""
             n, mk = km_copies(w, idx, fp8)
-            k = (2 if fp8 else 1) * H // K_
+            k = km_k(K_, fp8, n_out)
             xb = x.astype(BF16)
 
             def use(s_, sl):
@@ -521,10 +443,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             return out if scale is None else out * scale
 
         def mv_km_allreduce(w, idx, K_, x, fp8=False, warmed=False, scale=None):
-            """allreduce(mv_km(...)) with H outputs, each slot's columns sent to the
-            peers as soon as they are computed (same pads and sum as `_round`)."""
+            """allreduce(mv_km(...)), each slot's columns sent as soon as they are computed."""
             n, mk = km_copies(w, idx, fp8)
-            k = (2 if fp8 else 1) * H // K_
+            k = km_k(K_, fp8, H)
             xb = x.astype(BF16)
             send, finish = _ar_pipe()
             if not warmed:
@@ -544,15 +465,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             return finish(x.shape[0])
 
         def put_send(cols, v):
-            """Columns of this device's partial, into the send buffer of the
-            collective format (f32, or bf16 with bf16_collectives)."""
             buf = sendb if BF16_COLL else sendv
             buf[:, cols] = v.astype(buf.dtype)
 
         def _ar_pipe():
-            """An allreduce of `sendv` sent in column groups as they are written.
-            Returns (send(c0, width), finish(rows)); same pads, parity and sum as
-            `_round`, so the result is identical to allreduce(sendv)."""
+            """Allreduce sent in column groups: (send(c0, width), finish(rows)), same result as `_round`."""
             par = collective[0] % 2
             collective[0] += 1
             cps = []
@@ -578,109 +495,13 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
             return send, finish
 
-        def load_scale(s_, idx, buf):
-            """Block scales live in HBM, which only async_copy may touch."""
-            _dma(s_.at[idx], buf, sem2)
-            return buf[...]
-
-        ring_in, sem_in = (r8i, s8i) if CH_EXPERTS else (r8a, s8a)
-
-        def mv_fp8_in_h(w, s_, sbuf, idx, out_dim, in_dim, x, warmed=False):
-            tile = pick_tile(out_dim, TR)
-            rows_per = max(1, tile // blk[0])
-            # The block scales are fetched alongside the first weight tiles.
-            sc_cp = pltpu.make_async_copy(s_.at[idx], sbuf, sem2)
-            sc_cp.start()
-            n = out_dim // tile
-
-            def mk(t):
-                sl = t % S
-                return pltpu.make_async_copy(
-                    w.at[idx, pl.ds(t * tile, tile), pl.ds(0, in_dim)],
-                    ring_in.at[sl, pl.ds(0, tile), pl.ds(0, in_dim)], sem_in.at[sl])
-
-            def use(t, sl):
-                if t == 0:
-                    sc_cp.wait()
-                return K.matvec_fp8(x, ring_in[sl, :tile, :in_dim],
-                                    sbuf[t * rows_per : (t + 1) * rows_per], blk)
-
-            return jnp.concatenate(_stream(n, mk, use, warmed), axis=1)
-
-        def warm_fp8_in_h(w, idx, out_dim, in_dim):
-            tile = pick_tile(out_dim, TR)
-
-            def mk(t):
-                sl = t % S
-                return pltpu.make_async_copy(
-                    w.at[idx, pl.ds(t * tile, tile), pl.ds(0, in_dim)],
-                    ring_in.at[sl, pl.ds(0, tile), pl.ds(0, in_dim)], sem_in.at[sl])
-
-            _warm(out_dim // tile, mk)
-
-        def fp8_out_h_copies(w, idx, in_dim):
-            tile = pick_tile(H, TR)
-
-            def mk(t):
-                sl = t % S
-                return pltpu.make_async_copy(
-                    w.at[idx, pl.ds(t * tile, tile), pl.ds(0, in_dim)],
-                    r8b.at[sl, pl.ds(0, tile), pl.ds(0, in_dim)], s8b.at[sl])
-
-            return H // tile, tile, mk
-
-        def warm_fp8_out_h(w, idx, in_dim):
-            n, _, mk = fp8_out_h_copies(w, idx, in_dim)
-            _warm(n, mk)
-
-        def mv_fp8_out_h(w, s_, sbuf, idx, in_dim, x, warmed=False):
-            n, tile, mk = fp8_out_h_copies(w, idx, in_dim)
-            rows_per = max(1, tile // blk[0])
-            sc_cp = pltpu.make_async_copy(s_.at[idx], sbuf, sem2)
-            sc_cp.start()
-
-            def use(t, sl):
-                if t == 0:
-                    sc_cp.wait()
-                return K.matvec_fp8(x, r8b[sl, :tile, :in_dim],
-                                    sbuf[t * rows_per : (t + 1) * rows_per], blk)
-
-            return jnp.concatenate(_stream(n, mk, use, warmed), axis=1)
-
-        def mv_fp8_out_h_allreduce(w, s_, sbuf, idx, in_dim, x, warmed=False, group=4):
-            """allreduce(mv_fp8_out_h(...)) with the reduction pipelined into the
-            matvec, as `mv_slots_allreduce`: exact."""
-            n, tile, mk = fp8_out_h_copies(w, idx, in_dim)
-            rows_per = max(1, tile // blk[0])
-            sc_cp = pltpu.make_async_copy(s_.at[idx], sbuf, sem2)
-            sc_cp.start()
-            send, finish = _ar_pipe()
-            if not warmed:
-                _warm(n, mk)
-            for t in range(n):
-                _wait(mk(t), "w_wait")
-                if t == 0:
-                    sc_cp.wait()
-                put_send(pl.ds(t * tile, tile), K.matvec_fp8(
-                    x, r8b[t % S, :tile, :in_dim],
-                    sbuf[t * rows_per : (t + 1) * rows_per], blk))
-                sinkhorn_bg()
-                if t + PF + 1 < n:
-                    mk(t + PF + 1).start()
-                if (t + 1) % group == 0 or t == n - 1:
-                    g0 = (t // group) * group
-                    send(g0 * tile, (t + 1 - g0) * tile)
-            return finish(x.shape[0])
-
-        # ------------------------------------------------------ embedding
         if cfg.init_streams:
-            streams = in_streams[...]                       # [Q*N, H]
+            streams = in_streams[...]
         else:
             rows = []
             for qi in range(Q):
                 if cfg.embed_2d:
-                    # A 2-D table is tiled 8 rows at a time and a DMA offset must
-                    # be tile-aligned: fetch the token's tile, pick its row here.
+                    # DMA offsets must be tile-aligned: fetch the token's 8-row tile, pick the row.
                     t8 = tok_ref[qi]
                     _dma(w_embed.at[pl.ds(pl.multiple_of((t8 // 8) * 8, 8), 8)], embv, sem)
                     r8 = jax.lax.broadcasted_iota(jnp.int32, (8, 1), 0)
@@ -691,11 +512,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     row = embv[...].astype(F32)
                 emb = allgather(row, hsh)
                 rows.append(jnp.broadcast_to(emb, (N, H)).astype(BF16))
-            streams = jnp.concatenate(rows, axis=0)         # [Q*N, H]
+            streams = jnp.concatenate(rows, axis=0)
 
-        # Deferred Sinkhorn chains: each is [matrix, pairs left].  The serial
-        # chain of tiny reductions runs between a stream's tiles, where the core
-        # would otherwise wait on DMA; combine() drains whatever is left.
+        # Deferred Sinkhorn chains [matrix, pairs left]: stepped in DMA waits, drained in combine().
         pending_sinkhorn = []
 
         def sinkhorn_bg(n=1):
@@ -714,8 +533,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             return e[0]
 
         def mhc(streams, tag, kind):
-            """mHC is per token; its coefficient projection runs once for all Q
-            tokens (hyper_connection_q), the small per-token math after it Q times."""
             iters = spec.hc_sinkhorn_iters
             res = K.hyper_connection_q(
                 [streams[qi * N : (qi + 1) * N] for qi in range(Q)],
@@ -726,17 +543,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 defer_sinkhorn=True)
             posts = [post for post, _, _ in res]
             cols = [col for _, _, col in res]
-            # The Sinkhorn pairs run in the block's DMA waits (sinkhorn_bg), all
-            # queries' matrices as one [Q, N, N] chain: the chain is serial, so
-            # one per query would cost Q times its latency.
             entry = [jnp.stack([comb for _, comb, _ in res]) if Q > 1 else res[0][1],
                      iters - 1]
             pending_sinkhorn.append(entry)
-            return posts, entry, jnp.concatenate(cols, axis=0)   # [Q, H]
+            return posts, entry, jnp.concatenate(cols, axis=0)
 
         def combine(posts, combs, block_out, residual):
             if isinstance(combs, list) and len(combs) == 2 and isinstance(combs[1], int):
-                done = sinkhorn_done(combs)       # one pending entry for all queries
+                done = sinkhorn_done(combs)
                 combs = [done[qi] for qi in range(Q)] if Q > 1 else [done]
             outs = []
             for qi in range(Q):
@@ -746,9 +560,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     residual[qi * N : (qi + 1) * N]))
             return jnp.concatenate(outs, axis=0)
 
-        # --------------------------------------------------------- KDA
         def kda(x, k_i, kind):
-            # The state and the small weights are in flight while qkv streams.
             loads = [pltpu.make_async_copy(src, dst, sgrp.at[i]) for i, (src, dst) in enumerate([
                 (_crec_in.at[k_i] if Q == 1 else _crec_in.at[k_i, ck], st),
                 (_cconv_in.at[k_i] if Q == 1 else _cconv_in.at[k_i, ck], cv),
@@ -759,14 +571,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             for c in loads:
                 c.start()
 
-            # Projections see all Q tokens at once; the weight is streamed once.
             with _scope("kda_qkv"):
-                qkv = mv_km(w_kqkv, k_i, H, x, FP8_KDA, warmed=True)    # [Q, 3*qsh]
+                qkv = mv_km(w_kqkv, k_i, H, x, FP8_KDA, warmed=True)
             if FP8_KDA:
-                # The scales arrive with the small loads: wait for them first.
                 _wait(loads[-1], "ld_wait")
                 qkv = qkv * ksc[:, : 3 * qsh]
-            # The output projection's first tiles land during the recurrence.
             warm_km(w_ko, k_i, FP8_KDA)
             for c in loads[:-1] if FP8_KDA else loads:
                 _wait(c, "ld_wait")
@@ -780,10 +589,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             decay = jnp.exp(alv[...]).reshape(hkda, 1)
             lb = spec.linear_lower_bound
 
-            # The recurrence and the convolution are sequential in the token
-            # index: there is no way to run query 1 without query 0's state.
-            # With Q > 1 each query's state goes to checkpoint qi from a two-slot
-            # ring (the small loads are all waited, so sgrp 0..3 are free).
+            # Checkpoint writes use sgrp 0..3, free once the small loads are waited.
             ys, ck_out = [], [[], []]
             for qi in range(Q):
                 slot, prev = qi % 2, (qi - 1) % 2
@@ -826,14 +632,13 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 y = y * jax.nn.sigmoid(gg_all[qi].reshape(hkda, dh))
                 ys.append(y.reshape(1, qsh))
 
-            # The state write-back overlaps the output projection.
             if Q == 1:
                 saves = [pltpu.make_async_copy(st, c_recur.at[k_i], sgrp.at[0]),
                          pltpu.make_async_copy(cv, c_conv.at[k_i], sgrp.at[1])]
                 for c in saves:
                     c.start()
             else:
-                saves = ck_out[0] + ck_out[1]     # the last two checkpoints
+                saves = ck_out[0] + ck_out[1]
             with _scope("kda_o"):
                 out = mv_km_allreduce(w_ko, k_i, qsh, jnp.concatenate(ys, axis=0),
                                       FP8_KDA, warmed=True,
@@ -842,9 +647,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 c.wait()
             return out
 
-        # --------------------------------------------------------- DSA
         TK = cfg.attn_tile
-        PT = TK // kp                      # pools per tile
+        PT = TK // kp
         NT = Lcap // TK
         if Q + kp + 15 > 32:
             raise ValueError(f"n_query={Q}: the pools closed this step span > 32 rows")
@@ -855,21 +659,23 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         def dsa(x, d_i):
             kvb_cp = pltpu.make_async_copy(w_kvb.at[d_i], kvb, sgrp.at[3])
             kvb_cp.start()
-            # The layer's pooled indexer keys, whole, land during the projections.
             pka_cp = pltpu.make_async_copy(c_ip.at[d_i], pka, sgrp.at[7])
             pka_cp.start()
-            # The output projection's ring is idle until the end of the block.
-            warm_fp8_out_h(w_do, d_i, nh * vd)
+            psc_cp = pltpu.make_async_copy(w_dsc.at[d_i], psc, sasy.at[7])
+            psc_cp.start()
+            w_qakv_n, w_qb_n, _ = dsa_scale_widths(spec, tp)
+            ql = spec.q_lora_rank
             sc_proj = _scope("dsa_proj")
             sc_proj.__enter__()
-            q_resid = K.rms_norm(
-                mv_fp8_in_h(w_qa, w_qas, s_qa, d_i, spec.q_lora_rank, H, x, warmed=True),
-                slab.get(sm, "q_a_layernorm").reshape(1, -1), eps, BF16)
-            q_all = mv_fp8_in_h(w_qb, w_qbs, s_qb, d_i, nh * qk,
-                                spec.q_lora_rank, q_resid)        # [Q, nh*qk]
-            kv_new = K.rms_norm(
-                mv_fp8_in_h(w_kva, w_kvas, s_kva, d_i, kvl, H, x),
-                slab.get(sm, "kv_a_layernorm").reshape(1, -1), eps, BF16)
+            qakv = mv_km(w_qakv, d_i, H, x, True, warmed=True, n_out=w_qakv_n)
+            _wait(psc_cp, "ld_wait")
+            qakv = qakv * psc[:, :w_qakv_n]
+            q_resid = K.rms_norm(qakv[:, :ql],
+                                 slab.get(sm, "q_a_layernorm").reshape(1, -1), eps, BF16)
+            q_all = mv_km(w_qb, d_i, ql, q_resid, True, n_out=w_qb_n,
+                          scale=psc[:, w_qakv_n : w_qakv_n + w_qb_n])
+            kv_new = K.rms_norm(qakv[:, ql:],
+                                slab.get(sm, "kv_a_layernorm").reshape(1, -1), eps, BF16)
             ik_new = K.layer_norm(
                 K.matvec_bf16(x, slab.get(sm, "indexer_wk").astype(BF16)),
                 slab.get(sm, "indexer_k_norm_w").reshape(1, -1),
@@ -878,8 +684,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 x, slab.get(sm, "indexer_compress_gate").astype(BF16))
             sc_proj.__exit__(None, None, None)
 
-            # This step's rows: written to the cache after the kernel (row_write_call),
-            # and patched into the streamed tiles below so this step sees them.
+            # row_write_call stores the new rows after the kernel; this step patches them in.
             kv_new = kv_new.astype(BF16)
             ik_new = ik_new.astype(BF16)
             ig_new = ig_new.astype(BF16)
@@ -894,16 +699,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 return tile
 
             last = pos + Q - 1
-            nt = last // TK + 1                       # tiles holding any visible token
+            nt = last // TK + 1
             with _scope("dsa_indexq"):
                 iq_all = mv_km(w_iwq, d_i, spec.q_lora_rank, q_resid)
             hw_all = K.matvec_bf16(
                 x, slab.get(sm, "indexer_weights_proj").astype(BF16)) * (hi ** -0.5)
             ape = slab.get(sm, "indexer_ape").astype(F32)
 
-            # Pools this step closes (their last token is one of the new rows):
-            # their keys come from the raw rows around pos; every older closed
-            # pool's key is read from the pooled-key cache c_ip.
+            # Pools this step closes are keyed from the raw rows; older pools come from c_ip.
             fp0, fresh = closing_pools(pos)
             r0 = jnp.minimum(((jnp.maximum(pos - kp + 1, 0)) // 16) * 16, Lcap - 32)
             raw = [pltpu.make_async_copy(c.at[d_i, pl.ds(r0, 32)], buf, sgrp.at[i])
@@ -917,20 +720,16 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             for qi in range(Q):
                 ikv = jnp.where(rr == pos + qi, ik_new[qi], ikv)
                 igv = jnp.where(rr == pos + qi, ig_new[qi], igv)
-            pk_blk, _ = K.indexer_pool_keys(ikv, igv, ape, last, kp)   # [32/kp, idh]
+            pk_blk, _ = K.indexer_pool_keys(ikv, igv, ape, last, kp)
             prow = jax.lax.broadcasted_iota(jnp.int32, (32 // kp, 1), 0) + r0 // kp
             fresh_keys = [jnp.sum(jnp.where(prow == fp0 + i, pk_blk, 0.0), axis=0,
                                   keepdims=True) for i in range(Q)]
             o_npk[d_i] = jnp.concatenate(fresh_keys, axis=0)
             pcol = jax.lax.broadcasted_iota(jnp.int32, (PT, 1), 0)
 
-            # Pass 1: every pool's score, from the VMEM-resident pooled keys.
             _wait(pka_cp, "kv_wait")
 
             if Q > 1:
-                # All queries' indexer heads in one operand [Q*hi, idh], and their
-                # head weights block-diagonal [Q, Q*hi]: two dots per tile serve
-                # every query (each tile's cost is the pooled keys, not the rows).
                 iq_cat = jnp.concatenate(
                     [iq_all[qi].reshape(hi, idh) for qi in range(Q)], axis=0)
                 hcol = jax.lax.broadcasted_iota(jnp.int32, (Q, Q * hi), 1)
@@ -943,7 +742,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 for i in range(Q):
                     pk = jnp.where((pcol + t * PT == fp0 + i) & (i < fresh), fresh_keys[i], pk)
                 if Q > 1:
-                    sc = K.indexer_scores(iq_cat, hw_blk, pk, idh ** -0.5)   # [Q, PT]
+                    sc = K.indexer_scores(iq_cat, hw_blk, pk, idh ** -0.5)
                     scr[:, pl.ds(t, 1), :] = sc.reshape(Q, 1, PT)
                     return c
                 for qi in range(Q):
@@ -954,13 +753,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             with _scope("dsa_scores"):
                 jax.lax.fori_loop(0, nt, score_tile, 0)
 
-            # Selection: each query sees closed pools ending at or before it.
             gidx = (jax.lax.broadcasted_iota(jnp.int32, (NT, PT), 0) * PT
                     + jax.lax.broadcasted_iota(jnp.int32, (NT, PT), 1))
             pool_end = (gidx + 1) * kp - 1
-            # One bisection for all queries: its cost is the latency of a serial
-            # chain of reductions, which batching the queries does not lengthen.
-            eligs = [pool_end <= pos + qi for qi in range(Q)]   # unwritten tiles never
+            eligs = [pool_end <= pos + qi for qi in range(Q)]
             if Q == 1:
                 chosen = K.select_top_k_mask_2d(
                     jnp.where(eligs[0], scr[0], -jnp.inf), selk)[None]
@@ -975,8 +771,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 q_abs = [K.absorb_q(q_all[qi].reshape(nh, qk), kvbf, n_heads=nh,
                                     qk_dim=qk, v_dim=vd, kv_lora=kvl) for qi in range(Q)]
 
-            # Pass 2: attention over the selected tokens, one latent tile at a
-            # time with an online softmax.
             def kv_cp(t, b):
                 return pltpu.make_async_copy(
                     c_kv.at[d_i, pl.ds(t * TK, TK)], kvt.at[b], sgrp.at[4 + b])
@@ -984,15 +778,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             kv_cp(0, 0).start()
             scaling = qk ** -0.5
 
-            # The query and the probabilities enter their dots as bf16 against the
-            # bf16 latent tiles (single-pass dots, f32 accumulation).
             def dot(a, b, dims):
                 return jax.lax.dot_general(a.astype(BF16), b, (dims, ((), ())),
                                            preferred_element_type=F32)
 
-            # All queries' heads in one operand [Q*nh, kvl]: one logits dot and one
-            # probability-times-latent dot per tile serve every query (the MXU
-            # cost is the KV tile, not the rows).
             q_all = jnp.concatenate(q_abs, axis=0) if Q > 1 else q_abs[0]
             q_bf = q_all.astype(BF16)
 
@@ -1004,8 +793,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 def _():
                     kv_cp(t + 1, 1 - b).start()
 
-                # This step's rows go into the one 32-row block of the tile that
-                # holds them (a whole-tile select per tile costs more than the dots).
                 @pl.when((t * TK <= last) & (pos < (t + 1) * TK))
                 def _():
                     ws = pl.multiple_of(
@@ -1016,13 +803,12 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         blk = jnp.where(rows == pos + qi, kv_new[qi], blk)
                     kvt[b, pl.ds(ws, 32), :] = blk
 
-                kvt_b = kvt[b]                                    # [TK, kvl] bf16
+                kvt_b = kvt[b]
                 tok = t * TK + jax.lax.broadcasted_iota(jnp.int32, (1, TK), 1)
                 masks = []
                 for qi in range(Q):
                     p_q = pos + qi
-                    # Repeating the boolean directly lowers to an i1 transpose;
-                    # go through float32 and compare.
+                    # Repeating a bool lowers to an i1 transpose; repeat the f32 and compare.
                     allowed = jnp.repeat(scr[qi, pl.ds(t, 1), :], kp, axis=1) > 0.5
                     if spec.index_kpool_always_select_tail:
                         tail_count = jax.lax.rem(p_q + 1, kp)
@@ -1033,7 +819,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 allowed = jnp.concatenate(masks, axis=0) if Q > 1 else masks[0]
                 m_o, l_o, a_o = carry
                 lg = dot(q_bf, kvt_b, ((1,), (1,))) * scaling
-                lg = jnp.where(allowed, lg, -jnp.inf)                # [Q*nh, TK]
+                lg = jnp.where(allowed, lg, -jnp.inf)
                 m_n = jnp.maximum(m_o, jnp.max(lg, axis=1, keepdims=True))
                 shift = jnp.where(jnp.isfinite(m_n), m_n, 0.0)
                 pr = jnp.where(allowed, jnp.exp(lg - shift), 0.0)
@@ -1057,13 +843,12 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     head_out = K.project_out(lat, kvbf, n_heads=nh, qk_dim=qk, v_dim=vd)
                     outs.append(head_out.reshape(1, nh * vd))
             with _scope("dsa_o"):
-                return mv_fp8_out_h_allreduce(w_do, w_dos, s_do, d_i, nh * vd,
-                                              jnp.concatenate(outs, axis=0), warmed=True)
+                o_off = w_qakv_n + w_qb_n
+                return mv_km_allreduce(w_do, d_i, nh * vd, jnp.concatenate(outs, axis=0),
+                                       True, scale=psc[:, o_off : o_off + H])
 
-        # --------------------------------------------------------- MLP
         def moe_early(m_i):
-            """Router, every expert's block scales and the shared expert's scales,
-            started before the FFN-side mHC; only the router is needed to route."""
+            """Start the router and scale fetches before the FFN-side mHC."""
             fetch = [(w_router.at[m_i], rtr)]
             if not CH_EXPERTS:
                 fetch += [(w_egus.at[m_i], egs), (w_edns.at[m_i], eds),
@@ -1072,16 +857,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                      for i, (src, dst) in enumerate(fetch)]
             for c in early:
                 c.start()
-            # The shared expert does not depend on routing: its weights take the
-            # ring's first slot now, so they are in flight across the FFN-side mHC
-            # and the router instead of queued behind the routed experts.
             for c in shared_copies(m_i):
                 c.start()
             return early
 
         def expert_copies(sl, gu, dn, gu_s=None, dn_s=None):
-            """The copies filling expert ring slot `sl`: gate/up and down slabs, and
-            with CH_EXPERTS their scale rows."""
             if CH_EXPERTS:
                 return [pltpu.make_async_copy(gu, r8a.at[sl], s8a.at[sl]),
                         pltpu.make_async_copy(dn, r8d.at[sl], s8d.at[sl]),
@@ -1112,9 +892,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 mask, wts = K.route_experts(
                     x, rtr[...], slab.getf(smf, kind, "router_bias"), **route_kw)
                 idxs = None
-            # With Q tokens the selected sets differ.  Fetch the union once and
-            # apply each expert to whichever tokens chose it, weighted by that
-            # token's own routing weight (zero where it did not).
             n_slot = kexp * Q
             union = mask if Q == 1 else jnp.max(mask.astype(jnp.int32), axis=0,
                                                 keepdims=True) > 0
@@ -1122,14 +899,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 idxs = K.mask_to_indices_mxu(union, n_slot)
             base = m_i * nexp
             acc = jnp.zeros((Q, H), F32)
-            # An unused union slot carries the sentinel `nexp`; clamp it for the
-            # fetch (the bytes are harmless) and let the weight mask below give it
-            # zero weight, since no token selected it.
+            # Unused union slots hold sentinel nexp: clamp it for the fetch; its weight is zero.
             safe = jnp.minimum(idxs, nexp - 1)
             sc_route.__exit__(None, None, None)
 
-            # The shared expert and then the routed experts stream through one
-            # ring; the shared expert's copy was started by moe_early.
+            # Entry 0 is the shared expert, whose copy moe_early already started.
             entries = [None] + list(range(n_slot))
 
             def src_gu(e):
@@ -1149,9 +923,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                                      w_egus.at[pl.ds(row, 1)], w_edns.at[pl.ds(row, 1)])
 
             n_e = len(entries)
-            # With several queries the union's ids are ascending with unused slots
-            # last: only the n_u distinct experts are fetched and applied.  One
-            # query always uses all of its slots, so that path is unguarded.
+            # Q > 1: union ids are ascending with unused slots last, so only the first n_u run.
             guard = Q > 1
             n_u = jnp.sum(union.astype(jnp.int32)) if guard else None
 
@@ -1196,9 +968,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         gs, dsc, w_j = s_sgu[...], s_sdn[...], None
                     else:
                         gs, dsc = egs[safe[e]], eds[safe[e]]
-                        # Per-token weight for this expert, zero where the token did
-                        # not select it; a masked sum, since a dynamic lane extract
-                        # does not lower.
+                        # A masked sum, since a dynamic lane extract does not lower.
                         hit = jax.lax.broadcasted_iota(jnp.int32, (Q, nexp), 1) == idxs[e]
                         w_j = jnp.sum(jnp.where(hit, wts, 0.0), axis=1, keepdims=True)
                     h = K.matvec_fp8(x, r8a[sl, : 2 * moesh, :H], gs, blk)
@@ -1219,17 +989,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             return allreduce(macc[...] if guard else acc)
 
         def dense(x, d_i):
-            h = mv_fp8_in_h(w_dgu, w_dgus, s_dgu, d_i, 2 * ffnsh, H, x)
+            _dma(w_dnsc.at[d_i], psc, sem2)
+            h = mv_km(w_dgu, d_i, H, x, True, n_out=2 * ffnsh, scale=psc[:, : 2 * ffnsh])
             act = K.swiglu_clamped(h[:, :ffnsh], h[:, ffnsh:], spec.swiglu_limit)
-            return mv_fp8_out_h_allreduce(w_ddn, w_ddns, s_ddn, d_i, ffnsh, act)
+            return mv_km_allreduce(w_ddn, d_i, ffnsh, act, True,
+                                   scale=psc[:, 2 * ffnsh : 2 * ffnsh + H])
 
         def layer(streams, L, kind, mlp_kind, next_kda=None, prewarmed=False, par=None):
-            """`next_kda`: the next layer's index when it is a KDA layer whose qkv
-            may start during this layer's FFN block (the bf16 ring is idle then);
-            `prewarmed`: this layer's qkv was started that way."""
+            """`next_kda`: start that KDA layer's qkv during this FFN; `prewarmed`: ours was started so."""
             slab_kind = f"{kind}_{'sparse' if mlp_kind == 'moe' else 'dense'}"
-            # This layer's slab was started by the previous layer (or here, for the
-            # first); the next layer's goes into the other half now.
             par = L % 2 if par is None else par
             sm.i = smf.i = par
             with _scope("slab"):
@@ -1247,13 +1015,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     pl.when(L + 1 < n_layers)(prefetch)
                 elif L + 1 < n_layers:
                     prefetch()
-            # The block's first weight tiles stream while mHC runs: the weights do
-            # not depend on it, and mHC is a serial chain of small reductions.
             if kind == "kda":
                 if not prewarmed:
                     warm_km(w_kqkv, kda_ord(L), FP8_KDA)
             else:
-                warm_fp8_in_h(w_qa, dsa_ord(L), spec.q_lora_rank, H)
+                warm_km(w_qakv, dsa_ord(L), True)
             with _scope("mhc_attn"):
                 posts, combs, x = mhc(streams, "attn", slab_kind)
                 x = K.rms_norm(x, slab.get(sm, "input_layernorm").reshape(1, H), eps, BF16)
@@ -1281,9 +1047,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         o_nik[...] = jnp.zeros(o_nik.shape, o_nik.dtype)
         o_nig[...] = jnp.zeros(o_nig.shape, o_nig.dtype)
         n_dense = min(spec.first_k_dense_replace, n_layers)
+        # No next_kda: the dense MLP occupies the K-major ring.
         for L in range(n_dense):
-            nxt = L + 1 if (L + 1 < n_dense and spec.layer_types[L + 1] == "linear_attention") else None
-            streams = layer(streams, L, "kda", "dense", next_kda=nxt, prewarmed=L > 0)
+            streams = layer(streams, L, "kda", "dense")
 
         def period(p, s_):   # noqa: ARG001 - p is the traced period index
             base = spec.first_k_dense_replace + 4 * p
@@ -1304,9 +1070,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             kind = "kda" if spec.layer_types[L] == "linear_attention" else "dsa"
             streams = layer(streams, L, kind, "moe")
 
-        # The residual stream is also emitted, so a disagreement can be localised
-        # to a layer instead of being inferred from the logits.  It costs one
-        # [N, H] write per step.
         o_streams[...] = streams
         _dma(w_fnorm, fnv, sem)
         hidden = K.rms_norm(
@@ -1323,29 +1086,21 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
 def _closing_pools(pos, Q, kp):
     """(first pool, count) of the pools whose last token is one of pos .. pos+Q-1."""
-    first = (pos + kp) // kp - 1          # the pool containing pos
+    first = (pos + kp) // kp - 1
     first = jnp.where((first + 1) * kp - 1 >= pos, first, first + 1)
-    last = (pos + Q) // kp - 1            # the last pool that ends by pos+Q-1
+    last = (pos + Q) // kp - 1
     return first, jnp.maximum(last - first + 1, 0)
 
 
 def init_pool_keys(spec, ik, ig, apes):
-    """The pooled-key cache [n_dsa, L/kpool, Dh] f32 from raw indexer caches
-    [n_dsa, L, Dh]: same formula as the kernel (phases.indexer_pool_keys)."""
+    """Pooled-key cache [n_dsa, L/kpool, Dh] f32 from the raw caches, as the kernel computes it."""
     kp = spec.index_kpool
     return jnp.stack([K.indexer_pool_keys(ik[d], ig[d], apes[d], ik.shape[1], kp)[0]
                       for d in range(ik.shape[0])])
 
 
 def row_write_call(spec, cfg: KernelConfig):
-    """``f(pos, nkv, nik, nig, npk, kv, idx_key, idx_gate, idx_pool) -> (kv, idx_key,
-    idx_gate, idx_pool)``.
-
-    Stores the decode step's new rows, and the keys of the pools it closed, in
-    place.  It has no remote DMA, so XLA aliases the caches without a copy.  A
-    dynamic single-row write into a tiled HBM array is not legal, so each layer's
-    aligned block around the rows (32 bf16 rows, 8 f32 pool rows) is read,
-    patched and written back."""
+    """Store new rows and pool keys in place by aligned blocks; no remote DMA, so XLA does not copy."""
     Q, Lcap, kp = cfg.n_query, cfg.max_len, spec.index_kpool
     kvl, idh = spec.kv_lora_rank, spec.index_head_dim
     n_dsa = len(spec.dsa_layers)

@@ -1,36 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash decode megakernel in serving (experimental, opt-in).
 
-``SGLANG_TPU_GLM_FLASH_MEGAKERNEL=1`` runs single-request target
-steps through one Pallas call per device instead of the decoder: the MTP verify
-(all draft tokens in one call) with speculative decoding, the plain decode step
-without it. Prefill, batches of more than one request and the draft model keep
-the native path.
-
-Prototype scope:
-- The kernel streams its own packed weights (``..._PACKED``, written by
-  ``python -m sglang_tpu.glm_flash_megakernel.pack``), loaded per rank right
-  after the model, so the KV pool is sized after them. Serving's weights stay resident beside them.
-- At a request's first step its caches are gathered from serving's pools (fp8
-  MLA latent x k_scale, the raw indexer key | gate, the committed KDA state) into
-  the kernel's contiguous per-request layout; later steps keep them in the
-  kernel. Serving's pools are not updated during these steps, so the radix cache
-  must be off.
-- With MTP the KDA states hold one checkpoint per draft token, like serving's
-  mamba pool: a verify resumes from the checkpoint of the last token the
-  previous one accepted, found on the device from the two steps' positions.
-  Rejected tokens' KV rows are overwritten by the next verify.
-- The kernel computes the logits and the draft's hidden (final norm of the mean
-  residual stream) itself; the logits are all-gathered over TP.
+Runs single-request target steps (the MTP verify, or plain decode without MTP) as
+one Pallas call per device. A request's caches are gathered from serving's pools at
+its first step and then live in the kernel; serving's pools are not updated, so the
+radix cache must be off. With MTP the KDA states hold one checkpoint per draft
+token, and a verify resumes from the last token the previous verify accepted.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 
-import numpy as np
 import torch
 
 from sglang_tpu.envs import envs as tpu_envs
@@ -44,109 +25,46 @@ def enabled() -> bool:
     return tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get()
 
 
-def _torch_from_npy(a: np.ndarray, dtype_name: str, device, chunk_bytes=1 << 30):
-    """A memory-mapped .npy to a device tensor, a slab of rows at a time so the
-    host never holds a whole (multi-GB) array."""
-    tdtype, view = {
-        "bfloat16": (torch.bfloat16, np.uint16),
-        "float8_e4m3fn": (torch.float8_e4m3fn, np.uint8),
-        "float32": (torch.float32, np.float32),
-    }[dtype_name]
-    raw = a.view(view)
-    out = torch.empty(raw.shape, dtype=tdtype, device=device)
-    rows = max(1, chunk_bytes // max(1, raw[:1].nbytes))
-    for i in range(0, raw.shape[0], rows):
-        part = torch.from_numpy(np.ascontiguousarray(raw[i : i + rows]))
-        out[i : i + rows].copy_(part.view(tdtype))
-    return out
-
-
-def _manifest(packed_dir: str) -> dict:
-    """The pack manifest, with the per-channel experts (which serving's kernel
-    config reads) merged in."""
-    manifest = json.load(open(os.path.join(packed_dir, "manifest.json")))
-    for r in range(manifest["tp"]):
-        manifest["ranks"][str(r)].update(json.load(open(
-            os.path.join(packed_dir, f"manifest_ch.rank{r}.json"))))
-    return manifest
-
-
-def _sources() -> dict:
-    """Kernel weight name -> packed array name (the runner's ``src``)."""
-    from sglang_tpu.glm_flash_megakernel.kernel import runner as R
-    from sglang_tpu.glm_flash_megakernel.weights import CH_REPLACES
-
-    return {n: CH_REPLACES.get(n, n) for n in R.WEIGHT_ORDER if n != "kda_scale"}
-
-
-def load_packed_weights(packed_dir: str, device) -> dict:
-    """This rank's packed weight shards as device tensors, by packed name.
-
-    Called before serving loads its own weights: the largest array is one
-    ~24 GiB buffer, which an HBM already fragmented by serving cannot place."""
-    from sglang.srt.runtime_context import get_parallel
-    from sglang_tpu.glm_flash_megakernel.weights import SHARD_AXIS, _load_npy
-
-    manifest = _manifest(packed_dir)
-    rank = get_parallel().tp_rank
-    weights = {}
-    for name in _sources().values():
-        e = manifest["ranks"][str(rank if SHARD_AXIS[name] is not None else 0)][name]
-        weights[name] = _torch_from_npy(
-            _load_npy(os.path.join(packed_dir, e["file"]), e["dtype"]), e["dtype"], device)
-    nbytes = sum(t.numel() * t.element_size() for t in weights.values())
-    logger.info("GLM-Flash megakernel: %.1f GiB of packed weights on rank %d",
-                nbytes / 2**30, rank)
-    return weights
-
-
 class GlmFlashMegakernel:
-    def __init__(self, model, model_path: str, packed_dir: str, max_len: int,
-                 weights: dict, n_query: int = 1):
+    def __init__(self, model, model_path: str, max_len: int, experts: dict,
+                 n_query: int = 1):
         import jax
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
+        from sglang.srt.runtime_context import get_parallel
         from torch_tpu._internal.pallas import get_pallas_mesh
         from torch_tpu._internal.pallas import pallas as pallas_impl
 
+        from sglang_tpu.glm_flash_megakernel.build import build_weights, slab_maps
         from sglang_tpu.glm_flash_megakernel.config import Glm53FlashSpec
         from sglang_tpu.glm_flash_megakernel.kernel import decode as D
         from sglang_tpu.glm_flash_megakernel.kernel import runner as R
-        from sglang_tpu.glm_flash_megakernel.layout import PackedLayout
-        from sglang_tpu.glm_flash_megakernel.weights import SHARD_AXIS, PackedWeights
+        from sglang_tpu.glm_flash_megakernel.layout import KernelLayout
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
         from sglang_tpu.pallas_jax_op import _CpuExportJaxCallable
 
         spec = Glm53FlashSpec.from_checkpoint(model_path)
-        manifest = _manifest(packed_dir)
-        tp = manifest["tp"]
-        device = next(iter(weights.values())).device
+        par = get_parallel()
+        tp, rank = par.tp_size, par.tp_rank
+        device = model.model.norm.weight.device
         self.spec, self.tp, self.max_len, self.Q = spec, tp, max_len, n_query
         self.vocab = spec.vocab_size
-
-        # Shapes only: the runner reads ranks and the slab index, not the arrays.
-        global_arrays = {}
-        for name in weights:
-            ax = SHARD_AXIS[name]
-            e = manifest["ranks"]["0"][name]
-            shape = list(e["shape"])
-            if ax is not None:
-                shape[ax] *= tp
-            global_arrays[name] = jax.ShapeDtypeStruct(tuple(shape), jax.numpy.dtype(e["dtype"]))
-        small_map = {k: (v[0], v[1], tuple(v[2])) for k, v in manifest["small_map"].items()}
-        small_f32_map = {
-            int(k): {kk: (vv[0], vv[1]) for kk, vv in v.items()}
-            for k, v in manifest["small_f32_map"].items()
-        }
-        meta = PackedWeights(global_arrays, small_map, small_f32_map,
-                             PackedLayout(spec, tp), None, manifest)
+        layout = KernelLayout(spec, tp)
+        small_map, small_f32_map = slab_maps(spec)
         mesh = get_pallas_mesh((_AXIS,), (tp,))
-        # The kernel reads embedding rows from serving's 2-D table (8-row tiles)
-        # instead of a re-tiled [V, 1, D] copy.
+        # embed_2d: build_weights holds the 2-D table as a real tensor, since a torch
+        # view would be re-materialised per call.
         self.cfg = D.KernelConfig(max_len=max_len, n_query=n_query, embed_2d=True)
         with tpu_info_for_cpu_export():
-            run = R.make_decode(spec, meta, mesh, self.cfg)
+            run = R.make_decode(spec, layout, small_map, small_f32_map, mesh, self.cfg)
         self.run = run
+
+        weights = build_weights(model, spec, layout, self.cfg, tp, rank, experts)
+        self.weights = [weights[n] for n in R.WEIGHT_ORDER]
+        nbytes = sum(t.numel() * t.element_size() for t in self.weights)
+        logger.info("GLM-Flash megakernel: %.1f GiB of kernel weights on rank %d",
+                    nbytes / 2**30, rank)
+        del weights
 
         def export(name, fn, in_specs, out_specs, donate=()):
             out_sh = tuple(NamedSharding(mesh, s) for s in out_specs)
@@ -160,29 +78,11 @@ class GlmFlashMegakernel:
             call.sglang_output_shardings = out_sh
             return call
 
-        # The derived weights (K-major packing, fp8 KDA scales, channels-last
-        # conv), once.
-        derived = R.DERIVED
-        prep = export("jax_glm_flash_mk_prep", lambda *a: run.prep(*a),
-                      run.prep_in_specs, [run.wspec[n] for n in derived])
-        out = prep(weights["kda_qkv"], weights["kda_o"], weights["indexer_wq_b"],
-                   weights["lm_head"], weights["kda_conv"])
-        ready = {run.src.get(n, n): w for n, w in weights.items()}
-        ready.update(dict(zip(derived, out)))
-        self.weights = [ready[n if n in derived else run.src[n]] for n in R.WEIGHT_ORDER]
-        del weights, ready, out
-        # A real 2-D tensor, not a view of the packed [V, 1, D] one: a view is
-        # materialised again on every call.
-        ie = R.WEIGHT_ORDER.index("embed_tokens")
-        self.weights[ie] = self.weights[ie].reshape(self.weights[ie].shape[0], -1).clone()
-
-        # The pooled indexer keys, derived from the raw caches at a request's load.
         rep3 = P(None, None, None)
         self.init_ip = export("jax_glm_flash_mk_init_ip", lambda *a: (run.init_ip(*a),),
                               [rep3, rep3, run.wspec["smalls"]], [rep3])
         self.smalls = self.weights[R.WEIGHT_ORDER.index("smalls")]
 
-        # The request's caches, in the kernel's layout.
         n_dsa, n_kda = len(spec.dsa_layers) + 1, len(spec.kda_layers)
         bf16, f32 = torch.bfloat16, torch.float32
         ck = (n_query,) if n_query > 1 else ()
@@ -213,10 +113,8 @@ class GlmFlashMegakernel:
 
         Q = n_query
 
-        # The per-step bookkeeping (the checkpoint offset) happens inside this launch: as separate eager ops each would be its
-        # own program launch, and the decode loop is host-bound once the kernel is
-        # fast.  The checkpoint of the last token the previous verify accepted is
-        # pos - prev - 1 (that verify ended at prev + accepted - 1 = pos - 1).
+        # In-launch bookkeeping: separate eager ops would each be a host-bound launch.
+        # The last verify ended at pos - 1, so its last accepted checkpoint is pos - prev - 1.
         def step(tok, positions, prev, init, *rest):
             ws = dict(zip(R.WEIGHT_ORDER, rest[:nw]))
             dc = dict(zip(run.dsa_names, rest[nw : nw + nd]))
@@ -233,14 +131,12 @@ class GlmFlashMegakernel:
         cspec = {**run.dspec, **run.kspec}
         self.call = export(
             f"jax_glm_flash_mk_L{max_len}_q{n_query}", step, in_specs,
-            # Logits stay vocab-sharded and are gathered by serving's collective:
-            # replicated in this launch, tensors derived from them carry mesh
-            # shardings into serving's own compiled ops, which then fail to compile.
+            # Keep logits vocab-sharded: replicated here, their mesh sharding leaks into
+            # serving's compiled ops, which then fail to compile.
             [P(None, _AXIS), P(None, None), P()] + [cspec[n] for n in run.step_caches],
             donate=tuple(range(4 + nw, 4 + nw + nd)))
         self.req, self.prev_pos = None, None
 
-    # ------------------------------------------------------------------ serving
     def handles(self, forward_batch, input_ids) -> bool:
         if forward_batch.batch_size != 1 or input_ids.shape[0] != self.Q:
             return False
@@ -255,11 +151,9 @@ class GlmFlashMegakernel:
         return self.req is not None
 
     def invalidate(self):
-        """A target step the kernel did not run (a prefill): reload next time."""
         self.req = None
 
     def _load_request(self, forward_batch, req: int, pos: int):
-        """Gather the request's caches from serving's pools (once per request)."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         spec = self.spec
@@ -269,7 +163,6 @@ class GlmFlashMegakernel:
         full = getattr(backend, "full_attn_backend", backend)
         lin = getattr(backend, "linear_attn_backend", backend)
         pool, req_pool = full.token_to_kv_pool, lin.req_to_token_pool
-        # req_to_token is host-resident on TPU.
         device = self.dsa_caches[0].device
         locs = req_pool.req_to_token[req, :pos].to(device=device, dtype=torch.int64)
         kv, ik, ig, _ = self.dsa_caches
@@ -292,9 +185,8 @@ class GlmFlashMegakernel:
         for k, L in enumerate(spec.kda_layers):
             c = req_pool.mamba2_layer_cache(L)
             st = c.temporal.index_select(0, row)[0]
-            cv = c.conv[0].index_select(0, row)[0].reshape(k1, -1)   # [K-1, C], as the kernel
+            cv = c.conv[0].index_select(0, row)[0].reshape(k1, -1)
             if self.Q > 1:
-                # Every checkpoint: the first verify resumes from checkpoint 0.
                 recur[k] = st.unsqueeze(0).expand(self.Q, *st.shape)
                 conv[k] = cv.unsqueeze(0).expand(self.Q, *cv.shape)
             else:
