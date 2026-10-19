@@ -8,5 +8,5 @@
 # Everything else in the TPU stack (torch, torchvision, libtpu, jax, jaxlib)
 # IS resolved here: the pins live in python/pyproject_tpu.toml, and MODULE.bazel
 # points torch_tpu's pip hub at this lock's hub via override_repo.
-torch-tpu==0.2.0rc4
+torch-tpu==0.2.0
 tpu-sync-torch==0.0.1.dev20261013083150
