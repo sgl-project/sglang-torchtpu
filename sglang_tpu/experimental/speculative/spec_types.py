@@ -145,7 +145,6 @@ class AcceptResult(NamedTuple):
     next_seq_lens: torch.Tensor
     window_tokens: torch.Tensor
     window_seq_lens: torch.Tensor
-    # Computed in finalize_accept so the commit launches no eager ops for them.
     live_mask: torch.Tensor | None = None
     last_steps: torch.Tensor | None = None
 
