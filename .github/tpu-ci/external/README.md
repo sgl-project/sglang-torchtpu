@@ -112,8 +112,7 @@ python3 .github/tpu-ci/external/render_external_jobset.py --list-groups  # what 
 ## Configuration
 
 Non-sensitive structure lives in [`external-topology.yaml`](external-topology.yaml). Partner-internal
-identifiers are **environment secrets** in the GitHub environment `external-tpu`
-(masked in Actions logs, out of source):
+identifiers are **repo secrets** (masked in logs, out of source) — set once:
 
 | Secret | Value |
 |---|---|
@@ -122,35 +121,19 @@ identifiers are **environment secrets** in the GitHub environment `external-tpu`
 | `EXTERNAL_NODEPOOL_2X2X2_0..3` | the **4** nodepools backing the `2x2x2` slices |
 | `EXTERNAL_NODEPOOL_2X2X4_0..1` | the **2** nodepools backing the `2x2x4` slices |
 
-### Set up the environment before merging the migration
+The cluster provides **4× `2x2x2`** and **2× `2x2x4`** slices. There is no Kueue, so discovery
+**round-robins** the launch groups across a shape's slices (`nodepool_vars` in
+`external-topology.yaml`) and buckets them into **one job per slice**: up to 4 `2x2x2` + 2
+`2x2x4` jobs run in **parallel**, and groups beyond the slice count run **serially inside their
+slice's job** (no Pending race, no dropped work). Cross-run overlap on a slice is held by the
+slice-keyed `concurrency` group (depth-1 — fine until Kueue).
 
-1. Create `external-tpu` in repository **Settings → Environments**. Configure the
-   allowed deployment branches and any required reviewers for external cluster access.
-   Scheduled runs must be able to deploy from `main`; required reviewers will also
-   gate unattended nightly runs. Only dispatch trusted test refs: deployment branch
-   rules apply to the workflow ref, not the separately checked-out `inputs.ref`.
-2. Populate all eight secrets above from the authorized infrastructure configuration.
-   GitHub does not return existing secret values, so repository secrets cannot be
-   downloaded and copied. For example, `gh secret set EXTERNAL_CLUSTER --env external-tpu`
-   prompts for a value without putting it in shell history. Repeat for the other keys.
-3. The reusable workflow sets `jobs.test.environment: external-tpu` and resolves
-   cluster credentials in that job. Keep `secrets: inherit` on both nightly callers.
-   Same-named environment secrets take precedence over repository secrets; see
-   [GitHub's reusable workflow documentation](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow).
-4. Validate an authorized manual run, then remove the eight repository-level copies
-   once all consumers use the environment. Until removed, repository copies remain
-   available to other workflows and can hide missing environment configuration.
+Discover nodepools with
+`kubectl get nodes -L cloud.google.com/gke-nodepool,cloud.google.com/gke-tpu-topology`. To add
+a slice, append a secret name to that shape's `nodepool_vars`, set the secret, and add a line
+to `_external-tpu-test.yml`'s render-step env. A new shape also needs a `suites:` entry.
 
-The region, namespace, in-project WIF provider, CI service-account address, and CI
-bucket are non-secret configuration. Authentication uses OIDC; do not add a
-long-lived service-account key. If the WIF trust policy constrains the GitHub OIDC
-`sub` claim, check the configured subject format and update it for the environment
-before switching the job. For the traditional default format this is
-`repo:sgl-project/sglang-torchtpu:environment:external-tpu`; see the
-[GitHub OIDC reference](https://docs.github.com/en/actions/reference/security/oidc#example-subject-claims)
-for customized or immutable subject formats.
-
-### Logs and historical disclosures
+## Logs and historical disclosures
 
 Pod status output includes names and phases only. Event summaries omit free-form
 messages, and the workflow does not print full JobSet descriptions or node selectors.
@@ -166,15 +149,3 @@ still avoid printing credentials or other confidential content. These changes do
 not redact existing artifacts, GCS logs, commits, branch names, PRs, or reports.
 Review previously published material separately; use secret **names**, not values
 or partner-identifying details, in shareable reports.
-
-The cluster provides **4× `2x2x2`** and **2× `2x2x4`** slices. There is no Kueue, so discovery
-**round-robins** the launch groups across a shape's slices (`nodepool_vars` in
-`external-topology.yaml`) and buckets them into **one job per slice**: up to 4 `2x2x2` + 2
-`2x2x4` jobs run in **parallel**, and groups beyond the slice count run **serially inside their
-slice's job** (no Pending race, no dropped work). Cross-run overlap on a slice is held by the
-slice-keyed `concurrency` group (depth-1 — fine until Kueue).
-
-Discover nodepools with
-`kubectl get nodes -L cloud.google.com/gke-nodepool,cloud.google.com/gke-tpu-topology`. To add
-a slice, append a secret name to that shape's `nodepool_vars`, set the secret, and add a line
-to `_external-tpu-test.yml`'s render-step env. A new shape also needs a `suites:` entry.
