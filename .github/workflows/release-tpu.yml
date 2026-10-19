@@ -25,7 +25,7 @@ on:
         required: true
         default: main
       version:
-        description: "TPU release version, e.g. 0.1.0 (image tag becomes v0.1.0-tpu)"
+        description: "Upstream sglang version this tree tracks, e.g. 0.5.22 (image tag becomes v0.5.22-tpu)"
         required: true
       target:
         description: "none = dry run (private only), staging = lmsysorg/sglang-staging, prod = lmsysorg/sglang"
@@ -78,9 +78,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${IN_VERSION#v}"
-          # X.Y.Z or X.Y.Z.postN; the TPU release has its own numbering, not upstream's.
+          # X.Y.Z or X.Y.Z.postN, the forms upstream release tags use.
           if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
-            echo "::error::version must look like 0.1.0 or 0.1.0.post1, got '$IN_VERSION'"
+            echo "::error::version must look like 0.5.22 or 0.5.22.post1, got '$IN_VERSION'"
             exit 1
           fi
           case "$IN_TARGET" in
@@ -339,7 +339,7 @@ jobs:
             image="(dry run, not published) ${DIGEST}"
           fi
           cat > notes.md <<EOF
-          SGLang on TPU v${VERSION}. Commit: ${SHA}
+          SGLang on TPU, tracking upstream sglang ${VERSION}. Commit: ${SHA}
 
           ## Docker
           \`\`\`
