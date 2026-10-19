@@ -110,13 +110,54 @@ def build_draft_block_inputs(
         dtype=bonus_tokens.dtype,
         device=bonus_tokens.device,
     )
-    extend_seq_lens = live_mask.to(torch.int32) * width
+    return _block_inputs(
+        torch.cat([bonus_tokens[:, None], mask_tokens], dim=1),
+        rows,
+        seq_lens,
+        live_mask,
+        offset=0,
+    )
+
+
+@compiled_op()
+def build_chain_block_inputs(
+    tokens: torch.Tensor,
+    rows: VerifyRows,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    offset: int,
+) -> DraftBlockInputs:
+    """Draft inputs for tokens [pbs * width] on verify rows offset .. offset + width - 1.
+
+    The chain worker sends offset 0 at full width (draft extend) and each draft
+    step at width 1, so it warms this op per offset.
+    """
+    # Callers pass flat tokens: a [:, None] view input costs an eager as_strided per bucket.
+    tokens = tokens.reshape(seq_lens.shape[0], -1)
+    inputs = _block_inputs(tokens, rows, seq_lens, live_mask, offset=offset)
+    # TARGET_VERIFY RPA adds the row width to seq_lens itself; the post-row length
+    # would let each row attend width stale draft KV slots past it.
+    return inputs._replace(seq_lens=inputs.extend_prefix_lens.to(seq_lens.dtype))
+
+
+def _block_inputs(
+    tokens: torch.Tensor,
+    rows: VerifyRows,
+    seq_lens: torch.Tensor,
+    live_mask: torch.Tensor,
+    *,
+    offset: int,
+) -> DraftBlockInputs:
+    width = tokens.shape[1]
+    live = live_mask.to(seq_lens.dtype)
+    extend_seq_lens = live.to(torch.int32) * width
+    end = offset + width
     return DraftBlockInputs(
-        input_ids=torch.cat([bonus_tokens[:, None], mask_tokens], dim=1).reshape(-1),
-        positions=rows.positions[:, :width].reshape(-1),
-        cache_locs=rows.cache_locs[:, :width].reshape(-1),
-        seq_lens=seq_lens + extend_seq_lens,
-        extend_prefix_lens=seq_lens.to(torch.int32),
+        input_ids=tokens.reshape(-1),
+        positions=rows.positions[:, offset:end].reshape(-1),
+        cache_locs=rows.cache_locs[:, offset:end].reshape(-1),
+        seq_lens=seq_lens + live * end,
+        extend_prefix_lens=(seq_lens + live * offset).to(torch.int32),
         extend_seq_lens=extend_seq_lens,
     )
 
@@ -367,6 +408,18 @@ def finalize_accept(
         window_tokens=accept_tokens.clamp_min(0).reshape(-1),
         window_seq_lens=seq_lens + (n + 1),
     )
+
+
+@compiled_op()
+def live_result_rows(
+    accept_tokens: torch.Tensor, accept_lens: torch.Tensor, bs: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The scheduler's [bs] accept rows as fresh buffers, flat tokens first.
+
+    Eager [:bs] clones would defer and fuse into the next FutureMap store, one
+    program per (bucket, bs, store) that warmup never builds.
+    """
+    return accept_tokens[:bs].reshape(-1), accept_lens[:bs]
 
 
 def _verify_mask(num_verify_drafts: torch.Tensor, n: int) -> torch.Tensor:
