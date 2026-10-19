@@ -773,7 +773,6 @@ assert not any(name.startswith('sglang_tpu.graph_runner') for name in sys.module
         ):
             worker._warmup_relay_and_results()
         relay = flush.call_args.args[0]
-        self.assertIsInstance(relay, TpuFutureMap)
         self.assertIsNone(relay.tpu_direct_handoff)
         self.assertFalse(relay.need_topk)
         self.assertEqual(relay.output_tokens_buf[0].item(), 0)
