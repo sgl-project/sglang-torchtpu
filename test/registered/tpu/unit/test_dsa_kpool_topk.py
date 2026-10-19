@@ -154,6 +154,44 @@ class TestKpoolIndexerStep(CustomTestCase):
                 t += new[r]
             self.assertTrue((out[n_tok:] == -1).all())
 
+    def test_row_chunked_prefill_matches_one_pass(self):
+        # A long prefill row-chunks the scores (here forced at a small context);
+        # chunking must not change the selection.
+        tokens, context, topk = 2 * kp._CHUNK_TOKENS, 8192, 2048
+        pages = context // PAGE
+        rng = np.random.default_rng(1)
+
+        def f(*shape, dtype=jnp.bfloat16):
+            return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
+
+        args = (
+            f(tokens, HEADS, D),
+            f(tokens, D),
+            f(tokens, D),
+            f(tokens, HEADS, dtype=jnp.float32),
+            f(KPOOL, D, dtype=jnp.float32),
+            jnp.zeros((pages + 1, PAGE, 2 * D), jnp.bfloat16),
+            jnp.zeros((pages + 1, PAGE // 4, 4, kp.pooled_record_bytes(D)), jnp.uint8),
+            jnp.asarray([context], jnp.int32),
+            jnp.asarray(1 + np.arange(pages), jnp.int32),
+            jnp.asarray([0, tokens], jnp.int32),
+            jnp.asarray([0, 0, 1], jnp.int32),
+        )
+        outs = []
+        default = kp._MAX_UNCHUNKED_SCORE_BYTES
+        for threshold in (1 << 62, 0):
+            kp._MAX_UNCHUNKED_SCORE_BYTES = threshold
+            try:
+                step = jax.jit(
+                    lambda *a: kp.kpool_indexer_step(
+                        *a, weight_scale=1.0, topk=topk, kpool=KPOOL
+                    )[0]
+                )
+                outs.append(np.asarray(step(*args)))
+            finally:
+                kp._MAX_UNCHUNKED_SCORE_BYTES = default
+        np.testing.assert_array_equal(outs[1], outs[0])
+
 
 if __name__ == "__main__":
     unittest.main()
