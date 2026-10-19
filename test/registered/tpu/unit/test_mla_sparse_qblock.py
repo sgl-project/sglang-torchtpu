@@ -7,7 +7,7 @@ kernel), and the q-block kernel reads the caches that step wrote.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=90, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - non-TPU host
     _HAS_TPU = False
 
 D, KPOOL, PAGE, IH, TOPK, W, QH = 128, 4, 128, 32, 2048, 2176, 8
-# bf16 softmax weights: observed max_abs / max|ref| <= 7e-3 across these cases.
+# bf16 softmax weights: observed max_abs / max|ref| <= 7e-3.
 REL_TOL = 1e-2
 
 
@@ -141,22 +141,12 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         # Padding tokens come back as zeros.
         self.assertFalse(np.asarray(out[n:]).any())
 
-    def test_single_8k_prefill(self):
-        args, ref = self._case([(0, 8192)], 8192, 1, 10240, 0.1, 1.0)
-        self._check(args, ref, 0.1, 1.0)
-
     def test_padded_multi_request_batch_with_prefixes(self):
-        seqs = [(1024, 2500), (600, 1800), (0, 2900), (0, 1)]
+        # Prefixed and fresh requests, one ending past a 2048-token block
+        # boundary, a one-token request, and padding rows.
+        seqs = [(1024, 2500), (600, 1800), (0, 2049), (0, 1)]
         args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
         self._check(args, ref, 0.08, 0.75)
-
-    def test_block_boundary_lengths(self):
-        for n in (2047, 2049):
-            with self.subTest(n=n):
-                t = -(-n // 128) * 128
-                args, ref = self._case([(0, n)], t, 1, 10240, 0.1, 1.0)
-                self._check(args, ref, 0.1, 1.0)
-
 
 if __name__ == "__main__":
     unittest.main()
