@@ -17,19 +17,6 @@ pip install pre-commit && pre-commit install
 
 On a TPU host, the TPU wheels (`torch_tpu`, `libtpu`) come from the pins in `python/pyproject_tpu.toml`. On a laptop, skip them: everything in the next section marked CPU runs without a TPU.
 
-If those pins require a separate package index, configure it outside the repository:
-
-```bash
-export UV_INDEX="torch-tpu-registry=https://YOUR_INDEX_HOST/simple/"
-# For an authenticated index, use uv's credential provider or set:
-export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="YOUR_INDEX_USERNAME"
-# Set UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD securely in your environment.
-```
-
-See [uv's package index documentation](https://docs.astral.sh/uv/concepts/indexes/)
-and [TPU CI deployment configuration](.github/tpu-ci/README.md#deployment-configuration).
-
-
 ## Run tests
 
 | What | Command | Needs |
@@ -67,7 +54,7 @@ Labels are required and come from `scripts/ci/tpu/support_matrix_vocab.json`; ad
 4. Title with an area prefix: `[TPU]` backend code, `[TPU/CI]` CI and tooling, `[Docs]`, `[Upstream]` for a change also open against sgl-project/sglang (link it).
 5. Fill in the PR template. The description becomes the squash-merge commit message, so keep it accurate.
 6. Lint and CPU tests run automatically on every PR, from forks included, with no secrets involved.
-7. **TPU tests run on request**, because TPU capacity is limited and fork PRs cannot reach the TPU runners on their own. A maintainer adds the `run-ci` label after reading the diff and comments `/tag-and-rerun-ci` on the PR; that runs the TPU suite once for the current commit. A new push needs a new comment. `/rerun-failed-ci` reruns what failed. Ask for the run in a PR comment once the CPU checks are green.
+7. **TPU tests run on request**, because TPU capacity is limited. They need cloud credentials, so CI never runs them on code from a fork. For a fork PR, a maintainer reads the diff and pushes the same commits to a branch in this repository, where `/tag-and-rerun-ci` runs the TPU suite once for the current commit. A new push needs a new comment. `/rerun-failed-ci` reruns what failed. Ask for the run in a PR comment once the CPU checks are green.
 8. CODEOWNERS assigns reviewers for TPU paths. One approval plus code-owner review, all threads resolved, then a maintainer squash-merges.
 
 A new kernel ships with a correctness test against a reference. A new feature ships with a registered e2e test. Disabling a test is a registration change, `disabled="<reason, with an issue link>"`, and the test stays visible in the matrix as Disabled.

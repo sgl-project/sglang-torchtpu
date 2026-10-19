@@ -52,13 +52,15 @@ concurrency:
 env:
   # The runner authenticates as the in-project CI SA; the external cluster grants that SA access
   # to their cluster (RBAC + roles/container.developer) and its DNS endpoint. See README "Access".
-  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
-  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
-  # Partner-internal identifiers come from repo secrets (masked in logs, out of source).
+  WIF_PROVIDER: ${{ vars.TPU_WIF_PROVIDER }}
+  CI_SA: ${{ vars.TPU_CI_SA }}
+  # External-cluster identifiers come from repo secrets (masked in logs, out of source).
   EXTERNAL_CLUSTER: ${{ secrets.EXTERNAL_CLUSTER }}
   EXTERNAL_PROJECT: ${{ secrets.EXTERNAL_PROJECT }}
-  EXTERNAL_LOCATION: us-central1        # public GCP region; not a partner identifier
+  EXTERNAL_LOCATION: us-central1        # public GCP region, not a cluster identifier
   EXTERNAL_NAMESPACE: default
+  TPU_WEIGHTS_BUCKET: ${{ vars.TPU_WEIGHTS_BUCKET }}
+  TPU_ARTIFACTS_BUCKET: ${{ vars.TPU_ARTIFACTS_BUCKET }}
 
 jobs:
   test:
@@ -67,10 +69,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 380   # > WAIT_SLACK + 2 files x 8100s (= 350 min) + job setup
     steps:
+      # This job holds cloud credentials, so never build or run a pull request
+      # ref here. Fork PR code must not reach the CI service account.
+      - name: Reject pull request refs
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          case "$REF" in
+            refs/pull/*|pull/*)
+              echo "::error::Refusing to run with cloud credentials on pull request ref $REF"
+              exit 1
+              ;;
+          esac
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          : "${WIF_PROVIDER:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
+          : "${CI_SA:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
+          : "${TPU_WEIGHTS_BUCKET:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
+          : "${TPU_ARTIFACTS_BUCKET:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
@@ -125,8 +147,8 @@ jobs:
           # outside the runner while it runs. The CI SA holds objectCreator (create,
           # no overwrite), so each sync is a NEW cumulative snapshot; the newest
           # object is the whole log so far. Best-effort (`|| true`). Read with:
-          #   gcloud storage cat "$(gcloud storage ls gs://sglang-torchtpu-ci-artifacts/ci-live-logs/<run_id>/<slice>/ | tail -1)"
-          LIVE_LOG_DIR="gs://sglang-torchtpu-ci-artifacts/ci-live-logs/${GITHUB_RUN_ID}/${slice}"
+          #   gcloud storage cat "$(gcloud storage ls gs://YOUR_ARTIFACTS_BUCKET/ci-live-logs/<run_id>/<slice>/ | tail -1)"
+          LIVE_LOG_DIR="gs://${TPU_ARTIFACTS_BUCKET:?Set repository variable TPU_ARTIFACTS_BUCKET}/ci-live-logs/${GITHUB_RUN_ID}/${slice}"
           ( while true; do
               sleep "$LIVE_LOG_SYNC_EVERY"
               gcloud storage cp "$RUNNER_TEMP/external-pod-logs.txt" \
@@ -143,6 +165,10 @@ jobs:
             NODEPOOL_DECODE="${!NODEPOOL_VAR_DECODE:-}"
             [ -n "$NODEPOOL_DECODE" ] || { echo "❌ repo secret ${NODEPOOL_VAR_DECODE} is not set"; exit 1; }
           fi
+
+          # GKE node names embed the external cluster and nodepool names, which this
+          # public log must not show. Secret masking misses their truncated forms.
+          redact_nodes() { sed -u -E 's/gke-[A-Za-z0-9-]+/gke-<node>/g'; }
 
           # Re-mint the CI SA token from a fresh GitHub OIDC token (same exchange the auth action
           # does) and swap it into the kubeconfig; a full slice of groups can outlast one hour.
@@ -165,6 +191,9 @@ jobs:
               -H "Authorization: Bearer ${sts}" -H 'Content-Type: application/json' \
               -d '{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}' \
               | python3 -c 'import json,sys; print(json.load(sys.stdin)["accessToken"])')" || return 1
+            # Minted here, not by an action, so the runner does not mask them.
+            echo "::add-mask::${sts}"
+            echo "::add-mask::${sa_token}"
             user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
             kubectl config set-credentials "$user" --token "$sa_token" >/dev/null
             echo "refreshed cluster credentials at $(date -u +%FT%TZ)"
@@ -216,7 +245,7 @@ jobs:
               # "already exists" is EXCLUDED: the JobSet controller races its own
               # reconcile and logs that as JobCreationFailed although the child
               # Job is live and its pods start normally.
-              fatal_events="$(kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep "${short}" | grep -v "already exists" || true)"
+              fatal_events="$(kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep "${short}" | grep -v "already exists" | redact_nodes || true)"
               if [ -n "$fatal_events" ]; then
                 echo "❌ ${label}: Job creation rejected -- no pod will ever start:"
                 echo "$fatal_events" | tail -n 3
@@ -226,12 +255,12 @@ jobs:
               fi
               if [ "$(date +%s)" -ge "$running_deadline" ]; then
                 echo "⚠️  ${label}: pods not all Running ${POD_RUNNING_DEADLINE}s after apply; continuing anyway"
-                kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
+                kubectl -n "$ns" get events --field-selector "involvedObject.name=${short}" --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 | redact_nodes || true
                 break
               fi
               sleep "$POLL"
             done
-            kubectl -n "$ns" get pods -l "$sel" -o wide || true
+            kubectl -n "$ns" get pods -l "$sel" || true
 
             refresh_cluster_token || echo "credential refresh failed; continuing"
             # Stream logs in the background, re-attaching if the stream dies while
@@ -246,9 +275,9 @@ jobs:
                 jbad="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
                 { [ "$jok" = "True" ] || [ "$jbad" = "True" ]; } && break
                 if [ "$first" = 1 ]; then tailn=-1; first=0; else tailn=20; fi
-                kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
+                kubectl -n "$ns" logs -f -l "$sel" -c test --prefix=true \
                   --max-log-requests="$LOG_STREAM_MAX" --pod-running-timeout=20m --tail="$tailn" \
-                  2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
+                  2>&1 | redact_nodes | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
                 sleep 20
               done ) &
             local stream_pid=$!
@@ -263,7 +292,7 @@ jobs:
               fi
               if [ $(( iter % PODS_PRINT_EVERY )) -eq 0 ]; then
                 echo "--- [$(date +%T)] ${label} pods ---"
-                kubectl -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName 2>/dev/null || true
+                kubectl -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase 2>/dev/null || true
               fi
               iter=$(( iter + 1 ))
               if ! kubectl -n "$ns" get "$name" >/dev/null 2>&1; then
@@ -278,10 +307,10 @@ jobs:
               if [ "$ok" = "True" ]; then echo "✅ ${label} PASSED"; rc=0; break; fi
               if [ "$bad" = "True" ]; then
                 echo "❌ ${label} FAILED"
-                kubectl -n "$ns" get pods -l "$sel" -o wide || true
-                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 --max-log-requests=64 2>/dev/null || true
-                kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
-                kubectl -n "$ns" describe "$name" | tail -n 120 || true
+                kubectl -n "$ns" get pods -l "$sel" || true
+                kubectl -n "$ns" logs -l "$sel" -c test --prefix --tail=200 --max-log-requests=64 2>/dev/null | redact_nodes || true
+                kubectl -n "$ns" get events --field-selector "involvedObject.name=${short}" --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 | redact_nodes || true
+                kubectl -n "$ns" describe "$name" | tail -n 120 | redact_nodes || true
                 rc=1; break
               fi
               sleep "$POLL"
@@ -318,7 +347,7 @@ jobs:
               --nodepool "$NODEPOOL" \
               --nodepool-decode "$NODEPOOL_DECODE" \
               --extra-args "$IN_EXTRA_ARGS" > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
-            grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|MODE|SINGLE_HOST|bash "benchmark' /tmp/external-job.yaml | head -20
+            grep -nE 'generateName:|completions:|MODE|SINGLE_HOST|bash "benchmark' /tmp/external-job.yaml | head -20
             # Waiting outlasts the rendered activeDeadlineSeconds (same formula + slack).
             wait_budget=$(( WAIT_SLACK + nf * tpf )); (( wait_budget < WAIT_FLOOR )) && wait_budget=$WAIT_FLOOR
             run_group /tmp/external-job.yaml "$gname" "$wait_budget" || overall=1

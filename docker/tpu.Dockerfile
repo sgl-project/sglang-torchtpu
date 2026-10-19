@@ -3,7 +3,7 @@
 # SGLang on Google Cloud TPU (tpu7x) via torch_tpu
 # Builds on top of sglang-tpu-base (which provides all pinned dependencies).
 #
-ARG BASE_IMAGE=us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base:latest
+ARG BASE_IMAGE=sglang-tpu-base:latest
 FROM ${BASE_IMAGE} AS final
 
 WORKDIR /sgl-workspace/sglang

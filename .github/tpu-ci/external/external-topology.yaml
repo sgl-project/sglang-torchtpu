@@ -1,6 +1,6 @@
 # External TPU test config for the `external-nightly-*` suites. See README.md.
 #
-# Partner-internal identifiers (cluster name, project id, nodepool names) are NOT stored in
+# External-cluster identifiers (cluster name, project id, nodepool names) are NOT stored in
 # source -- they come from repo secrets at workflow time:
 #   secrets.EXTERNAL_CLUSTER, secrets.EXTERNAL_PROJECT, secrets.EXTERNAL_NODEPOOL_<shape>
 # This file holds only non-sensitive structure. Each suite names the SECRET that holds its
@@ -14,8 +14,9 @@ cluster:
 
 weights:
   # The CI artifacts bucket doubles as the weight store under weights/<model>/. Stage with:
-  #   gcloud storage rsync -r ./<model> gs://sglang-torchtpu-ci-artifacts/weights/<model>
-  bucket: sglang-torchtpu-ci-artifacts
+  #   gcloud storage rsync -r ./<model> "gs://${TPU_WEIGHTS_BUCKET}/weights/<model>"
+  # Supplied through TPU_WEIGHTS_BUCKET, or set here for a local deployment.
+  bucket: ""
   prefix: weights
   mount_path: /gcs-weights
   # gcsfuse mount tuned for safetensors weight loading. cache-file-for-range-read turns the

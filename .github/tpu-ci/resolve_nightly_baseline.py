@@ -31,6 +31,14 @@ def _gh_api(path: str, token: str | None = None, allow_escape: bool = False) -> 
         raise
 
 
+def _image_digest_pattern() -> str:
+    """Digest-pinned image reference printed by the TPU build job."""
+    image = os.environ.get("TPU_AR_IMAGE")
+    if image:
+        return re.escape(image) + r"@sha256:[a-f0-9]+"
+    return r"[a-z0-9-]+-docker\.pkg\.dev/[\w.-]+/[\w.-]+/sglang-tpu@sha256:[a-f0-9]+"
+
+
 def resolve_baseline(
     repo: str,
     token: str | None = None,
@@ -67,7 +75,7 @@ def resolve_baseline(
             log_text = _gh_api(log_path, token, allow_escape=True).decode(
                 "utf-8", errors="ignore"
             )
-            pattern = r"us-central1-docker\.pkg\.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:[a-f0-9]+"
+            pattern = _image_digest_pattern()
             matches = re.findall(pattern, log_text)
             if not matches:
                 continue

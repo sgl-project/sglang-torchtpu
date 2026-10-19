@@ -86,7 +86,7 @@ ${POOL_AFFINITY}
                   csi:
                     driver: gcsfuse.csi.storage.gke.io
                     volumeAttributes:
-                      bucketName: sglang-torchtpu-ci-compile-cache
+                      bucketName: ${COMPILE_CACHE_BUCKET}
                       mountOptions: "implicit-dirs"
 ${WEIGHTS_VOLUME}
               containers:

@@ -82,7 +82,7 @@ Where to file what: TPU-specific bugs and feature requests here; engine bugs tha
   ```
 
 - Develop speculative decoding in the experimental spec worker, which has no CUDA dependency: see its [developer guide](sglang_tpu/experimental/speculative/README.md). The legacy spec worker only takes fixes.
-- Kernel and end-to-end tests need a TPU. A maintainer applies the `run-ci` label and comments `/tag-and-rerun-ci` to run them on your pull request.
+- Kernel and end-to-end tests need a TPU and cloud credentials, so they never run on fork code directly. A maintainer runs them from a branch in this repository (see CONTRIBUTING.md).
 - CONTRIBUTING.md covers the branch-and-PR flow, adding a test to the support matrix, and the policy for changes outside `sglang_tpu/`.
 
 ## Community

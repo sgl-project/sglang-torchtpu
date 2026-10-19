@@ -10,9 +10,7 @@
 #   /weights/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI
 # Qwen3-VL-8B lives on its own disk (PVC qwen3-spec-vl-rox), not here.
 #
-# Built 2026-07-29 by consolidating the former per-model disks (qwen30b-rox,
-# gptoss120b-rox, mimo25pro-rox) onto a 5Ti disk: RWO PVC model-weights-rwo +
-# a copy Job (three parallel disk-to-disk cp streams), then the ROX conversion:
+# Build: hydrate an RWO PVC model-weights-rwo, then convert it to ROX:
 #
 #   HANDLE=$(kubectl -n tpu-ci get pv \
 #     "$(kubectl -n tpu-ci get pvc model-weights-rwo -o jsonpath='{.spec.volumeName}')" \
@@ -24,7 +22,7 @@
 # this disk cannot be made writable again. To append model N+1:
 #   1. snapshot the ROX disk; create a new RWO Hyperdisk (>= same size) from it
 #   2. hydrate the new model into it (HF download Job: RWO PVC + snapshot_download
-#      with HF_HOME on the disk -- see git history of hydrate-qwen30b.yaml)
+#      with HF_HOME on the disk)
 #   3. convert the new disk to ROX with the commands above; repoint this PV's
 #      volumeHandle (or bump a -v2 name and update weights_pvc references)
 #   4. delete the old disk once green

@@ -1,13 +1,9 @@
 # Cloud Build: override torch_tpu wheel in the built SGLang TPU image and push to Artifact Registry.
 substitutions:
-  _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu"
+  _IMAGE: "sglang-tpu"
   _TAG: "latest"
-  _BASE_IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu:latest"
+  _BASE_IMAGE: "sglang-tpu:latest"
   _WHEEL: "torch-tpu"
-
-serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
-
-logsBucket: "gs://sglang-torchtpu_cloudbuild/logs"
 
 options:
   logging: LEGACY
@@ -16,6 +12,8 @@ options:
 steps:
   - id: override-wheel
     name: gcr.io/cloud-builders/docker
+    env:
+      - "WHEEL=${_WHEEL}"
     entrypoint: bash
     args:
       - -c
@@ -24,7 +22,7 @@ steps:
         echo "============================================================"
         echo "Cloud Build: Starting Single-Layer Mutation"
         echo "Base Container: ${_BASE_IMAGE}"
-        echo "Target Wheel:   ${_WHEEL}"
+        echo "Wheel candidate configured"
         echo "Target Tag:     ${_IMAGE}:${_TAG}"
         echo "============================================================"
 
@@ -38,22 +36,26 @@ steps:
         LOCAL_WHL="$$(find /workspace/wheel_override -name '*.whl' 2>/dev/null | head -n 1 || true)"
         if [[ -n "$$LOCAL_WHL" && -f "$$LOCAL_WHL" ]]; then
           echo "Using pre-staged candidate wheel file: $$LOCAL_WHL ($$(ls -lh "$$LOCAL_WHL"))"
-        elif [[ "${_WHEEL}" == gs://* ]]; then
-          echo "Fetching wheel from GCS: ${_WHEEL}"
+        elif [[ "$${WHEEL}" == gs://* ]]; then
+          echo "Fetching wheel from GCS: $${WHEEL}"
           tok_file="/workspace/tok.txt"
           printf '%s' "$$TOKEN" > "$$tok_file"
-          gcloud storage cp "${_WHEEL}" /workspace/wheel_override/ --access-token-file="$$tok_file" || true
+          gcloud storage cp "$${WHEEL}" /workspace/wheel_override/ --access-token-file="$$tok_file"
           rm -f "$$tok_file"
-        elif [[ "${_WHEEL}" == http://* || "${_WHEEL}" == https://* ]]; then
-          echo "Fetching wheel from URL: ${_WHEEL}"
-          curl -sSL -H "Authorization: Bearer $$TOKEN" -O --output-dir /workspace/wheel_override "${_WHEEL}"
+        elif [[ "$${WHEEL}" == https://* ]]; then
+          echo "Fetching wheel from HTTPS URL"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            -O --output-dir /workspace/wheel_override "$${WHEEL}"
+        elif [[ "$${WHEEL}" == http://* ]]; then
+          echo "Wheel downloads require HTTPS or gs://" >&2
+          exit 1
         fi
 
         DOCKER_BUILDKIT=1 docker build \
           -f docker/tpu-override-wheel.Dockerfile \
           --secret id=gcp_token,src=/workspace/gcp_token \
           --build-arg BASE_IMAGE="${_BASE_IMAGE}" \
-          --build-arg WHEEL="${_WHEEL}" \
+          --build-arg WHEEL="$${WHEEL}" \
           -t "${_IMAGE}:${_TAG}" .
         rm -rf /workspace/gcp_token /workspace/wheel_override/*.whl
 

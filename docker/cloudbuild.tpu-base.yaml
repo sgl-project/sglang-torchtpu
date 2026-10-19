@@ -1,14 +1,11 @@
 # Cloud Build: build the SGLang TPU base image and push to Artifact Registry.
 #
 substitutions:
-  _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base"
+  _IMAGE: "sglang-tpu-base"
   _TAG: "latest"
-
-serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
 
 # GCS copy of the build log, streamed into the GitHub Actions job log by
 # run_cloudbuild.py; see docker/cloudbuild.tpu.yaml for why.
-logsBucket: "gs://sglang-torchtpu_cloudbuild/logs"
 
 options:
   logging: LEGACY

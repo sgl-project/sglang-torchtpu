@@ -26,11 +26,12 @@ permissions:
   id-token: write
 
 env:
-  GCP_PROJECT: sglang-torchtpu
-  AR_BASE_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base
-  AR_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu
-  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
-  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+  GCP_PROJECT: ${{ vars.TPU_GCP_PROJECT }}
+  AR_BASE_IMAGE: ${{ vars.TPU_AR_BASE_IMAGE }}
+  AR_IMAGE: ${{ vars.TPU_AR_IMAGE }}
+  WIF_PROVIDER: ${{ vars.TPU_WIF_PROVIDER }}
+  CI_SA: ${{ vars.TPU_CI_SA }}
+  BUILD_BUCKET: ${{ vars.TPU_BUILD_BUCKET }}
 
 jobs:
   build:
@@ -38,10 +39,32 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
+      # This job holds cloud credentials, so never build or run a pull request
+      # ref here. Fork PR code must not reach the CI service account.
+      - name: Reject pull request refs
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          case "$REF" in
+            refs/pull/*|pull/*)
+              echo "::error::Refusing to run with cloud credentials on pull request ref $REF"
+              exit 1
+              ;;
+          esac
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          : "${WIF_PROVIDER:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
+          : "${CI_SA:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
+          : "${GCP_PROJECT:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
+          : "${AR_IMAGE:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
+          : "${AR_BASE_IMAGE:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
+          : "${BUILD_BUCKET:?Missing required TPU CI repository variable; see .github/tpu-ci/README.md}"
       - id: auth
         uses: google-github-actions/auth@v2
         with:
@@ -76,7 +99,7 @@ jobs:
           echo "Base image tag: ${base_tag}"
 
           # 2. Check if the base image already exists in Artifact Registry
-          bucket="${GCP_PROJECT}_cloudbuild"
+          bucket="${BUILD_BUCKET:?Set repository variable TPU_BUILD_BUCKET}"
           src="${RUNNER_TEMP}/source.tgz"
           tar --exclude=./.git -czf "$src" -C "$GITHUB_WORKSPACE" .
 
@@ -99,6 +122,8 @@ jobs:
             python3 .github/tpu-ci/run_cloudbuild.py \
               --project "$GCP_PROJECT" --config docker/cloudbuild.tpu-base.yaml \
               --bucket "$bucket" --object "$base_object" --tag "$base_tag" --token-file "$tokfile" \
+              --service-account "$CI_SA" --logs-bucket "gs://${bucket}/logs" \
+              --substitutions "_IMAGE=${AR_BASE_IMAGE}" \
               --max-attempts 2
           fi
 
@@ -118,7 +143,8 @@ jobs:
           digest="$(python3 .github/tpu-ci/run_cloudbuild.py \
             --project "$GCP_PROJECT" --config docker/cloudbuild.tpu.yaml \
             --bucket "$bucket" --object "$object" --tag "$tag" --token-file "$tokfile" \
-            --substitutions "_BASE_IMAGE=${AR_BASE_IMAGE}:${base_tag}" "_VERSION=${INPUT_VERSION}" \
+            --service-account "$CI_SA" --logs-bucket "gs://${bucket}/logs" \
+            --substitutions "_IMAGE=${AR_IMAGE}" "_BASE_IMAGE=${AR_BASE_IMAGE}:${base_tag}" "_VERSION=${INPUT_VERSION}" \
             --max-attempts 2)"
           echo "digest=${AR_IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
           echo "built ${AR_IMAGE}@${digest}"

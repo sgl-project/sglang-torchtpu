@@ -1,6 +1,6 @@
 name: Build and Push Docker Image (radixark)
 #
-# Fork-local Docker pipeline for this private collaboration repo. Pushes to
+# Fork-local Docker pipeline for this repo. Pushes to
 # radixark/sglang-torchtpu on Docker Hub, never to the upstream lmsysorg
 # namespace. Scoped to sgl-project/sglang-torchtpu only so it can never run
 # after this repo is merged back / synced from upstream.
@@ -36,6 +36,20 @@ jobs:
     steps:
       - name: Cleanup workspace (remove root-owned files from prior runs)
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      # This job holds release credentials, so never build or run a pull request
+      # ref here. Fork PR code must not reach the publishing account.
+      - name: Reject pull request refs
+        shell: bash
+        env:
+          REF: ${{ inputs.checkout_ref }}
+        run: |
+          case "$REF" in
+            refs/pull/*|pull/*)
+              echo "::error::Refusing to run with release credentials on pull request ref $REF"
+              exit 1
+              ;;
+          esac
 
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -85,3 +99,9 @@ jobs:
         env:
           TAG: ${{ inputs.tag }}
         run: docker push "radixark/sglang-torchtpu:$TAG"
+
+      # The runner's home persists across runs, so never leave the push token in
+      # ~/.docker/config.json for the next job on this host.
+      - name: Logout from Docker Hub
+        if: always()
+        run: docker logout || true

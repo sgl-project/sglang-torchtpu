@@ -15,8 +15,7 @@ set -e
 # Example:
 #   ./docker/build_sgl_torchtpu.sh \
 #     --remote-torch-tpu-image \
-#     us-docker.pkg.dev/ml-oss-artifacts-transient/\
-#     torch-tpu-docker-container/torch-tpu:nightly-latest
+#     REGION-docker.pkg.dev/YOUR_PROJECT/YOUR_REPOSITORY/torch-tpu:nightly-latest
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SGLANG_ROOT="$(cd "${SCRIPT_DIR}/../" && pwd)"

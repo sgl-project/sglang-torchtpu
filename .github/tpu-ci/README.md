@@ -299,28 +299,17 @@ in the repository settings, not in committed workflow files.
 | `TPU_ARTIFACTS_BUCKET` | External tests' live-log bucket name, without `gs://` |
 | `TPU_COMPILE_CACHE_BUCKET` | In-project tests' shared JAX compile-cache bucket name, without `gs://` |
 | `TPU_CI_POD_KSA` | Optional Kubernetes service account for in-project test pods |
-| `TPU_PACKAGE_INDEX_URL` | Optional package index URL without credentials; defaults to `https://pypi.org/simple/` |
-
-For an authenticated Artifact Registry package index, the build identity needs
-read access. Docker builds attach the existing `gcp_token` BuildKit secret to a
-configured Google Artifact Registry Python index (`https://*-python.pkg.dev/`)
-as an OAuth access token. Other index hosts receive no CI token. Do not put credentials in repository variables or build
-arguments. The package index must provide the versions pinned in
-`python/pyproject_tpu.toml`; the public default does not guarantee those versions
-are available. The base-image cache key includes the package index URL.
 
 External cluster and nodepool identities still use the existing `EXTERNAL_*`
 repository secrets described in [external/README.md](external/README.md).
 `render_external_jobset.py --list-groups` needs no bucket; rendering a JobSet
 requires `TPU_WEIGHTS_BUCKET` or a local `weights.bucket` setting.
 
-For local Docker builds, override `BASE_IMAGE` and `TPU_PACKAGE_INDEX_URL` with
-`--build-arg` as needed. Supply a package-registry access token through
-`--secret id=gcp_token,src=/path/to/token`, never through a build argument.
+For local Docker builds, override `BASE_IMAGE` with `--build-arg` as needed.
 The checked-in Cloud Build configs use local image names as placeholders;
 `run_cloudbuild.py` callers must pass `--service-account`, `--logs-bucket`, and
-`--substitutions "_IMAGE=YOUR_IMAGE_REPOSITORY"` (plus `_BASE_IMAGE` and
-`_PACKAGE_INDEX_URL` when applicable). The workflows supply these values from the
+`--substitutions "_IMAGE=YOUR_IMAGE_REPOSITORY"` (plus `_BASE_IMAGE` when
+applicable). The workflows supply these values from the
 variables above. Direct `gcloud builds submit` users must supply the equivalent
 service account, log bucket, and substitutions explicitly.
 

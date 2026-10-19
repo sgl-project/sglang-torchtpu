@@ -202,7 +202,7 @@ class TestPdSingleHostGptOss120bIntegration(PDSingleHostTestCase):
 
 
 def render_jobset_yaml(
-    image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
+    image: str = "sglang-tpu:latest",
     lane: str = "nightly",
     weights_pvc: str = "model-weights",
     run_name: str = RUN_NAME,

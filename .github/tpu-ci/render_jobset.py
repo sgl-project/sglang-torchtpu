@@ -435,6 +435,11 @@ def main():
         ),
     }
 
+    compile_cache_bucket = os.environ.get("TPU_COMPILE_CACHE_BUCKET")
+    if not compile_cache_bucket:
+        sys.exit("Set TPU_COMPILE_CACHE_BUCKET before rendering a JobSet")
+    vals["COMPILE_CACHE_BUCKET"] = compile_cache_bucket
+
     tpl = open(f"{a.dir}/jobset-tpu.yaml").read()
     out = re.sub(r"\$\{(\w+)\}", lambda m: vals.get(m.group(1), m.group(0)), tpl)
     sys.stdout.write(out)

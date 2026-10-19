@@ -8,7 +8,7 @@ by `gcloud storage cp` succeeding with the same token). This talks to the Cloud 
 REST API directly instead -- the source is pre-uploaded to GCS by the caller and we
 POST a Build that points at it, so that broken pre-flight never runs.
 
-When the build config sets ``logsBucket``, the build's GCS log object is streamed
+With ``--logs-bucket`` configured, the build's GCS log object is streamed
 to stderr while the build runs, so the full Cloud Build log lands in the GitHub
 Actions job log. External collaborators cannot open this project's Cloud Console /
 Cloud Logging, so the Actions job log is the only build log they can read.
@@ -164,6 +164,10 @@ def main() -> None:
     ap.add_argument("--token-file", required=True, help="file holding a bearer token")
     ap.add_argument("--timeout", default="3600s", help="build timeout")
     ap.add_argument(
+        "--service-account", required=True, help="Cloud Build service account email"
+    )
+    ap.add_argument("--logs-bucket", required=True, help="GCS URL for build logs")
+    ap.add_argument(
         "--max-attempts",
         type=int,
         default=1,
@@ -209,10 +213,10 @@ def main() -> None:
         "substitutions": subs,
         "timeout": args.timeout,
     }
-    if "serviceAccount" in cfg:  # run the build as the configured SA (tpu-ci)
-        build["serviceAccount"] = cfg["serviceAccount"]
-    if "logsBucket" in cfg:  # GCS log copy, streamed to stderr by _LogTail
-        build["logsBucket"] = cfg["logsBucket"]
+    build["serviceAccount"] = (
+        f"projects/{args.project}/serviceAccounts/{args.service_account}"
+    )
+    build["logsBucket"] = args.logs_bucket
 
     status = None
     b: dict = {}

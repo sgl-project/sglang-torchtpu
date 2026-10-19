@@ -2,7 +2,7 @@
 #
 # Override torch_tpu wheel in the built SGLang TPU image with the latest
 # (or specified) wheel from PyPI or a staged local wheel file.
-ARG BASE_IMAGE=us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu:latest
+ARG BASE_IMAGE=sglang-tpu:latest
 FROM ${BASE_IMAGE}
 
 ARG WHEEL=torch-tpu

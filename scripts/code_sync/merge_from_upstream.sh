@@ -17,7 +17,7 @@ set -euo pipefail
 UPSTREAM_URL="https://github.com/sgl-project/sglang.git"
 UPSTREAM_BRANCH="main"
 BASE_BRANCH="main"
-REPO="sgl-project-dev/sglang-torchtpu"
+REPO="${GITHUB_REPOSITORY:-sgl-project/sglang-torchtpu}"
 
 git config user.name "sglang-bot"
 git config user.email "sglang-bot@users.noreply.github.com"

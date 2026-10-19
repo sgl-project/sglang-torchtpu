@@ -19,6 +19,14 @@ def _gh_api(path: str, token: str | None = None) -> bytes:
     return subprocess.check_output(["gh", "api", path], env=env)
 
 
+def _image_digest_pattern() -> str:
+    """Digest-pinned image reference printed by the TPU build job."""
+    image = os.environ.get("TPU_AR_IMAGE")
+    if image:
+        return re.escape(image) + r"@sha256:[a-f0-9]+"
+    return r"[a-z0-9-]+-docker\.pkg\.dev/[\w.-]+/[\w.-]+/sglang-tpu@sha256:[a-f0-9]+"
+
+
 def resolve_image(
     repo: str, token: str | None = None, workflow_file: str = "nightly-test-tpu.yml"
 ) -> str:
@@ -49,7 +57,7 @@ def resolve_image(
             job_id = build_job.get("id")
             log_path = f"repos/{repo}/actions/jobs/{job_id}/logs"
             log_text = _gh_api(log_path, token).decode("utf-8", errors="ignore")
-            pattern = r"us-central1-docker\.pkg\.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu@sha256:[a-f0-9]+"
+            pattern = _image_digest_pattern()
             matches = re.findall(pattern, log_text)
             if matches:
                 return matches[-1]

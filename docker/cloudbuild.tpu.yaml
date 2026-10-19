@@ -1,19 +1,16 @@
 # Cloud Build: build the SGLang TPU test image from sglang-tpu-base and push to Artifact Registry.
 #
 substitutions:
-  _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu"
+  _IMAGE: "sglang-tpu"
   _TAG: "latest"
-  _BASE_IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base:latest"
+  _BASE_IMAGE: "sglang-tpu-base:latest"
   # Release version for the packages in the image; empty for CI builds.
   _VERSION: ""
-
-serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
 
 # GCS copy of the build log, streamed into the GitHub Actions job log by
 # run_cloudbuild.py. External collaborators cannot open this project's Cloud
 # Console / Cloud Logging, so the Actions log is the only surface they can read.
 # LEGACY keeps the Cloud Logging / console log view working for maintainers.
-logsBucket: "gs://sglang-torchtpu_cloudbuild/logs"
 
 options:
   logging: LEGACY

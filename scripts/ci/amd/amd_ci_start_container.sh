@@ -24,7 +24,7 @@ fi
 ROCM_VERSION="rocm10"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
+LOCAL_DOCKER_REGISTRY="${AMD_CI_LOCAL_REGISTRY:-}"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -224,7 +224,7 @@ if [[ -n "${CUSTOM_IMAGE}" ]]; then
   # Use explicitly provided custom image
   IMAGE="${CUSTOM_IMAGE}"
   echo "Using custom image: ${IMAGE}"
-  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
+  if [[ -n "${LOCAL_DOCKER_REGISTRY}" && "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
     docker pull "${IMAGE}"
   else
     retry_with_backoff 6 docker pull "${IMAGE}"

@@ -288,6 +288,9 @@ def render(cfg, a):
     sl = suites[g["suite"]]
     cl = cfg["cluster"]
     w = cfg["weights"]
+    weights_bucket = os.environ.get("TPU_WEIGHTS_BUCKET") or w.get("bucket")
+    if not weights_bucket:
+        sys.exit("Set TPU_WEIGHTS_BUCKET or weights.bucket before rendering a JobSet")
     hosts = int(sl["hosts"])
     mode = g["mode"]
     vals = {
@@ -300,7 +303,7 @@ def render(cfg, a):
         "ACTIVE_DEADLINE": str(a.active_deadline or _active_deadline(g)),
         "TEST_FILES": g["files"],
         "TIMEOUT_PER_FILE": str(g["timeout_per_file"]),
-        "WEIGHTS_BUCKET": w["bucket"],
+        "WEIGHTS_BUCKET": weights_bucket,
         "WEIGHTS_MOUNT_OPTIONS": w["mount_options"],
         "WEIGHTS_MOUNT_PATH": w["mount_path"],
         "WEIGHTS_DIR": f"{w['mount_path']}/{w['prefix']}",

@@ -300,3 +300,13 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Local credentials and linked worktrees must never enter an image context.
+gcp_token
+tok.txt
+gha-creds-*.json
+.env.*
+.aws/
+.ssh/
+.config/gcloud/
+tree/
