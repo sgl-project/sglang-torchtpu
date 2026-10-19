@@ -39,7 +39,6 @@ On a TPU7x host, start a container with access to the TPU chips:
 ```bash
 docker run -it --rm --privileged --net=host --shm-size=64g \
   -e SGLANG_PLATFORM=tpu_oot \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
   lmsysorg/sglang:v0.1.0-tpu
 ```
 
