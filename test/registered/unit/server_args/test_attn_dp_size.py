@@ -77,8 +77,6 @@ class TestAttnDpSize(CustomTestCase):
 
         model = SimpleNamespace(
             hf_config=SimpleNamespace(model_type="llama"),
-            head_dim=128,
-            v_head_dim=128,
             get_num_kv_heads=lambda *args: 1,
             get_max_num_attention_heads=lambda: 32,
             attention_chunk_size=None,

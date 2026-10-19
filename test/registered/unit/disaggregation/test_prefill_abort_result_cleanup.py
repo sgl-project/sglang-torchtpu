@@ -33,7 +33,6 @@ class _Req:
         self.rid = "aborted-prefill"
         self.release_mm_inputs_on_abort = Mock()
         self.session = None
-        self.lock = None
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
         self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
