@@ -25,7 +25,7 @@ on:
         required: true
         default: main
       version:
-        description: "Upstream sglang version this tree tracks, e.g. 0.5.22 (image tag becomes v0.5.22-tpu)"
+        description: "TPU release version, e.g. 0.1.0 (image tag becomes v0.1.0-tpu)"
         required: true
       target:
         description: "none = dry run (private only), staging = lmsysorg/sglang-staging, prod = lmsysorg/sglang"
@@ -78,9 +78,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${IN_VERSION#v}"
-          # X.Y.Z or X.Y.Z.postN, the forms upstream release tags use.
+          # X.Y.Z or X.Y.Z.postN; the TPU release has its own numbering, not upstream's.
           if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
-            echo "::error::version must look like 0.5.22 or 0.5.22.post1, got '$IN_VERSION'"
+            echo "::error::version must look like 0.1.0 or 0.1.0.post1, got '$IN_VERSION'"
             exit 1
           fi
           case "$IN_TARGET" in
@@ -202,6 +202,10 @@ jobs:
           mkdir -p dist
           # Same manifest swap as docker/tpu.Dockerfile: the TPU dependency set.
           cp python/pyproject_tpu.toml python/pyproject.toml
+          # Pin the plugin to the fork wheel it ships with; a bare `sglang` lets
+          # `pip install -U` swap in upstream sglang from PyPI.
+          sed -i 's/^dependencies = \["sglang"\]$/dependencies = ["sglang==${{ needs.resolve.outputs.version }}"]/' pyproject.toml
+          grep -qx 'dependencies = \["sglang==${{ needs.resolve.outputs.version }}"\]' pyproject.toml
           cp README.md LICENSE python/
           python -m build --wheel --outdir dist python
           python -m build --wheel --outdir dist .
@@ -217,9 +221,14 @@ jobs:
             f="dist/${name}-${VERSION}-py3-none-any.whl"
             [ -f "$f" ] || { echo "::error::missing $f"; ls dist; exit 1; }
           done
-          # Install without dependencies (torch-tpu is not on a public index yet)
-          # and check the metadata the runtime relies on. Imports are covered by
-          # the TPU smoke on the image built from the same commit.
+          # The install command the Release notes give must resolve from public
+          # indexes. --dry-run resolves without downloading the TPU stack.
+          python -m venv /tmp/r
+          /tmp/r/bin/pip install --quiet --upgrade pip
+          /tmp/r/bin/pip install --dry-run --quiet \
+            --extra-index-url https://download.pytorch.org/whl/cpu dist/*.whl
+          # Check the metadata the runtime relies on. Imports are covered by the
+          # TPU smoke on the image built from the same commit.
           python -m venv /tmp/v
           /tmp/v/bin/pip install --quiet --no-deps dist/*.whl
           /tmp/v/bin/python - <<'EOF'
@@ -233,6 +242,7 @@ jobs:
           assert "tpu_oot" in names, names
           deps = " ".join(requires("sglang") or [])
           assert "torch-tpu" in deps, "fork sglang wheel lost its torch-tpu pin"
+          assert requires("sglang-tpu") == [f"sglang=={want}"], requires("sglang-tpu")
           print("ok:", want, sorted(names))
           EOF
       - uses: actions/upload-artifact@v4
@@ -329,7 +339,7 @@ jobs:
             image="(dry run, not published) ${DIGEST}"
           fi
           cat > notes.md <<EOF
-          SGLang on TPU, tracking upstream sglang ${VERSION}. Commit: ${SHA}
+          SGLang on TPU v${VERSION}. Commit: ${SHA}
 
           ## Docker
           \`\`\`
@@ -340,7 +350,8 @@ jobs:
           ## Wheels
           Install both together; \`sglang\` here is this repository's build, not the PyPI one.
           \`\`\`
-          pip install ${base}/sglang-${VERSION}-py3-none-any.whl ${base}/sglang_tpu-${VERSION}-py3-none-any.whl
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \\
+            ${base}/sglang-${VERSION}-py3-none-any.whl ${base}/sglang_tpu-${VERSION}-py3-none-any.whl
           \`\`\`
           EOF
           flags=(--target "$SHA" --title "TPU v${VERSION}" --notes-file notes.md)
