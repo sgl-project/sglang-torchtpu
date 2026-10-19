@@ -10,6 +10,7 @@ not instantiated on its own and deliberately defines no ``__init__``.
 
 from __future__ import annotations
 
+import functools
 import secrets
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -26,6 +27,7 @@ from sglang_tpu.disaggregation.raiden.common import (
     kv_layout_mismatch_reason,
     logger,
 )
+from sglang_tpu.disaggregation.raiden.land import LAND_VERSION
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -33,14 +35,21 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardBlocks,
     ReshardChunk,
     ReshardChunkReady,
+    ReshardLandChunkReady,
+    ReshardLandReady,
     ReshardReady,
     ReshardReq,
     RoomFailed,
     write_aux_blob,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+
+# _register_reshard_chunk's result for a chunk parked until the landing arena
+# frees enough blocks: its index stays registering, and the retry finishes it.
+_LAND_HELD = object()
 
 
 def _present_ids(*req_ids: Optional[str]) -> Tuple[str, ...]:
@@ -855,6 +864,8 @@ class RaidenReceiverMixin:
             )
             self._decode.reshard_sources[room] = {}
             self._decode.reshard_swa_sources[room] = {}
+            if self._land is not None:
+                self._land.started[room] = time.time()
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
         payload = ReshardReq(
@@ -908,20 +919,126 @@ class RaidenReceiverMixin:
         except Exception as error:
             self._fail_reshard_room(room, error)
         finally:
-            with self._state_lock:
-                registering = self._decode.reshard_chunk_registering.get(room)
-                if registering is not None:
-                    registering.discard(index)
-                    if not registering:
-                        self._decode.reshard_chunk_registering.pop(room, None)
-                # A span is covered only once its chunk plan is published,
-                # so the closing transfer keeps every span the sources still
-                # owe -- including one that lost its race mid-range.
-                if accepted_end is not None and room in self._decode.reshard_meta:
-                    self._decode.reshard_covered.setdefault(room, []).append(
-                        accepted_end
-                    )
+            # A held chunk keeps its index registering, which holds the
+            # closing plan back until the retry finishes it.
+            if accepted_end is not _LAND_HELD:
+                self._finish_reshard_chunk(room, index, accepted_end)
+        if accepted_end is not _LAND_HELD:
+            self._maybe_register_reshard_final(room)
+
+    def _finish_reshard_chunk(
+        self, room: int, index: int, accepted_end: Optional[Tuple[int, int]]
+    ) -> None:
+        with self._state_lock:
+            registering = self._decode.reshard_chunk_registering.get(room)
+            if registering is not None:
+                registering.discard(index)
+                if not registering:
+                    self._decode.reshard_chunk_registering.pop(room, None)
+            # A span is covered only once its chunk plan is published,
+            # so the closing transfer keeps every span the sources still
+            # owe -- including one that lost its race mid-range.
+            if accepted_end is not None and room in self._decode.reshard_meta:
+                self._decode.reshard_covered.setdefault(room, []).append(accepted_end)
+
+    def _retry_reshard_chunk(
+        self,
+        room: int,
+        index: int,
+        total_pages: int,
+        sources_map: Dict[int, Tuple[int, List[int]]],
+    ) -> None:
+        """A held chunk's registration, re-run by the landing pre-pass on the
+        scheduler thread once the arena covers it. ``_state_lock`` is not held:
+        the final step retakes it."""
+        accepted_end = None
+        try:
+            accepted_end = self._register_reshard_chunk(
+                room, index, total_pages, sources_map
+            )
+        except Exception as error:
+            self._fail_reshard_room(room, error)
+        if accepted_end is _LAND_HELD:
+            return
+        self._finish_reshard_chunk(room, index, accepted_end)
         self._maybe_register_reshard_final(room)
+
+    def _expire_reshard_chunk(self, room: int, index: int) -> None:
+        self._fail_reshard_room(room, self._land_hold_error())
+        self._finish_reshard_chunk(room, index, None)
+        self._maybe_register_reshard_final(room)
+
+    # ----- reshard landing (#829) -------------------------------------------
+
+    def _land_geometry(self, src_attn_tp: int) -> Tuple[Any, bool]:
+        """The receive geometry of this decode rank, and whether any of its
+        sources lands in scratch. Without an arena, today's geometry."""
+        geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
+        if self._land is None:
+            return geom, False
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            LandEntry,
+            source_ranks_for,
+        )
+
+        landing = geom.with_land()
+        try:
+            lands = any(
+                isinstance(landing.entry_bytes(p, self.attn_tp_rank), LandEntry)
+                for p in source_ranks_for(self.attn_tp_rank, landing.ratio)
+            )
+        except ValueError:
+            # Not a landing cell; building the plan raises as it did before.
+            return geom, False
+        return (landing if lands else geom), lands
+
+    def _land_hold_timeout(self) -> float:
+        return float(tpu_envs.SGLANG_RAIDEN_LAND_HOLD_TIMEOUT_S.get())
+
+    def _land_hold_error(self) -> TimeoutError:
+        return TimeoutError(
+            "the reshard landing arena had no free blocks for this room "
+            f"within {self._land_hold_timeout():.0f}s "
+            "(SGLANG_RAIDEN_LAND_HOLD_TIMEOUT_S)"
+        )
+
+    def _land_take(
+        self,
+        room: int,
+        key: str,
+        n: int,
+        retry: Any,
+        expire: Any,
+    ) -> Optional[List[int]]:
+        """``n`` scratch blocks for plan ``key``, or None after parking the
+        take as a hold. The hold ends before the room's waiting timeout, so
+        the expiry, not the timeout, names the arena."""
+        from sglang_tpu.disaggregation.raiden.land import LandHold
+
+        with self._state_lock:
+            ids = self._land.take(key, room, n)
+            if ids is None:
+                now = time.time()
+                deadline = now + self._land_hold_timeout()
+                started = self._land.started.get(room)
+                waiting = getattr(self, "waiting_timeout", None)
+                if started is not None and waiting:
+                    deadline = min(deadline, started + float(waiting) - 10.0)
+                self._land.hold(
+                    LandHold(
+                        key=key,
+                        room=room,
+                        pages=n,
+                        deadline=deadline,
+                        retry=retry,
+                        expire=expire,
+                    )
+                )
+            return ids
+
+    def _land_free(self, key: str) -> None:
+        with self._state_lock:
+            self._land.free(key)
 
     def _register_reshard_chunk(
         self,
@@ -929,11 +1046,11 @@ class RaidenReceiverMixin:
         index: int,
         total_pages: int,
         sources_map: Dict[int, Tuple[int, List[int]]],
-    ) -> Optional[int]:
+    ) -> Any:
         """Registers the receive plan for one chunk and asks its sources to push.
 
-        Returns the absolute end of the accepted span, or None when nothing
-        was published.
+        Returns the absolute end of the accepted span, None when nothing
+        was published, or ``_LAND_HELD`` when the take waits for the arena.
 
         Every source of a decode rank holds the same pages of the request, so
         they announce the same span; the plan pairs each source's slice of it
@@ -972,25 +1089,59 @@ class RaidenReceiverMixin:
             (p_rank, sources_map[p_rank][1][lo:hi]) for p_rank in sorted(sources_map)
         ]
         dst = local_blocks[window.local_offset : window.local_offset + window.length]
-        # Independent decoders share a prefill. Use positive IDs that
-        # fit the reshard RPC's signed int64 field.
-        uuid = secrets.randbelow((1 << 63) - 1) + 1
         req_id = f"{room}#{index}"
-        req = build_receiver_request(
-            pb2,
-            uuid=uuid,
-            req_id=req_id,
-            peer=self._ensure_engine().transfer_address,
-            decode_rank=self.attn_tp_rank,
-            geom=self._make_geometry(src_attn_tp, self.attn_tp_size),
-            sources=sources,
-            dst_block_ids=dst,
-            live_tokens=[self.kv_args.page_size] * window.length,
-        )
-        payload = ReshardChunkReady(room=room, index=index, uuid=uuid).to_frames()
-        if not self._publish_reshard_plan(
-            room, req_id, uuid, req, payload, ready_endpoints
-        ):
+        geom, lands = self._land_geometry(src_attn_tp)
+        scratch = None
+        if lands:
+            # Taken after the span check, so a disagreement holds nothing.
+            scratch = self._land_take(
+                room,
+                req_id,
+                len(dst),
+                retry=functools.partial(
+                    self._retry_reshard_chunk, room, index, total_pages, sources_map
+                ),
+                expire=functools.partial(self._expire_reshard_chunk, room, index),
+            )
+            if scratch is None:
+                return _LAND_HELD
+        published = False
+        try:
+            # Independent decoders share a prefill. Use positive IDs that
+            # fit the reshard RPC's signed int64 field.
+            uuid = secrets.randbelow((1 << 63) - 1) + 1
+            req = build_receiver_request(
+                pb2,
+                uuid=uuid,
+                req_id=req_id,
+                peer=self._ensure_engine().transfer_address,
+                decode_rank=self.attn_tp_rank,
+                geom=geom,
+                sources=sources,
+                dst_block_ids=dst,
+                live_tokens=[self.kv_args.page_size] * window.length,
+                scratch_block_ids=scratch,
+            )
+            if scratch is None:
+                payload = ReshardChunkReady(
+                    room=room, index=index, uuid=uuid
+                ).to_frames()
+            else:
+                payload = ReshardLandChunkReady(
+                    room=room,
+                    index=index,
+                    uuid=uuid,
+                    scratch=scratch,
+                    land_version=LAND_VERSION,
+                ).to_frames()
+            published = self._publish_reshard_plan(
+                room, req_id, uuid, req, payload, ready_endpoints, land_final=dst
+            )
+        finally:
+            # Never pushed: the scratch is free at once.
+            if scratch is not None and not published:
+                self._land_free(req_id)
+        if not published:
             return None
         return (start, start + length)
 
@@ -1124,6 +1275,7 @@ class RaidenReceiverMixin:
         ready_payload: List[bytes],
         ready_endpoints: List[str],
         record_read: bool = True,
+        land_final: Optional[List[int]] = None,
     ) -> bool:
         """Registers a receive plan and, if the room is still live, publishes
         it and asks its sources to push, as one step.
@@ -1160,6 +1312,9 @@ class RaidenReceiverMixin:
                 if record_read:
                     self._decode.chunk_reads.setdefault(room, []).append(req_id)
                 self._reshard_plans.setdefault(room, {})[req_id] = uuid
+                if self._land is not None and req_id in self._land.plans:
+                    # From here the engine owns the scratch until it reports.
+                    self._land.publish(req_id, land_final)
                 # Sent under the lock: after a clear wins it, no push can be
                 # requested for the pages the room gave back.
                 for endpoint in ready_endpoints:
@@ -1288,6 +1443,21 @@ class RaidenReceiverMixin:
             sources_map = dict(self._decode.reshard_sources[room])
             swa_sources_map = dict(self._decode.reshard_swa_sources.get(room, {}))
 
+        if self._land is not None and self.chunked_transfer:
+            geom, lands = self._land_geometry(src_attn_tp)
+            if lands:
+                self._register_landing_closing(
+                    room,
+                    geom,
+                    local_blocks,
+                    local_swa_blocks,
+                    src_attn_tp,
+                    ready_endpoints,
+                    sources_map,
+                    swa_sources_map,
+                )
+                return
+
         # Arm the sliding-window receive before the READY goes out: the READY is
         # what tells every source to push, and its closing push carries the SWA
         # pages, so the second engine's plan has to be registered by then. A
@@ -1379,6 +1549,144 @@ class RaidenReceiverMixin:
             ready_endpoints,
             record_read=not self.chunked_transfer,
         )
+
+    def _register_landing_closing(
+        self,
+        room: int,
+        geom: Any,
+        local_blocks: List[int],
+        local_swa_blocks: List[int],
+        src_attn_tp: int,
+        ready_endpoints: List[str],
+        sources_map: Dict[int, List[int]],
+        swa_sources_map: Dict[int, List[int]],
+    ) -> None:
+        """The closing plan of a room whose sources land (#829): the
+        complement first, since its length is the take; then the take (or a
+        hold), the SWA arm, the registration and RESHARD_LAND_READY. The SWA
+        arm follows the take so a hold never leaves it armed."""
+        n = len(local_blocks)
+        total = len(next(iter(sources_map.values())))
+        base = total - n
+        with self._state_lock:
+            covered = list(self._decode.reshard_covered.get(room, []))
+        missing = [pg for pg in self._uncovered_pages(total, covered) if pg >= base]
+        with self._state_lock:
+            if room not in self._decode.reshard_meta:
+                return  # cleared while the complement was computed
+            # Owed from the moment the room can look complete, as below.
+            if missing:
+                self._decode.chunk_reads.setdefault(room, []).append(str(room))
+            self._decode.final_seen.add(room)
+        if not missing:
+            if not self._register_reshard_swa_receiver(
+                room, src_attn_tp, local_swa_blocks, swa_sources_map
+            ):
+                return
+            # Nothing lands: today's empty READY.
+            for endpoint in ready_endpoints:
+                self._send_multipart_locked(
+                    endpoint, ReshardReady(room=room).to_frames()
+                )
+            return
+        sources = [
+            (p_rank, [sources_map[p_rank][pg] for pg in missing])
+            for p_rank in sorted(sources_map)
+        ]
+        dst = [local_blocks[pg - base] for pg in missing]
+        self._land_closing(
+            room,
+            geom,
+            src_attn_tp,
+            local_swa_blocks,
+            swa_sources_map,
+            sources,
+            dst,
+            missing,
+            ready_endpoints,
+        )
+
+    def _land_closing(
+        self,
+        room: int,
+        geom: Any,
+        src_attn_tp: int,
+        local_swa_blocks: List[int],
+        swa_sources_map: Dict[int, List[int]],
+        sources: List[Tuple[int, List[int]]],
+        dst: List[int],
+        missing: List[int],
+        ready_endpoints: List[str],
+    ) -> None:
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
+
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            build_receiver_request,
+        )
+
+        args = (
+            room,
+            geom,
+            src_attn_tp,
+            local_swa_blocks,
+            swa_sources_map,
+            sources,
+            dst,
+            missing,
+            ready_endpoints,
+        )
+        req_id = str(room)
+        scratch = self._land_take(
+            room,
+            req_id,
+            len(dst),
+            retry=functools.partial(self._retry_land_closing, *args),
+            expire=functools.partial(
+                self._fail_reshard_room, room, self._land_hold_error()
+            ),
+        )
+        if scratch is None:
+            return
+        published = False
+        try:
+            if not self._register_reshard_swa_receiver(
+                room, src_attn_tp, local_swa_blocks, swa_sources_map
+            ):
+                return
+            req = build_receiver_request(
+                pb2,
+                uuid=room,
+                req_id=req_id,
+                peer=self._ensure_engine().transfer_address,
+                decode_rank=self.attn_tp_rank,
+                geom=geom,
+                sources=sources,
+                dst_block_ids=dst,
+                live_tokens=[self.kv_args.page_size] * len(dst),
+                scratch_block_ids=scratch,
+            )
+            payload = ReshardLandReady(
+                room=room, pages=missing, scratch=scratch, land_version=LAND_VERSION
+            ).to_frames()
+            published = self._publish_reshard_plan(
+                room,
+                req_id,
+                room,
+                req,
+                payload,
+                ready_endpoints,
+                record_read=False,
+                land_final=dst,
+            )
+        finally:
+            if not published:
+                self._land_free(req_id)
+
+    def _retry_land_closing(self, room: int, *args: Any) -> None:
+        try:
+            self._land_closing(room, *args)
+        except Exception as error:
+            self._fail_reshard_room(room, error)
 
 
 def _kv_layout_refusal(receiver: RaidenKVReceiver) -> Optional[str]:
@@ -1546,7 +1854,9 @@ class RaidenKVReceiver(CommonKVReceiver):
             # The heartbeat declared the prefill down; nobody is left to
             # notify.
             return self._conclude_failed(notify=False)
-        if self.kv_mgr.is_recv_done(self.bootstrap_room):
+        if self.kv_mgr.is_recv_done(self.bootstrap_room) and self.kv_mgr.land_merged(
+            self.bootstrap_room
+        ):
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
         if self._check_waiting_timeout() is not None:
@@ -1601,7 +1911,9 @@ class RaidenKVReceiver(CommonKVReceiver):
 
     def drained(self) -> bool:
         """No transfer of this room still runs on this rank."""
-        return not self.kv_mgr.room_has_active_io(self.bootstrap_room)
+        return not self.kv_mgr.room_has_active_io(
+            self.bootstrap_room
+        ) and self.kv_mgr.land_merged(self.bootstrap_room)
 
     def quiesce_group_failure(self) -> None:
         """Tombstone this rank before the group snapshots its drain bit."""
