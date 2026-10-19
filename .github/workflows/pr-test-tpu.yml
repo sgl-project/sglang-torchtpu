@@ -202,6 +202,11 @@ jobs:
   # If tests are skipped (non-TPU PR), this finishes green immediately.
   # If tests are run, it blocks until all TPU stages finish and fails if any fail.
   pr-test-tpu-finish:
+    # An unrelated label skips decide. Its trivial success reports under another
+    # name so it cannot replace a failed gate's result for the same head.
+    name: >-
+      ${{ needs.decide.result == 'skipped' && 'pr-test-tpu-finish (label event)'
+      || 'pr-test-tpu-finish' }}
     needs: [decide, build, unit, e2e]
     if: always()
     runs-on: ubuntu-latest

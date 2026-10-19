@@ -255,7 +255,9 @@ Adding `run-ci` requests one attempt for the current head; `/tag-and-rerun-ci`,
 `/rerun-failed-ci`, and the Actions UI's failed-job rerun also request an attempt.
 A later push requires a new request even if `run-ci` is still present. Remove and
 re-add it, or rerun the failed gate. Unrelated label events do not cancel a
-requested TPU run and remain recoverable by an explicit rerun.
+requested TPU run and remain recoverable by an explicit rerun. Their runs report
+the finish job as `pr-test-tpu-finish (label event)`, so a skipped gate never
+replaces a failed `pr-test-tpu-finish` for the same head.
 
 The build and both test suites use the immutable PR head SHA. Only same-repository
 heads can build; fork PRs do not receive the build identity. The unit and e2e
