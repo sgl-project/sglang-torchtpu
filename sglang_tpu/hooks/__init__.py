@@ -27,7 +27,6 @@ from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
-    reserve_glm_flash_megakernel_experts,
     route_glm_flash_megakernel,
 )
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
@@ -127,11 +126,6 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
         bind_glm5_next_kda_weights,
         HookType.AFTER,
-    ),
-    (
-        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
-        reserve_glm_flash_megakernel_experts,
-        HookType.BEFORE,
     ),
     (
         "sglang_tpu.graph_runner.tpu_graph_runner.TpuGraphRunner.__init__",

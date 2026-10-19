@@ -34,9 +34,7 @@ def enabled() -> bool:
 
 
 class GlmFlashMegakernel:
-    def __init__(
-        self, model, model_path: str, max_len: int, experts: dict, n_query: int = 1
-    ):
+    def __init__(self, model, model_path: str, max_len: int, n_query: int = 1):
         import jax
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
@@ -69,14 +67,13 @@ class GlmFlashMegakernel:
             run = R.make_decode(spec, layout, small_map, small_f32_map, mesh, self.cfg)
         self.run = run
 
-        weights = build_weights(model, spec, layout, self.cfg, tp, rank, experts)
+        weights = build_weights(model, spec, layout, self.cfg, tp, rank)
         # Packing leaves dtype and shape views, which every call would re-materialise.
-        self.weights = [
-            weights[n] if n in experts else _owned(weights[n]) for n in R.WEIGHT_ORDER
-        ]
+        self.weights = [_owned(weights[n]) for n in R.PACKED_ORDER]
+        self.experts = [w for n in R.EXPERT_LISTS for w in weights[n]]
         nbytes = sum(t.numel() * t.element_size() for t in self.weights)
         logger.info(
-            "GLM-Flash megakernel: %.1f GiB of kernel weights on rank %d",
+            "GLM-Flash megakernel: %.1f GiB of packed weights on rank %d (experts are sglang's)",
             nbytes / 2**30,
             rank,
         )
@@ -107,7 +104,7 @@ class GlmFlashMegakernel:
             [rep3, rep3, run.wspec["smalls"]],
             [rep3],
         )
-        self.smalls = self.weights[R.WEIGHT_ORDER.index("smalls")]
+        self.smalls = self.weights[R.PACKED_ORDER.index("smalls")]
         self.pool_records = export(
             "jax_glm_flash_mk_pool_records",
             lambda *a: (run.pool_records(*a),),
@@ -168,16 +165,20 @@ class GlmFlashMegakernel:
             ks = getattr(attn, "k_scale_float", None)
             self.k_scales.append(1.0 if ks is None else float(ks))
 
-        nw, nd = len(R.WEIGHT_ORDER), len(run.dsa_names)
+        nw, nd, nk = len(R.PACKED_ORDER), len(run.dsa_names), len(run.kda_names)
+        n_moe = len(self.experts) // len(R.EXPERT_LISTS)
 
         Q = n_query
 
         # In-launch bookkeeping: separate eager ops would each be a host-bound launch.
         # The last verify ended at pos - 1, so its last accepted checkpoint is pos - prev - 1.
         def step(tok, positions, prev, init, *rest):
-            ws = dict(zip(R.WEIGHT_ORDER, rest[:nw]))
+            ws = dict(zip(R.PACKED_ORDER, rest[:nw]))
             dc = dict(zip(run.dsa_names, rest[nw : nw + nd]))
-            kc = dict(zip(run.kda_names, rest[nw + nd :]))
+            kc = dict(zip(run.kda_names, rest[nw + nd : nw + nd + nk]))
+            experts = rest[nw + nd + nk :]
+            for i, n in enumerate(R.EXPERT_LISTS):
+                ws[n] = list(experts[i * n_moe : (i + 1) * n_moe])
             pos = positions.reshape(-1)[:1].astype(jax.numpy.int32)
             pos_in = jax.numpy.concatenate([pos, pos - prev - 1]) if Q > 1 else pos
             logits, _, hidden, out = run.shard(
@@ -187,9 +188,10 @@ class GlmFlashMegakernel:
 
         in_specs = (
             [P(), P(), P(), P(None, None)]
-            + [run.wspec[n] for n in R.WEIGHT_ORDER]
+            + [run.wspec[n] for n in R.PACKED_ORDER]
             + [run.dspec[n] for n in run.dsa_names]
             + [run.kspec[n] for n in run.kda_names]
+            + [spec for n in R.EXPERT_LISTS for spec in run.wspec[n]]
         )
         cspec = {**run.dspec, **run.kspec}
         self.call = export(
@@ -381,6 +383,7 @@ class GlmFlashMegakernel:
             *self.weights,
             *self.dsa_caches,
             *self.kda_caches,
+            *self.experts,
         )
         self.steps += 1
         self.last_steps = None

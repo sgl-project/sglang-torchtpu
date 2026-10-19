@@ -43,6 +43,10 @@ WEIGHT_ORDER = [
     "kda_scale",
 ]
 
+# sglang's per-layer expert tensors: lists in `weights`, passed after the caches.
+EXPERT_LISTS = ("expert_gate_up", "expert_down")
+PACKED_ORDER = [n for n in WEIGHT_ORDER if n not in EXPERT_LISTS]
+
 # K-major packed weights ([L, slots, rows, cols]) hold each rank's blocks on the slot axis.
 _REPLICATED = {
     "final_norm": 2,
@@ -104,11 +108,13 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
     kernel = D.build(spec, layout, cfg, slab)
     write_rows = D.row_write_call(spec, cfg)
     n_dsa = len(spec.dsa_layers)
-    n_w = len(WEIGHT_ORDER)
+    n_moe = sum(t == "sparse" for t in spec.mlp_layer_types)
+    n_w = len(PACKED_ORDER)
     in_specs = (
         [pl.BlockSpec(memory_space=pltpu.SMEM)] * 2
         + [pl.BlockSpec(memory_space=pltpu.VMEM)]
-        + [pl.BlockSpec(memory_space=pl.ANY)] * (n_w + len(KERNEL_CACHES))
+        + [pl.BlockSpec(memory_space=pl.ANY)]
+        * (n_w + len(KERNEL_CACHES) + len(EXPERT_LISTS) * n_moe)
     )
 
     def make_call(cache_structs):
@@ -146,16 +152,18 @@ def make_decode(spec, layout, small_map, small_f32_map, mesh, cfg: D.KernelConfi
 
     def body(tok, pos, init_streams, warrays, dsa_caches, kda_caches):
         caches = {**dsa_caches, **kda_caches}
-        ws = [warrays[n] for n in WEIGHT_ORDER]
+        ws = [warrays[n] for n in PACKED_ORDER]
         cs = [caches[n] for n in KERNEL_CACHES]
+        experts = [w for n in EXPERT_LISTS for w in warrays[n]]
         call = make_call([jax.ShapeDtypeStruct(c.shape, c.dtype) for c in cs])
-        out = call(tok, pos, init_streams, *ws, *cs)
+        out = call(tok, pos, init_streams, *ws, *cs, *experts)
         new_rows = out[3 : 3 + N_KDSA]
         dsa = write_rows(pos, *new_rows, *cs[:N_KDSA])
         new = dict(zip(KERNEL_CACHES, (*dsa, *out[3 + N_KDSA :])))
         return out[0], out[1], out[2], new
 
-    wspec = {n: weight_spec(n) for n in WEIGHT_ORDER}
+    wspec = {n: weight_spec(n) for n in PACKED_ORDER}
+    wspec.update({n: [weight_spec(n)] * n_moe for n in EXPERT_LISTS})
     cspec = {
         "kv": P(None, None, None),
         "idx_key": P(None, None, None),

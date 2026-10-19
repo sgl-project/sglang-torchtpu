@@ -3,10 +3,9 @@
 
 Why: SGLANG_TPU_GLM_FLASH_MEGAKERNEL runs single-request decode steps (the
      MTP verify) as one Pallas call per device.
-How: BEFORE Glm5NextForConditionalGeneration.load_weights reserves the stacked
-     expert arrays while HBM is contiguous; AFTER TpuGraphRunner.__init__ builds
-     the kernel and wraps the compiled model.forward, routing the steps it
-     handles to the kernel and flushing its state before any other step; BEFORE
+How: AFTER TpuGraphRunner.__init__ builds the kernel on the target model and
+     wraps the compiled model.forward, routing the steps it handles to the kernel
+     and flushing its state before any other step; BEFORE
      ReqToTokenPool.free_rows drops a freed request.
 Upstream PR or issue: none (TPU-only kernel).
 Remove when: the megakernel is a seam of the model, or dropped.
@@ -19,33 +18,14 @@ from typing import Any
 _KERNELS: list = []
 
 
-def reserve_glm_flash_megakernel_experts(model: Any, *args, **kwargs) -> None:
-    """BEFORE Glm5NextForConditionalGeneration.load_weights, while HBM is contiguous."""
-    from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
-    from sglang.srt.runtime_context import get_parallel
-    from sglang_tpu.glm_flash_megakernel import ops
-    from sglang_tpu.glm_flash_megakernel.build import expert_buffers
-
-    # The MTP draft loads through this method too; the kernel serves the target.
-    if (
-        not ops.enabled()
-        or hasattr(model, "_tpu_glm_flash_mk_experts")
-        or isinstance(model, Glm5NextForConditionalGenerationNextN)
-    ):
-        return None
-    model._tpu_glm_flash_mk_experts = expert_buffers(
-        model.config, get_parallel().tp_size, model.model.embed_tokens.weight.device
-    )
-    return None
-
-
 def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> None:
     """AFTER TpuGraphRunner.__init__: wrap the compiled (fullgraph) model.forward."""
+    from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
     from sglang_tpu.glm_flash_megakernel import ops
 
     model = runner.model
-    experts = getattr(model, "_tpu_glm_flash_mk_experts", None)
-    if not ops.enabled() or experts is None:
+    # The MTP draft has its own graph runner; the kernel serves the target.
+    if not ops.enabled() or type(model) is not Glm5NextForConditionalGeneration:
         return result
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -58,10 +38,8 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
         args.model_path,
         tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN.get()
         or runner.model_runner.model_config.context_len,
-        experts,
         n_query,
     )
-    del model._tpu_glm_flash_mk_experts
     model._tpu_glm_flash_mk = mk
     _KERNELS.append(mk)
     compiled = model.forward

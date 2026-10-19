@@ -109,19 +109,6 @@ def _gather_vocab(w: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_all_gather(w.contiguous(), dim=0)
 
 
-def expert_buffers(config, tp: int, device) -> dict[str, torch.Tensor]:
-    """Allocated before sglang's own weights, while HBM can still fit them contiguously."""
-    n_moe = sum(t == "sparse" for t in config.mlp_layer_types)
-    E, H = config.n_routed_experts, config.hidden_size
-    i_sh = config.moe_intermediate_size // tp
-    return {
-        "expert_gate_up": torch.empty(
-            (n_moe * E, H, 2 * i_sh), dtype=_F8, device=device
-        ),
-        "expert_down": torch.empty((n_moe * E, i_sh, H), dtype=_F8, device=device),
-    }
-
-
 def build_weights(
     model,
     spec,
@@ -129,8 +116,7 @@ def build_weights(
     cfg: D.KernelConfig,
     tp: int,
     rank: int,
-    experts: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
+) -> dict:
     H = spec.hidden_size
     layers = model.model.layers
     dev = model.model.norm.weight.device
@@ -271,13 +257,14 @@ def build_weights(
     moe = [
         L for L in range(spec.num_hidden_layers) if spec.mlp_layer_types[L] == "sparse"
     ]
-    router, egs, eds, sgu, sgs, sdn, sds = [], [], [], [], [], [], []
+    router, e_gate_up, e_down, egs, eds = [], [], [], [], []
+    sgu, sgs, sdn, sds = [], [], [], []
     for m_i, L in enumerate(moe):
         m = layers[L].mlp
         router.append(m.gate.weight.to(bf16))
         ex = m.experts
-        experts["expert_gate_up"][m_i * E : (m_i + 1) * E] = ex.w13_weight
-        experts["expert_down"][m_i * E : (m_i + 1) * E] = ex.w2_weight
+        e_gate_up.append(ex.w13_weight.data)
+        e_down.append(ex.w2_weight.data)
         egs.append(ex.w13_weight_scale.reshape(E, -1).float())
         eds.append(ex.w2_weight_scale.reshape(E, -1).float())
         sh = m.shared_experts
@@ -286,8 +273,9 @@ def build_weights(
         sdn.append(sh.down_proj.weight)
         sds.append(_scale(sh.down_proj))
     out["moe_router"] = torch.stack(router)
-    out["expert_gate_up"] = experts["expert_gate_up"]
-    out["expert_down"] = experts["expert_down"]
+    # sglang's own per-layer expert tensors, not copies.
+    out["expert_gate_up"] = e_gate_up
+    out["expert_down"] = e_down
     out["expert_gate_up_scale"] = torch.cat(egs)
     out["expert_down_scale"] = torch.cat(eds)
     out["shared_gate_up"] = torch.stack(sgu)
