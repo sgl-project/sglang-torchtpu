@@ -17,6 +17,19 @@ pip install pre-commit && pre-commit install
 
 On a TPU host, the TPU wheels (`torch_tpu`, `libtpu`) come from the pins in `python/pyproject_tpu.toml`. On a laptop, skip them: everything in the next section marked CPU runs without a TPU.
 
+If those pins require a separate package index, configure it outside the repository:
+
+```bash
+export UV_INDEX="torch-tpu-registry=https://YOUR_INDEX_HOST/simple/"
+# For an authenticated index, use uv's credential provider or set:
+export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="YOUR_INDEX_USERNAME"
+# Set UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD securely in your environment.
+```
+
+See [uv's package index documentation](https://docs.astral.sh/uv/concepts/indexes/)
+and [TPU CI deployment configuration](.github/tpu-ci/README.md#deployment-configuration).
+
+
 ## Run tests
 
 | What | Command | Needs |

@@ -252,18 +252,22 @@ def argmax_draft_tokens_tpu(
     """
     hs_3d = hidden_states.view(-1, block_size, hidden_states.shape[-1])
     bs = hs_3d.shape[0]
-    hs_1d = hs_3d[:, 1:, :].reshape(-1, hs_3d.shape[-1])
-    hs = (
-        hs_1d if hs_1d.dtype == lm_head.weight.dtype else hs_1d.to(lm_head.weight.dtype)
-    )
+    hs = hs_3d[:, 1:, :].reshape(-1, hs_3d.shape[-1])
+    from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+
+    # A quant method takes the activation as is, as in the logits processor; an
+    # unquantized head multiplies in its weight dtype.
+    if not should_apply_lm_head_quant_method(lm_head, lm_head.quant_method):
+        hs = hs.to(lm_head.weight.dtype)
 
     tp_size = (
         int(get_parallel().tp_group.world_size)
         if model_parallel_is_initialized()
         else 1
     )
+    # Through the head's own quant method, so a quantized head serves the draft too.
+    local_logits = lm_head.quant_method.apply(lm_head, hs)
     if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
-        local_logits = torch.matmul(hs, lm_head.weight.T)
         _, global_token_ids = distributed_tpu_top_k(
             local_logits,
             TpuVocabShard.from_lm_head(lm_head),
@@ -277,9 +281,7 @@ def argmax_draft_tokens_tpu(
     num_org = int(shard.num_org_elements) if shard is not None else 0
     org_vocab_start = int(shard.org_vocab_start_index) if shard is not None else 0
     if num_org > 0:
-        local_logits = torch.matmul(hs, lm_head.weight[:num_org].T)
-    else:
-        local_logits = torch.matmul(hs, lm_head.weight.T)
+        local_logits = local_logits[:, :num_org]
 
     tokens = torch.argmax(local_logits, dim=-1).to(torch.long)
     if org_vocab_start > 0:
@@ -337,7 +339,7 @@ def _select_verify_cache_locs(
       Slot ids, [bs, block_size].
     """
     device = candidates.device
-    # Binds only on the uninitialized bucket-padding rows; live rows stay inside
+    # Binds only on the zero-filled bucket-padding rows; live rows stay inside
     # [0, block_size] by the one-commit lag.
     offsets = (seq_lens.to(torch.int64) - committed_lens.to(torch.int64)).clamp_(
         0, block_size
@@ -347,6 +349,38 @@ def _select_verify_cache_locs(
     )
     rows = torch.arange(candidates.shape[0], device=device, dtype=torch.int64)
     return candidates[rows[:, None], columns]
+
+
+def build_dflash_draft_block(
+    *,
+    embed: Callable[..., torch.Tensor],
+    bonus_tokens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    candidates: torch.Tensor,
+    committed_lens: torch.Tensor,
+    block_pos_offsets: torch.Tensor,
+    mask_token_id: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Everything the draft step needs from the previous accept, as one program.
+
+    Returns block ids and positions [bs, block_size], the verify slots picked out of
+    the candidate window [bs, block_size], and the embedded block [bs * block_size,
+    hidden]; step by step these are about eight separately launched programs.
+    """
+    bs = bonus_tokens.shape[0]
+    masked = torch.full(
+        (bs, block_size - 1),
+        mask_token_id,
+        dtype=torch.long,
+        device=bonus_tokens.device,
+    )
+    block_ids = torch.cat([bonus_tokens.view(bs, 1), masked], dim=1)
+    positions = prefix_lens.view(bs, 1) + block_pos_offsets
+    slots = _select_verify_cache_locs(
+        candidates, prefix_lens, committed_lens, block_size
+    )
+    return block_ids, positions, slots, embed(block_ids=block_ids)
 
 
 @compiled_op(warmup=make_dflash_verify_cache_locs_args)
@@ -376,9 +410,9 @@ class DeviceVerifyBlockSelector:
     """Bucket-padded driver for select_dflash_verify_cache_locs_tpu.
 
     The op is specialized per physical batch bucket, so live rows are staged into
-    buffers sized to that bucket. Rows past the live batch stay uninitialized:
-    the selection clamps its offsets, so they only ever produce in-bounds garbage
-    that the caller trims off.
+    buffers sized to that bucket. Rows past the live batch stay zero: the selection
+    clamps its offsets, so they only produce in-bounds slots that the caller trims
+    off.
     """
 
     def __init__(
@@ -445,13 +479,16 @@ class DeviceVerifyBlockSelector:
         cap = 0 if self._candidates is None else int(self._candidates.shape[0])
         if cap >= pad_bs:
             return
-        self._candidates = torch.empty(
+        # zeros, not empty: rows past the live batch are never written, and torch_tpu
+        # fails a compiled read of a never-written buffer ("a required argument is in
+        # a failed state").
+        self._candidates = torch.zeros(
             (pad_bs, 2 * self.block_size), dtype=torch.int64, device=self._device
         )
-        self._committed_lens = torch.empty(
+        self._committed_lens = torch.zeros(
             (pad_bs,), dtype=torch.int64, device=self._device
         )
-        self._prefix_lens = torch.empty(
+        self._prefix_lens = torch.zeros(
             (pad_bs,), dtype=torch.int64, device=self._device
         )
 

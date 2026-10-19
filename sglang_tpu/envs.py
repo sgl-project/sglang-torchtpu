@@ -73,6 +73,17 @@ class TpuEnvs:
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
     # to TpuEagle3Worker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+    # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
+    # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
+    # keep the bf16 weights. Changes the draft's proposals, not verification.
+    SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
+
+    # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
+    # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
+    SGLANG_TPU_MUSE_MEGAKERNEL = EnvBool(False)
+    # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
+    # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
+    SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
 
     # PD disaggregation (raiden)
     # TCP connections per rank pair for raiden KV reads and resharding pushes,

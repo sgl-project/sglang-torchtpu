@@ -579,6 +579,15 @@ def _register_attention_backends() -> None:
         return DSV4TPUAttnBackend(runner)
 
 
+def _register_models() -> None:
+    """Add the model implementations that only this package provides to the registry."""
+    from sglang.srt.models.registry import ModelRegistry
+
+    # A module that fails to import is logged and skipped, so it can't take the
+    # other models down with it; an arch core already serves raises.
+    ModelRegistry.register("sglang_tpu.models")
+
+
 def _resolve_num_hidden_layers(server_args) -> int:
     """Layer count from the model's HF config (lru-cached load), 0 when
     unresolvable — an unloadable model fails later with its real error, and
@@ -1270,7 +1279,10 @@ class TpuSRTPlatform(SRTPlatform):
             from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
             register_fp8_linear_small_m_op()
+        # Set before registering: importing the model registry imports model_runner,
+        # which calls init_backend again on the OOT path.
         self._backend_initialized = True
+        _register_models()
 
     def on_warmup_complete(self) -> None:
         """Freeze torch.compile so serving-time recompiles raise."""

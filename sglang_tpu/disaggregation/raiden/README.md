@@ -1,7 +1,7 @@
 # Raiden TPU disaggregation backend
 
 `--disaggregation-transfer-backend raiden` moves KV pages between TPU prefill
-and decode hosts with the [tpu-sync](../../../../../../tpu-sync) DMA engine —
+and decode hosts with the [tpu-sync](https://github.com/google/tpu-sync) DMA engine —
 the TPU analogue of the CUDA mooncake/nixl backends.
 
 ## How it works
@@ -142,7 +142,7 @@ Drive both through the standard SGLang PD router, same as mooncake.
   `python -m pytest test/manual/kv_transfer/test_raiden_serde.py`
 - Resharding schedule byte-math (host-only, proto mocked):
   `python -m pytest test/manual/kv_transfer/test_reshard_schedule.py`
-- End-to-end correctness + throughput: TPU VM only (via the team cdk flow);
+- End-to-end correctness + throughput: TPU VM only;
   compare decode output token-for-token against a single-instance run.
 
 ## Pipeline-parallel prefill

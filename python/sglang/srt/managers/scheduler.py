@@ -3756,11 +3756,11 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
-    def stash_chunked_request(self, req: Req):
+    def stash_chunked_request(self, req: Req, *, mid_prefill: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
         else:
-            checkpoint_kv_cache(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache, mid_prefill=mid_prefill)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
@@ -3970,7 +3970,7 @@ class Scheduler(
             # len(prefix_indices), so there is nothing new to cache and
             # stashing would be a no-op.
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
-                self.stash_chunked_request(self.chunked_req)
+                self.stash_chunked_request(self.chunked_req, mid_prefill=True)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:

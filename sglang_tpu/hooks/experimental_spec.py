@@ -11,21 +11,25 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.experimental import (
     experimental_spec_enabled,
     get_host_batch_padder,
-    is_experimental_spec,
+    is_experimental_chain,
     uses_host_batch,
 )
 
 
 def initialize_host_batch(result, *args, **kwargs):
-    if is_experimental_spec(result.spec_algorithm):
+    # Every batch of a process a TpuSpecWorker serves is host padded, whatever the algorithm.
+    padder = get_host_batch_padder()
+    if padder is not None:
         if not result.enable_overlap:
             raise ValueError(
                 "The experimental TPU spec worker requires overlap scheduling"
             )
-        result.host_pad_bs = get_host_batch_padder()
+        result.host_pad_bs = padder
     return result
 
 
@@ -222,6 +226,36 @@ def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
     return sample(model, hidden_states, input_ids)
 
 
+def supports_kv_free_fence(original, spec_algorithm, *, copies_draft_tail):
+    if is_experimental_chain(spec_algorithm):
+        # commit writes draft KV after the accept tensors the result copies.
+        return False
+    return original(spec_algorithm, copies_draft_tail=copies_draft_tail)
+
+
+def need_topk(original, spec_algorithm):
+    # HostPaddedDraftInput carries an empty topk placeholder; an EAGLE topk relay
+    # would route it through the EAGLE device-accept resolve.
+    if is_experimental_chain(spec_algorithm):
+        return False
+    return original(spec_algorithm)
+
+
+def supports_tpu_direct_compile(original, spec_algorithm):
+    # The chain worker's fused draft and draft rows are direct-compiled.
+    if is_experimental_chain(spec_algorithm):
+        return True
+    return original(spec_algorithm)
+
+
+def spec_need_hidden_states(original):
+    # The chain carry lives in a req-pool-indexed device table, never in FutureMap.
+    algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    if is_experimental_chain(algorithm):
+        return False
+    return original()
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -235,6 +269,26 @@ def hook_specs():
         (
             "sglang.srt.models.dflash.DFlash2DraftModel.sample_draft_tokens_tpu",
             sample_dflash2_draft_tokens,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            spec_need_hidden_states,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.need_topk",
+            need_topk,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.supports_kv_free_fence",
+            supports_kv_free_fence,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.supports_tpu_direct_compile",
+            supports_tpu_direct_compile,
             HookType.AROUND,
         ),
         (schedule + "init_new", initialize_host_batch, HookType.AFTER),

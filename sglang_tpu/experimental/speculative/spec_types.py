@@ -142,14 +142,15 @@ class AcceptResult(NamedTuple):
 
 
 class DraftBlockInputs(NamedTuple):
-    """Device fields of a block-parallel draft forward over [r, m, ..., m], [pbs] rows.
+    """Device fields of a draft forward over width verify rows, [pbs] rows.
 
     Attributes:
-      input_ids: [pbs * width] root token then mask tokens.
+      input_ids: [pbs * width] tokens of the block.
       positions: [pbs * width] int64.
       cache_locs: [pbs * width] int64 KV slots.
-      seq_lens: [pbs] post-block lengths, 0 on padded rows.
-      extend_prefix_lens: [pbs] int32 pre-block lengths.
+      seq_lens: [pbs] length handed to the forward, 0 on padded rows: post-block
+        for the block drafter, pre-row for the chain drafter (RPA adds the width).
+      extend_prefix_lens: [pbs] int32 pre-block lengths, 0 on padded rows.
       extend_seq_lens: [pbs] int32, width on live rows and 0 on padded rows.
     """
 

@@ -330,6 +330,9 @@ def inner_kernel(
 
         def _get_scale_slice(b_id, start_n, end_n):
             rhs_scale = tiled_rhs_ref.get_scale()
+            if rhs_scale.ndim == 2:
+                # Compact [num_quant_blocks, n] tile (fused-RS 3D scale layout).
+                return rhs_scale[b_id : b_id + 1, start_n:end_n]
             return rhs_scale[..., b_id, :, start_n:end_n]
 
         def _online_quantize(block, axis, quant_dtype):

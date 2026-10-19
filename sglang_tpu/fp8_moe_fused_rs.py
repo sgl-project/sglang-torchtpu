@@ -84,8 +84,24 @@ def fp8_fused_rs_unsupported_reason(
     standard_dispatcher: bool,
     enable_dp_attention: bool,
     enable_fused_moe_sum_all_reduce: bool,
+    expert_tp: bool = False,
+    gate_up_width: int | None = None,
 ) -> str | None:
-    """Return the first reason the fused-RS backend cannot be selected."""
+    """Return the first reason the fused-RS backend cannot be selected.
+
+    ``expert_tp`` (EP=1, every expert's intermediate dim sharded over TP) runs
+    with the full TP width as the kernel's reduction axis; ``gate_up_width`` is
+    then the per-rank width of the fused gate/up projection.
+    """
+    if expert_tp:
+        # The kernel pads the gate/up width only at its tail, which would split
+        # gate from up at the wrong column.
+        if gate_up_width is None or gate_up_width % 256:
+            return (
+                "expert TP needs a per-rank gate/up width that is a multiple of "
+                f"256, got {gate_up_width}"
+            )
+        ep_size = tp_size
     if ep_size <= 1:
         return f"expert parallel size must be greater than 1, got {ep_size}"
     if num_experts > 256:
@@ -134,6 +150,7 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
 def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> bool:
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang_tpu.moe.expert_tp import is_fused_moe_rs_expert_tp
 
     w13_weight = getattr(layer, "w13_weight", None)
     if w13_weight is not None and w13_weight.dtype == torch.uint8:
@@ -146,6 +163,9 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     parallel = get_parallel()
     ep_size = parallel.moe_ep_size
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    expert_tp = is_fused_moe_rs_expert_tp(
+        ep_size, parallel.moe_tp_size, parallel.tp_group.world_size
+    )
     unsupported_reason = fp8_fused_rs_unsupported_reason(
         num_experts=layer.num_experts,
         ep_size=ep_size,
@@ -165,6 +185,8 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
         enable_fused_moe_sum_all_reduce=(
             get_exec().moe.enable_fused_moe_sum_all_reduce
         ),
+        expert_tp=expert_tp,
+        gate_up_width=2 * layer.intermediate_size_per_partition,
     )
     if unsupported_reason is not None:
         layer.__dict__["_tpu_fused_rs_unsupported_reason"] = unsupported_reason
@@ -176,7 +198,38 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     from sglang_tpu.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
 
     prepare_fused_moe_rs(layer)
+    if expert_tp:
+        _replicate_channelwise_fused_rs_scales(layer)
     return True
+
+
+def _replicate_channelwise_fused_rs_scales(layer: torch.nn.Module) -> None:
+    """Store channelwise fused-RS FP8 scales as (E, 2, N) instead of (E, 1, 1, N).
+
+    torch-tpu stores a size-1 K-block dim major-most ({2,0,1:T(8,128)}), but the
+    kernel operand needs it tiled ({2,1,0:T(2,128)}), so XLA relayouts both scale
+    tensors before every call.
+    Replicating the channel scale into two K blocks gives a real second-minor dim
+    whose default layout already matches. The kernel then scales two K/2 partial
+    matmuls; K/2 stays >= the 256-deep MXU, so the scale is still applied after
+    the matmul.
+    """
+    from sglang.srt.layers.utils import copy_or_rebind_param
+    from sglang_tpu.fp8_moe import _own_storage
+
+    if getattr(layer, "weight_block_size", None) is not None:
+        return
+    names = ("w13", "w2")
+    # The kernel needs both scales in one layout: replicate both or neither.
+    for name in names:
+        scale = getattr(layer, f"{name}_weight_scale").data
+        k = getattr(layer, f"{name}_weight").shape[1]
+        if scale.dim() != 4 or scale.shape[1:3] != (1, 1) or k % 2 or k // 2 < 256:
+            return
+    for name in names:
+        scale = getattr(layer, f"{name}_weight_scale").data
+        replicated = scale.squeeze(2).expand(-1, 2, -1).contiguous()
+        copy_or_rebind_param(layer, f"{name}_weight_scale", _own_storage(replicated))
 
 
 def apply_fp8_fused_rs(
@@ -215,6 +268,7 @@ def _apply_fp8_fused_rs(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk = int(topk_ids.shape[-1])
     block_quantized = getattr(layer, "weight_block_size", None) is not None
+    expert_tp = layer.__dict__.get("_tpu_fused_rs_expert_tp", False)
     from sglang_tpu.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
 
     topk_weights = topk_weights.to(x.dtype)
@@ -248,8 +302,11 @@ def _apply_fp8_fused_rs(
         # sequence-parallel local-shard paths. A direct FP8 write would add row
         # quantization and scale DMAs before a BF16 consumer.
         fp8_direct_write=False,
-        world_size=layer.moe_ep_size,
+        # Expert TP runs with moe_ep_size == 1 and shards over the MoE TP ranks.
+        world_size=layer.moe_tp_size if expert_tp else layer.moe_ep_size,
         keep_token_shard=keep_output_shard,
+        expert_tp=expert_tp,
+        oneshot_rank=getattr(layer, "_tpu_oneshot_rank", None),
     )
     return StandardCombineInput(
         hidden_states=result[: prepared_input.output_token_count]

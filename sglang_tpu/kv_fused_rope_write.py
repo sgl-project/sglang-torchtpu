@@ -34,6 +34,11 @@ from jax.experimental.pallas import tpu as pltpu
 _OP_NAME = "sglang_tpu::kv_fused_rope_write"
 
 
+def _op_name(num_layers: int, max_span_len: int) -> str:
+    """``namespace::name`` of the op built for one layer count and span bound."""
+    return f"{_OP_NAME}_{num_layers}_{max_span_len}"
+
+
 def _kernel(dst_ref, src_ref, len_ref, k_hbm, v_hbm, cos_hbm, sin_hbm, *rest):
     """Rotate one span's K and write its K/V pair into every layer.
 
@@ -230,7 +235,7 @@ def get_fused_rope_write_op(num_layers: int, max_span_len: int) -> Callable[...,
     )
 
     @torch.library.custom_op(
-        f"{_OP_NAME}_{num_layers}_{max_span_len}",
+        _op_name(num_layers, max_span_len),
         mutates_args=("kv",),
         device_types=["tpu"],
     )
@@ -263,6 +268,18 @@ def get_fused_rope_write_op(num_layers: int, max_span_len: int) -> Callable[...,
     return op
 
 
+@torch._dynamo.assume_constant_result
+def _fused_rope_write_op_name(num_layers: int, max_span_len: int) -> str:
+    """Build the op eagerly, even under dynamo, and return its torch.ops name.
+
+    Dynamo ignores lru_cache and cannot trace the builder (custom_op's
+    infer_schema, the jax kernel's id()), so calling it in a compiled region
+    breaks the graph.
+    """
+    get_fused_rope_write_op(num_layers, max_span_len)
+    return _op_name(num_layers, max_span_len)
+
+
 def fused_rope_write_kv(
     *,
     dst_starts: torch.Tensor,
@@ -290,7 +307,10 @@ def fused_rope_write_kv(
         kv_heads_packed, kv_packing, padded_head_dim]; mutated in place.
       max_span_len: Upper bound on span_lens.
     """
-    get_fused_rope_write_op(len(kv_bufs), max_span_len)(
+    # Resolved through torch.ops by name so dynamo keeps the caller in one graph.
+    namespace, name = _fused_rope_write_op_name(len(kv_bufs), max_span_len).split("::")
+    op = getattr(getattr(torch.ops, namespace), name)
+    op(
         dst_starts.to(torch.int32),
         src_starts.to(torch.int32),
         span_lens.to(torch.int32),

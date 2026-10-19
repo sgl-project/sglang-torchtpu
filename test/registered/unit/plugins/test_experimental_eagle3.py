@@ -25,6 +25,7 @@ from sglang_tpu.experimental.compilation.eagle3_compile_policy import (
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
 from sglang_tpu.experimental.speculative import spec_ops
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+from sglang_tpu.experimental.speculative.chain_spec_worker import TpuChainSpecWorker
 from sglang_tpu.experimental.speculative.eagle.eagle_worker import (
     EagleSeed,
     TpuEagle3Worker,
@@ -108,8 +109,10 @@ class TestExperimentalEagle3(CustomTestCase):
                 ),
                 TpuEagle3Worker,
             )
-            self.assertIsNone(
-                select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE, None)
+            # EAGLE is MTP (core resolves NEXTN to it), served by the chain worker.
+            self.assertIs(
+                select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE, None),
+                TpuChainSpecWorker,
             )
         with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
             self.assertIsNone(
