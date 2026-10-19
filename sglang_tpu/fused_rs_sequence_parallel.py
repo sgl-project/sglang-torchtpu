@@ -175,7 +175,9 @@ def prepare_fused_moe_sequence_parallel_input(
     parallel = get_parallel()
     group = parallel.attn_tp_group
     tp_group = getattr(parallel, "tp_group", None)
-    fused_rs_world_size = layer.moe_ep_size
+    # Expert TP shards every expert over the MoE TP ranks instead of the EP ranks.
+    expert_tp = layer.__dict__.get("_tpu_fused_rs_expert_tp", False)
+    fused_rs_world_size = layer.moe_tp_size if expert_tp else layer.moe_ep_size
     if group.world_size != fused_rs_world_size:
         raise RuntimeError(
             "TPU fused-RS sequence parallelism requires matching attention-TP "
