@@ -446,7 +446,7 @@ class DefaultModelLoader(BaseModelLoader):
         def init_new(cls, model_config: ModelConfig, model):
             local_expert_range = None
             if _is_tpu:
-                from sglang_tpu.ep_local_expert_reader import (
+                from sglang_tpu.model_loader.ep_local_expert_reader import (
                     tpu_local_routed_expert_range,
                 )
 

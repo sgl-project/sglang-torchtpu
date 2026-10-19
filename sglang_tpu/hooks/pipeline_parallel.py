@@ -3,7 +3,7 @@
 
 check_pipeline_parallel_compat
   Why: Core's PP check admits only EAGLE, but the TPU target relays the Eagle3
-       aux captures across stages (see sglang_tpu.pp_wave).
+       aux captures across stages (see sglang_tpu.distributed.pp_wave).
   How: AROUND check_pipeline_parallel_compat; EAGLE3 runs the core check as
        EAGLE, every other configuration runs it unchanged.
   Upstream PR or issue: not filed.

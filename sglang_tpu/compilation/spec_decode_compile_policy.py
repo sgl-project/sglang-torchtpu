@@ -31,7 +31,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (
     _warmup_progress,
 )
 from sglang_tpu.compilation.pending_call import PendingCall
-from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.sampling.sampling_batch_info import is_host_padded
 
 logger = get_logger(__name__)
 

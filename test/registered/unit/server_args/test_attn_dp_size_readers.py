@@ -104,7 +104,7 @@ class TestTpuPlatformRefusesAttentionDp(_ResolveCase):
     record and cannot see what resolution actually leaves behind."""
 
     def apply_tpu_defaults(self, server_args):
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         with patch("sglang_tpu.patches._prepare_tpu_env"):
             TpuSRTPlatform().apply_server_args_defaults(server_args)

@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.fused_rs_sequence_parallel import (
+from sglang_tpu.layers.moe.fused_rs_sequence_parallel import (
     DISABLED_FUSED_MOE_SEQUENCE_PARALLEL_PLAN,
     FusedMoeSequenceParallelPlan,
     get_fused_moe_sequence_parallel_plan,
@@ -89,7 +89,7 @@ class TestFusedRsSequenceParallel(CustomTestCase):
         with (
             use_fused_moe_sequence_parallel_plan(plan),
             patch(
-                "sglang_tpu.fused_rs_sequence_parallel.get_parallel",
+                "sglang_tpu.layers.moe.fused_rs_sequence_parallel.get_parallel",
                 return_value=SimpleNamespace(attn_tp_group=group, tp_group=group),
             ),
         ):

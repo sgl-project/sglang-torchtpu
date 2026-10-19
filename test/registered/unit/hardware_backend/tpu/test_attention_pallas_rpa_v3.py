@@ -12,17 +12,17 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_pallas_rpa_base import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_base import (
     _zero_inactive_rpa_rows,
 )
-from sglang_tpu.attention_pallas_rpa_v3 import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-from sglang_tpu.attention_pallas_rpa_base import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_base import (
     _SCOPED_SMEM_BYTES,
     _get_pages_per_seq,
     _page_table_smem_bytes,
@@ -107,7 +107,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         )
         with (
             patch(
-                "sglang_tpu.attention_pallas_rpa_base._build_pallas_kernel_op",
+                "sglang_tpu.layers.attention.attention_pallas_rpa_base._build_pallas_kernel_op",
                 return_value=None,
             ),
             envs.SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE.override(cache_metadata),

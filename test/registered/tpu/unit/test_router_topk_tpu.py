@@ -36,7 +36,7 @@ def _reference(logits, bias, k, renormalize, scale):
 @unittest.skipUnless(_HAS_TPU, "requires a TPU backend")
 class TestRouterTopk(CustomTestCase):
     def test_matches_reference(self):
-        from sglang_tpu.kernels.router_topk import router_topk_jax
+        from sglang_tpu.layers.pallas.router_topk import router_topk_jax
 
         rng = np.random.default_rng(0)
         for tokens, experts, k, renorm, scale, dtype in (
@@ -72,7 +72,7 @@ class TestRouterTopk(CustomTestCase):
     def test_f32_ties_pick_the_lowest_ids(self):
         """f32 logits quantized to a few values, so many scores tie exactly: the
         kernel picks the lowest expert ids among ties, as a stable sort does."""
-        from sglang_tpu.kernels.router_topk import router_topk_jax
+        from sglang_tpu.layers.pallas.router_topk import router_topk_jax
 
         rng = np.random.default_rng(1)
         for tokens in (1, 8):

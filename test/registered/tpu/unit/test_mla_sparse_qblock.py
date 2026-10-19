@@ -31,11 +31,11 @@ REL_TOL = 1e-2
 class TestSparseMlaPrefillQblock(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
-        from sglang_tpu.attention.pallas.mla_sparse_fused import (
+        from sglang_tpu.layers.attention.pallas import dsa_kpool_topk as kp
+        from sglang_tpu.layers.attention.pallas.mla_sparse_fused import (
             sparse_mla_attention_fused,
         )
-        from sglang_tpu.attention.pallas.mla_sparse_qblock import (
+        from sglang_tpu.layers.attention.pallas.mla_sparse_qblock import (
             sparse_mla_prefill_qblock,
         )
 

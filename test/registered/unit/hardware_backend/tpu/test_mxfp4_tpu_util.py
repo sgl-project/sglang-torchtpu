@@ -189,7 +189,7 @@ class TestIntermediatePadding(CustomTestCase):
         activation name to gmm_v2's ``fuse_act`` spelling, swaps in the
         chip's Pallas metadata via ``tpu_info_for_cpu_export``, and queries
         ``pad_size_n_to_fewest_tiles``."""
-        from sglang_tpu import pallas_export
+        from sglang_tpu.utils import pallas_export
 
         # fused_moe_op imports torch_tpu at module scope; stub it when
         # running on a CPU host that has JAX but not torch_tpu.

@@ -16,14 +16,14 @@ import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang_tpu.dflash_utils_tpu import (
+from sglang_tpu.managers.overlap_utils_tpu import (
+    resolve_device_accept_seq_lens_tpu,
+)
+from sglang_tpu.speculative.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
     build_dflash_draft_block,
     gather_dflash_candidate_window,
     select_dflash_verify_cache_locs_tpu,
-)
-from sglang_tpu.overlap_utils_tpu import (
-    resolve_device_accept_seq_lens_tpu,
 )
 
 BLOCK_SIZE = 4

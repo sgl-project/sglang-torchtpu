@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The fused TPU mHC site kernel (sglang_tpu.mhc) vs the shared hc_pre / hc_post
+"""The fused TPU mHC site kernel (sglang_tpu.layers.mhc) vs the shared hc_pre / hc_post
 torch path on CPU.
 
 The reference runs in fp32 on CPU: torch_tpu evaluates its fp32 projection at
@@ -19,8 +19,8 @@ from sglang.test.ci.ci_register import register_tpu_ci
 try:
     import torch_tpu  # noqa: F401
 
-    import sglang_tpu.mhc as kernel
-    from sglang_tpu.mhc import supports_mhc_site
+    import sglang_tpu.layers.mhc as kernel
+    from sglang_tpu.layers.mhc import supports_mhc_site
 except ImportError:
     torch_tpu = None
 

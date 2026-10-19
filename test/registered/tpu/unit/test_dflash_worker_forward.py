@@ -38,7 +38,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecodeCompilePolicyMixin,
     _DFlashVerifyPadding,
 )
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
 
 
 def _detect_tpu() -> bool:

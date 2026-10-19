@@ -240,7 +240,7 @@ class TestDflashDraftKvWrite(CustomTestCase):
         cls.draft_model = _StubDraftModel(rope).to(DEVICE)
 
     def _make_pool(self):
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
 
         return TpuFusedMHATokenToKVPool(
             size=NUM_PAGES * PAGE_SIZE,
@@ -260,7 +260,7 @@ class TestDflashDraftKvWrite(CustomTestCase):
           Tuple of (fused buffers, reference buffers), each a list of per-layer
           CPU float32 copies.
         """
-        from sglang_tpu.dflash_draft_kv_write import (
+        from sglang_tpu.speculative.dflash_draft_kv_write import (
             dflash_write_draft_kv,
             dflash_write_draft_kv_ref,
         )
@@ -362,7 +362,7 @@ class TestDflashDraftKvWrite(CustomTestCase):
         production uses. One pool per path is reused across shapes; the
         specialization key gives each shape its own artifact.
         """
-        from sglang_tpu.dflash_draft_kv_write import (
+        from sglang_tpu.speculative.dflash_draft_kv_write import (
             dflash_write_draft_kv,
             dflash_write_draft_kv_ref,
         )

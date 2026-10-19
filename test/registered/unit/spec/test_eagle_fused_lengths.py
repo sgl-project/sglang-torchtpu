@@ -15,7 +15,7 @@ import torch
 
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.eagle_utils_tpu import (
+from sglang_tpu.speculative.eagle_utils_tpu import (
     build_topk1_verify_chain_torch,
 )
 

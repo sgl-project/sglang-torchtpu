@@ -14,7 +14,7 @@ register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
 class TestGDNPrefixCache(CustomTestCase):
     def setUp(self):
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -71,7 +71,7 @@ class TestGDNPrefixCache(CustomTestCase):
             torch.testing.assert_close(
                 actual[2].cpu(), expected[1].cpu(), atol=2e-5, rtol=2e-5
             )
-        from sglang_tpu.mamba_pool import (
+        from sglang_tpu.mem_cache.mamba_pool import (
             TpuMambaPool,
             TpuPerLayerState,
         )
@@ -96,7 +96,7 @@ class TestGDNPrefixCache(CustomTestCase):
     def test_copy_buckets_preserve_states_without_recompilation(self):
         from torch._dynamo.utils import counters
 
-        from sglang_tpu.mamba_pool import (
+        from sglang_tpu.mem_cache.mamba_pool import (
             TpuMambaPool,
             TpuPerLayerState,
         )
@@ -133,7 +133,7 @@ class TestGDNPrefixCache(CustomTestCase):
         self.assertEqual(graphs, counters["stats"]["unique_graphs"])
 
     def test_copy_skips_padding_and_large_slots(self):
-        from sglang_tpu.mamba_state_copy import compiled_state_copy
+        from sglang_tpu.mem_cache.mamba_state_copy import compiled_state_copy
 
         # 32 MiB per slot exceeds VMEM on supported smaller TPU generations.
         original = torch.randn(4, 128, 256, 256)
@@ -163,7 +163,7 @@ class TestGDNPrefixCache(CustomTestCase):
         from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
         from sglang.srt.platforms import current_platform
-        from sglang_tpu.mamba_pool import TpuMambaPool
+        from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
 
         shape = Mamba2StateShape.create(
             tp_world_size=1,
@@ -321,7 +321,7 @@ class TestGDNPrefixCache(CustomTestCase):
             ForwardBatch,
             ForwardMode,
         )
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             TpuGDNAttnBackend,
         )
 

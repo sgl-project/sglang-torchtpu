@@ -47,10 +47,10 @@ class FakeQwen3VLDecoderTpuCompilePolicy(CompilePolicy):
 
 
 def _stub_tpu_modules():
-    attention_module = types.ModuleType("sglang_tpu.attention_pallas")
+    attention_module = types.ModuleType("sglang_tpu.layers.attention.attention_pallas")
     attention_module._get_vision_flash_op = lambda: None
 
-    vit_module = types.ModuleType("sglang_tpu.graph_runner.vit_tpu_compile_runner")
+    vit_module = types.ModuleType("sglang_tpu.multimodal.vit_tpu_compile_runner")
     vit_module.ViTTpuCompileRunner = FakeViTTpuCompileRunner
     vit_module.VisionTpuCompilePolicy = FakeQwen3VLVisionTpuCompilePolicy
     vit_module.Qwen3VLVisionTpuCompilePolicy = FakeQwen3VLVisionTpuCompilePolicy

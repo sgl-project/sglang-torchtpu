@@ -38,8 +38,10 @@ from absl.testing import parameterized
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from sglang_tpu.attention.pallas.mla_sparse import native_sc_cache_layout as layout
-from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
+from sglang_tpu.layers.attention.pallas.mla_sparse import (
+    native_sc_cache_layout as layout,
+)
+from sglang_tpu.layers.attention.pallas.mla_sparse.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
     SparseMLAKVCacheSpec,

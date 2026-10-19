@@ -313,7 +313,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 compressed_tensor_quant=True,
             )
         elif _is_tpu:
-            from sglang_tpu.fp8_linear import (
+            from sglang_tpu.layers.quantization.fp8_linear import (
                 apply_tpu_fp8_linear,
             )
 

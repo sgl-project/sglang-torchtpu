@@ -20,7 +20,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_pallas_rpa_dcp import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_dcp import (
     DCP_OP_NAME,
     build_dcp_kernel_op,
 )
@@ -94,7 +94,7 @@ class TestDcpOpContract(CustomTestCase):
     NUM_SEQS = 3
 
     def setUp(self):
-        from sglang_tpu.attention_pallas_rpa_batched import (
+        from sglang_tpu.layers.attention.attention_pallas_rpa_batched import (
             RPA_BATCHED_SPEC,
         )
 
@@ -169,7 +169,7 @@ class TestDcpOpKernelSpec(CustomTestCase):
     def test_another_kernel_spec_is_refused(self):
         # The base builds the distribution for its own kernel spec, and the
         # DCP op reads it as the batched kernel's.
-        from sglang_tpu.attention_pallas_rpa_v3 import (
+        from sglang_tpu.layers.attention.attention_pallas_rpa_v3 import (
             RPA_V3_SPEC,
         )
 

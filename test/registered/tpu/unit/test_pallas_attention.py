@@ -44,7 +44,7 @@ class TestPallasHelpers(CustomTestCase):
     """Pure logic — no TPU required."""
 
     def test_bucket_kv_len_boundaries(self):
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _PAGE_SIZE,
             _bucket_kv_len,
         )
@@ -65,7 +65,7 @@ class TestPallasHelpers(CustomTestCase):
     def test_maybe_expand_kv_heads(self):
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _maybe_expand_kv_heads,
         )
 
@@ -127,7 +127,7 @@ class TestPallasFlashTokenSlotPadding(CustomTestCase):
         import torch
 
         from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _pad_token_slots,
         )
 
@@ -151,7 +151,7 @@ class TestPallasFlashTokenSlotPadding(CustomTestCase):
     def test_padding_helper_also_slices(self):
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _pad_token_slots,
         )
 
@@ -184,7 +184,7 @@ class TestFlashKernelNumerics(CustomTestCase):
     def _check(self, H, Sq, Skv, D, causal, tol=2e-2):
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _attend,
             _get_flash_op,
         )
@@ -221,7 +221,7 @@ class TestPagedKernelNumerics(CustomTestCase):
         import numpy as np
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             _get_paged_op,
         )
 
@@ -277,7 +277,7 @@ class TestPallasFlashDecodePaddingNumerics(CustomTestCase):
         import numpy as np
         import torch
 
-        from sglang_tpu.attention_pallas import (
+        from sglang_tpu.layers.attention.attention_pallas import (
             TpuPallasAttnBackend,
             _bucket_kv_len,
         )

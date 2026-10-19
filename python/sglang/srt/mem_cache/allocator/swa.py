@@ -26,7 +26,7 @@ if _is_npu:
     )
 
 if _is_tpu:
-    from sglang_tpu.allocator_tpu import (
+    from sglang_tpu.mem_cache.allocator.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
 

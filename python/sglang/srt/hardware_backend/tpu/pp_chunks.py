@@ -1,6 +1,6 @@
-"""Moved to :mod:`sglang_tpu.pp_chunks`; alias kept for in-flight branches, delete once they merge."""
+"""Moved to :mod:`sglang_tpu.managers.pp_chunks`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib
 import sys
 
-sys.modules[__name__] = importlib.import_module("sglang_tpu.pp_chunks")
+sys.modules[__name__] = importlib.import_module("sglang_tpu.managers.pp_chunks")

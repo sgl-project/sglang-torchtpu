@@ -97,7 +97,7 @@ def _to_tpu(*modules):
 class TestKimiK3AttnResKernel(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        from sglang_tpu import kimi_attn_residual
+        from sglang_tpu.layers import kimi_attn_residual
 
         kimi_attn_residual.register_kimi_attn_res_decode_ops()
         cls.kernel = kimi_attn_residual

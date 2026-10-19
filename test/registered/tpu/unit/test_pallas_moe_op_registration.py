@@ -57,7 +57,7 @@ class TestPallasMoeOpRegistration(CustomTestCase):
     drift here would silently produce a separate, unregistered op."""
 
     def test_op_registered_under_expected_qualified_name(self):
-        from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
 
         _build_fused_moe_op()
         # Reachable via the torch.ops namespace -- this is what dynamo
@@ -80,7 +80,7 @@ class TestPallasMoeOpIdempotency(CustomTestCase):
     the cached singleton instead of re-registering."""
 
     def test_build_returns_same_singleton(self):
-        from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
 
         op_a = _build_fused_moe_op()
         op_b = _build_fused_moe_op()
@@ -94,7 +94,7 @@ class TestPallasMoeCallContract(CustomTestCase):
     """
 
     def test_forwards_ep_and_sparse_core_options_to_registered_op(self):
-        import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op
+        import sglang_tpu.layers.moe.pallas.fused_moe_op as fused_moe_op
 
         hidden_states = torch.empty(2, 8, dtype=torch.bfloat16)
         w1 = torch.empty(2, 8, 16, dtype=torch.bfloat16)
@@ -157,7 +157,7 @@ class TestPallasMoeCallContract(CustomTestCase):
 
     def test_situ_params_are_encoded_in_the_activation(self):
         """SiTU (beta, linear_beta) reach the op in the activation string."""
-        import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op
+        import sglang_tpu.layers.moe.pallas.fused_moe_op as fused_moe_op
 
         t = torch.empty(2, 2)
         op = Mock(return_value=t)

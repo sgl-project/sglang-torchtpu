@@ -30,9 +30,6 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
 )
-from sglang_tpu.attention_pallas_rpa_base import (
-    PallasForwardMetadata,
-)
 from sglang_tpu.compilation.graph_identity import _key_value, canonical
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.pp_proxy_pytree import (
@@ -40,7 +37,10 @@ from sglang_tpu.compilation.pp_proxy_pytree import (
 )
 from sglang_tpu.compilation.spmd_compiler import SPMDCompiler
 from sglang_tpu.compilation.warmup_queue import current_warmup_queue
-from sglang_tpu.rank_local import trace_rank
+from sglang_tpu.distributed.rank_local import trace_rank
+from sglang_tpu.layers.attention.attention_pallas_rpa_base import (
+    PallasForwardMetadata,
+)
 
 logger = logging.getLogger(__name__)
 

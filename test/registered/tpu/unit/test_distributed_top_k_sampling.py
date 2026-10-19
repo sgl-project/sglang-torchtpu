@@ -48,7 +48,7 @@ class TestTpuVocabShardFullgraphCompile(CustomTestCase):
     def test_constructible_under_fullgraph_dynamo(self):
         import torch
 
-        from sglang_tpu.top_k import TpuVocabShard
+        from sglang_tpu.layers.top_k import TpuVocabShard
 
         def build_and_read(values: torch.Tensor) -> torch.Tensor:
             shard = TpuVocabShard(
@@ -244,8 +244,8 @@ def _run_distributed_worker() -> None:
             f"logical-to-physical mapping, got {physical_ids}"
         )
 
-    from sglang_tpu import top_k as top_k_module
-    from sglang_tpu.sampler import (
+    from sglang_tpu.layers import top_k as top_k_module
+    from sglang_tpu.layers.sampler import (
         sample_from_global_top_k_logits,
     )
 
@@ -261,7 +261,7 @@ def _run_distributed_worker() -> None:
         added_vocab_start=_VOCAB_SIZE,
         added_vocab_count=0,
     )
-    from sglang_tpu.distributed_topk_pallas import (
+    from sglang_tpu.layers.distributed_topk_pallas import (
         register_pallas_distributed_top_k_op,
     )
 

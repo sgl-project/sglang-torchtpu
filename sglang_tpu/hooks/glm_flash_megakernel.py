@@ -20,8 +20,8 @@ def reserve_glm_flash_megakernel_experts(model: Any, *args, **kwargs) -> None:
     """BEFORE Glm5NextForConditionalGeneration.load_weights, while HBM is contiguous."""
     from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
     from sglang.srt.runtime_context import get_parallel
-    from sglang_tpu.glm_flash_megakernel import ops
-    from sglang_tpu.glm_flash_megakernel.build import expert_buffers
+    from sglang_tpu.models.glm_flash_megakernel import ops
+    from sglang_tpu.models.glm_flash_megakernel.build import expert_buffers
 
     # The MTP draft loads through this method too; the kernel serves the target.
     if (
@@ -38,7 +38,7 @@ def reserve_glm_flash_megakernel_experts(model: Any, *args, **kwargs) -> None:
 
 def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> None:
     """AFTER TpuGraphRunner.__init__: wrap the compiled (fullgraph) model.forward."""
-    from sglang_tpu.glm_flash_megakernel import ops
+    from sglang_tpu.models.glm_flash_megakernel import ops
 
     model = runner.model
     experts = getattr(model, "_tpu_glm_flash_mk_experts", None)

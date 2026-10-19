@@ -42,7 +42,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
-from sglang_tpu.kv_free_fence import (
+from sglang_tpu.mem_cache.kv_free_fence import (
     KVFreeFence,
     deferred_dma_read,
 )

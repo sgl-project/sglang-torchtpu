@@ -39,7 +39,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
-from sglang_tpu.attention.pallas.mla_sparse import dsa_gather, kv_cache_utils
+from sglang_tpu.layers.attention.pallas.mla_sparse import dsa_gather, kv_cache_utils
 
 LKV_DIM = 512
 PAGE_SIZE = 32

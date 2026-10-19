@@ -21,7 +21,7 @@ from torch import nn
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.fp8_linear import (
+from sglang_tpu.layers.quantization.fp8_linear import (
     apply_tpu_static_fp8_linear,
     quantize_rmsnorm_fed_weight,
 )
@@ -140,7 +140,7 @@ class TestStaticFp8PallasGemvHelpers(CustomTestCase):
 
     def test_padded_n_matches_unpadded(self):
         """N=2112 (Kimi-K3 MLA q_a) padded to 2176 must not change the output."""
-        from sglang_tpu.fp8_linear import pad_static_fp8_n as pad_n
+        from sglang_tpu.layers.quantization.fp8_linear import pad_static_fp8_n as pad_n
 
         gen = torch.Generator().manual_seed(6)
         w = (torch.randn(K, 2112, generator=gen) * 0.02).to(torch.bfloat16)
@@ -160,7 +160,7 @@ class TestStaticFp8PallasGemvHelpers(CustomTestCase):
         )
 
     def test_aligned_n_is_left_alone(self):
-        from sglang_tpu.fp8_linear import pad_static_fp8_n as pad_n
+        from sglang_tpu.layers.quantization.fp8_linear import pad_static_fp8_n as pad_n
 
         w, g, _ = _inputs(7)
         packed = quantize_rmsnorm_fed_weight(w, g)
@@ -178,7 +178,7 @@ class TestStaticFp8PallasGemvHelpers(CustomTestCase):
         )
 
     def test_block_k_divides_k_and_fits_vmem(self):
-        from sglang_tpu.kernels.static_fp8_gemv import block_k
+        from sglang_tpu.layers.quantization.pallas.static_fp8_gemv import block_k
 
         # Kimi-K3 TP32 shapes: KDA qkvg, MoE front, latent up.
         for k, n in ((7168, 1536), (7168, 3968), (3584, 7168)):
@@ -194,7 +194,7 @@ class TestStaticFp8PallasGemvHelpers(CustomTestCase):
 
 class TestKimiK3StaticFp8Selector(CustomTestCase):
     def test_parts_and_all(self):
-        from sglang_tpu.kimi_k3.static_fp8 import PARTS, selected_parts
+        from sglang_tpu.models.kimi_k3.static_fp8 import PARTS, selected_parts
 
         with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_front,kda_qkvg"):
             self.assertEqual(selected_parts(), {"moe_front", "kda_qkvg"})
@@ -206,7 +206,7 @@ class TestKimiK3StaticFp8Selector(CustomTestCase):
         self.assertEqual(selected_parts(), frozenset())  # unset: everything bf16
 
     def test_unknown_part_raises(self):
-        from sglang_tpu.kimi_k3.static_fp8 import selected_parts
+        from sglang_tpu.models.kimi_k3.static_fp8 import selected_parts
 
         with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_frnt"):
             with self.assertRaises(ValueError):
@@ -214,7 +214,7 @@ class TestKimiK3StaticFp8Selector(CustomTestCase):
 
     def test_unknown_part_fails_at_startup(self):
         """apply_server_args_defaults validates the selection before any load."""
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         with (
             tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_frnt"),
@@ -232,7 +232,7 @@ class TestStaticFp8PallasGemvGate(CustomTestCase):
         return mock.Mock(weight=torch.zeros(1024, n))
 
     def test_batches_up_to_the_padded_tile(self):
-        from sglang_tpu import fp8_linear as f
+        from sglang_tpu.layers.quantization import fp8_linear as f
 
         x = lambda m: torch.zeros(m, 1024, dtype=torch.bfloat16)
         with mock.patch.object(f, "_STATIC_FP8_GEMV_READY", True):
@@ -242,7 +242,7 @@ class TestStaticFp8PallasGemvGate(CustomTestCase):
             self.assertFalse(f._static_fp8_gemv_eligible(x(1), self._w(1500)))
 
     def test_switch_off_leaves_the_op_unregistered(self):
-        from sglang_tpu import fp8_linear as f
+        from sglang_tpu.layers.quantization import fp8_linear as f
 
         with (
             tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.override(False),
@@ -328,7 +328,7 @@ class TestKimiK3StaticFp8Binder(CustomTestCase):
 
     def setUp(self):
         from sglang.srt.models import kimi_k3
-        from sglang_tpu.kimi_k3 import static_fp8
+        from sglang_tpu.models.kimi_k3 import static_fp8
 
         patches = [
             mock.patch.object(kimi_k3, "KimiK3MoE", _FakeMoE),
@@ -342,7 +342,7 @@ class TestKimiK3StaticFp8Binder(CustomTestCase):
             self.addCleanup(p.stop)
 
     def _bind(self, model, parts):
-        from sglang_tpu.kimi_k3.static_fp8 import bind_static_fp8
+        from sglang_tpu.models.kimi_k3.static_fp8 import bind_static_fp8
 
         with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override(parts):
             bind_static_fp8(model)
@@ -389,7 +389,7 @@ class TestKimiK3StaticFp8Binder(CustomTestCase):
 
     def test_logs_the_input_scale_headroom(self):
         layer = _layer(_FakeKDA())
-        with self.assertLogs("sglang_tpu.kimi_k3.static_fp8", "INFO") as logs:
+        with self.assertLogs("sglang_tpu.models.kimi_k3.static_fp8", "INFO") as logs:
             self._bind(_model(layer), "moe_front,kda_qkvg")
         text = "\n".join(logs.output)
         self.assertIn("max|g| / median|g|", text)
@@ -427,7 +427,7 @@ class TestKimiK3StaticFp8Binder(CustomTestCase):
     def test_selection_with_no_qualifying_layer_warns(self):
         layer = _layer(_FakeKDA())
         layer.self_attn.use_full_rank_gate = False
-        with self.assertLogs("sglang_tpu.kimi_k3.static_fp8", "WARNING") as logs:
+        with self.assertLogs("sglang_tpu.models.kimi_k3.static_fp8", "WARNING") as logs:
             self._bind(_model(layer), "kda_qkvg")
         self.assertIn("kda_qkvg", "\n".join(logs.output))
 
@@ -438,7 +438,7 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
     decode program per rank, and the ranks then hung in a collective."""
 
     def test_every_rank_gets_a_fresh_base_tensor_of_one_shape(self):
-        from sglang_tpu.kimi_k3 import static_fp8 as sf
+        from sglang_tpu.models.kimi_k3 import static_fp8 as sf
 
         w_kn = torch.randn(3584, 64).t()  # [64, 3584] view, like _dense_weight_kn
         used = sf._split_ranks(w_kn.shape[1], 8)
@@ -453,7 +453,7 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
         torch.testing.assert_close(slices[7], slices[0], rtol=0, atol=0)
 
     def test_host_split_needs_moe_front_and_latent_up(self):
-        from sglang_tpu.kimi_k3 import static_fp8_parts
+        from sglang_tpu.models.kimi_k3 import static_fp8_parts
 
         with tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.override(True):
             with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_front,kda_qkvg"):
@@ -463,7 +463,7 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
                 self.assertIn("latent_up", static_fp8_parts())
 
     def _layout(self, world, nnodes, rank=13, world_size=None, compile_bs=None):
-        from sglang_tpu.kimi_k3 import static_fp8 as sf
+        from sglang_tpu.models.kimi_k3 import static_fp8 as sf
 
         with (
             tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.override(True),
@@ -491,7 +491,7 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
         self.assertEqual(self._layout(32, 4), (32, 8, 5))  # tpu7x 2x2x4, TP32
 
     def test_layout_off_for_other_groups(self):
-        from sglang_tpu.kimi_k3 import static_fp8 as sf
+        from sglang_tpu.models.kimi_k3 import static_fp8 as sf
 
         # Not host-major spanning the world, or not a measured topology (one
         # host, or 8 hosts x 8 ranks).
@@ -508,7 +508,7 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
         would turn them into strings and the op build fails at bind time."""
         import ast
 
-        import sglang_tpu.kimi_k3.host_split_op as mod
+        import sglang_tpu.models.kimi_k3.host_split_op as mod
 
         tree = ast.parse(open(mod.__file__).read())
         future = [
@@ -520,14 +520,14 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
         self.assertNotIn("annotations", future)
 
     def test_warns_without_compile_bs_1(self):
-        from sglang_tpu.kimi_k3 import static_fp8 as sf
+        from sglang_tpu.models.kimi_k3 import static_fp8 as sf
 
         with self.assertLogs(sf.logger, "WARNING") as logs:
             self.assertEqual(self._layout(32, 4, compile_bs=[2, 4]), (32, 8, 5))
         self.assertIn("no batch size 1", "\n".join(logs.output))
 
     def test_ranks_must_agree_on_the_switch(self):
-        from sglang_tpu.kimi_k3 import static_fp8 as sf
+        from sglang_tpu.models.kimi_k3 import static_fp8 as sf
 
         def gather(seen, flag, group=None):
             seen[:] = [flag, flag, not flag, flag]
@@ -545,7 +545,7 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
                 sf._check_ranks_agree(True)
 
     def test_split_ranks_needs_128_multiples(self):
-        from sglang_tpu.kimi_k3 import static_fp8 as sf
+        from sglang_tpu.models.kimi_k3 import static_fp8 as sf
 
         self.assertEqual(sf._split_ranks(7168, 8), 8)
         self.assertEqual(sf._split_ranks(896, 8), 7)

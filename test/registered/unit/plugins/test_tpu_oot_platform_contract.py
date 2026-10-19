@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Contract test for the out-of-tree TPU platform (wave 0 of the plugin migration).
 
-``sglang_tpu.platform.TpuOOTPlatform`` declares ``PlatformEnum.OOT``, which turns
+``sglang_tpu.platforms.tpu_oot_platform.TpuOOTPlatform`` declares ``PlatformEnum.OOT``, which turns
 on every ``is_out_of_tree()`` gate in ``python/sglang/srt``. Those gates call
 platform methods the in-tree TPU platform never had to answer, and the base
 ``SRTPlatform`` / ``DeviceMixin`` implementations of several are bare
@@ -75,8 +75,8 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     def setUpClass(cls):
         from sglang.srt.platforms.device_mixin import PlatformEnum
         from sglang.srt.platforms.interface import SRTPlatform
-        from sglang_tpu.platform import TpuOOTPlatform
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.platforms.tpu_oot_platform import TpuOOTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         cls.PlatformEnum = PlatformEnum
         cls.SRTPlatform = SRTPlatform
@@ -135,7 +135,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
                 for site in sites:
                     lines.append(f"      gate at {site}")
             lines.append(
-                "Implement each on sglang_tpu.platform.TpuOOTPlatform, or add it "
+                "Implement each on sglang_tpu.platforms.tpu_oot_platform.TpuOOTPlatform, or add it "
                 "to KNOWN_UNANSWERED in this file with the reason it cannot be."
             )
             self.fail("\n".join(lines))
@@ -164,7 +164,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
 
     def test_init_backend_defers_outside_the_worker_bootstrap(self):
         """The import-time call from model_runner.py must not initialize the backend."""
-        from sglang_tpu.platform import _WORKER_BOOTSTRAP_MARKER
+        from sglang_tpu.platforms.tpu_oot_platform import _WORKER_BOOTSTRAP_MARKER
 
         with patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False):
             os.environ.pop(_WORKER_BOOTSTRAP_MARKER, None)
@@ -174,7 +174,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
 
     def test_init_backend_runs_inside_the_worker_bootstrap(self):
         """The worker bootstrap's call must do the real work."""
-        from sglang_tpu.platform import _WORKER_BOOTSTRAP_MARKER
+        from sglang_tpu.platforms.tpu_oot_platform import _WORKER_BOOTSTRAP_MARKER
 
         with patch.dict(os.environ, {_WORKER_BOOTSTRAP_MARKER: "dp1_dprank0_tp1"}):
             with patch.object(self.TpuSRTPlatform, "init_backend") as in_tree_init:
@@ -183,7 +183,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
 
     def test_worker_bootstrap_marker_is_set_by_patch_torch(self):
         """The marker is only meaningful while patch_torch sets it."""
-        from sglang_tpu.platform import _WORKER_BOOTSTRAP_MARKER
+        from sglang_tpu.platforms.tpu_oot_platform import _WORKER_BOOTSTRAP_MARKER
 
         source = self._read_core("utils/patch_torch.py")
         self.assertIn(f'os.environ["{_WORKER_BOOTSTRAP_MARKER}"] = ', source)
@@ -203,7 +203,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     def test_supported_speculative_algorithms_are_real_algorithms(self):
         """Catches an upstream rename of a SpeculativeAlgorithm member."""
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.platform import _SUPPORTED_SPEC_ALGORITHMS
+        from sglang_tpu.platforms.tpu_oot_platform import _SUPPORTED_SPEC_ALGORITHMS
 
         known = {member.name for member in SpeculativeAlgorithm}
         self.assertTrue(
@@ -216,7 +216,9 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         self.assertFalse(self.platform.supports_speculative_algorithm("DSPARK"))
 
     def test_claimed_draft_backends_are_registered(self):
-        from sglang_tpu.platform import _SUPPORTED_DRAFT_ATTENTION_BACKENDS
+        from sglang_tpu.platforms.tpu_oot_platform import (
+            _SUPPORTED_DRAFT_ATTENTION_BACKENDS,
+        )
 
         missing = _SUPPORTED_DRAFT_ATTENTION_BACKENDS - (
             self._draft_backend_keys() | self._registered_draft_backends()
@@ -230,7 +232,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
 
     def test_default_draft_backend_matches_the_core_default(self):
         """Must match the in-tree default in speculative_hook.py."""
-        from sglang_tpu.platform import (
+        from sglang_tpu.platforms.tpu_oot_platform import (
             _DEFAULT_DRAFT_ATTENTION_BACKEND,
             _SUPPORTED_DRAFT_ATTENTION_BACKENDS,
         )
@@ -480,7 +482,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
 
     def _registered_draft_backends(self) -> set:
         """Names sglang_tpu registers with register_draft_attention_backend."""
-        path = os.path.join(_REPO_ROOT, "sglang_tpu", "tpu_platform.py")
+        path = os.path.join(_REPO_ROOT, "sglang_tpu", "platforms", "tpu_platform.py")
         with open(path, "r", encoding="utf-8") as handle:
             tree = ast.parse(handle.read())
         names = set()
@@ -639,7 +641,7 @@ class TestTpuDebtRatchet(CustomTestCase):
     def test_plugin_imports_are_counted_at_any_scope(self):
         source = (
             "import sglang_tpu\n"
-            "from sglang_tpu.kv_pool import X\n"
+            "from sglang_tpu.mem_cache.kv_pool import X\n"
             "from sglang_tpuish import Y\n"
             "def f():\n"
             "    from sglang_tpu import patches\n"

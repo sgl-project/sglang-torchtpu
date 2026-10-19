@@ -142,7 +142,7 @@ _is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 if _is_tpu:
-    from sglang_tpu.eagle_utils_tpu import (
+    from sglang_tpu.speculative.eagle_utils_tpu import (
         build_topk1_verify_chain_torch,
         fused_draft_extend_select_argmax_func,
     )

@@ -15,11 +15,11 @@ import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_pallas_rpa_batched import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_batched import (
     PallasForwardMetadata,
     TpuPallasRpaBatchedAttnBackend,
 )
-from sglang_tpu.host_metadata_cache import HostMetadataCache
+from sglang_tpu.layers.attention.host_metadata_cache import HostMetadataCache
 
 
 class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
@@ -276,7 +276,7 @@ class TestBatchedRpaNonEmptyBatchSize(CustomTestCase):
 
 class TestBatchedRpaKernelArguments(CustomTestCase):
     def test_attention_sink_reaches_the_kernel(self):
-        from sglang_tpu import attention_pallas_rpa_batched
+        from sglang_tpu.layers.attention import attention_pallas_rpa_batched
 
         kernel = Mock(return_value="out")
         sinks = object()

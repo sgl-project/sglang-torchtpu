@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.allocator_tpu import (
+from sglang_tpu.mem_cache.allocator.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
 

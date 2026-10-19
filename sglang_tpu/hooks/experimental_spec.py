@@ -16,7 +16,7 @@ import torch
 
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang_tpu.experimental import (
+from sglang_tpu.speculative.experimental_spec import (
     experimental_spec_enabled,
     get_host_batch_padder,
     is_experimental_chain,
@@ -46,7 +46,7 @@ def sampling_from_batch(
     original, cls, batch, vocab_size, *, sampling_params_on_cpu=False
 ):
     if uses_host_batch(batch):
-        from sglang_tpu.experimental.sampling.sampling_batch_info import (
+        from sglang_tpu.sampling.sampling_batch_info import (
             HostPaddedSamplingInfo,
         )
 
@@ -84,7 +84,7 @@ def merge_model_inputs(original, batch, other):
 def filter_spec_input(original, batch, keep_indices, keep_indices_device):
     if not uses_host_batch(batch):
         return original(batch, keep_indices, keep_indices_device)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+    from sglang_tpu.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.filter_batch(
@@ -97,7 +97,7 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
 def merge_spec_input(original, batch, other):
     if not uses_host_batch(batch):
         return original(batch, other)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+    from sglang_tpu.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.merge_batch(other.spec_info, future_indices=batch.req_pool_indices)
@@ -109,7 +109,7 @@ def prepare_spec_decode(original, batch):
     # plans the bucketed verify window.
     if not uses_host_batch(batch) or batch.spec_algorithm.is_dflash_family():
         return original(batch)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+    from sglang_tpu.speculative.draft_info import HostPaddedDraftInput
 
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.prepare_for_decode(batch)
@@ -121,7 +121,7 @@ def build_disagg_eagle_input(original, batch, last_tokens_tensor, future_map):
     spec_info = original(batch, last_tokens_tensor, future_map)
     if not uses_host_batch(batch):
         return spec_info
-    from sglang_tpu.experimental.speculative.eagle_info import (
+    from sglang_tpu.speculative.eagle_info import (
         HostPaddedEagleDraftInput,
     )
 
@@ -148,7 +148,7 @@ def stage_prefill_tokens(original, batch):
 
 
 def extend_metadata_device(original, batch, device):
-    from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+    from sglang_tpu.sampling.sampling_batch_info import is_host_padded
 
     if is_host_padded(batch.sampling_info):
         return "cpu"
@@ -193,7 +193,7 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
     # and hidden at the token bucket; DP attention's unpadding would trim them
     # to the live rows, which the samplers and the draft prefill do not take.
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+    from sglang_tpu.sampling.sampling_batch_info import is_host_padded
 
     sampling_info = forward_batch.sampling_info
     if (
@@ -210,21 +210,21 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
 
 
 def sample_draft_tokens(original, model, hidden_states, input_ids):
-    from sglang_tpu.experimental import experimental_spec_enabled
+    from sglang_tpu.speculative.experimental_spec import experimental_spec_enabled
 
     if not experimental_spec_enabled():
         return original(model, hidden_states, input_ids)
-    from sglang_tpu.experimental.models.dspark import sample_draft_tokens as sample
+    from sglang_tpu.speculative.dspark.dspark import sample_draft_tokens as sample
 
     return sample(model, hidden_states, input_ids)
 
 
 def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
-    from sglang_tpu.experimental import experimental_spec_enabled
+    from sglang_tpu.speculative.experimental_spec import experimental_spec_enabled
 
     if not experimental_spec_enabled():
         return original(model, hidden_states, input_ids)
-    from sglang_tpu.experimental.models.dflash2 import sample_draft_tokens as sample
+    from sglang_tpu.speculative.dflash.dflash2 import sample_draft_tokens as sample
 
     return sample(model, hidden_states, input_ids)
 
@@ -261,7 +261,7 @@ def spec_need_hidden_states(original):
 
 def kimi_spec_defaults(original, server_args):
     from sglang.srt.arg_groups.overrides import resolving_view
-    from sglang_tpu.experimental import experimental_spec_enabled
+    from sglang_tpu.speculative.experimental_spec import experimental_spec_enabled
 
     cfg = resolving_view(server_args)
     if cfg.speculative_algorithm == "DSPARK" and experimental_spec_enabled():

@@ -10,9 +10,12 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.attention_pallas_rpa_base import _pack_qkv_heads, _unpack_out_heads
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.kv_pool import kv_pack_heads
+from sglang_tpu.layers.attention.attention_pallas_rpa_base import (
+    _pack_qkv_heads,
+    _unpack_out_heads,
+)
+from sglang_tpu.mem_cache.kv_pool import kv_pack_heads
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

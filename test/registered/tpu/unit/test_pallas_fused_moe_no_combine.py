@@ -45,7 +45,7 @@ class TestPallasFusedMoeNoCombineTpu(CustomTestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
         rng = jax.random.PRNGKey(0)
         m, hidden, inter, num_experts, topk = 16, 128, 256, 8, 2

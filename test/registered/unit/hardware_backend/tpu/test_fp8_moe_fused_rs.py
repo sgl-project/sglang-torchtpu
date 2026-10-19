@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.fp8_moe_fused_rs import (
+from sglang_tpu.layers.quantization.fp8_moe_fused_rs import (
     _replicate_channelwise_fused_rs_scales,
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
@@ -178,7 +178,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
         with patch(
-            "sglang_tpu.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            "sglang_tpu.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
             return_value=torch.zeros_like(x),
         ) as fused:
             actual = apply_fp8_fused_rs(
@@ -214,7 +214,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
         with patch(
-            "sglang_tpu.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            "sglang_tpu.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
             return_value=torch.zeros_like(x),
         ) as fused:
             apply_fp8_fused_rs(

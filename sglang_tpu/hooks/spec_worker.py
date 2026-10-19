@@ -16,7 +16,7 @@ from __future__ import annotations
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang_tpu.experimental import (
+from sglang_tpu.speculative.experimental_spec import (
     is_experimental_chain,
     is_experimental_eagle3,
     is_experimental_spec_worker,
@@ -30,19 +30,19 @@ def select_experimental_spec_worker(
 ) -> type[BaseSpecWorker] | None:
     del result, server_args
     if is_experimental_chain(algorithm):
-        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+        from sglang_tpu.speculative.chain_spec_worker import (
             TpuChainSpecWorker,
         )
 
         return TpuChainSpecWorker
     if is_experimental_spec_worker(algorithm):
-        from sglang_tpu.experimental.speculative.block_spec_worker import (
+        from sglang_tpu.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
 
         return TpuBlockSpecWorker
     if is_experimental_eagle3(algorithm):
-        from sglang_tpu.experimental.speculative.eagle.eagle_worker import (
+        from sglang_tpu.speculative.eagle.eagle_worker import (
             TpuEagle3Worker,
         )
 

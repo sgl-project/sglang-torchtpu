@@ -1,6 +1,8 @@
-"""Moved to :mod:`sglang_tpu.pp_chunk_scheduler`; alias kept for in-flight branches, delete once they merge."""
+"""Moved to :mod:`sglang_tpu.managers.pp_chunk_scheduler`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib
 import sys
 
-sys.modules[__name__] = importlib.import_module("sglang_tpu.pp_chunk_scheduler")
+sys.modules[__name__] = importlib.import_module(
+    "sglang_tpu.managers.pp_chunk_scheduler"
+)

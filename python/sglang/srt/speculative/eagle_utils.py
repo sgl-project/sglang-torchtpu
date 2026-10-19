@@ -53,7 +53,7 @@ _is_tpu = is_tpu()
 _is_cpu = is_cpu()
 
 if _is_tpu:
-    from sglang_tpu.eagle_utils_tpu import (
+    from sglang_tpu.speculative.eagle_utils_tpu import (
         build_topk1_verify_tree_tpu,
         prepare_device_accept_tpu,
         prepare_verify_cache_locs_tpu,
@@ -427,13 +427,13 @@ def _verify_tree_greedy_torch_inplace(
 
 def _make_verify_tree_greedy_args(context):
     # Imported on first call so this module loads without sglang_tpu installed.
-    from sglang_tpu.spec_op_warmup import make_verify_tree_greedy_args
+    from sglang_tpu.speculative.spec_op_warmup import make_verify_tree_greedy_args
 
     return make_verify_tree_greedy_args(context)
 
 
 def _make_verify_bookkeeping_args(context):
-    from sglang_tpu.spec_op_warmup import make_verify_bookkeeping_args
+    from sglang_tpu.speculative.spec_op_warmup import make_verify_bookkeeping_args
 
     return make_verify_bookkeeping_args(context)
 

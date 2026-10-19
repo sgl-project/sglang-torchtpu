@@ -12,7 +12,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import twolevel_allreduce as tl
+from sglang_tpu.distributed import twolevel_allreduce as tl
 from sglang_tpu.envs import envs as tpu_envs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")

@@ -20,7 +20,7 @@ from sglang.srt.sampling.sampling_batch_info import (
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.sampler import sampling_params_to_device
+from sglang_tpu.layers.sampler import sampling_params_to_device
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"
@@ -890,7 +890,7 @@ class TestHostSamplingMode(CustomTestCase):
 
     def _sampler(self):
         from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
-        from sglang_tpu.sampler import TpuSampler, _DeviceParamCache
+        from sglang_tpu.layers.sampler import TpuSampler, _DeviceParamCache
 
         # Exercise real sampling math without distributed CPU setup.
         sampler = TpuSampler.__new__(TpuSampler)
@@ -912,7 +912,7 @@ class TestHostSamplingMode(CustomTestCase):
         from unittest.mock import patch
 
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-        from sglang_tpu import sampler as sampler_module
+        from sglang_tpu.layers import sampler as sampler_module
 
         sampler = self._sampler()
 

@@ -4,10 +4,10 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.dflash_utils_tpu import (
+from sglang_tpu.speculative.dflash_utils_tpu import (
     dflash_verify_bookkeeping_torch,
 )
-from sglang_tpu.spec_op_warmup import (
+from sglang_tpu.speculative.spec_op_warmup import (
     SpecOpWarmupContext,
     make_dflash_verify_bookkeeping_args,
     make_draft_extend_select_args,

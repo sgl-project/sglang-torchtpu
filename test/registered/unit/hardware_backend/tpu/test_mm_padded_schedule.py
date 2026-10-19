@@ -7,8 +7,8 @@ import torch
 
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu import mm_schedule_tpu
-from sglang_tpu.mm_embedding import (
+from sglang_tpu.managers import mm_schedule_tpu
+from sglang_tpu.managers.mm_embedding import (
     PaddedEmbedding,
     TpuEmbeddingResult,
 )

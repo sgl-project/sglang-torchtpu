@@ -54,7 +54,7 @@ def _mxfp4_weights(hidden_size: int) -> tuple:
 @unittest.skipUnless(_HAS_TPU, "requires a TPU backend")
 class TestFusedMoESparseCoreGatherOddTokens(CustomTestCase):
     def test_odd_token_count_matches_tensorcore_gather(self):
-        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
         # Top-16 needs no token padding for bf16 tiling, so m reaches the
         # gather unpadded.

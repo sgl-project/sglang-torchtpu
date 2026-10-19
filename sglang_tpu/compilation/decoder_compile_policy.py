@@ -71,15 +71,15 @@ from sglang_tpu.compilation.frame_stack import (
     call_with_reserved_frame_stack,
 )
 from sglang_tpu.compilation.pending_call import PendingCall
-from sglang_tpu.cp_forward import (
+from sglang_tpu.distributed.pp_wave import num_relayed_aux_slots
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.layers.cp.cp_forward import (
     install_cp_logits_forward,
     prepare_tpu_cp_forward_batch,
     wrap_cp_embedding_forward,
 )
-from sglang_tpu.cp_layout import warmup_request_lengths
-from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
-from sglang_tpu.pp_wave import num_relayed_aux_slots
+from sglang_tpu.layers.cp.cp_layout import warmup_request_lengths
+from sglang_tpu.sampling.sampling_batch_info import is_host_padded
 
 logger = get_logger(__name__)
 
@@ -988,7 +988,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _distributed_top_k_width(self) -> int | None:
         if not self._compiles_logits_processor():
             return None
-        from sglang_tpu.sampler import (
+        from sglang_tpu.layers.sampler import (
             distributed_top_k_candidate_width_for_model,
         )
 
@@ -1004,7 +1004,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
         if spec_algorithm is not None and not spec_algorithm.is_none():
             return (LogitsOutputMode.FULL_VOCAB,)
-        from sglang_tpu.sampler import (
+        from sglang_tpu.layers.sampler import (
             distributed_top_k_min_batch_size,
         )
 
@@ -1057,7 +1057,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return False
 
     def keep_outputs_padded(self, batch: ForwardBatch) -> bool:
-        from sglang_tpu.sampler import supports_padded_sampling
+        from sglang_tpu.layers.sampler import supports_padded_sampling
 
         # EAGLE warmup and serving have different sampling_info values. Avoid
         # guarding that metadata in compiled paths which cannot use this mode.
@@ -1381,7 +1381,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         max_live = min(runner.max_running_requests, max(buckets))
         runner.req_to_token_pool._tpu_relay_bucketer = self.b_bucketer
-        from sglang_tpu.allocator_tpu import host_return_allocators
+        from sglang_tpu.mem_cache.allocator.allocator_tpu import host_return_allocators
 
         for allocator in host_return_allocators(runner.token_to_kv_pool_allocator):
             allocator.defer_decode_upload = True
@@ -1668,7 +1668,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 args = (*args[:2], prepared_batch, *args[3:])
             forward_batch = prepared_batch
         if profile_prefix is not None:
-            from sglang_tpu.pp_profile import set_profile_inputs
+            from sglang_tpu.managers.pp_profile import set_profile_inputs
 
             args, kwargs = set_profile_inputs(
                 self, forward_batch, args, kwargs, num_tokens, profile_prefix
@@ -2302,7 +2302,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         each token bucket unless warmed here. The deepstack grid needs no warm:
         it is bound straight from its host matrix, which is a plain transfer.
         """
-        from sglang_tpu.mm_embed_tpu import apply_host_mm_embeds
+        from sglang_tpu.managers.mm_embed_tpu import apply_host_mm_embeds
 
         assert self.t_bucketer is not None
 

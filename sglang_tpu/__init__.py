@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """SGLang's TPU backend (torch_tpu) as an out-of-tree platform plugin.
 
-``SGLANG_PLATFORM=tpu_oot`` selects :class:`sglang_tpu.platform.TpuOOTPlatform`;
+``SGLANG_PLATFORM=tpu_oot`` selects :class:`sglang_tpu.platforms.tpu_oot_platform.TpuOOTPlatform`;
 the fork's in-tree ``tpu`` entry point still resolves to
-:class:`sglang_tpu.tpu_platform.TpuSRTPlatform` (see README.md).
+:class:`sglang_tpu.platforms.tpu_platform.TpuSRTPlatform` (see README.md).
 """
 
 import importlib.util
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["activate", "ENTRY_POINT_NAME", "PLATFORM_CLASS_PATH"]
 
 ENTRY_POINT_NAME = "tpu_oot"
-PLATFORM_CLASS_PATH = "sglang_tpu.platform:TpuOOTPlatform"
+PLATFORM_CLASS_PATH = "sglang_tpu.platforms.tpu_oot_platform:TpuOOTPlatform"
 
 
 def activate():

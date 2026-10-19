@@ -32,7 +32,7 @@ from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.hooks import HOOKS
 from sglang_tpu.hooks import attn_residual as hooks
 
-_KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
+_KERNEL_MODULE = "sglang_tpu.layers.kimi_attn_residual"
 _FLAG = tpu_envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL
 _ATTN_RES_HOOKS = [h for h in HOOKS if h[1].__module__ == hooks.__name__]
 

@@ -264,7 +264,7 @@ class HybridCacheController(BaseHiCacheController):
         its own controller class.
         """
         if kwargs.get("io_backend") == "raiden":
-            from sglang_tpu.raiden_hybrid_cache_controller import (
+            from sglang_tpu.mem_cache.hybrid_cache.raiden_hybrid_cache_controller import (
                 TpuRaidenHybridCacheController,
             )
 

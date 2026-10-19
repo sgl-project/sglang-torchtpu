@@ -685,7 +685,7 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_up_proj = None
 
         # Static-scale fp8 GEMVs, bound post-load by the TPU plugin
-        # (sglang_tpu.kimi_k3.static_fp8); callables that replace the bf16
+        # (sglang_tpu.models.kimi_k3.static_fp8); callables that replace the bf16
         # GEMVs. The front is [latent down-proj | shared gate_up] in one weight.
         self._static_fp8_front = None
         self._static_fp8_front_split: Optional[List[int]] = None
@@ -1996,7 +1996,7 @@ class KimiK3DeltaAttention(nn.Module):
     def _pack_tpu_kda_weights(self) -> torch.Tensor:
         """conv, dt_bias and A_log in one f32 operand (kda_layout): XLA stages
         every small kernel operand with its own copy."""
-        from sglang_tpu.kda_layout import pack_kda_weights
+        from sglang_tpu.layers.attention.linear.kda_layout import pack_kda_weights
 
         attn = self.attn
         packed = pack_kda_weights(

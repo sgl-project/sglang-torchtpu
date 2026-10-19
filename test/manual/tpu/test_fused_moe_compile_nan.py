@@ -96,7 +96,7 @@ class TestFusedMoeCompileNaN(unittest.TestCase):
         return hs, ti, tw
 
     def _check(self, m):
-        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import fused_moe_call
 
         w = self._weights()
 

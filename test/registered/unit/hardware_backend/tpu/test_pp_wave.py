@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.pp_wave import PPAuxWave, PPWave, pipeline_permutation
+from sglang_tpu.distributed.pp_wave import PPAuxWave, PPWave, pipeline_permutation
 
 ROWS, HIDDEN = 8, 4
 

@@ -737,8 +737,10 @@ class TestHostPadFieldSelection(CustomTestCase):
         """VL embedding IDs need the device, but KV slots must upload bucketed."""
         from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
         from sglang_tpu.hooks import host_padding
+        from sglang_tpu.mem_cache.allocator.allocator_tpu import (
+            TpuPagedTokenToKVPoolAllocator,
+        )
 
         override = get_context().override_server_args(
             enable_torch_compile=True, enable_mixed_chunk=False
@@ -876,7 +878,7 @@ class TestHostPadFieldSelection(CustomTestCase):
     def test_bucketed_relay_preserves_live_slots_and_only_uses_bucket_shapes(self):
         from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+        from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
         buckets = Bucketer(name="Bs", buckets=[1, 2, 4, 8])
         table = torch.full((9, 16), 123, dtype=torch.int32)
@@ -914,7 +916,7 @@ class TestHostPadFieldSelection(CustomTestCase):
     def test_prefill_cap_relay_can_gather_a_smaller_decode_bucket(self):
         from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+        from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
         pool = SimpleNamespace(
             req_to_token=torch.zeros((9, 16), dtype=torch.int32),
@@ -935,7 +937,7 @@ class TestHostPadFieldSelection(CustomTestCase):
         from sglang.srt.managers import overlap_utils
         from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+        from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
         pool = SimpleNamespace(
             req_to_token=torch.zeros((9, 16), dtype=torch.int32),
@@ -955,7 +957,9 @@ class TestHostPadFieldSelection(CustomTestCase):
                 relay.gather(indices)
 
     def test_decode_allocator_can_retain_host_locations_until_padding(self):
-        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+        from sglang_tpu.mem_cache.allocator.allocator_tpu import (
+            TpuPagedTokenToKVPoolAllocator,
+        )
 
         allocator = TpuPagedTokenToKVPoolAllocator(
             size=24,

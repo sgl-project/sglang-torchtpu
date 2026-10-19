@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.result_copy_worker import (
+from sglang_tpu.managers.result_copy_worker import (
     TpuAsyncCopyEvent,
     TPUAsyncCopyWorker,
 )

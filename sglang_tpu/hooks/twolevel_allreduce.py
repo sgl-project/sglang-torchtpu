@@ -6,7 +6,7 @@ all_reduce
        TP group is latency bound (tpu7x 2x2x4, TP32: 21 us at H=7168); a
        host-then-cross-host one-shot Pallas exchange takes 13 us.
   How: AROUND GroupCoordinator.all_reduce; the TP group's eligible tensors go
-       to sglang_tpu.twolevel_allreduce when SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE
+       to sglang_tpu.distributed.twolevel_allreduce when SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE
        registered the op (every rank on, a measured topology), everything else
        calls the original.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1444 (platform all-reduce
@@ -24,8 +24,8 @@ merged_moe_all_reduce
        provider, per #1444.
 """
 
-from sglang_tpu.twolevel_allreduce import all_reduce_around as all_reduce
-from sglang_tpu.twolevel_allreduce import (
+from sglang_tpu.distributed.twolevel_allreduce import all_reduce_around as all_reduce
+from sglang_tpu.distributed.twolevel_allreduce import (
     merged_moe_all_reduce_around as merged_moe_all_reduce,
 )
 

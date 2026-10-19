@@ -42,17 +42,17 @@ from types import SimpleNamespace
 import torch
 
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.dsv4.dsv4_compressor import (
+from sglang_tpu.layers.attention.dsv4.dsv4_compressor import (
     _register_csa_compressor_op,
     _register_hca_compressor_op,
     _register_indexer_compressor_op,
     ensure_tpu_compressor_caches,
 )
-from sglang_tpu.dsv4.dsv4_indexer import (
+from sglang_tpu.layers.attention.dsv4.dsv4_indexer import (
     _register_streamindex_topk_op,
     ensure_tpu_indexer_caches,
 )
-from sglang_tpu.dsv4.rope import get_or_build_cos_sin_cache
+from sglang_tpu.layers.attention.dsv4.rope import get_or_build_cos_sin_cache
 
 
 def _skip_if_no_tpu() -> bool:
@@ -154,7 +154,7 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         return get_or_build_cos_sin_cache(freqs_cis)
 
     def test_rope_and_qnorm_rope_ops(self):
-        from sglang_tpu.dsv4.dsv4_attention_backend import (
+        from sglang_tpu.layers.attention.dsv4.dsv4_attention_backend import (
             _register_qnorm_rope_op,
             _register_rope_op,
         )
@@ -178,7 +178,7 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         self.assertFalse(torch.isnan(q_out).any().item())
 
     def test_swa_attention_op(self):
-        from sglang_tpu.dsv4.dsv4_attention_backend import (
+        from sglang_tpu.layers.attention.dsv4.dsv4_attention_backend import (
             _register_attention_swa_op,
         )
 
@@ -214,7 +214,7 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         self.assertFalse(torch.isnan(out).any().item())
 
     def test_csa_and_hca_pipeline_ops(self):
-        from sglang_tpu.dsv4.dsv4_attention_backend import (
+        from sglang_tpu.layers.attention.dsv4.dsv4_attention_backend import (
             _register_attention_csa_op,
             _register_attention_hca_op,
         )
@@ -436,11 +436,11 @@ class TestDSV4TPUPallasKernels(CustomTestCase):
         from sglang.srt.layers.quantization.fp8 import cast_e2m1fn_to_e4m3fn
         from sglang.srt.runtime_context import get_context, get_parallel
         from sglang.test.test_utils import enter_scope
-        from sglang_tpu.fp8_moe import (
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.layers.quantization.fp8_moe import (
             _dequantize_dsv4_mxfp4_block32,
             prepare_tpu_fp8_moe_weights,
         )
-        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         enter_scope(self, get_parallel().override(tp_size=1))
         override = get_context().override_server_args(

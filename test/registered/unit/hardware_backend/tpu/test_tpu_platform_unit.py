@@ -22,8 +22,8 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
-from sglang_tpu.tpu_platform import (
+from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.platforms.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
 )
@@ -117,7 +117,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 side_effect=prepare,
             ),
             patch(
-                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key",
+                "sglang_tpu.compilation.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key",
                 side_effect=lambda: calls.append(
                     ("cache_key", os.environ["LIBTPU_INIT_ARGS"])
                 ),
@@ -127,11 +127,11 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 side_effect=lambda: calls.append(("patch", None)),
             ),
             patch(
-                "sglang_tpu.tpu_platform.rank_slice._load",
+                "sglang_tpu.platforms.tpu_platform.rank_slice._load",
                 side_effect=lambda: calls.append(("rank_slice", None)),
             ),
             patch(
-                "sglang_tpu.tpu_platform.traced_rank._load",
+                "sglang_tpu.platforms.tpu_platform.traced_rank._load",
                 side_effect=lambda: calls.append(("traced_rank", None)),
             ),
         ):
@@ -168,11 +168,11 @@ class TestTpuPlatformInitialization(CustomTestCase):
             patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
             patch("sglang_tpu.patches._prepare_tpu_env"),
             patch(
-                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key"
+                "sglang_tpu.compilation.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key"
             ),
             patch("sglang_tpu.patches.apply_tpu_patches"),
-            patch("sglang_tpu.tpu_platform.rank_slice._load"),
-            patch("sglang_tpu.tpu_platform.traced_rank._load"),
+            patch("sglang_tpu.platforms.tpu_platform.rank_slice._load"),
+            patch("sglang_tpu.platforms.tpu_platform.traced_rank._load"),
             patch(
                 "sglang.srt.models.registry.ModelRegistry.register",
                 side_effect=register,
@@ -959,15 +959,19 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
 
     def test_draft_backends_run_their_target_backend_per_step(self):
         from sglang.srt.layers.attention import attention_registry as registry
-        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
-        from sglang_tpu.attention_pallas_mla_sparse import (
+        from sglang_tpu.layers.attention.attention_pallas_mla import (
+            TpuPallasMlaAttnBackend,
+        )
+        from sglang_tpu.layers.attention.attention_pallas_mla_sparse import (
             TpuPallasSparseMlaAttnBackend,
         )
-        from sglang_tpu.attention_pallas_rpa_batched import (
+        from sglang_tpu.layers.attention.attention_pallas_rpa_batched import (
             TpuPallasRpaBatchedAttnBackend,
         )
-        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
-        from sglang_tpu.tpu_platform import _register_attention_backends
+        from sglang_tpu.layers.attention.attention_pallas_rpa_v3 import (
+            TpuPallasRpaV3AttnBackend,
+        )
+        from sglang_tpu.platforms.tpu_platform import _register_attention_backends
 
         expected = {
             "pallas_tpu_rpa_v3": TpuPallasRpaV3AttnBackend,

@@ -35,7 +35,7 @@ class TestKvSpanWrite(unittest.TestCase):
     def test_spans_land_on_their_slots_and_nothing_else_changes(self):
         import jax.numpy as jnp
 
-        from sglang_tpu.kv_span_write import kv_span_write_jax
+        from sglang_tpu.mem_cache.kv_span_write import kv_span_write_jax
 
         rng = np.random.default_rng(0)
         pages, page_size, tail = 6, 8, (2, 2, 128)

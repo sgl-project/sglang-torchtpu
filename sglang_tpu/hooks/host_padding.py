@@ -111,7 +111,7 @@ def alloc_extend(
     out_cache_loc_host=None,
     return_host=False,
 ):
-    from sglang_tpu.allocator_tpu import host_return_allocators
+    from sglang_tpu.mem_cache.allocator.allocator_tpu import host_return_allocators
 
     # Other wrapped allocators retain their original return-device contract.
     # VL embedding preparation needs device token IDs, but not KV locations.
@@ -144,7 +144,7 @@ def create_future_map(original, algorithm, device, req_to_token_pool, *args, **k
         and algorithm.is_none()
         and getattr(req_to_token_pool, "_tpu_relay_bucketer", None) is not None
     ):
-        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+        from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
         return HostPaddingFutureMap(
             device, algorithm, req_to_token_pool, *args, **kwargs
@@ -153,7 +153,7 @@ def create_future_map(original, algorithm, device, req_to_token_pool, *args, **k
 
 
 def resolve_forward_inputs(original, batch, future_map):
-    from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+    from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
     if (
         isinstance(future_map, HostPaddingFutureMap)
@@ -168,7 +168,7 @@ def resolve_forward_inputs(original, batch, future_map):
 
 
 def relay_forward_payload(original, scheduler, batch, future_indices, result):
-    from sglang_tpu.host_padding_relay import HostPaddingFutureMap
+    from sglang_tpu.managers.host_padding_relay import HostPaddingFutureMap
 
     padded = (
         isinstance(scheduler.future_map, HostPaddingFutureMap)

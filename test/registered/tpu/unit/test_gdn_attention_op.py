@@ -3,7 +3,7 @@
 Parallel to :mod:`test.manual.tpu.test_pallas_moe_op_registration` and
 :mod:`test.manual.tpu.test_gdn_attention_v3` (the raw-kernel correctness
 test). This file pins the torch<->JAX bridge in
-:mod:`sglang_tpu.attention_gdn_pallas`:
+:mod:`sglang_tpu.layers.attention.linear.attention_gdn_pallas`:
 
   * a torch.library custom op ``sglang_tpu_pallas::gdn_attention`` is
     registered and reachable via ``torch.ops.sglang_tpu_pallas``;
@@ -91,7 +91,7 @@ class TestGDNAttentionOp(CustomTestCase):
         This runs through torch_tpu with JAX pinned to CPU, just like serving.
         Both conv and recurrent state must resume from the selected checkpoint.
         """
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -232,7 +232,7 @@ class TestGDNAttentionOp(CustomTestCase):
                 )
 
     def test_op_registered_and_idempotent(self):
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -259,7 +259,7 @@ class TestGDNAttentionOp(CustomTestCase):
         it does not need the TPU-backed ``jax.devices()`` the numerics case
         below requires -- that gate is what kept this path untested.
         """
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -317,7 +317,7 @@ class TestGDNAttentionOp(CustomTestCase):
         66 tokens, 3 and then 2 sequences, must each lower under the export
         pin. An export guard keyed by the token count alone runs the second
         lowering unguarded, which dies on device_kind="cpu"."""
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -364,10 +364,10 @@ class TestGDNAttentionOp(CustomTestCase):
 
     @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON_JAX_TPU)
     def test_op_matches_kernel_and_mutates_state(self):
-        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
+        from sglang_tpu.layers.attention.pallas.gdn import fused_conv1d_gdn
 
         n_kq, n_v, d_k, d_v, K = self.N_KQ, self.N_V, self.D_K, self.D_V, self.K
         # Mixed batch: 2 decode + 1 prefill.
@@ -496,7 +496,7 @@ class TestGDNAttentionOp(CustomTestCase):
 
     def test_kda_op_lowers_under_cpu_export_pin(self):
         """KDA mode through the op, in the server's CPU-pinned export config."""
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -516,11 +516,11 @@ class TestGDNAttentionOp(CustomTestCase):
     @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON_JAX_TPU)
     def test_kda_op_matches_kernel(self):
         """The op forwards KDA mode and the gate bound to the kernel unchanged."""
-        from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
-        from sglang_tpu.attention.pallas.gdn.config import AttentionMode
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
+        from sglang_tpu.layers.attention.pallas.gdn import fused_conv1d_gdn
+        from sglang_tpu.layers.attention.pallas.gdn.config import AttentionMode
 
         args, (n_kq, n_v, d_k, d_v, K) = self._kda_case()
         (conv_ref, rec_ref), out_ref = fused_conv1d_gdn(
@@ -557,10 +557,10 @@ class TestGDNAttentionOp(CustomTestCase):
         rows of which the first `num_real` are real; the rest are bucket
         padding pointing at the null slot. Returns run(fast) -> numpy
         (out, conv_state, recurrent_state) from fresh state copies."""
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
-        from sglang_tpu.kda_layout import pack_kda_weights
+        from sglang_tpu.layers.attention.linear.kda_layout import pack_kda_weights
 
         n_v, d_k, d_v, K = 4, self.D_K, self.D_V, self.K
         conv_dim = 2 * n_v * d_k + n_v * d_v
@@ -626,7 +626,7 @@ class TestGDNAttentionOp(CustomTestCase):
     def _gdn_decode_padding(self):
         """TpuGDNAttnBackend's decode call (batched_only) on a one-row bucket
         whose row is padding. Returns run() -> numpy output."""
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 
@@ -706,7 +706,7 @@ class TestGDNAttentionOp(CustomTestCase):
     def test_wide_qkv_requires_fused_qkvg(self):
         """Only an explicit fused_qkvg call may pass a qkv wider than the conv
         dim; any other width fails the op's width check."""
-        from sglang_tpu.attention_gdn_pallas import (
+        from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
             build_gdn_pallas_op,
         )
 

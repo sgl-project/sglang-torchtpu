@@ -863,7 +863,7 @@ class DFlashDraftModel(nn.Module):
         Extension hook: DSpark overrides it with its markov chain, whose first
         step conditions on the anchor token in input_ids.
         """
-        from sglang_tpu.dflash_utils_tpu import (
+        from sglang_tpu.speculative.dflash_utils_tpu import (
             argmax_draft_tokens_tpu,
         )
 

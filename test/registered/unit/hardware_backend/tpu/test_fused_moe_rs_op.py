@@ -11,7 +11,7 @@ import torch
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.moe.pallas import fused_moe_rs_op
+from sglang_tpu.layers.moe.pallas import fused_moe_rs_op
 
 register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -186,7 +186,9 @@ class TestFusedMoeRsOp(CustomTestCase):
                 return_value=MoeRunnerBackend.PALLAS_TPU_FUSED_RS,
             ),
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op"),
-            patch("sglang_tpu.oneshot_collectives.get_oneshot_all_gather_op"),
+            patch(
+                "sglang_tpu.distributed.oneshot_collectives.get_oneshot_all_gather_op"
+            ),
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
 
@@ -200,7 +202,7 @@ class TestFusedMoeRsOp(CustomTestCase):
         import jax.numpy as jnp
         import numpy as np
 
-        from sglang_tpu.moe.pallas.fused_rs.fused_moe import (
+        from sglang_tpu.layers.moe.pallas.fused_rs.fused_moe import (
             _compute_expert_tp_routing,
             _compute_rs_routing,
         )

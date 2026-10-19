@@ -6,8 +6,8 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.mm_embed_tpu import scatter_mm_on_device
-from sglang_tpu.mm_embedding import (
+from sglang_tpu.managers.mm_embed_tpu import scatter_mm_on_device
+from sglang_tpu.managers.mm_embedding import (
     EmbeddingSpan,
     PaddedEmbedding,
     concat_embeddings,

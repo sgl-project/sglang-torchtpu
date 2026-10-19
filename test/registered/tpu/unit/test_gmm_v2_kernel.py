@@ -180,7 +180,7 @@ class TestGmmV2Dense(
     def test_gmm(
         self, batch_size, in_size, out_size, num_groups, has_bias, group_offset
     ):
-        from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2
+        from sglang_tpu.layers.moe.pallas.gmm_v2 import gmm_v2
 
         num_local_groups = num_groups - group_offset
         key = jax.random.key(0)
@@ -249,7 +249,7 @@ class TestGmmV2WeightQuantized(
         weight_dtype,
         group_offset,
     ):
-        from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2
+        from sglang_tpu.layers.moe.pallas.gmm_v2 import gmm_v2
 
         block_size = in_size
         num_local_groups = num_groups - group_offset
@@ -335,7 +335,7 @@ class TestGmmV2ActivationWeightQuantized(
         weight_dtype,
         group_offset,
     ):
-        from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2
+        from sglang_tpu.layers.moe.pallas.gmm_v2 import gmm_v2
 
         # TODO(kyuyeunk, wenxindong): Add subchannel quantization on gmm_v2.
         block_size = in_size

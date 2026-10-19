@@ -62,7 +62,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
+from sglang_tpu.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
     align_to,
     get_dtype_packing,
     get_kv_cache_shape,

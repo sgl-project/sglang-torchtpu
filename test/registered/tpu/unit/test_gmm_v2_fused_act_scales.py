@@ -47,7 +47,7 @@ class TestFusedActScales(CustomTestCase):
     G, M, K, N2 = 4, 512, 256, 512
 
     def _fused_vs_unfused(self, quant_mode, fuse_act="silu"):
-        from sglang_tpu.moe.pallas.gmm_v2 import apply_act_fn, gmm_v2
+        from sglang_tpu.layers.moe.pallas.gmm_v2 import apply_act_fn, gmm_v2
 
         key = jax.random.key(0)
         k1, k2 = jax.random.split(key)
@@ -99,7 +99,7 @@ class TestFusedActScales(CustomTestCase):
         self._fused_vs_unfused("bf16", fuse_act="situ:4.0:25.0")
 
     def test_misaligned_gate_up_boundary_asserts(self):
-        from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2
+        from sglang_tpu.layers.moe.pallas.gmm_v2 import gmm_v2
 
         g, m, k = 2, 128, 256
         n2 = 384  # per-projection n = 192; 192 % 128 != 0

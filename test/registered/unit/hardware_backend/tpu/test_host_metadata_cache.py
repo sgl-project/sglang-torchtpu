@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.host_metadata_cache import HostMetadataCache
+from sglang_tpu.layers.attention.host_metadata_cache import HostMetadataCache
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

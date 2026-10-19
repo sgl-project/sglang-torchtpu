@@ -482,7 +482,7 @@ class HiCacheController:
         if kwargs.get("io_backend") == "torch_tpu":
             return TpuHiCacheController(*args, **kwargs)
         if kwargs.get("io_backend") == "raiden":
-            from sglang_tpu.raiden_cache_controller import (
+            from sglang_tpu.managers.raiden_cache_controller import (
                 TpuRaidenHiCacheController,
             )
 
@@ -1530,7 +1530,7 @@ class TpuHiCacheController(HiCacheController):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        from sglang_tpu.kv_copy_worker import TpuKvCopyWorker
+        from sglang_tpu.managers.kv_copy_worker import TpuKvCopyWorker
 
         # Whole-batch gate instead of the per-layer device-stream counter; the
         # base already registered a LayerDoneCounter, so swap + re-register.

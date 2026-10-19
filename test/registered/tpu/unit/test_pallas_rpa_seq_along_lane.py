@@ -21,7 +21,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_pallas_rpa_batched import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_batched import (
     RPA_BATCHED_SPEC,
     kv_layout,
 )
@@ -31,22 +31,22 @@ class TestKvLayoutSelection(CustomTestCase):
     """One flag picks the layout, and the KV pool has to follow it."""
 
     def test_defaults_to_token_major(self):
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs
 
         self.assertEqual(kv_layout(), configs.KVLayout.HEAD_ALONG_SUBLANE)
 
     def test_flag_selects_seq_along_lane(self):
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs
 
         with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
             self.assertEqual(kv_layout(), configs.KVLayout.SEQ_ALONG_LANE)
 
     def test_pool_class_follows_the_flag(self):
-        from sglang_tpu.kv_pool import (
+        from sglang_tpu.mem_cache.kv_pool import (
             TpuFusedMHATokenToKVPool,
             TpuSeqAlongLaneKVPool,
         )
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         # get_mha_kv_pool_cls reads the exec bag; publish the backend.
         with get_context().override_server_args(
@@ -67,8 +67,8 @@ class TestPoolBytesPerToken(CustomTestCase):
     def test_head_dim_rounds_to_a_sublane_tile_only(self):
         """SEQ_ALONG_LANE rounds head_dim to num_sublanes * packing, not to 128,
         and never rounds the K/V head axis, so the fused formula over-counts it."""
-        from sglang_tpu import pallas_export
-        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+        from sglang_tpu.mem_cache.kv_pool import TpuSeqAlongLaneKVPool
+        from sglang_tpu.utils import pallas_export
 
         page_size = 16
         with patch.object(
@@ -116,7 +116,7 @@ class TestPageSizeFloor(CustomTestCase):
         return resolution_result(sa, field)
 
     def test_default_is_raised_to_the_floor(self):
-        from sglang_tpu.tpu_platform import (
+        from sglang_tpu.platforms.tpu_platform import (
             _apply_page_size_default,
         )
 
@@ -127,7 +127,7 @@ class TestPageSizeFloor(CustomTestCase):
         )
 
     def test_explicit_below_floor_is_rejected(self):
-        from sglang_tpu.tpu_platform import (
+        from sglang_tpu.platforms.tpu_platform import (
             _apply_page_size_default,
         )
 
@@ -135,7 +135,7 @@ class TestPageSizeFloor(CustomTestCase):
             _apply_page_size_default(self._server_args(64))
 
     def test_explicit_above_floor_is_kept(self):
-        from sglang_tpu.tpu_platform import (
+        from sglang_tpu.platforms.tpu_platform import (
             _apply_page_size_default,
         )
 
@@ -159,7 +159,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
         return resolution_result(sa, field)
 
     def test_auto_becomes_fp8_for_the_rpa_backends(self):
-        from sglang_tpu.tpu_platform import (
+        from sglang_tpu.platforms.tpu_platform import (
             _apply_kv_cache_dtype_default,
         )
 
@@ -172,7 +172,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
         # pallas_tpu_mla raises on an fp8 KV cache and pallas_tpu_flash has no
         # dequantization scale, so the default must not reach them -- the
         # DeepSeek recipe launches MLA with no --kv-cache-dtype.
-        from sglang_tpu.tpu_platform import (
+        from sglang_tpu.platforms.tpu_platform import (
             _apply_kv_cache_dtype_default,
         )
 
@@ -182,7 +182,7 @@ class TestKvCacheDtypeDefault(CustomTestCase):
             self.assertEqual(self._resolved(sa, "kv_cache_dtype"), "auto", backend)
 
     def test_explicit_choice_is_left_alone(self):
-        from sglang_tpu.tpu_platform import (
+        from sglang_tpu.platforms.tpu_platform import (
             _apply_kv_cache_dtype_default,
         )
 
@@ -205,8 +205,8 @@ class TestPrefillBlockSizes(CustomTestCase):
     ):
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
-        from sglang_tpu.pallas_export import (
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.utils.pallas_export import (
             tpu_info_for_cpu_export,
         )
 
@@ -303,8 +303,8 @@ class TestKernelBlockSizes(CustomTestCase):
     ):
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
-        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.utils.pallas_export import tpu_info_for_cpu_export
 
         num_q_heads, num_kv_heads, head_dim, cp_group_size = geometry
         model = configs.ModelConfigs(
@@ -335,7 +335,7 @@ class TestKernelBlockSizes(CustomTestCase):
         keys from the wrong pages from its second block on."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs
 
         layouts = (configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE)
         for page_size, kv_layout, dtype_kv, geometry in itertools.product(
@@ -363,7 +363,7 @@ class TestKernelBlockSizes(CustomTestCase):
         the kernel reads bq_sz == 1 as a decode-only block."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs
 
         shrunk = 0
         for vmem_mib in range(30, 46):
@@ -386,8 +386,8 @@ class TestKernelBlockSizes(CustomTestCase):
         cached pages; a prefill-only call reads none."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
-        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.utils.pallas_export import tpu_info_for_cpu_export
 
         page_size, num_seqs, pages_per_seq = 512, 4, 4
         model = configs.ModelConfigs(
@@ -443,8 +443,8 @@ class TestKernelBlockSizes(CustomTestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
-        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.utils.pallas_export import tpu_info_for_cpu_export
 
         page_size, num_seqs, pages_per_seq, vmem_limit_bytes = 256, 4, 2, 1 << 20
         with self.assertRaises(ValueError):
@@ -486,7 +486,7 @@ class TestKernelBlockSizes(CustomTestCase):
         answered with a buffer count below one."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.layers.attention.pallas.batched_rpa import configs
 
         for vmem_limit_bytes in (1 << 18, 1 << 19, 1 << 20, 1 << 21):
             with self.subTest(vmem_limit_bytes=vmem_limit_bytes):

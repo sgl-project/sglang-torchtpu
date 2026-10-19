@@ -7,7 +7,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang_tpu.sampler import MAX_DISTRIBUTED_TOP_K
+from sglang_tpu.layers.sampler import MAX_DISTRIBUTED_TOP_K
 
 
 def _sampling_variants():

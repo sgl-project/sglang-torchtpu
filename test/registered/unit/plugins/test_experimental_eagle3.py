@@ -18,41 +18,41 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.envs import envs
-from sglang_tpu.experimental.compilation.eagle3_compile_policy import (
+from sglang_tpu.compilation.eagle3_compile_policy import (
     TpuEagle3SpecDecodeCompilePolicyMixin,
 )
-from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import spec_ops
-from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
-from sglang_tpu.experimental.speculative.chain_spec_worker import TpuChainSpecWorker
-from sglang_tpu.experimental.speculative.eagle.eagle_worker import (
+from sglang_tpu.envs import envs
+from sglang_tpu.hooks.experimental_spec import (
+    keep_host_padded_extend_outputs,
+)
+from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+from sglang_tpu.managers.overlap_utils_tpu import (
+    device_accept_resolved_tpu,
+    resolve_device_accept_seq_lens_tpu,
+)
+from sglang_tpu.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.speculative import spec_ops
+from sglang_tpu.speculative.base_spec_worker import TpuSpecWorker
+from sglang_tpu.speculative.chain_spec_worker import TpuChainSpecWorker
+from sglang_tpu.speculative.eagle.eagle_worker import (
     EagleSeed,
     TpuEagle3Worker,
     _shifted_prompt,
     fill_prefill_tail,
 )
-from sglang_tpu.experimental.speculative.eagle_info import HostPaddedEagleDraftInput
-from sglang_tpu.experimental.speculative.spec_ops import (
+from sglang_tpu.speculative.eagle_info import HostPaddedEagleDraftInput
+from sglang_tpu.speculative.spec_ops import (
     _filtered_target_probs,
     accept_drafts_sampled,
     accept_drafts_sampled_filtered,
     accept_drafts_target_only,
     finalize_accept,
 )
-from sglang_tpu.experimental.speculative.spec_types import (
+from sglang_tpu.speculative.spec_types import (
     AcceptResult,
     SpecState,
 )
-from sglang_tpu.experimental.speculative.spec_utils import pad_rows
-from sglang_tpu.hooks.experimental_spec import (
-    keep_host_padded_extend_outputs,
-)
-from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
-from sglang_tpu.overlap_utils_tpu import (
-    device_accept_resolved_tpu,
-    resolve_device_accept_seq_lens_tpu,
-)
+from sglang_tpu.speculative.spec_utils import pad_rows
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -282,7 +282,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         kept, trimmed = outputs(), outputs()
         with patch(
-            "sglang_tpu.experimental.sampling.sampling_batch_info.is_host_padded",
+            "sglang_tpu.sampling.sampling_batch_info.is_host_padded",
             side_effect=lambda info: info is batch.sampling_info,
         ):
             keep_host_padded_extend_outputs(trim, batch, kept)
@@ -424,7 +424,7 @@ class TestExperimentalEagle3(CustomTestCase):
     def test_greedy_rows_do_not_switch_the_batch_onto_the_filter(self):
         """Greedy rows set core's need_top_k_sampling (top_k = 1); only sampled
         rows' filters may route verify through the full-vocab target filter."""
-        from sglang_tpu.experimental.speculative.base_spec_worker import (
+        from sglang_tpu.speculative.base_spec_worker import (
             _sampled_row_filters,
         )
 
@@ -512,8 +512,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 return_value=SimpleNamespace(buckets=[4]),
             ),
             patch(
-                "sglang_tpu.experimental.speculative.eagle.eagle_worker."
-                "warmup_compiled_op",
+                "sglang_tpu.speculative.eagle.eagle_worker.warmup_compiled_op",
                 lambda op, *args: calls.append(args),
             ),
         ):
@@ -574,7 +573,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 hidden_states=torch.zeros((16 if capture.is_full() else 8, 2)),
             )
             with patch(
-                "sglang_tpu.experimental.compilation.eagle3_compile_policy.is_host_padded",
+                "sglang_tpu.compilation.eagle3_compile_policy.is_host_padded",
                 return_value=True,
             ):
                 outputs = policy.finalize_forward_batch(outputs, forward_batch)
@@ -595,7 +594,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         inner = (torch.zeros((16, 2)), [torch.zeros((16, 2))])
         with patch(
-            "sglang_tpu.experimental.compilation.eagle3_compile_policy.is_host_padded",
+            "sglang_tpu.compilation.eagle3_compile_policy.is_host_padded",
             return_value=True,
         ):
             hidden, aux = policy.finalize_forward_batch(inner, forward_batch)

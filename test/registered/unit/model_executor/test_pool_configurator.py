@@ -1419,7 +1419,7 @@ class TestMixedKVFormats(CustomTestCase):
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
-        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
+        from sglang_tpu.mem_cache.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # 512 INT8 payload bytes plus 16 exponent rows aligned to 32.
@@ -1528,7 +1528,7 @@ class TestMixedKVFormats(CustomTestCase):
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
-        from sglang_tpu.kv_mxint8 import cache_bytes_per_token
+        from sglang_tpu.mem_cache.kv_mxint8 import cache_bytes_per_token
 
         available, page_size = 10_000_000, 128
         # Full: 2048 payload bytes plus 128/64/32 exponent rows.
@@ -2157,9 +2157,9 @@ class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
     def test_oot_mla_builder_kwargs_reach_the_tpu_mla_pools(self):
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
-        from sglang_tpu.platform import TpuOOTPlatform
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.mem_cache.kv_pool import TpuFusedMLATokenToKVPool
+        from sglang_tpu.platforms.tpu_oot_platform import TpuOOTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         _publish_config(self, page_size=64, disaggregation_mode="null")
         fake = SimpleNamespace(

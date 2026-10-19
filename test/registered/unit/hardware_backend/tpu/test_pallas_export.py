@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pallas_export
+from sglang_tpu.utils import pallas_export
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
@@ -31,7 +31,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         from jax.sharding import PartitionSpec as P
 
         from sglang.test.cpu_test_utils import get_cpu_export_mesh
-        from sglang_tpu import pp_wave
+        from sglang_tpu.distributed import pp_wave
 
         mesh = get_cpu_export_mesh(("pp",), (4,), (3, 1, 0, 2))
         group = SimpleNamespace(
@@ -79,7 +79,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         from jax.sharding import PartitionSpec as P
 
         from sglang.test.cpu_test_utils import get_cpu_export_mesh
-        from sglang_tpu import pp_wave
+        from sglang_tpu.distributed import pp_wave
 
         mesh = get_cpu_export_mesh(("pp",), (4,), (3, 1, 0, 2))
         group = SimpleNamespace(
@@ -123,8 +123,8 @@ class TestPallasExportEnvironment(CustomTestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires TorchTPU")
     def test_mesh_builders_use_native_mesh_unchanged(self):
-        from sglang_tpu import distributed_topk_pallas
-        from sglang_tpu.moe.pallas import fused_moe_rs_op
+        from sglang_tpu.layers import distributed_topk_pallas
+        from sglang_tpu.layers.moe.pallas import fused_moe_rs_op
 
         for builder, args, axes, shape in (
             (distributed_topk_pallas._get_mesh, (8,), ("model",), (8,)),
@@ -184,7 +184,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         "requires JAX and TorchTPU",
     )
     def test_cpu_export_custom_op_uses_process_stable_trace_identity(self):
-        from sglang_tpu import pallas_jax_op
+        from sglang_tpu.utils import pallas_jax_op
 
         def identity(value: pallas_jax_op.jax.Array) -> pallas_jax_op.jax.Array:
             return value
@@ -230,7 +230,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         through functions that take tensors only."""
         import torch
 
-        from sglang_tpu import (
+        from sglang_tpu.mem_cache import (
             kv_fused_rope_write,
             kv_page_write,
             kv_row_write,
@@ -269,7 +269,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         from jax.sharding import PartitionSpec as P
 
         from sglang.test.cpu_test_utils import get_cpu_export_mesh
-        from sglang_tpu import pallas_jax_op
+        from sglang_tpu.utils import pallas_jax_op
 
         device_ids = (3, 1, 0, 2)
         mesh = get_cpu_export_mesh(("model",), (4,), device_ids)
@@ -397,7 +397,7 @@ class TestPallasExportEnvironment(CustomTestCase):
             import json
             from unittest.mock import patch
 
-            from sglang_tpu import pallas_export
+            from sglang_tpu.utils import pallas_export
 
             from sglang.test.cpu_test_utils import get_cpu_export_mesh
 
@@ -595,7 +595,7 @@ class TestPallasExportEnvironment(CustomTestCase):
             import torch
             import torch_tpu  # noqa: F401
 
-            from sglang_tpu.pallas_jax_op import (
+            from sglang_tpu.utils.pallas_jax_op import (
                 cpu_export_jax_op,
             )
 
@@ -646,7 +646,7 @@ class TestPallasExportEnvironment(CustomTestCase):
 
         from jax.sharding import PartitionSpec as P
 
-        from sglang_tpu.pallas_jax_op import (
+        from sglang_tpu.utils.pallas_jax_op import (
             _convert_partitioned_shape,
         )
 

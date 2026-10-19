@@ -16,7 +16,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 _is_tpu = is_tpu()
 
 if _is_tpu:
-    from sglang_tpu.overlap_utils_tpu import (
+    from sglang_tpu.managers.overlap_utils_tpu import (
         device_accept_resolved_tpu,
         resolve_device_accept_seq_lens_tpu,
     )

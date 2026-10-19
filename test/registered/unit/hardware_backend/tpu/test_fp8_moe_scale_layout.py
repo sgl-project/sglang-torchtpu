@@ -17,7 +17,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.fp8_moe import (
+from sglang_tpu.layers.quantization.fp8_moe import (
     _own_storage,
     _to_tpu_fp8_moe_block_scale_layout,
     _to_tpu_fp8_moe_scale_layout,

@@ -39,10 +39,10 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.allocator_tpu import (
+from sglang_tpu.mem_cache.allocator.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
-from sglang_tpu.kv_free_fence import install_kv_free_fence
+from sglang_tpu.mem_cache.kv_free_fence import install_kv_free_fence
 
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
@@ -607,7 +607,7 @@ class TestTpuImportOrder(CustomTestCase):
             sglang.srt.utils.is_tpu = lambda: True
             import sglang.srt.mem_cache.allocator.swa
             import sys
-            assert "sglang_tpu.kv_free_fence" in sys.modules
+            assert "sglang_tpu.mem_cache.kv_free_fence" in sys.modules
             """)
         completed = subprocess.run(
             [sys.executable, "-c", script],

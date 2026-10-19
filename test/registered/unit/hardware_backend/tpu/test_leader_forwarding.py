@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 import anyio
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu import leader_forwarding
+from sglang_tpu.entrypoints import leader_forwarding
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

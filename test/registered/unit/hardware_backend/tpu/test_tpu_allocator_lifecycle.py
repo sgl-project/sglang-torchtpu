@@ -11,12 +11,12 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.allocator_tpu import (
+from sglang_tpu.mem_cache.allocator.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
     host_return_allocators,
 )
-from sglang_tpu.kv_free_fence import install_kv_free_fence
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.mem_cache.kv_free_fence import install_kv_free_fence
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

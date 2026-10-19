@@ -9,12 +9,12 @@ maybe_stub_sgl_kernel()
 from sglang.srt.environ import envs
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
-from sglang_tpu.platform import TpuOOTPlatform
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.platforms.tpu_oot_platform import TpuOOTPlatform
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-_TPU_MOD = "sglang_tpu.tpu_platform"
+_TPU_MOD = "sglang_tpu.platforms.tpu_platform"
 _CHECKER_MOD = "sglang_tpu.compilation.recompilation_checker"
 
 

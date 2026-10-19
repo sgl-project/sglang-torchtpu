@@ -223,7 +223,7 @@ class TestLogitsProcessorGating(CustomTestCase):
     def test_non_last_stage_warms_only_full_vocab(self):
         policy = _policy(_model_runner(_pp_group(first=False, last=False)))
         with patch(
-            "sglang_tpu.sampler.distributed_top_k_candidate_width_for_model"
+            "sglang_tpu.layers.sampler.distributed_top_k_candidate_width_for_model"
         ) as width:
             self.assertIsNone(policy._distributed_top_k_width())
             self.assertEqual(

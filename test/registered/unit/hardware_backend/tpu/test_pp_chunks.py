@@ -5,7 +5,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import pytest
 
 from sglang.srt.runtime_context import get_context
-from sglang_tpu.pp_chunks import (
+from sglang_tpu.managers.pp_chunks import (
     StepCostModel,
     chunk_buckets,
     chunk_granularity,

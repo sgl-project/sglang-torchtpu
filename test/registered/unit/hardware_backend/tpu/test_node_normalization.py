@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_scope
-from sglang_tpu import node_normalization as normalization
+from sglang_tpu.entrypoints import node_normalization as normalization
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -108,7 +108,7 @@ class TestNodeNormalization(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang_tpu.node_normalization",
+                "sglang_tpu.entrypoints.node_normalization",
                 "--print_local_device_coords",
             ],
         )

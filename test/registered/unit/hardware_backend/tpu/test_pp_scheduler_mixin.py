@@ -22,13 +22,13 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors  # noqa:
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.test.test_utils import CustomTestCase  # noqa: E402
-from sglang_tpu import pp_scheduler  # noqa: E402
 from sglang_tpu.compilation.bucketer import (  # noqa: E402
     Bucketer,
 )
 from sglang_tpu.compilation.decoder_compile_policy import (  # noqa: E402
     DecoderTpuCompilePolicy,
 )
+from sglang_tpu.managers import pp_scheduler  # noqa: E402
 
 
 def _single_queue_scheduler(is_last_rank=False) -> SchedulerPPMixin:

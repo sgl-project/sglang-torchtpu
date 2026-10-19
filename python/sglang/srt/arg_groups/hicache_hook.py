@@ -179,7 +179,7 @@ def resolve_layout_io_compatibility(server_args: Any):
         # (the runtime context does not exist yet), and read both helpers
         # through the module, because plugins patch them to register their
         # own backends and pools.
-        from sglang_tpu import tpu_platform
+        from sglang_tpu.platforms import tpu_platform
 
         pool_cls = tpu_platform._mha_kv_pool_cls(cfg.attention_backend)
         if cfg.hicache_io_backend not in getattr(

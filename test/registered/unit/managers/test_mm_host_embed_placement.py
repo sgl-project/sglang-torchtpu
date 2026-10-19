@@ -15,7 +15,7 @@ import torch
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.mm_embed_tpu import embed_mm_on_host
+from sglang_tpu.managers.mm_embed_tpu import embed_mm_on_host
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

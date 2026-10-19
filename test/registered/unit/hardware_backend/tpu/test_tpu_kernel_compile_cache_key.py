@@ -17,12 +17,12 @@ from sglang.srt.environ import envs
 from sglang.srt.utils.patch_torch import monkey_patch_torch_tpu_env
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
-from sglang_tpu import compile_cache
+from sglang_tpu.compilation import compile_cache
 from sglang_tpu.envs import envs as tpu_envs
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-_PACKAGE_ROOT = Path(compile_cache.__file__).resolve().parent
+_PACKAGE_ROOT = Path(compile_cache.__file__).resolve().parents[1]
 _SGLANG_ROOT = Path(sglang.__file__).resolve().parent
 _SRT_ROOT = _SGLANG_ROOT / "srt"
 _TAG_PREFIX = "tpu-kernel-inputs-v1:"
@@ -37,10 +37,10 @@ class TestKernelInputsDigest(CustomTestCase):
 
     def setUp(self):
         self.root = Path(enter_scope(self, tempfile.TemporaryDirectory()))
-        self.write("sglang_tpu/kv_page_write.py", "out = pages\n")
-        self.write("sglang_tpu/attention/pallas/kernel.py", "block = 128\n")
+        self.write("sglang_tpu/mem_cache/kv_page_write.py", "out = pages\n")
+        self.write("sglang_tpu/layers/attention/pallas/kernel.py", "block = 128\n")
         self.write(
-            "sglang_tpu/moe/pallas/gmm.py",
+            "sglang_tpu/layers/moe/pallas/gmm.py",
             "FP32 = envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()\n",
         )
         self.write(
@@ -93,9 +93,9 @@ class TestKernelInputsDigest(CustomTestCase):
 
     def test_kernel_source_edits_change_the_digest(self):
         for path in (
-            "sglang_tpu/kv_page_write.py",
-            "sglang_tpu/attention/pallas/kernel.py",
-            "sglang_tpu/moe/pallas/gmm.py",
+            "sglang_tpu/mem_cache/kv_page_write.py",
+            "sglang_tpu/layers/attention/pallas/kernel.py",
+            "sglang_tpu/layers/moe/pallas/gmm.py",
             "sglang/srt/layers/moe/tpu_moe_utils.py",
         ):
             with self.subTest(path=path):
@@ -110,8 +110,8 @@ class TestKernelInputsDigest(CustomTestCase):
         (self.root / "sglang_tpu/kernels/new_kernel.py").unlink()
 
         # Moving a file changes the key even with identical contents.
-        old = self.root / "sglang_tpu/attention/pallas/kernel.py"
-        old.rename(self.root / "sglang_tpu/attention/pallas/renamed.py")
+        old = self.root / "sglang_tpu/layers/attention/pallas/kernel.py"
+        old.rename(self.root / "sglang_tpu/layers/attention/pallas/renamed.py")
         self.assertNotEqual(self.digest(), self.base)
 
     def test_code_outside_the_kernel_sources_is_left_to_the_fx_key(self):
@@ -302,7 +302,7 @@ class TestKernelInputsTag(CustomTestCase):
 class TestKernelInputsDigestAcrossProcesses(CustomTestCase):
     def test_fresh_processes_compute_the_same_digest(self):
         script = (
-            "from sglang_tpu import compile_cache\n"
+            "from sglang_tpu.compilation import compile_cache\n"
             "print(compile_cache.tpu_kernel_inputs_digest())\n"
         )
         digests = set()

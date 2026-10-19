@@ -6,7 +6,7 @@ import threading
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
 
 import torch
 

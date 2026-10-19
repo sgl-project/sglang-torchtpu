@@ -26,12 +26,12 @@ import torch
 
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
-from sglang_tpu.dflash_draft_kv_write import (
-    get_contiguous_slot_spans,
-)
-from sglang_tpu.kv_fused_rope_write import (
+from sglang_tpu.mem_cache.kv_fused_rope_write import (
     fused_rope_write_kv,
     fused_rope_write_kv_ref,
+)
+from sglang_tpu.speculative.dflash_draft_kv_write import (
+    get_contiguous_slot_spans,
 )
 
 DEVICE = "tpu:0"

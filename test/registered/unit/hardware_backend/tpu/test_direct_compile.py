@@ -554,8 +554,8 @@ class TestDirectCompile(CustomTestCase):
         from sglang.srt.compilation.compiled_op import (
             get_compiled_ops,
         )
-        from sglang_tpu import spec_op_precompile  # noqa: F401
-        from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
+        from sglang_tpu.speculative import spec_op_precompile  # noqa: F401
+        from sglang_tpu.speculative.spec_op_warmup import SpecOpWarmupContext
 
         cases = []
         with (

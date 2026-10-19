@@ -115,7 +115,7 @@ _is_npu = is_npu()
 _is_tpu = is_tpu()
 
 if _is_tpu:
-    from sglang_tpu.prefill_early_send import (
+    from sglang_tpu.disaggregation.prefill_early_send import (
         tpu_clip_cached_prefix_send_end,
         tpu_clip_hicache_load_send_end,
         tpu_update_inflight_kv_write_pages,

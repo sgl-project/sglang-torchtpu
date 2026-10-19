@@ -44,10 +44,10 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.dsv4.dsv4_attention_backend import (
+from sglang_tpu.layers.attention.dsv4.dsv4_attention_backend import (
     DSV4TPUAttnBackend,
 )
-from sglang_tpu.dsv4.dsv4_memory_pool import (
+from sglang_tpu.layers.attention.dsv4.dsv4_memory_pool import (
     DSV4TPUTokenToKVPool,
     TPUCompressStatePool,
 )
@@ -399,7 +399,7 @@ class TestDSV4TPUPatches(CustomTestCase):
             ATTENTION_BACKENDS,
             create_dsv4_backend,
         )
-        from sglang_tpu.tpu_platform import _register_attention_backends
+        from sglang_tpu.platforms.tpu_platform import _register_attention_backends
 
         original = ATTENTION_BACKENDS.get("dsv4")
         try:
@@ -441,11 +441,11 @@ class TestDSV4TPUPatches(CustomTestCase):
 
         with (
             patch(
-                "sglang_tpu.dsv4.dsv4_attention_backend.apply_tpu_dsv4_qnorm_rope",
+                "sglang_tpu.layers.attention.dsv4.dsv4_attention_backend.apply_tpu_dsv4_qnorm_rope",
                 side_effect=lambda q, pos, fc, eps: q * 2,
             ) as mock_qnorm_rope,
             patch(
-                "sglang_tpu.dsv4.dsv4_attention_backend.apply_tpu_dsv4_rope",
+                "sglang_tpu.layers.attention.dsv4.dsv4_attention_backend.apply_tpu_dsv4_rope",
                 side_effect=lambda x, pos, fc, inverse=False: x * 3,
             ) as mock_rope,
         ):

@@ -9,14 +9,14 @@ import torch
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pp_attention_capacity as capacity
+from sglang_tpu.layers.attention import pp_attention_capacity as capacity
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestResolvedPipelineGuard(CustomTestCase):
     def test_resolved_pipeline_enables_capacity_guard(self):
-        from sglang_tpu.attention_pallas_rpa_batched import (
+        from sglang_tpu.layers.attention.attention_pallas_rpa_batched import (
             BaseTpuPallasRpaAttnBackend,
             TpuPallasRpaBatchedAttnBackend,
         )

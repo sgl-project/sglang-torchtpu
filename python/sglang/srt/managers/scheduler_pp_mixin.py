@@ -45,7 +45,7 @@ _PP_PD_CONSENSUS_TAG = 0x5050
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang_tpu.pp_scheduler import PPDecodeTransferStatus
+    from sglang_tpu.managers.pp_scheduler import PPDecodeTransferStatus
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -222,7 +222,7 @@ class SchedulerPPMixin:
     # otherwise over the host channel. Each helper dispatches once; the wait
     # on the output copy event is the same on both.
     def _pp_init_wave(self: Scheduler):
-        from sglang_tpu.pp_scheduler import (
+        from sglang_tpu.managers.pp_scheduler import (
             build_scheduler_pp_wave,
         )
 
@@ -2152,7 +2152,7 @@ class SchedulerPPMixin:
         if self._pp_wave is not None:
             # Over the wave every stage polls its own receivers and the status
             # carries the failures seen by any stage.
-            from sglang_tpu.pp_scheduler import (
+            from sglang_tpu.managers.pp_scheduler import (
                 decode_transfer_status,
             )
 
@@ -2229,7 +2229,7 @@ class SchedulerPPMixin:
         if release_rids is not None:
             terminal_rids = release_rids
             if self._pp_wave is not None:
-                from sglang_tpu.pp_scheduler import (
+                from sglang_tpu.managers.pp_scheduler import (
                     abort_failed_receivers,
                 )
 

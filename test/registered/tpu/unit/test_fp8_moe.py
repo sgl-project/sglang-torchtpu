@@ -8,12 +8,12 @@ import torch
 import torch.nn.functional as F
 
 import sglang.srt.layers.quantization.fp8 as fp8_mod
-import sglang_tpu.fp8_moe as tpu_fp8_moe
-import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op_module
+import sglang_tpu.layers.moe.pallas.fused_moe_op as fused_moe_op_module
+import sglang_tpu.layers.quantization.fp8_moe as tpu_fp8_moe
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.moe.pallas.fused_moe_op import (
+from sglang_tpu.layers.moe.pallas.fused_moe_op import (
     _build_fused_moe_op,
     fused_moe_call,
 )

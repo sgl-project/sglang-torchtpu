@@ -32,8 +32,8 @@ DIM = 3 * N_V * D
 @unittest.skipUnless(_HAS_TPU, "requires a JAX TPU backend")
 class TestKdaSpecVerify(CustomTestCase):
     def _kernel(self, num_spec_tokens, batched_only=True):
-        from sglang_tpu.attention.pallas.gdn import wrapper
-        from sglang_tpu.attention.pallas.gdn.config import AttentionMode
+        from sglang_tpu.layers.attention.pallas.gdn import wrapper
+        from sglang_tpu.layers.attention.pallas.gdn.config import AttentionMode
 
         def run(qkv, b, a, conv, rec, packed, qsl, idx, dist, seq_lens, offsets):
             return wrapper.fused_conv1d_gdn(
@@ -66,7 +66,7 @@ class TestKdaSpecVerify(CustomTestCase):
         return jax.jit(run)
 
     def test_window_checkpoints_match_sequential_decode(self):
-        from sglang_tpu.kda_layout import (
+        from sglang_tpu.layers.attention.linear.kda_layout import (
             kda_packed_weights_shape,
         )
 

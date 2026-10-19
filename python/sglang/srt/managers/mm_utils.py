@@ -556,7 +556,7 @@ def embed_mm_inputs(
 
     # 4. scatter embeddings into input embedding
     if _is_tpu and not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
-        from sglang_tpu.mm_embed_tpu import embed_mm_on_host
+        from sglang_tpu.managers.mm_embed_tpu import embed_mm_on_host
 
         input_embeds, input_deepstack_embeds = embed_mm_on_host(
             input_embeds=input_embeds,

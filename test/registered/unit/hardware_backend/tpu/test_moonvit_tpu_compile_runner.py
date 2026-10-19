@@ -7,7 +7,7 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang_tpu.graph_runner.moonvit_tpu_compile_runner import (
+from sglang_tpu.multimodal.moonvit_tpu_compile_runner import (
     MoonVitTpuCompilePolicy,
     MoonVitTpuCompileRunner,
 )

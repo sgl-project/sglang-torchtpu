@@ -80,7 +80,7 @@ class TpuEnvs:
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(16384)
 
     # Speculative decoding
-    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
+    # Route DFLASH/DSPARK to sglang_tpu.speculative.block_spec_worker.TpuBlockSpecWorker and EAGLE3
     # to TpuEagle3Worker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8

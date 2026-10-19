@@ -85,7 +85,7 @@ class TestRecompilationChecker(CustomTestCase):
         frames = [
             traceback.FrameSummary("/venv/torch/dispatch.py", 1, "dispatch"),
             traceback.FrameSummary("/repo/python/sglang/srt/runner.py", 20, "run"),
-            traceback.FrameSummary("/repo/sglang_tpu/sampler.py", 30, "sample"),
+            traceback.FrameSummary("/repo/sglang_tpu/layers/sampler.py", 30, "sample"),
             traceback.FrameSummary(recompilation_checker.__file__, 40, "trace"),
         ]
         with patch.object(
@@ -94,7 +94,7 @@ class TestRecompilationChecker(CustomTestCase):
             site = recompilation_checker._describe_site("aten.add", (), {})
         self.assertEqual(
             site,
-            "aten.add() @ sglang_tpu/sampler.py:30 <- sglang/srt/runner.py:20",
+            "aten.add() @ sglang_tpu/layers/sampler.py:30 <- sglang/srt/runner.py:20",
         )
 
     def test_baseline_entries_are_not_reported(self):
@@ -397,7 +397,7 @@ class TestSharedChecker(CustomTestCase):
         self.assertEqual(checker.check(context_fn=_context).durations_ms, (50,))
 
     def test_speculative_op_warmup_refreshes_shared_baseline(self):
-        from sglang_tpu import spec_op_precompile
+        from sglang_tpu.speculative import spec_op_precompile
 
         def warmup(cache):
             op = SimpleNamespace(

@@ -10,7 +10,7 @@ from unittest.mock import patch
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.profiler import (
+from sglang_tpu.utils.profiler import (
     _tpu_profile_options,
     start_tpu_profile,
     stop_tpu_profile,

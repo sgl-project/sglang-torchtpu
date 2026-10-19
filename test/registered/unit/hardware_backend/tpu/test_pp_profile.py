@@ -9,7 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.pp_profile import (
+from sglang_tpu.managers.pp_profile import (
     profile_cache,
     set_profile_inputs,
 )

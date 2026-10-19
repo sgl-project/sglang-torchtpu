@@ -39,7 +39,7 @@ def worker():
 
     # The Pallas kernel is lowered inside the compiled graph; FX sees only the
     # opaque custom op.
-    from sglang_tpu.kv_page_write import get_write_pages_op
+    from sglang_tpu.mem_cache.kv_page_write import get_write_pages_op
 
     write_pages = get_write_pages_op()
 

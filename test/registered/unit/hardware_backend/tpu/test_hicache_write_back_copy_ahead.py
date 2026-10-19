@@ -1,4 +1,4 @@
-"""Unit tests for write_back copy-ahead (sglang_tpu/hicache_write_back_copy_ahead.py).
+"""Unit tests for write_back copy-ahead (sglang_tpu/mem_cache/hicache_write_back_copy_ahead.py).
 
 A real FULL-only ``UnifiedRadixCache`` on CPU with a fake raiden controller
 whose D2H futures complete only when the test says so. Covers the contracts
@@ -35,17 +35,17 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import hicache_write_back_copy_ahead as copy_ahead_module
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.hicache_write_back_copy_ahead import (
+from sglang_tpu.mem_cache import hicache_write_back_copy_ahead as copy_ahead_module
+from sglang_tpu.mem_cache.hicache_write_back_copy_ahead import (
     WriteBackCopyAhead,
     attach_copy_ahead,
     resolve_copy_ahead_tokens,
 )
-from sglang_tpu.raiden_hybrid_cache_controller import (
+from sglang_tpu.mem_cache.hybrid_cache.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
-from sglang_tpu.raiden_transfer import NOOP_EVENT
+from sglang_tpu.mem_cache.raiden_transfer import NOOP_EVENT
 
 FULL = ComponentType.FULL
 

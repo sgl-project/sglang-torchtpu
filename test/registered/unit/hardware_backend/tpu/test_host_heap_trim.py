@@ -12,8 +12,8 @@ import weakref
 from unittest.mock import MagicMock, patch
 
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import host_heap_trim as tpu
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.utils import host_heap_trim as tpu
 
 
 class _Scheduler:

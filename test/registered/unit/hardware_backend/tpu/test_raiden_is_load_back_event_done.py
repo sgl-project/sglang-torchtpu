@@ -21,7 +21,7 @@ from sglang.srt.managers.cache_controller import BatchDoneCounter
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import patches
-from sglang_tpu.raiden_hybrid_cache_controller import (
+from sglang_tpu.mem_cache.hybrid_cache.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
 

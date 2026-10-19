@@ -1,6 +1,8 @@
-"""Moved to :mod:`sglang_tpu.fp8_moe`; alias kept for in-flight branches, delete once they merge."""
+"""Moved to :mod:`sglang_tpu.layers.quantization.fp8_moe`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib
 import sys
 
-sys.modules[__name__] = importlib.import_module("sglang_tpu.fp8_moe")
+sys.modules[__name__] = importlib.import_module(
+    "sglang_tpu.layers.quantization.fp8_moe"
+)

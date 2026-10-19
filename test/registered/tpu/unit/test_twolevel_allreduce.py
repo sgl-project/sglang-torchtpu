@@ -29,7 +29,7 @@ class TestTwoLevelAllReduce(CustomTestCase):
         from jax.sharding import Mesh
         from jax.sharding import PartitionSpec as P
 
-        from sglang_tpu.twolevel_allreduce import twolevel_all_reduce_local
+        from sglang_tpu.distributed.twolevel_allreduce import twolevel_all_reduce_local
 
         world = len(_DEVICES)
         mesh = Mesh(np.array(_DEVICES), ("model",))
@@ -80,7 +80,7 @@ class TestTwoLevelAllReduce(CustomTestCase):
         from jax.sharding import Mesh
         from jax.sharding import PartitionSpec as P
 
-        from sglang_tpu.twolevel_allreduce import twolevel_all_reduce_local
+        from sglang_tpu.distributed.twolevel_allreduce import twolevel_all_reduce_local
 
         world = len(_DEVICES)
         local = world // 2

@@ -23,7 +23,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
-    from sglang_tpu.kv_free_fence import KVFreeFence
+    from sglang_tpu.mem_cache.kv_free_fence import KVFreeFence
 
 
 class MambaFullCacheDonor(Protocol):

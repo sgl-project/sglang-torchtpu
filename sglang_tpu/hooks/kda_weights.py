@@ -26,7 +26,7 @@ from typing import Any
 
 def bind_glm5_next_kda_weights(result: None, model: Any, *args, **kwargs) -> None:
     from sglang.srt.models.glm5_next import Glm5NextLinearAttention
-    from sglang_tpu.kda_layout import pack_kda_weights
+    from sglang_tpu.layers.attention.linear.kda_layout import pack_kda_weights
 
     for module in model.modules():
         if not isinstance(module, Glm5NextLinearAttention):

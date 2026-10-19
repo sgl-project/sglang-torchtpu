@@ -64,11 +64,11 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReq,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
-from sglang_tpu.kv_pool_host import (
+from sglang_tpu.mem_cache.pool_host.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
 )
-from sglang_tpu.raiden_transfer import (
+from sglang_tpu.mem_cache.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
     RaidenFutureEvent,
@@ -190,7 +190,9 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
                         return_value=host_base.HICACHE_HOST_MEMORY_RESERVE_BYTES
                         + budget * 8,
                     ),
-                    patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer,
+                    patch(
+                        "sglang_tpu.mem_cache.raiden_transfer.RaidenKVTransfer"
+                    ) as transfer,
                 ):
                     if budget < requested:
                         with self.assertRaisesRegex(
@@ -206,8 +208,8 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
 
     def test_explicit_hybrid_pools_share_one_budget(self):
         """Full and SWA pools must not each spend the same host-memory allowance."""
-        from sglang_tpu.platform import TpuOOTPlatform
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.platforms.tpu_oot_platform import TpuOOTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
             for host_size in (0, 16_384 / 1e9):
@@ -215,8 +217,8 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
 
     def test_native_or_disabled_hicache_does_not_reserve_raiden_budget(self):
         """The Raiden policy must not consume headroom for other cache paths."""
-        from sglang_tpu.platform import TpuOOTPlatform
-        from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.platforms.tpu_oot_platform import TpuOOTPlatform
+        from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
         for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
             for io_backend, enabled in (("torch_tpu", True), ("raiden", False)):
@@ -253,7 +255,7 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
                 "available_host_memory_bytes",
                 return_value=host_base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 30_000 * 8,
             ),
-            patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer,
+            patch("sglang_tpu.mem_cache.raiden_transfer.RaidenKVTransfer") as transfer,
         ):
             with auto_size_hicache(None, None, enabled=True):
                 full = self._host_pool(host_size=host_size, pool_label="full")
@@ -290,8 +292,12 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 "available_host_memory_bytes",
                 return_value=host_base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1024,
             ),
-            patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer_cls,
-            self.assertLogs("sglang_tpu.kv_pool_host", level="WARNING") as logs,
+            patch(
+                "sglang_tpu.mem_cache.raiden_transfer.RaidenKVTransfer"
+            ) as transfer_cls,
+            self.assertLogs(
+                "sglang_tpu.mem_cache.pool_host.kv_pool_host", level="WARNING"
+            ) as logs,
         ):
             pool = TpuRaidenHostKVCache(
                 device_pool,
@@ -2735,7 +2741,7 @@ class TestRaidenFutureEvent(CustomTestCase):
     def test_query_raises_once_pending_past_the_deadline(self):
         """A copy that never lands must stop the scheduler when polled, as a
         blocking wait does, instead of holding its pages and every later ack."""
-        monotonic = "sglang_tpu.raiden_transfer.time.monotonic"
+        monotonic = "sglang_tpu.mem_cache.raiden_transfer.time.monotonic"
         with envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.override(60.0):
             with patch(monotonic, return_value=1000.0):
                 pending = RaidenFutureEvent(_FakeFuture(ready_after=10**6))

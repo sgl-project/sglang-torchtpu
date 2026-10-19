@@ -63,7 +63,7 @@ def _call_production_kernel(
     """
     # Lazy import so the module loads on hosts without JAX (the
     # @skipUnless decorator below will skip the whole class there).
-    from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+    from sglang_tpu.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
     topk = int(topk_ids.shape[-1])
     return _fused_moe_jax(
@@ -315,7 +315,7 @@ class TestFusedMoEJaxKernelGuards(unittest.TestCase):
         """SGLang spells the GPT-OSS gating ``swiglu_oai``; gmm_v2's
         in-kernel ``fuse_act`` spells it ``swigluoai``. Both spellings must
         map through, since the activation is applied inside GMM1."""
-        from sglang_tpu.moe.pallas.fused_moe_op import _fuse_act_name
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fuse_act_name
 
         self.assertEqual(_fuse_act_name("swiglu_oai"), "swigluoai")
         self.assertEqual(_fuse_act_name("swigluoai"), "swigluoai")
@@ -326,7 +326,7 @@ class TestFusedMoEJaxKernelGuards(unittest.TestCase):
         the offending value, so a model that requests a new activation
         gets a clear failure mode.
         """
-        from sglang_tpu.moe.pallas.fused_moe_op import _fuse_act_name
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fuse_act_name
 
         with self.assertRaises(NotImplementedError) as cm:
             _fuse_act_name("relu2")
@@ -364,7 +364,7 @@ class TestFusedMoEPaddedIntermediate(unittest.TestCase):
     K = 2944  # hidden padded to 128 lanes
 
     def _padded_inter(self):
-        from sglang_tpu.moe.pallas.gmm_v2 import pad_size_n_to_fewest_tiles
+        from sglang_tpu.layers.moe.pallas.gmm_v2 import pad_size_n_to_fewest_tiles
 
         return pad_size_n_to_fewest_tiles(
             self.K, self.INTER, jnp.bfloat16, fuse_act="swigluoai"
@@ -372,7 +372,7 @@ class TestFusedMoEPaddedIntermediate(unittest.TestCase):
 
     def _gmm1_tile_n(self, size_m, size_n):
         """The N tile make_gmm_configs runs for GMM1 on this chip."""
-        from sglang_tpu.moe.pallas import gmm_v2
+        from sglang_tpu.layers.moe.pallas import gmm_v2
 
         spec = jax.ShapeDtypeStruct
         return gmm_v2.make_gmm_configs(
@@ -425,7 +425,7 @@ class TestFusedMoEPaddedIntermediate(unittest.TestCase):
     def test_padded_intermediate_matches_the_128_aligned_width(self):
         """Zero gate/up columns and bias give zero activations, which meet
         zero rows of w2, so only the accumulation order may differ."""
-        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
         g, topk = 8, 4
         hidden, w1, w2, topk_weights, topk_ids = _make_inputs(

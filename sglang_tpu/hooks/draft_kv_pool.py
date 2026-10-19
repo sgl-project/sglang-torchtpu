@@ -25,7 +25,7 @@ from __future__ import annotations
 def _draft_pool_cls(backend: str | None):
     if backend is None:
         return None
-    from sglang_tpu.tpu_platform import _mha_kv_pool_cls
+    from sglang_tpu.platforms.tpu_platform import _mha_kv_pool_cls
 
     return _mha_kv_pool_cls(backend)
 
@@ -54,7 +54,7 @@ def draft_cell_size_per_token(
         tp_size=tp_size,
     )
     from sglang.srt.runtime_context import get_spec
-    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang_tpu.mem_cache.kv_pool import TpuFusedMHATokenToKVPool
 
     pool_cls = _draft_pool_cls(get_spec().speculative_draft_attention_backend)
     if (

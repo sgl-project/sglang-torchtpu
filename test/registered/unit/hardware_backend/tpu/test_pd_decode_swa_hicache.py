@@ -57,11 +57,11 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pd_decode_swa_hicache as tpu
+from sglang_tpu.disaggregation import pd_decode_swa_hicache as tpu
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
 BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
-TPU = "sglang_tpu.pd_decode_swa_hicache"
+TPU = "sglang_tpu.disaggregation.pd_decode_swa_hicache"
 
 
 @contextlib.contextmanager

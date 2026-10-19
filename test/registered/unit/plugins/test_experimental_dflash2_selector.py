@@ -11,7 +11,7 @@ import torch._dynamo.config
 from sglang.srt.models.dflash import CandidateSelector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.experimental.models.dflash2 import (
+from sglang_tpu.speculative.dflash.dflash2 import (
     build_lattice,
     sample_draft_tokens,
     sample_drafts,

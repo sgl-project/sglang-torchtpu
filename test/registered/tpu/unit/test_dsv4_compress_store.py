@@ -33,13 +33,13 @@ import numpy as np
 from absl.testing import parameterized
 from jax._src import test_util as jtu
 
-from sglang_tpu.compile_cache import initialize_jax_compile_cache
-from sglang_tpu.dsv4.compress_and_store import (
+from sglang_tpu.compilation.compile_cache import initialize_jax_compile_cache
+from sglang_tpu.layers.attention.dsv4.compress_and_store import (
     compress_store_ref,
     config,
 )
-from sglang_tpu.dsv4.compress_and_store import kernel as compress_store
-from sglang_tpu.dsv4.compress_and_store import (
+from sglang_tpu.layers.attention.dsv4.compress_and_store import kernel as compress_store
+from sglang_tpu.layers.attention.dsv4.compress_and_store import (
     project_and_save_state_ref as proj_and_save_state_ref,
 )
 

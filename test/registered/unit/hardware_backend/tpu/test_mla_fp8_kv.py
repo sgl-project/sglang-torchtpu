@@ -14,16 +14,16 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_pallas_mla import (
+from sglang_tpu.layers.attention.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
-from sglang_tpu.attention_pallas_mla_sparse import (
+from sglang_tpu.layers.attention.attention_pallas_mla_sparse import (
     TpuPallasSparseMlaAttnBackend,
 )
-from sglang_tpu.attention_pallas_rpa_base import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
-from sglang_tpu.kv_pool import (
+from sglang_tpu.mem_cache.kv_pool import (
     TpuFusedMLATokenToKVPool,
     TpuSplitMLATokenToKVPool,
     _zeros_kv_buffer,

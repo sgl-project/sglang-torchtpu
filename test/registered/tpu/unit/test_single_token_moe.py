@@ -71,8 +71,8 @@ class TestSingleTokenMoe(CustomTestCase):
     ):
         """_fused_moe_jax output, and whether the fused kernel ran."""
         from sglang_tpu.envs import envs as tpu_envs
-        from sglang_tpu.moe.pallas import single_token_moe
-        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.layers.moe.pallas import single_token_moe
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
         weights = self.weights if weights is None else weights
         x = self.x if x is None else x
@@ -166,7 +166,7 @@ class TestSingleTokenMoe(CustomTestCase):
         )
 
     def test_validated_gate(self):
-        from sglang_tpu.moe.pallas.single_token_moe import validated
+        from sglang_tpu.layers.moe.pallas.single_token_moe import validated
 
         for n in (3072, 1536, 768, 384):  # any TP split of the intermediate
             self.assertTrue(validated(3584, n, 896, 16, "situ:4.0:25.0"))

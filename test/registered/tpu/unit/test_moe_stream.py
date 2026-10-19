@@ -59,10 +59,11 @@ class TestMoeStreamBs1(CustomTestCase):
 
     def routed(self, x, ids, wts):
         """The route-meta + gmm_v2 path, with the streaming dispatch disabled."""
-        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
         with mock.patch(
-            "sglang_tpu.moe.pallas.moe_stream.maybe_moe_stream", return_value=None
+            "sglang_tpu.layers.moe.pallas.moe_stream.maybe_moe_stream",
+            return_value=None,
         ):
             return _fused_moe_jax(
                 x,
@@ -80,7 +81,7 @@ class TestMoeStreamBs1(CustomTestCase):
             )
 
     def test_bit_identical_to_route_meta_path(self):
-        from sglang_tpu.moe.pallas.moe_stream import moe_stream_bs1
+        from sglang_tpu.layers.moe.pallas.moe_stream import moe_stream_bs1
 
         for seed in range(5):
             with self.subTest(seed=seed):
@@ -94,7 +95,7 @@ class TestMoeStreamBs1(CustomTestCase):
                 )
 
     def test_padded_slots_contribute_nothing(self):
-        from sglang_tpu.moe.pallas.moe_stream import moe_stream_bs1
+        from sglang_tpu.layers.moe.pallas.moe_stream import moe_stream_bs1
 
         x, ids, wts = self.inputs(1)
         padded = ids.at[0, TOPK // 2 :].set(-1)
@@ -113,7 +114,7 @@ class TestMoeStreamBs1(CustomTestCase):
         )
 
     def test_dispatch_runs_stream_kernel(self):
-        from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _fused_moe_jax
 
         x, ids, wts = self.inputs(2)
         out = _fused_moe_jax(
@@ -136,7 +137,7 @@ class TestMoeStreamBs1(CustomTestCase):
         )
 
     def test_dispatch_declines_outside_its_case(self):
-        from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
+        from sglang_tpu.layers.moe.pallas.moe_stream import maybe_moe_stream
 
         x, ids, wts = self.inputs(0)
         common = dict(activation_name=f"silu_and_mul_clamp:{LIMIT}", w_quant_bits=0)
@@ -223,7 +224,7 @@ class TestMoeStreamBs1(CustomTestCase):
     def test_few_tokens_match_route_meta_path(self):
         """Verify windows (2..8 tokens) match the routed path up to the f32
         combine order, including shared experts and padding rows."""
-        from sglang_tpu.moe.pallas.moe_stream import moe_stream_few_tokens
+        from sglang_tpu.layers.moe.pallas.moe_stream import moe_stream_few_tokens
 
         for tokens, seed, pad in ((2, 10, False), (6, 11, False), (8, 12, True)):
             with self.subTest(tokens=tokens, pad=pad):

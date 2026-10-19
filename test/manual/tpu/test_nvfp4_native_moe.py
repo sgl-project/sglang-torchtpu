@@ -165,7 +165,7 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
             apply_tpu_patches()
         except Exception:  # pragma: no cover
             pass
-        from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
 
         cls.op = _build_fused_moe_op()
         cls.device = "tpu"
@@ -180,10 +180,10 @@ class TestNativeNvfp4FusedMoE(unittest.TestCase):
         return hs, topk_ids, topk_w
 
     def test_native_matches_bf16(self):
-        from sglang_tpu.fp4_moe import (
+        from sglang_tpu.layers.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang_tpu.layers.quantization.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
-        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         # Real routed-MoE expert shapes: hidden 4096, intermediate 4096, top-8.
         # E is a small subset of the full expert count (the kernel loops over

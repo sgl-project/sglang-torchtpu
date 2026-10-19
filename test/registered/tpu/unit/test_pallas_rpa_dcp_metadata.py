@@ -38,18 +38,18 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.allocator_tpu import (
-    TpuPagedTokenToKVPoolAllocator,
-)
-from sglang_tpu.attention_pallas_rpa_batched import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_batched import (
     PallasForwardMetadata,
     TpuPallasRpaBatchedAttnBackend,
 )
-from sglang_tpu.attention_pallas_rpa_dcp import (
+from sglang_tpu.layers.attention.attention_pallas_rpa_dcp import (
     build_owner_write_spans,
     max_write_spans,
 )
-from sglang_tpu.host_metadata_cache import HostMetadataCache
+from sglang_tpu.layers.attention.host_metadata_cache import HostMetadataCache
+from sglang_tpu.mem_cache.allocator.allocator_tpu import (
+    TpuPagedTokenToKVPoolAllocator,
+)
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 

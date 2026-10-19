@@ -5,7 +5,7 @@ register_attn_residual_ops, prepare_attn_residual_kernel, aggregate,
 aggregate_fused_add
   Why: attn_residual picks its aggregation implementation with in-module
        CUDA/HIP gates and has no backend seam, and the TPU Pallas decode kernel
-       (sglang_tpu.kimi_attn_residual) must stay out of core.
+       (sglang_tpu.layers.kimi_attn_residual) must stay out of core.
   How: AFTER KimiK3LinearModel.__init__ registers the kernel's custom ops
        before torch.compile traces the model. AFTER
        KimiK3LinearForCausalLM.post_load_weights builds the kernel's fp32
@@ -24,7 +24,7 @@ import importlib
 from types import ModuleType
 from typing import Any, Callable
 
-_KERNEL_MODULE = "sglang_tpu.kimi_attn_residual"
+_KERNEL_MODULE = "sglang_tpu.layers.kimi_attn_residual"
 
 # The kernel module once a model with attention residuals was built with the
 # flag set, else None. Aggregation checks this module global, a constant under

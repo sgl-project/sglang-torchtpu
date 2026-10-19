@@ -57,8 +57,6 @@ from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import sampler as tpu_sampler_module
-from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
@@ -80,13 +78,18 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
-from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.mamba_pool import TpuMambaPool
-from sglang_tpu.sampler import select_logits_output_mode
-from sglang_tpu.top_k import (
+from sglang_tpu.layers import sampler as tpu_sampler_module
+from sglang_tpu.layers.attention.linear.attention_gdn_pallas import (
+    GdnTracedMetadata,
+    TpuGDNAttnBackend,
+)
+from sglang_tpu.layers.sampler import select_logits_output_mode
+from sglang_tpu.layers.top_k import (
     PallasDistributedTopKConfig,
     TpuVocabShard,
 )
+from sglang_tpu.mem_cache.mamba_pool import TpuMambaPool
+from sglang_tpu.sampling.sampling_batch_info import HostPaddedSamplingInfo
 
 
 class _FakeAttnBackend:
@@ -1878,7 +1881,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy = _make_distributed_top_k_policy()
 
         with patch(
-            "sglang_tpu.sampler.distributed_top_k_min_batch_size",
+            "sglang_tpu.layers.sampler.distributed_top_k_min_batch_size",
             return_value=64,
         ):
             self.assertEqual(
@@ -2068,7 +2071,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         policy._run_one = MagicMock()
 
         with (
-            patch("sglang_tpu.mm_embed_tpu.apply_host_mm_embeds") as warmed,
+            patch("sglang_tpu.managers.mm_embed_tpu.apply_host_mm_embeds") as warmed,
             get_parallel().override(
                 tp_size=2,
                 tp_rank=1,
@@ -2141,7 +2144,7 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
             patch.object(envs.SGLANG_DIRECT_COMPILE_ASYNC, "get", return_value=True),
             patch.object(policy, "_supports_async_warmup", return_value=True),
             patch(
-                "sglang_tpu.pp_profile.set_profile_inputs",
+                "sglang_tpu.managers.pp_profile.set_profile_inputs",
                 side_effect=lambda policy, batch, args, kwargs, tokens, prefix: (
                     args,
                     kwargs,

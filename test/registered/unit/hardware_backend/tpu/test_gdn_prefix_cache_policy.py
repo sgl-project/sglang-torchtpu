@@ -14,8 +14,8 @@ from sglang.srt.configs import Qwen3NextConfig
 from sglang.srt.mem_cache import kv_cache_builder as builder
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.platform import TpuOOTPlatform
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.platforms.tpu_oot_platform import TpuOOTPlatform
+from sglang_tpu.platforms.tpu_platform import TpuSRTPlatform
 
 
 class TestTpuPrefixCachePolicy(CustomTestCase):

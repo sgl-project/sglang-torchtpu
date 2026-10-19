@@ -13,7 +13,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.base.conn import KVPoll  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.utils.common import point_to_point_pyobj  # noqa: E402
-from sglang_tpu.pp_scheduler import (  # noqa: E402
+from sglang_tpu.managers.pp_scheduler import (  # noqa: E402
     PPDecodeTransferStatus,
 )
 

@@ -358,7 +358,7 @@ class MuseSparkMoE(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(self.num_experts, dtype=torch.float32), requires_grad=False
         )
-        from sglang_tpu.moe.expert_tp import is_fused_moe_rs_expert_tp
+        from sglang_tpu.layers.moe.expert_tp import is_fused_moe_rs_expert_tp
 
         # With expert TP, the small decode-sized projection outputs are gathered
         # by the one-shot Pallas all-gather, as the fused-RS output is.
@@ -366,7 +366,9 @@ class MuseSparkMoE(nn.Module):
             parallel.moe_ep_size, parallel.moe_tp_size, parallel.tp_size
         )
         if self.oneshot_gather:
-            from sglang_tpu.oneshot_collectives import get_oneshot_all_gather_op
+            from sglang_tpu.distributed.oneshot_collectives import (
+                get_oneshot_all_gather_op,
+            )
 
             get_oneshot_all_gather_op(self.tp_size)
             self.register_buffer(
@@ -467,7 +469,7 @@ class MuseSparkMoE(nn.Module):
         if shard.numel() * shard.element_size() > 256 * 1024:
             # Prefill-sized shards: XLA's bandwidth-oriented all-gather.
             return tensor_model_parallel_all_gather(shard.contiguous())
-        from sglang_tpu.oneshot_collectives import oneshot_all_gather
+        from sglang_tpu.distributed.oneshot_collectives import oneshot_all_gather
 
         tokens, cols = shard.shape
         full = oneshot_all_gather(
@@ -658,8 +660,8 @@ class MuseSparkForConditionalGeneration(nn.Module):
         experts it reads, and before the KV pool is sized, so the budget counts them."""
         if not self._megakernel_enabled:
             return
-        from sglang_tpu.fp8_lm_head import TpuFp8LmHeadMethod
-        from sglang_tpu.muse_megakernel.ops import MuseMegakernel
+        from sglang_tpu.layers.quantization.fp8_lm_head import TpuFp8LmHeadMethod
+        from sglang_tpu.models.muse_megakernel.ops import MuseMegakernel
 
         self._megakernel = MuseMegakernel.from_model(self)
         # The megakernel path also takes the fp8 weight-only LM head.

@@ -268,7 +268,7 @@ class DFlashDraftInputV2(SpecInput):
         """Record this step's device-resident verify addressing, if eligible."""
         plan = None
         if _is_tpu:
-            from sglang_tpu.dflash_utils_tpu import (
+            from sglang_tpu.speculative.dflash_utils_tpu import (
                 plan_dflash_device_accept,
             )
 

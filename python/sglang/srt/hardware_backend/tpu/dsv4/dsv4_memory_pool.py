@@ -1,6 +1,8 @@
-"""Moved to :mod:`sglang_tpu.dsv4.dsv4_memory_pool`; alias kept for in-flight branches, delete once they merge."""
+"""Moved to :mod:`sglang_tpu.layers.attention.dsv4.dsv4_memory_pool`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib
 import sys
 
-sys.modules[__name__] = importlib.import_module("sglang_tpu.dsv4.dsv4_memory_pool")
+sys.modules[__name__] = importlib.import_module(
+    "sglang_tpu.layers.attention.dsv4.dsv4_memory_pool"
+)

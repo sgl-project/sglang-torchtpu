@@ -33,15 +33,15 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.kv_free_fence import KVFreeFence, fence_hicache_backups
-from sglang_tpu.kv_pool_host import (
+from sglang_tpu.mem_cache.hybrid_cache.raiden_hybrid_cache_controller import (
+    TpuRaidenHybridCacheController,
+)
+from sglang_tpu.mem_cache.kv_free_fence import KVFreeFence, fence_hicache_backups
+from sglang_tpu.mem_cache.pool_host.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
 )
-from sglang_tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
-)
-from sglang_tpu.raiden_transfer import RaidenKVTransfer
+from sglang_tpu.mem_cache.raiden_transfer import RaidenKVTransfer
 
 
 class _FakeFuture:

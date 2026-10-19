@@ -62,7 +62,7 @@ from torch.distributed import barrier
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
-    from sglang_tpu.kv_free_fence import KVFreeFence
+    from sglang_tpu.mem_cache.kv_free_fence import KVFreeFence
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
@@ -1383,7 +1383,7 @@ class Scheduler(
         self._tpu_pp_chunk_cost = None
         self._tpu_pp_cached_prefix = {}
         if current_platform.is_tpu() and get_parallel().pp_size > 1:
-            from sglang_tpu.pp_chunk_scheduler import (
+            from sglang_tpu.managers.pp_chunk_scheduler import (
                 profile_and_install_cost_model,
             )
 
@@ -1678,7 +1678,7 @@ class Scheduler(
             and self.enable_overlap
             and envs.SGLANG_TPU_ASYNC_COPY_WORKER.get()
         ):
-            from sglang_tpu.result_copy_worker import (
+            from sglang_tpu.managers.result_copy_worker import (
                 TPUAsyncCopyWorker,
             )
 
@@ -1787,7 +1787,7 @@ class Scheduler(
         Raises if the fence cannot cover every KV write of this server."""
         if not self._needs_kv_free_fence():
             return
-        from sglang_tpu.kv_free_fence import (
+        from sglang_tpu.mem_cache.kv_free_fence import (
             fence_hicache_backups,
             install_kv_free_fence,
             kv_free_fence_unsupported_reason,
@@ -1825,7 +1825,7 @@ class Scheduler(
         from sglang_tpu.compilation.spec_decode_compile_policy import (
             BaseSpecDecodeCompilePolicyMixin,
         )
-        from sglang_tpu.spec_op_precompile import (
+        from sglang_tpu.speculative.spec_op_precompile import (
             precompile_spec_v2_ops,
         )
 
@@ -4226,7 +4226,7 @@ class Scheduler(
         adder_cls = PrefillAdder
         adder_kwargs = {}
         if self._tpu_pp_chunk_cost is not None:
-            from sglang_tpu.pp_chunk_scheduler import (
+            from sglang_tpu.managers.pp_chunk_scheduler import (
                 TpuPipelinePrefillAdder,
                 pending_step_limit,
             )
@@ -4450,7 +4450,7 @@ class Scheduler(
                 and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
                 and adder.host_load_indices
             ):
-                from sglang_tpu.prefill_early_send import (
+                from sglang_tpu.disaggregation.prefill_early_send import (
                     tpu_hicache_load_page_ids,
                 )
 

@@ -20,8 +20,8 @@ fork already satisfies the plugin's `sglang` requirement.
 
 | Mode | Select with | Platform class | `is_out_of_tree()` | Status |
 |---|---|---|---|---|
-| A (default) | `SGLANG_PLATFORM=tpu` or unset | `sglang_tpu.tpu_platform.TpuSRTPlatform` (`PlatformEnum.TPU`) | False | the shipped path |
-| B | `SGLANG_PLATFORM=tpu_oot` | `sglang_tpu.platform.TpuOOTPlatform` (`PlatformEnum.OOT`, `is_tpu()` True) | True | what the PR gate and the single-host nightly run; opt-in for users until the divergences below close |
+| A (default) | `SGLANG_PLATFORM=tpu` or unset | `sglang_tpu.platforms.tpu_platform.TpuSRTPlatform` (`PlatformEnum.TPU`) | False | the shipped path |
+| B | `SGLANG_PLATFORM=tpu_oot` | `sglang_tpu.platforms.tpu_oot_platform.TpuOOTPlatform` (`PlatformEnum.OOT`, `is_tpu()` True) | True | what the PR gate and the single-host nightly run; opt-in for users until the divergences below close |
 
 `tpu_oot` only activates when named: with `SGLANG_PLATFORM` unset the loader
 calls every installed `activate()` and errors when two answer.
@@ -56,17 +56,37 @@ either.
 
 ## Layout
 
+Subpackages mirror `python/sglang/srt/`: a module lives at the path of the core
+module it extends or plugs into, so `sglang_tpu/mem_cache/kv_pool.py` is the TPU
+side of `sglang/srt/mem_cache/`.
+
 ```
 sglang_tpu/
   __init__.py            activate() for the tpu_oot entry point
-  platform.py            TpuOOTPlatform (identity + the gate-required methods)
-  tpu_platform.py        TpuSRTPlatform, the in-tree identity (moved here as-is)
-  envs.py  hooks/  compat/
-  attention/pallas/      Pallas attention kernels (was layers/attention/pallas)
-  moe/pallas/            Pallas MoE kernels (was layers/moe/pallas)
-  disaggregation/{tpu,raiden}/
-  graph_runner/          decode graph runner + ViT compile runners
-  <everything else>      was python/sglang/srt/hardware_backend/tpu/
+  envs.py  env_override.py  patches.py  _logging.py
+  hooks/  compat/        plugin hooks and version shims (no core counterpart)
+  platforms/             TpuSRTPlatform (in-tree identity), TpuOOTPlatform
+  layers/                sampler, top-k, fused QK-norm+RoPE, mHC, attention residual
+    attention/           Pallas attention backends; linear/ (GDN, KDA), dsa/, dsv4/
+    attention/pallas/    Pallas attention kernels (was layers/attention/pallas)
+    moe/pallas/          Pallas MoE kernels (was layers/moe/pallas)
+    quantization/        FP8 / FP4 / int4 linear and MoE helpers; pallas/ kernels
+    cp/  pallas/
+  mem_cache/             KV / mamba pools, KV write ops, HiRadix, raiden transfer
+  managers/              cache controller, copy workers, overlap, mm scheduling, PP scheduling
+  speculative/           EAGLE / DFlash helpers, spec-op precompile, the TPU spec
+                         workers (block / chain / EAGLE3; dflash/ dspark/ eagle/ mtp/)
+  compilation/           compile policies, direct compile, compile cache
+  disaggregation/        {tpu,raiden}/ transports, PD decode / prefill helpers
+  model_executor/runner/ decode graph runner
+  multimodal/            ViT compile runners
+  models/                TPU-only models (registered by init_backend); model-specific
+                         code in subpackages (kimi_k3/, muse_megakernel/,
+                         glm_flash_megakernel/), which the registry scan skips
+  sampling/              sampling batch info and warmup
+  distributed/           PP wave / stage groups, one-/two-shot collectives; pallas/ kernels
+  model_loader/  entrypoints/  ray/  utils/
+  testing/               SPMD-safe recipe verification
 ```
 
 The old paths under `python/sglang/srt/` are one-file re-export shims so
@@ -79,7 +99,8 @@ of the migration. The TPU Plugin Scoreboard workflow publishes both daily.
 
 ## Rules for new TPU code
 
-1. New TPU-only modules go here, never under `python/sglang/srt/`.
+1. New TPU-only modules go here, never under `python/sglang/srt/`, at the path
+   that mirrors the core module they extend (see Layout).
 2. Core never imports this package at module scope. A function-scope import
    inside an `is_tpu()` guard is tolerated during the migration and counted by
    the ratchet lint (`tools/plugin/check_tpu_branches.py`); the baseline may

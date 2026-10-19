@@ -37,8 +37,8 @@ except ImportError:  # pragma: no cover - JAX is absent on some CPU CI agents
 # Deliberately outside the try: once JAX is present, a failure to import the
 # pallas chain is a real breakage and must surface, not silently skip the suite.
 if _HAS_GMM:
-    from sglang_tpu.moe.pallas import gmm_v2
-    from sglang_tpu.moe.pallas.fused_moe_op import (
+    from sglang_tpu.layers.moe.pallas import gmm_v2
+    from sglang_tpu.layers.moe.pallas.fused_moe_op import (
         _dividing_tile_k,
         _gmm2_tile_source,
         _largest_compatible_tile_k,

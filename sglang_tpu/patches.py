@@ -83,7 +83,7 @@ def _register_tpu_sampler_backend() -> None:
         return
 
     from sglang.srt.layers.sampler import register_sampler_backend
-    from sglang_tpu.sampler import TpuSampler
+    from sglang_tpu.layers.sampler import TpuSampler
 
     register_sampler_backend("tpu", TpuSampler)
     _tpu_sampler_backend_registered = True
@@ -745,7 +745,7 @@ def _patch_future_map_direct_handoff() -> None:
     _future_map_direct_handoff_patched = True
 
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang_tpu.overlap_utils_tpu import (
+    from sglang_tpu.managers.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
         publish_tpu,
         stash_tpu,
@@ -804,7 +804,7 @@ def _patch_raiden_is_load_back_event_done() -> None:
     _raiden_is_load_back_event_done_patched = True
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang_tpu.raiden_hybrid_cache_controller import (
+    from sglang_tpu.mem_cache.hybrid_cache.raiden_hybrid_cache_controller import (
         TpuRaidenHybridCacheController,
     )
 
@@ -874,7 +874,7 @@ def _patch_pd_decode_swa_hicache() -> None:
 
     Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
     """
-    from sglang_tpu import pd_decode_swa_hicache
+    from sglang_tpu.disaggregation import pd_decode_swa_hicache
 
     pd_decode_swa_hicache.install()
 
@@ -884,7 +884,7 @@ def _patch_hicache_write_back_copy_ahead() -> None:
 
     See ``hicache_write_back_copy_ahead``.
     """
-    from sglang_tpu import hicache_write_back_copy_ahead
+    from sglang_tpu.mem_cache import hicache_write_back_copy_ahead
 
     hicache_write_back_copy_ahead.install()
 
@@ -894,7 +894,7 @@ def _patch_pd_decode_async_prefill_info() -> None:
 
     See ``pd_decode_async_prefill_info``.
     """
-    from sglang_tpu import pd_decode_async_prefill_info
+    from sglang_tpu.disaggregation import pd_decode_async_prefill_info
 
     pd_decode_async_prefill_info.install()
 
@@ -904,7 +904,7 @@ def _patch_host_heap_trim() -> None:
 
     See ``host_heap_trim``.
     """
-    from sglang_tpu import host_heap_trim
+    from sglang_tpu.utils import host_heap_trim
 
     host_heap_trim.install()
 
@@ -914,7 +914,7 @@ def _patch_profile_auto() -> None:
 
     See ``profile_auto``.
     """
-    from sglang_tpu import profile_auto
+    from sglang_tpu.utils import profile_auto
 
     profile_auto.install()
 

@@ -349,7 +349,7 @@ def _encode_vision_items(
     if _is_tpu:
         # Imported here, not at module scope: mm_schedule_tpu imports
         # DataEmbeddingFunc back from this module.
-        from sglang_tpu.mm_schedule_tpu import encode_vision_items
+        from sglang_tpu.managers.mm_schedule_tpu import encode_vision_items
 
         return encode_vision_items(data_embedding_func, items)
     return data_embedding_func(items)

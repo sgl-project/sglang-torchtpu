@@ -675,7 +675,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 if _is_tpu and not use_mxfp8:
-                    from sglang_tpu.fp8_linear import (
+                    from sglang_tpu.layers.quantization.fp8_linear import (
                         compute_tpu_fp8_linear_scale_shape,
                     )
 
@@ -1094,7 +1094,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
             if _is_tpu and not self.use_mxfp8:
-                from sglang_tpu.fp8_linear import (
+                from sglang_tpu.layers.quantization.fp8_linear import (
                     prepare_tpu_fp8_linear_weights,
                 )
 
@@ -1318,7 +1318,7 @@ class Fp8LinearMethod(LinearMethodBase):
             and not self.use_mxfp8
             and (not self.block_quant or layer.weight_block_size is None)
         ):
-            from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
+            from sglang_tpu.layers.quantization.fp8_linear import apply_tpu_fp8_linear
 
             return apply_tpu_fp8_linear(
                 x=x,
@@ -2666,7 +2666,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if _is_tpu:
-            from sglang_tpu.fp8_moe import (
+            from sglang_tpu.layers.quantization.fp8_moe import (
                 prepare_tpu_fp8_moe_weights,
             )
 
@@ -2682,7 +2682,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend.is_auto()
                 or moe_runner_backend.is_pallas_tpu_fused_rs()
             ):
-                from sglang_tpu.fp8_moe_fused_rs import (
+                from sglang_tpu.layers.quantization.fp8_moe_fused_rs import (
                     prepare_fp8_fused_rs,
                 )
 
@@ -3039,7 +3039,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if _is_tpu:
             if self.handles_moe_reduction:
-                from sglang_tpu.fp8_moe_fused_rs import (
+                from sglang_tpu.layers.quantization.fp8_moe_fused_rs import (
                     apply_fp8_fused_rs,
                 )
 
@@ -3049,7 +3049,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     activation=moe_runner_config.activation,
                     swiglu_limit=moe_runner_config.swiglu_limit,
                 )
-            from sglang_tpu.fp8_moe import apply_tpu_fp8_moe
+            from sglang_tpu.layers.quantization.fp8_moe import apply_tpu_fp8_moe
 
             return apply_tpu_fp8_moe(
                 layer=layer,
