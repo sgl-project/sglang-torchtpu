@@ -50,12 +50,11 @@ logger = logging.getLogger(__name__)
 GB = 1024**3
 
 
-@compiled_op(direct=True)
+@compiled_op()
 def committed_read_offsets(read_offsets, indices, steps):
     """(int64 slots, int32 read offsets) select_checkpoints commits, in one
     launch. Negative steps (inactive requests) and the null slot keep their
-    previous offset. Warmed per batch bucket by the experimental spec worker;
-    other shapes run eagerly."""
+    previous offset."""
     indices = indices.to(torch.int64)
     steps = steps.to(torch.int32)
     previous = read_offsets.index_select(0, indices)
