@@ -1364,6 +1364,17 @@ class TpuSRTPlatform(SRTPlatform):
             store_dtype=kv_cache_dtype,
         )
 
+    def get_kv_pool_reserved_blocks(self, *, use_mla_backend: bool) -> int:
+        from sglang_tpu.envs import envs as tpu_envs
+
+        # The raiden reshard landing arena (disaggregation/raiden/land.py). An
+        # MLA target charges none; land_arena_blocks keeps its draft at 0 too.
+        if not tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get() or use_mla_backend:
+            return 0
+        from sglang_tpu.disaggregation.raiden.land import land_arena_blocks
+
+        return land_arena_blocks()
+
     # In-tree (SGLANG_PLATFORM=tpu) answer; the method is the tpu_oot answer.
     supports_mamba_extra_buffer = True
 
