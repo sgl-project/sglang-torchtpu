@@ -25,8 +25,7 @@ from sglang_tpu.experimental.speculative.chain_draft_worker import (
 )
 
 # Each reads the target hidden from spec_info.hidden_states and returns its own
-# normed hidden, the logits input of its lm_head. DeepseekV3ForCausalLMNextN
-# covers the DeepSeek-style NextN layers (GLM-5.3-Flash included).
+# normed hidden, the logits input of its lm_head.
 MTP_DRAFT_MODELS = (Qwen3_5ForCausalLMMTP, DeepseekV3ForCausalLMNextN)
 _MtpDraftModel = Qwen3_5ForCausalLMMTP | DeepseekV3ForCausalLMNextN
 
