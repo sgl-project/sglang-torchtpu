@@ -228,6 +228,8 @@ class TestExperimentalEagle3(CustomTestCase):
                 next_seq_lens=torch.zeros(4, dtype=torch.int64),
                 window_tokens=torch.zeros(12, dtype=torch.int64),
                 window_seq_lens=torch.zeros(4, dtype=torch.int64),
+                live_mask=torch.ones(4, dtype=torch.bool),
+                last_steps=torch.zeros(4, dtype=torch.int64),
             ),
         )
         exported = result.next_draft_input

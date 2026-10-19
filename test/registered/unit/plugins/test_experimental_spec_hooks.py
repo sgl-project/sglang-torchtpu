@@ -371,6 +371,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             cache_locs=positions,
             flat_positions=positions.reshape(-1),
             flat_cache_locs=positions.reshape(-1),
+            verify_kv_lens=(seq_lens + 4).to(torch.int32),
         )
         step = build_chain_block_inputs(
             torch.tensor([1, 2, 3]), rows, seq_lens, live, 2
