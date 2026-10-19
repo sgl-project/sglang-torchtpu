@@ -33,7 +33,7 @@ COPY . /workspace/sglang
 # 2. Copy pyproject_tpu.toml to pyproject.toml
 # 3. Install sglang tpu dependencies and sglang itself
 RUN cd /workspace/sglang/python && \
-    sed -i 's/"torch-tpu==[^"]*"/"torch-tpu"/' pyproject_tpu.toml && \
+    sed -i 's/"torch_tpu==[^"]*"/"torch_tpu"/' pyproject_tpu.toml && \
     sed -i '/\[tool.uv\]/,$d' pyproject_tpu.toml && \
     cp pyproject_tpu.toml pyproject.toml && \
     uv pip install --system .[all_tpu,ray,runai] && \

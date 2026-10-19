@@ -68,13 +68,13 @@ dependencies = [
 
   # The pins below form one TPU stack and must be upgraded and validated
   # together:
-  # - torch-tpu and torch must be ABI compatible.
+  # - torch_tpu and torch must be ABI compatible.
   # - torch and torchvision must be ABI compatible.
-  # - torch-tpu and libtpu must be validated together.
+  # - torch_tpu and libtpu must be validated together.
   # - jax and jaxlib must be compatible with libtpu.
-  # - tpu-sync-torch's native extension links torch-tpu's per-torch-version
-  #   glue library, so it must be upgraded and validated with torch-tpu.
-  "torch-tpu==0.2.0",
+  # - tpu-sync-torch's native extension links torch_tpu's per-torch-version
+  #   glue library, so it must be upgraded and validated with torch_tpu.
+  "torch_tpu==0.2.0",
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
