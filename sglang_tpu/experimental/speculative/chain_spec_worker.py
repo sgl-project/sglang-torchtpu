@@ -398,6 +398,10 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 top_ks=top_ks,
             )
             result.draft_tokens.cpu()
+            if result.draft_logits is not None:
+                self._warmup_sampled_accept(
+                    pbs, result.draft_tokens, result.draft_logits
+                )
 
     def _warmup_extend_ops(self) -> None:
         """Host uploads and the tail fill of the draft prompt extend, per token and batch bucket."""
