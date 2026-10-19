@@ -1,12 +1,12 @@
 # Packages excluded from the unified resolution (see regenerate_lock). Only
 # what must NOT come from PyPI:
 #
-# - torch-tpu is built from source as the Bazel module @torch_tpu, not a wheel.
-# - tpu-sync-torch links torch-tpu's glue, which the Bazel build compiles from
+# - torch_tpu is built from source as the Bazel module @torch_tpu, not a wheel.
+# - tpu-sync-torch links torch_tpu's glue, which the Bazel build compiles from
 #   source as @torch_tpu; sglang's Bazel build does not consume it.
 #
 # Everything else in the TPU stack (torch, torchvision, libtpu, jax, jaxlib)
 # IS resolved here: the pins live in python/pyproject_tpu.toml, and MODULE.bazel
 # points torch_tpu's pip hub at this lock's hub via override_repo.
-torch-tpu==0.2.0
+torch_tpu==0.2.0
 tpu-sync-torch==0.0.1.dev20261013083150
