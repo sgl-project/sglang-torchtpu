@@ -225,7 +225,8 @@ class TestPaddedExtendAttention(CustomTestCase):
         for in_place in (True, False):
             with self.subTest(in_place=in_place):
                 backend = _OutputBackend(in_place)
-                batch = _batch(ForwardMode.EXTEND, 5)
+                batch = object.__new__(ForwardBatch)
+                vars(batch).update(vars(_batch(ForwardMode.EXTEND, 5)))
                 out_cache_loc, positions = batch.out_cache_loc, batch.positions
 
                 def forward(q):
@@ -234,9 +235,7 @@ class TestPaddedExtendAttention(CustomTestCase):
                     )
 
                 compiled = torch.compile(forward, backend="eager", fullgraph=True)
-                with patch.object(
-                    radix_attention, "get_attn_backend", return_value=backend
-                ):
+                with patch.object(radix_attention, "get_attn_backend", lambda: backend):
                     for value in (0.0, 1.0):
                         output = compiled(torch.full((8, 2), value))
                         torch.testing.assert_close(
