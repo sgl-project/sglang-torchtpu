@@ -245,9 +245,6 @@ def kpool_indexer_step(
         enable_early_exit=False,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         chunk_tokens=_CHUNK_TOKENS if chunked else None,
-        # In a model graph the chunks' scheduling groups fail to compile on
-        # libtpu 0.0.50 ("annotation groups with gaps"), and alone they overlap
-        # nothing measurable here.
         overlap_chunks=False,
     )  # i32[T, n_pick], chosen pools first, then -1
 
