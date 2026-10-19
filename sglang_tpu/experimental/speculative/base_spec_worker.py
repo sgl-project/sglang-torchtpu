@@ -801,6 +801,29 @@ class TpuSpecWorker(BaseSpecWorker):
         top_ks = torch.ones((padded_bs,), dtype=torch.int32, device=self.device)
         return temperatures, top_ks, top_ps, min_ps
 
+    def _warmup_sampled_accept(
+        self, padded_bs: int, draft_tokens: torch.Tensor, draft_logits: torch.Tensor
+    ) -> None:
+        """verify's sampled acceptance at padded_bs, with and without target filters."""
+        target_logits = torch.zeros(
+            (padded_bs * self.num_verify_rows, draft_logits.shape[-1]),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        temperatures, top_ks, top_ps, min_ps = self._sampling_param_warmup_args(
+            padded_bs
+        )
+        args = (
+            target_logits,
+            draft_tokens,
+            self._all_drafts[padded_bs],
+            draft_logits.float(),
+            temperatures,
+            top_ks,
+        )
+        warmup_compiled_op(accept_drafts_sampled, *args)
+        warmup_compiled_op(accept_drafts_sampled_filtered, *args, top_ps, min_ps)
+
     def _warmup_relay_and_results(self) -> None:
         """FutureMap relay and result D2H run per live bs outside any compiled op."""
         runner = self.target_worker.model_runner
