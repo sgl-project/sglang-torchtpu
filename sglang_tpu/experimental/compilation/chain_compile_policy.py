@@ -36,7 +36,6 @@ from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.experimental.speculative.chain_draft_input import (
-    ChainVerifyInput,
     chain_draft_forward_input,
     register_chain_draft_pytree,
 )
@@ -207,16 +206,6 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
 
         call = self._direct_compile_draft(trace, specialization_key=specialization_key)
         return functools.wraps(fn)(call)
-
-    def make_verify_spec_info(self) -> ChainVerifyInput:
-        """TARGET_VERIFY warmup input, of the type the chain worker verifies with."""
-        device = self.model_runner.device
-        return ChainVerifyInput(
-            draft_token=torch.empty(0, device=device, dtype=torch.int64),
-            positions=torch.empty(0, device=device, dtype=torch.int64),
-            draft_token_num=self.draft_token_num,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-        )
 
     def _make_dummy_forward_batch(
         self,

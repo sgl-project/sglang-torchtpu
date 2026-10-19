@@ -87,8 +87,6 @@ class VerifyRows(NamedTuple):
       cache_locs: [pbs, N + 1] int64 KV slots; dummy slot 0 on padded rows.
       flat_positions: [pbs * (N + 1)] positions as its own graph output.
       flat_cache_locs: [pbs * (N + 1)] cache_locs as its own graph output.
-      verify_kv_lens: [pbs] int32 seq_lens + N + 1, the RPA KV length of a
-        forward over the verify rows.
     """
 
     positions: torch.Tensor
@@ -96,7 +94,6 @@ class VerifyRows(NamedTuple):
     # A reshape view fed to direct_compile costs an eager as_strided program per bucket.
     flat_positions: torch.Tensor
     flat_cache_locs: torch.Tensor
-    verify_kv_lens: torch.Tensor
 
 
 class DraftResult(NamedTuple):

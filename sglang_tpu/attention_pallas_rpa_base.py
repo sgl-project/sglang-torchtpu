@@ -1081,18 +1081,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             assert forward_batch.spec_info is not None
             verify_width = forward_batch.spec_info.num_tokens_per_req
             kv_len_bump = verify_width
-            # Prebuilt lengths serve only a batch of the same (padded) size.
-            kv_lens = getattr(forward_batch.spec_info, "verify_kv_lens", None)
-            if kv_lens is None or kv_lens.shape[0] != bs:
-                kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
+            kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
             query_width = verify_width
         elif self._is_extend_including_draft(forward_batch.forward_mode):
-            # EXTEND and DRAFT_EXTEND use current lengths; a draft extend over
-            # the verify window may carry them prebuilt.
+            # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
-            kv_lens = getattr(forward_batch.spec_info, "verify_kv_lens", None)
-            if kv_lens is None or kv_lens.shape[0] != bs:
-                kv_lens = forward_batch.seq_lens.to(torch.int32)
+            kv_lens = forward_batch.seq_lens.to(torch.int32)
             query_lens = self._extend_query_lens(forward_batch, bs)
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)

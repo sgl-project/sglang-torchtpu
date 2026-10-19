@@ -64,9 +64,8 @@ Inheritance kept for reuse, not because it is-a (do not extend the pattern):
 
 - `TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin)`: every
   family, chain included, reuses the DFlash policy's padded TARGET_VERIFY handling.
-- `ChainVerifyInput(DFlashVerifyInput)` and `ChainDraftForwardInput(ChainVerifyInput)`:
-  the chain verify and draft forwards reuse the DFlash input type so that RPA and
-  direct_compile accept them; they add the verify KV lengths and the draft hidden.
+- `ChainDraftForwardInput(DFlashVerifyInput)`: the chain draft forward reuses the
+  DFlash input type so that RPA and direct_compile accept it.
 
 ## Why it is built this way
 

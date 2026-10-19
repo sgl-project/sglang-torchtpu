@@ -79,7 +79,6 @@ def select_verify_rows(
         cache_locs=cache_locs,
         flat_positions=positions.reshape(-1),
         flat_cache_locs=cache_locs.reshape(-1),
-        verify_kv_lens=(seq_lens + num_rows).to(torch.int32),
     )
 
 
