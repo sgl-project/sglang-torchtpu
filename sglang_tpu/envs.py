@@ -8,7 +8,7 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvTuple
+from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvStr, EnvTuple
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -72,6 +72,13 @@ class TpuEnvs:
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
+    # GLM-5.3-Flash: single-request target steps (the MTP verify, or decode
+    # without speculation) as one Pallas call per device (glm_flash_megakernel/).
+    # Needs the packed weights (..._PACKED, written by glm_flash_megakernel.pack)
+    # and the radix cache off; ..._MAX_LEN caps the request length.
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_PACKED = EnvStr(None)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(16384)
 
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
