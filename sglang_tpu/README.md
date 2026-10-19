@@ -59,15 +59,22 @@ either.
 Both platform identities select `TpuChainSpecWorker` for EAGLE3 and native MTP
 (NEXTN) top-k-1 chains and `TpuBlockSpecWorker` for DFlash/DSpark at PP=1 by
 default. These paths require overlap scheduling; argument resolution enables torch
-compilation for them. Unsupported tree, adaptive/multi-layer, draft M-RoPE,
-mixed-phase attention-DP and block attention-DP combinations keep their explicit
-errors. PP-prefill retains the compatibility driver. TPU PP decode remains
+compilation for them. Argument resolution also checks, before any model loads,
+what the plugin workers reject: disabled overlap, mixed-phase attention-DP
+settings, non-static ragged verify, block attention-DP, and for the chain worker
+a draft window, adaptive/multi-layer drafting, draft-token counts other than
+steps + 1, and EAGLE3 drafts other than `LlamaForCausalLMEagle3` or with M-RoPE.
+Such a launch runs on the compatibility worker and logs why; with the plugin
+worker requested explicitly (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1` or
+`SGLANG_TPU_HOST_PADDING_NO_D2H=1`) it fails instead. Tree top-k stays rejected.
+PP-prefill retains the compatibility driver. TPU PP decode remains
 unsupported.
 
 For the compatibility route set both
 `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0` and
 `SGLANG_TPU_HOST_PADDING_NO_D2H=0` before launch.
-At PP=1, DSpark requires the plugin route. The existing environment name is
+At PP=1, DSpark requires the plugin route and fails at argument resolution when
+the plugin worker cannot serve it. The existing environment name is
 retained for deployment compatibility. The
 default switch does not establish TPU compilation or serving parity: validate the
 selected model, topology, request features and warmup on TPU before deployment.

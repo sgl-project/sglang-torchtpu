@@ -347,6 +347,11 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_multi_layer_eagle=False,
             speculative_adaptive=False,
             speculative_use_rejection_sampling=False,
+            speculative_skip_dp_mlp_sync=False,
+            speculative_draft_model_path=None,
+            speculative_draft_model_revision=None,
+            speculative_draft_window_size=None,
+            speculative_num_draft_tokens=None,
             disaggregation_mode="null",
             disaggregation_transfer_backend="mooncake",
             optimistic_prefill_attempts=0,
@@ -362,9 +367,22 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
-    def _apply(self, args):
+    @staticmethod
+    def _eagle3_draft(architecture="LlamaForCausalLMEagle3", *, mrope=False):
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]),
+            model_is_mrope=mrope,
+        )
+
+    def _apply(self, args, *, eagle3_draft=None):
         platform = TpuSRTPlatform()
-        with patch("sglang_tpu.patches._prepare_tpu_env"):
+        with (
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch(
+                "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                return_value=eagle3_draft or self._eagle3_draft(),
+            ),
+        ):
             platform.apply_server_args_defaults(args)
 
     def _resolved(self, args, field):
@@ -444,7 +462,102 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertFalse(self._resolved(args, "disable_overlap_schedule"))
         self.assertEqual(self._resolved(args, "mem_fraction_static"), 0.40)
 
-    def test_plugin_spec_resolves_compile_and_rejects_non_overlap_before_load(self):
+    def _plugin_rejections(self):
+        """(algorithm, args overrides, env, apply kwargs, reason) the plugin worker rejects."""
+        dp = dict(attn_dp_size=2, tp_size=4, enable_dp_lm_head=True)
+        cases = [
+            (
+                algo,
+                dict(disable_overlap_schedule=True),
+                {},
+                {},
+                "requires overlap scheduling",
+            )
+            for algo in ("EAGLE3", "DFLASH", "DSPARK")
+        ]
+        cases += [
+            ("DFLASH", dp, {}, {}, "does not support DP attention"),
+            (
+                "DFLASH",
+                {},
+                {"SGLANG_RAGGED_VERIFY_MODE": "compact"},
+                {},
+                "SGLANG_RAGGED_VERIFY_MODE=static",
+            ),
+            (
+                "EAGLE3",
+                {},
+                {"SGLANG_RAGGED_VERIFY_MODE": "compact"},
+                {},
+                "SGLANG_RAGGED_VERIFY_MODE=static",
+            ),
+            (
+                "EAGLE3",
+                dict(speculative_draft_window_size=8),
+                {},
+                {},
+                "draft-window-size",
+            ),
+            (
+                "EAGLE3",
+                dict(speculative_num_steps=3, speculative_num_draft_tokens=3),
+                {},
+                {},
+                "num-draft-tokens = --speculative-num-steps",
+            ),
+            (
+                "EAGLE3",
+                dict(enable_multi_layer_eagle=True),
+                {},
+                {},
+                "multi-layer or adaptive",
+            ),
+            (
+                "EAGLE3",
+                dict(speculative_adaptive=True),
+                {},
+                {},
+                "multi-layer or adaptive",
+            ),
+            (
+                "EAGLE3",
+                {},
+                {},
+                dict(eagle3_draft=self._eagle3_draft("Eagle3DeepseekV2ForCausalLM")),
+                "LlamaForCausalLMEagle3 only",
+            ),
+            (
+                "EAGLE3",
+                {},
+                {},
+                dict(eagle3_draft=self._eagle3_draft(mrope=True)),
+                "M-RoPE drafts",
+            ),
+            (
+                "EAGLE3",
+                dict(dp, speculative_skip_dp_mlp_sync=True),
+                {},
+                {},
+                "prefill and decode",
+            ),
+            (
+                "EAGLE3",
+                dp,
+                {"SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION": "1"},
+                {},
+                "prefill and decode",
+            ),
+            (
+                "EAGLE3",
+                dp,
+                {"SGLANG_SPEC_TP_SYNC": "spec-accept-sample"},
+                {},
+                "SGLANG_SPEC_TP_SYNC",
+            ),
+        ]
+        return cases
+
+    def test_explicit_plugin_opt_in_compiles_or_rejects_before_load(self):
         from sglang_tpu.envs import envs as tpu_envs
 
         with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
@@ -456,26 +569,70 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                     self._apply(args)
                     self.assertTrue(self._resolved(args, "enable_torch_compile"))
                     self.assertFalse(args.enable_torch_compile)
-                    with self.assertRaisesRegex(
-                        ValueError, "requires overlap scheduling"
-                    ):
-                        self._apply(
-                            self._args(
-                                speculative_algorithm=algo,
-                                disable_overlap_schedule=True,
-                            )
-                        )
-            with self.assertRaisesRegex(ValueError, "speculative_num_steps >= 2"):
-                self._apply(
-                    self._args(speculative_algorithm="EAGLE3", speculative_num_steps=1)
-                )
-            for flag in ("enable_multi_layer_eagle", "speculative_adaptive"):
-                with self.assertRaisesRegex(
-                    NotImplementedError, "multi-layer or adaptive"
+            for algo, overrides, env, kwargs, reason in self._plugin_rejections():
+                with (
+                    self.subTest(algorithm=algo, reason=reason),
+                    patch.dict(os.environ, env),
                 ):
-                    self._apply(
-                        self._args(speculative_algorithm="EAGLE3", **{flag: True})
-                    )
+                    if algo == "DSPARK":
+                        expected = (NotImplementedError, "DSPARK only with the plugin")
+                    else:
+                        expected = (ValueError, "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC")
+                    with self.assertRaisesRegex(*expected) as caught:
+                        self._apply(
+                            self._args(speculative_algorithm=algo, **overrides),
+                            **kwargs,
+                        )
+                    self.assertRegex(str(caught.exception), reason)
+
+    def test_default_route_serves_unsupported_plugin_configs_with_compatibility(self):
+        """Unless the plugin worker was requested, what it would reject after the
+        weights load goes to the compatibility worker before any model loads."""
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.spec_execution import resolve_spec_execution
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        for algo, overrides, env, kwargs, reason in self._plugin_rejections():
+            with (
+                self.subTest(algorithm=algo, reason=reason),
+                patch.dict(os.environ, env),
+                flag.override(True),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            ):
+                flag.clear()
+                args = self._args(speculative_algorithm=algo, **overrides)
+                if algo == "DSPARK":
+                    # No compatibility worker serves DSPARK on TPU.
+                    with self.assertRaisesRegex(NotImplementedError, reason):
+                        self._apply(args, **kwargs)
+                    continue
+                self._apply(args, **kwargs)
+                # Scheduler processes inherit the flag, so every consumer agrees.
+                self.assertTrue(flag.is_set())
+                self.assertFalse(flag.get())
+                self.assertFalse(
+                    resolve_spec_execution(
+                        SpeculativeAlgorithm[algo], pp_size=1
+                    ).host_padded
+                )
+                self.assertFalse(self._resolved(args, "enable_torch_compile"))
+
+    def test_default_route_keeps_supported_configs_on_the_plugin_worker(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        for algo in ("EAGLE3", "DFLASH", "DSPARK"):
+            with (
+                self.subTest(algorithm=algo),
+                flag.override(True),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            ):
+                flag.clear()
+                args = self._args(speculative_algorithm=algo)
+                self._apply(args)
+                self.assertFalse(flag.is_set())
+                self.assertTrue(self._resolved(args, "enable_torch_compile"))
 
     def test_compatibility_route_keeps_eager_configuration(self):
         from sglang_tpu.envs import envs as tpu_envs

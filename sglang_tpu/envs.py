@@ -116,7 +116,8 @@ class TpuEnvs:
     # Default to the plugin workers at PP=1: DFLASH/DSPARK on
     # sglang_tpu.experimental.TpuBlockSpecWorker, MTP and EAGLE3 on
     # TpuChainSpecWorker. Set 0 for the compatibility route;
-    # SGLANG_TPU_HOST_PADDING_NO_D2H=1 also selects the plugin workers.
+    # SGLANG_TPU_HOST_PADDING_NO_D2H=1 also selects the plugin workers. Left
+    # unset, launches the plugin workers cannot serve use compatibility instead.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
     # Same effect as SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1. Non-speculative
     # batches ignore it.

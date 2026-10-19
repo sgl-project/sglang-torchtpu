@@ -927,25 +927,14 @@ class TpuSRTPlatform(SRTPlatform):
         )
         # Plugin speculative workers require bucketed compiled forwards.
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.spec_execution import resolve_spec_execution
+        from sglang_tpu.spec_execution import settle_spec_execution
 
-        if resolve_spec_execution(
-            SpeculativeAlgorithm.__members__.get(
+        if settle_spec_execution(
+            server_args,
+            algorithm=SpeculativeAlgorithm.__members__.get(
                 cfg.speculative_algorithm, SpeculativeAlgorithm.NONE
             ),
-            pp_size=cfg.pp_size,
         ).host_padded:
-            if cfg.disable_overlap_schedule:
-                raise ValueError(
-                    "The TPU plugin spec worker requires overlap scheduling; remove "
-                    "--disable-overlap-schedule or select the compatibility worker with "
-                    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0 and "
-                    "SGLANG_TPU_HOST_PADDING_NO_D2H=0."
-                )
-            if cfg.enable_multi_layer_eagle or cfg.speculative_adaptive:
-                raise NotImplementedError(
-                    "The TPU plugin spec worker does not support multi-layer or adaptive EAGLE."
-                )
             declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", enable_torch_compile=True
             )
