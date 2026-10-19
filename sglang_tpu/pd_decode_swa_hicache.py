@@ -8,7 +8,7 @@ to host RAM:
   and prefill sends each request's SWA window fresh.
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
-- With EAGLE3, the draft KV goes to RAM together with the full-attention KV.
+- With EAGLE3 or DFlash, the draft KV goes to RAM together with the full-attention KV.
 
 For every raiden PD decode prefix cache, sliding-window or not, a request that
 reuses pages of an unfinished RAM restore waits for it. Restores that load only
@@ -149,8 +149,10 @@ def _validate_full_only_host_cache_config(
         ),
         (page_size > 1, "--page-size must be > 1 for the page-aligned SWA tail"),
         (
-            spec_algorithm.is_none() or spec_algorithm.is_eagle3(),
-            "Only EAGLE3 is supported for speculative decoding in this mode",
+            spec_algorithm.is_none()
+            or spec_algorithm.is_eagle3()
+            or spec_algorithm.is_dflash(),
+            "Only EAGLE3 and DFlash are supported for speculative decoding in this mode",
         ),
         # Draft KV reaches RAM only through upstream's draft sidecar pool. A
         # packed draft lives inside the full KV pool, which this build does
@@ -161,7 +163,7 @@ def _validate_full_only_host_cache_config(
                 hicache_draft_plan is not None
                 and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
             ),
-            "EAGLE3 draft KV must use the HiCache draft sidecar",
+            "Draft KV must use the HiCache draft sidecar",
         ),
         # Upstream auto-sizes the host pool for it, and so would this build.
         (
@@ -277,7 +279,7 @@ def _build_full_only_host_stack(
     Like ``build_hybrid_swa_stack`` without the SWA pool, so the full pool gets the
     whole host budget.
     """
-    # EAGLE3 draft KV registers as a sidecar after this build, never packed.
+    # Draft KV registers as a sidecar after this build, never packed.
     assert not params.mtp_draft_device_pools, "packed MTP draft KV is not supported"
     full_layer_mapping, swa_layer_mapping = hybrid_pool_assembler._swa_layer_mappings(
         kvcache

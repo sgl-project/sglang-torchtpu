@@ -190,8 +190,10 @@ def make_ctx():
     )
 
 
-def spec(*, eagle3=False, none=False):
-    return SimpleNamespace(is_none=lambda: none, is_eagle3=lambda: eagle3)
+def spec(*, eagle3=False, dflash=False, none=False):
+    return SimpleNamespace(
+        is_none=lambda: none, is_eagle3=lambda: eagle3, is_dflash=lambda: dflash
+    )
 
 
 def real_swa_cache(*, is_eagle=False):
@@ -298,9 +300,14 @@ class TestCacheConstruction(CustomTestCase):
             upstream.assert_called_once_with(ctx)
             auto_size.assert_called_once()
 
-    def test_eagle3_draft_plan_is_sized_and_registered_as_a_sidecar(self):
+    def test_draft_plan_is_sized_and_registered_as_a_sidecar(self):
         # Upstream registers the draft sidecar only with the flag on, which
         # this build turns off to pass the SWA guard.
+        for algorithm in (spec(eagle3=True), spec(dflash=True)):
+            with self.subTest(algorithm=algorithm):
+                self._check_draft_sidecar(algorithm)
+
+    def _check_draft_sidecar(self, algorithm):
         ctx = make_ctx()
         cache = MagicMock()
         draft_plan = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
@@ -318,9 +325,7 @@ class TestCacheConstruction(CustomTestCase):
         ):
             tpu._build_kv_cache(
                 upstream_build,
-                **build_kwargs(
-                    spec_algorithm=spec(eagle3=True), hicache_draft_plan=draft_plan
-                ),
+                **build_kwargs(spec_algorithm=algorithm, hicache_draft_plan=draft_plan),
             )
         auto_size.assert_called_once_with(ctx.params, draft_plan, enabled=True)
         register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
@@ -358,10 +363,11 @@ class TestCacheConstruction(CustomTestCase):
     def test_unsupported_configs_are_rejected(self):
         for overrides, mem, dis, tree_core, reason in (
             ({"page_size": 1}, {}, {}, "python", "page-size"),
-            # DFlash and the other drafts are not validated in this mode.
-            ({"spec_algorithm": spec()}, {}, {}, "python", "Only EAGLE3"),
-            # EAGLE3 draft KV reaches RAM only as upstream's draft sidecar.
+            # MTP and the other drafts are not validated in this mode.
+            ({"spec_algorithm": spec()}, {}, {}, "python", "Only EAGLE3 and DFlash"),
+            # Draft KV reaches RAM only as upstream's draft sidecar.
             ({"spec_algorithm": spec(eagle3=True)}, {}, {}, "python", "sidecar"),
+            ({"spec_algorithm": spec(dflash=True)}, {}, {}, "python", "sidecar"),
             (
                 {
                     "spec_algorithm": spec(eagle3=True),
