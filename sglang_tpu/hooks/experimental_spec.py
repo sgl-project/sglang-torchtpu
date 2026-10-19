@@ -445,8 +445,8 @@ def hook_specs():
         ),
     ]
     # Hooks install before arguments are resolved, so the route is unknown here.
-    # Argument resolution turns the flag off for launches the plugin worker cannot
-    # serve, which scheduler processes inherit before they install these.
+    # Argument resolution marks launches the plugin worker cannot serve with a
+    # fallback that scheduler processes inherit before they install these.
     if experimental_spec_enabled():
         # Each adapter still checks the batch route: PP-prefill uses compatibility metadata.
         hooks += [
