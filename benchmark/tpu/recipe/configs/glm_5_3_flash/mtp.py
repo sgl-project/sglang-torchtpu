@@ -30,5 +30,10 @@ _args.update(
         # Linear-chain KDA speculation keeps one state slot per running request.
         "max_mamba_cache_size": _args["max_running_requests"],
         "json_model_override_args": json.dumps(_overrides),
+        # Young-generation GC ~70x rarer: a collection on one TP rank stalls
+        # every rank at the next all-reduce.
+        "gc_threshold": [50000, 100, 100],
     }
 )
+# Module state is fixed after warmup; skip its Dynamo guards (#1472).
+CONFIG["runtime_env"]["SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER"] = "1"
