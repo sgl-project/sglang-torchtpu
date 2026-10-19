@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     get_tensor_size_bytes,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,21 @@ def _seq_along_lane_head_dim(*, head_dim: int, kv_packing: int) -> int:
     return _cdiv(head_dim, tile) * tile
 
 
+def kv_pack_heads(num_kv_heads: int, head_dim: int, align: int) -> int:
+    """Heads stored side by side in one ``align``-lane row (SGLANG_TPU_KV_PACK_HEADS), or 1.
+
+    Only exact fits pack (e.g. two 64-wide heads in 128 lanes): the row then holds no
+    padding, half the bytes of one zero-padded row per head.
+    """
+    if (
+        tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get()
+        and num_kv_heads > 1
+        and num_kv_heads * head_dim == align
+    ):
+        return num_kv_heads
+    return 1
+
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -100,6 +116,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     """
 
     HEAD_DIM_ALIGNMENT = 128
+    # Whether this layout can store exactly-fitting heads side by side (kv_pack_heads).
+    PACKS_HEADS = True
     # HiCache io backends (--hicache-io-backend) that can offload this pool to
     # host; hicache_hook refuses the rest at startup. raiden copies whole pages
     # by their dim-0 block id, so it serves any block-major pool exposing
@@ -121,6 +139,11 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         """Bytes one token occupies in one layer's buffer; must track
         ``_create_buffers``, since the KV budget is spent before the pool exists."""
         del v_head_dim  # V shares K's padded slot; see __init__'s width check.
+        if (
+            cls.PACKS_HEADS
+            and kv_pack_heads(num_kv_heads, head_dim, cls.HEAD_DIM_ALIGNMENT) > 1
+        ):
+            num_kv_heads, head_dim = 1, num_kv_heads * head_dim
         packing = _torch_dtype_packing(store_dtype)
         num_kv_heads_x2 = _cdiv(num_kv_heads * 2, packing) * packing
         padded_head_dim = (
@@ -198,6 +221,18 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # ``attention_pallas_rpa_v3._forward``) and the attention output is
         # sliced back to v_head_dim. Only v_head_dim <= head_dim is
         # representable; a wider V cannot fit the qk-width slot.
+        # Packed heads (kv_pack_heads): the buffer holds one head of the heads' total
+        # width; attention backends read kv_pack_heads and lay q / k / v out to match.
+        self.kv_pack_heads = (
+            kv_pack_heads(self.head_num, self.head_dim, self.HEAD_DIM_ALIGNMENT)
+            if self.PACKS_HEADS
+            else 1
+        )
+        if self.kv_pack_heads > 1:
+            if self.v_head_dim != self.head_dim:
+                raise NotImplementedError("packed KV heads need v_head_dim == head_dim")
+            self.head_num, self.head_dim = 1, self.head_num * self.head_dim
+            self.v_head_dim = self.head_dim
         if self.v_head_dim > self.head_dim:
             raise NotImplementedError(
                 "TpuFusedMHATokenToKVPool supports v_head_dim <= head_dim "
@@ -562,6 +597,8 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     to ``kv_packing``. Host copies retain this native packing while translating
     between token indices and their page/lane coordinates.
     """
+
+    PACKS_HEADS = False
 
     # raiden's page copy is layout-agnostic, and torch_tpu's host pool reads
     # its page shape from get_fused_kv_buffer, so it mirrors this layout too.

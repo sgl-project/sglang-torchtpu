@@ -688,6 +688,9 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Hybrid-SWA unified cache: insert a mid-prefill chunk only if it reaches a
+    # multiple of this many tokens (0: every chunk); each insert pins an SWA window.
+    SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE = EnvInt(0)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
@@ -1445,6 +1448,12 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Shard the DFLASH draft's context projection (K * hidden -> hidden) across TP by its
+    # input dim instead of replicating it; same math plus one all-reduce.
+    SGLANG_DFLASH_ROW_PARALLEL_FC = EnvBool(False)
+    # DFlash2 conv on flat [tokens, hidden] rows, the per-group deltas widened to channels
+    # by one exact 0/1 matmul per sublayer; needs groups to be a multiple of 128.
+    SGLANG_DFLASH_CONV_MATMUL_EXPAND = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

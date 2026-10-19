@@ -20,8 +20,8 @@ def uses_host_batch(batch) -> bool:
     return getattr(batch, "host_pad_bs", None) is not None
 
 
-def get_host_batch_padder() -> Callable[[int], int]:
-    assert _host_batch_padder is not None, "TpuSpecWorker has not registered a padder"
+def get_host_batch_padder() -> Callable[[int], int] | None:
+    """The TpuSpecWorker's batch bucketing, or None when no TpuSpecWorker serves this process."""
     return _host_batch_padder
 
 
@@ -38,13 +38,17 @@ def is_experimental_spec_worker(spec_algorithm: SpeculativeAlgorithm) -> bool:
     return spec_algorithm.is_dflash_family() and experimental_spec_enabled()
 
 
+def is_experimental_mtp(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    """Whether MTP is served by sglang_tpu.experimental.TpuChainSpecWorker."""
+    # Core resolves NEXTN (MTP) to EAGLE; exact, since is_eagle() also matches EAGLE3.
+    return spec_algorithm == SpeculativeAlgorithm.EAGLE and experimental_spec_enabled()
+
+
+def is_experimental_chain(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    """Whether TpuChainSpecWorker serves this algorithm."""
+    return is_experimental_mtp(spec_algorithm)
+
+
 def is_experimental_eagle3(spec_algorithm: SpeculativeAlgorithm) -> bool:
     """Whether EAGLE3 is served by sglang_tpu.experimental.TpuEagle3Worker."""
     return spec_algorithm.is_eagle3() and experimental_spec_enabled()
-
-
-def is_experimental_spec(spec_algorithm: SpeculativeAlgorithm) -> bool:
-    """Whether a TpuSpecWorker serves this algorithm (host-padded batches)."""
-    return is_experimental_spec_worker(spec_algorithm) or is_experimental_eagle3(
-        spec_algorithm
-    )

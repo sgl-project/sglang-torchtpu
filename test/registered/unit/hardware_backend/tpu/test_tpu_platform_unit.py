@@ -153,6 +153,35 @@ class TestTpuPlatformInitialization(CustomTestCase):
             ],
         )
 
+    def test_reentry_during_model_registration_registers_once(self):
+        """init_backend re-entered while registering models (model_runner's OOT import
+        hook does this) must not register the TPU models a second time."""
+        registered = []
+
+        def register(package_name):
+            registered.append(package_name)
+            if len(registered) == 1:
+                self.platform.init_backend()
+
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
+            patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch(
+                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key"
+            ),
+            patch("sglang_tpu.patches.apply_tpu_patches"),
+            patch("sglang_tpu.tpu_platform.rank_slice._load"),
+            patch("sglang_tpu.tpu_platform.traced_rank._load"),
+            patch(
+                "sglang.srt.models.registry.ModelRegistry.register",
+                side_effect=register,
+            ),
+        ):
+            self.platform.init_backend()
+
+        self.assertEqual(registered, ["sglang_tpu.models"])
+
 
 class TestTpuCompileCache(CustomTestCase):
     def test_reports_tier1_cache_misses(self):

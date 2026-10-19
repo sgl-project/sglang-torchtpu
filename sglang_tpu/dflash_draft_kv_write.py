@@ -44,6 +44,10 @@ def dflash_write_draft_kv(
       commit_lens: Verify's accepted counts [bs], or None on extend.
       max_num_reqs: Upper bound on requests in one extend batch.
     """
+    # Packed pools (SGLANG_TPU_KV_PACK_HEADS) hold a rank's heads side by side in
+    # one row, a layout these writers don't produce.
+    if kv_pool.kv_pack_heads > 1:
+        raise NotImplementedError("DFLASH draft KV writes need an unpacked KV pool")
     # kv_fused_rope_write imports jax eagerly; keep the span math and the rope
     # gather above importable without it.
     from sglang_tpu.kv_fused_rope_write import (
@@ -148,6 +152,10 @@ def _scatter_layer_kv(
       k: Rotated keys [num_tokens, head_num, head_dim].
       v: Values [num_tokens, head_num, v_head_dim].
     """
+    # Packed pools (SGLANG_TPU_KV_PACK_HEADS) hold a rank's heads side by side in
+    # one row, a layout these writers don't produce.
+    if kv_pool.kv_pack_heads > 1:
+        raise NotImplementedError("DFLASH draft KV writes need an unpacked KV pool")
     buf = kv_pool.get_fused_kv_buffer(layer_idx)
     num_tokens = int(loc.shape[0])
     head_dim = kv_pool.head_dim

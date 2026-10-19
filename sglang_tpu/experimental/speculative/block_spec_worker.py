@@ -22,11 +22,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-    enable_num_token_non_padded,
 )
-from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -49,6 +45,7 @@ from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftI
 from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
     TpuDflashDraftWorker,
 )
+from sglang_tpu.experimental.speculative.draft_forward import forward_draft_rows
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
@@ -285,7 +282,6 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         """Returns the block's [pbs, width, H] draft hidden and the graph's greedy [pbs, gamma] drafts."""
         state = bucket.state
         padded_bs = state.seq_lens.shape[0]
-        bs = verify_input.seq_lens_cpu.shape[0]
         width = self._draft_block_width
         inputs = build_draft_block_inputs(
             state.bonus_tokens,
@@ -295,48 +291,20 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             self._mask_token_id,
             width,
         )
-        # Padded rows carry kv len 0, so RPA keeps them inactive.
-        kv_lens_cpu, kv_lens_sum = verify_input.padded_kv_lens_after_rows(width)
-        num_live_tokens = bs * width
-        num_token_non_padded = (
-            torch.tensor(num_live_tokens, dtype=torch.int32, device=self.device)
-            if enable_num_token_non_padded()
-            else None
-        )
-        num_pad = padded_bs - bs
         # Writes the block's draft KV into the same slots target verify uses next.
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            out_cache_loc_is_physical=True,
-            batch_size=padded_bs,
-            input_ids=inputs.input_ids,
-            req_pool_indices=state.req_pool_indices,
-            req_pool_indices_cpu=verify_input.req_pool_indices_cpu,
-            seq_lens=inputs.seq_lens,
-            out_cache_loc=inputs.cache_locs,
-            seq_lens_sum=kv_lens_sum,
-            seq_lens_cpu=kv_lens_cpu,
-            positions=inputs.positions,
-            input_embeds=None,
+        logits_output = forward_draft_rows(
+            draft_runner=self._draft_runner,
             spec_algorithm=self._spec_algorithm,
+            inputs=inputs,
+            req_pool_indices=state.req_pool_indices,
+            verify_input=verify_input,
+            offset=0,
+            width=width,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            # Pallas RPA plans the draft block as an extend from host lengths.
-            extend_prefix_lens=inputs.extend_prefix_lens,
-            extend_seq_lens=inputs.extend_seq_lens,
-            extend_prefix_lens_cpu=verify_input.seq_lens_cpu.tolist() + [0] * num_pad,
-            extend_seq_lens_cpu=[width] * bs + [0] * num_pad,
-            extend_num_tokens=num_live_tokens,
-            # Only the local field, as in the warmup batch: direct_compile pins
-            # Tensor-vs-None per input.
-            num_token_non_padded=num_token_non_padded,
-            global_num_token_non_padded_cpu=num_live_tokens,
         )
-        # Dynamo guards grad mode; the TPU warmup traced under no_grad.
-        with torch.no_grad():
-            draft_out = self._draft_runner.forward(forward_batch)
-        hidden = draft_out.logits_output.hidden_states
-        draft_tokens = draft_out.logits_output.next_draft_tokens
+        hidden = logits_output.hidden_states
+        draft_tokens = logits_output.next_draft_tokens
         if hidden is None or draft_tokens is None:
             raise RuntimeError("Draft forward returned no hidden or draft tokens.")
         return hidden.view(padded_bs, width, -1), draft_tokens
@@ -426,10 +394,6 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     torch.zeros((tokens,), dtype=dtype).to(
                         self.device, non_blocking=True
                     ).cpu()
-
-    # The base default reads draft_worker.draft_runners, which TpuBlockDraftWorker lacks.
-    def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
-        return [("draft", self._draft_runner)]
 
     # FIXME(junyanxu): metrics_reporter calls this on every DSPARK decode log;
     # report the block-accept estimate once the confidence budget is ported.
