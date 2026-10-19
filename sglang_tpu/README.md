@@ -56,19 +56,34 @@ either.
 
 ## Speculative worker selection
 
-Both platform identities select `TpuChainSpecWorker` for EAGLE3 and native MTP
-(NEXTN) top-k-1 chains and `TpuBlockSpecWorker` for DFlash/DSpark at PP=1 by
-default. These paths require overlap scheduling; argument resolution enables torch
-compilation for them. Argument resolution also checks, before any model loads,
-what the plugin workers reject: disabled overlap, mixed-phase attention-DP
-settings, non-static ragged verify, block attention-DP, and for the chain worker
-a draft window, adaptive/multi-layer drafting, draft-token counts other than
-steps + 1, and EAGLE3 drafts other than `LlamaForCausalLMEagle3` or with M-RoPE.
-Such a launch runs on the compatibility worker and logs why; with the plugin
-worker requested explicitly (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1` or
-`SGLANG_TPU_HOST_PADDING_NO_D2H=1`) it fails instead. Tree top-k stays rejected.
-PP-prefill retains the compatibility driver. TPU PP decode remains
-unsupported.
+At PP=1 both platform identities select a plugin worker by default:
+`TpuChainSpecWorker` for EAGLE3 top-k-1 chains and for native MTP (NEXTN) on the
+drafts TPU serving has exercised (Qwen3.8 and GLM-5.3-Flash MTP), and
+`TpuBlockSpecWorker` for DFlash/DSpark. These paths require overlap scheduling;
+argument resolution enables torch compilation for them.
+
+Argument resolution also checks, before any model loads, what the plugin workers
+reject:
+- every route: disabled overlap, a non-fixed simulated-acceptance token mode,
+  mixed-phase attention-DP settings, and an `SGLANG_SPEC_TP_SYNC` that enables
+  only one spec-accept site under attention DP;
+- EAGLE3 and native MTP: non-static ragged verify, a draft window, top-k other
+  than 1, adaptive or multi-layer drafting, and draft-token counts other than
+  steps + 1; EAGLE3 also drafts other than `LlamaForCausalLMEagle3` and M-RoPE
+  drafts;
+- DFlash and DSpark: attention DP and non-static ragged verify; DFlash also
+  LiLiCorr or Domino drafts, a `mask_embedding.pt` beside the draft, and a
+  missing or out-of-vocabulary `dflash_config.mask_token_id`; DSpark a draft its
+  runtime config rejects.
+
+Such a launch runs on the compatibility worker and logs why, as does native MTP
+on a draft not yet exercised. The fallback lasts for that launch only and leaves
+`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER` as set. With the plugin worker requested
+explicitly (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1` or
+`SGLANG_TPU_HOST_PADDING_NO_D2H=1`) the launch fails instead, and
+`--tpu-compile-tracer direct` fails when the selected compatibility driver is not
+direct-compiled. Tree top-k stays rejected. PP-prefill retains the compatibility
+driver. TPU PP decode remains unsupported.
 
 For the compatibility route set both
 `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0` and
