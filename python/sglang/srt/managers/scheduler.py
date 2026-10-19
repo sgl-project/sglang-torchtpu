@@ -534,7 +534,7 @@ class Scheduler(
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
-        bootstrap.init_parallel_runtime(
+        self.distributed_init_time = bootstrap.init_parallel_runtime(
             server_args=server_args,
             device=get_device().device,
             dist_port=self.nccl_port,
@@ -727,13 +727,21 @@ class Scheduler(
         self.scheduler_startup_begin = time.perf_counter()
 
     def init_startup_timing_summary(self) -> None:
+        startup_end = time.perf_counter()
+        post_sync_startup_begin = self.tp_worker.model_runner.post_sync_startup_begin
         self.startup_time = build_scheduler_startup_time(
             target_load_weight=self.tp_worker.weight_load_time,
             draft_load_weight=(
                 0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
             ),
             kv_cache_allocation=self.kv_cache_allocation_time,
-            scheduler_e2e=time.perf_counter() - self.scheduler_startup_begin,
+            scheduler_e2e=startup_end - self.scheduler_startup_begin,
+            distributed_init=self.distributed_init_time,
+            post_sync_startup=(
+                None
+                if post_sync_startup_begin is None
+                else startup_end - post_sync_startup_begin
+            ),
             target_cuda_graph=self.tp_worker.graph_time_usage,
             draft_cuda_graph=(
                 None
@@ -3756,11 +3764,11 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
-    def stash_chunked_request(self, req: Req):
+    def stash_chunked_request(self, req: Req, *, mid_prefill: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
         else:
-            checkpoint_kv_cache(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache, mid_prefill=mid_prefill)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
@@ -3970,7 +3978,7 @@ class Scheduler(
             # len(prefix_indices), so there is nothing new to cache and
             # stashing would be a no-op.
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
-                self.stash_chunked_request(self.chunked_req)
+                self.stash_chunked_request(self.chunked_req, mid_prefill=True)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:

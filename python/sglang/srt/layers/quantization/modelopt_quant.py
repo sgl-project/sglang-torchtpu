@@ -1650,7 +1650,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
 
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get("ignore", config.get("exclude_modules", []))
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:

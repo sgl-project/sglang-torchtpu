@@ -138,7 +138,6 @@
     "python/sglang/srt/speculative/dflash_info_v2.py": 1,
     "python/sglang/srt/speculative/dflash_utils.py": 1,
     "python/sglang/srt/speculative/dflash_worker_v2.py": 2,
-    "python/sglang/srt/speculative/draft_utils.py": 4,
     "python/sglang/srt/speculative/eagle_info.py": 1,
     "python/sglang/srt/speculative/eagle_utils.py": 3,
     "python/sglang/srt/speculative/eagle_worker_common.py": 1,

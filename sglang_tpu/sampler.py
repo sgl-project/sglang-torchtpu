@@ -488,6 +488,14 @@ class TpuSampler(Sampler):
         Full-logit outputs retain the base sampler's processing and return contract."""
         if is_host_padded(sampling_info):
             sampling_info = sampling_info.on_device()
+            padded_bs = sampling_info.temperatures.shape[0]
+            logits = logits_output.next_token_logits
+            # An eager outer logits processor (multimodal wrappers) emits live
+            # rows; HOST_PADDED sampling runs at the batch bucket.
+            if logits is not None and logits.shape[0] < padded_bs:
+                logits_output.next_token_logits = torch.nn.functional.pad(
+                    logits, (0, 0, 0, padded_bs - logits.shape[0])
+                )
 
         live_rows = None
         if sampling_info.sampling_params_on_cpu:

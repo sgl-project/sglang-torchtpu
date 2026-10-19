@@ -13,6 +13,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import pipeline as pl
+from sglang_tpu.disaggregation.raiden import pp_common
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -54,7 +55,7 @@ def test_rank4_head_slices_land_on_owning_rank(total_kv_heads, dst_tp, dtype):
     swa_src = torch.zeros((4, 2 * total_kv_heads, head_dim, page), dtype=dtype)
     pools = pl.pool_manifest(_groups([src], [swa_src], [1], [2]))
     full_ids, swa_ids = [4, 0, 2], [1, 3]
-    spans = pl.head_slice_spans(
+    spans = pp_common.head_slice_spans(
         pools, [src, swa_src], full_ids, swa_ids, dst_tp, total_kv_heads
     )
     rng = np.random.default_rng(0)

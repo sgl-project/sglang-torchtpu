@@ -49,11 +49,12 @@ launch/rank-0 run model, and the image are the same too. `tp = hosts × 8` (tpu7
 
 ## Add an `external-nightly-*` test
 
-1. **Stage the weights** once (you need `objectAdmin` on the bucket):
+1. **Stage the weights** once (you need `objectAdmin` on the bucket). Set
+   `TPU_WEIGHTS_BUCKET` to your deployment's bucket name before running:
 
    ```sh
    gcloud storage rsync -r ./Qwen3-Coder-30B-A3B-Instruct-FP8 \
-     gs://sglang-torchtpu-ci-artifacts/weights/Qwen3-Coder-30B-A3B-Instruct-FP8
+     "gs://${TPU_WEIGHTS_BUCKET}/weights/Qwen3-Coder-30B-A3B-Instruct-FP8"
    ```
 
 2. **Write the test** under `test/registered/tpu/...` like any in-project multi-host test —
@@ -111,7 +112,7 @@ python3 .github/tpu-ci/external/render_external_jobset.py --list-groups  # what 
 
 ## Configuration
 
-Non-sensitive structure lives in [`external-topology.yaml`](external-topology.yaml). Partner-internal
+Non-sensitive structure lives in [`external-topology.yaml`](external-topology.yaml). External-cluster
 identifiers are **repo secrets** (masked in logs, out of source) — set once:
 
 | Secret | Value |
@@ -133,7 +134,12 @@ Discover nodepools with
 a slice, append a secret name to that shape's `nodepool_vars`, set the secret, and add a line
 to `_external-tpu-test.yml`'s render-step env. A new shape also needs a `suites:` entry.
 
-## Logs and historical disclosures
+## Public log boundary
+
+The workflow publishes pod output to Actions logs, log artifacts, and the
+configured live-log bucket. Use only release-approved models and public or
+synthetic datasets in these suites; do not use production requests or customer
+data. Log filtering is best effort and does not make arbitrary test output safe.
 
 Pod status output includes names and phases only. Event summaries omit free-form
 messages, and the workflow does not print full JobSet descriptions or node selectors.

@@ -1,0 +1,5 @@
+# actionlint config for scripts/ci/tpu/check_workflows.sh.
+self-hosted-runner:
+  # Self-hosted runner labels used by the fork's workflows.
+  labels:
+    - linux-x64-k3s-docker-build

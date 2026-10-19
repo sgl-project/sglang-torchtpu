@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import inspect
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, ClassVar, Literal
 
 import msgspec
@@ -16,12 +17,16 @@ from torch.utils._pytree import tree_leaves
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
-from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+from sglang.srt.layers.aux_hidden_states import (
+    AUX_HIDDEN_STATES_PROXY_KEY,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import dp_gather_width, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -411,6 +416,20 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
         )
 
 
+# Per-DP-rank token counts the compiled forward reads as device tensors.
+_DP_COUNT_FIELDS = ("global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu")
+
+
+class EagerLogitsCase(msgspec.Struct, frozen=True):
+    """One shape of the eager outer-model logits that follows a compiled decoder forward."""
+
+    num_tokens: int
+    bs: int
+    mode: ForwardMode
+    capture_hidden_mode: CaptureHiddenMode
+    spec_info: SpecInput | None = None
+
+
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
@@ -783,6 +802,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         from sglang_tpu.compilation.direct_compile import (
             direct_compile,
         )
+        from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+            bind_traced_attention_metadata,
+            bind_traced_conv_weights,
+            traced_attention_metadata,
+        )
 
         fn = torch.no_grad()(fn)
         model = self.model_runner.model
@@ -798,9 +822,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         ) -> Any:
             backend = get_forward_context().attn_backend
             with (
-                backend.bind_forward_metadata(
-                    attention_metadata, forward_batch.forward_mode
+                bind_traced_attention_metadata(
+                    backend, attention_metadata, forward_batch.forward_mode
                 ),
+                bind_traced_conv_weights(model),
                 use_attention_rank_tensors(attention_rank_tensors),
             ):
                 return fn(input_ids, positions, forward_batch, *args, **kwargs)
@@ -825,7 +850,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         def call(*args: Any, **kwargs: Any) -> Any:
             backend = get_forward_context().attn_backend
             return compiled(
-                backend.forward_metadata,
+                traced_attention_metadata(backend),
                 *args,
                 attention_rank_tensors=get_attention_rank_tensors(
                     torch.device(self.model_runner.device)
@@ -836,7 +861,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         def warmup_async(*args: Any, **kwargs: Any) -> PendingCall:
             backend = get_forward_context().attn_backend
             return compiled.warmup_async(
-                backend.forward_metadata,
+                traced_attention_metadata(backend),
                 *args,
                 attention_rank_tensors=get_attention_rank_tensors(
                     torch.device(self.model_runner.device)
@@ -847,7 +872,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return call, warmup_async
 
     def get_direct_compile_kv_pool(self):
-        return self.model_runner.token_to_kv_pool
+        kv_pool = self.model_runner.token_to_kv_pool
+        if not isinstance(kv_pool, HybridLinearKVPool):
+            return kv_pool
+        from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+            hybrid_linear_kv_pool_state,
+        )
+
+        return hybrid_linear_kv_pool_state(
+            kv_pool=kv_pool, req_to_token_pool=self.model_runner.req_to_token_pool
+        )
 
     def _ignored_argnames(self) -> tuple[str, ...]:
         return (
@@ -1018,6 +1052,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _supports_padded_sampling_outputs(self) -> bool:
         return self._compiles_logits_processor()
 
+    def keeps_padded_mm_embeds(self, batch: ForwardBatch) -> bool:
+        """Whether the shim hands mm_input_embeds back at the token bucket."""
+        return False
+
     def keep_outputs_padded(self, batch: ForwardBatch) -> bool:
         from sglang_tpu.sampler import supports_padded_sampling
 
@@ -1099,7 +1137,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         sampling_info = forward_batch.sampling_info
         if sampling_info is None or not is_host_padded(sampling_info):
             return
-        for name in (*_TOKEN_FIELDS, *_BS_FIELDS):
+        # DP attention's bucket metadata is built on input_ids' (host) device too.
+        for name in (*_TOKEN_FIELDS, *_BS_FIELDS, *_DP_COUNT_FIELDS):
             if name == "req_pool_indices_cpu":
                 continue
             value = getattr(forward_batch, name, None)
@@ -1385,6 +1424,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _extend_input_variants(self) -> tuple[str, ...]:
         """Input signatures an extend graph must be compiled for."""
         return ("plain",)
+
+    def _extend_serving_variants(self) -> tuple[str, ...]:
+        """Every input signature serving hands the extend graph, for each warmup grid."""
+        return self._extend_input_variants()
 
     def _extend_cp_compile_items(self) -> list[tuple[int, int, ForwardMode, str, Any]]:
         """Warmup items of the context-parallel extend family.
@@ -1708,6 +1751,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
         return _unpad_decoder_outputs(outputs, forward_batch)
 
+    def warmup_eager_logits(self, cases: Sequence[EagerLogitsCase]) -> None:
+        """Warm the logits a wrapper runs eagerly after its compiled decoder, one run per case."""
+
     def _set_dp_attention_metadata(
         self, forward_batch: ForwardBatch, num_tokens: int, bs: int, mode: ForwardMode
     ) -> None:
@@ -1807,7 +1853,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # MROPE runtime positions are real [3, num_tokens] tensors. Keep strides
         # identical here so Dynamo does not guard-miss after precompile.
         mrope_positions = None
-        if self._model_is_mrope:
+        if self._model_is_mrope and mode.is_target_verify():
+            # torch_tpu fuses the eager ops before a compiled call into one program;
+            # mirror ForwardBatch.compute_spec_mrope_positions so verify reuses it.
+            mrope_positions = (
+                layout.positions.to(torch.int64).flatten().unsqueeze(0).repeat(3, 1)
+            )
+        elif self._model_is_mrope:
             mrope_positions = layout.positions.unsqueeze(0).expand(3, -1).contiguous()
 
         sampling_info = (
@@ -1968,17 +2020,64 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             return super()._sampling_warmup_logits(rows)
         return self._eager_warmup_logits(rows, rows, ForwardMode.DECODE)
 
+    def warmup_eager_logits(self, cases: Sequence[EagerLogitsCase]) -> None:
+        if self._compiles_logits_processor():
+            return
+        with torch.no_grad():
+            for case in cases:
+                self._eager_warmup_logits(
+                    case.num_tokens,
+                    case.bs,
+                    case.mode,
+                    capture_hidden_mode=case.capture_hidden_mode,
+                    spec_info=case.spec_info,
+                ).cpu()
+
     def _eager_warmup_logits(
-        self, tokens: int, rows: int, mode: ForwardMode
+        self,
+        tokens: int,
+        rows: int,
+        mode: ForwardMode,
+        *,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: SpecInput | None = None,
     ) -> torch.Tensor:
         runner = self.model_runner
-        batch = self._make_dummy_forward_batch(tokens, rows, mode)
+        batch = self._make_dummy_forward_batch(
+            tokens,
+            rows,
+            mode,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
+        )
         batch.logits_output_mode = LogitsOutputMode.FULL_VOCAB
-        hidden = torch.zeros(
-            (tokens, runner.model_config.hidden_size), dtype=runner.dtype
-        ).to(runner.device)
+
+        def hidden() -> torch.Tensor:
+            return torch.zeros(
+                (tokens, runner.model_config.hidden_size), dtype=runner.dtype
+            ).to(runner.device)
+
+        # EAGLE3/DFlash capture hands the logits processor one hidden per captured layer.
+        aux_hidden_states = (
+            AuxHiddenStateList(hidden() for _ in self.owner.layers_to_capture)
+            if runner.model.capture_aux_hidden_states
+            else None
+        )
+        hidden_states = hidden()
+        # torch_tpu fuses pending eager ops into one program; serving starts the
+        # logits right after the compiled call, so flush the setup ops first.
+        for field in dataclasses.fields(batch):
+            value = getattr(batch, field.name)
+            if isinstance(value, torch.Tensor) and value.device.type == "tpu":
+                value.cpu()
+        for tensor in (hidden_states, *(aux_hidden_states or ())):
+            tensor.cpu()
         return runner.model.logits_processor(
-            batch.input_ids, hidden, runner.model.lm_head, batch
+            batch.input_ids,
+            hidden_states,
+            runner.model.lm_head,
+            batch,
+            aux_hidden_states,
         ).next_token_logits
 
     def install(self) -> bool:
@@ -2015,6 +2114,13 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         if self._num_deepstack > 0:
             return ("deepstack", "text_only")
         return ("text_only",)
+
+    def _extend_serving_variants(self) -> tuple[str, ...]:
+        if not self._uses_input_embeds(self.owner):
+            return super()._extend_serving_variants()
+        # "text_ids" warms positional token-ID calls used by text-only serving,
+        # in addition to the input_embeds calls used by multimodal serving.
+        return (*self._extend_input_variants(), "text_ids")
 
     def _direct_compile_specialization_key(
         self,
@@ -2079,6 +2185,15 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     def finalize_forward_batch(self, outputs: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+        sampling_info = forward_batch.sampling_info
+        if (
+            sampling_info is not None
+            and is_host_padded(sampling_info)
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            # HOST_PADDED extend samples and writes draft KV at the buckets; trimming
+            # here would run the eager logits and the draft writer per prompt length.
+            return outputs
         out = super().finalize_forward_batch(outputs, forward_batch)
         if real_q is None:
             return out
@@ -2122,9 +2237,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 f"extend batch cap {self._extend_compile_cap()}."
             )
 
-        # "text_ids" warms positional token-ID calls used by text-only serving,
-        # in addition to the input_embeds calls used by multimodal serving.
-        variants = (*self._extend_input_variants(), "text_ids")
+        variants = self._extend_serving_variants()
 
         compile_items = [
             (num_tokens, bs, mode, variant, logits_output_mode)

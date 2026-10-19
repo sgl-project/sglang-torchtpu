@@ -21,7 +21,6 @@ The kernel reads either of two KV cache layouts, chosen once here from
 from sglang.srt.environ import envs
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
-    BaseTpuPallasRpaMultiStepDraftBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
 )
@@ -30,7 +29,6 @@ from sglang_tpu.cp_forward import get_tpu_cp_layout
 __all__ = [
     "PallasForwardMetadata",
     "TpuPallasRpaBatchedAttnBackend",
-    "TpuPallasRpaBatchedMultiStepDraftBackend",
     "kv_layout",
     "uses_seq_along_lane_kv",
 ]
@@ -165,9 +163,3 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
             check_batch_schedule(self._pp_schedule_runner, self, forward_batch)
         super().init_forward_metadata(forward_batch)
-
-
-class TpuPallasRpaBatchedMultiStepDraftBackend(BaseTpuPallasRpaMultiStepDraftBackend):
-    """One batched-RPA backend per EAGLE draft decode step."""
-
-    attn_backend_cls = TpuPallasRpaBatchedAttnBackend

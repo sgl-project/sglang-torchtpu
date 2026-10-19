@@ -18,6 +18,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
+    build_dflash_draft_block,
     gather_dflash_candidate_window,
     select_dflash_verify_cache_locs_tpu,
 )
@@ -425,6 +426,73 @@ def test_device_selection_makes_no_host_transfer():
 
     assert log.d2h == [], f"unexpected device-to-host transfer: {log.d2h}"
     assert log.h2d == [], f"unexpected host-to-device transfer: {log.h2d}"
+
+
+@pytest.mark.parametrize("allocated_len, num_alloc_calls", [(64, 0), (12, 1)])
+def test_skip_empty_host_decode_alloc_only_skips_steps_without_new_slots(
+    allocated_len, num_alloc_calls
+):
+    """Skipping empty host decode allocations must still allocate (and record the
+    allocation) whenever any request crosses its reserve."""
+    batch = _prepare_batch(_req_to_token(2))
+    batch.reqs[0].kv.kv_allocated_len = allocated_len
+    info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
+    spec_mock = SimpleNamespace(
+        speculative_num_draft_tokens=BLOCK_SIZE, speculative_draft_window_size=None
+    )
+    alloc = Mock()
+
+    with (
+        patch.object(dflash_info_v2, "_is_tpu", True),
+        patch.object(dflash_info_v2, "get_spec", return_value=spec_mock),
+        patch.object(dflash_info_v2, "allocate_and_assign_decode_cache", alloc),
+    ):
+        info.prepare_for_decode(batch)
+
+    assert alloc.call_count == num_alloc_calls
+    # committed 10 + reserve 2 * BLOCK_SIZE
+    assert batch.reqs[0].kv.kv_allocated_len == max(allocated_len, 18)
+
+
+def test_fused_draft_block_matches_the_step_by_step_prep():
+    """The fused draft block: one graph-break-free program that equals the separate
+    block-id fill, position add, verify-slot select and embedding."""
+    req_to_token = _req_to_token(3)
+    base = torch.tensor([10, 7, 23], dtype=torch.int64)
+    candidates = gather_dflash_candidate_window(
+        req_to_token, torch.tensor([2, 0, 1], dtype=torch.int64), base, BLOCK_SIZE
+    )
+    prefix_lens = base + torch.tensor([1, 4, 2], dtype=torch.int64)
+    bonus = torch.tensor([5, 6, 7], dtype=torch.int64)
+    offsets = torch.arange(BLOCK_SIZE, dtype=torch.int64)
+    embedding = torch.nn.Embedding(16, 8)
+
+    def embed(*, block_ids):
+        return embedding(block_ids).flatten(0, 1)
+
+    fused = torch.compile(build_dflash_draft_block, fullgraph=True, backend="eager")
+    with torch.no_grad():
+        block_ids, positions, slots, embeds = fused(
+            embed=embed,
+            bonus_tokens=bonus,
+            prefix_lens=prefix_lens,
+            candidates=candidates,
+            committed_lens=base,
+            block_pos_offsets=offsets,
+            mask_token_id=15,
+            block_size=BLOCK_SIZE,
+        )
+        expected_ids = torch.full((3, BLOCK_SIZE), 15, dtype=torch.int64)
+        expected_ids[:, 0] = bonus
+        assert torch.equal(block_ids, expected_ids)
+        assert torch.equal(positions, prefix_lens[:, None] + offsets)
+        assert torch.equal(
+            slots,
+            select_dflash_verify_cache_locs_tpu(
+                candidates, prefix_lens, base, BLOCK_SIZE
+            ),
+        )
+        assert torch.equal(embeds, embed(block_ids=expected_ids))
 
 
 if __name__ == "__main__":

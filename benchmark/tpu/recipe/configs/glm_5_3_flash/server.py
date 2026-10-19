@@ -50,6 +50,10 @@ CONFIG["server_args"].update(
         "mem_fraction_static": 0.9,
         "disable_shared_experts_fusion": True,
         "watchdog_timeout": 1800,
+        # Prefill keeps the mHC residual streams sequence-parallel over TP: each
+        # rank runs the per-token mHC seam on 1/tp of the tokens, and a
+        # reduce-scatter + all-gather replace the all-reduce.
+        "enable_attn_tp_input_scattered": True,
     }
 )
 if DENSE_MAX_CONTEXT:
@@ -67,6 +71,11 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_ENABLE_GLM5_NEXT_FUSED_MHC": "1",
         "SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL": "1",
         "SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL": "1",
+        "SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL": "1",
+        # f32 MoE scales skip a per-step scale relayout in gmm_v2.
+        "SGLANG_TPU_FP8_MOE_FP32_SCALES": "1",
+        # Route-meta permute (single-token SMEM counting sort) for small batches.
+        "SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD": "512",
     }
 )
 # libtpu >= 0.0.46 bug (#1137, fixed in 0.0.51): with large KV pools the fast-merge

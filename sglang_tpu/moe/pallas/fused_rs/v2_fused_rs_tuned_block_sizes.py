@@ -202,6 +202,12 @@ def _all_m(tile):
     return {m_key: tile for m_key in _ALL_M_KEYS}
 
 
+# H4096-I4096 expert TP8 (each expert's intermediate dim split 8 ways: w13 N=1024, w2
+# K=512 per device). Muse Spark microbench: tile_m 128 for the prefill calls (2048 tokens x
+# top-8 x 8 routed rows) beats the default 64, and 256 and 512.
+_H4096_I4096_EXPERT_TP8 = (128, 4096, 1024, 512, 4096, 2, 2)
+
+
 def _h4096_i4096_fp4_size_dependent():
     """H4096-I4096 fp4: full tiles for small M, smaller tiles for large M.
 
@@ -362,6 +368,26 @@ def _h4096_i4096_fp8_perchannel_size_dependent():
     return out
 
 
+def _h4096_i4096_fp8_kblock2_size_dependent():
+    """H4096-I4096 channelwise fp8 stored as two identical K blocks (rhs_bs=K/2).
+
+    Muse Spark EP8 microbench (32 tokens at 6 experts/device, 128 tokens, 4096
+    tokens): full-N single buffer is fastest at M<=256, half-N double-buffered
+    at M 512-2048, and tile_m 128 half-N for prefill (over the per-channel
+    full-N tile_m 112; larger tile_m does not fit VMEM).
+    """
+    out = {}
+    for m_key in _ALL_M_KEYS:
+        m_val = int(m_key.split("_")[0])
+        if m_val <= 256:
+            out[m_key] = (32, 4096, 4096, 4096, 4096, 1, 1)
+        elif m_val <= 2048:
+            out[m_key] = _H4096_I4096_FP8_DECODE
+        else:
+            out[m_key] = (128, 4096, 2048, 4096, 2048, 2, 2)
+    return out
+
+
 def _h4096_i4096_fp8_fp8comm_size_dependent():
     """H4096-I4096 fp8 WITH fp8 output comm (fp8_direct_write).
 
@@ -390,6 +416,10 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
         # FP8 (lhs bf16 × rhs fp8)
         # ---------------------------------------------------------------------
         "lhs_bfloat16_rhs_float8_e4m3fn": {
+            (
+                "k-4096_n-1024_g-256_lhs_quant_rhs_bs-2048"
+                "+k-512_n-4096_g-256_lhs_quant_rhs_bs-2048"
+            ): _all_m(_H4096_I4096_EXPERT_TP8),
             # Qwen3-Coder-480B FP8, TP8/EP8, 8K-token prefill. The serving
             # loader converts the checkpoint to channelwise runtime scales.
             # A larger M tile amortizes the four W1 and four W2 steps while
@@ -431,6 +461,37 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-4096_n-8192_g-32_lhs_quant_rhs_bs-4096"
                 "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-4096"
             ): _h4096_i4096_fp8_perchannel_size_dependent(),
+            # Channelwise FP8 stored as two identical K blocks
+            # (_replicate_channelwise_fused_rs_scales); without an entry these
+            # fall back to the untuned defaults.
+            (
+                "k-4096_n-8192_g-16_lhs_quant_rhs_bs-2048"
+                "+k-4096_n-4096_g-16_lhs_quant_rhs_bs-2048"
+            ): _h4096_i4096_fp8_kblock2_size_dependent(),
+            (
+                "k-4096_n-8192_g-32_lhs_quant_rhs_bs-2048"
+                "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-2048"
+            ): _h4096_i4096_fp8_kblock2_size_dependent(),
+            # H4096-I4096 expert TP16 (every expert's intermediate dim split 16
+            # ways: w13 N=512, w2 K=256 per device). Muse Spark microbench:
+            # tile_m 32 beats the default 64 for decode (M up to
+            # 16384 = 128 tokens x top-8 x 16); larger tile_m is slower even
+            # for a 1024-token prefill call, so keep 64 there.
+            (
+                "k-4096_n-512_g-256_lhs_quant_rhs_bs-4096"
+                "+k-256_n-4096_g-256_lhs_quant_rhs_bs-4096"
+            ): {
+                m_key: (
+                    (32 if int(m_key.split("_")[0]) <= 16384 else 64),
+                    4096,
+                    512,
+                    256,
+                    4096,
+                    2,
+                    2,
+                )
+                for m_key in _ALL_M_KEYS
+            },
             # H3072-I3072: H=3072, I=3072, E=256, EP=8 → g=32
             # Full-N tiles (no N-tiling), no caching. tile_m=256 for large M
             # to minimize gm-loop iterations. Matches shared table values.
@@ -464,6 +525,10 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
         # (num_w1_bufs=2) that FP8 couldn't afford. No size-dependent
         # split needed — the caching overhead is negligible at FP4 sizes.
         "lhs_bfloat16_rhs_float4_e2m1fn": {
+            (
+                "k-4096_n-1024_g-256_lhs_quant_rhs_bs-16"
+                "+k-512_n-4096_g-256_lhs_quant_rhs_bs-16"
+            ): _all_m(_H4096_I4096_EXPERT_TP8),
             # H4096-I4096: H=4096, I=4096, E=256, EP=8 → g=32
             # Small M: full tiles (1,1). Large M (≥32768): smaller tiles
             # with W2 caching (2,2) for better pipelining.

@@ -57,7 +57,9 @@ fi
 # turn a ~minute compile into 10+ minutes plus a multi-GB log file.
 export TORCH_LOGS=${TORCH_LOGS:-+recompiles}
 # Serving-time XLA compiles; SITES attributes eager compiles to sglang lines.
-export SGLANG_TPU_CHECK_RECOMPILATION=${SGLANG_TPU_CHECK_RECOMPILATION:-1}
+# Off by default: every forward that misses the in-memory cache (persistent-cache
+# loads included) syncs the device, which stalls spec decode most.
+export SGLANG_TPU_CHECK_RECOMPILATION=${SGLANG_TPU_CHECK_RECOMPILATION:-0}
 # Off by default: its dispatch mode costs ~40us per eager op (CPU ops included).
 export SGLANG_TPU_CHECK_RECOMPILATION_SITES=${SGLANG_TPU_CHECK_RECOMPILATION_SITES:-0}
 

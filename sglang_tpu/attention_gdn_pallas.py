@@ -30,7 +30,10 @@ Sibling to :mod:`sglang_tpu.attention_pallas_rpa_v3`
 # reject them.
 
 import logging
-from typing import TYPE_CHECKING, Optional
+import weakref
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -404,6 +407,18 @@ def build_gdn_pallas_op():
     return custom_op
 
 
+class GdnTracedMetadata(NamedTuple):
+    """Per-forward tensors the GDN/KDA layers read; direct compile lifts them as inputs."""
+
+    distribution: torch.Tensor
+    seq_lens: torch.Tensor
+    state_indices: torch.Tensor
+    query_start_loc: torch.Tensor
+    track_indices: Optional[torch.Tensor]
+    track_end: Optional[torch.Tensor]
+    read_offsets: Optional[torch.Tensor]
+
+
 class TpuGDNAttnBackend(MambaAttnBackendBase):
     """TPU GDN linear-attention backend backed by the fused Pallas kernel.
 
@@ -438,6 +453,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.mamba_pool.warmup_state_copy(
                 self.req_to_token_pool.size
             )
+        self._warmup_slot_bookkeeping()
         # Per-forward GDN metadata (int32, TPU-native), computed once in
         # init_forward_metadata and read by every GDN layer's forward — not
         # carried by the shared ForwardMetadata dataclass.
@@ -445,6 +461,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._seq_lens: Optional[torch.Tensor] = None
         self._state_indices: Optional[torch.Tensor] = None
         self._query_start_loc: Optional[torch.Tensor] = None
+        self._track_indices: Optional[torch.Tensor] = None
+        self._track_end: Optional[torch.Tensor] = None
         # Pure decode / verify has no PER_SEQ rows and extend no BATCHED rows
         # (see _get_distribution), so each runs one kernel pass instead of both.
         self._is_decode = False
@@ -457,6 +475,58 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
         self._query_start_loc_cache: dict = {}
+        self._slot_memo: Optional[tuple] = None
+
+    def _slot_indices(
+        self, req_pool_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(int64 slot ids, int32 slot ids) of the batch's requests.
+
+        An unchanged batch reuses the last result: the gather and the cast are
+        two launches per round otherwise. Valid only while every write to the
+        request-to-slot table is an eager in-place op (it is written when a
+        request is allocated), which bumps ``_version``; a write from inside a
+        compiled graph would not, and must clear ``_slot_memo``.
+        """
+        pool = self.req_to_token_pool
+        table = pool.req_index_to_mamba_index_mapping
+        memo = self._slot_memo
+        if (
+            memo is not None
+            and memo[0]() is req_pool_indices
+            and memo[1] == req_pool_indices._version
+            and memo[2] == table._version
+        ):
+            return memo[3], memo[4]
+        slots = self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices))
+        slots_i32 = slots.to(torch.int32)
+        # int64 for the verify commit's index_copy_ (the table itself is int32).
+        if slots.dtype != torch.int64:
+            slots = slots.long()
+        if pool.mamba_v2p_table is None:
+            self._slot_memo = (
+                weakref.ref(req_pool_indices),
+                req_pool_indices._version,
+                table._version,
+                slots,
+                slots_i32,
+            )
+        return slots, slots_i32
+
+    def _warmup_slot_bookkeeping(self) -> None:
+        """Slot allocation's mapping write and clear_slots, once per new-request count."""
+        pool = self.req_to_token_pool
+        mapping = pool.req_index_to_mamba_index_mapping
+        with torch.no_grad():
+            for count in range(1, pool.size + 1):
+                # Allocator slot ids arrive as CPU int64; request row 0 and state
+                # slot 0 are reserved, so these writes touch no request.
+                slots = torch.zeros(count, dtype=torch.int64)
+                mapping[[0] * count] = slots.to(
+                    device=mapping.device, dtype=torch.int32
+                )
+                pool.mamba_pool.clear_slots(slots)
+            mapping[0:1].cpu()
 
     def _uniform_query_start_loc(
         self, padded_bs: int, step: int, device: torch.device
@@ -512,10 +582,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # tracked-row selections and reads device masks on the host. Here every
         # row retains its bucket slot and disabled snapshots use end=-1.
         # Slot ids; the op clamps the -1 pad in-graph (see build_gdn_pallas_op).
-        slots = self._translate_mamba_indices(
-            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
-        )
-        self._state_indices = slots.to(torch.int32)
+        slots, self._state_indices = self._slot_indices(forward_batch.req_pool_indices)
         padded_bs = forward_batch.seq_lens.shape[0]
         if is_decode:
             # One token per request, or the verify window per request.
@@ -576,6 +643,36 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             self._read_offsets_pool.index_fill_(
                 0, self._state_indices.clamp(min=0).long(), 0
             )
+
+    def traced_metadata(self) -> GdnTracedMetadata:
+        return GdnTracedMetadata(
+            distribution=self._distribution,
+            seq_lens=self._seq_lens,
+            state_indices=self._state_indices,
+            query_start_loc=self._query_start_loc,
+            track_indices=self._track_indices,
+            track_end=self._track_end,
+            read_offsets=self._read_offsets,
+        )
+
+    @contextmanager
+    def bind_traced_metadata(self, metadata: GdnTracedMetadata) -> Iterator[None]:
+        """Install graph inputs in place of the eager metadata while tracing."""
+        previous = self.traced_metadata()
+        self._set_traced_metadata(metadata)
+        try:
+            yield
+        finally:
+            self._set_traced_metadata(previous)
+
+    def _set_traced_metadata(self, metadata: GdnTracedMetadata) -> None:
+        self._distribution = metadata.distribution
+        self._seq_lens = metadata.seq_lens
+        self._state_indices = metadata.state_indices
+        self._query_start_loc = metadata.query_start_loc
+        self._track_indices = metadata.track_indices
+        self._track_end = metadata.track_end
+        self._read_offsets = metadata.read_offsets
 
     def commit_verified_states(
         self,

@@ -2,39 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
+
 import torch
 
-from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.common import is_pin_memory_available
 
-
-def apply_verify_logits_adjustments(
-    *,
-    next_token_logits: torch.Tensor,
-    sampling_info: SamplingBatchInfo,
-    num_verify_rows: int,
-) -> None:
-    """Apply per-request adjustments to [bs * num_verify_rows, V] request-major logits in place."""
-    if sampling_info.has_custom_logit_processor:
-        apply_custom_logit_processor(
-            next_token_logits, sampling_info, num_tokens_in_batch=num_verify_rows
-        )
-    # Penalties come from the committed prefix only, same relaxation as EAGLE verify.
-    # Overlap hands the forward precomputed acc_* penalties and no orchestrator.
-    logits_3d = next_token_logits.view(-1, num_verify_rows, next_token_logits.shape[-1])
-    orchestrator = sampling_info.penalizer_orchestrator
-    if orchestrator is not None and orchestrator.is_required:
-        orchestrator.apply(next_token_logits, repeat=num_verify_rows)
-    else:
-        if sampling_info.acc_additive_penalties is not None:
-            logits_3d.add_(sampling_info.acc_additive_penalties[:, None, :])
-        if sampling_info.acc_scaling_penalties is not None:
-            apply_scaling_penalties(
-                logits_3d, sampling_info.acc_scaling_penalties[:, None, :]
-            )
-    if sampling_info.logit_bias is not None:
-        logits_3d.add_(sampling_info.logit_bias[:, None, :])
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 def prompt_positions(*, prefix_lens: list[int], extend_lens: list[int]) -> torch.Tensor:
@@ -55,3 +32,29 @@ def pad_rows(tensor: torch.Tensor, rows: int) -> torch.Tensor:
     if pad == 0:
         return tensor
     return torch.nn.functional.pad(tensor, [0, 0] * (tensor.dim() - 1) + [0, pad])
+
+
+def padded_h2d(rows_cpu: torch.Tensor, rows: int, device: str) -> torch.Tensor:
+    """Zero-pad host rows to rows (a batch bucket) in pinned memory, then upload."""
+    padded = torch.zeros(
+        (rows, *rows_cpu.shape[1:]),
+        dtype=rows_cpu.dtype,
+        pin_memory=is_pin_memory_available(device),
+    )
+    padded[: rows_cpu.shape[0]] = rows_cpu
+    return padded.to(device, non_blocking=True)
+
+
+@contextlib.contextmanager
+def overridden_fields(
+    batch: ScheduleBatch, **overrides: Any
+) -> Iterator[ScheduleBatch]:
+    """batch with overrides set, restored on exit."""
+    live = {name: getattr(batch, name) for name in overrides}
+    for name, value in overrides.items():
+        setattr(batch, name, value)
+    try:
+        yield batch
+    finally:
+        for name, value in live.items():
+            setattr(batch, name, value)

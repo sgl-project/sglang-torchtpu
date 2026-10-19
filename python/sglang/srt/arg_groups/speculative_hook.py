@@ -92,7 +92,11 @@ def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> Non
     if cfg.kv_canary != "none":
         raise ValueError("TPU speculative decoding does not support KV canary.")
     if getattr(model_config.hf_config, "index_share_for_mtp_iteration", False):
-        raise ValueError("TPU speculative decoding does not support DSA index sharing.")
+        raise ValueError(
+            "TPU speculative decoding does not support DSA index sharing. A NextN "
+            "draft with its own indexer can run without it: pass "
+            "--json-model-override-args with index_share_for_mtp_iteration=false."
+        )
 
 
 def _resolve_speculative_algorithm_alias(

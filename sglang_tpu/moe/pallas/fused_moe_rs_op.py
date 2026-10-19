@@ -7,9 +7,24 @@ import os
 
 import torch
 
+from sglang_tpu.moe.expert_tp import is_fused_moe_rs_expert_tp
+
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
 _FUSED_MOE_RS_OP = None
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
+# Mirrors fused_rs.fused_moe._FUSED_RS_MAX_SAFE_SIZE_M (kernel SMEM bound on
+# routed rows); kept here so the Torch wrapper need not import JAX.
+_FUSED_RS_MAX_SAFE_ROUTED_ROWS = 262144
+
+
+def fused_moe_rs_expert_tp_max_tokens(topk: int, tp_size: int) -> int:
+    """Largest power-of-two token count one expert-TP call can route.
+
+    Expert TP routes every (token, slot) to all ``tp_size`` expert slices, so a
+    call carries ``tokens * topk * tp_size`` kernel rows.
+    """
+    max_tokens = (_FUSED_RS_MAX_SAFE_ROUTED_ROWS - 1) // (topk * tp_size)
+    return 1 << (max_tokens.bit_length() - 1)
 
 
 def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
@@ -21,21 +36,71 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
     return ((num_tokens + token_alignment - 1) // token_alignment) * token_alignment
 
 
+def pad_moe_tokens(hidden_states, topk_weights, topk_ids, *, padded_tokens: int):
+    """Pad a MoE call's rows out to ``padded_tokens`` (see fused_moe_rs_padded_tokens).
+
+    Activations and routing weights pad with zeros, so the padding rows contribute nothing.
+    The expert ids repeat the first token's instead: 0 is a real expert, so a zero id makes
+    its owner read that expert's weights on every call even when nothing routes there, and at
+    small batch the lone extra expert is often what every other rank ends up waiting on.
+    """
+    import jax.numpy as jnp
+
+    token_padding = padded_tokens - topk_ids.shape[0]
+    if token_padding == 0:
+        return hidden_states, topk_weights, topk_ids
+    return (
+        jnp.pad(hidden_states, ((0, token_padding), (0, 0))),
+        jnp.pad(topk_weights, ((0, token_padding), (0, 0))),
+        jnp.concatenate(
+            [
+                topk_ids,
+                jnp.broadcast_to(topk_ids[:1], (token_padding, topk_ids.shape[1])),
+            ]
+        ),
+    )
+
+
+# Shards above this go through XLA's bandwidth-oriented all-gather.
+_ONESHOT_ALL_GATHER_MAX_SHARD_BYTES = 256 * 1024
+
+
 def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     """Prepare logical expert ownership before Dynamo captures the MoE layer."""
     from sglang.srt.runtime_context import get_parallel
 
-    moe_ep_rank = get_parallel().moe_ep_rank
+    parallel = get_parallel()
+    expert_tp = is_fused_moe_rs_expert_tp(
+        parallel.moe_ep_size, parallel.moe_tp_size, parallel.tp_size
+    )
+    layer.__dict__["_tpu_fused_rs_expert_tp"] = expert_tp
+    # The kernel derives its rank from this offset. Expert TP addresses rank r's
+    # slices as virtual experts [r * E_local, (r + 1) * E_local).
+    rank = parallel.moe_tp_rank if expert_tp else parallel.moe_ep_rank
     group_offset = torch.tensor(
-        [
-            moe_ep_rank * layer.num_local_experts,
-            moe_ep_rank,
-        ],
+        [rank * layer.num_local_experts],
         dtype=torch.int32,
         device=layer.w13_weight.device,
     )
     layer.register_buffer("_tpu_fused_rs_group_offset", group_offset, persistent=False)
 
+    # Expert TP gathers each decode step's small output shard with the one-shot
+    # Pallas all-gather; larger shards still take XLA's (fused_moe_rs_gather).
+    if expert_tp:
+        from sglang_tpu.oneshot_collectives import (
+            get_oneshot_all_gather_op,
+        )
+
+        # The one-shot all-gather writes its shard at this TP rank's slot; the
+        # rank must be a graph input, not a tensor built while tracing.
+        layer.register_buffer(
+            "_tpu_oneshot_rank",
+            torch.tensor(
+                [parallel.tp_rank], dtype=torch.int32, device=layer.w13_weight.device
+            ),
+            persistent=False,
+        )
+        get_oneshot_all_gather_op(parallel.tp_size)
     _build_fused_moe_rs_op()
 
 
@@ -53,7 +118,6 @@ def _build_fused_moe_rs_op():
         return _FUSED_MOE_RS_OP
 
     import jax
-    import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal.pallas import jax_op
 
@@ -75,15 +139,14 @@ def _build_fused_moe_rs_op():
         activation: str,
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
+        expert_tp: bool,
     ) -> jax.Array:
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
         padded_tokens = fused_moe_rs_padded_tokens(num_tokens, topk, ep_size)
-        if padded_tokens != num_tokens:
-            token_padding = padded_tokens - num_tokens
-            hidden_states = jnp.pad(hidden_states, ((0, token_padding), (0, 0)))
-            topk_weights = jnp.pad(topk_weights, ((0, token_padding), (0, 0)))
-            topk_ids = jnp.pad(topk_ids, ((0, token_padding), (0, 0)))
+        hidden_states, topk_weights, topk_ids = pad_moe_tokens(
+            hidden_states, topk_weights, topk_ids, padded_tokens=padded_tokens
+        )
 
         # Run the experts and fuse their model-axis reduce-scatter in one kernel.
         # MoE layers are data-dependent and cannot overlap. Reuse the default
@@ -109,6 +172,7 @@ def _build_fused_moe_rs_op():
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
             fp8_direct_write=fp8_direct_write,
+            expert_tp=expert_tp,
         )
         if not has_post_expert_norm:
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
@@ -121,7 +185,7 @@ def _build_fused_moe_rs_op():
         _FUSED_MOE_RS_OP_NAME,
         _wrapped,
         mesh=mesh,
-        input_partition_specs=(P(),) * 9 + (None,) * 4,
+        input_partition_specs=(P(),) * 9 + (None,) * 5,
         output_partition_specs=(P(),),
     )
 
@@ -139,6 +203,7 @@ def _build_fused_moe_rs_op():
         activation: str,
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
+        expert_tp: bool,
     ) -> torch.Tensor:
         ep_size = mesh.shape["model"]
         padded_tokens = fused_moe_rs_padded_tokens(
@@ -167,6 +232,7 @@ def fused_moe_rs_call(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
+    expert_tp: bool = False,
 ) -> torch.Tensor:
     return _build_fused_moe_rs_op()(
         hidden_states,
@@ -182,6 +248,7 @@ def fused_moe_rs_call(
         activation,
         has_post_expert_norm,
         fp8_direct_write,
+        expert_tp,
     )
 
 
@@ -202,9 +269,42 @@ def fused_moe_rs_gather(
     fp8_direct_write: bool,
     world_size: int,
     keep_token_shard: bool = False,
+    expert_tp: bool = False,
+    oneshot_rank: torch.Tensor | None = None,
 ) -> torch.Tensor:
     import torch.distributed as dist
 
+    if expert_tp:
+        max_tokens = fused_moe_rs_expert_tp_max_tokens(topk, world_size)
+        if hidden_states.shape[0] > max_tokens:
+            if keep_token_shard:
+                raise NotImplementedError(
+                    "TPU fused-RS expert TP does not chunk sequence-parallel "
+                    f"input above {max_tokens} tokens"
+                )
+            return torch.cat(
+                [
+                    fused_moe_rs_gather(
+                        hidden_states=hidden_states[start : start + max_tokens],
+                        w1=w1,
+                        w2=w2,
+                        w1_scale=w1_scale,
+                        w2_scale=w2_scale,
+                        topk_weights=topk_weights[start : start + max_tokens],
+                        topk_ids=topk_ids[start : start + max_tokens],
+                        post_expert_norm_weight=post_expert_norm_weight,
+                        group_offset=group_offset,
+                        topk=topk,
+                        activation=activation,
+                        has_post_expert_norm=has_post_expert_norm,
+                        fp8_direct_write=fp8_direct_write,
+                        world_size=world_size,
+                        expert_tp=True,
+                        oneshot_rank=oneshot_rank,
+                    )[: min(max_tokens, hidden_states.shape[0] - start)]
+                    for start in range(0, hidden_states.shape[0], max_tokens)
+                ]
+            )
     if keep_token_shard and hidden_states.shape[0] % world_size:
         raise RuntimeError(
             "TPU fused-RS sharded output requires input rows divisible by "
@@ -250,6 +350,7 @@ def fused_moe_rs_gather(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
+        expert_tp=expert_tp,
     )
     if token_shard.ndim != 2 or token_shard.shape != (
         padded_shard_rows,
@@ -262,6 +363,19 @@ def fused_moe_rs_gather(
         )
     if keep_token_shard:
         return token_shard[:logical_shard_rows].contiguous()
+
+    if (
+        oneshot_rank is not None
+        and token_shard.numel() * token_shard.element_size()
+        <= _ONESHOT_ALL_GATHER_MAX_SHARD_BYTES
+    ):
+        from sglang_tpu.oneshot_collectives import (
+            oneshot_all_gather,
+        )
+
+        return oneshot_all_gather(
+            token_shard, rank_input=oneshot_rank, world_size=world_size
+        )
 
     try:
         from sglang.srt.runtime_context import get_parallel

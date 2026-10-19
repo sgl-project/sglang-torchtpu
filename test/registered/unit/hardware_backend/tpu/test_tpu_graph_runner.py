@@ -37,6 +37,10 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.compilation.warmup_queue import collect_warmups
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.experimental.compilation.chain_compile_policy import (
+    TpuChainSpecDecodeCompilePolicyMixin,
+)
 from sglang_tpu.graph_runner import tpu_graph_runner
 from sglang_tpu.graph_runner.tpu_graph_runner import (
     TpuGraphRunner,
@@ -421,6 +425,18 @@ class TestTpuGraphRunner(CustomTestCase):
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
 
+    def test_experimental_worker_takes_native_mtp_to_the_chain_policy(self):
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="EAGLE"
+            ),
+        )
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
         # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy.
         mr = SimpleNamespace(
@@ -444,7 +460,8 @@ class TestTpuGraphRunner(CustomTestCase):
                 speculative_num_steps=3, speculative_algorithm="EAGLE"
             ),
         )
-        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))

@@ -475,6 +475,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
         everything after, and unpins."""
 
+    def defer_chunk_checkpoint(self, req: Req) -> bool:
+        """Stand in for the ``checkpoint`` of a mid-prefill chunk at the end of
+        ``req.get_fill_ids()``, keeping its rows request-owned; False means not
+        deferred, so the caller checkpoints."""
+        return False
+
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.

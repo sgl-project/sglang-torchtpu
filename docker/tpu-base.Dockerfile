@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1.7
 #
 # SGLang TPU base image: installs the pinned TPU stack from python/pyproject_tpu.toml
-# into a reusable base image (torch-tpu, libtpu, torch, torchvision, jax, jaxlib, etc.)
-# from the private torch-tpu "virtual" registry.
+# into a reusable base image (torch-tpu, libtpu, torch, torchvision, jax, jaxlib, etc.).
 #
 ARG PYTHON_VERSION=3.12
 FROM python:${PYTHON_VERSION}-slim AS base
@@ -28,14 +27,12 @@ COPY scripts/ci/tpu/warm_mmlu_cache.py ./scripts/ci/tpu/warm_mmlu_cache.py
 
 # Install the pinned TPU stack (dev_tpu extra = all_tpu + test + ray) without sglang itself.
 # diffusion_tpu: test_diffusion_tpu_platform.py imports the diffusion runtime.
-RUN --mount=type=secret,id=gcp_token \
-    cd python && \
+RUN cd python && \
     mkdir -p sglang && \
     touch sglang/__init__.py && \
     pip install --upgrade pip && \
-    TOKEN="$(cat /run/secrets/gcp_token)" && \
     pip install \
-      --index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/" \
+      --extra-index-url https://download.pytorch.org/whl/cpu \
       ".[dev_tpu,diffusion_tpu]" && \
     pip uninstall -y sglang && \
     rm -rf sglang && \

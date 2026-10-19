@@ -273,7 +273,14 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         out = self._op(
-            *self._mla_kernel_args(q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope),
+            *self._mla_kernel_args(
+                q=q,
+                k=k,
+                layer=layer,
+                forward_batch=forward_batch,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            ),
             # Only this dense kernel takes ``segments``. The sparse op does not.
             segments=self.forward_metadata.segments,
             decode_query_size=self.forward_metadata.decode_query_size,
@@ -290,6 +297,7 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         layer: "RadixAttention",
+        forward_batch: ForwardBatch,
         q_rope: Optional[torch.Tensor],
         k_rope: Optional[torch.Tensor],
     ) -> tuple:
@@ -350,7 +358,7 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             new_kv_c,
             new_k_pe,
             *self._kv_cache_buffers(layer.layer_id),
-            self.forward_metadata.kv_lens,
+            self._kv_lens(forward_batch),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,

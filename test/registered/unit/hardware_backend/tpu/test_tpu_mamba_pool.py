@@ -230,6 +230,26 @@ class TestTpuMambaPool(CustomTestCase):
         self.assertTrue(torch.all(pool.mamba_cache.temporal[0] == 4.0))
         self.assertTrue(torch.all(pool.mamba_cache.temporal[1] == 0.0))
 
+    def test_state_swap_routes_each_layer_to_its_tensor(self):
+        """direct_compile swaps placeholders in through set_state while tracing.
+
+        A slicing mistake hands one layer another layer's (or the conv's) state,
+        which still traces and runs but silently mixes recurrent states.
+        """
+        pool = self._pool()
+        num_layers = len(self.LAYERS)
+        state = pool.get_state()
+        self.assertEqual(len(state), 2 * num_layers)
+        replacement = [torch.empty_like(tensor) for tensor in state]
+        pool.set_state(replacement)
+        for layer in range(num_layers):
+            per = pool.mamba2_layer_cache(layer)
+            self.assertIs(per.conv[0], replacement[layer])
+            self.assertIs(per.temporal, replacement[num_layers + layer])
+        self.assertEqual(
+            [id(t) for t in pool.get_state()], [id(t) for t in replacement]
+        )
+
     def test_total_bytes_match_stacked_layout(self):
         """Per-layer allocation must not change the memory footprint."""
         pool = self._pool()

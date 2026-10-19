@@ -25,6 +25,7 @@ from sglang_tpu.compilation.compiled_forward_shim import (
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
     _COMPILE_BAR_FORMAT,
+    EagerLogitsCase,
     _get_hbm_usage_mb,
     _hbm_delta_str,
     _warmup_progress,
@@ -94,7 +95,39 @@ class BaseSpecDecodeCompilePolicyMixin:
             pending += self._precompile_target_verify()
         if disagg_mode != "decode":
             pending += self._precompile_extend_full()
+        cases = self._eager_logits_cases(disagg_mode)
+        pending.append(PendingCall(lambda: self.warmup_eager_logits(cases)))
         return pending
+
+    def _eager_logits_cases(self, disagg_mode: str) -> list[EagerLogitsCase]:
+        """The TARGET_VERIFY and EXTEND(FULL) shapes the target precompile warms."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        cases = []
+        if disagg_mode != "prefill":
+            cases += [
+                EagerLogitsCase(
+                    num_tokens=bs * self.draft_token_num,
+                    bs=bs,
+                    mode=ForwardMode.TARGET_VERIFY,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    spec_info=self.make_verify_spec_info(),
+                )
+                for bs in self.b_bucketer.buckets
+            ]
+        if disagg_mode != "decode":
+            bs = self._extend_compile_cap()
+            cases += [
+                EagerLogitsCase(
+                    num_tokens=num_tokens,
+                    bs=bs,
+                    mode=ForwardMode.EXTEND,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                for num_tokens in self.t_bucketer.buckets
+                if num_tokens >= bs
+            ]
+        return cases
 
     def _precompile_target_verify(self) -> list[PendingCall]:
         """Compile TARGET_VERIFY across the batch-size buckets."""
@@ -144,7 +177,7 @@ class BaseSpecDecodeCompilePolicyMixin:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
-        variants = self._extend_input_variants()
+        variants = self._extend_serving_variants()
         valid_shapes = [
             (t, bs, has_spec_info, variant)
             for t in self.t_bucketer.buckets

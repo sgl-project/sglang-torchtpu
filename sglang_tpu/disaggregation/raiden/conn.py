@@ -83,6 +83,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     RoomFailed,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
@@ -194,6 +195,11 @@ class RaidenKVManager(
         )
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
+        self._transfer_parallelism = (
+            tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.get()
+        )
+        if self._transfer_parallelism < 1:
+            raise ValueError("SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM must be >= 1")
         # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
         # built in this process. Store the resolved value back so later reads
         # do not mistake the variable set here for the deprecated alias.
@@ -400,19 +406,21 @@ class RaidenKVManager(
             max_blocks=max_blocks,
             num_slots=num_slots,
             timeout_s=self._timeout_s,
+            parallelism=self._transfer_parallelism,
         )
         self._full_engine_max_blocks = max_blocks
         pool_pages = num_slots * max_blocks
         swa_pool_pages = None
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
-            "num_slots=%d pool_pages=%d chunked=%d",
+            "num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
             self.attn_tp_rank,
             self.raiden_endpoint,
             max_blocks,
             num_slots,
             pool_pages,
             int(self.chunked_transfer),
+            self._transfer_parallelism,
         )
         if self._swa_kv_caches:
             self.swa_raiden_endpoint = NetworkAddress(
@@ -427,6 +435,7 @@ class RaidenKVManager(
                 max_blocks=swa_max_blocks,
                 num_slots=swa_num_slots,
                 timeout_s=self._timeout_s,
+                parallelism=self._transfer_parallelism,
             )
             self._swa_engine_max_blocks = swa_max_blocks
             swa_pool_pages = swa_num_slots * swa_max_blocks
@@ -487,15 +496,24 @@ class RaidenKVManager(
         return max(1, batch + in_transfer)
 
     def _num_slots(
-        self, kv_caches: List[Any], max_blocks: int, engines: int = 1
+        self,
+        kv_caches: List[Any],
+        max_blocks: int,
+        engines: int = 1,
+        *,
+        reserved_bytes: int = 0,
+        paired_slot_bytes: int = 0,
     ) -> int:
         """Slots this engine can afford within the host staging budget.
 
         The per-node budget is split across the ranks resident on this host
-        and across the engines this rank builds, then divided by what one slot
-        costs. Deriving the count keeps a large context length from turning
-        into a host allocation that fails at startup -- it shrinks the pool
-        instead, and refuses to start when not even one slot fits the budget.
+        and across the engines this rank builds, less ``reserved_bytes``
+        another engine of this rank already took, then divided by what one
+        slot costs, plus ``paired_slot_bytes`` when each slot comes with one
+        of another engine. Deriving the count keeps a large context length
+        from turning into a host allocation that fails at startup -- it
+        shrinks the pool instead, and refuses to start when not even one slot
+        fits the budget.
         """
         budget = float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128")) * 1024**3
         local_ranks = ranks_per_node(
@@ -506,8 +524,8 @@ class RaidenKVManager(
             self.attn_cp_size,
             self.pp_size,
         )
-        budget /= local_ranks * max(1, engines)
-        slot_bytes = slot_host_bytes(kv_caches, max_blocks)
+        budget = budget / (local_ranks * max(1, engines)) - reserved_bytes
+        slot_bytes = slot_host_bytes(kv_caches, max_blocks) + paired_slot_bytes
         slots = slots_within_budget(budget, slot_bytes, self._slot_ceiling())
         logger.info(
             "RaidenKVManager rank%d slot budget | max_blocks=%d slot=%.1fMB "

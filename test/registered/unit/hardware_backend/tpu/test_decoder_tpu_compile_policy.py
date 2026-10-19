@@ -18,11 +18,25 @@ from sglang.srt.compilation.support_torch_compile import (
     get_torch_compile_policy,
     support_torch_compile,
 )
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateDType,
+    Mamba2StateShape,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    MHATokenToKVPool,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -44,6 +58,7 @@ from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import sampler as tpu_sampler_module
+from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
@@ -55,6 +70,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (
     _materialize_out,
     _unpad_decoder_outputs,
 )
+from sglang_tpu.compilation.hybrid_linear_direct_compile import bind_traced_conv_weights
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecoderTpuCompilePolicy,
@@ -64,6 +80,8 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
+from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.sampler import select_logits_output_mode
 from sglang_tpu.top_k import (
     PallasDistributedTopKConfig,
@@ -140,6 +158,15 @@ class _SpecPolicyTestCase(_PolicyTestCase):
     config_defaults = _EAGLE3_CONFIG
 
 
+class _FakeModel(torch.nn.Module):
+    """Model stand-in; direct compile walks named_modules for linear-attention weights."""
+
+    def __init__(self, **attrs):
+        super().__init__()
+        for name, value in attrs.items():
+            setattr(self, name, value)
+
+
 def _model_runner(device="cpu"):
     """Minimal ModelRunner stand-in for unit tests.
 
@@ -150,7 +177,7 @@ def _model_runner(device="cpu"):
     embed_tokens = torch.nn.Embedding(8, 4)
     return SimpleNamespace(
         device=device,
-        model=SimpleNamespace(
+        model=_FakeModel(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
             get_input_embeddings=lambda: embed_tokens,
@@ -322,7 +349,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
                 "object_state.weight_alias",
             )
 
-        model = SimpleNamespace(forward=MagicMock())
+        model = _FakeModel(forward=MagicMock())
         support_torch_compile(model, policy=CustomPolicy)
         policy_cls = get_torch_compile_policy(model)
         self.assertIs(policy_cls, CustomPolicy)
@@ -388,6 +415,196 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
 
 
+class _GdnNoInit(TpuGDNAttnBackend):
+    def __init__(self, metadata: GdnTracedMetadata):  # skips the JAX op build
+        self._set_traced_metadata(metadata)
+
+
+class _FullKVPool(MHATokenToKVPool):
+    def __init__(self, num_layers: int):  # skips allocation
+        self.k_buffer = [torch.zeros(2) for _ in range(num_layers)]
+        self.v_buffer = [torch.zeros(2) for _ in range(num_layers)]
+
+
+class _HybridKVPool(HybridLinearKVPool):
+    def __init__(self, full_kv_pool: MHATokenToKVPool):  # skips allocation
+        self.full_kv_pool = full_kv_pool
+
+
+class _HybridReqPool(HybridReqToTokenPool):
+    def __init__(self, mamba_pool: TpuMambaPool):  # skips allocation
+        self.mamba_pool = mamba_pool
+
+
+def _gdn_metadata(fill: int) -> GdnTracedMetadata:
+    def tensor():
+        return torch.full((2,), fill, dtype=torch.int32)
+
+    return GdnTracedMetadata(
+        distribution=tensor(),
+        seq_lens=tensor(),
+        state_indices=tensor(),
+        query_start_loc=tensor(),
+        track_indices=None,
+        track_end=None,
+        read_offsets=tensor(),
+    )
+
+
+def _cpu_mamba_pool(num_layers: int) -> TpuMambaPool:
+    shape = Mamba2StateShape.create(
+        tp_world_size=1,
+        intermediate_size=8,
+        n_groups=1,
+        num_heads=1,
+        head_dim=8,
+        state_size=8,
+        conv_kernel=4,
+    )
+    layers = list(range(num_layers))
+    return TpuMambaPool(
+        size=2,
+        spec_state_size=0,
+        cache_params=Mamba2CacheParams(
+            dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
+            layers=layers,
+            shape=shape,
+        ),
+        mamba_layer_ids=layers,
+        device="cpu",
+    )
+
+
+class TestHybridLinearDirectCompile(CustomTestCase):
+    def test_trace_binds_each_child_metadata_and_restores_it(self):
+        """HybridLinearAttnBackend has no forward_metadata of its own.
+
+        Binding only the wrapper leaves both children reading eager tensors while
+        tracing, which bakes one batch's metadata into the executable.
+        """
+        full = AttentionBackend()
+        full.token_to_kv_pool = full.req_to_token_pool = None
+        eager_full = object()
+        full.forward_metadata = eager_full
+        linear = _GdnNoInit(_gdn_metadata(0))
+        eager_linear = linear.traced_metadata()
+        backend = HybridLinearAttnBackend(
+            full_attn_backend=full, linear_attn_backend=linear, full_attn_layers=[0]
+        )
+        seen = []
+
+        def forward(*_args, **_kwargs):
+            seen.append((full.forward_metadata, linear.traced_metadata()))
+            return torch.zeros(1)
+
+        model_runner = _model_runner()
+        model_runner.model.forward = forward
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        compile_module_name = "sglang_tpu.compilation.direct_compile"
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=MagicMock())
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        graph_full, graph_linear = object(), _gdn_metadata(7)
+
+        with (
+            patch.dict(sys.modules, {compile_module_name: compile_module}),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            call, _ = policy._direct_compile(forward)
+            call("input_ids", None, forward_batch)
+            trace_forward = compile_module.direct_compile.call_args.args[0]
+            trace_forward(
+                (graph_full, graph_linear),
+                "input_ids",
+                None,
+                forward_batch,
+                attention_rank_tensors=(),
+            )
+
+        passed_full, passed_linear = (
+            compile_module.direct_compile.return_value.call_args.args[0]
+        )
+        self.assertIs(passed_full, eager_full)
+        self.assertEqual([id(t) for t in passed_linear], [id(t) for t in eager_linear])
+        traced_full, traced_linear = seen[-1]
+        self.assertIs(traced_full, graph_full)
+        self.assertEqual([id(t) for t in traced_linear], [id(t) for t in graph_linear])
+        self.assertIs(full.forward_metadata, eager_full)
+        self.assertEqual(
+            [id(t) for t in linear.traced_metadata()], [id(t) for t in eager_linear]
+        )
+
+    def test_kv_pool_swaps_full_kv_then_linear_state(self):
+        """get_state and set_state must agree on one layout.
+
+        A split at the wrong index still traces, but hands KV buffers to the GDN
+        layers (or the reverse) and silently corrupts both caches.
+        """
+        num_layers = 2
+        full_kv_pool = _FullKVPool(num_layers)
+        mamba_pool = _cpu_mamba_pool(num_layers)
+        model_runner = _model_runner()
+        model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
+        model_runner.req_to_token_pool = _HybridReqPool(mamba_pool)
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+
+        kv_pool = policy.get_direct_compile_kv_pool()
+        expected = [
+            *full_kv_pool.k_buffer,
+            *full_kv_pool.v_buffer,
+            *mamba_pool.get_state(),
+        ]
+        self.assertEqual(
+            [id(t) for t in kv_pool.get_state()], [id(t) for t in expected]
+        )
+        replacement = [torch.empty_like(t) for t in expected]
+        kv_pool.set_state(replacement)
+        num_full = 2 * num_layers
+        self.assertEqual(
+            [id(t) for t in [*full_kv_pool.k_buffer, *full_kv_pool.v_buffer]],
+            [id(t) for t in replacement[:num_full]],
+        )
+        self.assertEqual(
+            [id(t) for t in mamba_pool.get_state()],
+            [id(t) for t in replacement[num_full:]],
+        )
+
+    def test_trace_derives_conv_weights_from_the_traced_conv1d_weight(self):
+        """RadixLinearAttention keeps conv_weights as a view of conv1d.weight.
+
+        Read as-is while tracing, the graph uses a tensor no input provides and
+        the compile aborts; lifted as an input, execute re-materializes the view
+        on every call. The trace must view the placeholder weight instead.
+        """
+        layer = torch.nn.Module()
+        layer.conv1d = torch.nn.Conv1d(4, 4, 3, groups=4, bias=False)
+        eager_view = layer.conv1d.weight.view(4, 3)
+        layer.attn = RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=1,
+            head_q_dim=1,
+            head_k_dim=1,
+            head_v_dim=1,
+            conv_weights=eager_view,
+        )
+        model = torch.nn.ModuleList([layer])
+        placeholder = torch.nn.Parameter(torch.ones(4, 1, 3))
+        eager_weight = layer.conv1d.weight
+        # direct_compile swaps parameters for placeholders before tracing.
+        layer.conv1d.weight = placeholder
+        with bind_traced_conv_weights(model):
+            self.assertIs(layer.attn.conv_weights._base, placeholder)
+            self.assertEqual(tuple(layer.attn.conv_weights.shape), (4, 3))
+        layer.conv1d.weight = eager_weight
+        self.assertIs(layer.attn.conv_weights, eager_view)
+
+
 class TestEagle3DirectCompile(_SpecPolicyTestCase):
     def test_fused_draft_trace_temporarily_restores_eager_regions(self):
         eager_backbone = MagicMock(name="eager_backbone")
@@ -398,7 +615,7 @@ class TestEagle3DirectCompile(_SpecPolicyTestCase):
         compiled_logits = MagicMock(name="compiled_logits")
         backbone = SimpleNamespace(forward=eager_backbone)
         logits_processor = SimpleNamespace(forward=eager_logits)
-        model = SimpleNamespace(
+        model = _FakeModel(
             model=backbone,
             logits_processor=logits_processor,
             forward=eager_model,
@@ -910,12 +1127,14 @@ class TestInstallExtendCap(_PolicyTestCase):
 
 
 class TestQwen3VLDecoderPolicy(_PolicyTestCase):
-    def _forward_batch(self):
+    def _forward_batch(self, sampling_info=None):
         return SimpleNamespace(
             _tpu_real_q=3,
             _tpu_real_b=2,
             batch_size=4,
             seq_lens=torch.zeros(4, dtype=torch.int32),
+            sampling_info=sampling_info,
+            forward_mode=ForwardMode.EXTEND,
         )
 
     def test_slices_raw_hidden_states_before_logits_processing(self):
@@ -970,6 +1189,40 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         self.assertEqual(result_hidden.shape, (3, 4))
         self.assertEqual(result_aux[0].shape, (3, 4))
+
+    def test_host_padded_extend_keeps_the_bucket_rows(self):
+        """The experimental spec worker samples and writes draft KV at the buckets.
+
+        Trimming to the live tokens here would run the eager logits and the draft
+        KV writer once per prompt length while serving.
+        """
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        sampling_info = HostPaddedSamplingInfo(
+            temperatures=torch.ones((4, 1)),
+            top_ps=torch.ones((4,)),
+            top_ks=torch.ones((4,), dtype=torch.int32),
+            min_ps=torch.zeros((4,)),
+            is_all_greedy=True,
+            is_any_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=8,
+            device="cpu",
+            host_pad_bs=lambda bs: bs,
+            real_batch_size=4,
+        )
+        forward_batch = self._forward_batch(sampling_info)
+        hidden_states = torch.zeros(5, 4)
+        aux = [torch.ones(5, 4)]
+
+        result_hidden, result_aux = policy.finalize_forward_batch(
+            (hidden_states, aux), forward_batch
+        )
+
+        self.assertIs(result_hidden, hidden_states)
+        self.assertIs(result_aux[0], aux[0])
+        self.assertEqual(forward_batch.seq_lens.shape, (4,))
 
     @staticmethod
     def _policy_for(*, multimodal: bool):
@@ -1173,6 +1426,42 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         self.assertEqual(result["hidden_states"].shape, (5, 4))
         self.assertEqual(result["residual"].shape, (5, 4))
+
+    def test_spec_full_capture_extend_warms_text_ids(self):
+        """A speculative multimodal target still serves text-only prefills.
+
+        Those take the positional token-ID call with FULL capture. Warming only
+        the input_embeds variant let the server's image warmup request freeze
+        compilation first, so the first text prefill tripped fail_on_recompile.
+        """
+
+        class _SpecQwenPolicy(
+            Eagle3SpecDecodeCompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy
+        ):
+            pass
+
+        policy = object.__new__(_SpecQwenPolicy)
+        policy.model_runner = SimpleNamespace(model=SimpleNamespace())
+        policy.owner = policy.model_runner.model
+        policy.t_bucketer = SimpleNamespace(buckets=(1024,))
+        policy.b_bucketer = SimpleNamespace(buckets=(1,))
+        policy._extend_compile_cap = lambda: 1
+        policy._uses_input_embeds = lambda target: True
+        policy.make_null_spec_info = MagicMock()
+        policy._run_one = MagicMock(return_value=None)
+
+        with patch(
+            "sglang_tpu.compilation.spec_decode_compile_policy.get_parallel",
+            return_value=SimpleNamespace(tp_rank=1),
+        ):
+            policy._precompile_extend_full()
+
+        warmed = {
+            (call.kwargs["variant"], call.kwargs["capture_hidden_mode"])
+            for call in policy._run_one.call_args_list
+        }
+        self.assertIn(("text_ids", CaptureHiddenMode.FULL), warmed)
+        self.assertIn(("text_only", CaptureHiddenMode.FULL), warmed)
 
     def test_spec_policy_delegates_raw_vl_output_unpadding(self):
         class _SpecQwenPolicy(
@@ -2002,7 +2291,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False):
     embed_tokens = torch.nn.Embedding(8, 4)
     return SimpleNamespace(
         device=device,
-        model=SimpleNamespace(
+        model=_FakeModel(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
             get_input_embeddings=lambda: embed_tokens,
@@ -2497,7 +2786,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         tracer="dynamo",
     ):
-        model = SimpleNamespace(
+        model = _FakeModel(
             fc=SimpleNamespace(in_features=target_hidden_size),
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
@@ -2754,11 +3043,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         with get_parallel().override(
@@ -2779,6 +3072,10 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             policy.append_target_hidden_to_draft_kv_by_loc_tpu,
         )
         self.assertEqual(worker.embed_draft_block_ids, mock_block_embedder)
+        self.assertEqual(
+            worker.prepare_draft_block_fused, policy._prepare_draft_block_fused
+        )
+        self.assertEqual(mock_draft_block.call_count, 2)
 
         # Extend call with 10 tokens pads to token bucket 16.
         target_hidden = torch.ones(10, 32)
@@ -2973,11 +3270,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         # precompile_draft branches on get_disagg().disaggregation_mode.
@@ -3001,6 +3302,8 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(mock_append_kernel.call_count, 2)
         # Block embed warmup is not mode-gated: one call per bs bucket.
         self.assertEqual(mock_block_embedder.call_count, 2)
+        # A prefill-only engine never builds a draft block.
+        self.assertEqual(mock_draft_block.call_count, 0)
 
     def test_precompile_draft_pd_decode_mode_skips_extend(self):
         policy, mr = self._make_dflash_policy(
@@ -3010,11 +3313,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         with (
@@ -3036,6 +3343,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(mr.model.forward.call_count, 2)
         self.assertEqual(mock_append_kernel.call_count, 2)
         self.assertEqual(mock_block_embedder.call_count, 2)
+        self.assertEqual(mock_draft_block.call_count, 2)
 
     def test_dflash_build_disagg_draft_input(self):
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2

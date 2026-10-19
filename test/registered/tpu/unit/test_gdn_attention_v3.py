@@ -13,6 +13,13 @@ Cases covered (kernel vs. reference, bf16-ish tolerance):
 * mixed prefill + decode in one call
 * padded batches (trailing dummy sequences)
 
+Multi-tile state pipeline regressions, ported with vllm-project/vllm-torchtpu#1927
+(a later tile's state load must not overwrite an in-flight checkpoint store):
+
+* CPU interpret-mode DMA race detection (decode + prefill, and a W=8 verify)
+* multi-tile batched decode keeps every sequence's state (fp32 / bf16)
+* multi-tile W=8 verify windows write the right checkpoints
+
 Plus two state-plumbing invariants:
 
 * ``has_initial_state=False`` masks a stale (non-zero) slot so a fresh
@@ -21,7 +28,7 @@ Plus two state-plumbing invariants:
   state, matching the equivalent single-shot prefill.
 
 The kernel is pure JAX/Pallas and requires a TPU device; tests are skipped
-otherwise. They do **not** depend on torch_tpu or the SGLang server runtime.
+otherwise, except the race test, which runs in CPU interpret mode. They do **not** depend on torch_tpu or the SGLang server runtime.
 
 Adapted from torchtpu-vllm ``tests/kernels/test_gdn_attention_v3.py``.
 
@@ -40,11 +47,19 @@ import unittest
 from sglang.test.test_utils import CustomTestCase
 
 
-def _has_jax_tpu() -> bool:
+def _has_jax() -> bool:
     try:
-        import jax
+        import jax  # noqa: F401
     except Exception:
         return False
+    return True
+
+
+def _has_jax_tpu() -> bool:
+    if not _has_jax():
+        return False
+    import jax
+
     try:
         return any("TPU" in d.device_kind for d in jax.devices())
     except Exception:
@@ -54,7 +69,9 @@ def _has_jax_tpu() -> bool:
 _SKIP_REASON = "Requires JAX with a TPU device"
 
 
-if _has_jax_tpu():
+if _has_jax():
+    import sys
+
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -759,6 +776,286 @@ class TestGDNAttentionV3(CustomTestCase):
                 atol=2e-2,
                 err_msg=f"recurrent checkpoint mismatch at slot {slot}",
             )
+
+    def test_batched_decode_initial_state_parity(self):
+        """Multi-tile batched decode keeps every sequence's own state."""
+        from sglang_tpu.attention.pallas.gdn import wrapper
+
+        n_kq, n_v, d_k, d_v, kernel_size = 2, 8, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        num_seqs = 256
+        decode_tile = 4
+
+        # A distinct value per slot so a cross-slot copy is identifiable; the
+        # gates below keep the state unchanged, so output state == input state.
+        block_ids = jnp.arange(1, num_seqs + 1, dtype=jnp.float32)
+        init_conv = jnp.broadcast_to(
+            block_ids[:, None, None] * jnp.float32(1e-2),
+            (num_seqs, kernel_size - 1, dim),
+        ).astype(jnp.bfloat16)
+        qkv = jnp.zeros((num_seqs, dim), dtype=jnp.bfloat16)
+        b = jnp.full((num_seqs, n_v), -20.0, dtype=jnp.bfloat16)
+        a = jnp.full((num_seqs, n_v), -20.0, dtype=jnp.bfloat16)
+        conv_weight = jnp.zeros((dim, 1, kernel_size), dtype=jnp.bfloat16)
+        conv_bias = jnp.zeros((dim,), dtype=jnp.bfloat16)
+        a_log = jnp.full((n_v,), -20.0, dtype=jnp.float32)
+        dt_bias = jnp.full((n_v,), -20.0, dtype=jnp.float32)
+        kwargs = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=jnp.arange(num_seqs + 1, dtype=jnp.int32),
+            state_indices=jnp.arange(num_seqs, dtype=jnp.int32),
+            distribution=jnp.array([num_seqs] * 3, dtype=jnp.int32),
+            seq_lens=jnp.full((num_seqs,), 11, dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+
+        for state_dtype in (jnp.float32, jnp.bfloat16):
+            init_rec = jnp.broadcast_to(
+                block_ids[:, None, None, None] * jnp.float32(1e-2),
+                (num_seqs, n_v, d_k, d_v),
+            ).astype(state_dtype)
+            (conv_ref, rec_ref), out_ref = _gdn_attention_ref(
+                conv_state=init_conv, recurrent_state=init_rec, **kwargs
+            )
+            for rep in range(3):
+                with self.subTest(state_dtype=jnp.dtype(state_dtype).name, rep=rep):
+                    (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+                        conv_state=init_conv.copy(),
+                        recurrent_state=init_rec.copy(),
+                        decode_tile_size=decode_tile,
+                        **kwargs,
+                    )
+                    rec_np = np.asarray(rec_out, dtype=np.float32)
+                    ref_np = np.asarray(rec_ref, dtype=np.float32)
+                    bad = np.where(
+                        np.max(np.abs(rec_np - ref_np), axis=(1, 2, 3)) > 1e-5
+                    )[0]
+                    self.assertEqual(
+                        bad.size, 0, f"corrupted recurrent slots: {bad.tolist()}"
+                    )
+                    np.testing.assert_allclose(conv_out, conv_ref, rtol=1e-5, atol=1e-5)
+                    np.testing.assert_allclose(out, out_ref, rtol=1e-5, atol=1e-5)
+
+    def test_spec_window_checkpoints_multi_tile(self):
+        """W=8 verify over several multi-sequence tiles writes each sequence's
+        own checkpoints, including checkpoint 0."""
+        from sglang_tpu.attention.pallas.gdn import wrapper
+
+        n_kq, n_v, d_k, d_v, kernel_size = 2, 4, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        window = 8
+        num_seqs = 16
+        batch_size = num_seqs * window
+        num_blocks = num_seqs * window + 8
+
+        rngs = iter(jax.random.split(jax.random.key(314), 10))
+        qkv = jax.random.normal(next(rngs), (batch_size, dim), dtype=jnp.bfloat16)
+        b = jax.random.normal(next(rngs), (batch_size, n_v), dtype=jnp.bfloat16)
+        a = jax.random.normal(next(rngs), (batch_size, n_v), dtype=jnp.bfloat16)
+        conv_w = jax.random.normal(
+            next(rngs), (dim, 1, kernel_size), dtype=jnp.bfloat16
+        )
+        conv_b = jax.random.normal(next(rngs), (dim,), dtype=jnp.bfloat16)
+        a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        init_conv = jax.random.normal(
+            next(rngs), (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+        )
+        init_rec = jax.random.normal(
+            next(rngs), (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
+        )
+
+        q_loc = jnp.arange(0, batch_size + 1, window, dtype=jnp.int32)
+        state_indices = jnp.arange(num_seqs, dtype=jnp.int32) * window
+        read_offsets = jnp.array([s % window for s in range(num_seqs)], jnp.int32)
+        seq_lens = jnp.full((num_seqs,), window + 10, dtype=jnp.int32)
+
+        (conv_ref, rec_ref), out_ref = gdn_attention_spec_ref(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_state=init_conv,
+            recurrent_state=init_rec,
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            read_offsets=read_offsets,
+            num_spec_seqs=num_seqs,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+
+        for rep in range(3):
+            (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+                qkv=qkv,
+                b=b,
+                a=a,
+                conv_state=init_conv.copy(),
+                recurrent_state=init_rec.copy(),
+                conv_weight=conv_w,
+                conv_bias=conv_b,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                query_start_loc=q_loc,
+                state_indices=state_indices,
+                distribution=jnp.array([num_seqs] * 3, dtype=jnp.int32),
+                seq_lens=seq_lens,
+                read_offsets=read_offsets,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                num_spec_tokens=window - 1,
+                decode_tile_size=4,
+            )
+            np.testing.assert_allclose(out, out_ref, rtol=1e-2, atol=1e-2)
+            for s in range(num_seqs):
+                base = int(state_indices[s])
+                for name, got, want in (
+                    ("conv", conv_out, conv_ref),
+                    ("recurrent", rec_out, rec_ref),
+                ):
+                    np.testing.assert_allclose(
+                        got[base : base + window],
+                        want[base : base + window],
+                        rtol=1e-2,
+                        atol=1e-2,
+                        err_msg=f"rep={rep} seq={s} {name} checkpoints",
+                    )
+
+
+@unittest.skipIf(not _has_jax(), "Requires JAX")
+class TestGDNStatePipelineRace(CustomTestCase):
+    """CPU interpret-mode vector-clock race detection on the state pipeline."""
+
+    def _races_per_call(self, num_spec_tokens: int) -> list[bool]:
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+
+        from sglang_tpu.attention.pallas.gdn import wrapper
+
+        n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        window = num_spec_tokens + 1
+        # 6 decode/verify sequences at tile 2 (step 2 reuses step 0's slot),
+        # then 3 one-token PER_SEQ tiles that do the same.
+        num_decode, num_seqs = 6, 9
+        lengths = [window] * num_decode + [1] * (num_seqs - num_decode)
+        num_tokens = sum(lengths)
+        num_blocks = num_seqs * window
+
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            rngs = iter(jax.random.split(jax.random.key(0), 9))
+            qkv = jax.random.normal(next(rngs), (num_tokens, dim), jnp.bfloat16)
+            b = jax.random.normal(next(rngs), (num_tokens, n_v), jnp.bfloat16)
+            a = jax.random.normal(next(rngs), (num_tokens, n_v), jnp.bfloat16)
+            conv_w = jax.random.normal(next(rngs), (dim, 1, kernel_size), jnp.bfloat16)
+            conv_b = jax.random.normal(next(rngs), (dim,), jnp.bfloat16)
+            a_log = jax.random.normal(next(rngs), (n_v,), jnp.float32)
+            dt_bias = jax.random.normal(next(rngs), (n_v,), jnp.float32)
+            init_conv = jax.random.normal(
+                next(rngs), (num_blocks, kernel_size - 1, dim), jnp.bfloat16
+            )
+            init_rec = jax.random.normal(
+                next(rngs), (num_blocks, n_v, d_k, d_v), jnp.float32
+            )
+            q_loc = jnp.array(np.concatenate([[0], np.cumsum(lengths)]), jnp.int32)
+            read_offsets = None
+            if num_spec_tokens:
+                read_offsets = jnp.array(
+                    [s % window for s in range(num_seqs)], jnp.int32
+                )
+
+        # jax has no InterpretParams.on_race; read each pallas_call's verdict
+        # before its clean-up barrier drops the shared state.
+        mosaic_interpret = sys.modules[pltpu.reset_tpu_interpret_mode_state.__module__]
+        races_per_call: list[bool] = []
+        orig_clear = mosaic_interpret._clear_shared_memory
+
+        def _record_and_clear():
+            races = mosaic_interpret.races
+            if races is not None:
+                races_per_call.append(bool(races.races_found))
+            orig_clear()
+
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        pltpu.reset_tpu_interpret_mode_state()
+        mosaic_interpret._clear_shared_memory = _record_and_clear
+        try:
+            with (
+                jax.default_device(cpu),
+                use_abstract_mesh(mesh),
+                pltpu.force_tpu_interpret_mode(
+                    pltpu.InterpretParams(
+                        detect_races=True,
+                        dma_execution_mode="eager",
+                        skip_floating_point_ops=False,
+                        vector_clock_size=128,
+                    )
+                ),
+            ):
+                (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+                    qkv=qkv,
+                    b=b,
+                    a=a,
+                    conv_state=init_conv,
+                    recurrent_state=init_rec,
+                    conv_weight=conv_w,
+                    conv_bias=conv_b,
+                    a_log=a_log,
+                    dt_bias=dt_bias,
+                    query_start_loc=q_loc,
+                    state_indices=jnp.arange(num_seqs, dtype=jnp.int32) * window,
+                    distribution=jnp.array(
+                        [num_decode, num_seqs, num_seqs], dtype=jnp.int32
+                    ),
+                    seq_lens=jnp.full((num_seqs,), 11, dtype=jnp.int32),
+                    read_offsets=read_offsets,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    num_spec_tokens=num_spec_tokens,
+                    decode_tile_size=2,
+                    # Interpret mode cannot reshape refs on the C > 1 chunked
+                    # path; one-token prefills run at C = 1.
+                    mixed_tile_size=1,
+                )
+                jax.block_until_ready((conv_out, rec_out, out))
+        finally:
+            mosaic_interpret._clear_shared_memory = orig_clear
+            pltpu.reset_tpu_interpret_mode_state()
+        return races_per_call
+
+    def test_state_pipeline_has_no_dma_race(self):
+        for num_spec_tokens in (0, 7):
+            with self.subTest(num_spec_tokens=num_spec_tokens):
+                races = self._races_per_call(num_spec_tokens)
+                # One verdict per pallas_call: the batched and PER_SEQ kernels.
+                self.assertEqual(len(races), 2, races)
+                self.assertFalse(any(races), f"DMA race per pallas_call: {races}")
 
 
 if __name__ == "__main__":

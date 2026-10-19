@@ -85,6 +85,16 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             setattr(self, name, _pad_host_rows(value, padded_bs, fill, pin))
         self.real_batch_size = batch_size
 
+    def host_params_at(self, rows: int) -> dict[str, torch.Tensor]:
+        """Host sampling params padded to rows, at least this info's own bucket."""
+        return {
+            name: _pad_host_rows(value[: self.real_batch_size], rows, fill, False)
+            if value.shape[0] < rows
+            else value
+            for name, fill in _PARAM_FILLS.items()
+            if (value := getattr(self, name)) is not None
+        }
+
     def on_device(self) -> SamplingBatchInfo:
         """This info with the sampling param tensors on self.device; HOST_PADDED keeps its bucket rows."""
         moved = {
