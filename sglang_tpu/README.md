@@ -127,3 +127,10 @@ prepares patches. Live check:
 [`test_tpu_muse_spark_mm_pd_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_mm_pd_multihost.py)
 (images and video over P/D), with `SGLANG_TPU_USE_LIVE_SERVER=1` and
 `BASE_URL` pointing at the router.
+
+Under EP (for example the four-host `2x2x4` TP32/EP32 engine) each rank reads
+only its rows of the checkpoint's stacked `[E, ...]` expert tensors
+(`ep_local_expert_reader.py`), so no host reads the whole checkpoint. Text live
+check:
+[`test_tpu_muse_spark_nvfp4_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_nvfp4_multihost.py)
+with `SGLANG_TPU_USE_LIVE_SERVER=1` and `BASE_URL`.

@@ -103,6 +103,57 @@ def _read(files, iterator, expert_range, disable_mmap=True):
 
 
 class TestEpLocalExpertReads(CustomTestCase):
+    def test_stacked_experts_read_only_local_payload(self):
+        """Muse stacks must be sliced on disk, without slicing shared norms."""
+        prefix = "model.language_model.layers.0.mlp.experts"
+        stacks = {
+            f"{prefix}.gate_up_proj": torch.arange(4 * 16 * 8)
+            .reshape(4, 16, 8)
+            .bfloat16(),
+            f"{prefix}.down_proj": torch.arange(4 * 8 * 8).reshape(4, 8, 8).bfloat16(),
+            f"{prefix}.post_expert_norm.weight": torch.arange(8).bfloat16(),
+        }
+        for iterator in _ITERATORS:
+            with self.subTest(iterator=iterator), tempfile.TemporaryDirectory() as d:
+                files, tensors = _write_checkpoint(d, layers=(), extra=stacks)
+                read_bytes = []
+                real_open = open
+
+                def counting_open(path, mode="r", *args, **kwargs):
+                    return _CountingFile(
+                        real_open(path, mode, *args, **kwargs), read_bytes
+                    )
+
+                with (
+                    patch(f"{_MOD}._SPAN_MERGE_GAP_BYTES", 0),
+                    patch(f"{_MOD}.open", counting_open, create=True),
+                ):
+                    loaded = _read(files, iterator, (2, 4))
+                expected_bytes = 0
+                for name, tensor in tensors.items():
+                    expected = (
+                        tensor[2:4]
+                        if name.endswith((".gate_up_proj", ".down_proj"))
+                        else tensor
+                    )
+                    torch.testing.assert_close(loaded[name], expected, rtol=0, atol=0)
+                    expected_bytes += expected.numel() * expected.element_size()
+                self.assertEqual(sum(read_bytes), expected_bytes)
+
+    def test_stacked_experts_are_verified_and_range_checked(self):
+        name = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        with tempfile.TemporaryDirectory() as d:
+            files, _ = _write_checkpoint(
+                d, layers=(), extra={name: torch.ones(4, 8, 8)}
+            )
+            reader = ep_local_expert_reader.EpLocalExpertReader(files, (2, 4))
+            with self.assertRaisesRegex(RuntimeError, "missed 1 local expert"):
+                reader.verify()
+            reader = ep_local_expert_reader.EpLocalExpertReader(files, (3, 5))
+            with self.assertRaisesRegex(ValueError, "Invalid stacked expert range"):
+                for path in files:
+                    reader.read(path)
+
     def test_reads_only_local_experts_and_all_other_weights(self):
         for iterator in ("single", "buffered"):
             with self.subTest(iterator=iterator), tempfile.TemporaryDirectory() as d:
@@ -365,7 +416,7 @@ def _fused_moe(
 def _model(layers, opted_in=True):
     model = torch.nn.Module()
     model.layers = torch.nn.ModuleList(layers)
-    model.supports_tpu_ep_local_expert_reads = opted_in
+    model.supports_ep_local_checkpoint_reads = opted_in
     return model
 
 

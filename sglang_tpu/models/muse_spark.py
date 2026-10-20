@@ -57,6 +57,8 @@ logger = logging.getLogger(__name__)
 _TEXT_PREFIX = "model.language_model."
 # Static activation scales; the NVFP4 experts run weight-only (W4A16) on TPU.
 _UNUSED_SUFFIXES = (".gate_up_proj_input_scale", ".down_proj_input_scale")
+# The FusedMoE parameters those scales would have filled.
+_UNLOADED_INPUT_SCALES = ("w13_input_scale", "w2_input_scale")
 # Checkpoint suffix -> parameter suffix, first match wins.
 _RENAMES = (
     (".experts.gate_up_proj_weight_scale_2", ".experts.w13_weight_scale_2"),
@@ -425,6 +427,11 @@ class MuseSparkMoE(nn.Module):
             # Per-slot outputs: the post-expert norm runs before the combine.
             no_combine=True,
         )
+        # Never loaded (W4A16), so they must not turn EP-local expert reads off
+        # by asking for every expert.
+        for name, param in self.experts.named_parameters(recurse=False):
+            if name in _UNLOADED_INPUT_SCALES:
+                param._sglang_require_global_experts = False
         self.experts.supports_tpu_fused_rs_post_expert_norm = True
         self.experts.tpu_fused_rs_post_expert_norm_weight = lambda: (
             self.post_expert_norm.weight.data
@@ -615,6 +622,9 @@ class MuseSparkTextModel(nn.Module):
 class MuseSparkForConditionalGeneration(nn.Module):
     """Muse Spark served text-only."""
 
+    # Under EP each rank reads only its slice of the stacked expert tensors;
+    # the BF16 checkpoint is ~1.6 TB, nearly all experts, too much for every host.
+    supports_ep_local_checkpoint_reads = True
     # Parameters a subclass loads itself (perception towers); the checkpoint
     # completeness check here skips them.
     tower_param_prefixes: Tuple[str, ...] = ()
@@ -827,7 +837,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             for name in params
             if name not in loaded
             and not name.startswith(self.tower_param_prefixes)
-            and not name.endswith(("w13_input_scale", "w2_input_scale"))
+            and not name.endswith(_UNLOADED_INPUT_SCALES)
             and not self._is_online_quant_scale(name)
         )
         if missing:

@@ -23,6 +23,13 @@ _READ_CHUNK_BYTES = 64 * 1024 * 1024
 # extra read for fewer seeks on network filesystems (not tuned).
 _SPAN_MERGE_GAP_BYTES = 16 * 1024 * 1024
 _EXPERT_ID_KEY_RE = re.compile(r"^(.*)\.experts\.(\d+)\.")
+# HF fused-experts layout: one [E, ...] stack per projection instead of
+# ``.experts.<id>.`` tensors; ModelOpt NVFP4 stacks its scales the same way.
+_STACKED_EXPERT_SUFFIXES = tuple(
+    f".experts.{proj}{part}"
+    for proj in ("gate_up_proj", "down_proj")
+    for part in ("", "_weight_scale", "_weight_scale_2")
+)
 
 _SAFETENSORS_DTYPES = {
     "BOOL": torch.bool,
@@ -57,15 +64,16 @@ def _log_whole_shards(reason: str) -> None:
 def tpu_local_routed_expert_range(model: torch.nn.Module) -> tuple[int, int] | None:
     """Routed-expert ids [start, end) this EP rank stores, for EP-local reads.
 
-    For models that set ``supports_tpu_ep_local_expert_reads`` (every
-    ``.experts.<id>.`` checkpoint key loads into FusedMoE expert ``<id>``), the
+    For models that set ``supports_ep_local_checkpoint_reads`` (every
+    ``.experts.<id>.`` key, or row ``<id>`` of a stacked expert tensor, loads
+    into FusedMoE expert ``<id>``), the
     range is ``local_routed_expert_range`` of their FusedMoE layers. None (read
     everything) off TPU, without EP, with EPLB metadata or elastic EP join, when
     the layers disagree, when a layer also loads ids outside its routed range
     (fused shared experts, parameters that need every expert), or when
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS is true.
     """
-    if not _is_tpu or not getattr(model, "supports_tpu_ep_local_expert_reads", False):
+    if not _is_tpu or not getattr(model, "supports_ep_local_checkpoint_reads", False):
         return None
     from sglang.srt.environ import envs
     from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -122,7 +130,11 @@ class EpLocalExpertReader:
         self.expected: set[str] = {
             name
             for name, shard in weight_map.items()
-            if shard in loaded and self._local_expert_id(name) not in (None, -1)
+            if shard in loaded
+            and (
+                self._local_expert_id(name) not in (None, -1)
+                or name.endswith(_STACKED_EXPERT_SUFFIXES)
+            )
         }
         self.seen: set[str] = set()
         self._seen_lock = threading.Lock()
@@ -184,6 +196,20 @@ class EpLocalExpertReader:
                     unviewable.append(name)
                     continue
                 start, end = meta["data_offsets"]
+                # Stacked experts: read only this rank's contiguous expert rows,
+                # never the multi-GB global stack.
+                if name.endswith(_STACKED_EXPERT_SUFFIXES):
+                    shape = meta["shape"]
+                    first, stop = self.expert_range
+                    if not shape or not 0 <= first < stop <= shape[0]:
+                        raise ValueError(
+                            f"Invalid stacked expert range for {name}: {shape}, {self.expert_range}"
+                        )
+                    stride, remainder = divmod(end - start, shape[0])
+                    if remainder:
+                        raise ValueError(f"Invalid stacked expert byte size for {name}")
+                    meta = dict(meta, shape=[stop - first, *shape[1:]])
+                    start, end = start + first * stride, start + stop * stride
                 kept.append((start, end, name, meta))
             kept.sort(key=lambda item: item[0])
 

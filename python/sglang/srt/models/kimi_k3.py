@@ -3283,7 +3283,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 
     # Every `.experts.<id>.` checkpoint key loads into FusedMoE expert <id>, so a
     # TPU EP rank may read only its own routed experts.
-    supports_tpu_ep_local_expert_reads = True
+    supports_ep_local_checkpoint_reads = True
 
     # ModelSlim describes quantization with the original checkpoint module
     # names. Register the runtime fused QKVG module so it can resolve the
@@ -3755,7 +3755,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
-    supports_tpu_ep_local_expert_reads = True
+    supports_ep_local_checkpoint_reads = True
 
     # Fused runtime module -> checkpoint shard names, so quant configs can
     # match fused prefixes against per-shard exclude_modules
