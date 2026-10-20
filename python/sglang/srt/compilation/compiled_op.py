@@ -114,7 +114,11 @@ def compiled_op(
         compiled_fn = None
         use_direct = False
         signature = inspect.signature(fn)
-        op_name = name or f"{fn.__module__}.{fn.__qualname__}"
+        op_name = name or (
+            fn._qualname
+            if isinstance(fn, torch.library.CustomOpDef)
+            else f"{fn.__module__}.{fn.__qualname__}"
+        )
         specialization_key = (
             _spmd_specialization_key if spmd_safe else _specialization_key
         )

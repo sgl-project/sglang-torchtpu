@@ -72,6 +72,22 @@ def test_compiled_op_imports_and_runs_without_jax():
         torch.testing.assert_close(helper(x), x + 1)
 
 
+@pytest.mark.parametrize("spmd_safe", (False, True))
+def test_compiled_op_accepts_custom_ops(spmd_safe):
+    module_path = importlib.util.find_spec("sglang.srt.compilation.compiled_op").origin
+    module = runpy.run_path(module_path)
+
+    @torch.library.custom_op("compiled_op_test::scale", mutates_args=())
+    def scale(x: torch.Tensor) -> torch.Tensor:
+        return x * 2
+
+    x = torch.tensor([1, 2])
+    op = module["compiled_op"](spmd_safe=spmd_safe, warmup=lambda _: (x,))(scale)
+    assert module["_compiled_ops"]["compiled_op_test::scale"].op is op
+    assert module["warmup_compiled_op"](op, x) is None
+    assert torch.equal(op(x), x * 2)
+
+
 def test_positions_marks_the_token_axis_dynamic_for_mrope_and_1d_rope():
     dynamic_dims = _infer_dynamic_arg_dims_from_annotations(_MropeModel.forward)
     string_dynamic_dims = _infer_dynamic_arg_dims_from_annotations(
