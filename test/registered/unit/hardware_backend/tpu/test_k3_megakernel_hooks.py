@@ -39,7 +39,7 @@ def _model_with_kernel():
 class TestK3MegakernelHooks(CustomTestCase):
     def test_hooks_target_existing_kimi_k3_methods(self):
         targets = {t for t, fn, _ in HOOKS if fn.__module__ == hooks.__name__}
-        self.assertEqual(len(targets), 5)
+        self.assertEqual(len(targets), 6)
         for target in targets:
             with self.subTest(target=target):
                 self.assertTrue(callable(pkgutil.resolve_name(target)))
@@ -67,10 +67,11 @@ class TestK3MegakernelHooks(CustomTestCase):
         model = _model_with_kernel()
         self.assertEqual(_forward(model, ForwardMode.DECODE), "kernel")
         self.assertEqual(_forward(model, ForwardMode.EXTEND, tokens=17), "kernel")
+        self.assertEqual(_forward(model, ForwardMode.TARGET_VERIFY, tokens=8), "kernel")
         for mode, bs, tokens in (
             (ForwardMode.DECODE, 2, 2),
             (ForwardMode.EXTEND, 2, 9),
-            (ForwardMode.TARGET_VERIFY, 1, 8),
+            (ForwardMode.TARGET_VERIFY, 2, 16),
         ):
             with self.subTest(mode=mode, bs=bs), self.assertRaises(NotImplementedError):
                 _forward(model, mode, bs, tokens)
@@ -98,16 +99,28 @@ class TestK3MegakernelHooks(CustomTestCase):
                 hooks._check_server_args()
 
         check()
+        check(speculative_algorithm="DSPARK")
         for kw, needle in (
             ({"max_running_requests": 4}, "--max-running-requests 1"),
             ({"disable_radix_cache": False}, "--disable-radix-cache"),
-            ({"speculative_algorithm": "DSPARK"}, "no speculative decoding"),
+            ({"speculative_algorithm": "EAGLE"}, "other than DSPARK"),
             ({"chunked_prefill_size": -1}, "--chunked-prefill-size > 0"),
             ({"kv_cache_dtype": "fp8_e4m3"}, "bf16 KV cache"),
             ({"tpu_compile_bs": [1, 4]}, "TPU compile batch sizes"),
         ):
             with self.subTest(**kw), self.assertRaisesRegex(ValueError, needle):
                 check(**kw)
+
+    def test_dspark_capture_builds_the_capturing_kernels(self):
+        runtime = MagicMock()
+        causal_lm = SimpleNamespace(model=SimpleNamespace(_k3_megakernel=runtime))
+        spec = SimpleNamespace(speculative_num_draft_tokens=8)
+        with patch("sglang.srt.runtime_context.get_spec", return_value=spec):
+            hooks.prepare_k3_capture_kernels(None, causal_lm, [51, 7, 23])
+            hooks.prepare_k3_capture_kernels(
+                None, SimpleNamespace(model=SimpleNamespace()), [7]
+            )
+        runtime.prepare.assert_called_once_with((7, 23, 51), verify_rows=8)
 
     def test_serving_refuses_debug_and_broken_kernel_options(self):
         from sglang_tpu.k3_megakernel.ops import SERVING_KERNEL_OPTIONS, kernel_options

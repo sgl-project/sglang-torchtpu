@@ -34,6 +34,7 @@ from sglang_tpu.hooks.k3_megakernel import (
     attach_k3_megakernel,
     k3_megakernel_forward,
     load_k3_non_layer_weights,
+    prepare_k3_capture_kernels,
     skip_k3_decoder_layers,
 )
 from sglang_tpu.hooks.kda_weights import bind_glm5_next_kda_weights
@@ -126,6 +127,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.kimi_k3.KimiK3LinearModel.forward",
         k3_megakernel_forward,
         HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture",
+        prepare_k3_capture_kernels,
+        HookType.AFTER,
     ),
     (
         "sglang.srt.layers.attn_residual._aggregate",

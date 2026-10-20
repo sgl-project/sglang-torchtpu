@@ -8,9 +8,10 @@ attach_k3_megakernel, k3_megakernel_forward
        of core.
   How: AFTER KimiK3LinearForCausalLM.post_load_weights builds the per-rank
        runtime (kernel-layout weights read from the checkpoint, the exported
-       calls). AROUND KimiK3LinearModel.forward sends bs=1 decode steps and bs=1
-       extend (prefill) chunks to the kernel. Both pass through unless
-       SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL=1 when the model is loaded.
+       calls). AROUND KimiK3LinearModel.forward sends bs=1 decode steps, bs=1
+       extend (prefill) chunks and bs=1 DSpark target-verify steps to the
+       kernel. Both pass through unless SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL=1
+       when the model is loaded.
   Upstream PR or issue: <to be filed> (a model-level seam to replace a decoder
        stack's layers and forward).
   Remove when: that seam exists, or the megakernel is dropped.
@@ -29,6 +30,16 @@ skip_k3_decoder_layers, load_k3_non_layer_weights
        the decoder shards are never read).
        SGLANG_TPU_K3_MEGAKERNEL_KEEP_SGLANG_WEIGHTS=1 (dev only)
        keeps sglang's layers and its prefill path for A/B comparisons.
+  Upstream PR or issue: <to be filed> (same seam).
+  Remove when: as above.
+
+prepare_k3_capture_kernels
+  Why: DSpark sets the layers to capture after the model is built, and the
+       kernel variants that capture them (prefill and verify) must exist before
+       the compiled forward traces: dynamo cannot construct them.
+  How: AFTER KimiK3LinearForCausalLM.set_dspark_layers_to_capture (the
+       multimodal entry delegates to it) builds those variants, with one verify
+       row per draft token plus the bonus row.
   Upstream PR or issue: <to be filed> (same seam).
   Remove when: as above.
 """
@@ -135,9 +146,23 @@ _ATTENTION_BACKENDS = ("pallas_tpu_mla",)
 _KV_CACHE_DTYPES = ("auto", "bf16", "bfloat16")
 
 
+def prepare_k3_capture_kernels(
+    result: None, causal_lm: Any, layer_ids, *args, **kwargs
+) -> None:
+    """AFTER KimiK3LinearForCausalLM.set_dspark_layers_to_capture."""
+    runtime = causal_lm.model.__dict__.get("_k3_megakernel")
+    if runtime is None:
+        return
+    from sglang.srt.runtime_context import get_spec
+
+    # Verify rows per request: the DSpark block plus the bonus row.
+    rows = get_spec().speculative_num_draft_tokens
+    runtime.prepare(tuple(sorted(layer_ids)), verify_rows=rows)
+
+
 def _check_server_args() -> None:
     """The megakernel owns the decoder weights, so every forward must be one it can run: one
-    request at a time, no speculative verify, no radix reuse of a prefix whose KDA state the
+    request at a time, no speculation other than DSpark, no radix reuse of a prefix whose KDA state the
     kernel did not see (the token loop resets the state only for a request without a prefix),
     and the pool layout the kernel reads in place."""
     from sglang.srt.runtime_context import (
@@ -157,9 +182,10 @@ def _check_server_args() -> None:
         )
     if not get_memory().disable_radix_cache:
         problems.append("--disable-radix-cache")
-    if get_spec().speculative_algorithm is not None:
+    if get_spec().speculative_algorithm not in (None, "DSPARK"):
         problems.append(
-            f"no speculative decoding (got {get_spec().speculative_algorithm})"
+            "no speculative decoding other than DSPARK "
+            f"(got {get_spec().speculative_algorithm})"
         )
     if schedule.enable_mixed_chunk:
         problems.append("no --enable-mixed-chunk")
@@ -208,6 +234,8 @@ def _eligible(
         return False
     if mode.is_decode():
         return (input_ids if input_ids is not None else inputs_embeds).shape[0] == 1
+    if mode.is_target_verify():  # DSpark: one request's verify rows
+        return owns and _real_batch_size(forward_batch) == 1
     # Prefill through the kernel only when sglang has no layer weights to run it.
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -237,7 +265,8 @@ def k3_megakernel_forward(
     if not _eligible(model, input_ids, forward_batch, inputs_embeds, pp_proxy_tensors):
         if model.__dict__.get("_k3_megakernel_owns_weights", False):
             raise NotImplementedError(
-                f"K3 megakernel owns the decoder weights and runs only bs=1 decode / extend; got "
+                f"K3 megakernel owns the decoder weights and runs only bs=1 decode / extend / "
+                f"DSpark verify; got "
                 f"{forward_batch.forward_mode} with {_real_batch_size(forward_batch)} requests, "
                 f"{(input_ids if input_ids is not None else inputs_embeds).shape[0]} tokens."
             )
