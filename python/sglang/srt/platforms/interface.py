@@ -162,6 +162,14 @@ class SRTPlatform(DeviceMixin):
         """
         return "inductor"
 
+    def get_batch_input_device(self, batch) -> Optional[str]:
+        """Placement of host-created forward inputs before backend preparation.
+
+        None preserves each caller's normal device. Scheduler state and
+        device-produced tokens keep their own devices.
+        """
+        return None
+
     def supports_torch_compile(self) -> bool:
         """Whether this platform consumes annotation-driven compile policies."""
         return False

@@ -65,6 +65,7 @@ from sglang_tpu.cp_forward import (
     get_tpu_cp_layout,
 )
 from sglang_tpu.cp_layout import TpuCpHostLayout
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 from sglang_tpu.kv_row_write import (
     get_write_rows_op,
@@ -803,7 +804,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return cached
 
         dist = self._make_rpa_distribution_cpu(is_decode, non_empty_bs).to(device)
-        if not envs.SGLANG_TPU_HOST_PADDING.get():
+        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get():
             dist.tolist()  # one-time blocking sync: wait until the H2D completes
         self._distribution_cache[key] = dist
         return dist

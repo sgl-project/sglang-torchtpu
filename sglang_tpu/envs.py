@@ -82,10 +82,18 @@ class TpuEnvs:
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)
 
+    # Host padding
+    # Keep eligible host-built inputs on CPU through bucket padding, then upload
+    # once to avoid per-length XLA compilations. Device inputs are not read back.
+    SGLANG_TPU_HOST_PADDING = EnvBool(False)
+
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+    # Same effect as SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER. Non-speculative
+    # batches ignore it.
+    SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.

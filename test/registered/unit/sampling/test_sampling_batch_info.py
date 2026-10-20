@@ -1093,7 +1093,6 @@ class TestHostSamplingMode(CustomTestCase):
                     self.assertEqual(original_logits.shape[0], physical_rows)
 
     def test_non_spec_padding_eligibility_preserves_auxiliary_contracts(self):
-        from sglang.srt.environ import envs
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardMode,
@@ -1102,6 +1101,7 @@ class TestHostSamplingMode(CustomTestCase):
         from sglang_tpu.compilation.decoder_compile_policy import (
             Qwen3VLDecoderTpuCompilePolicy,
         )
+        from sglang_tpu.envs import envs
 
         runtime = get_context().override_server_args(
             tp_size=1, pp_size=1, enable_mixed_chunk=False
@@ -1110,7 +1110,10 @@ class TestHostSamplingMode(CustomTestCase):
         self.addCleanup(runtime.restore)
         info = self._host_info(3)
         config = SimpleNamespace(
-            use_ngram_embedding=False, use_engram=False, is_encoder_decoder=False
+            is_generation=True,
+            use_ngram_embedding=False,
+            use_engram=False,
+            is_encoder_decoder=False,
         )
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=SimpleNamespace(model_config=config)
@@ -1249,7 +1252,6 @@ class TestHostSamplingMode(CustomTestCase):
                     )
 
     def test_factory_hook_selects_host_storage_only_for_non_spec_tpu_sampling(self):
-        from sglang.srt.environ import envs
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.plugins.hook_registry import (
             HookRegistry,
@@ -1259,11 +1261,9 @@ class TestHostSamplingMode(CustomTestCase):
         from sglang.srt.runtime_context import get_context
         from sglang.srt.sampling.sampling_params import SamplingParams
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.hooks.host_padding import (
-            extend_metadata_device,
-            sampling_from_batch,
-            stage_prefill_tokens,
-        )
+        from sglang_tpu.envs import envs
+        from sglang_tpu.hooks.host_padding import sampling_from_batch
+        from sglang_tpu.host_padding import _can_stage_forward_metadata
 
         override = get_context().override_server_args(sampling_backend="tpu")
         override.install()
@@ -1312,17 +1312,9 @@ class TestHostSamplingMode(CustomTestCase):
                 try:
                     with envs.SGLANG_TPU_HOST_PADDING.override(True):
                         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-                        batch.input_ids = stage_prefill_tokens(
-                            lambda b: b.prefill_input_ids_cpu.to("meta"), batch
-                        )
                         self.assertEqual(info.sampling_params_on_cpu, host_sampling)
                         self.assertEqual(
-                            batch.input_ids.device.type,
-                            "cpu" if host_inputs else "meta",
-                        )
-                        self.assertEqual(
-                            extend_metadata_device(lambda b, d: d, batch, "meta"),
-                            "cpu" if host_inputs else "meta",
+                            _can_stage_forward_metadata(batch), host_inputs
                         )
                 finally:
                     mode.restore()

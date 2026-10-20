@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs as srt_envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -289,7 +288,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
             )
 
     def test_either_flag_enables_the_experimental_worker(self):
-        from sglang.srt.environ import envs as srt_envs
         from sglang_tpu.experimental import (
             is_experimental_mtp,
             is_experimental_spec_worker,
@@ -298,7 +296,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         for experimental, no_d2h in ((True, False), (False, True), (False, False)):
             with (
                 envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(experimental),
-                srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(no_d2h),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(no_d2h),
             ):
                 for algo in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
                     self.assertEqual(
@@ -332,7 +330,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         }
         with (
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
-            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
         ):
             off = {target for target, _, _ in hook_specs()}
         on = {target for target, _, _ in hook_specs()}

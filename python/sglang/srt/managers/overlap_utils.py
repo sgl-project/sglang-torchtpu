@@ -93,7 +93,10 @@ def _assert_nonneg_and_invalidate(
 
 def _stage_prefill_tokens(batch):
     """Materialize the staged prompt before combining it with decode inputs."""
-    return batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+    # None uploads now; a backend may keep prompts on CPU until padding.
+    return batch.prefill_input_ids_cpu.to(
+        batch.input_tensor_device or batch.device, non_blocking=True
+    )
 
 
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:

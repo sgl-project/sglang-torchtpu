@@ -11,14 +11,22 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.runtime_context import get_context, get_exec, get_parallel, get_schedule
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import patches
+from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
@@ -52,6 +60,8 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
 # torch_tpu-free, so this runs on the CPU CI runner (no TPU required).
@@ -151,6 +161,233 @@ class TestDummyFieldPadCoverage(CustomTestCase):
             and not name.endswith("_cpu")
         }
         self.assertLessEqual(device_tensor_fields, set(_TOKEN_FIELDS) | set(_BS_FIELDS))
+
+
+class TestHostStagedPrefillInputs(CustomTestCase):
+    """Arbitrary prefill lengths must not reach the device before bucketing."""
+
+    def test_default_platform_keeps_device_input_contract(self):
+        batch = ScheduleBatch(
+            reqs=[], device="meta", prefill_input_ids_cpu=torch.arange(3)
+        )
+        with patch(
+            "sglang.srt.managers.schedule_batch.current_platform",
+            SRTPlatform(),
+        ):
+            resolve_forward_inputs(batch, None)
+        self.assertEqual(batch.input_ids.device.type, "meta")
+        self.assertEqual(batch.input_ids.shape, (3,))
+        self.assertIsNone(batch.prefill_input_ids_cpu)
+
+    def test_mixed_and_speculative_batches_keep_the_device_contract(self):
+        with (
+            get_context().override_server_args(enable_torch_compile=True),
+            tpu_envs.SGLANG_TPU_HOST_PADDING.override(True),
+        ):
+            allocator = TpuPagedTokenToKVPoolAllocator(
+                size=32,
+                page_size=4,
+                dtype=torch.bfloat16,
+                device="meta",
+                kvcache=None,
+                need_sort=False,
+            )
+            batch = ScheduleBatch(
+                reqs=[
+                    SimpleNamespace(
+                        positional_embed_overrides=None,
+                        input_embeds=None,
+                        beam_group=None,
+                    )
+                ],
+                device="meta",
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=SimpleNamespace(
+                    is_generation=True,
+                    is_encoder_decoder=False,
+                    is_multimodal=False,
+                    use_ngram_embedding=False,
+                    use_engram=False,
+                ),
+                token_to_kv_pool_allocator=allocator,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.empty(2, 32)),
+            )
+            platform = TpuSRTPlatform()
+            self.assertEqual(platform.get_batch_input_device(batch), "cpu")
+            with tpu_envs.SGLANG_TPU_HOST_PADDING.override(False):
+                self.assertIsNone(platform.get_batch_input_device(batch))
+            with get_schedule().override(enable_mixed_chunk=True):
+                self.assertIsNone(platform.get_batch_input_device(batch))
+            batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+            self.assertIsNone(platform.get_batch_input_device(batch))
+            batch.spec_algorithm = SpeculativeAlgorithm.NONE
+            batch.model_config.is_multimodal = True
+            self.assertEqual(platform.get_batch_input_device(batch), "cpu")
+
+    def test_host_inputs_survive_forward_construction_and_upload_after_padding(self):
+        class HostInputPlatform(SRTPlatform):
+            calls = 0
+
+            def get_batch_input_device(self, batch):
+                self.calls += 1
+                if self.calls > 1:
+                    raise AssertionError("placement must be resolved once per prefill")
+                return "cpu"
+
+        runner = SimpleNamespace(
+            device="meta",
+            is_draft_worker=False,
+            kv_index_translator=SimpleNamespace(rebind_write_loc=lambda _: None),
+            ngram_embedding_manager=SimpleNamespace(enabled=False),
+            model_config=SimpleNamespace(
+                model_is_mrope=True, requires_mm_token_modalities=False
+            ),
+            lora_manager=None,
+            prefill_attention_backend_str="torch_native",
+        )
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(attn_dcp_size=1),
+            tpu_envs.SGLANG_TPU_HOST_PADDING.override(True),
+            patch(
+                "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch",
+                return_value=None,
+            ),
+        ):
+            for n, has_image in (
+                (1, False),
+                (3, True),
+                (8, False),
+                (9, True),
+                (17, True),
+            ):
+                with self.subTest(tokens=n, multimodal=has_image):
+                    platform = HostInputPlatform()
+                    req = Req(
+                        "0", "", array("q", range(n + 3)), SamplingParams(), False
+                    )
+                    req.refresh_fill_ids()
+                    req.prefix_indices = torch.arange(3)
+                    req.set_extend_range(3, n + 3)
+                    expected_mrope = torch.arange(3, n + 3).repeat(3, 1)
+                    if has_image:
+                        spatial_offsets = torch.tensor([[0], [10], [20]])
+                        req.multimodal_inputs = SimpleNamespace(
+                            mrope_positions=torch.arange(n + 3).repeat(3, 1)
+                            + spatial_offsets,
+                            vision_position_ids=None,
+                            visible_frame_counts=None,
+                        )
+                        expected_mrope = expected_mrope + spatial_offsets
+                    batch = ScheduleBatch(
+                        reqs=[req],
+                        device="meta",
+                        model_config=SimpleNamespace(
+                            is_encoder_decoder=False, vocab_size=32
+                        ),
+                        spec_algorithm=SpeculativeAlgorithm.NONE,
+                    )
+
+                    def allocate(batch):
+                        # Allocation and the later upload must share the decision.
+                        self.assertEqual(batch.input_tensor_device, "cpu")
+                        return (
+                            torch.arange(n, dtype=torch.int32),
+                            torch.empty(1, dtype=torch.int64, device="meta"),
+                            torch.tensor([0]),
+                        )
+
+                    with (
+                        patch(
+                            "sglang.srt.managers.schedule_batch.current_platform",
+                            platform,
+                        ),
+                        patch(
+                            "sglang.srt.managers.schedule_batch.alloc_for_extend",
+                            allocate,
+                        ),
+                    ):
+                        batch.prepare_for_extend()
+                    resolve_forward_inputs(batch, None)
+                    self.assertEqual(batch.input_ids.device.type, "cpu")
+                    fb = ForwardBatch.init_new(
+                        batch,
+                        runner,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        return_hidden_states_before_norm=False,
+                    )
+                    torch.testing.assert_close(fb.positions, torch.arange(3, n + 3))
+                    torch.testing.assert_close(fb.mrope_positions, expected_mrope)
+                    for field in (
+                        "input_ids",
+                        "positions",
+                        "mrope_positions",
+                        "out_cache_loc",
+                        "extend_seq_lens",
+                        "extend_prefix_lens",
+                        "extend_start_loc",
+                    ):
+                        self.assertEqual(getattr(fb, field).device.type, "cpu")
+                    policy = DecoderTpuCompilePolicy()
+                    policy.model_runner = runner
+                    policy.t_bucketer = _bucketer("Token", [8, 16, 32])
+                    policy.b_bucketer = _bucketer("Bs", [1, 4])
+                    policy.extend_bs = 4
+                    policy.prepare_forward_batch(fb)
+                    self.assertEqual(
+                        fb.input_ids.shape, (8 if n <= 8 else 16 if n <= 16 else 32,)
+                    )
+                    self.assertEqual(fb.extend_start_loc.shape, (4,))
+                    for field in (
+                        "input_ids",
+                        "positions",
+                        "out_cache_loc",
+                        "mrope_positions",
+                        "extend_seq_lens",
+                        "extend_prefix_lens",
+                        "extend_start_loc",
+                    ):
+                        self.assertEqual(getattr(fb, field).device.type, "meta")
+                    # Preparation owns the forward snapshot, not scheduler inputs.
+                    self.assertEqual(batch.input_ids.device.type, "cpu")
+                    self.assertEqual(batch.input_ids.numel(), n)
+                    self.assertEqual(fb.req_pool_indices_cpu.device.type, "cpu")
+                    self.assertEqual(platform.calls, 1)
+
+                    batch.sampling_info = SimpleNamespace(
+                        penalizer_orchestrator=SimpleNamespace(is_required=False)
+                    )
+                    with patch(
+                        "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                        return_value=torch.empty(1, dtype=torch.int32, device="meta"),
+                    ):
+                        batch.prepare_for_decode()
+                    self.assertEqual(batch.out_cache_loc.device.type, "meta")
+
+    def test_extend_allocator_can_retain_host_output_without_changing_default(self):
+        with get_context().override_server_args():
+            for output_device in (None, "cpu"):
+                allocator = TpuPagedTokenToKVPoolAllocator(
+                    size=32,
+                    page_size=4,
+                    dtype=torch.bfloat16,
+                    device="meta",
+                    kvcache=None,
+                    need_sort=False,
+                )
+                indices = allocator.alloc_extend(
+                    torch.tensor([0]),
+                    torch.tensor([0]),
+                    torch.tensor([5]),
+                    torch.tensor([5]),
+                    torch.tensor([-1]),
+                    5,
+                    **({"return_host": True} if output_device else {}),
+                )
+                self.assertEqual(indices.device.type, output_device or "meta")
+                self.assertEqual(allocator.available_size(), 24)
+                if output_device == "cpu":
+                    self.assertEqual(indices.tolist(), [4, 5, 6, 7, 8])
 
 
 class TestZeroPadDim0(CustomTestCase):

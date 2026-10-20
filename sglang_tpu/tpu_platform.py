@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
 # Platform discovery runs before worker bootstrap configures torch_tpu.
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
@@ -1162,6 +1163,39 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
+
+    def get_batch_input_device(self, batch) -> str | None:
+        """Keep eligible prefill inputs on CPU until backend padding."""
+        from sglang.srt.layers.cp.base import get_cp_strategy
+        from sglang.srt.utils.common import print_warning_once
+        from sglang_tpu.allocator_tpu import host_return_allocators
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.host_padding import _can_stage_forward_metadata
+
+        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get():
+            return None
+        # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
+        allocator = batch.token_to_kv_pool_allocator
+        checks = (
+            ("forward metadata is not staged", _can_stage_forward_metadata(batch)),
+            ("context parallelism is on", get_cp_strategy() is None),
+            ("the allocator returns device indices", host_return_allocators(allocator)),
+            # Page size 1 uses alloc(), which has no host-return contract.
+            ("page size is 1", allocator.page_size > 1),
+            (
+                "req_to_token is on the device",
+                batch.req_to_token_pool.req_to_token.device.type == "cpu",
+            ),
+        )
+        for reason, ok in checks:
+            if not ok:
+                print_warning_once(
+                    "SGLANG_TPU_HOST_PADDING is set, but prefill inputs upload at "
+                    f"the live length because {reason}. This may compile a program "
+                    "per prompt length."
+                )
+                return None
+        return "cpu"
 
     def supports_torch_compile(self) -> bool:
         return True
