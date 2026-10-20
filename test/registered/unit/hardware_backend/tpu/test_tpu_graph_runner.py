@@ -503,7 +503,7 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         with (
             tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
-            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
         ):
             cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))

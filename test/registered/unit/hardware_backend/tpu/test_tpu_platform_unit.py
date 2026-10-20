@@ -626,7 +626,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 self.subTest(algorithm=algo, reason=reason),
                 patch.dict(os.environ, env),
                 flag.override(True),
-                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+                tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
             ):
                 flag.clear()
                 args = self._args(speculative_algorithm=algo, **overrides)
@@ -655,7 +655,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             with (
                 self.subTest(algorithm=algo),
                 flag.override(True),
-                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+                tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
             ):
                 flag.clear()
                 args = self._args(speculative_algorithm=algo)
@@ -690,7 +690,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
         mtp = SpeculativeAlgorithm.EAGLE
-        with envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False):
+        with tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False):
             for draft in (
                 "Qwen3_5ForCausalLMMTP",
                 "Glm5NextForConditionalGenerationNextN",
@@ -796,7 +796,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         from sglang_tpu.envs import envs as tpu_envs
 
         flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
-        with envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False):
+        with tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False):
             for mode in ("prefill", "decode"):
                 with self.subTest(mode=mode), flag.override(True):
                     flag.clear()
@@ -823,7 +823,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
         with (
             flag.override(True),
-            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
         ):
             flag.clear()
             args = self._args(
@@ -850,7 +850,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         )
         with (
             patch.object(SpeculativeAlgorithm, "supports_tpu_direct_compile", hooked),
-            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
         ):
             with flag.override(True):
                 # The draft TPU has not exercised falls back to core's EAGLE driver.
@@ -877,7 +877,10 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
         fallback = tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK
-        with flag.override(True), envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False):
+        with (
+            flag.override(True),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             flag.clear()
             self._apply(
                 self._args(
@@ -896,7 +899,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         with (
             tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
-            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
             patch("sglang_tpu.patches._prepare_tpu_env"),
             patch(
                 "sglang.srt.configs.model_config.ModelConfig.from_server_args",
@@ -972,7 +975,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         with (
             tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
-            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
         ):
             args = self._args(
                 speculative_algorithm="EAGLE3", disable_overlap_schedule=True

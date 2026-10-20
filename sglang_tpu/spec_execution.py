@@ -86,7 +86,7 @@ def experimental_spec_enabled() -> bool:
         return False
     return (
         tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.get()
-        or envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()
+        or tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()
     )
 
 
@@ -121,7 +121,9 @@ def _resolve(
 
 def _plugin_requested_explicitly() -> bool:
     flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
-    return (flag.is_set() and flag.get()) or envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()
+    return (
+        flag.is_set() and flag.get()
+    ) or tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()
 
 
 def settle_spec_execution(
