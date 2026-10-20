@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs as srt_envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
@@ -129,7 +128,7 @@ class TestExperimentalEagle3(CustomTestCase):
 
         with (
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
-            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
             patch("sglang_tpu.experimental._host_batch_padder", None),
         ):
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.clear()
@@ -293,7 +292,7 @@ class TestExperimentalEagle3(CustomTestCase):
                             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(
                                 enabled
                             ),
-                            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(alias),
+                            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(alias),
                         ):
                             for (
                                 name,
@@ -451,7 +450,7 @@ assert not any(name.startswith('sglang_tpu.graph_runner') for name in sys.module
 
         with (
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
-            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
             get_context().override_server_args(),
         ):
             args = ServerArgs(model_path="dummy")
