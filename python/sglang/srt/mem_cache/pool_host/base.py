@@ -506,10 +506,6 @@ class HostKVCache(abc.ABC):
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
 
-    def used_size(self) -> int:
-        """Slots currently allocated in this pool."""
-        return self.logical_size - self.available_size()
-
     def _merge_release_slots(self):
         if self.num_release_slots == 0:
             return

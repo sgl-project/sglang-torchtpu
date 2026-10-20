@@ -1232,10 +1232,6 @@ class SchedulerMetricsReporter:
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
-        swa_host_pool = self.scheduler.tree_cache.swa_host_pool()
-        if swa_host_pool is not None:
-            self.stats.hicache_host_swa_used_tokens = swa_host_pool.used_size()
-            self.stats.hicache_host_swa_total_tokens = swa_host_pool.logical_size
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

@@ -476,11 +476,6 @@ class _SharedPageEnvelopeHostBacking:
             raise AssertionError("Host indices must contain contiguous pages.")
         return (groups[:, 0] // page_size).tolist()
 
-    def used_size(self, name: str) -> int:
-        with self.lock:
-            side = self.sides[name]
-            return side.live_page_count * side.page_size
-
     def available_size(self, name: str) -> int:
         with self.lock:
             side = self.sides[name]
@@ -840,10 +835,6 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
 
     def available_size(self):
         return self._shared_backing.available_size(self.pool_label)
-
-    def used_size(self) -> int:
-        # Free bytes are shared with the peer side, so used is the live page count.
-        return self._shared_backing.used_size(self.pool_label)
 
     def alloc(self, need_size: int) -> torch.Tensor | None:
         return self._shared_backing.alloc(self.pool_label, need_size)

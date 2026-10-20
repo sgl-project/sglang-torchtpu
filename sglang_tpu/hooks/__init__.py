@@ -29,6 +29,7 @@ from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
     route_glm_flash_megakernel,
 )
+from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.kda_weights import bind_glm5_next_kda_weights
 from sglang_tpu.hooks.mhc import (
@@ -205,6 +206,8 @@ HOOKS: list[tuple] = [
 ]
 
 HOOKS.extend(host_padding_hooks())
+
+HOOKS.extend(hicache_swa_metrics_hooks())
 
 HOOKS.extend(hook_specs())
 

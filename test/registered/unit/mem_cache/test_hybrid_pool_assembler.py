@@ -1054,19 +1054,6 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 self.assertTrue(cc.prefetch_sync_queue.empty())
         self.assertEqual(seen_prefixes, [["prefix", "h0"], ["prefix", "h0"]])
 
-    def test_used_size_counts_only_this_sides_pages(self):
-        """Free bytes are shared, so FULL allocations shrink SWA's available size;
-        SWA's used size must still count only SWA pages."""
-        full_pool, swa_pool = _build_unified_host_pair(_build_unified_swa_pool(4))
-        self.addCleanup(full_pool.destroy)
-        self.addCleanup(swa_pool.destroy)
-        swa_available = swa_pool.available_size()
-        self.assertIsNotNone(full_pool.alloc(full_pool.available_size() // 8 * 4))
-        self.assertLess(swa_pool.available_size(), swa_available)
-        self.assertEqual(swa_pool.used_size(), 0)
-        self.assertIsNotNone(swa_pool.alloc(4))
-        self.assertEqual(swa_pool.used_size(), 4)
-
     def test_shorter_prefetch_reserves_full_and_swa_without_mutating_probe_keys(self):
         page_size = 4
         full_pool, swa_pool = _build_unified_host_pair(
