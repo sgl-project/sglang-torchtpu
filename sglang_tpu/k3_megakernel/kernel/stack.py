@@ -606,7 +606,7 @@ class StackKernel:
             late_handoff=self.handoff == "experts",
             split_refill=moe_split_refill,
             late_latent_up=moe_region_m and moe_up_fill,
-            row_gathers=row_gathers,
+            row_gathers=row_gathers or self.rows_mode,
             up_tree=moe_up_tree,
             fast_topk=moe_fast_topk,
             debug=frozenset(x for x in moe_debug.split(",") if x)

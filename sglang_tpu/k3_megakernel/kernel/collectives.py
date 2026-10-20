@@ -308,9 +308,10 @@ class AllGatherSpec(msgspec.Struct, frozen=True):
     the in-host round followed by a host-level forward of the gathered host block
     (one dependent round trip instead of two at ``hosts > 1``; ``world - 1`` sends).
 
-    Row mode (``rows == 1``, flat or one host): each rank's ``[1, cols]`` row lands in its
-    ``cols``-lane slice of one ``[1, world * cols]`` row, so a message is ``cols`` values
-    (256 B for 128 bf16) instead of a whole ``[8 | 16, 128]`` tile; the result is that row."""
+    Row mode (``rows == 1`` or ``by_cols``; flat or one host): each rank's ``[rows, cols]`` block lands
+    in its ``cols``-lane slice of one ``[rows, world * cols]`` block, so a message is the block itself
+    (256 B for one 128-wide bf16 row) instead of whole flat ``[8 | 16, 128]`` tiles, and the result
+    needs no relayout."""
 
     topo: Topology
     rows: int
@@ -318,6 +319,7 @@ class AllGatherSpec(msgspec.Struct, frozen=True):
     flat: bool = False
     cols: int = LANE
     stride: int = 1  # peers are me ^ (stride * offset); see _coords
+    by_cols: bool = False  # row mode for rows > 1: [rows, cols] blocks side by side -> [rows, world * cols]
 
     def __post_init__(self):
         if self.row_mode:
@@ -332,7 +334,7 @@ class AllGatherSpec(msgspec.Struct, frozen=True):
 
     @property
     def row_mode(self) -> bool:
-        return self.rows == 1
+        return self.rows == 1 or self.by_cols
 
     @property
     def wire_rows(self) -> int:
@@ -349,10 +351,11 @@ class AllGatherSpec(msgspec.Struct, frozen=True):
             pltpu.SMEM((1,), jnp.int32),  # round counter
         ]
         if self.row_mode:
+            r = self.rows
             return [
-                pltpu.VMEM((1, self.cols), t),  # own row, wire dtype
-                pltpu.VMEM((2, 1, topo.world * self.cols), t),
-            ] + sems  # gathered row slots
+                pltpu.VMEM((r, self.cols), t),  # own block, wire dtype
+                pltpu.VMEM((2, r, topo.world * self.cols), t),
+            ] + sems  # gathered slots
         local = (
             (1, 1, 8 * 4 // jnp.dtype(t).itemsize, LANE)
             if self.flat

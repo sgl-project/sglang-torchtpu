@@ -232,7 +232,7 @@ class MoeStage:
         """``gather_bf16``: the router-score, latent and output gathers travel as bf16 (their
         values are bf16, so exact). ``flat_gather``: the latent gather is one world-wide
         one-shot (one dependent round trip at ``hosts > 1``; see ``AllGatherSpec.flat``).
-        ``row_gathers`` (one decode row): the three gathers are flat one-shots of bf16 ``[1, C]``
+        ``row_gathers`` (on by default in verify rows): the three gathers are flat one-shots of bf16 ``[R, C]``
         rows (``AllGatherSpec`` row mode: router 512, latent chunk, output columns per message
         instead of whole [8, 128] f32 tiles); exact.
         ``shared_after`` >= 0: the shared expert runs after that many routed experts instead of
@@ -281,10 +281,10 @@ class MoeStage:
         self.relax = relax
         d, topo = layout.dims, layout.topo
         g = jnp.bfloat16 if gather_bf16 else jnp.float32
-        self.row_gathers = row_gathers and rows == 1
+        self.row_gathers = row_gathers
         if self.row_gathers:
             row = lambda t, cols: AllGatherSpec(
-                t, 1, jnp.bfloat16, flat=True, cols=cols
+                t, rows, jnp.bfloat16, flat=True, cols=cols, by_cols=rows > 1
             )
             self.pair = row(Topology(1, 2), layout.router_pad)
             self.lat_gather = row(topo, layout.latent_chunk)
