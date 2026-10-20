@@ -68,9 +68,9 @@ reject:
   mixed-phase attention-DP settings, and an `SGLANG_SPEC_TP_SYNC` that enables
   only one spec-accept site under attention DP;
 - EAGLE3 and native MTP: non-static ragged verify, a draft window, top-k other
-  than 1, adaptive or multi-layer drafting, and draft-token counts other than
-  steps + 1; EAGLE3 also drafts other than `LlamaForCausalLMEagle3` and M-RoPE
-  drafts;
+  than 1, and draft-token counts other than steps + 1; EAGLE3 also adaptive or
+  multi-layer drafting, drafts other than `LlamaForCausalLMEagle3` and M-RoPE
+  drafts; native MTP also drafts the MTP drafter does not load;
 - DFlash and DSpark: attention DP and non-static ragged verify; DFlash also
   LiLiCorr or Domino drafts, a `mask_embedding.pt` beside the draft, and a
   missing or out-of-vocabulary `dflash_config.mask_token_id`; DSpark a draft its
@@ -78,7 +78,10 @@ reject:
 
 Such a launch runs on the compatibility worker and logs why, as does native MTP
 on a draft not yet exercised. The fallback lasts for that launch only and leaves
-`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER` as set. With the plugin worker requested
+`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER` as set. A P/D server does not fall
+back on its own for a configuration the plugin worker rejects, since its peer may
+not: it fails, and both servers then need the compatibility route set
+explicitly. With the plugin worker requested
 explicitly (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1` or
 `SGLANG_TPU_HOST_PADDING_NO_D2H=1`) the launch fails instead, and
 `--tpu-compile-tracer direct` fails when the selected compatibility driver is not

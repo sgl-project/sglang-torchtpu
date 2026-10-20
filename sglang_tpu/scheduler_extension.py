@@ -34,9 +34,16 @@ class TpuSchedulerExtension(SchedulerExtension):
         ):
             cls = HostPaddingFutureMap
         future_map = cls(device, algorithm, req_to_token_pool, **kwargs)
-        from sglang_tpu.experimental import experimental_spec_enabled
+        from sglang.srt.runtime_context import get_context
+        from sglang_tpu.spec_execution import resolve_spec_execution
 
-        if experimental_spec_enabled():
+        # Only a plugin spec worker serves this relay through compiled programs.
+        if (
+            not algorithm.is_none()
+            and resolve_spec_execution(
+                algorithm, pp_size=get_context().config_bag("parallel").pp_size
+            ).host_padded
+        ):
             from sglang_tpu.hooks.experimental_spec import materialize_future_map
 
             future_map = materialize_future_map(future_map, algorithm)

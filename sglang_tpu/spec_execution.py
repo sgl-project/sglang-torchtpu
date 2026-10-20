@@ -174,10 +174,14 @@ def _plugin_rejection(
     server_args: ServerArgs, *, algorithm: SpeculativeAlgorithm
 ) -> str | None:
     """Why the default route leaves the plugin worker; raise where it cannot."""
+    from sglang.srt.arg_groups.overrides import resolving_view
+
     explicit = _plugin_requested_explicitly()
     reason = _plugin_unsupported_reason(server_args, algorithm=algorithm)
+    unproven = False
     if reason is None and not explicit:
         reason = _plugin_unproven_reason(server_args, algorithm=algorithm)
+        unproven = reason is not None
     if reason is None:
         return None
     if algorithm.is_dspark():
@@ -188,6 +192,15 @@ def _plugin_rejection(
         raise ValueError(
             f"The TPU plugin spec worker {reason}; set {_ROLLBACK_ENV} to serve "
             f"{algorithm.name} with the compatibility worker."
+        )
+    # Each P/D server settles alone, and a configuration only one of them carries
+    # would pair a plugin worker with a compatibility one. The checkpoint behind an
+    # unproven draft is the same on both, so only that fallback stays automatic.
+    if not unproven and resolving_view(server_args).disaggregation_mode != "null":
+        raise ValueError(
+            f"The TPU plugin spec worker {reason}. Both P/D servers must serve "
+            f"{algorithm.name} with the same worker; set {_ROLLBACK_ENV} on the "
+            "prefill and decode servers to use the compatibility worker."
         )
     return reason
 
@@ -257,8 +270,6 @@ def _chain_unsupported_reason(
         return "does not support --speculative-draft-window-size"
     if cfg.speculative_eagle_topk not in (None, 1):
         return "drafts chains only (--speculative-eagle-topk 1)"
-    if cfg.enable_multi_layer_eagle or cfg.speculative_adaptive:
-        return "does not support multi-layer or adaptive EAGLE"
     if (
         cfg.speculative_num_steps is not None
         and cfg.speculative_num_draft_tokens is not None
@@ -266,7 +277,30 @@ def _chain_unsupported_reason(
     ):
         return "needs --speculative-num-draft-tokens = --speculative-num-steps + 1"
     if algorithm.is_eagle3():
+        if cfg.enable_multi_layer_eagle or cfg.speculative_adaptive:
+            return "does not support multi-layer or adaptive EAGLE3"
         return _eagle3_draft_unsupported_reason(server_args)
+    if _is_mtp(algorithm):
+        return _mtp_draft_unsupported_reason(server_args)
+    return None
+
+
+def _mtp_draft_unsupported_reason(server_args: ServerArgs) -> str | None:
+    """What ``TpuMtpDraftWorker`` rejects in the draft checkpoint."""
+    from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+    from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+    from sglang.srt.models.registry import ModelRegistry
+
+    # The drafter's MTP_DRAFT_MODELS, without importing the drafter before load.
+    drafts = (Qwen3_5ForCausalLMMTP, DeepseekV3ForCausalLMNextN)
+    architecture = _mtp_draft_architecture(server_args)
+    try:
+        model_cls, _ = ModelRegistry.resolve_model_cls([architecture])
+    except ValueError:
+        model_cls = None
+    if model_cls is None or not issubclass(model_cls, drafts):
+        names = ", ".join(cls.__name__ for cls in drafts)
+        return f"drafts MTP with {names} (or subclasses) only, not {architecture}"
     return None
 
 

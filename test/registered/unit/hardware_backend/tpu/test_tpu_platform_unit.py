@@ -387,12 +387,17 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         *,
         eagle3_draft=None,
         mtp_draft="Qwen3_5ForCausalLMMTP",
+        mtp_draft_class=None,
         dflash_draft=None,
         dspark_draft=None,
     ):
         platform = TpuSRTPlatform()
         with (
             patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch(
+                "sglang_tpu.spec_execution._mtp_draft_unsupported_reason",
+                return_value=mtp_draft_class,
+            ),
             patch(
                 "sglang_tpu.spec_execution._dflash_draft_unsupported_reason",
                 return_value=dflash_draft,
@@ -692,7 +697,6 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             ),
             ({}, {"SGLANG_RAGGED_VERIFY_MODE": "compact"}, "RAGGED_VERIFY_MODE"),
             (dict(speculative_draft_window_size=64), {}, "draft-window-size"),
-            (dict(enable_multi_layer_eagle=True), {}, "multi-layer or adaptive"),
             (
                 dict(speculative_num_steps=3, speculative_num_draft_tokens=5),
                 {},
@@ -774,6 +778,68 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                             self._args(speculative_algorithm="NEXTN", **overrides)
                         )
                     self.assertRegex(str(caught.exception), reason)
+
+    def test_mtp_draft_check_matches_the_mtp_drafter(self):
+        """Settle accepts the drafter's MTP_DRAFT_MODELS and their subclasses."""
+        from sglang_tpu import spec_execution
+
+        for architecture, supported in (
+            ("Qwen3_5ForCausalLMMTP", True),
+            ("DeepseekV3ForCausalLMNextN", True),
+            ("Glm5NextForConditionalGenerationNextN", True),
+            ("NotAnMtpDraftForCausalLM", False),
+        ):
+            with (
+                self.subTest(architecture=architecture),
+                patch.object(
+                    spec_execution,
+                    "_mtp_draft_architecture",
+                    return_value=architecture,
+                ),
+            ):
+                reason = spec_execution._mtp_draft_unsupported_reason(self._args())
+                if supported:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertRegex(reason, architecture)
+
+    def test_explicit_nextn_opt_in_rejects_an_unloadable_draft_before_load(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            with self.assertRaisesRegex(ValueError, "drafts MTP"):
+                self._apply(
+                    self._args(speculative_algorithm="NEXTN"),
+                    mtp_draft_class="drafts MTP with Qwen3_5ForCausalLMMTP only",
+                )
+
+    def test_disaggregated_launch_never_falls_back_alone(self):
+        """A P/D server cannot tell whether its peer falls back too, so a config
+        the plugin worker rejects raises; an unproven draft, the same checkpoint on
+        both servers, still falls back."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        with envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False):
+            for mode in ("prefill", "decode"):
+                with self.subTest(mode=mode), flag.override(True):
+                    flag.clear()
+                    with self.assertRaisesRegex(ValueError, "Both P/D servers"):
+                        self._apply(
+                            self._args(
+                                speculative_algorithm="NEXTN",
+                                disaggregation_mode=mode,
+                                speculative_draft_window_size=64,
+                            )
+                        )
+                    flag.clear()
+                    self._apply(
+                        self._args(
+                            speculative_algorithm="NEXTN", disaggregation_mode=mode
+                        ),
+                        mtp_draft="DeepseekV3ForCausalLMNextN",
+                    )
+                    self.assertTrue(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
 
     def test_direct_tracer_cannot_fall_back_to_the_eager_mtp_driver(self):
         from sglang_tpu.envs import envs as tpu_envs
