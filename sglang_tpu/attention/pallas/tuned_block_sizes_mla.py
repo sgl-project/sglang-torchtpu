@@ -171,11 +171,30 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 4096): (16, 128),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 8192): (16, 128),
         # fp8 KV rows, tuned on one v7x core.
-        # Kimi-K2.6 tp=16 (4 heads, page 128)
+        # 4 q heads per shard, page 128: Kimi-K3 TP32 (3 -> 4) and Kimi-K2.6
+        # TP16. Each entry minimizes the worst-case slowdown vs the best block
+        # per workload (decode: kv 512 / 2048 / 8192; mixed: a fresh chunk and
+        # one behind a 4k prefix): <= 1.10x decode, <= 1.04x mixed. Against the
+        # untuned fallback, decode bs 8 at kv 8192 runs 2.1x faster and a
+        # 1024-token chunk 12x.
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 1): (16, 1, 1),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 2): (16, 1, 2),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 4): (8, 1, 4),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 8): (8, 1, 8),
         ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 16): (8, 1, 8),
-        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 64): (8, 1, 4),
-        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 128): (16, 1, 8),
-        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 8192): (16, 256),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 32): (8, 1, 8),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 64): (8, 1, 8),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 128): (8, 1, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 16): (8, 16),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 32): (8, 32),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 64): (4, 64),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 128): (4, 128),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 256): (4, 256),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 512): (4, 512),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 1024): (8, 1024),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 2048): (8, 1024),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 4096): (8, 1024),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 8192): (8, 1024),
         # DeepSeek-R1 tp=8 (16 heads, page 128)
         ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 64): (
             32,
