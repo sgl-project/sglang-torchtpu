@@ -7,8 +7,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import json
 import queue
+import sys
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
@@ -19,6 +21,11 @@ try:
     from sglang_tpu.k3_megakernel.server import app as srv
 except ImportError:  # pragma: no cover
     srv = None
+
+
+# app.py reads the process count / index from jax; the CPU CI has no jax, so stand in a
+# two-process one (this process is the leader, index 0).
+_JAX = SimpleNamespace(process_count=lambda: 2, process_index=lambda: 0)
 
 
 class _Tok:
@@ -97,7 +104,7 @@ class TestK3MegakernelServer(CustomTestCase):
         )
         patches = [
             patch.object(srv, "_kv_client", return_value=kv),
-            patch("jax.process_count", return_value=2),
+            patch.dict(sys.modules, {"jax": _JAX}),
         ]
         for p in patches:
             p.start()
@@ -166,7 +173,10 @@ class TestK3MegakernelServer(CustomTestCase):
         )
         kv.key_value_set(srv._KV_PREFIX + "1", json.dumps({"job": spec}))
         kv.key_value_set(srv._KV_PREFIX + "2", json.dumps({"shutdown": True}))
-        with patch.object(srv, "_kv_client", return_value=kv):
+        with (
+            patch.object(srv, "_kv_client", return_value=kv),
+            patch.dict(sys.modules, {"jax": _JAX}),
+        ):
             done = threading.Thread(
                 target=srv.follower_loop, args=(engine, _Tok()), daemon=True
             )

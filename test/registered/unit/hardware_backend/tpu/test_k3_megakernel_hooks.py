@@ -6,6 +6,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import contextlib
+import importlib.util
 import pkgutil
 import unittest
 from types import SimpleNamespace
@@ -122,6 +123,9 @@ class TestK3MegakernelHooks(CustomTestCase):
             )
         runtime.prepare.assert_called_once_with((7, 23, 51), verify_rows=8)
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax"), "kernel_options checks StackKernel's signature"
+    )
     def test_serving_refuses_debug_and_broken_kernel_options(self):
         from sglang_tpu.k3_megakernel.ops import SERVING_KERNEL_OPTIONS, kernel_options
 
