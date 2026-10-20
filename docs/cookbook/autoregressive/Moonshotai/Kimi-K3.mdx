@@ -728,9 +728,9 @@ Measured with the commands in 3.7.1 (the long-reasoning runs at
 
 The decode megakernel runs all 93 decoder layers as one Pallas call per
 step, with the cross-rank reductions and the next layer's weight prefetch inside
-the kernel. **One decode step takes 3.77 ms, 2.1x faster than the default path
-(7.81 ms at the same short context); with DSpark, sglang decodes at 2.21 ms per
-token, 3.6x faster.** It owns the decoder weights, so it serves one request at a
+the kernel. **One decode step takes 3.60 ms, 2.2x faster than the default path
+(7.81 ms at the same short context); with DSpark, sglang decodes at 1.77 ms per
+token, 4.4x faster.** It owns the decoder weights, so it serves one request at a
 time, and prefill chunks run through the same kernel in 8-token row blocks. It uses
 fp8 dense weights and bf16 reduction transport
 (`SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX`), at GSM8K 0.978.
@@ -739,17 +739,18 @@ fp8 dense weights and bf16 reduction transport
 
 | Serving | TTFT | TPOT | Decode tok/s | TPOT vs default path |
 | --- | --- | --- | --- | --- |
-| sglang + megakernel + DSpark | 1.23 s | **2.21 ms** | **452** | **3.6x** |
-| Standalone megakernel server | 1.28 s | **4.25 ms** | **235** | **1.8x** |
+| sglang + megakernel + DSpark | 1.06 s | **1.77 ms** | **565** | **4.4x** |
+| Standalone megakernel server | 1.06 s | **3.87 ms** | **258** | **2.0x** |
 | Default path (3.7.4) | 0.21 s | 7.86 ms | 129 | 1.0x |
 
-- Other shapes with DSpark: 2.34 ms at 1k in / 1k out and 3.10 ms at 8k in /
-  1k out (2.6x), at an accept length of 5.61. The standalone server decodes at
-  3.80 ms on a 3-token prompt and 4.61 ms at 8k in / 1k out.
+- Other shapes with DSpark: 1.89 ms at 1k in / 1k out and 2.45 ms at 8k in /
+  1k out (3.2x). The standalone server decodes at 3.69 ms on a 3-token prompt,
+  3.74 ms at 1k in / 1k out and 4.04 ms at 8k in / 1k out.
 - Prompts prefill more slowly than on the default path, because the chunks run
-  through the decode kernel: about 1.2 s for 1k tokens and 10 s for 8k.
-- On real text, 20 GSM8K questions take 41 s with DSpark and 85 s without
-  (2.1x end to end), at an accept length of 5.47.
+  through the decode kernel: about 1.1 s for 1k tokens and 8.7 s for 8k.
+- On real text (20 GSM8K questions, all correct), DSpark decodes at about
+  496 tok/s, at an accept length of 5.25.
+- Measured on torch_tpu 0.2.0 / libtpu 0.0.50.
 
 **Through sglang, with DSpark.** Serves the full sglang API; DSpark runs its
 target verify through the kernel too:
