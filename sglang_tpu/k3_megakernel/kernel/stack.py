@@ -405,7 +405,7 @@ class StackKernel:
         moe_shared_after: int = -1,
         moe_debug: str = "",
         prefetch_latent_up: bool = False,
-        moe_early_dma: bool = True,
+        moe_early_dma: bool | None = None,
         moe_pair_down: bool = True,
         moe_ring: int | None = None,
         moe_overlap_pair: bool = True,
@@ -593,6 +593,10 @@ class StackKernel:
         wires = {"bf16_transport": False, "host_bf16": False}
         rx_moe = msgspec.structs.replace(rx, **wires) if wire_scope == "attn" else rx
         rx_attn = msgspec.structs.replace(rx, **wires) if wire_scope == "moe" else rx
+        if moe_early_dma is None:
+            # Verify rows: starting expert DMAs from inside the grouped compaction cost ~12 us/layer at
+            # TP32 (w10b_croute: 1.5045 -> 1.3085 ms/token without them, same tokens); B1 keeps them.
+            moe_early_dma = self.R == 1
         self.moe = MoeStage(
             self.layout,
             rows=self.R,
