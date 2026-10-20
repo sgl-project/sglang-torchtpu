@@ -41,7 +41,6 @@ The tables below are the short view. The sections that follow give per-row topol
 | Qwen3.8-27B | bf16 | 1 host | Experimental |
 | GLM-5.2 / GLM-5.3 | FP8 | 1 host | Experimental |
 | DeepSeek-V4 | FP8 | — | Experimental |
-| Kimi-K2.5 | INT4 | 1 host | Experimental |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
 
 ### Features
