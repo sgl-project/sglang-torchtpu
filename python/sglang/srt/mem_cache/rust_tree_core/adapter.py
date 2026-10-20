@@ -277,7 +277,6 @@ def _match_result_from_binding(result) -> MatchResult:
         mamba_host_hit_length=result.mamba_host_hit_length,
         mamba_branching_seqlen=result.mamba_branching_seqlen,
         full_kv_hit_length=result.full_kv_hit_length,
-        best_match_length=result.best_match_length,
         cache_actions=_cache_actions_from_tagged(result.cache_actions),
     )
 

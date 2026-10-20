@@ -69,7 +69,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.swa_prefix_accounting import overlap_len, swa_miss_range
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
@@ -731,7 +730,6 @@ class PrefillAdder:
         self.log_device_hit_tokens = 0
         self.log_host_hit_tokens = 0
         self.log_storage_hit_tokens = 0
-        self.log_swa_miss_tokens = 0
         self.log_input_tokens = 0
         self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -987,16 +985,6 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
-    def _account_swa_miss_in_extend(self, req: Req) -> None:
-        # Charged per scheduled chunk, like input tokens, so a prefill aborted
-        # between chunks counts only what it recomputed.
-        if req.retracted_stain:
-            return
-        start, end = req.swa_miss_range
-        self.log_swa_miss_tokens += overlap_len(
-            start=start, end=end, lo=req.extend_range.start, hi=req.extend_range.end
-        )
-
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if get_exec().features.enable_encoder_swa_bounded_replay and (
             req.kv.req_pool_idx is None or req.is_retracted
@@ -1025,10 +1013,6 @@ class PrefillAdder:
             self.log_device_hit_tokens += device_hit
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
-        req.swa_miss_range = swa_miss_range(
-            match=req.swa_prefix_match, prefix_len=prefix_len
-        )
-        self._account_swa_miss_in_extend(req)
 
         fulfilled_storage_hit = req.fulfilled_storage_hit_len(prefix_len)
         reason = None
@@ -1165,7 +1149,6 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
-        self._account_swa_miss_in_extend(req)
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -1241,7 +1224,6 @@ class PrefillAdder:
         if not reserved:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
-        self._account_swa_miss_in_extend(req)
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,

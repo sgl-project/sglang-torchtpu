@@ -8606,23 +8606,6 @@ fn full_kv_hit_length_counts_the_split_fragment() {
 }
 
 #[test]
-fn best_match_length_reaches_a_host_only_leaf() {
-    let mut tc = core();
-    tc.set_hicache_enabled();
-    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
-    tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
-    let leaf = tc
-        .match_prefix(&match_params(&vec![1, 2, 3, 4]))
-        .best_match_node_id;
-    tc.commit_backup(leaf, Tensor::from_slice(&[102i64, 103]), HashMap::new())
-        .expect("live test node");
-    tc.demote(leaf).expect("backuped live test node");
-    let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
-    assert_eq!(result.full_kv_hit_length, 4);
-    assert_eq!(result.best_match_length, 4);
-}
-
-#[test]
 fn dec_evictable_size_updates_only_the_addressed_component() {
     let mut tc = core();
     tc.component_state_mut(FULL).evictable_size = 5;

@@ -954,18 +954,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Pre-seed every mode at 0 so per-tier ratio charts get a complete operand set
         for mode in ("input", "device_hit", "host_hit", "storage_hit"):
             self.prefill_effective_tokens_total.labels(**labels, mode=mode)
-        # Kept out of prefill_effective_tokens_total: its modes sum to the
-        # hit-rate denominator. Exported only by caches whose components are exactly
-        # full KV + SWA. Each request is counted once, at admission; full-KV misses
-        # are the input mode minus these.
-        self.prefill_swa_miss_tokens_total = Counter(
-            name="sglang:prefill_swa_miss_tokens_total",
-            documentation=(
-                "Prefix tokens whose full-attention KV was cached on device or "
-                "host but recomputed because their SWA window was missing."
-            ),
-            labelnames=list(labels.keys()),
-        )
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1386,11 +1374,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 self.prefill_effective_tokens_total.labels(
                     **self.labels, mode=mode
                 ).inc(delta)
-
-    def increment_swa_miss_tokens(self, tokens: int) -> None:
-        # Zeros are incremented too, so the series exists once a cache that counts
-        # SWA misses has run a prefill batch; ratio panels rely on that.
-        self.prefill_swa_miss_tokens_total.labels(**self.labels).inc(tokens)
 
     def increment_forward_execution_seconds(
         self,

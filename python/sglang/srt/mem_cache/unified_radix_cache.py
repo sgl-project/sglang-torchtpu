@@ -197,10 +197,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.is_swa_enabled = ComponentType.SWA in params.tree_components
         # Whether Mamba is enabled.
         self.is_mamba_enabled = ComponentType.MAMBA in params.tree_components
-        self.swa_is_only_match_validator = set(params.tree_components) == {
-            ComponentType.FULL,
-            ComponentType.SWA,
-        }
         # Whether the mamba extra (ping-pong) buffer is enabled.
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
@@ -3575,13 +3571,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_mamba(self) -> bool:
         return self.is_mamba_enabled
-
-    def swa_is_only_match_cut(self) -> bool:
-        # A re-prefill tail caps the match before the walk, so the recomputed
-        # window would be invisible to the walk's lengths.
-        return (
-            self.swa_is_only_match_validator and self.swa_reprefill_tail_tokens() == 0
-        )
 
     # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
 

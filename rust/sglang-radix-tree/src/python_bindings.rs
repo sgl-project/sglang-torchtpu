@@ -347,8 +347,6 @@ struct InspectionMatchResultInput {
     mamba_branching_seqlen: Option<usize>,
     #[pyo3(attribute)]
     full_kv_hit_length: usize,
-    #[pyo3(attribute)]
-    best_match_length: usize,
 }
 
 /// Map a python CacheTransferPhase value onto the Rust enum.
@@ -666,7 +664,6 @@ pub struct MatchResultBinding {
     mamba_host_hit_length: usize,
     mamba_branching_seqlen: Option<usize>,
     full_kv_hit_length: usize,
-    best_match_length: usize,
     cache_actions: Py<PyList>,
 }
 
@@ -684,7 +681,6 @@ impl MatchResultBinding {
             mamba_host_hit_length: result.mamba_host_hit_length,
             mamba_branching_seqlen: result.mamba_branching_seqlen,
             full_kv_hit_length: result.full_kv_hit_length,
-            best_match_length: result.best_match_length,
             cache_actions: cache_actions_to_py(py, result.cache_actions)?,
         })
     }
@@ -2635,7 +2631,6 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             mamba_host_hit_length,
             mamba_branching_seqlen,
             full_kv_hit_length,
-            best_match_length,
         } = result;
         let result = MatchResult {
             device_indices: device_indices.0,
@@ -2648,7 +2643,6 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             mamba_host_hit_length,
             mamba_branching_seqlen,
             full_kv_hit_length,
-            best_match_length,
             cache_actions: Vec::new(),
         };
         let value_chunks = value_chunks

@@ -475,32 +475,6 @@ class TestIdleMetrics(CustomTestCase):
         self.assertEqual(self.published_occupancies, [])
 
 
-class TestSwaPrefixMetrics(CustomTestCase):
-    def test_zero_count_still_exports_the_series(self):
-        """Dashboard ratios mask replicas by series presence and pool clusters by
-        weight, so a zero batch must still create the SWA-miss series."""
-        registry = prometheus_client.CollectorRegistry()
-        labels = {"model_name": "test", "priority": "", "moe_ep_rank": 0}
-        sample_labels = {key: str(value) for key, value in labels.items()}
-        with patch.multiple(
-            prometheus_client,
-            **{
-                kind: partial(getattr(prometheus_client, kind), registry=registry)
-                for kind in ("Counter", "Gauge", "Histogram", "Summary")
-            },
-        ):
-            collector = SchedulerMetricsCollector(
-                labels=labels, server_args=_publish_server_args(self)
-            )
-        collector.increment_swa_miss_tokens(0)
-        self.assertEqual(
-            registry.get_sample_value(
-                "sglang:prefill_swa_miss_tokens_total", sample_labels
-            ),
-            0,
-        )
-
-
 class TestSchedulerTimeAccounting(CustomTestCase):
     def setUp(self):
         enter_scope(
