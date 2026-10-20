@@ -342,8 +342,11 @@ class CompiledFunction:
     def precompile(
         self, *args: Any, async_compile: bool = False, **kwargs: Any
     ) -> PendingCall:
-        """Compile without executing the helper or retaining example inputs."""
-        if async_compile:
+        """Compile without executing; shared input binding completes at queue join."""
+        queue = current_warmup_queue() if self._spmd_safe else None
+        shared = queue is not None and queue.spmd_compiler is not None
+        # Shared compilation validates real input layouts on every rank.
+        if async_compile and not shared:
             tensors = [
                 value
                 for value in tree_util.tree_leaves((args, kwargs))

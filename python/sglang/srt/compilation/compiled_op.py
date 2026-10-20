@@ -95,10 +95,11 @@ def compiled_op(
     A ``warmup`` factory registers the helper for the speculative-op grid.
     Model-specific owners can instead
     call ``warmup_compiled_op(op, ...)`` with their own representative inputs.
-    Direct helper warmups compile without executing; the queue joins compilation
-    futures without retaining example inputs. Dynamo warmups still execute to
-    trigger tracing and compilation, preserving the generator when ``uses_rng``
-    is set. Warmup is a no-op when compilation is disabled or off TPU.
+    Direct helper warmups compile without executing. Ordinary precompile releases
+    example inputs after submission; shared compilation retains them until the
+    queue binds distributed executables. Dynamo warmup executes to trigger
+    compilation, preserving the generator when ``uses_rng`` is set. Warmup is a
+    no-op when compilation is disabled or off TPU.
 
     ``spmd_safe=True`` lets asynchronous warmup use the queue's shared compiler
     under ``--use-spmd-compile``. Every rank must warm the same specializations
