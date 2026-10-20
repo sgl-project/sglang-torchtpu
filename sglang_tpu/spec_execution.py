@@ -223,9 +223,10 @@ def _plugin_unsupported_reason(
     """What the plugin worker would reject, read from arguments and model configs.
 
     Mirrors the construction checks of ``TpuSpecWorker``, ``TpuChainSpecWorker``,
-    ``TpuBlockSpecWorker`` and their drafters. Speculative fields still unset here
-    are resolved later to values the plugin worker accepts. A model config that
-    cannot be read raises here, as loading it would.
+    ``TpuBlockSpecWorker`` and their drafters, and adds DP attention, which no
+    plugin worker serves yet. Speculative fields still unset here are resolved
+    later to values the plugin worker accepts. A model config that cannot be read
+    raises here, as loading it would.
     """
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.speculative.ragged_verify import (
@@ -241,9 +242,10 @@ def _plugin_unsupported_reason(
     ):
         return "only supports SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed"
     if cfg.attn_dp_size > 1:
-        reason = _dp_attention_unsupported_reason(cfg, algorithm=algorithm)
-        if reason is not None:
-            return reason
+        # The block workers refuse it at construction. The chain worker accepts it,
+        # but its verify forward pads tokens to an attention-TP-aligned bucket that
+        # the DP-synced token counts do not cover, so verify fails on its first step.
+        return "does not support DP attention"
     if algorithm.is_dflash_family():
         if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
             return "only supports SGLANG_RAGGED_VERIFY_MODE=static"
@@ -408,34 +410,6 @@ def _dspark_draft_unsupported_reason(server_args: ServerArgs) -> str | None:
         )
     except ValueError as e:
         return f"cannot serve this draft ({e})"
-    return None
-
-
-def _dp_attention_unsupported_reason(
-    cfg, *, algorithm: SpeculativeAlgorithm
-) -> str | None:
-    from sglang.srt.speculative.spec_tp_sync import (
-        SpecTpSyncSite,
-        parse_spec_tp_sync,
-    )
-
-    if algorithm.is_dflash_family():
-        return "does not support DP attention"
-    if (
-        envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
-        or cfg.speculative_skip_dp_mlp_sync
-    ):
-        return "does not mix prefill and decode steps across DP ranks"
-    # SpecTpSync syncs nothing on a one-rank attention-TP group.
-    if cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size > 1:
-        sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
-        if (SpecTpSyncSite.SPEC_ACCEPT_GREEDY in sites) != (
-            SpecTpSyncSite.SPEC_ACCEPT_SAMPLE in sites
-        ):
-            return (
-                "needs SGLANG_SPEC_TP_SYNC to enable both or neither spec-accept "
-                "site under DP attention"
-            )
     return None
 
 

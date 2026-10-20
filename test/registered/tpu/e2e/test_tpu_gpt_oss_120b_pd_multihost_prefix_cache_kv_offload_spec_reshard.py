@@ -143,6 +143,10 @@ EXTRA_LAUNCH_ENV: Dict[str, str] = {
     # decode rank is fed by more than one prefill rank, and raises rather than
     # falling back when it cannot -- so there is no silent symmetric path.
     "SGLANG_RAIDEN_RESHARD": "1",
+    # The plugin spec worker does not serve the decode's DP attention, and a P/D
+    # pair must serve EAGLE3 with one worker, so both pin the compatibility one.
+    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "0",
+    "SGLANG_TPU_HOST_PADDING_NO_D2H": "0",
 }
 
 # launch_server.sh turns DP_SIZE>1 into --dp-size + --enable-dp-attention (plus

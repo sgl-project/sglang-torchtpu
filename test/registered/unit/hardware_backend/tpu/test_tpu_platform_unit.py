@@ -508,7 +508,10 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             for algo in ("EAGLE3", "DFLASH", "DSPARK")
         ]
         cases += [
-            ("DFLASH", dp, {}, {}, "does not support DP attention"),
+            (algo, dp, {}, {}, "does not support DP attention")
+            for algo in ("EAGLE3", "DFLASH", "DSPARK")
+        ]
+        cases += [
             (
                 "DFLASH",
                 {},
@@ -578,27 +581,6 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 {},
                 dict(dspark_draft="cannot serve this draft (no markov head)"),
                 "cannot serve this draft",
-            ),
-            (
-                "EAGLE3",
-                dict(dp, speculative_skip_dp_mlp_sync=True),
-                {},
-                {},
-                "prefill and decode",
-            ),
-            (
-                "EAGLE3",
-                dp,
-                {"SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION": "1"},
-                {},
-                "prefill and decode",
-            ),
-            (
-                "EAGLE3",
-                dp,
-                {"SGLANG_SPEC_TP_SYNC": "spec-accept-sample"},
-                {},
-                "SGLANG_SPEC_TP_SYNC",
             ),
         ]
         return cases
@@ -686,14 +668,9 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         return [
             (dict(disable_overlap_schedule=True), {}, "requires overlap scheduling"),
             (
-                dict(
-                    attn_dp_size=2,
-                    tp_size=4,
-                    enable_dp_lm_head=True,
-                    speculative_skip_dp_mlp_sync=True,
-                ),
+                dict(attn_dp_size=2, tp_size=4, enable_dp_lm_head=True),
                 {},
-                "prefill and decode",
+                "does not support DP attention",
             ),
             ({}, {"SGLANG_RAGGED_VERIFY_MODE": "compact"}, "RAGGED_VERIFY_MODE"),
             (dict(speculative_draft_window_size=64), {}, "draft-window-size"),
@@ -745,9 +722,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                     self.assertTrue(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
                     self.assertFalse(flag.is_set())
                     self.assertFalse(self._resolved(args, "enable_torch_compile"))
-            # The chain worker serves attention DP and either PD role.
+            # The chain worker serves either PD role.
             for overrides in (
-                dict(attn_dp_size=2, tp_size=4, enable_dp_lm_head=True),
                 dict(disaggregation_mode="prefill"),
                 dict(disaggregation_mode="decode"),
             ):

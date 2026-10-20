@@ -65,13 +65,13 @@ argument resolution enables torch compilation for them.
 Argument resolution also checks, before any model loads, what the plugin workers
 reject:
 - every route: disabled overlap, a non-fixed simulated-acceptance token mode,
-  mixed-phase attention-DP settings, and an `SGLANG_SPEC_TP_SYNC` that enables
-  only one spec-accept site under attention DP;
+  and attention DP, which no plugin worker serves yet (the chain worker's
+  bucket-aligned verify rows exceed the DP-synced token counts);
 - EAGLE3 and native MTP: non-static ragged verify, a draft window, top-k other
   than 1, and draft-token counts other than steps + 1; EAGLE3 also adaptive or
   multi-layer drafting, drafts other than `LlamaForCausalLMEagle3` and M-RoPE
   drafts; native MTP also drafts the MTP drafter does not load;
-- DFlash and DSpark: attention DP and non-static ragged verify; DFlash also
+- DFlash and DSpark: non-static ragged verify; DFlash also
   LiLiCorr or Domino drafts, a `mask_embedding.pt` beside the draft, and a
   missing or out-of-vocabulary `dflash_config.mask_token_id`; DSpark a draft its
   runtime config rejects.
