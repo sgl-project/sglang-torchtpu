@@ -39,7 +39,9 @@ The tables below are the short view. The sections that follow give per-row topol
 | Qwen3-Coder-30B-A3B | FP8 | 1 host | Experimental |
 | Kimi-K3, Kimi-K2.5 | bf16, INT4 | 1 host | Experimental |
 | DeepSeek-V4 | FP8 | — | Experimental |
-| GLM-5.2 / 5.3, Qwen 3.8 | FP8, bf16 | — | Experimental |
+| GLM-5.2 / GLM-5.3 | FP8 | — | Experimental |
+| GLM-5.3-Flash | FP8 | 1 host | Experimental |
+| Qwen3.8-27B | bf16 | 1 host | Experimental |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
 
 ### Features
@@ -97,8 +99,9 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a dummy-weight compile smoke runs; no real checkpoint served in CI. |
 | Kimi-K2.5 | INT4 | shares the K2.6 path | **Experimental** | MoonViT vision tower compiled per image. No K2.5-specific test. |
 | DeepSeek-V4 | FP8 | — | **Experimental** | Compressor, indexer, sparse attention, SparseCore top-k landed. No on-device test. FP4 indexer and online compression rejected. |
-| GLM-5.2 / 5.3 | FP8 | — | **Experimental** | Recipe and DSA sparse-MLA kernels. No registered test. |
-| Qwen 3.8 (27B) | bf16 | — | **Experimental** | Text serving code only. |
+| GLM-5.2 / GLM-5.3 | FP8 | — | **Experimental** | Recipe and DSA sparse-MLA kernels. No registered test. |
+| GLM-5.3-Flash | FP8 | 1 host tp8 | **Experimental** | DeepSeek Sparse Attention. Serving, MTP, and decode-megakernel recipes. No registered test. |
+| Qwen3.8-27B | bf16 | 1 host tp8 | **Experimental** | Dense hybrid GDN, vision on. Nightly AIME26, GPQA, MMMU-Pro; MTP and DFlash recompile e2e. |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; multi-host collectives | **Experimental** | Runs through the generic diffusion engine; external nightly only, no recent green. |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
 
