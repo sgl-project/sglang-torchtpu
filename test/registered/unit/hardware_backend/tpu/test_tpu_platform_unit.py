@@ -1163,6 +1163,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
 
     _args = TestTpuPlatformServerDefaults._args
     _apply = TestTpuPlatformServerDefaults._apply
+    _eagle3_draft = staticmethod(TestTpuPlatformServerDefaults._eagle3_draft)
     _resolved = TestTpuPlatformServerDefaults._resolved
 
     def _apply_cp(self, architectures=("Qwen3MoeForCausalLM",), **overrides):
@@ -1278,6 +1279,7 @@ class TestDsaValidation(CustomTestCase):
 
     _args = TestTpuPlatformServerDefaults._args
     _apply = TestTpuPlatformServerDefaults._apply
+    _eagle3_draft = staticmethod(TestTpuPlatformServerDefaults._eagle3_draft)
 
     def _apply_dsa(
         self, *, attention_backend, tpu_compile_tracer="dynamo", **config_fields
