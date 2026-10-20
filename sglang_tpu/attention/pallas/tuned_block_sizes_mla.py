@@ -64,7 +64,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # ===== DeepSeek-V3 (kv_lora_rank=512, qk_rope_head_dim=64) =====
         # Deploy: --tp-size 64 --dp-size 8 --page-size 128
         # → attention_tp = 8 → per-shard num_q_heads = 128/8 = 16.
-        # Tuned 2026-06-05 on chavoshi-us-east5-b-2 v6e-64 via
+        # Tuned 2026-06-05 on a v6e-64 slice via
         # benchmark/kernels/mla/get_block_spec_config_mla.py (kv_len=4096).
         ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 1): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 8): (16, 1, 2),
@@ -87,7 +87,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
     },
     "TPU v7": {
         # ===== Ling-2.6-1T (kv_lora_rank=512, qk_rope_head_dim=64) =====
-        # Production deploy: --tp-size 32 --dp-size 4 --page-size 256
+        # Deploy: --tp-size 32 --dp-size 4 --page-size 256
         # → attention_tp = tp/dp = 8 → per-shard num_q_heads = 64/8 = 8.
         # Server-jit per-shard mnt buckets (= global / dp_size=4):
         #   decode bs_buckets = [64,128,256,512] → per-shard mnt {16,32,64,128}
@@ -97,12 +97,12 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         #   prefill chunk per-shard mnt = 2048/4 = 512 (mixed case)
         #   decode per-shard mnt depends on running req count (∈ above)
         #
-        # Tuned 2026-05-29 on falcon exp-vj0fm1psbw (single v7x host, 8 cores)
+        # Tuned 2026-05-29 on a single v7x host (8 cores)
         # against hardcoded heuristic decode=(3,1,4) / mixed=(1,16).
         # Tuner uses scope-name-matched extraction of pallas_call
         # device_duration_ps (matches the kernel's `MLA-bd-...` /
         # `MLA-m-...` named_scope) → pure kernel device time.
-        # Cross-validated: production profiling shows decode dp=4 tp=8 with
+        # Cross-validated: a serving profile of decode dp=4 tp=8 with
         # 128-concurrency (per-DP 32) ≈ 350us; tuner heur (3,1,4) at
         # mnt=32 measured 347us — match.
         #
@@ -113,7 +113,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         #   decode mnt=128: +20.0%  (1.104ms vs 1.380ms)
         #   mixed mnt=512:  +85.6%  (0.266ms vs 1.841ms)
         #   mixed mnt=1024: +86.2%  (0.546ms vs 3.966ms)
-        #   mixed mnt=2048: +87.2%  (1.162ms vs 9.065ms)  ← user prefill chunk
+        #   mixed mnt=2048: +87.2%  (1.162ms vs 9.065ms)  ← chunked-prefill size
         #   mixed mnt=4096: +88.4%  (2.616ms vs 22.638ms)
         #
         # See benchmark/kernels/mla/get_block_spec_config_mla.py.
@@ -170,7 +170,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 2048): (16, 128),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 4096): (16, 128),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 8192): (16, 128),
-        # fp8 KV rows, tuned with profiles/kimi-k26/opt/tune_mla_fp8.py on one v7x core.
+        # fp8 KV rows, tuned on one v7x core.
         # Kimi-K2.6 tp=16 (4 heads, page 128)
         ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 16): (8, 1, 8),
         ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 64): (8, 1, 4),

@@ -474,6 +474,12 @@ class RpaConfigs:
             )
         if distribution.shape != (3,):
             raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+        if self.bkv_p_cache and self.block.bkv_sz % self.serve.page_size:
+            # Block k's cached pages start at k * cdiv(bkv_sz, page_size).
+            raise ValueError(
+                f"Expected {self.block.bkv_sz=} to be a multiple of"
+                f" {self.serve.page_size=} when the kernel reads cached pages."
+            )
 
         if (
             self.serve.cache_only

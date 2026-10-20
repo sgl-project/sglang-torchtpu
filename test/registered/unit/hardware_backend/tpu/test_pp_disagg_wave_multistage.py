@@ -159,6 +159,7 @@ def stage(fabric, rank, mode, schedule):
     scheduler.disaggregation_mode = mode
     scheduler.waiting_queue = []
     scheduler.disagg_prefill_inflight_queue = []
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=Mock())
     scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
     scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
     scheduler.device_module = Mock()

@@ -1543,6 +1543,9 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
 class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
     def test_prepare_for_prebuilt_padding(self):
         class MockScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+            def metadata_device(self):
+                return self.device
+
             def __init__(self):
                 self.device = torch.device("cpu")
                 self.forward_mode = None
@@ -1607,6 +1610,8 @@ class TestTpuPagedTokenToKVPoolAllocatorCpuAssertion(CustomTestCase):
             need_sort=False,
         )
         allocator.clear()
+        # Hand out pages 1 and 2, which the frees below release.
+        allocator.alloc(2 * 16)
 
         # Freeing CPU tensor should succeed
         cpu_index = torch.tensor([16, 17, 18], dtype=torch.int32, device="cpu")
@@ -1631,6 +1636,8 @@ class TestTpuPagedTokenToKVPoolAllocatorCpuAssertion(CustomTestCase):
             need_sort=False,
         )
         allocator.clear()
+        # Hand out page 1, which the free below releases.
+        allocator.alloc(16)
 
         class FakeDeviceTensor:
             device = SimpleNamespace(type="cuda")

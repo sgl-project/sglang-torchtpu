@@ -253,6 +253,28 @@ def _select_fused_rs_block_sizes(
             fp8_direct_write=fp8_direct_write,
         )
     )
+    # --- Step 4b: bound the W1/W2 VMEM buffers by their real element width ---
+    # calculate_tiling sizes the RHS tiles for the quantized width. Unquantized
+    # (bf16) experts at a large hidden size can otherwise get W1/W2 buffers that
+    # exceed VMEM. Halve tile_n (then tile_k) until each buffer set fits 16 MiB;
+    # quantized tiles already fit.
+    if not is_quantized:
+        w_bytes = jax.dtypes.itemsize_bits(w1_dtype) // 8
+        budget = 16 * 1024 * 1024
+        n1_cols = lambda: tile_n1 * 2 if act_fn else tile_n1
+        while (
+            num_w1_bufs * tile_k1 * n1_cols() * w_bytes > budget and tile_n1 > num_lanes
+        ):
+            tile_n1 //= 2
+        while (
+            num_w1_bufs * tile_k1 * n1_cols() * w_bytes > budget
+            and tile_k1 > 2 * num_lanes
+        ):
+            tile_k1 //= 2
+        while (
+            num_w2_bufs * tile_k2 * tile_n2 * w_bytes > budget and tile_n2 > num_lanes
+        ):
+            tile_n2 //= 2
     # --- Step 5: Alignment post-processing ---
     k_align1 = num_lanes
     if tile_k1 % k_align1 != 0:
@@ -321,6 +343,91 @@ def _select_fused_rs_block_sizes(
 # =============================================================================
 # Phase 2: kernel_main_fused_rs — Core Kernel (Direct-Write ICI)
 # =============================================================================
+
+
+def _scale_hbm_tile(scale_ref, expert_id, k_blocks, n_cols):
+    """One expert's [k_blocks, n_cols] scale tile in either HBM scale layout.
+
+    Scales are [E, K_blocks, N] (compact) or [E, K_blocks, 1, N]. The compact
+    layout matches the parameter's stored HBM layout, so XLA does not insert a
+    relayout copy of the whole scale tensor before every kernel call.
+    """
+    if len(scale_ref.shape) == 3:
+        return scale_ref.at[expert_id, k_blocks, n_cols]
+    return scale_ref.at[expert_id, k_blocks, :, n_cols]
+
+
+def _scale_vmem_cols(scale_buf_ref, buf_id, n_cols):
+    if len(scale_buf_ref.shape) == 3:
+        return scale_buf_ref.at[buf_id, :, n_cols]
+    return scale_buf_ref.at[buf_id, :, :, n_cols]
+
+
+def _scale_vmem_tile_cols(scale_tile_ref, n_cols):
+    if scale_tile_ref is None:
+        return None
+    if len(scale_tile_ref.shape) == 2:
+        return scale_tile_ref.at[:, n_cols]
+    return scale_tile_ref.at[:, :, n_cols]
+
+
+def _precompute_fused_rs_metadata(
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    group_start: jax.Array,
+    lhs_indices: jax.Array,
+    *,
+    size_group: int,
+    tile_m: int,
+    sublane: int,
+    chunk_size: int,
+    num_slots: int,
+) -> jax.Array:
+    """Vectorized version of the kernel's scalar routing prologue and gm tiling.
+
+    Returns (local_start, local_end, total_recv, local_num_gm,
+    gm_id_to_group_id[S], gm_id_to_m_offset[S + 1]) with fill_local_metadata's
+    tiling: a group's first tile starts at its first row, later tiles at
+    sublane-aligned multiples of tile_m; gm_id_to_m_offset[num_gm] = local_end.
+    """
+    go = group_offset[0]
+    local_start = group_start[0]
+    sizes = lax.dynamic_slice_in_dim(group_sizes, go, size_group).astype(jnp.int32)
+    starts = local_start + jnp.cumsum(sizes) - sizes
+    local_end = local_start + jnp.sum(sizes)
+    tiles = jnp.where(sizes > 0, (sizes + starts % sublane + tile_m - 1) // tile_m, 0)
+    tiles_end = jnp.cumsum(tiles)
+    num_gm = tiles_end[-1]
+    gm = jnp.arange(num_slots, dtype=jnp.int32)
+    # Gather-free: searchsorted and indexed gathers lower to serial gather loops
+    # on TPU; compare-reduce over the small [S, E] grid fuses.
+    group = jnp.minimum(
+        jnp.sum((tiles_end[None, :] <= gm[:, None]).astype(jnp.int32), axis=1),
+        size_group - 1,
+    )
+    onehot = group[:, None] == jnp.arange(size_group, dtype=jnp.int32)[None, :]
+
+    def _select(values):
+        return jnp.sum(jnp.where(onehot, values[None, :], 0), axis=1)
+
+    tile_in_group = gm - (_select(tiles_end) - _select(tiles))
+    first = _select(starts)
+    m_offset = jnp.where(
+        tile_in_group == 0, first, first - first % sublane + tile_in_group * tile_m
+    )
+    valid = gm < num_gm
+    gm_group = jnp.where(valid, group, 0)
+    gm_m_offset = jnp.concatenate(
+        [jnp.where(valid, m_offset, local_end), local_end[None]]
+    )
+    rows = jnp.arange(lhs_indices.shape[0], dtype=jnp.int32)
+    my_id = go // size_group
+    is_local = jnp.logical_and(rows >= local_start, rows < local_end)
+    total_recv = jnp.sum(
+        jnp.logical_and(lhs_indices // chunk_size == my_id, jnp.logical_not(is_local))
+    )
+    head = jnp.stack([local_start, local_end, total_recv, num_gm]).astype(jnp.int32)
+    return jnp.concatenate([head, gm_group, gm_m_offset]).astype(jnp.int32)
 
 
 def kernel_main_fused_rs(
@@ -403,6 +510,7 @@ def kernel_main_fused_rs(
     top_k: int,
     pack_indices: bool = True,
     fp8_direct_write: bool = False,
+    defer_writes: bool = False,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -423,6 +531,10 @@ def kernel_main_fused_rs(
 
     # Derive the receive count directly from the same scalar-prefetched routing refs
     # used by metadata construction and direct writes.
+    # group_start_ref is either (local_start,) or the metadata precomputed by
+    # _precompute_fused_rs_metadata: (local_start, local_end, total_recv,
+    # local_num_gm, gm_id_to_group_id[S], gm_id_to_m_offset[S + 1]).
+    precomputed_meta = group_start_ref.shape[0] > 1
     with jax.named_scope("routing_scalar_prologue"):
         group_offset = group_offset_ref[0]
         local_start = group_start_ref[0]
@@ -430,12 +542,15 @@ def kernel_main_fused_rs(
         def _sum_local_group_size(local_group_id, count):
             return count + lhs_group_sizes_ref[group_offset + local_group_id]
 
-        local_end = local_start + lax.fori_loop(
-            0,
-            dims.size_group,
-            _sum_local_group_size,
-            jnp.int32(0),
-        )
+        if precomputed_meta:
+            local_end = group_start_ref[1]
+        else:
+            local_end = local_start + lax.fori_loop(
+                0,
+                dims.size_group,
+                _sum_local_group_size,
+                jnp.int32(0),
+            )
 
         def _count_remote_receive(assignment_row, count):
             gathered_index = lhs_indices_ref[assignment_row]
@@ -450,12 +565,15 @@ def kernel_main_fused_rs(
             )
             return count + is_remote_receive.astype(jnp.int32)
 
-        total_recv = lax.fori_loop(
-            0,
-            dims.size_m,
-            _count_remote_receive,
-            jnp.int32(0),
-        )
+        if precomputed_meta:
+            total_recv = group_start_ref[2]
+        else:
+            total_recv = lax.fori_loop(
+                0,
+                dims.size_m,
+                _count_remote_receive,
+                jnp.int32(0),
+            )
 
     @jax.named_scope("sync_barrier_signal")
     def sync_barrier_signal():
@@ -514,6 +632,20 @@ def kernel_main_fused_rs(
         zero_init=False,
     )
 
+    @jax.named_scope("copy_local_metadata")
+    def copy_local_metadata():
+        num_slots = metadata_ref.gm_id_to_group_id.shape[0]
+        num_gm = group_start_ref[3]
+
+        def _copy(gm, carry):
+            metadata_ref.gm_id_to_group_id[gm] = group_start_ref[4 + gm]
+            metadata_ref.gm_id_to_m_offset[gm] = group_start_ref[4 + num_slots + gm]
+            return carry
+
+        lax.fori_loop(0, num_gm, _copy, jnp.int32(0))
+        metadata_ref.gm_id_to_m_offset[num_gm] = group_start_ref[4 + num_slots + num_gm]
+        return num_gm
+
     @jax.named_scope("fill_local_metadata")
     def fill_local_metadata():
         group_offset = group_offset_ref[0]
@@ -564,7 +696,10 @@ def kernel_main_fused_rs(
         )
         return num_gm
 
-    local_num_gm = fill_local_metadata()
+    if precomputed_meta:
+        local_num_gm = copy_local_metadata()
+    else:
+        local_num_gm = fill_local_metadata()
 
     # (out_buf was zero-initialized and awaited above, before the entry-barrier
     # signal, so incoming ICI writes can never race the zeroing.)
@@ -633,33 +768,37 @@ def kernel_main_fused_rs(
                 _gate_offset_s = n_id * tile_n1
                 _up_offset_s = out_n1 + n_id * tile_n1
                 pltpu.make_async_copy(
-                    src_ref=w1_scale_ref.at[
+                    src_ref=_scale_hbm_tile(
+                        w1_scale_ref,
                         expert_id,
                         pl.ds(k_id * nqb1, nqb1),
-                        :,
                         pl.ds(_gate_offset_s, tile_n1),
-                    ],
-                    dst_ref=w1_scale_buf_ref.at[buf_id, :, :, :tile_n1],
+                    ),
+                    dst_ref=_scale_vmem_cols(
+                        w1_scale_buf_ref, buf_id, slice(None, tile_n1)
+                    ),
                     sem=w1_sem_ref.at[buf_id],
                 ).start()
                 pltpu.make_async_copy(
-                    src_ref=w1_scale_ref.at[
+                    src_ref=_scale_hbm_tile(
+                        w1_scale_ref,
                         expert_id,
                         pl.ds(k_id * nqb1, nqb1),
-                        :,
                         pl.ds(_up_offset_s, tile_n1),
-                    ],
-                    dst_ref=w1_scale_buf_ref.at[buf_id, :, :, tile_n1:],
+                    ),
+                    dst_ref=_scale_vmem_cols(
+                        w1_scale_buf_ref, buf_id, slice(tile_n1, None)
+                    ),
                     sem=w1_sem_ref.at[buf_id],
                 ).start()
             else:
                 pltpu.make_async_copy(
-                    src_ref=w1_scale_ref.at[
+                    src_ref=_scale_hbm_tile(
+                        w1_scale_ref,
                         expert_id,
                         pl.ds(k_id * nqb1, nqb1),
-                        :,
                         pl.ds(n_id * w1_dma_n, w1_dma_n),
-                    ],
+                    ),
                     dst_ref=w1_scale_buf_ref.at[buf_id],
                     sem=w1_sem_ref.at[buf_id],
                 ).start()
@@ -681,12 +820,12 @@ def kernel_main_fused_rs(
         ).start()
         if has_scale:
             pltpu.make_async_copy(
-                src_ref=w2_scale_ref.at[
+                src_ref=_scale_hbm_tile(
+                    w2_scale_ref,
                     expert_id,
                     pl.ds(k_id * nqb2, nqb2),
-                    :,
                     pl.ds(n_id * tile_n2, tile_n2),
-                ],
+                ),
                 dst_ref=w2_scale_buf_ref.at[buf_id],
                 sem=w2_sem_ref.at[buf_id],
             ).start()
@@ -756,12 +895,12 @@ def kernel_main_fused_rs(
         if cfgs1.fuse_act is not None:
             w1_up = WeightsRef(
                 weight=w1_tile.at[:, tile_n1:],
-                scale=w1_sc.at[:, :, tile_n1:] if w1_sc is not None else None,
+                scale=_scale_vmem_tile_cols(w1_sc, slice(tile_n1, None)),
                 bias=w1_bias_tile.at[:, pl.ds(tile_n1, tile_n1)] if has_bias else None,
             )
             w1_gate = WeightsRef(
                 weight=w1_tile.at[:, :tile_n1],
-                scale=w1_sc.at[:, :, :tile_n1] if w1_sc is not None else None,
+                scale=_scale_vmem_tile_cols(w1_sc, slice(None, tile_n1)),
                 bias=w1_bias_tile.at[:, pl.ds(0, tile_n1)] if has_bias else None,
             )
             w1_weights = FusedWeightsRef(gate=w1_gate, up=w1_up)
@@ -846,12 +985,33 @@ def kernel_main_fused_rs(
     # (0.5 B/param); fp8 (1 B) / bf16 (2 B) weight buffers are 2-4x larger and, on
     # tight configs (e.g. EP8 E_32 M_256), leave less than the bucket transient of
     # VMEM free -> scoped-VMEM OOM. All measured bucketing gains are on fp4 (the
-    # prod decode dtype) anyway, so only bucket when the weights are fp4.
+    # usual decode dtype) anyway, so only bucket when the weights are fp4.
     _w_qdt = cfgs1.rhs_cfgs.quant_dtype
     _weight_is_fp4 = _w_qdt is not None and jax.dtypes.itemsize_bits(_w_qdt) <= 4
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
 
     # --- Main padded gm loop ---
+    @jax.named_scope("wait_staging_slot_writes")
+    def wait_staging_slot_writes(slot):
+        """Wait for and clear the row writes still reading staging ``slot``."""
+        pending_local = gm_id_ref[4 + slot]
+        pending_send = gm_id_ref[1 + slot]
+
+        @pl.when(pending_local > 0)
+        def _():
+            pl.semaphore_wait(local_write_sems_ref.at[slot], pending_local)
+            if fp8_direct_write:
+                pl.semaphore_wait(scale_local_write_sems_ref.at[slot], pending_local)
+
+        @pl.when(pending_send > 0)
+        def _():
+            pl.semaphore_wait(send_sems_ref.at[slot], pending_send)
+            if fp8_direct_write:
+                pl.semaphore_wait(scale_send_sems_ref.at[slot], pending_send)
+
+        gm_id_ref[1 + slot] = jnp.int32(0)
+        gm_id_ref[4 + slot] = jnp.int32(0)
+
     @jax.named_scope("gm_loop_body")
     def gm_loop_body(gm_id, _):
         is_active = gm_id < local_num_gm
@@ -1081,6 +1241,9 @@ def kernel_main_fused_rs(
             _sls = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
             _ml = m_st % _sls
 
+            if defer_writes:
+                wait_staging_slot_writes(stg_id)
+
             with jax.named_scope("reshape_gmm2_output"):
                 scatter_staging_3x_ref[stg_id] = tiled_out_2x_ref[sem_id][...].reshape(
                     tile_m,
@@ -1234,7 +1397,7 @@ def kernel_main_fused_rs(
                 gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + send_sz
                 gm_id_ref[4 + stg_id] = gm_id_ref[4 + stg_id] + local_sz
 
-                @pl.when(local_sz > 0)
+                @pl.when(jnp.logical_and(local_sz > 0, not defer_writes))
                 def _():
                     pl.semaphore_wait(local_write_sems_ref.at[stg_id], local_sz)
                     if fp8_direct_write:
@@ -1242,7 +1405,7 @@ def kernel_main_fused_rs(
                             scale_local_write_sems_ref.at[stg_id], local_sz
                         )
 
-                @pl.when(send_sz > 0)
+                @pl.when(jnp.logical_and(send_sz > 0, not defer_writes))
                 def _():
                     pl.semaphore_wait(send_sems_ref.at[stg_id], send_sz)
                     if fp8_direct_write:
@@ -1253,6 +1416,10 @@ def kernel_main_fused_rs(
         return _
 
     lax.fori_loop(0, max_num_gm, gm_loop_body, None)
+    if defer_writes:
+        # A kernel must not exit with DMAs or semaphores outstanding.
+        for _s in range(3):
+            wait_staging_slot_writes(_s)
 
     # Post-Scatter Cross-Rank Optical Barrier
     sync_barrier()
@@ -1336,6 +1503,7 @@ def kernel_main_fused_rs_fp8(
     ep_axis_name: str,
     top_k: int,
     pack_indices: bool = True,
+    defer_writes: bool = False,
 ):
     """FP8 direct-write wrapper with output refs ordered for pallas_call."""
     return kernel_main_fused_rs(
@@ -1406,6 +1574,7 @@ def kernel_main_fused_rs_fp8(
         top_k=top_k,
         pack_indices=pack_indices,
         fp8_direct_write=True,
+        defer_writes=defer_writes,
     )
 
 
@@ -1424,6 +1593,7 @@ def kernel_main_fused_rs_fp8(
         "top_k",
         "fp8_direct_write",
         "caller_tile_m",
+        "expert_tp",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1452,6 +1622,7 @@ def gmm_v2_fused_rs(
     caller_tile_m: int | None = None,
     top_k: int,
     fp8_direct_write: bool = False,
+    expert_tp: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -1469,12 +1640,28 @@ def gmm_v2_fused_rs(
         rhs1_quant_block_size = recover_quant_block_size(size_k1, w1_scale.shape[1])
         rhs2_quant_block_size = recover_quant_block_size(size_k2, w2_scale.shape[1])
         quant_block_size = rhs1_quant_block_size
-        w1_scale = w1_scale.astype(jnp.float32)
-        w2_scale = w2_scale.astype(jnp.float32)
+        # Scales stay in their stored dtype when it is bf16 or fp32: the matmul
+        # casts each tile slice, while a full-tensor cast here would re-copy
+        # every expert's scales on each call (group-16 scales are large).
+        scale_dtype = (
+            w1_scale.dtype
+            if w1_scale.dtype in (jnp.bfloat16, jnp.float32)
+            else jnp.dtype(jnp.float32)
+        )
+        w1_scale = w1_scale.astype(scale_dtype)
+        w2_scale = w2_scale.astype(scale_dtype)
+        if w1_scale.ndim != w2_scale.ndim or w1_scale.ndim not in (3, 4):
+            raise ValueError(
+                "fused-RS scales must both be [E, K_blocks, N] or "
+                f"[E, K_blocks, 1, N], got {w1_scale.shape} and {w2_scale.shape}"
+            )
+        scale_has_unit_dim = w1_scale.ndim == 4
     else:
         rhs1_quant_block_size = size_k1
         rhs2_quant_block_size = size_k2
         quant_block_size = None
+        scale_dtype = jnp.dtype(jnp.float32)
+        scale_has_unit_dim = True
     # Per-expert global_scale as scalar prefetch (SMEM): one scalar per expert,
     # indexed inside inner_kernel via metadata_ref.gm_id_to_group_id.
     if w1_global_scale is not None:
@@ -1582,7 +1769,9 @@ def gmm_v2_fused_rs(
         n1_pad = aligned_n1 - size_n1
         w1 = jnp.pad(w1, ((0, 0), (0, 0), (0, n1_pad)))
         if is_quantized:
-            w1_scale = jnp.pad(w1_scale, ((0, 0), (0, 0), (0, 0), (0, n1_pad)))
+            w1_scale = jnp.pad(
+                w1_scale, ((0, 0),) * (w1_scale.ndim - 1) + ((0, n1_pad),)
+            )
         new_k2 = aligned_n1 // 2
         if new_k2 != size_k2:
             w2 = jnp.pad(w2, ((0, 0), (0, new_k2 - size_k2), (0, 0)))
@@ -1604,7 +1793,7 @@ def gmm_v2_fused_rs(
                 [
                     w1_scale,
                     jnp.repeat(
-                        w1_scale[:, -1:, :, :],
+                        w1_scale[:, -1:],
                         total_scale_blocks1 - w1_scale.shape[1],
                         axis=1,
                     ),
@@ -1618,7 +1807,7 @@ def gmm_v2_fused_rs(
                 [
                     w2_scale,
                     jnp.repeat(
-                        w2_scale[:, -1:, :, :],
+                        w2_scale[:, -1:],
                         total_scale_blocks2 - w2_scale.shape[1],
                         axis=1,
                     ),
@@ -1813,25 +2002,25 @@ def gmm_v2_fused_rs(
             ),
             jnp.uint32 if is_quantized else w2.dtype,
         ),
-        # w1_scale_buf_ref
+        # w1_scale_buf_ref: [bufs, k_blocks, (1,) n] matching the HBM scale rank.
         pltpu.VMEM(
             (
                 num_w1_bufs,
                 (-(-tile_k1 // rhs1_quant_block_size) if is_quantized else 1),
-                1,
+                *((1,) if scale_has_unit_dim else ()),
                 tile_n1 * 2 if act_fn else tile_n1,
             ),
-            jnp.float32,
+            scale_dtype,
         ),
         # w2_scale_buf_ref
         pltpu.VMEM(
             (
                 num_w2_bufs,
                 (-(-tile_k2 // rhs2_quant_block_size) if is_quantized else 1),
-                1,
+                *((1,) if scale_has_unit_dim else ()),
                 tile_n2,
             ),
-            jnp.float32,
+            scale_dtype,
         ),
         # w1_bias_buf_ref
         pltpu.VMEM((1, tile_n1 * 2 if act_fn else tile_n1), jnp.float32),
@@ -1897,6 +2086,21 @@ def gmm_v2_fused_rs(
         primary_idx_ref = lhs_indices
         secondary_idx_ref = topk_indices
 
+    # Expert TP builds the routing metadata ahead of the kernel in XLA and
+    # leaves each tile's output writes in flight until its staging slot is reused.
+    if expert_tp:
+        group_start = _precompute_fused_rs_metadata(
+            group_sizes,
+            group_offset,
+            group_start,
+            lhs_indices,
+            size_group=size_group,
+            tile_m=tile_m,
+            sublane=size_lhs_sublane,
+            chunk_size=chunk_size,
+            num_slots=max_num_gm_static,
+        )
+
     pallas_inputs = (
         group_sizes,
         group_offset,
@@ -1939,6 +2143,7 @@ def gmm_v2_fused_rs(
         ep_axis_name=ep_axis_name,
         top_k=top_k,
         pack_indices=pack_indices,
+        defer_writes=expert_tp,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d

@@ -1,0 +1,91 @@
+name: TPU Security Checks
+
+# Secret scanning of new commits, and actionlint + zizmor over the fork's TPU
+# workflows. Runs without secrets, so it is safe on fork PRs.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tpu-security-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  ACTIONLINT_VERSION: 1.7.12
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  ZIZMOR_VERSION: 1.31.1
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history so the range below resolves for any PR, including ones
+      # that merge main. Cheaper variants were tried and dropped: a blobless
+      # clone cannot fetch blobs on demand once credentials are not persisted
+      # (gitleaks then scans nothing and still passes), and a shallow fetch of
+      # only the PR's commits stops early at merge commits.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "${tarball}" gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+
+      # Only the commits this event adds; the full history was reviewed once,
+      # and its known false positives are allowlisted in .gitleaks.toml.
+      - name: Scan new commits
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) range="${PR_BASE}..${PR_HEAD}" ;;
+            push)         range="${PUSH_BEFORE}..${GITHUB_SHA}" ;;
+            *)            range="HEAD~1..HEAD" ;;
+          esac
+          # A push that creates the ref reports an all-zero "before".
+          case "$range" in 0000000000000000000000000000000000000000..*) range="HEAD~1..HEAD" ;; esac
+          echo "Scanning ${range}"
+          gitleaks git --config .gitleaks.toml --redact --no-banner --verbose \
+            --log-opts="${range}" .
+
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint and zizmor
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "${tarball}" actionlint
+          sudo install actionlint /usr/local/bin/actionlint
+          python3 -m pip install --quiet "zizmor==${ZIZMOR_VERSION}"
+
+      - name: Lint TPU workflows
+        env:
+          # zizmor uses it for its online audits (e.g. known-vulnerable actions).
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/tpu/check_workflows.sh

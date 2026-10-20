@@ -10,7 +10,7 @@
 # Env (optional):
 #   TP_SIZE=16  EP_SIZE=16  PAGE_SIZE=64  MEM_FRACTION_STATIC=0.92
 #   PORT=30000  BOOTSTRAP_PORT=8998
-#   PYTHON=/cache/work/.venv/bin/python
+#   PYTHON=python3
 #   SGLANG_HOST_IP=<pod ip>          # default: auto from `hostname -i`
 #   # Multi-node TP (only if ONE engine spans multiple pods; default 1 pod/16 chips):
 #   NNODES=1  NODE_RANK=0  DIST_INIT_ADDR=<node0_ip>:<port>
@@ -26,7 +26,7 @@ PAGE_SIZE=${PAGE_SIZE:-64}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.92}
 PORT=${PORT:-30000}
 BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}
-PYTHON=${PYTHON:-/cache/work/.venv/bin/python}
+PYTHON=${PYTHON:-python3}
 HOST=0.0.0.0
 
 # Advertise this pod's cluster IP for the bootstrap server + KV ZMQ sockets;

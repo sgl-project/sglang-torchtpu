@@ -119,5 +119,42 @@ class TestTpu7xDecodeBlocks(CustomTestCase):
         self.assertEqual((blocks["bq_sz"], blocks["bkv_sz"]), (1, 8192))
 
 
+class TestTpu7xVerifyBlocks(CustomTestCase):
+    def test_verify_window_over_budget_shrinks_kv_instead_of_spinning(self):
+        """A decode-shaped verify window pins the query tile at its row count,
+        so an estimate still over budget must keep halving the KV tile; the
+        loop once retried the pinned query tile forever. GLM-5.3-Flash's MHA
+        full attention per TP8 rank (8 heads of 256) verifying 8 tokens."""
+        with mock.patch.object(rpa, "get_tpu_version", return_value=7):
+            blocks = rpa.get_default_block_sizes(
+                jnp.bfloat16,
+                jnp.bfloat16,
+                8,
+                8,
+                256,
+                128,
+                8,
+                1,
+                82,
+                case=rpa.RpaCase.DECODE,
+                vmem_limit_bytes=TPU7X_VMEM,
+                decode_query_size=8,
+            )
+        self.assertEqual(blocks["bq_sz"], 8)
+        est = rpa.get_vmem_estimate_bytes(
+            8,
+            1,
+            256,
+            8,
+            blocks["bkv_sz"],
+            jnp.bfloat16,
+            jnp.bfloat16,
+            bkv_csz=blocks["bkv_csz"],
+        )
+        self.assertTrue(
+            est <= int(TPU7X_VMEM * 0.15) or blocks["bkv_sz"] == 128, blocks
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

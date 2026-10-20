@@ -443,6 +443,13 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """TPU 3-tier KV cache and compressor state pool for DeepSeek-V4."""
 
     def __init__(self, *args, **kwargs):
+        if (
+            kwargs.get("start_layer") is None
+            and kwargs.get("end_layer") is None
+            and kwargs.get("layer_num") is not None
+        ):
+            kwargs["start_layer"] = 0
+            kwargs["end_layer"] = int(kwargs["layer_num"])
         super().__init__(*args, **kwargs)
         assert self.page_size == 256, (
             f"DSV4TPUTokenToKVPool requires page_size=256, got {self.page_size}"

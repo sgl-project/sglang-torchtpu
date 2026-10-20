@@ -12,7 +12,7 @@
 # queues the jobs), so GitHub-side ordering would only serialize what the
 # cluster already arbitrates -- and a red stage costs the others nothing.
 #
-# Dashboard publishing: scheduled runs are always ingested by keel. A dispatch
+# Dashboard publishing: scheduled runs are always ingested by the dashboard. A dispatch
 # run is ingested only when `update-dashboard` was set, which stamps `[publish]`
 # into the run name (the runs API does not expose dispatch inputs); the ingester
 # additionally requires head_branch == main, so a branch run can never write the

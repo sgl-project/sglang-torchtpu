@@ -641,6 +641,19 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         self.assertEqual(frees, [("run", True)])
 
+    def test_kv_full_retract_backs_up_draft_kv_pools(self):
+        """A KV-full retract must back up the speculative draft KV pools with the
+        target KV, or a resumed request drafts against another request's KV."""
+        scheduler = self._new_scheduler()
+        scheduler.retraction_draft_kv_pools = draft_pools = (object(),)
+
+        with patch.object(
+            ScheduleBatch, "retract_decode", return_value=([], 1.0, [])
+        ) as retract_decode:
+            self._retract_by_kv_full(scheduler, self._make_req("run"))
+
+        retract_decode.assert_called_once_with(draft_kv_pools=draft_pools)
+
     def test_retraction_refused_while_any_rank_tracks_an_offload_copy(self):
         """Retraction must be refused on every rank, before any KV is freed, while any
         rank still tracks a device-to-host offload copy after the drain."""

@@ -205,7 +205,7 @@ def main() -> None:
 
     physical_id = tpu_distributed.global_device_id()
     group_offset = torch.tensor(
-        [rank * local_experts, rank], dtype=torch.int32, device=device
+        [rank * local_experts], dtype=torch.int32, device=device
     )
     no_post_norm = torch.zeros(1, dtype=torch.bfloat16, device=device)
 

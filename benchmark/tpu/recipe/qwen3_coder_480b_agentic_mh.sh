@@ -17,7 +17,7 @@
 # HOST / PORT / ENABLE_PROFILER_ENDPOINT / ENABLE_COMPILE_CACHE come from the
 # JobSet template.
 #
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 
 exec env \

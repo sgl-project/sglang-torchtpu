@@ -49,11 +49,12 @@ launch/rank-0 run model, and the image are the same too. `tp = hosts × 8` (tpu7
 
 ## Add an `external-nightly-*` test
 
-1. **Stage the weights** once (you need `objectAdmin` on the bucket):
+1. **Stage the weights** once (you need `objectAdmin` on the bucket). Set
+   `TPU_WEIGHTS_BUCKET` to your deployment's bucket name before running:
 
    ```sh
    gcloud storage rsync -r ./Qwen3-Coder-30B-A3B-Instruct-FP8 \
-     gs://sglang-torchtpu-ci-artifacts/weights/Qwen3-Coder-30B-A3B-Instruct-FP8
+     "gs://${TPU_WEIGHTS_BUCKET}/weights/Qwen3-Coder-30B-A3B-Instruct-FP8"
    ```
 
 2. **Write the test** under `test/registered/tpu/...` like any in-project multi-host test —
@@ -111,7 +112,7 @@ python3 .github/tpu-ci/external/render_external_jobset.py --list-groups  # what 
 
 ## Configuration
 
-Non-sensitive structure lives in [`external-topology.yaml`](external-topology.yaml). Partner-internal
+Non-sensitive structure lives in [`external-topology.yaml`](external-topology.yaml). External-cluster
 identifiers are **repo secrets** (masked in logs, out of source) — set once:
 
 | Secret | Value |
@@ -132,3 +133,25 @@ Discover nodepools with
 `kubectl get nodes -L cloud.google.com/gke-nodepool,cloud.google.com/gke-tpu-topology`. To add
 a slice, append a secret name to that shape's `nodepool_vars`, set the secret, and add a line
 to `_external-tpu-test.yml`'s render-step env. A new shape also needs a `suites:` entry.
+
+## Public log boundary
+
+The workflow publishes pod output to Actions logs, log artifacts, and the
+configured live-log bucket. Use only release-approved models and public or
+synthetic datasets in these suites; do not use production requests or customer
+data. Log filtering is best effort and does not make arbitrary test output safe.
+
+Pod status output includes names and phases only. Event summaries omit free-form
+messages, and the workflow does not print full JobSet descriptions or node selectors.
+Pod logs pass through `sanitize_logs.py` **before** display and before writing the
+file uploaded as an Actions artifact or copied to GCS. The filter removes configured
+cluster/project/nodepool values, GKE node hostnames, and IPv4/IPv6 addresses while
+preserving benchmark metrics. GitHub's console masking alone does not sanitize
+uploaded files. Inspect detailed infrastructure diagnostics through authorized
+cluster access instead.
+
+This is a targeted infrastructure filter, not a general secret scanner: tests must
+still avoid printing credentials or other confidential content. These changes do
+not redact existing artifacts, GCS logs, commits, branch names, PRs, or reports.
+Review previously published material separately; use secret **names**, not values
+or partner-identifying details, in shareable reports.

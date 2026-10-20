@@ -1087,6 +1087,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         return self._embed_module
 
+    def prepare_draft_block_fused(
+        self,
+        *,
+        bonus_tokens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        candidates: torch.Tensor,
+        committed_lens: torch.Tensor,
+        block_pos_offsets: torch.Tensor,
+        bs: int,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Seam for a one-program draft-block prep that a compile policy installs.
+
+        Returns (block_ids, positions_2d, verify_out_cache_loc_2d, input_embeds),
+        or None to run the step-by-step path.
+        """
+        return None
+
     def embed_draft_block_ids(self, *, block_ids: torch.Tensor) -> torch.Tensor:
         """Embed drafted block ids [n, block_size] into [n * block_size, hidden].
 
@@ -2805,7 +2822,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         host_len_slack = block_size if draft_input.tpu_host_seq_lens_is_committed else 0
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
-        if self._use_triton_prepare_block:
+        fused_block = None
+        if verify_cache_candidates is not None:
+            fused_block = self.prepare_draft_block_fused(
+                bonus_tokens=draft_input.bonus_tokens.view(-1),
+                prefix_lens=prefix_lens.view(-1),
+                candidates=verify_cache_candidates,
+                committed_lens=draft_input.tpu_committed_lens,
+                block_pos_offsets=self._block_pos_offsets,
+                bs=bs,
+            )
+        if fused_block is not None:
+            block_ids, positions_2d, verify_out_cache_loc_2d, input_embeds = fused_block
+        elif self._use_triton_prepare_block:
             try:
                 _prepare_dflash_draft_block_unchecked(
                     bonus_tokens=draft_input.bonus_tokens.view(-1),
@@ -2859,14 +2888,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=device,
             )
 
-        if _is_tpu:
-            # Feed the bucket-padded buffer so the compiled artifact stays on a
-            # static shape, then trim the ghost rows back off.
-            input_embeds = self.embed_draft_block_ids(
-                block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
-            )[: bs * block_size]
-        else:
-            input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
+        if fused_block is None:
+            if _is_tpu:
+                # Feed the bucket-padded buffer so the compiled artifact stays on a
+                # static shape, then trim the ghost rows back off.
+                input_embeds = self.embed_draft_block_ids(
+                    block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
+                )[: bs * block_size]
+            else:
+                input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -3258,7 +3288,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits, dim=-1
                 ).view(bs, int(self.block_size))
             apply_dflash_simulated_acceptance(
-                candidates=candidates,
+                # The bucketed accept returns bucket-sized candidates; the accept
+                # outputs are already trimmed to the live batch.
+                candidates=candidates[:bs],
                 target_predict=target_predict,
                 accept_len=accept_len,
                 commit_lens=commit_lens,

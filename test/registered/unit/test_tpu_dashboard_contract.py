@@ -494,10 +494,10 @@ class TestNightlyConfigLabelLint(CustomTestCase):
     def test_perf_measures_through_recipe_and_bench_serving_only(self):
         # A recipe launch plus bench_serving.sh is what puts the server/bench
         # config panels on the dashboard; a hand-booted server or hand-rolled
-        # bench produces a chart nobody can reproduce from. Two launch forms
-        # qualify: MODEL_CONFIG's own `launch.recipe`, and the unified launcher,
-        # where a TPULauncherTestCase subclass serves a Python recipe module and
-        # the config carries gates only.
+        # bench produces a chart nobody can reproduce from. Three launch forms
+        # qualify: MODEL_CONFIG's own `launch.recipe` or `launch.config`, and
+        # the unified launcher, where a TPULauncherTestCase subclass serves a
+        # Python recipe module and the config carries gates only.
         for path, mod in self.perf:
             config = (
                 mod.build_model_config()
@@ -506,9 +506,11 @@ class TestNightlyConfigLabelLint(CustomTestCase):
             )
             launch = config.get("launch") or {}
             self.assertTrue(
-                launch.get("recipe") or self._fixture_config_module(mod),
+                launch.get("recipe")
+                or launch.get("config")
+                or self._fixture_config_module(mod),
                 f"{path.name}: perf must serve through a recipe -- launch.recipe, "
-                "or a TPULauncherTestCase subclass with config_module",
+                "launch.config, or a TPULauncherTestCase subclass with config_module",
             )
             self.assertFalse(launch.get("external"), path.name)
             for gate in config["gates"]:

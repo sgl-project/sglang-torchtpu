@@ -6,7 +6,7 @@
 # Prefill CP runs on the batched RPA backend (page size >= 256) and samples with the
 # pytorch backend. --moe-runner-backend pallas_tpu is the MoE runner this
 # checkpoint is validated with.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 exec env \
   MODEL="${MODEL:-Qwen/Qwen3-30B-A3B-FP8}" \

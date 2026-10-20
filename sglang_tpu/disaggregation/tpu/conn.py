@@ -115,7 +115,7 @@ def _kv_channels() -> int:
     """number of parallel PUSH streams the prefill shards layer frames over
     (default **2**). Each TP rank already pushes its own shard on its own
     socket, so the effective stream count is ``tp_size * channels`` — hence a
-    small default rather than torchtpu-vllm's per-rank ``tp_size``. Set
+    small default rather than vllm-torchtpu's per-rank ``tp_size``. Set
     ``SGLANG_TPU_KV_CHANNELS=1`` for the single-stream path."""
     try:
         return max(1, int(os.environ.get("SGLANG_TPU_KV_CHANNELS", "2")))
@@ -537,7 +537,7 @@ class TpuKVManager(TpuKVManagerBase):
 
     def _recv_layers(self, frames: list[zmq.Frame | bytes]) -> list[StageBuf | bytes]:
         """Background recv thread: turn the wire's per-layer frames into the
-        chunk's ``layer_blobs``, mirroring torchtpu-vllm's "unpack directly into
+        chunk's ``layer_blobs``, mirroring vllm-torchtpu's "unpack directly into
         the staging slot". On the TPU path each frame's bytes are copied **once**
         — straight from ZMQ's buffer into a pooled pinned+aligned ``StageBuf``
         ready for H2D — instead of the old wire -> ``bytes`` -> ``StageBuf`` two

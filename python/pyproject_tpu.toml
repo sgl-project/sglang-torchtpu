@@ -63,27 +63,25 @@ dependencies = [
   "transformers==5.8.1",
   "uvicorn",
   "uvloop",
+  "zstandard",
   "xgrammar==0.2.7",
   "smg-grpc-servicer>=0.5.0",
 
   # The pins below form one TPU stack and must be upgraded and validated
   # together:
-  # - torch-tpu and torch must be ABI compatible.
+  # - torch_tpu and torch must be ABI compatible.
   # - torch and torchvision must be ABI compatible.
-  # - torch-tpu and libtpu must be validated together.
+  # - torch_tpu and libtpu must be validated together.
   # - jax and jaxlib must be compatible with libtpu.
-  # - tpu-sync-torch's native extension links torch-tpu's per-torch-version
-  #   glue library, so it must be upgraded and validated with torch-tpu.
-  # torch-tpu wheels come from a private package server (see the
-  # [[tool.uv.index]] block below); installing them requires registry
-  # credentials (workload identity on CI, gcloud ADC on dev machines).
-  "torch-tpu==0.1.1+release.2026.9.22.20260927223741",
+  # - tpu-sync-torch's native extension links torch_tpu's per-torch-version
+  #   glue library, so it must be upgraded and validated with torch_tpu.
+  "torch_tpu==0.2.0",
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
-  # Published to PyPI as nightly .dev pre-releases (see [tool.uv.sources]).
+  # Published to PyPI as nightly .dev pre-releases.
   "tpu-sync-torch==0.0.1.dev20261013083150",
-  "libtpu==0.0.47",
+  "libtpu==0.0.50",
   "torch==2.11.0",
   "torchvision==0.26.0",
   "jax==0.10.2",
@@ -177,6 +175,8 @@ sglang = "sglang.cli.main:main"
   "kernels/aot/*",
   "kernels/aot/**/*",
 ]
+# .claude/skills is a directory symlink; setuptools build_py cannot copy it.
+"sglang.multimodal_gen" = [".claude/*"]
 
 [tool.setuptools.packages.find]
 exclude = [
@@ -208,19 +208,11 @@ git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
-[tool.uv]
-keyring-provider = "subprocess"
-
 [[tool.uv.index]]
-name = "torch-tpu-registry"
-# torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
-# and the PyPI index. It prioritizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
-url = "https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
-
-[[tool.uv.index]]
-name = "pypi"
-url = "https://pypi.org/simple/"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-tpu-sync-torch = { index = "pypi" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }

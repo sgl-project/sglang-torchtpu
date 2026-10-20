@@ -69,6 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ inputs.ref }}
       - uses: google-github-actions/auth@v2
         with:
@@ -96,10 +97,13 @@ jobs:
           NODEPOOL_VAR: ${{ inputs.nodepool_var }}
           NODEPOOL_VAR_DECODE: ${{ inputs.nodepool_var_decode }}
           GROUPS_JSON: ${{ inputs.groups_json }}
+          IN_SLICE_NAME: ${{ inputs.slice_name }}
+          IN_IMAGE: ${{ inputs.image }}
+          IN_EXTRA_ARGS: ${{ inputs.extra_args }}
         run: |
           set -uo pipefail
-          slice='${{ inputs.slice_name }}'
-          ns='${{ env.EXTERNAL_NAMESPACE }}'
+          slice="$IN_SLICE_NAME"
+          ns="$EXTERNAL_NAMESPACE"
           # --- named budgets/limits (one place; the rest of the step only uses these) ---
           POD_RUNNING_DEADLINE=1200   # pods not Running by then -> dump events, keep waiting on the JobSet
           WAIT_FLOOR=9600             # minimum JobSet wait, outlasts the renderer's deadline floor
@@ -113,6 +117,16 @@ jobs:
           PODS_PRINT_EVERY=12         # print the pod table every POLL x this seconds
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           : > "$RUNNER_TEMP/external-pod-logs.txt"
+          sanitize_logs() { python3 -u .github/tpu-ci/external/sanitize_logs.py; }
+          # Explicit fields avoid exposing node names, pod IPs, or free-form event messages.
+          pod_status() {
+            kubectl -n "$ns" get pods -l "$sel" \
+              -o custom-columns=NAME:.metadata.name,PHASE:.status.phase 2>/dev/null || true
+          }
+          event_status() {
+            kubectl -n "$ns" get events --sort-by=.lastTimestamp \
+              -o custom-columns=TYPE:.type,REASON:.reason,COUNT:.count 2>/dev/null | tail -n 30 || true
+          }
 
           # Mirror the accumulating pod log to the CI artifacts bucket every 10 min:
           # GitHub only serves a job's log blob AFTER the job completes, and the
@@ -122,7 +136,7 @@ jobs:
           # no overwrite), so each sync is a NEW cumulative snapshot; the newest
           # object is the whole log so far. Best-effort (`|| true`). Read with:
           #   gcloud storage cat "$(gcloud storage ls gs://sglang-torchtpu-ci-artifacts/ci-live-logs/<run_id>/<slice>/ | tail -1)"
-          LIVE_LOG_DIR="gs://sglang-torchtpu-ci-artifacts/ci-live-logs/${{ github.run_id }}/${slice}"
+          LIVE_LOG_DIR="gs://sglang-torchtpu-ci-artifacts/ci-live-logs/${GITHUB_RUN_ID}/${slice}"
           ( while true; do
               sleep "$LIVE_LOG_SYNC_EVERY"
               gcloud storage cp "$RUNNER_TEMP/external-pod-logs.txt" \
@@ -215,19 +229,19 @@ jobs:
               fatal_events="$(kubectl -n "$ns" get events --field-selector reason=JobCreationFailed 2>/dev/null | grep "${short}" | grep -v "already exists" || true)"
               if [ -n "$fatal_events" ]; then
                 echo "❌ ${label}: Job creation rejected -- no pod will ever start:"
-                echo "$fatal_events" | tail -n 3
+                echo "JobCreationFailed; inspect detailed events through authorized cluster access."
                 kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
                 CUR=""
                 return 1
               fi
               if [ "$(date +%s)" -ge "$running_deadline" ]; then
                 echo "⚠️  ${label}: pods not all Running ${POD_RUNNING_DEADLINE}s after apply; continuing anyway"
-                kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
+                event_status
                 break
               fi
               sleep "$POLL"
             done
-            kubectl -n "$ns" get pods -l "$sel" -o wide || true
+            pod_status
 
             refresh_cluster_token || echo "credential refresh failed; continuing"
             # Stream logs in the background, re-attaching if the stream dies while
@@ -244,7 +258,7 @@ jobs:
                 if [ "$first" = 1 ]; then tailn=-1; first=0; else tailn=20; fi
                 kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
                   --max-log-requests="$LOG_STREAM_MAX" --pod-running-timeout=20m --tail="$tailn" \
-                  2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
+                  2>&1 | sanitize_logs | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
                 sleep 20
               done ) &
             local stream_pid=$!
@@ -259,7 +273,7 @@ jobs:
               fi
               if [ $(( iter % PODS_PRINT_EVERY )) -eq 0 ]; then
                 echo "--- [$(date +%T)] ${label} pods ---"
-                kubectl -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName 2>/dev/null || true
+                pod_status
               fi
               iter=$(( iter + 1 ))
               if ! kubectl -n "$ns" get "$name" >/dev/null 2>&1; then
@@ -274,10 +288,9 @@ jobs:
               if [ "$ok" = "True" ]; then echo "✅ ${label} PASSED"; rc=0; break; fi
               if [ "$bad" = "True" ]; then
                 echo "❌ ${label} FAILED"
-                kubectl -n "$ns" get pods -l "$sel" -o wide || true
-                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 --max-log-requests=64 2>/dev/null || true
-                kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
-                kubectl -n "$ns" describe "$name" | tail -n 120 || true
+                pod_status
+                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 --max-log-requests=64 2>&1 | sanitize_logs || true
+                event_status
                 rc=1; break
               fi
               sleep "$POLL"
@@ -309,12 +322,12 @@ jobs:
             nf="$(wc -w <<<"$files")"
             echo "::group::group $(( i + 1 ))/${n}: ${gname} (${gmode})"
             python3 .github/tpu-ci/external/render_external_jobset.py \
-              --image '${{ inputs.image }}' \
+              --image "$IN_IMAGE" \
               --group "$g" \
               --nodepool "$NODEPOOL" \
               --nodepool-decode "$NODEPOOL_DECODE" \
-              --extra-args '${{ inputs.extra_args }}' > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
-            grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|MODE|SINGLE_HOST|bash "benchmark' /tmp/external-job.yaml | head -20
+              --extra-args "$IN_EXTRA_ARGS" > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
+            grep -nE 'generateName:|completions:|gke-tpu-topology:|bucketName:|MODE|SINGLE_HOST|bash "benchmark' /tmp/external-job.yaml | head -20
             # Waiting outlasts the rendered activeDeadlineSeconds (same formula + slack).
             wait_budget=$(( WAIT_SLACK + nf * tpf )); (( wait_budget < WAIT_FLOOR )) && wait_budget=$WAIT_FLOOR
             run_group /tmp/external-job.yaml "$gname" "$wait_budget" || overall=1

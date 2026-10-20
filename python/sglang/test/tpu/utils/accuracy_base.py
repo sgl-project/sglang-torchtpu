@@ -39,6 +39,21 @@ def validate_model_source(model_path: str, *, env_var: str = "MODEL") -> None:
         )
 
 
+def recipe_server_args(config_module: str) -> dict[str, Any]:
+    """The server_args a Python recipe resolves to.
+
+    A test that has to agree with its recipe on a value -- a pool size its probe
+    divides by, a page size it floors to -- reads it here instead of restating it.
+    """
+    # benchmark/ is a checkout directory, not a package: import it from the repo root.
+    root = str(TPULauncherTestCase.repo_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from benchmark.tpu.launch_server import load_recipe
+
+    return load_recipe(config_module)["server_args"]
+
+
 def gate_server_failures(config_module: str, *sampling: dict[str, Any]) -> list[str]:
     """Reject sampling that does not fit the server this recipe starts.
 
@@ -47,13 +62,7 @@ def gate_server_failures(config_module: str, *sampling: dict[str, Any]) -> list[
     admits queues them behind each other for the length of the eval. Takes the
     gate itself, or the catalog sampling when a runner owns the request.
     """
-    # benchmark/ is a checkout directory, not a package: import it from the repo root.
-    root = str(TPULauncherTestCase.repo_root)
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from benchmark.tpu.launch_server import load_recipe
-
-    args = load_recipe(config_module)["server_args"]
+    args = recipe_server_args(config_module)
     asked = {k: v for spec in sampling for k, v in spec.items()}
     failures = []
     max_tokens = asked.get("max_tokens")

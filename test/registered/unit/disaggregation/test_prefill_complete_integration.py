@@ -8,7 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+from parameterized import parameterized
+
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
@@ -46,19 +49,32 @@ class TestAllocationConfiguration(CustomTestCase):
         handle_pd_disaggregation(args)
         self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 0)
 
-    def test_dp_attention_topology_is_supported(self):
-        for size in (1, 4, 8):
-            with self.subTest(size=size):
-                args = ServerArgs(
-                    model_path="dummy",
-                    disaggregation_mode="prefill",
-                    disaggregation_decode_allocation_policy="prefill_complete",
-                    tp_size=size,
-                    dp_size=size,
-                    enable_dp_attention=size > 1,
-                )
-                handle_pd_disaggregation(args)
-                self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 1)
+    @parameterized.expand(
+        [
+            (f"{spelling}_{size}", size, spelling)
+            for size in (1, 4, 8)
+            for spelling in ("deprecated", "attn_dp_size")
+        ]
+    )
+    def test_dp_attention_topology_is_supported(self, _name, size, spelling):
+        layout = (
+            dict(dp_size=size, enable_dp_attention=size > 1)
+            if spelling == "deprecated"
+            else dict(attn_dp_size=size)
+        )
+        args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_decode_allocation_policy="prefill_complete",
+            tp_size=size,
+            **layout,
+        )
+        # The pipeline order: the deprecated spelling resolves to attn_dp_size
+        # before this hook runs. Calling the hook on the raw spelling hid that
+        # it read the old pair, which rejected this topology in production.
+        handle_deprecated_dp_attention(args)
+        handle_pd_disaggregation(args)
+        self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 1)
 
     def test_unsupported_modes_fail_explicitly(self):
         combinations = [

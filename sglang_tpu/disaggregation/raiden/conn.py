@@ -31,6 +31,7 @@ import time
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -39,6 +40,8 @@ from typing import (
     Set,
     Tuple,
 )
+
+import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -53,6 +56,9 @@ from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
+    PORTS_PER_RANK,
+    STATE_PORT_OFFSET,
+    SWA_PORT_OFFSET,
     RaidenKVCacheGroups,
     _tcp_endpoint,
     get_raiden_kv_caches,
@@ -83,6 +89,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     RoomFailed,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
@@ -139,6 +146,12 @@ class RaidenKVManager(
     _pipeline = None
     _pipeline_enabled = False
     _listener_start_read = False
+    # GDN state engine: one row per request, built only for linear-attention pools.
+    _state_engine: Optional[Any] = None
+    _state_kv_caches: Tuple[Any, ...] = ()
+    _state_engine_max_blocks = 0
+    _committed_state_row: Optional[Callable[[int], int]] = None
+    state_raiden_endpoint: Optional[str] = None
 
     def __init__(
         self,
@@ -176,7 +189,8 @@ class RaidenKVManager(
         )
         self._pipeline_init_lock = threading.Lock()
         self._pipeline_messages = []
-        # Each rank reserves control+data ports for full KV and SWA KV. The
+        # Each rank reserves control+data ports for full KV, SWA KV and GDN
+        # state. The
         # rank counts every worker on the node -- attention-TP ranks of every
         # context-parallel, attention-DP, and system-DP replica -- so
         # replicas never share a port, an engine id, or a uuid namespace.
@@ -192,8 +206,13 @@ class RaidenKVManager(
             self.pp_rank,
             self.pp_size,
         )
-        self._control_port = base_port + 4 * self._local_rank
+        self._control_port = base_port + PORTS_PER_RANK * self._local_rank
         self._timeout_s = envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
+        self._transfer_parallelism = (
+            tpu_envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.get()
+        )
+        if self._transfer_parallelism < 1:
+            raise ValueError("SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM must be >= 1")
         # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
         # built in this process. Store the resolved value back so later reads
         # do not mistake the variable set here for the deprecated alias.
@@ -355,7 +374,17 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        self._state_kv_caches = tuple(kv_caches.state)
+        self._committed_state_row = kv_caches.committed_state_row
+        if self._state_kv_caches and self._committed_state_row is None:
+            raise RuntimeError("Raiden GDN state tensors need a committed-row mapping")
         if self._pipeline_enabled:
+            if self._state_kv_caches:
+                raise NotImplementedError(
+                    "Raiden pipeline transfer does not move GDN (linear-attention) "
+                    "state yet; serve hybrid linear-attention models without "
+                    "pipeline parallelism or SGLANG_RAIDEN_PIPELINE_TRANSFER."
+                )
             from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
             pipeline = PipelineTransfer(self, kv_caches)
@@ -370,7 +399,8 @@ class RaidenKVManager(
             return
         # Full-attention KV moves piece by piece during the prefill. A hybrid
         # model's sliding-window pool holds only the last window, which is
-        # settled when the prefill ends, so it rides on the closing read.
+        # settled when the prefill ends, so it rides on the closing read, as
+        # does GDN state.
         self.chunked_transfer = True
         if not self._kv_caches:
             raise RuntimeError(
@@ -381,52 +411,40 @@ class RaidenKVManager(
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
             return
-        # TPU-only import, deferred so the disaggregation module imports cleanly
-        # on hosts without tpu_sync. Raiden owns the transport, host staging,
-        # D2H/H2D DMA, and completion tracking; it indexes each KV tensor's major
-        # dim as a page, matching the TPU fused KV pool ([num_blocks, page, ...]).
-        from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
-
-        engines = 2 if self._swa_kv_caches else 1
+        engines = 1 + bool(self._swa_kv_caches) + bool(self._state_kv_caches)
         max_blocks = self._max_request_blocks()
         num_slots = self._num_slots(self._kv_caches, max_blocks, engines)
-        self.raiden_endpoint = NetworkAddress(
-            host=self.local_ip, port=self._control_port
-        ).to_host_port_str()
-        self._engine = KVCacheManager(
+        self.raiden_endpoint, self._engine = self._start_engine(
             kv_caches=self._kv_caches,
-            node_id=self._local_rank,
-            local_control_port=self._control_port,
+            port=self._control_port,
             max_blocks=max_blocks,
             num_slots=num_slots,
-            timeout_s=self._timeout_s,
         )
         self._full_engine_max_blocks = max_blocks
         pool_pages = num_slots * max_blocks
         swa_pool_pages = None
+        state_pool_pages = None
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
-            "num_slots=%d pool_pages=%d chunked=%d",
+            "num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
             self.attn_tp_rank,
             self.raiden_endpoint,
             max_blocks,
             num_slots,
             pool_pages,
             int(self.chunked_transfer),
+            self._transfer_parallelism,
         )
         if self._swa_kv_caches:
-            self.swa_raiden_endpoint = NetworkAddress(
-                host=self.local_ip, port=self._control_port + 2
-            ).to_host_port_str()
             swa_max_blocks = self._swa_max_request_blocks()
-            swa_num_slots = self._num_slots(self._swa_kv_caches, swa_max_blocks, 2)
-            self._swa_engine = KVCacheManager(
+            swa_num_slots = self._num_slots(
+                self._swa_kv_caches, swa_max_blocks, engines
+            )
+            self.swa_raiden_endpoint, self._swa_engine = self._start_engine(
                 kv_caches=self._swa_kv_caches,
-                node_id=self._local_rank,
-                local_control_port=self._control_port + 2,
+                port=self._control_port + SWA_PORT_OFFSET,
                 max_blocks=swa_max_blocks,
                 num_slots=swa_num_slots,
-                timeout_s=self._timeout_s,
             )
             self._swa_engine_max_blocks = swa_max_blocks
             swa_pool_pages = swa_num_slots * swa_max_blocks
@@ -439,9 +457,50 @@ class RaidenKVManager(
                 swa_num_slots,
                 swa_pool_pages,
             )
+        if self._state_kv_caches:
+            # A request owns one committed state row, so a slot is one row.
+            state_num_slots = self._num_slots(list(self._state_kv_caches), 1, engines)
+            self.state_raiden_endpoint, self._state_engine = self._start_engine(
+                kv_caches=list(self._state_kv_caches),
+                port=self._control_port + STATE_PORT_OFFSET,
+                max_blocks=1,
+                num_slots=state_num_slots,
+            )
+            self._state_engine_max_blocks = 1
+            state_pool_pages = state_num_slots
+            logger.info(
+                "RaidenKVManager rank%d GDN state engine up | endpoint=%s "
+                "layers=%d num_slots=%d",
+                self.attn_tp_rank,
+                self.state_raiden_endpoint,
+                len(self._state_kv_caches),
+                state_num_slots,
+            )
         # Each engine's pool is handed out read by read, so the pages the
         # decode may hold in flight are the pages raiden reserved.
-        self._pulling = StagingAdmission(pool_pages, swa_pool_pages)
+        self._pulling = StagingAdmission(pool_pages, swa_pool_pages, state_pool_pages)
+
+    def _start_engine(
+        self, *, kv_caches: List[Any], port: int, max_blocks: int, num_slots: int
+    ) -> Tuple[str, Any]:
+        """Endpoint and raiden engine serving kv_caches on control port port."""
+        # TPU-only import, deferred so the disaggregation module imports cleanly
+        # on hosts without tpu_sync. Raiden owns the transport, host staging,
+        # D2H/H2D DMA, and completion tracking; it indexes each KV tensor's major
+        # dim as a page, matching the TPU fused KV pool ([num_blocks, page, ...]).
+        from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
+
+        endpoint = NetworkAddress(host=self.local_ip, port=port).to_host_port_str()
+        engine = KVCacheManager(
+            kv_caches=kv_caches,
+            node_id=self._local_rank,
+            local_control_port=port,
+            max_blocks=max_blocks,
+            num_slots=num_slots,
+            timeout_s=self._timeout_s,
+            parallelism=self._transfer_parallelism,
+        )
+        return endpoint, engine
 
     def _staging_cost(self, pages: int, max_blocks: int) -> int:
         """Host pages a read of ``pages`` pages takes from its engine's pool.
@@ -487,15 +546,24 @@ class RaidenKVManager(
         return max(1, batch + in_transfer)
 
     def _num_slots(
-        self, kv_caches: List[Any], max_blocks: int, engines: int = 1
+        self,
+        kv_caches: List[Any],
+        max_blocks: int,
+        engines: int = 1,
+        *,
+        reserved_bytes: int = 0,
+        paired_slot_bytes: int = 0,
     ) -> int:
         """Slots this engine can afford within the host staging budget.
 
         The per-node budget is split across the ranks resident on this host
-        and across the engines this rank builds, then divided by what one slot
-        costs. Deriving the count keeps a large context length from turning
-        into a host allocation that fails at startup -- it shrinks the pool
-        instead, and refuses to start when not even one slot fits the budget.
+        and across the engines this rank builds, less ``reserved_bytes``
+        another engine of this rank already took, then divided by what one
+        slot costs, plus ``paired_slot_bytes`` when each slot comes with one
+        of another engine. Deriving the count keeps a large context length
+        from turning into a host allocation that fails at startup -- it
+        shrinks the pool instead, and refuses to start when not even one slot
+        fits the budget.
         """
         budget = float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128")) * 1024**3
         local_ranks = ranks_per_node(
@@ -506,8 +574,8 @@ class RaidenKVManager(
             self.attn_cp_size,
             self.pp_size,
         )
-        budget /= local_ranks * max(1, engines)
-        slot_bytes = slot_host_bytes(kv_caches, max_blocks)
+        budget = budget / (local_ranks * max(1, engines)) - reserved_bytes
+        slot_bytes = slot_host_bytes(kv_caches, max_blocks) + paired_slot_bytes
         slots = slots_within_budget(budget, slot_bytes, self._slot_ceiling())
         logger.info(
             "RaidenKVManager rank%d slot budget | max_blocks=%d slot=%.1fMB "
@@ -542,13 +610,33 @@ class RaidenKVManager(
     def _swa_req_id(room: int) -> str:
         return f"swa:{room}"
 
+    @staticmethod
+    def _state_req_id(room: int) -> str:
+        return f"state:{room}"
+
     @classmethod
     def _room_of(cls, rid: str) -> Optional[int]:
-        """The room of a whole ("<room>"), sliding-window ("swa:<room>") or
-        chunk ("<room>#<k>") transfer id, resharded or not; None for any other
-        id."""
-        room = cls._norm_req_id(rid).removeprefix("swa:").partition("#")[0]
+        """The room of a whole ("<room>"), sliding-window ("swa:<room>"), GDN
+        state ("state:<room>") or chunk ("<room>#<k>") transfer id, resharded
+        or not; None for any other id."""
+        room = cls._norm_req_id(rid).removeprefix("swa:").removeprefix("state:")
+        room = room.partition("#")[0]
         return int(room) if room.isdecimal() else None
+
+    def _is_room_transfer(self, key: str, room: int) -> bool:
+        """Whether key is a whole, sliding-window, state or chunk id of room."""
+        return key in (
+            str(room),
+            self._swa_req_id(room),
+            self._state_req_id(room),
+        ) or key.startswith(f"{room}#")
+
+    def _side_reads_done(self, room: int, done: Set[str]) -> bool:
+        """Whether the room's sliding-window and state reads, where their
+        engines exist, are in done."""
+        return (self._swa_engine is None or self._swa_req_id(room) in done) and (
+            self._state_engine is None or self._state_req_id(room) in done
+        )
 
     @staticmethod
     def _tail_after(blocks: List[int], announced: int) -> Tuple[int, List[int]]:
@@ -575,9 +663,14 @@ class RaidenKVManager(
                 self._failed.update(failed)
             self._log_settled_transfers(sent=sent, received=received)
             return
-        if self._engine is None and self._swa_engine is None:
+        engines = (
+            ("full", self._engine),
+            ("swa", self._swa_engine),
+            ("state", self._state_engine),
+        )
+        if all(engine is None for _, engine in engines):
             return
-        for name, engine in (("full", self._engine), ("swa", self._swa_engine)):
+        for name, engine in engines:
             if engine is None:
                 continue
             status = self._poll_engine_status(name=name, engine=engine)
@@ -719,6 +812,8 @@ class RaidenKVManager(
         rids = [str(room)]
         if self._swa_engine is not None:
             rids.append(self._swa_req_id(room))
+        if self._state_engine is not None:
+            rids.append(self._state_req_id(room))
         times = [self._send_done_at.get(rid) for rid in rids]
         return None if None in times else max(times)
 
@@ -996,6 +1091,31 @@ class RaidenKVManager(
             raise RuntimeError("Raiden SWA transfer is missing its page indices")
         return [int(x) for x in state_indices[index]]
 
+    def _state_rows_from_state_indices(
+        self, state_indices: Optional[List]
+    ) -> List[int]:
+        """The committed GDN state row of the request's single mamba slot."""
+        if self._state_engine is None:
+            return []
+        try:
+            index = self.kv_args.state_types.index(StateType.MAMBA)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Raiden has GDN state tensors but StateType.MAMBA is not registered"
+            ) from exc
+        if (
+            state_indices is None
+            or index >= len(state_indices)
+            or state_indices[index] is None
+        ):
+            raise RuntimeError("Raiden GDN state transfer is missing its slot")
+        slots = [int(x) for x in np.asarray(state_indices[index]).reshape(-1)]
+        if len(slots) != 1:
+            raise RuntimeError(
+                f"Raiden GDN state transfer expects one mamba slot, got {slots}"
+            )
+        return [self._committed_state_row(slots[0])]
+
     @staticmethod
     def _monotonic() -> float:
         return time.monotonic()
@@ -1003,9 +1123,8 @@ class RaidenKVManager(
     # ----- completion queries (drained by poll()) ---------------------------
 
     def is_send_done(self, room: int) -> bool:
-        rid = str(room)
-        return rid in self._completed_send and (
-            self._swa_engine is None or self._swa_req_id(room) in self._completed_send
+        return str(room) in self._completed_send and self._side_reads_done(
+            room, self._completed_send
         )
 
     def is_recv_done(self, room: int) -> bool:
@@ -1016,27 +1135,21 @@ class RaidenKVManager(
                 ):
                     return False
                 reads = list(self._decode.chunk_reads.get(room, []))
-            return all(rid in self._completed_recv for rid in reads) and (
-                self._swa_engine is None
-                or self._swa_req_id(room) in self._completed_recv
-            )
-        rid = str(room)
-        return rid in self._completed_recv and (
-            self._swa_engine is None or self._swa_req_id(room) in self._completed_recv
+            return all(
+                rid in self._completed_recv for rid in reads
+            ) and self._side_reads_done(room, self._completed_recv)
+        return str(room) in self._completed_recv and self._side_reads_done(
+            room, self._completed_recv
         )
 
     def is_failed(self, room: int) -> bool:
-        """Whether any transfer of the room -- whole, sliding-window, or one of
-        its chunks -- has failed."""
+        """Whether any transfer of the room -- whole, sliding-window, state, or
+        one of its chunks -- has failed."""
         with self._state_lock:
             return self._is_failed_locked(room)
 
     def _is_failed_locked(self, room: int) -> bool:
-        rid, swa_rid, chunk_prefix = str(room), self._swa_req_id(room), f"{room}#"
-        return any(
-            key == rid or key == swa_rid or key.startswith(chunk_prefix)
-            for key in self._failed
-        )
+        return any(self._is_room_transfer(key, room) for key in self._failed)
 
     def room_has_active_io(self, room: int) -> bool:
         """Whether raiden still holds a transfer of the room: an unsettled
@@ -1048,15 +1161,12 @@ class RaidenKVManager(
         """
         if self._pipeline is not None:
             return self._pipeline.active(room)
-        rid, swa_rid, chunk_prefix = str(room), self._swa_req_id(room), f"{room}#"
-
-        def belongs(key: str) -> bool:
-            return key == rid or key == swa_rid or key.startswith(chunk_prefix)
-
         with self._state_lock:
             if self._pulling is not None:
                 for key in self._pulling.rooms():
-                    if belongs(key) and not self._pull_settled_locked(key):
+                    if self._is_room_transfer(
+                        key, room
+                    ) and not self._pull_settled_locked(key):
                         return True
             for req_id in (getattr(self, "_reshard_plans", None) or {}).get(room, {}):
                 if (
@@ -1079,12 +1189,8 @@ class RaidenKVManager(
     def _drop_room_state(
         self, room: int, *, clear_failure_record: bool = False
     ) -> None:
-        rid = str(room)
-        swa_rid = self._swa_req_id(room)
-        chunk_prefix = f"{room}#"
-
         def belongs(key: str) -> bool:
-            return key == rid or key == swa_rid or key.startswith(chunk_prefix)
+            return self._is_room_transfer(key, room)
 
         with self._state_lock:
             if self._prefill is not None:
@@ -1101,7 +1207,8 @@ class RaidenKVManager(
                         self._pulling.release(key)
                         continue
                     self._pulling_cleared.add(key)
-                    held.update((key, self._paired_swa_read(key) or key))
+                    held.add(key)
+                    held.update(self._paired_reads(key))
                 # A read of the room still waiting for staging will not ask
                 # again; it must not hold the line for the other rooms.
                 waiting = self._pulling.waiting
@@ -1138,7 +1245,9 @@ class RaidenKVManager(
                     self._prefill.reshard_ready_pages,
                     self._prefill.reshard_chunk_acked,
                     self._prefill.send_blocks,
+                    self._prefill.send_block_set,
                     self._prefill.send_swa_blocks,
+                    self._prefill.send_state_rows,
                     self._prefill.send_aux,
                     self._prefill.decode_addr,
                     self._prefill.reshard_req,
@@ -1165,11 +1274,14 @@ class RaidenKVManager(
                     self._decode.reshard_chunk_sources,
                     self._decode.local_blocks,
                     self._decode.local_swa_blocks,
+                    self._decode.local_state_rows,
                     self._decode.decode_aux_index,
                     self._decode.remote_blocks,
                     self._decode.remote_swa_blocks,
+                    self._decode.remote_state_rows,
                     self._decode.remote_endpoint,
                     self._decode.remote_swa_endpoint,
+                    self._decode.remote_state_endpoint,
                     self._decode.reshard_meta,
                     self._decode.reshard_sources,
                     self._decode.reshard_swa_sources,

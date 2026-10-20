@@ -212,6 +212,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        self.retraction_draft_kv_pools = self._carriable_draft_kv_pools()
         self.init_lm_head()
         self._init_boundary_kv_fix_state()
 

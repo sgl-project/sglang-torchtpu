@@ -296,6 +296,7 @@ class TestFreeRoundTrip(CustomTestCase):
 
     def test_free_dedupes_same_page(self):
         a = _make_allocator(size=32, page_size=4)
+        a.alloc(4)  # hands out page 1
         # All tokens belong to page 1 — freeing them should return
         # exactly one page to the pool.
         tok = torch.tensor([4, 5, 6, 7], dtype=torch.int64)

@@ -302,6 +302,11 @@ _SHAPES = [
     # 65 crosses a 64-token tile; the 1-token row is a prefill, not a decode.
     ("ragged_prefill", [65, 65, 1, 64], [0] * 4, [0, 4, 4], {}),
     ("prefill_long", [1000], [0], [0, 1, 1], {}),
+    # Past 1024 tokens in one prefill (GLM-5.3-Flash serves 8192-token chunks).
+    ("prefill_1912", [1912], [0], [0, 1, 1], {}),
+    ("prefill_2048", [2048], [0], [0, 1, 1], {}),
+    ("prefill_after_1792", [120], [1792], [0, 1, 1], {}),
+    ("prefill_4096", [4096], [0], [0, 1, 1], {}),
     ("prefill_with_context", [100], [50], [0, 1, 1], {}),
     ("decode_and_prefill", [1, 1, 38], [5, 9, 0], [2, 3, 3], {}),
     # 2 real prefills in a 4-row, 128-token bucket.

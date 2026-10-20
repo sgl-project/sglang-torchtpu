@@ -36,8 +36,10 @@ def make_verify_tree_greedy_args(
             dtype=torch.int64,
             device=context.device,
         ),
-        torch.arange(num_verify_rows, dtype=torch.int64, device=context.device).view(
-            context.physical_bs, context.num_verify_tokens
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int64,
+            device=context.device,
         ),
     )
 
@@ -50,8 +52,10 @@ def make_verify_bookkeeping_args(
         torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
         torch.ones((context.physical_bs,), dtype=torch.int32, device=context.device),
         torch.zeros((num_verify_rows,), dtype=torch.int32, device=context.device),
-        torch.arange(num_verify_rows, dtype=torch.int32, device=context.device).view(
-            context.physical_bs, context.num_verify_tokens
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int32,
+            device=context.device,
         ),
     )
 

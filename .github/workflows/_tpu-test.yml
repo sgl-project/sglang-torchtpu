@@ -72,6 +72,12 @@ on:
         required: false
         type: string
         default: ""
+      # SGLANG_PLATFORM for the pods: tpu (mode A) or tpu_oot (mode B, the plugin
+      # platform). P/D runs accept only tpu.
+      platform:
+        required: false
+        type: string
+        default: tpu
       # Names this job. Nested two deep (nightly -> stage -> here) the Actions
       # sidebar shows ONLY this job's name per leg, so it must be the test; the
       # fallbacks cover callers whose suite already is the test.
@@ -120,6 +126,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           ref: ${{ inputs.ref }}
       - uses: google-github-actions/auth@v2
         with:
@@ -132,39 +139,65 @@ jobs:
           location: ${{ env.GKE_ZONE }}
 
       - name: Render + run on TPU
+        env:
+          # Inputs reach the script through the environment, never by template
+          # substitution, so a value with shell metacharacters (a dispatch input,
+          # a test path discovered at the dispatched ref) cannot break out of its
+          # quoting.
+          IN_LABEL: ${{ inputs.run_name || inputs.test_file || inputs.files || inputs.suite }}
+          IN_NIGHTLY_FLAG: ${{ inputs.nightly && '--nightly' || '' }}
+          TPU_CI_POD_KSA: ${{ vars.TPU_CI_POD_KSA }}
+          IN_SUITE: ${{ inputs.suite }}
+          IN_LANE: ${{ inputs.lane }}
+          IN_HOSTS: ${{ inputs.hosts }}
+          IN_IMAGE: ${{ inputs.image }}
+          IN_TEST_FILE: ${{ inputs.test_file }}
+          IN_LAUNCH_SCRIPT: ${{ inputs.launch_script }}
+          IN_FILES: ${{ inputs.files }}
+          IN_EXEC_CMD: ${{ inputs.exec_cmd }}
+          IN_PD_PREFILL_HOSTS: ${{ inputs.pd_prefill_hosts }}
+          IN_PD_DECODE_HOSTS: ${{ inputs.pd_decode_hosts }}
+          IN_WEIGHTS_PVC: ${{ inputs.weights_pvc }}
+          IN_TIMEOUT_PER_FILE: ${{ inputs.timeout_per_file }}
+          IN_TPU_CHIP_WORKERS: ${{ inputs.tpu_chip_workers }}
+          IN_PARTITION_ID: ${{ inputs.partition_id }}
+          IN_PARTITION_SIZE: ${{ inputs.partition_size }}
+          IN_RUN_NAME: ${{ inputs.run_name }}
+          IN_PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
-          label='${{ inputs.run_name || inputs.test_file || inputs.files || inputs.suite }}'
+          label="$IN_LABEL"
           JOB_CEILING_S=21600        # 360m, the GitHub cap
-          suite='${{ inputs.suite }}'
+          suite="$IN_SUITE"
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
           # render time. Unions topology.yaml's list with any pool labelled
           # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
           # so adding a slice needs no code change. Fails open to topology.yaml.
           pools="$(python3 .github/tpu-ci/discover_pools.py \
-                     --lane '${{ inputs.lane }}' --hosts '${{ inputs.hosts }}' --sync)"
-          echo "pools for lane=${{ inputs.lane }} hosts=${{ inputs.hosts }}: ${pools}"
+                     --lane "$IN_LANE" --hosts "$IN_HOSTS" --sync)"
+          echo "pools for lane=${IN_LANE} hosts=${IN_HOSTS}: ${pools}"
           python3 .github/tpu-ci/render_jobset.py \
-            --image '${{ inputs.image }}' \
-            --suite '${{ inputs.suite }}' \
-            --test-file '${{ inputs.test_file }}' \
-            --launch-script '${{ inputs.launch_script }}' \
-            --files '${{ inputs.files }}' \
-            --exec '${{ inputs.exec_cmd }}' \
-            --hosts '${{ inputs.hosts }}' \
-            --lane '${{ inputs.lane }}' \
+            --image "$IN_IMAGE" \
+            --suite "$IN_SUITE" \
+            --test-file "$IN_TEST_FILE" \
+            --launch-script "$IN_LAUNCH_SCRIPT" \
+            --files "$IN_FILES" \
+            --exec "$IN_EXEC_CMD" \
+            --hosts "$IN_HOSTS" \
+            --lane "$IN_LANE" \
             --pools "${pools}" \
-            --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \
-            --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
-            --weights-pvc '${{ inputs.weights_pvc }}' \
-            --timeout-per-file '${{ inputs.timeout_per_file }}' \
-            --tpu-chip-workers '${{ inputs.tpu_chip_workers }}' \
-            --partition-id '${{ inputs.partition_id }}' \
-            --partition-size '${{ inputs.partition_size }}' \
-            --name '${{ inputs.run_name }}' \
-            --service-account '${{ vars.TPU_CI_POD_KSA }}' \
-            ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
+            --pd-prefill-hosts "$IN_PD_PREFILL_HOSTS" \
+            --pd-decode-hosts "$IN_PD_DECODE_HOSTS" \
+            --weights-pvc "$IN_WEIGHTS_PVC" \
+            --timeout-per-file "$IN_TIMEOUT_PER_FILE" \
+            --tpu-chip-workers "$IN_TPU_CHIP_WORKERS" \
+            --partition-id "$IN_PARTITION_ID" \
+            --partition-size "$IN_PARTITION_SIZE" \
+            --name "$IN_RUN_NAME" \
+            --platform "$IN_PLATFORM" \
+            --service-account "$TPU_CI_POD_KSA" \
+            ${IN_NIGHTLY_FLAG:+"$IN_NIGHTLY_FLAG"} > /tmp/job.yaml
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
           # Quota tracks live capacity, checked here rather than on a timer: it only has to
@@ -210,12 +243,12 @@ jobs:
           #     (3600s bring-up + files x timeout_per_file, the render_jobset.py
           #     formula), and this must OUTLAST it so the JobSet -- not this loop --
           #     decides the outcome.
-          if [ '${{ inputs.pd_prefill_hosts }}' != '0' ]; then
+          if [ "$IN_PD_PREFILL_HOSTS" != '0' ]; then
             wait_s=9300          # outlast P/D mode's activeDeadlineSeconds=8700 + margin
-          elif [ -n "${{ inputs.launch_script }}" ]; then
-            nf=$(wc -w <<< "${{ inputs.files }}")
-            wait_s=$(( 3600 + nf * ${{ inputs.timeout_per_file }} + 600 ))  # deadline + margin
-          elif [ -n "${{ inputs.exec_cmd }}" ]; then
+          elif [ -n "$IN_LAUNCH_SCRIPT" ]; then
+            nf=$(wc -w <<< "$IN_FILES")
+            wait_s=$(( 3600 + nf * IN_TIMEOUT_PER_FILE + 600 ))  # deadline + margin
+          elif [ -n "$IN_EXEC_CMD" ]; then
             wait_s=7800          # outlast exec mode's activeDeadlineSeconds=7200 + margin
           else
             # +600 for the same reason as the other two modes: the JobSet's deadline is
@@ -223,11 +256,11 @@ jobs:
             # the outcome rather than this loop racing it to a generic timeout.
             wait_s=$(( $(python3 .github/tpu-ci/render_jobset.py \
               --suite "$suite" \
-              --test-file '${{ inputs.test_file }}' \
-              --tpu-chip-workers '${{ inputs.tpu_chip_workers }}' \
-              --partition-id '${{ inputs.partition_id }}' \
-              --partition-size '${{ inputs.partition_size }}' \
-              ${{ inputs.nightly && '--nightly' || '' }} \
+              --test-file "$IN_TEST_FILE" \
+              --tpu-chip-workers "$IN_TPU_CHIP_WORKERS" \
+              --partition-id "$IN_PARTITION_ID" \
+              --partition-size "$IN_PARTITION_SIZE" \
+              ${IN_NIGHTLY_FLAG:+"$IN_NIGHTLY_FLAG"} \
               --print-wait-seconds) + 600 ))
           fi
 

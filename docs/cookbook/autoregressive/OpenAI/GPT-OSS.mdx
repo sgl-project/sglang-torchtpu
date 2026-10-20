@@ -502,6 +502,155 @@ print(response.output_text)
 # Output: The sum is 58,277,498,374.
 ```
 
+### 3.3 TPU (tpu7x) Deployment
+
+SGLang serves GPT-OSS on Google TPU through the `torch_tpu` backend
+(`--device tpu`). One tpu7x host is 4 chips x 2 TensorCores, so a single host
+runs tp8; the 128 experts go expert-parallel rather than tensor-parallel,
+because the MXFP4 path dequantizes each expert in a layout that TP-sharding
+`intermediate_size` would not tile cleanly.
+
+Pick the block matching the traffic you serve. These commands are generated
+from the serving recipes in `benchmark/tpu/recipe/configs/gpt_oss_120b/`, so the
+page cannot drift from what CI runs; the 20B is the same command with
+`recipe/configs/gpt_oss_20b/server.py`. Editing a command here fails a lint
+check -- change the recipe instead.
+
+Two settings to understand before changing them. The compile buckets
+(`--tpu-compile-tokens`, `--tpu-compile-bs`) are the shapes compiled at startup:
+a request whose prefill lands outside them takes the recompile path. And
+`--mem-fraction-static` must leave headroom for the `torch.compile` EXTEND-graph
+transient, not just the weights and the KV pool.
+
+#### 3.3.1 Chat (1k in / 1k out, concurrency 64)
+
+{/* render_recipe config=recipe/configs/gpt_oss_120b/server.py profile=chat_1k1k */}
+**Hardware**: one tpu7x host (4 chips x 2 TensorCores), tp8/ep8.
+
+**Workload**: 1024 in / 1024 out at concurrency 64.
+
+```bash
+export SGLANG_TPU_FUSED_MOE_SC_GATHER=0
+
+python3 -m sglang.launch_server \
+    --device tpu \
+    --dtype bfloat16 \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --grammar-backend none \
+    --attention-backend pallas_tpu_rpa_v3 \
+    --page-size 64 \
+    --max-running-requests 64 \
+    --chunked-prefill-size 2048 \
+    --max-prefill-tokens 2048 \
+    --context-length 2112 \
+    --torch-compile-max-bs 64 \
+    --enable-torch-compile \
+    --kv-cache-dtype fp8_e4m3 \
+    --model-path openai/gpt-oss-120b \
+    --tp-size 8 \
+    --ep-size 8 \
+    --max-total-tokens 137216 \
+    --mem-fraction-static 0.6 \
+    --tpu-compile-tracer direct \
+    --tpu-compile-tokens 2048 \
+    --tpu-compile-bs 64
+```
+{/* /render_recipe */}
+
+#### 3.3.2 Long context (8k in / 1k out, concurrency 16)
+
+{/* render_recipe config=recipe/configs/gpt_oss_120b/server.py profile=long_8k1k */}
+**Hardware**: one tpu7x host (4 chips x 2 TensorCores), tp8/ep8.
+
+**Workload**: 8192 in / 1024 out at concurrency 16.
+
+```bash
+export SGLANG_TPU_FUSED_MOE_SC_GATHER=0
+
+python3 -m sglang.launch_server \
+    --device tpu \
+    --dtype bfloat16 \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --grammar-backend none \
+    --attention-backend pallas_tpu_rpa_v3 \
+    --page-size 64 \
+    --max-running-requests 16 \
+    --chunked-prefill-size 8192 \
+    --max-prefill-tokens 8192 \
+    --context-length 9280 \
+    --torch-compile-max-bs 16 \
+    --enable-torch-compile \
+    --kv-cache-dtype fp8_e4m3 \
+    --model-path openai/gpt-oss-120b \
+    --tp-size 8 \
+    --ep-size 8 \
+    --max-total-tokens 156672 \
+    --mem-fraction-static 0.6 \
+    --tpu-compile-tracer direct \
+    --tpu-compile-tokens 8192 \
+    --tpu-compile-bs 16
+```
+{/* /render_recipe */}
+
+For the throughput-shaped point at the same shape, use the `long_8k1k_c64`
+profile: concurrency 64 and the pool sized for it.
+
+#### 3.3.3 Agentic (32k in / 1k out, concurrency 16)
+
+A long shared prefix re-sent each turn, so the radix cache does most of the
+work; the pool holds whole conversations rather than single prompts.
+
+{/* render_recipe config=recipe/configs/gpt_oss_120b/server.py profile=agentic */}
+**Hardware**: one tpu7x host (4 chips x 2 TensorCores), tp8/ep8.
+
+**Workload**: 32768 in / 1024 out at concurrency 16.
+
+```bash
+export SGLANG_TPU_FUSED_MOE_SC_GATHER=0
+
+python3 -m sglang.launch_server \
+    --device tpu \
+    --dtype bfloat16 \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --grammar-backend none \
+    --attention-backend pallas_tpu_rpa_v3 \
+    --page-size 64 \
+    --max-running-requests 16 \
+    --chunked-prefill-size 8192 \
+    --max-prefill-tokens 8192 \
+    --context-length 33856 \
+    --torch-compile-max-bs 16 \
+    --enable-torch-compile \
+    --kv-cache-dtype fp8_e4m3 \
+    --model-path openai/gpt-oss-120b \
+    --tp-size 8 \
+    --ep-size 8 \
+    --max-total-tokens 549888 \
+    --mem-fraction-static 0.6 \
+    --tpu-compile-tracer direct \
+    --tpu-compile-tokens 8192 \
+    --tpu-compile-bs 16
+```
+{/* /render_recipe */}
+
+#### 3.3.4 Measured performance
+
+Numbers are published per profile once a nightly baseline exists, each with the
+date, commit and `torch_tpu` version it was taken on. The nightlies that produce
+them run `recipe/configs/gpt_oss_120b/` and report to the CI dashboard.
+
+| Profile | TTFT p50 / p99 | TPOT p50 / p99 | Output tok/s | Measured on |
+| --- | --- | --- | --- | --- |
+| `chat_1k1k` | - | - | - | not yet published |
+| `long_8k1k` | - | - | - | not yet published |
+| `agentic` | - | - | - | not yet published |
+
+Reproduce a row with `benchmark/tpu/bench_serving.sh` against a server launched
+from the block above, at that profile's concurrency.
+
 ## 5.Benchmark
 
 ### 5.1 Speed Benchmark

@@ -140,7 +140,9 @@ def _format_compiles(event: RecompileEvent, *, warn_ms: int) -> str:
 
 
 def _short_path(filename: str) -> str:
-    return filename[filename.rfind("/sglang/") + 1 :]
+    # Core and the out-of-tree backend both own serving-time tensor operations.
+    start = max(filename.rfind("/sglang/"), filename.rfind("/sglang_tpu/"))
+    return filename[start + 1 :]
 
 
 def _describe_site(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
@@ -155,7 +157,8 @@ def _describe_site(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> 
     frames = [
         fs
         for fs in reversed(traceback.extract_stack())
-        if "/sglang/" in fs.filename and fs.filename != __file__
+        if ("/sglang/" in fs.filename or "/sglang_tpu/" in fs.filename)
+        and fs.filename != __file__
     ][:_SITE_FRAMES]
     where = " <- ".join(f"{_short_path(fs.filename)}:{fs.lineno}" for fs in frames)
     return f"{func}({leaves}) @ {where or '<no sglang frame>'}"

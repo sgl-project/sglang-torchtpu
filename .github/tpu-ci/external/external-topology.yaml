@@ -88,6 +88,15 @@ suites:
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_qwen3_8_27b_pd_singlehost_mtp_recompile.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_8_27b_pd_singlehost_mtp_recompile.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_qwen3_8_27b_pd_singlehost_dflash2_recompile.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_8_27b_pd_singlehost_dflash2_recompile.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
   # Single-host tests that launch their own server (no launch dict). There is no 1-host
   # slice here, so a group takes a whole 2x2x2 slice: rank 0 drops the slice-wide TPU env
   # and runs each file through run_suite on its own host; rank 1 idles.

@@ -1872,7 +1872,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> torch.Tensor:
         # On TPU the attention backend runs the indexer.
         return get_attn_backend().forward_indexer(
-            self, x=x, q_lora=q_lora, positions=positions, layer_id=layer_id
+            self,
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
         )
 
     def forward_xpu(

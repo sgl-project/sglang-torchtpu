@@ -1178,12 +1178,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 pin_memory = is_pin_memory_available(device)
+                input_device = _extend_metadata_device(batch, device)
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                ).to(input_device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
                 ret.extend_seq_lens_cpu = list(extend_seq_lens)
             else:
@@ -1526,7 +1527,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
-        seq_lens_int64 = self.seq_lens.to(torch.int64)
 
         # Some multimodal models (e.g. image generation models) provide
         # precomputed MRoPE positions. In this case, positions cannot be
@@ -1540,6 +1540,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         has_multimodal_input = any(mm is not None for mm in mm_inputs)
 
+        if (
+            rl_on_policy_target is not None
+            or not has_multimodal_input
+            or not has_precomputed_mrope
+        ):
+            position_device = _mrope_decode_device(batch, model_runner.device)
+            # Use the existing host lengths, never a device readback, when a
+            # backend defers position upload until after forward padding.
+            lengths = (
+                seq_lens_cpu
+                if torch.device(position_device).type == "cpu"
+                else self.seq_lens
+            )
+            seq_lens_int64 = lengths.to(torch.int64)
+
         if rl_on_policy_target is not None or not has_multimodal_input:
             # Text-only
             positions_1d = seq_lens_int64 - 1
@@ -1552,7 +1567,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             for i, mm in enumerate(mm_inputs):
                 deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
             deltas = torch.tensor(
-                deltas_list, dtype=torch.int64, device=model_runner.device
+                deltas_list, dtype=torch.int64, device=position_device
             )
             positions_1d = (deltas - 1) + seq_lens_int64
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
@@ -2301,3 +2316,13 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+def _extend_metadata_device(batch, device):
+    """Initial placement of host-built extend lengths and derived positions."""
+    return device
+
+
+def _mrope_decode_device(batch, device):
+    """Initial placement of delta-derived decode positions; fallback is unchanged."""
+    return device

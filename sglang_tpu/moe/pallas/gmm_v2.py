@@ -1,5 +1,5 @@
-# Uses the latest torchtpu-vllm gmm_v2 kernel
-#   (https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
+# Uses the latest vllm-torchtpu gmm_v2 kernel
+#   (https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
 # This cut adds in-kernel fused activation (``fuse_act``: silu / gelu /
 # swigluoai / situ) and fused gate+up weight support over the prior sglang-jax
 # vendor.
@@ -1208,6 +1208,81 @@ def calculate_tiling(
     return TileSizes(tile_m=tile_m, tile_k=tile_k, tile_n=tile_n)
 
 
+def default_vmem_limit_bytes() -> int:
+    """The VMEM budget ``gmm_v2`` sizes tiles against when given none."""
+    return int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+
+
+# ``calculate_tiling`` reads ``size_m`` only to cap tile_m (at most 256 rows),
+# so any M this large gets the large-M (prefill) tiling.
+_LARGE_SIZE_M = 1 << 20
+
+
+def _dividing_tile_n(size_n: int, tile_n: int) -> int:
+    """The N tile ``make_gmm_configs`` runs for a requested ``tile_n``:
+    ``tile_n`` when it divides ``size_n``, else the largest lane-aligned divisor
+    of ``size_n`` below it."""
+    return _largest_aligned_divisor_at_most(
+        size_n, tile_n, pltpu.get_tpu_info().num_lanes
+    )
+
+
+def pad_size_n_to_fewest_tiles(
+    size_k: int,
+    size_n: int,
+    dtype: jnp.dtype = jnp.bfloat16,
+    *,
+    fuse_act: str | None = None,
+    vmem_limit_bytes: int | None = None,
+) -> int:
+    """Width to zero-pad a weight's N to at load time for fewer N tiles.
+
+    ``make_gmm_configs`` shrinks an N tile that does not divide ``size_n`` to
+    the largest lane-aligned divisor of ``size_n``, and a width with few
+    divisors drops far: 2944 = 23 * 128 (GPT-OSS's intermediate 2880 padded to
+    the lane width) has only 128 and itself, so with 64 MiB of VMEM its fused
+    gate/up GEMM runs 23 N tiles of 128 instead of the 3 of 1024 that
+    ``calculate_tiling`` asks for.
+
+    Of the lane-aligned widths from ``size_n``'s lane-aligned width to an
+    eighth past it, returns the narrowest whose large-M (prefill) tiling runs
+    the fewest N tiles: 3072 for 2944 above, three tiles of 1024. Padding costs
+    weight bytes and FLOPs in proportion to the width, hence the bound, and a
+    wider width is only taken when it runs fewer tiles. Smaller M only lowers
+    tile_m, which frees VMEM for wider N tiles, and the large-M tile divides
+    the returned width, so no M falls back below that tile.
+
+    Covers the unquantized GEMM: ``dtype`` is both the lhs and the rhs dtype
+    and the rhs has no scales. ``size_n`` is per projection when ``fuse_act``
+    is set, like ``Dimensions.size_n``. Zero rhs columns (and zero bias) give
+    zero outputs, which the fused activations keep at zero.
+    """
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = default_vmem_limit_bytes()
+    # Mirrors make_gmm_configs for an unquantized rhs.
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=dtype)
+    rhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=size_k, dtype=dtype)
+
+    def num_n_tiles(width: int) -> int:
+        dims = Dimensions(
+            size_m=_LARGE_SIZE_M,
+            size_k=size_k,
+            size_n=width,
+            size_group=1,
+            size_lhs_group=1,
+            size_lhs_sublane=lhs_sublane_tiling(dtype),
+        )
+        tile_n = calculate_tiling(
+            dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act
+        ).tile_n
+        return width // _dividing_tile_n(width, tile_n)
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    lane_aligned = align_to(size_n, num_lanes)
+    widths = range(lane_aligned, lane_aligned + lane_aligned // 8 + 1, num_lanes)
+    return min(widths, key=lambda width: (num_n_tiles(width), width))
+
+
 def validate_inputs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -1515,16 +1590,12 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
-    if dims.size_n % tiles.tile_n != 0:
-        # The kernel uses fixed-size BlockSpecs and disables bounds checks. A
-        # partial final N tile would read/write past the RHS/output buffers, so
-        # constrain N tiling to cleanly divide the logical output width.
-        tiles = dataclasses.replace(
-            tiles,
-            tile_n=_largest_aligned_divisor_at_most(
-                dims.size_n, tiles.tile_n, pltpu.get_tpu_info().num_lanes
-            ),
-        )
+    # The kernel uses fixed-size BlockSpecs and disables bounds checks. A
+    # partial final N tile would read/write past the RHS/output buffers, so
+    # constrain N tiling to cleanly divide the logical output width.
+    tile_n = _dividing_tile_n(dims.size_n, tiles.tile_n)
+    if tile_n != tiles.tile_n:
+        tiles = dataclasses.replace(tiles, tile_n=tile_n)
     # A non-128-multiple N (e.g. GPT-OSS hidden = 2880) needs no caller padding:
     # the output is over-allocated to a 128-aligned width and sliced back (see
     # ``aligned_n`` below), and the partial final N tile's out-of-bounds RHS read
@@ -1667,7 +1738,7 @@ def gmm_v2(
             group_offset = group_offset[None]
 
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+        vmem_limit_bytes = default_vmem_limit_bytes()
 
     cfgs = make_gmm_configs(
         lhs,
