@@ -30,6 +30,12 @@ from sglang_tpu.hooks.glm_flash_megakernel import (
     route_glm_flash_megakernel,
 )
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.k3_megakernel import (
+    attach_k3_megakernel,
+    k3_megakernel_forward,
+    load_k3_non_layer_weights,
+    skip_k3_decoder_layers,
+)
 from sglang_tpu.hooks.kda_weights import bind_glm5_next_kda_weights
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
@@ -92,9 +98,34 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
     (
+        "sglang.srt.models.kimi_k3.make_pp_layers",
+        skip_k3_decoder_layers,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3ForConditionalGeneration.load_weights",
+        load_k3_non_layer_weights,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.load_weights",
+        load_k3_non_layer_weights,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
         prepare_attn_residual_kernel,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+        attach_k3_megakernel,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearModel.forward",
+        k3_megakernel_forward,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.layers.attn_residual._aggregate",
