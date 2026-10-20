@@ -33,13 +33,13 @@ The tables below are the short view. The sections that follow give per-row topol
 | Qwen3-0.6B | bf16 | 1 chip, 1 host | Quickstart |
 | Qwen3-30B-A3B | FP8 | 1 host | Supported |
 | Qwen3-VL-8B | bf16 | 1 host, 2P+2D | Supported |
+| GLM-5.2 / GLM-5.3 | FP8 | 1 host | Supported |
 | DeepSeek-V3.1, DeepSeek-R1-0528 | FP8 | 2 hosts | Supported |
 | Kimi-K2.6 | INT4 W4A16 | 2 hosts | Supported |
 | MiMo-V2.5-Pro | FP8 | 2 hosts | Supported |
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | Supported |
 | Qwen3-Coder-30B-A3B | FP8 | 1 host | Experimental |
 | Qwen3.8-27B | bf16 | 1 host | Experimental |
-| GLM-5.2 / GLM-5.3 | FP8 | 1 host | Experimental |
 | DeepSeek-V4 | FP8 | — | Experimental |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
 
