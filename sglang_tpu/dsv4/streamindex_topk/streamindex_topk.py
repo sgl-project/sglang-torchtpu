@@ -563,6 +563,7 @@ def _effective_row_lengths(
         "enable_early_exit",
         "kv_layout",
         "chunk_tokens",
+        "overlap_chunks",
         "cp_size",
         "interleave_size",
         "return_scores",
@@ -589,6 +590,7 @@ def streamindex_topk(
     enable_early_exit: bool = False,
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
+    overlap_chunks: bool = True,
     cp_size: int = 1,
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
@@ -605,6 +607,10 @@ def streamindex_topk(
     compression_ratio``. The default 0 lets a token see the row it falls in;
     ``compression_ratio - 1`` limits it to rows already closed (GLM-5.3-Flash's
     pooled indexer).
+
+    ``chunk_tokens`` scores the queries in row chunks of that size. With
+    ``overlap_chunks`` the chunks carry XLA scheduling groups that overlap one
+    chunk's scores with the previous chunk's top-k; without, they run in order.
     """
     kv_layout = KVLayout.parse(kv_layout)
     if decode_query_size > 1:
@@ -966,9 +972,10 @@ def streamindex_topk(
         else:
             num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
 
-        group_base = 0
-        if num_chunks > 1:
-            group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
+        overlap = overlap_chunks and num_chunks > 1
+        group_base = (
+            config.reserve_scheduling_group_ids(num_chunks - 1) if overlap else 0
+        )
 
         need_scores = cp_size > 1 or return_scores
 
@@ -984,9 +991,11 @@ def streamindex_topk(
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
-            tc_group = None if m == 0 else group_base + m - 1
-            sc_group = None if m == num_chunks - 1 else group_base + m
-            sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
+            tc_group = None if not overlap or m == 0 else group_base + m - 1
+            sc_group = None if not overlap or m == num_chunks - 1 else group_base + m
+            sc2_group = (
+                None if not overlap or m >= num_chunks - 2 else group_base + m + 1
+            )
 
             start = m * chunk_len
             scores = _scores_for_chunk(

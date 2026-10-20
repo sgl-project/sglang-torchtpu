@@ -37,7 +37,10 @@ from sglang_tpu.hooks.k3_megakernel import (
     prepare_k3_capture_kernels,
     skip_k3_decoder_layers,
 )
-from sglang_tpu.hooks.kda_weights import bind_glm5_next_kda_weights
+from sglang_tpu.hooks.kda_weights import (
+    bind_glm5_next_kda_weights,
+    rehome_kimi_k3_kda_weights,
+)
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -162,6 +165,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
         bind_glm5_next_kda_weights,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+        rehome_kimi_k3_kda_weights,
         HookType.AFTER,
     ),
     (
