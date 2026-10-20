@@ -1363,6 +1363,54 @@ class TestAdmissionRespectsTheTombstone(unittest.TestCase):
         self.assertEqual(len(mgr._pulling), 0)
 
 
+class TestSendBlockAccounting(CustomTestCase):
+    """A page listed twice for one room fails that room at the send, not at
+    the closing registration raiden rejects 5 s later, and not the engine."""
+
+    def test_a_page_sent_twice_fails_the_room_with_both_positions(self):
+        mgr = _prefill_manager()
+        for room in (ROOM, OTHER_ROOM):
+            mgr.request_status[room] = KVPoll.WaitingForInput
+            mgr._prefill.decode_addr[room] = ("10.0.0.2", 5555)
+        self.assertEqual(mgr.append_send_blocks(ROOM, [3, 4, 5]), 0)
+        self.assertEqual(mgr.append_send_blocks(ROOM, [6]), 3)
+        mgr.append_send_blocks(OTHER_ROOM, [10, 11])
+
+        with patch("sglang_tpu.disaggregation.raiden.sender.logger.error") as log_error:
+            self.assertIsNone(mgr.append_send_blocks(ROOM, [7, 4, 8]))
+
+        self.assertEqual(log_error.call_count, 1)
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertRegex(mgr.failure_records[ROOM], r"KV page 4 .* positions 1 and 5 ")
+        self.assertNotIn(ROOM, mgr._prefill.send_blocks)
+        self.assertNotIn(ROOM, mgr._prefill.send_block_set)
+        # The decode learns at once instead of at its waiting timeout.
+        [(endpoint, frames)] = _sent_frames(mgr)
+        self.assertEqual(endpoint, "tcp://10.0.0.2:5555")
+        self.assertEqual(RoomFailed.from_frames(frames).room, ROOM)
+        # Later sends of the room are not recorded; other rooms carry on.
+        self.assertIsNone(mgr.append_send_blocks(ROOM, [9]))
+        self.assertNotIn(ROOM, mgr._prefill.send_blocks)
+        self.assertEqual(mgr.check_status(OTHER_ROOM), KVPoll.WaitingForInput)
+        self.assertEqual(mgr.append_send_blocks(OTHER_ROOM, [12]), 2)
+
+    def test_a_page_repeated_within_one_send_fails_the_room(self):
+        mgr = _prefill_manager()
+        mgr.request_status[ROOM] = KVPoll.WaitingForInput
+        mgr.append_send_blocks(ROOM, [3, 4, 5, 6])
+
+        self.assertIsNone(mgr.append_send_blocks(ROOM, [9, 10, 9]))
+
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertRegex(mgr.failure_records[ROOM], r"KV page 9 .* positions 4 and 6")
+
+    def test_rooms_keep_separate_page_lists(self):
+        mgr = _prefill_manager()
+        mgr.append_send_blocks(ROOM, [3, 4])
+        self.assertEqual(mgr.append_send_blocks(OTHER_ROOM, [4, 3]), 0)
+        self.assertEqual(mgr._prefill.send_blocks[OTHER_ROOM], [4, 3])
+
+
 class TestSenderLeases(unittest.TestCase):
     def test_registered_read_holds_room_until_poll_stats_settles_it(self):
         mgr = _prefill_manager()

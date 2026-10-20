@@ -1631,7 +1631,9 @@ def get_default_block_sizes(
             )
             if vmem_est <= vmem_budget:
                 break
-            if bkv_sz > bq_sz * bkv_alignment:
+            # A query tile already at its floor cannot shrink; the KV tile must,
+            # or the loop never terminates.
+            if bkv_sz > bq_sz * bkv_alignment or bq_sz <= min_bq_sz:
                 bkv_sz = max(bkv_sz // 2, bkv_alignment)
                 bkv_csz = bkv_sz
             else:

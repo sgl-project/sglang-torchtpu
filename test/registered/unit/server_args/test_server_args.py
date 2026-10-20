@@ -2715,6 +2715,40 @@ class TestTpuCompileTracer(unittest.TestCase):
                 handle_tpu_compile_tracer(args)
 
 
+class TestTpuBatchLimitsUnderAttentionDp(CustomTestCase):
+    def test_decode_grid_reaches_attention_tp_padded_rows(self):
+        """Attention DP pads a worker's decode rows up to the attention-TP width
+        (8 here), so even one request per worker runs an 8-row decode program;
+        a grid stopping at the request cap of 4 has no bucket for it."""
+        args = ServerArgs(
+            model_path="dummy",
+            device="tpu",
+            tp_size=16,
+            attn_dp_size=2,
+            max_running_requests=4,
+            tpu_compile_bs=[1, 2, 4],
+            chunked_prefill_size=4096,
+            mem_fraction_static=0.8,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=None,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+
+        self.assertEqual(resolution_result(args, "tpu_compile_bs"), [1, 2, 4, 8])
+
+
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."

@@ -52,10 +52,13 @@ Top level
     skip_unless   (condition, reason) -- the config form of @unittest.skipUnless.
 
 launch
-    recipe        Script under benchmark/tpu/ that brings the server up, e.g.
-                  "recipe/gpt_oss_120b/eval.sh". It is also what a human runs to
-                  reproduce a CI failure, so the serving config stays one copy: point at
-                  the model's recipe, or at a wrapper that execs it with the eval delta.
+    config        Python recipe under benchmark/tpu/recipe/configs/ that brings the
+                  server up, e.g. "recipe/configs/gpt_oss_20b/spec.py". The form new
+                  tests take; a human reproduces a red run with
+                  `python -m benchmark.tpu.launch_server --config <it>`.
+    recipe        Shell script under benchmark/tpu/ that brings the server up, e.g.
+                  "recipe/gpt_oss_120b/server.sh". Legacy, and mutually exclusive
+                  with `config`.
     env           Environment for the recipe. The launcher logs it on boot, so a red run
                   stays reproducible by hand. Config describing *how* the model is
                   served belongs in the recipe.
@@ -119,6 +122,7 @@ threshold is the failure mode this shape would otherwise invite.
 """
 
 import re
+import sys
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -150,7 +154,7 @@ _CONFIG_KEYS = {
     "dashboard_model",
     "skip_unless",
 }
-_LAUNCH_KEYS = {"recipe", "env", "tag", "health_timeout", "external"}
+_LAUNCH_KEYS = {"config", "recipe", "env", "tag", "health_timeout", "external"}
 # Gate keys that map straight onto AccuracyTestParams.
 _GATE_PASSTHROUGH = {
     "dataset",
@@ -194,13 +198,34 @@ def _build_launcher(launch: dict[str, Any]):
     tag = launch.get("tag", "tpu-e2e")
 
     if launch.get("external"):
-        if "recipe" in launch or "env" in launch:
-            raise ValueError("external launch takes no recipe/env: the JobSet owns it")
+        if {"recipe", "config", "env"} & set(launch):
+            raise ValueError(
+                "external launch takes no recipe/config/env: the JobSet owns it"
+            )
         return ExternalServerLauncher(health_timeout=timeout, tag=tag)
 
-    recipe = launch.get("recipe")
+    config, recipe = launch.get("config"), launch.get("recipe")
+    if config and recipe:
+        raise ValueError('launch takes "config" or "recipe", not both')
+    if config:
+        # --config resolves as a module under benchmark.tpu.recipe, so the
+        # launcher runs from the repo root, not from benchmark/tpu/.
+        return RecipeLauncher(
+            command=[
+                sys.executable,
+                "-u",
+                "-m",
+                "benchmark.tpu.launch_server",
+                "--config",
+                config,
+            ],
+            env=launch.get("env"),
+            cwd=str(_TPU_BENCH_DIR.parents[1]),
+            health_timeout=timeout,
+            tag=tag,
+        )
     if not recipe:
-        raise ValueError('launch needs either "recipe" or "external": True')
+        raise ValueError('launch needs "config", "recipe", or "external": True')
     script = Path(recipe)
     if not script.is_absolute():
         script = _TPU_BENCH_DIR / script

@@ -327,14 +327,40 @@ def calculate_block_sizes(
 
         return batch_size * num_muls
 
+    # Even if we loose some potential performance, we want to avoid OOM at all
+    # costs. Therefore, we conservatively only use 80% of the VMEM budget.
+    capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
+
+    def fit_lanes_and_buffers(
+        batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
+    ) -> tuple[int, int]:
+        # Lanes go first; fewer buffers is the last resort. Neither drops below one.
+        while (
+            batch_size > 1
+            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            batch_size -= 1
+        while (
+            n_buffer > 1
+            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            n_buffer -= 1
+        if (
+            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            raise ValueError(
+                f"Cannot fit a {bq_sz=}, {bkv_sz=} tile within 80% of"
+                f" {vmem_limit_bytes=}."
+            )
+        return batch_size, n_buffer
+
     def find_best_block_sizes(
         max_batch_size: int, max_n_buffer: int, fixed_bq_sz: int | None = None
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
-
-        # Even if we loose some potential performance, we want to avoid OOM at all
-        # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-        capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
         bkv_sz = bkv_stride = mxu_column_size
         if fixed_bq_sz is None:
@@ -342,33 +368,11 @@ def calculate_block_sizes(
         else:
             bq_sz = fixed_bq_sz
             bq_stride = 0
-        batch_size = max_batch_size
-        n_buffer = max_n_buffer
-
         # Step 1: Lower batch_size and/or n_buffer if even the smallest bq and bkv
         # size can trigger OOM.
-
-        # If current batch size triggers OOM, decrease batch size until the kernel
-        # fits within VMEM limit.
-        while (
-            batch_size > 1
-            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            > capped_vmem_limit_bytes
-        ):
-            batch_size -= 1
-
-        # As a last resort, attempt to decrease number of buffers to avoid OOM.
-        while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            > capped_vmem_limit_bytes
-        ):
-            n_buffer -= 1
-
-        # Indicates OOM was triggered even when batch_size=1 or n_buffer=1.
-        # NOTE: If the function does not exit at this point even when either values
-        # are zero, it will trigger infinite loop at the next while loop.
-        if batch_size == 0 or n_buffer == 0:
-            raise ValueError("Cannot find batch size that fits within VMEM limit.")
+        batch_size, n_buffer = fit_lanes_and_buffers(
+            max_batch_size, max_n_buffer, bq_sz, bkv_sz
+        )
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         while (
@@ -392,27 +396,46 @@ def calculate_block_sizes(
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
         # Step 3: Given current tile size, calculate compute tile size.
+        if fixed_bq_sz is not None:
+            return configs.BlockSizes(
+                bq_sz=bq_sz,
+                bq_c_sz=bq_sz,
+                bkv_sz=bkv_sz,
+                batch_size=batch_size,
+                n_buffer=n_buffer,
+            )
 
         # Fixed threshold value based on hardware spec.
         # TODO(kyuyeunk): Use different threshold based on hardware and precision.
         threshold = 1500
-
-        num_bq_c = 1
-        last_valid_bq_c_sz = bq_c_sz = bq_sz
-        bq_c_rem = 0
-
-        while (
-            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
-            or bq_c_rem != 0
-        ) and num_bq_c < bq_sz:
-            if bq_c_rem == 0:
-                last_valid_bq_c_sz = bq_c_sz
-            num_bq_c += 1
+        # In flash_attention, each compute sub-tile reshapes Q to
+        # (bq_c_sz * aligned_num_q_heads_per_kv_head, head_dim), so keep
+        # bq_c_sz a power-of-2 divisor >= 1 full sublane tile (num_lanes)
+        # where possible, and return the divisor that satisfies threshold
+        # rather than the previous divisor that exceeded it.
+        min_bq_c_sz = min(bq_sz, max(1, num_lanes // aligned_num_q_heads_per_kv_head))
+        max_num_bq_c = min(bq_sz, 32)
+        best_bq_c_sz = bq_sz
+        for num_bq_c in range(1, max_num_bq_c + 1):
             bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+            if bq_c_rem != 0:
+                continue
+            if (
+                bq_c_sz > min_bq_c_sz
+                and (bq_c_sz & (bq_c_sz - 1)) != 0
+                and bq_c_sz != bq_sz
+            ):
+                continue
+            best_bq_c_sz = bq_c_sz
+            if (
+                calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) <= threshold
+                or bq_c_sz <= min_bq_c_sz
+            ):
+                break
 
         return configs.BlockSizes(
             bq_sz=bq_sz,
-            bq_c_sz=last_valid_bq_c_sz,
+            bq_c_sz=best_bq_c_sz,
             bkv_sz=bkv_sz,
             batch_size=batch_size,
             n_buffer=n_buffer,
@@ -434,7 +457,49 @@ def calculate_block_sizes(
     # cell's worth.
     prefill_batch_size = 1
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    def cover_whole_pages(block_sizes: configs.BlockSizes) -> configs.BlockSizes:
+        # The schedule fetches block k's cached pages from k * cdiv(bkv_sz, page),
+        # while the kernel labels its keys from k * bkv_sz; they agree on whole pages.
+        page = serve_cfgs.page_size
+        if block_sizes.bkv_sz % page == 0:
+            return block_sizes
+        if block_sizes.bkv_sz > page:
+            # The q block stays as searched; the kernel does not need bq_sz <= bkv_sz.
+            return dataclasses.replace(
+                block_sizes, bkv_sz=block_sizes.bkv_sz // page * page
+            )
+        # Growing the k block to one page needs VMEM the search did not budget.
+        # Like the search, keep the buffers and halve the q block first; a mixed
+        # q block stops at 2 tokens, since the kernel reads bq_sz == 1 as decode.
+        min_bq_sz = min(block_sizes.bq_sz, 2)
+        bq_sz = block_sizes.bq_sz
+        while (
+            bq_sz > min_bq_sz
+            and calculate_vmem_usage(1, block_sizes.n_buffer, bq_sz, page)
+            > capped_vmem_limit_bytes
+        ):
+            bq_sz = max(min_bq_sz, bq_sz // 2)
+        try:
+            batch_size, n_buffer = fit_lanes_and_buffers(
+                block_sizes.batch_size, block_sizes.n_buffer, bq_sz, page
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"A one-page k block ({page=}) does not fit within VMEM limit;"
+                " a smaller page size may."
+            ) from e
+        return dataclasses.replace(
+            block_sizes,
+            bq_sz=bq_sz,
+            bq_c_sz=math.gcd(block_sizes.bq_c_sz, bq_sz),
+            bkv_sz=page,
+            batch_size=batch_size,
+            n_buffer=n_buffer,
+        )
+
+    decode_block_sizes = cover_whole_pages(
+        find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     # Operator escape hatch. The search above works from a VMEM estimate that
@@ -447,6 +512,8 @@ def calculate_block_sizes(
         page = serve_cfgs.page_size
         aligned = max(page, -(-int(forced_bkv) // page) * page)
         prefill_block_sizes = dataclasses.replace(prefill_block_sizes, bkv_sz=aligned)
+    else:
+        prefill_block_sizes = cover_whole_pages(prefill_block_sizes)
 
     return decode_block_sizes, prefill_block_sizes
 
@@ -651,9 +718,13 @@ def ragged_paged_attention(
         else prepare_attention_sink(attention_sink, num_kv_heads, queries.dtype)
     )
 
-    default_decode, default_prefill = calculate_block_sizes(
-        model_cfgs, serve_cfgs, vmem_limit_bytes
-    )
+    # Explicit block sizes for both modes are used as given, even where the
+    # search would refuse.
+    default_decode = default_prefill = None
+    if decode_block_sizes is None or prefill_block_sizes is None:
+        default_decode, default_prefill = calculate_block_sizes(
+            model_cfgs, serve_cfgs, vmem_limit_bytes
+        )
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     lse_hbm = None

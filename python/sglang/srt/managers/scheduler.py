@@ -460,6 +460,8 @@ class Scheduler(
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     kv_free_fence: Optional["KVFreeFence"] = None
+    # Draft KV pools cpu_tensor retraction backs up with the target KV.
+    retraction_draft_kv_pools: tuple = ()
 
     def __init__(
         self,
@@ -532,7 +534,7 @@ class Scheduler(
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
-        bootstrap.init_parallel_runtime(
+        self.distributed_init_time = bootstrap.init_parallel_runtime(
             server_args=server_args,
             device=get_device().device,
             dist_port=self.nccl_port,
@@ -725,13 +727,21 @@ class Scheduler(
         self.scheduler_startup_begin = time.perf_counter()
 
     def init_startup_timing_summary(self) -> None:
+        startup_end = time.perf_counter()
+        post_sync_startup_begin = self.tp_worker.model_runner.post_sync_startup_begin
         self.startup_time = build_scheduler_startup_time(
             target_load_weight=self.tp_worker.weight_load_time,
             draft_load_weight=(
                 0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
             ),
             kv_cache_allocation=self.kv_cache_allocation_time,
-            scheduler_e2e=time.perf_counter() - self.scheduler_startup_begin,
+            scheduler_e2e=startup_end - self.scheduler_startup_begin,
+            distributed_init=self.distributed_init_time,
+            post_sync_startup=(
+                None
+                if post_sync_startup_begin is None
+                else startup_end - post_sync_startup_begin
+            ),
             target_cuda_graph=self.tp_worker.graph_time_usage,
             draft_cuda_graph=(
                 None
@@ -1084,6 +1094,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
+            self.retraction_draft_kv_pools = self.draft_worker.retraction_draft_kv_pools
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -1807,12 +1818,7 @@ class Scheduler(
             synchronize_device=self.device_module.synchronize,
             **fence_kwargs,
         )
-        # A PD prefill server releases requests after their prefill forward,
-        # whose copy_done precedes the backup, so its backups need no deferral.
-        if (
-            self._uses_raiden_hicache()
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
+        if self._uses_raiden_hicache():
             fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
 
     def precompile_tpu_spec_ops(self) -> None:
@@ -3758,11 +3764,11 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
-    def stash_chunked_request(self, req: Req):
+    def stash_chunked_request(self, req: Req, *, mid_prefill: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
         else:
-            checkpoint_kv_cache(req, self.tree_cache)
+            checkpoint_kv_cache(req, self.tree_cache, mid_prefill=mid_prefill)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
@@ -3799,11 +3805,7 @@ class Scheduler(
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
-            defer_page_release = (
-                getattr(req.disagg_kv_sender, "group_failure_requires_drain", False)
-                and hasattr(req.disagg_kv_sender, "drained")
-                and not self._group_drained([req.disagg_kv_sender])[0]
-            )
+            defer_page_release = self._defer_aborted_page_release(req.disagg_kv_sender)
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
@@ -3823,10 +3825,34 @@ class Scheduler(
         self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
+    def _defer_aborted_page_release(self, sender) -> bool:
+        """Whether an aborted prefill request keeps its pages until ``sender``
+        has drained. Pipeline stages always defer: only the in-flight queue's
+        release consensus frees them, in the same iteration on every stage."""
+        if not (
+            getattr(sender, "group_failure_requires_drain", False) is True
+            and hasattr(sender, "drained")
+        ):
+            return False
+        return get_parallel().pp_size > 1 or not self._group_drained([sender])[0]
+
+    def _release_consensus_sender_aborts(self, rids) -> None:
+        """Pipeline prefill: free the pages of deferred aborts whose senders
+        every stage reported drained in the release consensus ``rids``."""
+        still_held = []
+        for req in self._deferred_chunked_sender_aborts:
+            if req.rid not in rids:
+                still_held.append(req)
+                continue
+            req.disagg_kv_sender.clear()
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._deferred_chunked_sender_aborts = still_held
+
     def _drain_deferred_chunked_sender_aborts(self) -> None:
         """Release locally-aborted prefill pages after raiden relinquishes them."""
         pending = self._deferred_chunked_sender_aborts
-        if not pending:
+        if not pending or get_parallel().pp_size > 1:
+            # Pipeline stages free them through _release_consensus_sender_aborts.
             return
         drained = None
         if current_platform.is_tpu():
@@ -3952,7 +3978,7 @@ class Scheduler(
             # len(prefix_indices), so there is nothing new to cache and
             # stashing would be a no-op.
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
-                self.stash_chunked_request(self.chunked_req)
+                self.stash_chunked_request(self.chunked_req, mid_prefill=True)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -4541,7 +4567,9 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                draft_kv_pools=self.retraction_draft_kv_pools
+            )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (

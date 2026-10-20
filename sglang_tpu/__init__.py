@@ -10,6 +10,8 @@ import importlib.util
 import logging
 import os
 
+os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["activate", "ENTRY_POINT_NAME", "PLATFORM_CLASS_PATH"]
@@ -21,6 +23,7 @@ PLATFORM_CLASS_PATH = "sglang_tpu.platform:TpuOOTPlatform"
 def activate():
     """Return the platform class path only when selected by name; the in-tree
     ``tpu`` entry point answers auto-discovery, and two answers are an error."""
+    os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
     if os.environ.get("SGLANG_PLATFORM") != ENTRY_POINT_NAME:
         return None
 

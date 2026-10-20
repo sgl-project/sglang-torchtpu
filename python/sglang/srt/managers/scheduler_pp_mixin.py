@@ -9,13 +9,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 import torch.distributed
 
-from sglang.srt.disaggregation.base.conn import KVPoll, StateType
-from sglang.srt.disaggregation.utils import (
-    KVClassType,
-    TransferBackend,
-    get_kv_class,
-    poll_and_all_reduce_attn_cp_tp_group,
-)
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import GroupCoordinator, P2PWork
 from sglang.srt.environ import envs
@@ -29,7 +24,6 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
@@ -417,9 +411,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                    self._pp_pd_stage_ready(cur_batch, result)
+                    self._pp_pd_stage_ready(mb_id, cur_batch, result)
                 if get_parallel().pp_async_batch_depth > 0:
-                    self._pp_send_deferred_output(next_first_rank_mb_id)
+                    self._pp_pd_send_deferred_output(next_first_rank_mb_id)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -844,61 +838,38 @@ class SchedulerPPMixin:
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
-    def _pp_pd_stage_ready(self: Scheduler, batch: ScheduleBatch, result) -> None:
-        """Hand the Raiden pipeline transfer each request whose final chunk this
-        forward computes, fenced on the forward's output, so this stage's share
-        can move before the pipeline samples."""
-        if self.transfer_backend != TransferBackend.RAIDEN:
-            return
-        raiden_sender_cls = get_kv_class(TransferBackend.RAIDEN, KVClassType.SENDER)
-
-        kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
-        pipeline = kv_manager._pipeline
-        if pipeline is None or not pipeline.stage_parts:
-            return
-        # Register stage parts whose fences completed since the last launch.
-        pipeline.advance_stages()
-        finals = [
-            req
-            for req in batch.reqs
-            # Health checks carry a fake sender with no Raiden room.
-            if isinstance(req.disagg_kv_sender, raiden_sender_cls)
-            and req.extend_range.end >= len(req.origin_input_ids)
-        ]
-        if not finals:
-            return
-        proxy = result.pp_hidden_states_proxy_tensors
-        output = (
-            next(iter(proxy.tensors.values()))
-            if proxy is not None and proxy.tensors
-            else result.next_token_ids
+    def _pp_pd_stage_ready(
+        self: Scheduler, mb_id: int, batch: ScheduleBatch, result
+    ) -> None:
+        """Report a launched forward to the prefill KV manager, which may move
+        this stage's KV of the requests it finishes before they sample."""
+        self.disagg_prefill_bootstrap_queue.kv_manager.on_forward_launched(
+            self, mb_id, batch, result
         )
-        # One completion fence per forward, shared by its requests.
-        fence = pipeline.make_fence(output)
-        page_size = self.token_to_kv_pool_allocator.page_size
-        has_swa = StateType.SWA in kv_manager.kv_args.state_types
-        for req in finals:
-            end = len(req.origin_input_ids)
-            # Host-resident tables: reading page ids does not touch the device.
-            row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
-            full = kv_to_page_indices(row[:end], page_size).tolist()
-            swa = []
-            if has_swa:
-                window_start = max(0, end - self.sliding_window_size)
-                window_start = window_start // page_size * page_size
-                swa = kv_to_page_indices(
-                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                        row[window_start:end]
-                    ),
-                    page_size,
-                ).tolist()
-            pipeline.stage_ready(req.disagg_kv_sender.bootstrap_room, full, swa, fence)
+
+    def _pp_pd_send_deferred_output(self: Scheduler, mb_id: int) -> None:
+        """_pp_send_deferred_output for the prefill. The wave ships outputs as
+        host copies; the sampled tokens are copied first, so the prefill KV
+        manager gets the same copy once it is sent."""
+        target = self.mbs[mb_id] if self._pp_output_send_deferred() else None
+        if target is None or _pp_can_skip_output_comm(target):
+            self._pp_send_deferred_output(mb_id)
+            return
+        outputs = self.last_rank_comm_queue[0][1].tensors
+        next_token_ids = outputs["next_token_ids"] = outputs["next_token_ids"].cpu()
+        self._pp_send_deferred_output(mb_id)
+        self.disagg_prefill_bootstrap_queue.kv_manager.on_outputs_copied(
+            mb_id, next_token_ids
+        )
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
+        # Aborts holding pages until their senders drain vote here too, so
+        # every stage frees them in the same iteration.
+        reqs = self.disagg_prefill_inflight_queue + self._deferred_chunked_sender_aborts
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
+                reqs,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
@@ -909,7 +880,7 @@ class SchedulerPPMixin:
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
+                reqs,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )

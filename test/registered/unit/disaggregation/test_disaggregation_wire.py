@@ -677,6 +677,7 @@ class TestDisaggregationWire(unittest.TestCase):
         batch = SimpleNamespace(
             reqs=[req],
             device="cpu",
+            metadata_device=lambda: "cpu",
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.arange(5, dtype=torch.int64).reshape(1, 5)
             ),

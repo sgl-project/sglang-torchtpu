@@ -11,6 +11,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_rpa_base import (
     _zero_inactive_rpa_rows,
 )
@@ -26,6 +27,19 @@ from sglang_tpu.attention_pallas_rpa_base import (
     _get_pages_per_seq,
     _page_table_smem_bytes,
 )
+
+
+class TestDistributionWarmup(CustomTestCase):
+    def test_distribution_has_fixed_shape_for_all_live_counts(self):
+        backend = object.__new__(TpuPallasRpaV3AttnBackend)
+        backend._distribution_cache = {}
+        backend.warmup_distributions(256, "cpu:0")
+        self.assertEqual(len(backend._distribution_cache), 2)
+        for rows in (0, 1, 3, 7, 255, 256):
+            for decode in (False, True):
+                dist = backend._get_cached_rpa_distribution(decode, rows, "cpu")
+                self.assertEqual(dist.shape, (3,))
+                self.assertEqual(dist.tolist(), [rows if decode else 0, rows, rows])
 
 
 class TestPageTableSmemBudget(unittest.TestCase):

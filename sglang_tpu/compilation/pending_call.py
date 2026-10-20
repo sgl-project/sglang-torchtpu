@@ -8,6 +8,8 @@ from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -33,14 +35,24 @@ class PendingCall:
     _forward_context: ForwardContext | None = field(
         default_factory=_capture_forward_context, repr=False
     )
+    _grad_enabled: bool = field(default_factory=torch.is_grad_enabled, repr=False)
+    _inference_mode: bool = field(
+        default_factory=torch.is_inference_mode_enabled, repr=False
+    )
 
     def wait(self) -> Any:
-        scope = (
-            forward_context(self._forward_context)
-            if self._forward_context is not None
-            else nullcontext()
-        )
-        with scope:
+        # Restore inference mode, but never re-enable grad a caller disabled
+        # (WarmupQueue.wait runs every warmup under no_grad).
+        grad_enabled = self._grad_enabled and torch.is_grad_enabled()
+        with (
+            (
+                forward_context(self._forward_context)
+                if self._forward_context is not None
+                else nullcontext()
+            ),
+            torch.inference_mode(self._inference_mode),
+            torch.set_grad_enabled(grad_enabled),
+        ):
             return self._context.run(self._wait)
 
     def then(self, callback: Callable[[Any], Any]) -> PendingCall:

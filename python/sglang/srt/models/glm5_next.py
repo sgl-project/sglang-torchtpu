@@ -1216,7 +1216,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.mm_config = config
         text_config = config.text_config
         self.encoder_only = bool(getattr(config, "encoder_only", False))
-        self.language_only = bool(getattr(config, "language_only", False))
+        language_model_only = bool(getattr(config, "language_model_only", False))
+        self.language_only = (
+            bool(getattr(config, "language_only", False)) or language_model_only
+        )
 
         self.fuse_qkv_a_proj = (
             not self.encoder_only
@@ -1280,8 +1283,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,
             )
-        self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
-            self.config.rope_scaling or {}
+        # ModelConfig computes no mrope positions for --language-model-only.
+        self.is_mrope_enabled = (
+            not self.encoder_only
+            and not language_model_only
+            and "mrope_section" in (self.config.rope_scaling or {})
         )
 
     def get_input_embeddings(self) -> nn.Embedding:

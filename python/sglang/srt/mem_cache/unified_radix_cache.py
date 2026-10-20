@@ -1006,7 +1006,7 @@ class UnifiedRadixCache(BasePrefixCache):
         node_id: NodeId,
         params: DecLockRefParams,
     ) -> None:
-        if self.disable:
+        if self.disable or self.session.try_dec_swa_lock_only(node_id):
             return
         result = self.tree_core.dec_swa_lock_only(node_id, params)
         self._free_values(result.device_frees, result.host_frees)
@@ -1039,6 +1039,22 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
+
+    def defer_chunk_checkpoint(self, req: Req) -> bool:
+        # A chunk insert hands the tree the SWA window below the chunk end, which
+        # the request can no longer free (about half a long prompt at 4096-token
+        # chunks and a 2048 window). Kept request-owned, the chunk advances like an
+        # unpublished request, which frees only below the window and the SWA branch.
+        if (
+            self.disable
+            or not self.supports_swa()
+            or self.supports_mamba()
+            or req.session_id is not None
+            or req.finished()
+        ):
+            return False
+        self.advance_unpublished_req(req)
+        return True
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:

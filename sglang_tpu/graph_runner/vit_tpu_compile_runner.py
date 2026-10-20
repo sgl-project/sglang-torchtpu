@@ -19,6 +19,7 @@ from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
+from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.patches import _register_tpu_compile_backend
 
@@ -218,10 +219,17 @@ class VisionTpuCompilePolicy(CompilePolicy):
 
                 return direct_compile(
                     torch.no_grad()(method),
+                    name=self.name,
+                    spmd_safe=self.spmd_safe,
                     specialization_key=lambda *args: tuple(
                         (tuple(t.shape), t.dtype) for t in args
                     ),
                     model=model,
+                    lift_rank=(
+                        torch.distributed.is_initialized()
+                        and get_parallel().tp_group.world_size
+                        == torch.distributed.get_world_size()
+                    ),
                 )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         return compiler(

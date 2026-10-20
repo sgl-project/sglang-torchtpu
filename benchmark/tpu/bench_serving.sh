@@ -58,7 +58,7 @@
 #                                   # to skip and rely on ./warmup.sh.
 #   SEED=1
 #   RANDOM_RANGE_RATIO=0.8          # lens uniform in [0.8*L, L]. Matches the
-#                                   # InferenceX harness (and torchtpu-vllm)
+#                                   # InferenceX harness (and vllm-torchtpu)
 #   PROFILE=0                       # 1 → torch profiler /start_profile capture
 #   PROFILE_NUM_STEPS=5
 #   PROFILE_ACTIVITIES="CPU TPU"      # xprof device activity; CPU GPU is CUDA-only

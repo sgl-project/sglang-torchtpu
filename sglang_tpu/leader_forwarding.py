@@ -18,29 +18,48 @@ from sglang.srt.utils.network import try_bind_socket
 logger = logging.getLogger(__name__)
 
 
+async def _write(write, *args):
+    try:
+        await write(*args)
+    except RuntimeError as error:
+        # uvloop raises RuntimeError, not an anyio error, writing to a transport
+        # the peer already reset.
+        raise anyio.ClosedResourceError from error
+
+
 async def _copy_stream(source, destination, cancel_scope):
     try:
         async for data in source:
-            await destination.send(data)
+            await _write(destination.send, data)
         # Preserve half-close: the peer can still send its response after EOF.
-        await destination.send_eof()
-    except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+        await _write(destination.send_eof)
+    except (anyio.BrokenResourceError, anyio.ClosedResourceError, OSError):
         cancel_scope.cancel()
 
 
 async def _forward_connection(target_host, port, client):
+    # One connection must never stop the leader forwarder: that shuts the worker down.
+    try:
+        await _forward_connection_inner(target_host, port, client)
+    except Exception:
+        logger.warning(
+            "TPU leader forwarder dropped a connection on port %s", port, exc_info=True
+        )
+
+
+async def _forward_connection_inner(target_host, port, client):
     async with client:
         try:
             with anyio.fail_after(10):
-                upstream = await anyio.connect_tcp(target_host, port)
+                leader = await anyio.connect_tcp(target_host, port)
         except (OSError, TimeoutError) as error:
             # Closing the client makes readiness fail until the leader listens.
             logger.debug("TPU leader connection on port %s failed: %s", port, error)
             return
 
-        async with upstream, anyio.create_task_group() as tasks:
-            tasks.start_soon(_copy_stream, client, upstream, tasks.cancel_scope)
-            tasks.start_soon(_copy_stream, upstream, client, tasks.cancel_scope)
+        async with leader, anyio.create_task_group() as tasks:
+            tasks.start_soon(_copy_stream, client, leader, tasks.cancel_scope)
+            tasks.start_soon(_copy_stream, leader, client, tasks.cancel_scope)
 
 
 async def _serve_ports(host, target_host, ports, *, task_status):

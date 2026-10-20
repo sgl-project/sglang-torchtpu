@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -27,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import ceil_align, next_power_of_2
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.bucketer import (
     Bucketer,
@@ -46,6 +45,7 @@ from sglang_tpu.cp_forward import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
+    from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 
 logger = get_logger(__name__)
 
@@ -609,6 +609,13 @@ def _pad_forward_batch_inputs(
     is_draft_extend_v2 = forward_batch.forward_mode.is_draft_extend_v2()
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
+    if (
+        envs.SGLANG_TPU_HOST_PADDING.get()
+        and is_decode
+        and forward_batch.spec_info is None
+    ):
+        # Relay-gathered decode tokens arrive bucketed; lengths stay logical.
+        real_q = real_b
 
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
@@ -777,6 +784,16 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     """
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
+        if (
+            envs.SGLANG_TPU_HOST_PADDING.get()
+            and field == "mrope_positions"
+            and isinstance(value, torch.Tensor)
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.spec_info is None
+        ):
+            # Ordinary decode consumes mRoPE only inside the decoder. Leave
+            # its device tensor bucketed instead of creating an unused slice.
+            continue
         dim = _TOKEN_FIELD_DIM.get(field, 0)
         if isinstance(value, torch.Tensor) and value.shape[dim] > real_q:
             setattr(forward_batch, field, value.narrow(dim, 0, real_q))
@@ -879,7 +896,7 @@ class CompiledForwardShim:
     def __init__(
         self,
         compiled_fn: Callable[..., Any],
-        policy: DecoderCompilePolicy,
+        policy: DecoderTpuCompilePolicy,
         warmup_async_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.fn = compiled_fn
@@ -1051,6 +1068,7 @@ class CompiledForwardShim:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        keep_padded = self.policy.keep_outputs_padded(forward_batch)
         # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
         # which is_extend() excludes.
         if (
@@ -1175,13 +1193,17 @@ class CompiledForwardShim:
                 def finalize_pending(result: Any) -> Any:
                     previous = _pin_fields(forward_batch, finalize_fields)
                     try:
-                        return self._finalize_forward(result, forward_batch)
+                        return self._finalize_forward(
+                            result, forward_batch, keep_padded=keep_padded
+                        )
                     finally:
                         _restore_fields(forward_batch, previous)
 
                 out = out.then(finalize_pending)
             else:
-                out = self._finalize_forward(out, forward_batch)
+                out = self._finalize_forward(
+                    out, forward_batch, keep_padded=keep_padded
+                )
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
@@ -1191,7 +1213,12 @@ class CompiledForwardShim:
                 ]
         if mm_embeds is not None:
             real_q = getattr(forward_batch, _REAL_Q_KEY, None)
-            if real_q is not None and mm_embeds.shape[0] > real_q:
+            if (
+                not keep_padded
+                and real_q is not None
+                and mm_embeds.shape[0] > real_q
+                and not self.policy.keeps_padded_mm_embeds(forward_batch)
+            ):
                 mm_embeds = mm_embeds[:real_q]
             forward_batch.mm_input_embeds = mm_embeds
 
@@ -1210,9 +1237,11 @@ class CompiledForwardShim:
             return out.then(finish)
         return finish(out)
 
-    def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
+    def _finalize_forward(
+        self, out: Any, forward_batch: Any, *, keep_padded: bool
+    ) -> Any:
         spec_info = forward_batch.spec_info
-        if spec_info is None or not spec_info.keep_outputs_padded:
+        if not keep_padded and (spec_info is None or not spec_info.keep_outputs_padded):
             out = self.policy.finalize_forward_batch(out, forward_batch)
         return out
 
@@ -1236,6 +1265,7 @@ def reconcile_tpu_batch_limits(
     tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
     attn_dp_size: int = 1,
+    attn_tp_size: int = 1,
 ) -> tuple[int, Optional[List[int]], int]:
     """Make the TPU compile grid cover scheduler concurrency without dead shapes.
 
@@ -1243,6 +1273,11 @@ def reconcile_tpu_batch_limits(
     at most ``max_running_requests // attn_dp_size`` requests (the same
     division kv_cache_configurator applies), so all coupling here uses that
     per-worker concurrency, not the global cap.
+
+    ``attn_tp_size`` is the attention-TP width under attention DP and 1
+    otherwise: attention DP rounds every worker's decode rows up to a multiple
+    of it before the bucket lookup (``get_dp_padded_token_counts``), so the
+    grid has to reach the rounded per-worker cap.
     """
     per_worker_mrr = (
         max(max_running_requests // attn_dp_size, 1)
@@ -1267,14 +1302,14 @@ def reconcile_tpu_batch_limits(
     else:
         tcmb = DEFAULT_TPU_COMPILE_MAX_BS
 
-    if per_worker_mrr is not None:
-        tcmb = max(tcmb, per_worker_mrr)
-    else:
+    if per_worker_mrr is None:
         per_worker_mrr = tcmb
         max_running_requests = tcmb * attn_dp_size
+    per_worker_rows = ceil_align(per_worker_mrr, attn_tp_size)
+    tcmb = max(tcmb, per_worker_rows)
 
-    if tpu_compile_bs and max(tpu_compile_bs) < per_worker_mrr:
-        tpu_compile_bs = sorted(set(tpu_compile_bs) | {per_worker_mrr})
+    if tpu_compile_bs and max(tpu_compile_bs) < per_worker_rows:
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {per_worker_rows})
 
     return tcmb, tpu_compile_bs, max_running_requests
 

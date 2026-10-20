@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from contextlib import contextmanager
 from enum import Enum
 from typing import TYPE_CHECKING, Iterable, Optional
 
@@ -78,6 +79,16 @@ class AttentionBackend(ABC):
     # it assign their own type. Declared here so generic snapshot/restore code
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
+
+    @contextmanager
+    def bind_forward_metadata(self, metadata, forward_mode: ForwardMode):
+        """Install graph inputs while tracing a possibly deferred forward."""
+        previous = self.forward_metadata
+        self.forward_metadata = metadata
+        try:
+            yield
+        finally:
+            self.forward_metadata = previous
 
     # The runner's KVIndexTranslator; backends that read through it set the
     # instance attribute in __init__. None means "no translate" -- a backend

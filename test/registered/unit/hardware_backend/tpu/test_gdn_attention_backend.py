@@ -29,7 +29,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 import importlib.util
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -47,6 +47,12 @@ class _BackendNoInit(TpuGDNAttnBackend):
 
     def __init__(self):  # noqa: D107  (deliberately skips super().__init__)
         self._distribution_cache = {}
+        self._query_start_loc_cache = {}
+        self._slot_memo = None
+        self._spec_window = 1
+        self._read_offsets_pool = None
+        self._read_offsets = None
+        self._num_spec_tokens = 0
 
 
 class TestGDNDistribution(CustomTestCase):
@@ -115,9 +121,15 @@ class TestGDNSinglePassFlags(CustomTestCase):
         )
         backend._extra_buffer_enabled = False
         backend.req_to_token_pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(
+                checkpoint_width=1, checkpoint_read_offsets=None
+            ),
             mamba2_layer_cache=lambda _: cache,
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
+            # Read by the slot-id memo (TpuGDNAttnBackend._slot_indices).
+            req_index_to_mamba_index_mapping=torch.zeros(1, dtype=torch.int32),
+            mamba_v2p_table=None,
         )
         batch = SimpleNamespace(
             seq_lens=torch.full((bs,), 5),
@@ -161,6 +173,127 @@ class TestGDNSinglePassFlags(CustomTestCase):
                 self.assertEqual(distribution, [bs, bs, bs] if decode else [0, 0, bs])
                 self.assertEqual(batched_only, decode)
                 self.assertEqual(prefill_only, not decode)
+
+
+class TestGDNVerifyMetadata(CustomTestCase):
+    """With checkpoint rows, the op gets slot ids and the pool's whole offset
+    table; it gathers the offsets and scales the slots in-graph."""
+
+    def _backend(self, offsets):
+        backend = _BackendNoInit()
+        backend._spec_window = 3
+        backend._read_offsets_pool = offsets
+        backend._extra_buffer_enabled = False
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(select_checkpoints=Mock()),
+            get_mamba_indices=lambda indices: indices,
+            translate_mamba_indices=lambda indices: indices,
+            # Read by the slot-id memo (TpuGDNAttnBackend._slot_indices).
+            req_index_to_mamba_index_mapping=torch.zeros(1, dtype=torch.int32),
+            mamba_v2p_table=None,
+        )
+        return backend
+
+    def _batch(self, mode):
+        return SimpleNamespace(
+            req_pool_indices=torch.tensor([2, 1, -1]),
+            mamba_track_mask=None,
+            _tpu_real_b=2,
+            seq_lens=torch.tensor([17, 29, 0]),
+            extend_seq_lens=torch.tensor([3, 3, 3]),
+            forward_mode=mode,
+            spec_info=SimpleNamespace(num_tokens_per_req=3),
+        )
+
+    def test_verify_passes_slots_and_the_offset_table(self):
+        offsets = torch.tensor([0, 2, 1], dtype=torch.int32)
+        backend = self._backend(offsets)
+        backend.init_forward_metadata(self._batch(ForwardMode.TARGET_VERIFY))
+        self.assertEqual(backend._distribution.tolist(), [2, 2, 2])
+        self.assertEqual(backend._query_start_loc.tolist(), [0, 3, 6, 9])
+        self.assertEqual(backend._seq_lens.tolist(), [20, 32, 3])
+        self.assertEqual(backend._state_indices.tolist(), [2, 1, -1])
+        self.assertIs(backend._read_offsets, offsets)
+        self.assertEqual(backend._num_spec_tokens, 2)
+        self.assertEqual(offsets.tolist(), [0, 2, 1])
+
+    def test_extend_resets_the_batch_offsets(self):
+        offsets = torch.tensor([0, 2, 1], dtype=torch.int32)
+        backend = self._backend(offsets)
+        backend.init_forward_metadata(self._batch(ForwardMode.EXTEND))
+        self.assertIsNone(backend._read_offsets)
+        self.assertEqual(backend._num_spec_tokens, 0)
+        self.assertEqual(offsets.tolist(), [0, 0, 0])
+
+    def test_commit_selects_checkpoints_for_the_verified_slots(self):
+        backend = self._backend(torch.zeros(3, dtype=torch.int32))
+        steps = torch.tensor([1, -1])
+        # A DP pad slot (-1) maps to the null slot, which the pool keeps inert.
+        backend.commit_verified_states(
+            None, torch.tensor([2, -1]), steps, None, None, None
+        )
+        slots, got_steps = (
+            backend.req_to_token_pool.mamba_pool.select_checkpoints.call_args.args
+        )
+        self.assertEqual(slots.tolist(), [2, 0])
+        self.assertIs(got_steps, steps)
+
+    def test_commit_rejects_radix_tracking(self):
+        backend = self._backend(torch.zeros(3, dtype=torch.int32))
+        with self.assertRaises(NotImplementedError):
+            backend.commit_verified_states(
+                None,
+                torch.tensor([2]),
+                torch.tensor([1]),
+                torch.tensor([3]),
+                torch.tensor([1]),
+                None,
+            )
+
+
+class _RowReadRecorder:
+    """Mapping stand-in that records each row read by a Python int."""
+
+    def __init__(self, rows: int):
+        self.shape = (rows,)
+        self.device = torch.device("cpu")
+        self.int_rows: list[int] = []
+
+    def __getitem__(self, index):
+        if isinstance(index, int):
+            self.int_rows.append(index)
+        return torch.zeros(1, dtype=torch.int32)
+
+    def __setitem__(self, index, value):
+        pass
+
+
+class TestGDNSlotBookkeepingWarmup(CustomTestCase):
+    """The P/D state payload reads mapping[req_pool_idx] with a Python int, which
+    compiles one program per row; warmup must cover every row a request can hold."""
+
+    def _warm_rows(self, disaggregation_mode: str) -> list[int]:
+        backend = _BackendNoInit()
+        mapping = _RowReadRecorder(rows=5)
+        backend.req_to_token_pool = SimpleNamespace(
+            size=4,
+            req_index_to_mamba_index_mapping=mapping,
+            mamba_pool=SimpleNamespace(clear_slots=Mock()),
+        )
+        with patch(
+            "sglang_tpu.attention_gdn_pallas.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode=disaggregation_mode),
+        ):
+            backend._warmup_slot_bookkeeping()
+        return mapping.int_rows
+
+    def test_pd_servers_warm_every_mapping_row(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                self.assertEqual(sorted(self._warm_rows(mode)), list(range(5)))
+
+    def test_aggregated_server_skips_row_reads(self):
+        self.assertEqual(self._warm_rows("null"), [])
 
 
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")

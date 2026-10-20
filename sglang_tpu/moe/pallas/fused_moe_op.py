@@ -156,7 +156,9 @@ def _drop_invalid_slots(
     return hidden_states, topk_ids, topk_weights
 
 
-def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
+def _lookup_tile_info(
+    lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False, gmm_v2_only=False
+):
     """Pick a ``TileSizes`` for this gmm_v2 call.
 
     ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
@@ -174,6 +176,9 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     pass the LOCAL expert count (``w1.shape[0]``), which under EP is already
     this rank's share -- so both are the local count and the lookup is correct
     under expert parallelism as written.
+
+    ``gmm_v2_only`` reads only the gmm_v2-measured table and returns None on
+    a miss instead of the heuristic.
 
     Keep it that way. The heuristic behind a table miss computes
     ``tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)``, and with
@@ -198,7 +203,7 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
     quant_block_size = k if rhs_scale is None else k // rhs_scale.shape[1]
     rhs_dtype = "float4_e2m1fn" if packed_fp4 else str(jnp.dtype(rhs.dtype).name)
-    tm, tk, tn = get_tuned_block_sizes(
+    tiles = get_tuned_block_sizes(
         m=int(m),
         k=int(k),
         n=int(n),
@@ -207,7 +212,11 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
         lhs_dtype=str(jnp.dtype(lhs.dtype).name),
         rhs_dtype=rhs_dtype,
         quant_block_size=quant_block_size,
+        gmm_v2_only=gmm_v2_only,
     )
+    if tiles is None:
+        return None
+    tm, tk, tn = tiles
     return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
 
 
@@ -252,18 +261,26 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
     needs the packed-aware ``_lookup_tile_info`` (it keys on the real K and the
     float4 dtype the kernel contracts in).
 
-    Every other dtype keeps the kernel's own adaptive ``calculate_tiling``.
-    That is the only path that budgets the rhs tile against ``rhs_vmem_target``
-    -- a pinned ``TileSizes`` is consumed verbatim with no clamp, so routing
-    bf16/FP8 through the lookup would retune stock TPU MoE and could overflow
-    VMEM at an untested shape. Widening this gate is a separate change that
-    needs its own perf data.
+    Every other dtype keeps the kernel's own adaptive ``calculate_tiling``
+    unless gmm_v2 was measured at its exact shape (``_tuned_or_calculated``).
     """
+    if not w2_packed:
+        return _tuned_or_calculated(lhs, w2, w2_scale, num_experts)
+    return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+
+
+def _tuned_or_calculated(lhs, rhs, rhs_scale, num_experts):
+    """A ``GMM_V2_TUNED_BLOCK_SIZES`` entry for this exact shape, else
+    ``calculate_tiling``. A pinned ``TileSizes`` skips the VMEM budget, so only
+    shapes measured on gmm_v2 are pinned; the vendored v1 entries and the
+    heuristic default never reach bf16/FP8."""
     from sglang_tpu.moe.pallas.gmm_v2 import calculate_tiling
 
-    if not w2_packed:
+    # Packed (INT4) weights store a different K and keep calculate_tiling.
+    if rhs.shape[1] != lhs.shape[1]:
         return calculate_tiling
-    return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+    tuned = _lookup_tile_info(lhs, rhs, rhs_scale, num_experts, gmm_v2_only=True)
+    return tuned or calculate_tiling
 
 
 # 3 pipelined rhs buffers + unpack staging tile + scales/lhs/acc/out.
@@ -513,6 +530,49 @@ def _fused_moe_jax(
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
 
+    # One token with combine (bs=1 decode) on packed MXFP4: one kernel that
+    # streams only the hit experts (single_token_moe.py) replaces route
+    # metadata + two gmm_v2 calls + activation + combine. It reads topk_ids
+    # directly, so it does not depend on the permute path chosen below
+    # (permute_dense_threshold).
+    if m == 1 and not no_combine:
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.moe.pallas import single_token_moe
+
+        if (
+            tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.get()
+            and single_token_moe.validated(
+                hidden_size,
+                w1.shape[2] // 2,
+                global_num_experts or num_experts,
+                topk,
+                activation_name,
+            )
+            and single_token_moe.eligible(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                w1_bias,
+                w2_bias,
+                w1_channel_scale,
+                w2_channel_scale,
+            )
+        ):
+            return single_token_moe.single_token_moe(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_ids,
+                topk_weights,
+                offset=(expert_group_offset if global_num_experts > num_experts else 0),
+                act=_fuse_act_name(activation_name),
+                hidden_size=hidden_size,
+            ).astype(out_dtype)
+
     # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
     # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
     # Block size (32 MXFP4, 512 NVFP4) is data-driven from the scale.
@@ -547,6 +607,30 @@ def _fused_moe_jax(
         )
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
+
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get():
+        from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
+
+        # One kernel streaming the selected experts' weights; None outside its case.
+        out = maybe_moe_stream(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation_name=activation_name,
+            no_combine=no_combine,
+            use_group_offset=global_num_experts > num_experts,
+            w_quant_bits=w_quant_bits,
+        )
+        if out is not None:
+            return out
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
@@ -606,9 +690,8 @@ def _fused_moe_jax(
         # argsort is stable enough on TPU for our usage; the gmm kernel
         # only cares about contiguous expert runs.
         argsort_idx = jnp.argsort(topk_ids_flat)
-        # Row-of-original-token for each sorted slot.
-        token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
-        sorted_token_ids = token_indices[argsort_idx]
+        # Slot i belongs to token i // topk; a divide avoids an XLA gather.
+        sorted_token_ids = (argsort_idx // topk).astype(jnp.int32)
 
         # gmm_v2 only reads and writes the rows of expert groups at or after
         # ``group_offset``, so this rank's routed-row window is all the permute
@@ -697,7 +780,14 @@ def _fused_moe_jax(
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
     gmm1_tiling = _dividing_tile_k(
-        _vmem_safe_packed_tile_n(gmm1_tile_info or calculate_tiling)
+        _vmem_safe_packed_tile_n(
+            gmm1_tile_info
+            or (
+                calculate_tiling
+                if w1_packed
+                else _tuned_or_calculated(x_sorted, w1, w1_scale, num_experts)
+            )
+        )
     )
     if w1_scale is None:
         assert w1.shape[1] % 128 == 0, (

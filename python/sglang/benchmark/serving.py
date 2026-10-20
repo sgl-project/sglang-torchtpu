@@ -1089,6 +1089,7 @@ async def get_request(
     request_rate: float,
     use_trace_timestamps: bool = False,
     slowdown_factor: float = 1.0,
+    traffic_duration_seconds: Optional[float] = None,
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
         print(
@@ -1098,11 +1099,21 @@ async def get_request(
         input_requests.sort(key=lambda r: r.timestamp)
 
         start_time = time.perf_counter()
+        traffic_deadline = (
+            start_time + traffic_duration_seconds
+            if traffic_duration_seconds is not None
+            else None
+        )
         trace_start_time_ms = input_requests[0].timestamp if input_requests else 0
 
         for request in input_requests:
             trace_time_s = (request.timestamp - trace_start_time_ms) / 1000.0
             target_arrival_time = start_time + (trace_time_s * slowdown_factor)
+            if traffic_deadline is not None and target_arrival_time >= traffic_deadline:
+                remaining = traffic_deadline - time.perf_counter()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                break
 
             sleep_duration = target_arrival_time - time.perf_counter()
             if sleep_duration > 0:
@@ -1110,8 +1121,15 @@ async def get_request(
 
             yield request
     else:
+        traffic_deadline = (
+            time.perf_counter() + traffic_duration_seconds
+            if traffic_duration_seconds is not None
+            else None
+        )
         input_requests_iter = iter(input_requests)
         for request in input_requests_iter:
+            if traffic_deadline is not None and time.perf_counter() >= traffic_deadline:
+                break
             yield request
 
             if request_rate == float("inf"):
@@ -1120,8 +1138,33 @@ async def get_request(
 
             # Sample the request interval from the exponential distribution.
             interval = np.random.exponential(1.0 / request_rate)
+            if traffic_deadline is not None:
+                remaining = traffic_deadline - time.perf_counter()
+                if interval >= remaining:
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                    break
             # The next request will be sent after the interval.
             await asyncio.sleep(interval)
+
+
+async def _drain_request_tasks(
+    tasks: List[asyncio.Task], drain_timeout_seconds: Optional[float]
+) -> Tuple[set[asyncio.Task], int]:
+    if drain_timeout_seconds is None:
+        await asyncio.gather(*tasks)
+        return set(tasks), 0
+
+    done, pending = await asyncio.wait(tasks, timeout=drain_timeout_seconds)
+    if pending:
+        print(
+            f"Drain timed out after {drain_timeout_seconds}s; "
+            f"cancelling {len(pending)} unfinished requests."
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    return done, len(pending)
 
 
 def calculate_metrics(
@@ -1420,6 +1463,8 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    traffic_duration_seconds: Optional[float] = None,
+    drain_timeout_seconds: Optional[float] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1427,6 +1472,11 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     is_mooncake = args.dataset_name == "mooncake"
+    if is_mooncake and traffic_duration_seconds is not None:
+        raise ValueError(
+            "--traffic-duration-seconds is not supported by the Mooncake "
+            "trace scheduler"
+        )
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
     if is_mooncake:
@@ -1579,7 +1629,11 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     else:
-        request_generator = get_request(input_requests, request_rate)
+        request_generator = get_request(
+            input_requests,
+            request_rate,
+            traffic_duration_seconds=traffic_duration_seconds,
+        )
 
     # Prepare LoRA request distribution parameters
     if lora_request_distribution == "distinct":
@@ -1632,7 +1686,14 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    done, timed_out_requests = await _drain_request_tasks(tasks, drain_timeout_seconds)
+    finished_requests = []
+    outputs: List[RequestFuncOutput] = []
+    for request, task in zip(benchmark_requests, tasks):
+        if task in done:
+            finished_requests.append(request)
+            outputs.append(task.result())
+    benchmark_requests = finished_requests
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1703,6 +1764,8 @@ async def benchmark(
         )
     )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10}".format("Admitted requests:", len(tasks)))
+    print("{:<40} {:<10}".format("Drain-timed-out requests:", timed_out_requests))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
@@ -1868,6 +1931,8 @@ async def benchmark(
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
+            "traffic_duration_seconds": traffic_duration_seconds,
+            "drain_timeout_seconds": drain_timeout_seconds,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
@@ -1876,6 +1941,9 @@ async def benchmark(
             "server_info": server_info,
             # Results
             "duration": benchmark_duration,
+            "admitted": len(tasks),
+            "timed_out": timed_out_requests,
+            "latency_censored": timed_out_requests > 0,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
             "total_input_text_tokens": metrics.total_input_text,
@@ -2224,6 +2292,8 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            traffic_duration_seconds=getattr(args, "traffic_duration_seconds", None),
+            drain_timeout_seconds=getattr(args, "drain_timeout_seconds", None),
         )
     )
 
@@ -2456,6 +2526,25 @@ def cli_main():
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+    )
+    parser.add_argument(
+        "--traffic-duration-seconds",
+        type=_finite_positive_float,
+        default=None,
+        help=(
+            "Stop admitting requests after this many seconds. The finite "
+            "--num-prompts dataset remains an upper bound."
+        ),
+    )
+    parser.add_argument(
+        "--drain-timeout-seconds",
+        type=_finite_positive_float,
+        default=None,
+        help=(
+            "After request admission stops, wait at most this many seconds "
+            "for outstanding requests before cancelling them and writing "
+            "censored results."
+        ),
     )
     parser.add_argument(
         "--use-trace-timestamps",

@@ -23,7 +23,7 @@ PR / nightly ─▶ GitHub-hosted runner
                  │    render_jobset.py → ONE JobSet (slice sized from topology.yaml)
                  │    labelled for Kueue → created SUSPENDED
                  ▼
-            GKE tpu-cluster (us-central1-c)
+            GKE cluster (vars.TPU_GKE_CLUSTER)
                  │
                  │  Kueue gang-admits when a whole slice's quota is free
                  │    LocalQueue → ClusterQueue → ResourceFlavor (≡ one slice)
@@ -37,7 +37,7 @@ PR / nightly ─▶ GitHub-hosted runner
                       └─ ci-tpu7x-2x2x4-nightly  (nightly-4h, 1 slice = 4 hosts)
 ```
 
-Everything runs on the `ghostfish-u2zcmybntv70q` reservation.
+Configure a TPU reservation for your deployment.
 
 **Slice arithmetic.** `tpu7x-standard-4t` is 4 chips per host, so `2x2x1` = 4 chips = 1
 node, `2x2x2` = 8 chips = 2 nodes, `2x2x4` = 16 chips = 4 nodes. Each `2x2x1` node is
@@ -77,6 +77,11 @@ container branches on `NNODES` (from GKE's `TPU_WORKER_HOSTNAMES`):
   launch **group's recipe** (which owns model + config), and rank 0 runs each of the
   group's test files in **live-server mode** (`SGLANG_TPU_USE_LIVE_SERVER=1` + `BASE_URL`),
   so tests assert on real results. Workers serve until the leader tears down, exit 0.
+
+`--platform` (the `platform` input of `_tpu-test.yml`) sets the pods'
+`SGLANG_PLATFORM`. The PR gate and the single-host nightly (`nightly-tpu-4-v7`)
+pass `tpu_oot` (mode B, the plugin platform); every other lane keeps the
+default `tpu` (mode A). Each test runs in one mode only.
 
 ### Multi-host = test-owned launch, grouped by setup
 
@@ -141,8 +146,8 @@ Each slot fills the lane its MMMU-Pro legs leave idle:
 
 | Slot | 1-host lane | 2-host lane |
 |---|---|---|
-| `day-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
-| `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
+| `day-10am` | single-host accuracy (gpt-oss, Gemma 4, Qwen3.8) | Kimi-K2.6 MMMU shards |
+| `day-5pm` | Gemma 4 / Qwen3.5 / Qwen3.8 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
 
 Each stage is a reusable workflow (the nightly calls feature validation and perf with the
 shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one
@@ -254,7 +259,7 @@ _TODO._
 
 | Path | Purpose |
 |------|---------|
-| `docker/tpu-base.Dockerfile` | TPU base image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
+| `docker/tpu-base.Dockerfile` | TPU base image: installs `python/pyproject_tpu.toml` from the configured package index (optional token via BuildKit secret) |
 | `docker/cloudbuild.tpu-base.yaml` | Cloud Build config for base image; runs **as `tpu-ci`**, pushes `sglang-tpu-base` to AR |
 | `docker/tpu.Dockerfile` | Final TPU image: builds on `sglang-tpu-base` and installs editable SGLang without reinstalling deps |
 | `docker/cloudbuild.tpu.yaml` | Cloud Build config for final image; builds on base and pushes `sglang-tpu` to AR |
@@ -273,11 +278,58 @@ _TODO._
 | `.github/workflows/feature-validation-tpu.yml` | Feature-validation stage, also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
 | `.github/workflows/accuracy-test-tpu.yml` | Accuracy stage, on its own 10 AM / 5 PM schedule and dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |
 | `.github/workflows/perf-test-tpu.yml` | Perf stage, also dispatchable alone: one job per model via run_suite |
-| `.github/tpu-ci/dashboard_aliases.json` | Series-id rename registry: old-id → new-id, applied by keel at render time (pr-gate lint) |
+| `.github/tpu-ci/dashboard_aliases.json` | Series-id rename registry: old-id → new-id, applied by the dashboard at render time (pr-gate lint) |
+
+## Deployment configuration
+
+Set these GitHub repository variables before enabling TPU workflows. Values belong
+in the repository settings, not in committed workflow files.
+
+| Variable | Value |
+| --- | --- |
+| `TPU_GCP_PROJECT` | Project ID used for builds and in-project tests |
+| `TPU_WIF_PROVIDER` | Full Workload Identity Federation provider resource name |
+| `TPU_CI_SA` | CI service account email, also used by Cloud Build |
+| `TPU_AR_IMAGE` | Full final image repository, without a tag |
+| `TPU_AR_BASE_IMAGE` | Full base image repository, without a tag |
+| `TPU_BUILD_BUCKET` | Existing source/build-log bucket name, without `gs://`, logs use its `logs/` prefix |
+| `TPU_GKE_CLUSTER` | In-project cluster name |
+| `TPU_GKE_LOCATION` | In-project cluster zone or region |
+| `TPU_WEIGHTS_BUCKET` | External tests' weights bucket name, without `gs://` |
+| `TPU_ARTIFACTS_BUCKET` | External tests' live-log bucket name, without `gs://` |
+| `TPU_COMPILE_CACHE_BUCKET` | In-project tests' shared JAX compile-cache bucket name, without `gs://` |
+| `TPU_CI_POD_KSA` | Optional Kubernetes service account for in-project test pods |
+| `TPU_PACKAGE_INDEX_URL` | Optional package index URL without credentials; defaults to `https://pypi.org/simple/` |
+
+For an authenticated Artifact Registry package index, the build identity needs
+read access. Docker builds attach the existing `gcp_token` BuildKit secret to a
+configured Google Artifact Registry Python index (`https://*-python.pkg.dev/`)
+as an OAuth access token. Other index hosts receive no CI token. Do not put credentials in repository variables or build
+arguments. The package index must provide the versions pinned in
+`python/pyproject_tpu.toml`; the public default does not guarantee those versions
+are available. The base-image cache key includes the package index URL.
+
+External cluster and nodepool identities still use the existing `EXTERNAL_*`
+repository secrets described in [external/README.md](external/README.md).
+`render_external_jobset.py --list-groups` needs no bucket; rendering a JobSet
+requires `TPU_WEIGHTS_BUCKET` or a local `weights.bucket` setting.
+
+For local Docker builds, override `BASE_IMAGE` and `TPU_PACKAGE_INDEX_URL` with
+`--build-arg` as needed. Supply a package-registry access token through
+`--secret id=gcp_token,src=/path/to/token`, never through a build argument.
+The checked-in Cloud Build configs use local image names as placeholders;
+`run_cloudbuild.py` callers must pass `--service-account`, `--logs-bucket`, and
+`--substitutions "_IMAGE=YOUR_IMAGE_REPOSITORY"` (plus `_BASE_IMAGE` and
+`_PACKAGE_INDEX_URL` when applicable). The workflows supply these values from the
+variables above. Direct `gcloud builds submit` users must supply the equivalent
+service account, log bucket, and substitutions explicitly.
 
 ## Cluster infra
 
-CI node pools, all on the `ghostfish-u2zcmybntv70q` reservation. Create a new one with
+The resource names below are examples. Configure your own project, registry,
+service account, bucket, cluster, and NFS server before using these commands.
+
+Create CI node pools on your deployment's TPU reservation with
 `--machine-type=tpu7x-standard-4t --reservation-affinity=specific
 --node-labels=ci-tpu-pool=<unique>,ci-tpu-lane=<lane> --workload-metadata=GKE_METADATA`;
 multi-host also needs `--tpu-topology` plus a `workload-policy` resource policy
@@ -313,16 +365,16 @@ pods can straddle them: no error, just an ICI rendezvous hang. `reconcile_quota.
 to submit when it sees that, but the fix is to add capacity as a **new pool** — which, with
 both labels set, needs no edit to `topology.yaml` or `kueue-tpu.yaml`.
 
-- `tpu7x-2x2x2-haolin-dev` and `tpu7x-2x2x2-mimo` also exist — not CI, do not repurpose.
+- Keep developer pools separate from CI pools; do not repurpose them for CI.
 - `system-pool` (e2-standard-2 ×2) hosts the **JobSet operator v0.12.0** and the **Kueue
   controller** (the e2-medium default-pool is CPU-saturated by GKE daemons).
-- Artifact Registry: `us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci`.
-- Service account `tpu-ci@sglang-torchtpu.iam.gserviceaccount.com` with
+- Artifact Registry: `us-central1-docker.pkg.dev/YOUR_PROJECT/YOUR_REPOSITORY`.
+- Service account `tpu-ci@YOUR_PROJECT.iam.gserviceaccount.com` with
   `container.developer`, `artifactregistry.writer`, `logging.logWriter`.
 - WIF pool `github` + provider `github-oidc`, scoped to `sgl-project/sglang-torchtpu`,
   bound to `tpu-ci` via `workloadIdentityUser`.
 - Namespace `tpu-ci`; KSA `weights-loader` granted `storage.objectViewer` on
-  `gs://sglang-torchtpu-gcs-shared` via Workload Identity (no GSA key).
+  `gs://YOUR_WEIGHTS_BUCKET` via Workload Identity (no GSA key).
 
 ## Enabling Kueue
 
@@ -444,20 +496,16 @@ Topology-Aware Scheduling instead.
 
 ## ⚠️ Required before CI can run (owner actions)
 
-1. **Allowlist `tpu-ci` on the private torch-tpu registry.** The build pulls the
-   pinned `torch-tpu` wheel from `ml-oss-artifacts-transient` (Google-owned). Ask
-   Google / the TPU program (duckie or Jetski) to grant:
-   > `roles/artifactregistry.reader` to
-   > `serviceAccount:tpu-ci@sglang-torchtpu.iam.gserviceaccount.com` on the
-   > `torch-tpu-virtual-registry` Python repo in project `ml-oss-artifacts-transient`.
+1. **Grant the build identity access to the configured package registry.**
+   If your pinned `torch-tpu` wheels require authentication, ask the registry
+   administrator to grant the CI service account read access. Supply build
+   credentials through the existing BuildKit secret; do not put tokens in
+   Dockerfiles or commit them to the repository.
 
-   Until this lands, `gcloud builds submit` (and therefore every CI run) fails at
-   the `pip install` step. Validation to date builds once under the owner's own
-   identity (which already has read access) and pushes to AR (`:manual`).
-
-2. **Rotate the Docker Hub PAT** that was shared in chat, and store the new token
-   as repo secrets `RADIXARK_DOCKERHUB_USERNAME` / `RADIXARK_DOCKERHUB_TOKEN`
-   (only needed for publishing release images, not for TPU CI).
+2. **Configure release publishing credentials** in the repository secrets
+   `RADIXARK_DOCKERHUB_USERNAME` / `RADIXARK_DOCKERHUB_TOKEN` if publishing
+   release images. Use a dedicated publishing account and rotate its token
+   according to your deployment policy.
 
 3. **Pin action versions to commit SHAs** to match this repo's security convention
    (currently `@v4`/`@v2`).
@@ -469,14 +517,18 @@ Topology-Aware Scheduling instead.
   from the original **ReadOnlyMany** Hyperdisk (both hosts mount concurrently),
   rank-0 asserting on real inference.
 - **Filestore weights** — `model-weights-filestore` mounts the existing 10Ti
-  NFSv3 share `10.93.193.130:/weights` read-only at `/weights`.
+  NFSv3 share `<FILESTORE_IP>:/weights` read-only at `/weights`. The manifest keeps the
+  address as a placeholder; substitute the Filestore instance IP when applying it.
 
 Apply the claim before running CI from this revision:
 
 ```bash
-gcloud container clusters get-credentials tpu-cluster \
-  --project sglang-torchtpu --zone us-central1-c
-kubectl apply -f .github/tpu-ci/pvc-model-weights-filestore.yaml
+gcloud container clusters get-credentials "$GKE_CLUSTER" \
+  --project "$GCP_PROJECT" --zone "$GKE_ZONE"
+# The Filestore instance IP; see `gcloud filestore instances list --project "$GCP_PROJECT"`.
+FILESTORE_IP=...
+sed "s/<FILESTORE_IP>/${FILESTORE_IP}/" .github/tpu-ci/pvc-model-weights-filestore.yaml \
+  | kubectl apply -f -
 kubectl -n tpu-ci wait pvc/model-weights-filestore \
   --for=jsonpath='{.status.phase}'=Bound --timeout=60s
 ```
@@ -492,9 +544,8 @@ use it as a multi-host launch model. Multi-host tests use Qwen3-30B-A3B-FP8.
 
 ## Dashboard — making a new test show up
 
-The nightly dashboard is generated **outside this repo** (`ci-monitor/src/tpu_ci.py`
-and `tpu_dashboard.py` in `radixark/keel`, reusing the same parsers as the upstream
-sglang CI dashboard). Nothing here renders it, and nothing here needs to change to add
+The nightly dashboard is generated **outside this repo**, reusing the same parsers as
+the upstream sglang CI dashboard. Nothing here renders it, and nothing here needs to change to add
 a test to it — its **only** input is the job log this repo already prints. What follows
 is the contract that log has to satisfy.
 
@@ -550,13 +601,13 @@ with a label some test already uses.
 
 **Test-list and chart filters come from `register_tpu_ci(labels=[...])`** — free-form
 topology / model / feature tags (`multihost`, `gpt-oss-120b`, `pd`, `spec`, …),
-AST-scanned from source by keel and rendered as filter dropdowns on every tab. These
+AST-scanned from source by the dashboard and rendered as filter dropdowns on every tab. These
 are *test* properties, one declaration per file; `dump_metric` labels are
 *measurement* properties — don't restate one in the other.
 
 **Series identity.** `id` is the join key across nights: never renamed, never shown.
 `display_name` is cosmetic and free to change. When an `id` truly must change, record
-it once in [`dashboard_aliases.json`](dashboard_aliases.json) (old → new; keel merges
+it once in [`dashboard_aliases.json`](dashboard_aliases.json) (old → new; the dashboard merges
 at render time, so history needs no rewrite). A pr-gate lint keeps the map acyclic,
 its targets live, and every live `id` unique. `labels["model"]` groups a model's
 charts, so keep it stable too — the canonical HF id, not a mount path.
@@ -607,24 +658,13 @@ trends no matter how well-formed its log is. It needs a leg in the nightly's
 feature-validation stage too — that is what the `pd-mh-gpt-120b-pc-offload` and
 `pd-mh-gpt-120b-tp-reshard` jobs in `feature-validation-tpu.yml` are.
 
-Sanity-check a new test's log against the parser before waiting a night for it:
-
-```bash
-# from a keel checkout, against nightlies that already ran (needs repo read scope)
-export GITHUB_TOKEN=$(gh auth token)
-python3 ci-monitor/src/tpu_ci.py sync --limit 3 --db-dir /tmp/tpu-ci
-python3 ci-monitor/src/tpu_dashboard.py --db-dir /tmp/tpu-ci --out /tmp/tpu-ci.html
-```
-
-`sync` is idempotent — records are keyed by run, so re-running over the same window
-converges instead of duplicating.
-
 ## Local validation helpers
 
 Render + dry-run exactly as the workflow does (no live build needed):
 
 ```bash
-IMG=us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu:manual
+IMG=us-central1-docker.pkg.dev/YOUR_PROJECT/YOUR_REPOSITORY/sglang-tpu:manual
+export TPU_COMPILE_CACHE_BUCKET=YOUR_COMPILE_CACHE_BUCKET
 # single-host suite:
 python3 .github/tpu-ci/render_jobset.py --image "$IMG" --suite stage-b-test-tpu-4-v7 \
   | kubectl -n tpu-ci create --dry-run=server -f -
@@ -635,3 +675,10 @@ python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost   # -
 The old per-manifest files (`job-integration.yaml`, `job-nightly.yaml`,
 `jobset-nightly.yaml`) and `_tpu-test-stage.yml` were replaced by the unified
 template + `_tpu-build`/`_tpu-test`.
+
+Wheel URL inputs must use HTTPS and are downloaded without the CI bearer token.
+Use `gs://` for authenticated GCS objects. HTTPS redirects must remain HTTPS.
+
+AMD CI can optionally mirror images to `AMD_CI_LOCAL_REGISTRY` (a repository
+variable for the release workflow and an environment variable for local CI
+launchers). When unset, the mirror step is skipped and normal pulls use retries.

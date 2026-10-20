@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.fp8_moe_fused_rs import (
+    _replicate_channelwise_fused_rs_scales,
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
     supports_fp8_fused_rs,
@@ -28,6 +29,25 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 
 class TestFp8MoeFusedRs(CustomTestCase):
+    def test_channelwise_scales_keep_one_layout(self):
+        """Both fused-RS scales end in the same rank; the kernel rejects mixed layouts
+        (expert TP16 gives w2 K=256, too small for the two-K-block form)."""
+        for k2, expected in ((512, (4, 2, 64)), (256, (4, 1, 1, 64))):
+            with self.subTest(k2=k2):
+                layer = torch.nn.Module()
+                P = lambda t: torch.nn.Parameter(t, requires_grad=False)  # noqa: E731
+                layer.w13_weight = P(
+                    torch.zeros(4, 1024, 64, dtype=torch.float8_e4m3fn)
+                )
+                layer.w2_weight = P(torch.zeros(4, k2, 64, dtype=torch.float8_e4m3fn))
+                layer.w13_weight_scale = P(torch.ones(4, 1, 1, 64))
+                layer.w2_weight_scale = P(torch.ones(4, 1, 1, 64))
+                _replicate_channelwise_fused_rs_scales(layer)
+                self.assertEqual(tuple(layer.w2_weight_scale.shape), expected)
+                self.assertEqual(
+                    layer.w13_weight_scale.dim(), layer.w2_weight_scale.dim()
+                )
+
     def test_exposes_first_class_moe_runner_backend(self):
         legacy_backend = MoeRunnerBackend("pallas_tpu")
         self.assertTrue(legacy_backend.is_pallas_tpu())
@@ -68,6 +88,17 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
     def test_accepts_block_quantized_weights(self):
         self.assertTrue(self._supported(block_quantized=True))
+
+    def test_expert_tp_rejects_a_gate_up_width_off_256(self):
+        # Qwen3-30B-A3B at TP8: I/TP = 96, so the fused gate/up width is 192.
+        expert_tp = self._config(ep_size=1, expert_tp=True)
+        self.assertIn(
+            "multiple of 256",
+            fp8_fused_rs_unsupported_reason(**expert_tp, gate_up_width=192),
+        )
+        self.assertIsNone(
+            fp8_fused_rs_unsupported_reason(**expert_tp, gate_up_width=1024)
+        )
 
     def test_rejects_pipeline_parallel_layout(self):
         self.assertEqual(
@@ -143,7 +174,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             w13_weight_scale_inv=w13_scale_inv,
             w2_weight_scale_inv=w2_scale_inv,
             moe_ep_size=8,
-            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+            _tpu_fused_rs_group_offset=torch.tensor([0], dtype=torch.int32),
         )
 
         with patch(
@@ -179,7 +210,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             w13_weight_scale=torch.ones(1, 1, 1, 2 * hidden),
             w2_weight_scale=torch.ones(1, 1, 1, hidden),
             moe_ep_size=8,
-            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+            _tpu_fused_rs_group_offset=torch.tensor([0], dtype=torch.int32),
         )
 
         with patch(

@@ -10,10 +10,11 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
@@ -38,6 +39,8 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
+    # (draft pool, payload) per carried draft pool, at the target's token ids.
+    draft_cpu: tuple = ()
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -169,16 +172,28 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
-def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+def checkpoint_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, mid_prefill: bool = False
+) -> None:
     """Publish what the running request has computed so far, unless it is
-    barred from the tree."""
+    barred from the tree. ``mid_prefill`` marks a prefill chunk with more
+    chunks to come."""
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if req.skip_radix_cache_insert:
         return
+    start, end = req.extend_range.start, req.extend_range.end
+    stride = envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.get()
+    if (
+        mid_prefill
+        and stride > 0
+        and end // stride == start // stride
+        and tree_cache.defer_chunk_checkpoint(req)
+    ):
+        return
 
-    tree_cache.checkpoint(req, up_to=req.extend_range.end)
+    tree_cache.checkpoint(req, up_to=end)
 
 
 def evict_from_tree_cache(
@@ -234,6 +249,7 @@ def backup_kv_cache(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
+    draft_kv_pools: tuple[KVCache, ...] = (),
 ) -> bool:
     """Returns False when no backup can be taken ('none' backend, or the host
     pool cannot hold it); the caller aborts the request."""
@@ -245,7 +261,11 @@ def backup_kv_cache(
     if backend == "none":
         return False
     if backend == "cpu_tensor":
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        req.offload_kv_cache(
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            draft_kv_pools=draft_kv_pools,
+        )
         return True
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")

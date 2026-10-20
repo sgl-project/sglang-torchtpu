@@ -144,6 +144,18 @@ class TestModelOptNvfp4(CustomTestCase):
                 use_per_token_activation=True,
             )
 
+    def test_flat_config_reads_exclude_modules(self):
+        # config.json-style (flat) ModelOpt configs may list BF16 modules under
+        # exclude_modules instead of ignore; dropping them quantizes BF16 layers.
+        config = ModelOptFp4Config.from_config(
+            {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "exclude_modules": ["layers.0.", "lm_head"],
+            }
+        )
+        self.assertEqual(config.exclude_modules, ["layers.0.", "lm_head"])
+
     def test_shared_expert_fusion_requires_matching_fp4_precision(self):
         quantized_shared = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,

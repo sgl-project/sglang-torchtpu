@@ -5,11 +5,11 @@ tasks:
 - name: "mmlu_llama"
   metrics:
   - name: "exact_match,strict_match"
-    value: 0.8574  # torchtpu-vllm ref; sglang-TPU TP8/EP8 limit=100 measured 0.8635
+    value: 0.8574  # vllm-torchtpu ref; sglang-TPU TP8/EP8 limit=100 measured 0.8635
 - name: "mmlu_pro"
   metrics:
   - name: "exact_match,custom-extract"
-    value: 0.7687  # torchtpu-vllm ref; sglang-TPU TP8/EP8 limit=100 measured 0.7650
+    value: 0.7687  # vllm-torchtpu ref; sglang-TPU TP8/EP8 limit=100 measured 0.7650
 limit: 100
 num_concurrent: 32
 batch_size: "auto"

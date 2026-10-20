@@ -563,6 +563,7 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
+                "MuseSparkForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -2591,6 +2592,7 @@ def get_hybrid_layer_ids(
         or "MellumForCausalLM" in model_architectures
         or "MuseGlimmerForCausalLM" in model_architectures
         or "MuseGlimmerForConditionalGeneration" in model_architectures
+        or "MuseSparkForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [

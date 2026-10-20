@@ -285,6 +285,14 @@ class UnifiedLRUList:
         self._remove_node(node)
         self._add_node(node)
 
+    def reset_node_lru(self, node: UnifiedTreeNode) -> None:
+        """Make ``node`` the next eviction victim; session-referenced nodes stay put."""
+        assert node.id in self.cache
+        if self._is_referenced is not None and self._is_referenced(node):
+            return
+        self._remove_node(node)
+        self._add_node_after(self.tail.lru_prev[self._pt], node)
+
     def cursor_begin(self):
         if self.cursor.lru_prev[self._pt] is not None:
             self._remove_node(self.cursor)

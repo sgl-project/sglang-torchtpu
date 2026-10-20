@@ -138,6 +138,7 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
     """Return the fused-RS contract requirements this layer does not meet."""
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang_tpu.moe.expert_tp import is_fused_moe_rs_expert_tp
 
     parallel = get_parallel()
     runner_config = layer.moe_runner_config
@@ -146,12 +147,18 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
             f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}",
             group_size in TPU_NVFP4_SUPPORTED_GROUP_SIZES,
         ),
-        ("expert parallelism enabled", layer.moe_ep_size > 1),
         (
-            "moe_ep_size == tp_size == world_size",
-            layer.moe_ep_size
-            == get_parallel().tp_group.world_size
-            == get_parallel().world_group.world_size,
+            "moe_ep_size == tp_size == world_size > 1, or expert TP "
+            "(moe_ep_size == 1, moe_tp_size == tp_size == world_size > 1)",
+            parallel.tp_group.world_size == parallel.world_group.world_size
+            and (
+                layer.moe_ep_size == parallel.tp_group.world_size > 1
+                or is_fused_moe_rs_expert_tp(
+                    layer.moe_ep_size,
+                    getattr(parallel, "moe_tp_size", 1),
+                    parallel.tp_group.world_size,
+                )
+            ),
         ),
         ("layer allows backend reduction", layer.allow_backend_reduction),
         ("attn_dp_size == 1", parallel.attn_dp_size == 1),
@@ -217,6 +224,8 @@ def prepare_tpu_nvfp4_moe_weights(
       * ``w13_weight_scale`` (E, 2I, H/G) f8  -> (E, H/G, 1, 2*I_pad) scale_dtype
       * ``w2_weight``        (E, H, I/2) u8   -> (E, I_pad/2, H) u8
       * ``w2_weight_scale``  (E, H, I/G) f8   -> (E, I_pad/G, 1, H) scale_dtype
+
+    The fused-RS kernel takes the scales without the unit dim, (E, K/G, N).
     """
     if group_size not in TPU_NVFP4_SUPPORTED_GROUP_SIZES:
         raise NotImplementedError(
@@ -280,6 +289,13 @@ def prepare_tpu_nvfp4_moe_weights(
         prepare_fused_moe_rs(layer)
         w13_w = _materialize_packed_fp4(_transpose_packed_fp4(w13_w))
         w2_w = _materialize_packed_fp4(_transpose_packed_fp4(w2_w))
+        # Fused-RS reads [E, K_blocks, N]. The unit dim of the gmm_v2 layout is
+        # stored major-most on TPU while the kernel needs it tiled, so XLA would
+        # relayout both scale tensors before every call. Transpose directly: a
+        # clone of a squeezed view is rebuilt from its base on every compiled
+        # call (torch-tpu 0.2).
+        w13_scale = w13_s.to(scale_dtype).permute(0, 2, 1).contiguous()
+        w2_scale = w2_s.to(scale_dtype).permute(0, 2, 1).contiguous()
     else:
         w13_w = w13_w.permute(0, 2, 1).contiguous()
         w2_w = w2_w.permute(0, 2, 1).contiguous()
@@ -342,7 +358,9 @@ def apply_tpu_nvfp4_moe(
         if post_expert_norm_weight is None:
             post_expert_norm_weight = hidden_states.new_zeros((1,))
 
-        tp_world_size = layer.moe_ep_size
+        expert_tp = layer.__dict__.get("_tpu_fused_rs_expert_tp", False)
+        # Expert TP runs with moe_ep_size == 1 and shards over the MoE TP ranks.
+        tp_world_size = layer.moe_tp_size if expert_tp else layer.moe_ep_size
         if keep_output_shard:
             expected_global_rows = prepared_input.output_token_count * tp_world_size
             if hidden_states.shape[0] != expected_global_rows:
@@ -398,8 +416,10 @@ def apply_tpu_nvfp4_moe(
                 # Blocks 16-128 use W4A16; block-256/512 already quantize the
                 # GMM activation. A direct FP8 write would add another loss.
                 fp8_direct_write=False,
-                world_size=layer.moe_ep_size,
+                world_size=tp_world_size,
                 keep_token_shard=keep_output_shard,
+                expert_tp=expert_tp,
+                oneshot_rank=getattr(layer, "_tpu_oneshot_rank", None),
             )
             outputs.append(output[:output_rows])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))

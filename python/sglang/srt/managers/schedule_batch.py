@@ -117,7 +117,11 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    KVCache,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_prefix_accounting import (
     SwaPrefixMatch,
@@ -1222,6 +1226,9 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_last_match_len: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # Matched prefix length at this request's first radix insert; stale SWA
+        # window demotion stops here (SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST).
+        self.swa_stale_window_floor: Optional[int] = None
         # Logical-page KV sharding: rotation base of the chain this request
         # extends (owner of position-page P is (base + P) % shard_size).
         # Refreshed at every sharded alloc — read through last_node, or drawn
@@ -1996,6 +2003,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
+        self.swa_stale_window_floor = None
         self.swa_branching_seqlen = None
         self.extend_range = None
         self.dllm_initialized = False
@@ -2040,7 +2048,9 @@ class Req(ReqDllmMixin):
             return None
         return req_to_token_pool.mamba_pool
 
-    def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+    def offload_kv_cache(
+        self, req_to_token_pool, token_to_kv_pool_allocator, draft_kv_pools=()
+    ):
         token_indices = req_to_token_pool.req_to_token[
             self.kv.req_pool_idx, : self.seqlen - 1
         ]
@@ -2058,6 +2068,15 @@ class Req(ReqDllmMixin):
                 mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
                 if mamba_pool is not None and self.kv.holds_mamba
                 else None
+            ),
+            draft_cpu=tuple(
+                (
+                    pool,
+                    pool.get_cpu_copy(
+                        token_indices, req_pool_index=self.kv.req_pool_idx
+                    ),
+                )
+                for pool in draft_kv_pools
             ),
         )
 
@@ -2078,6 +2097,10 @@ class Req(ReqDllmMixin):
             mamba_indices=self.kv.mamba_pool_idx,
             req_pool_index=self.kv.req_pool_idx,
         )
+        for pool, draft_cpu in self.kv.retraction_backup.draft_cpu:
+            pool.load_cpu_copy(
+                draft_cpu, token_indices, req_pool_index=self.kv.req_pool_idx
+            )
         self.kv.retraction_backup = None
 
     def build_rebootstrap_payload(self) -> dict:
@@ -2297,6 +2320,7 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
+    draft_kv_pools: tuple[KVCache, ...] = (),
 ) -> bool:
     """Returns False when the KV backup failed and the request cannot be resumed."""
     if hisparse_coordinator is not None and not req.finished():
@@ -2315,6 +2339,7 @@ def release_req(
             req_to_token_pool,
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
+            draft_kv_pools=draft_kv_pools,
         )
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
@@ -2788,6 +2813,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
+    def metadata_device(self):
+        """Placement of scheduler-owned lengths and request rows.
+
+        Backends may retain logical metadata on host and materialize device
+        copies on the forward batch after padding. Token tensors are separate.
+        """
+        return self.device
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -2818,12 +2851,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # resolve_forward_inputs.
         pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+            self.metadata_device(), non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         orig_seq_lens_tensor = torch.tensor(
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        ).to(self.metadata_device(), non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -3366,8 +3399,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
-    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
-        """Retract the decoding requests when there is not enough memory."""
+    def retract_decode(
+        self, *, draft_kv_pools: tuple[KVCache, ...] = ()
+    ) -> Tuple[List[Req], float, List[Req]]:
+        """Retract the decoding requests when there is not enough memory.
+        ``draft_kv_pools`` are backed up with the target KV."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
         sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
 
@@ -3403,7 +3439,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices)):
+            if self.release_req(
+                idx, len(sorted_indices), draft_kv_pools=draft_kv_pools
+            ):
                 retracted_reqs.append(req)
             else:
                 # No backup exists and the device KV is already freed, so the
@@ -3502,6 +3540,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         idx: int,
         remaing_req_count: int,
         offload_kv: bool = True,
+        draft_kv_pools: tuple[KVCache, ...] = (),
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
@@ -3511,6 +3550,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
+            draft_kv_pools=draft_kv_pools,
         )
 
     def prepare_encoder_info_decode(self):
@@ -3520,11 +3560,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.metadata_device())
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.orig_seq_lens = torch.empty(
+            0, dtype=torch.int32, device=self.metadata_device()
+        )
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.empty(
+            0, dtype=torch.int64, device=self.metadata_device()
+        )
         self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
@@ -3768,16 +3812,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
-        self.seq_lens = self.seq_lens[keep_indices_device]
-        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        self._filter_model_inputs(keep_indices, keep_indices_device)
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
-        if self.input_ids is not None:
-            self.input_ids = self.input_ids[keep_indices_device]
         # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
@@ -3809,10 +3849,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(
-                new_indices=keep_indices_device,
-                new_indices_cpu=keep_indices,
-            )
+            self._filter_spec_input(keep_indices, keep_indices_device)
 
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
@@ -3826,14 +3863,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
-        )
         self.req_pool_indices_cpu = torch.cat(
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
-        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self._merge_model_inputs(other)
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3882,7 +3915,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
-            self.spec_info.merge_batch(other.spec_info)
+            self._merge_spec_input(other)
+
+    def _filter_model_inputs(self, keep_indices, keep_indices_device):
+        """Filter model-facing rows after the host pool-index mirror is updated."""
+
+        def keep(t):
+            return t[keep_indices if t.device.type == "cpu" else keep_indices_device]
+
+        self.req_pool_indices = keep(self.req_pool_indices)
+        self.seq_lens = keep(self.seq_lens)
+        self.orig_seq_lens = keep(self.orig_seq_lens)
+        if self.input_ids is not None:
+            self.input_ids = self.input_ids[keep_indices_device]
+
+    def _merge_model_inputs(self, other):
+        """Merge model-facing rows after the host pool-index mirror is updated."""
+        self.req_pool_indices = torch.cat(
+            [self.req_pool_indices, other.req_pool_indices]
+        )
+        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+
+    def _filter_spec_input(self, keep_indices, keep_indices_device):
+        self.spec_info.filter_batch(
+            new_indices=keep_indices_device, new_indices_cpu=keep_indices
+        )
+
+    def _merge_spec_input(self, other):
+        self.spec_info.merge_batch(other.spec_info)
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
@@ -3997,17 +4058,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             ),
                         )
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
+                    # The next query, at seqlen - 1, reads down to seqlen - 1 - W;
+                    # past cache_protected_len the prefix SWA lock is unused, so it
+                    # can become evictable. Skip decode_batch_idx 0, while the
+                    # overlapped prefill may still read it.
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
                         and req.lock_receipt.component_lock_uuids.get(ComponentType.SWA)
                         is not None
                         and req.last_node is not None
-                        and req.decode_batch_idx >= sliding_window_size
+                        and req.decode_batch_idx >= 1
+                        and req.seqlen - 1 - req.kv.cache_protected_len
+                        >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
                             req.last_node, req.lock_receipt

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/layers/vllm/quantization/fp8.py
+# Adapted from https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/layers/vllm/quantization/fp8.py
 # Copyright 2025 Google LLC
 """TPU FP8 MoE helpers.
 
@@ -11,6 +11,8 @@ native torch here without touching the generic FP8 quantization method.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 from torch.nn.parameter import Parameter
@@ -129,9 +131,15 @@ def _own_storage(t: torch.Tensor) -> torch.Tensor:
     ``base[:, None, None, :]`` on a contiguous ``[E, N]`` tensor is *already*
     contiguous, so ``.contiguous()`` returns the view unchanged and the
     parameter keeps the base's 2-D device buffer while declaring a 4-D shape.
-    torch_tpu then has to reconcile the two on every use.
+    torch_tpu then has to reconcile the two on every use. On torch_tpu 0.2 even
+    a device-side clone (or ``empty().copy_()``) of that shape is relaid out by
+    an ``execute_as_strided`` program at every compiled call; a buffer moved
+    from the host is not, so device tensors go through the host (load time
+    only). A host tensor that owns its buffer is returned as is.
     """
-    return t if t._base is None else t.clone()
+    if t.device.type == "cpu":
+        return t if t._base is None else t.clone()
+    return t.cpu().to(t.device)
 
 
 def _to_tpu_fp8_moe_scale_layout(
@@ -257,6 +265,187 @@ def _to_tpu_fp8_moe_block_scale_layout(
     return _own_storage(scale[:, :, None, :].contiguous())
 
 
+_MXFP4_BLOCK_SIZE = 32
+_TPU_FP4_BLOCK_SIZE = 512
+_FP4_PACKING = 2
+_FP4_MAX = 6.0
+_MXFP4_EXPERTS_PER_CHUNK = 8
+_FP4_E2M1_LUT = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+_FP4_E2M1_THRESHOLDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def _dequantize_dsv4_mxfp4_block32(
+    weight_packed: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize block-32 MXFP4 packed weights ``[E, N, K/2]`` to float32 ``[E, N, K]``."""
+    w_u8 = weight_packed.view(torch.uint8)
+    low = (w_u8 & 0x0F).to(torch.long)
+    high = ((w_u8 >> 4) & 0x0F).to(torch.long)
+    lut = torch.tensor(_FP4_E2M1_LUT, dtype=torch.float32, device=w_u8.device)
+    w_fp32 = torch.stack((lut[low], lut[high]), dim=-1).flatten(-2)
+
+    if scale.dtype == torch.uint8:
+        scale_fp32 = torch.exp2(scale.to(torch.int32).to(torch.float32) - 127.0)
+    else:
+        scale_fp32 = scale.to(torch.float32)
+
+    return (
+        w_fp32.unflatten(-1, (-1, _MXFP4_BLOCK_SIZE)) * scale_fp32.unsqueeze(-1)
+    ).flatten(-2)
+
+
+def _quantize_tpu_fp4_block512_kmajor(
+    weight_fp32: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize float32 ``[E, N, K]`` to gmm_v2 packed-FP4 ``(E, K/2, N)`` and scale ``(E, K/512, 1, N)``."""
+    num_experts, out_dim, in_dim = weight_fp32.shape
+    if in_dim % _TPU_FP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            "TPU packed-FP4 K dimension must be divisible by "
+            f"{_TPU_FP4_BLOCK_SIZE}, got {in_dim}."
+        )
+    num_blocks_k = in_dim // _TPU_FP4_BLOCK_SIZE
+    w_blocked = weight_fp32.reshape(
+        num_experts, out_dim, num_blocks_k, _TPU_FP4_BLOCK_SIZE
+    )
+    abs_max = w_blocked.abs().amax(dim=-1, keepdim=True)
+    block_scale = abs_max / _FP4_MAX
+    scale_inv = torch.where(
+        (block_scale == 0) | ~torch.isfinite(block_scale),
+        torch.zeros_like(block_scale),
+        1.0 / block_scale,
+    )
+    w_scaled = (w_blocked * scale_inv).clamp(-_FP4_MAX, _FP4_MAX)
+    abs_scaled = w_scaled.abs()
+    boundaries = torch.tensor(
+        _FP4_E2M1_THRESHOLDS, dtype=abs_scaled.dtype, device=abs_scaled.device
+    )
+    mag_idx = torch.bucketize(abs_scaled, boundaries, out_int32=True, right=False).to(
+        torch.uint8
+    )
+    sign_bit = ((w_scaled < 0) & (mag_idx > 0)).to(torch.uint8) << 3
+    indices = (mag_idx | sign_bit).reshape(num_experts, out_dim, in_dim)
+    packed_nk = indices[..., 0::2] | (indices[..., 1::2] << 4)
+    packed_kn = packed_nk.permute(0, 2, 1).contiguous()
+    scale_gmm = block_scale.squeeze(-1).permute(0, 2, 1).unsqueeze(2).contiguous()
+    return packed_kn, _own_storage(scale_gmm)
+
+
+def _prepare_tpu_dsv4_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
+    """Convert DeepSeek-V4 block-32 MXFP4 MoE weights into TPU block-512 packed-FP4 (W4A8) layout."""
+    from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+        _pad_gate_up_halves_axis1,
+        _pad_last_axis,
+    )
+
+    w13_param = layer.w13_weight
+    w2_param = layer.w2_weight
+    device = w13_param.data.device
+
+    w13_packed_cpu = w13_param.data.to("cpu")
+    w13_scale_cpu = layer.w13_weight_scale_inv.data.to("cpu")
+    w2_packed_cpu = w2_param.data.to("cpu")
+    w2_scale_cpu = layer.w2_weight_scale_inv.data.to("cpu")
+
+    num_experts, two_inter, hidden_packed = w13_packed_cpu.shape
+    if two_inter % 2 != 0:
+        raise ValueError(
+            f"Expected even w13 output dimension (2 * intermediate), got {two_inter}."
+        )
+    inter = two_inter // 2
+    hidden = hidden_packed * _FP4_PACKING
+    if hidden % _TPU_FP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"TPU packed-FP4 MoE requires hidden_size divisible by {_TPU_FP4_BLOCK_SIZE}, "
+            f"got {hidden}."
+        )
+    expected_w2_shape = (num_experts, hidden, inter // _FP4_PACKING)
+    if tuple(w2_packed_cpu.shape) != expected_w2_shape:
+        raise ValueError(
+            f"Unexpected w2_weight shape {tuple(w2_packed_cpu.shape)}, "
+            f"expected {expected_w2_shape}."
+        )
+
+    pad_inter = (
+        _TPU_FP4_BLOCK_SIZE - inter % _TPU_FP4_BLOCK_SIZE
+    ) % _TPU_FP4_BLOCK_SIZE
+
+    prev_threads = torch.get_num_threads()
+    tp_size = max(1, get_parallel().tp_size)
+    target_threads = max(prev_threads, (os.cpu_count() or 8) // tp_size)
+
+    w13_w_chunks = []
+    w13_s_chunks = []
+    w2_w_chunks = []
+    w2_s_chunks = []
+    torch.set_num_threads(target_threads)
+    try:
+        for c0 in range(0, num_experts, _MXFP4_EXPERTS_PER_CHUNK):
+            c1 = min(c0 + _MXFP4_EXPERTS_PER_CHUNK, num_experts)
+            w13_fp32 = _dequantize_dsv4_mxfp4_block32(
+                w13_packed_cpu[c0:c1], w13_scale_cpu[c0:c1]
+            )
+            w13_fp32 = _pad_gate_up_halves_axis1(w13_fp32, inter, pad_inter)
+            w13_q, w13_s = _quantize_tpu_fp4_block512_kmajor(w13_fp32)
+            del w13_fp32
+            w13_w_chunks.append(w13_q)
+            w13_s_chunks.append(w13_s)
+
+            w2_fp32 = _dequantize_dsv4_mxfp4_block32(
+                w2_packed_cpu[c0:c1], w2_scale_cpu[c0:c1]
+            )
+            w2_fp32 = _pad_last_axis(w2_fp32, pad_inter)
+            w2_q, w2_s = _quantize_tpu_fp4_block512_kmajor(w2_fp32)
+            del w2_fp32
+            w2_w_chunks.append(w2_q)
+            w2_s_chunks.append(w2_s)
+    finally:
+        torch.set_num_threads(prev_threads)
+
+    del w13_packed_cpu, w13_scale_cpu, w2_packed_cpu, w2_scale_cpu
+
+    # Release original device buffers before allocating converted tensors on device.
+    for param in (w13_param, w2_param):
+        old = param.data
+        param.data = torch.empty(0, dtype=old.dtype, device=old.device)
+        _free_replaced_storage(old, param.data)
+    _clear_replaced_param(layer, "w13_weight_scale_inv")
+    _clear_replaced_param(layer, "w2_weight_scale_inv")
+
+    w13_w = torch.cat(w13_w_chunks, dim=0).to(device=device)
+    w13_s = _own_storage(torch.cat(w13_s_chunks, dim=0).to(device=device))
+    w2_w = torch.cat(w2_w_chunks, dim=0).to(device=device)
+    w2_s = _own_storage(torch.cat(w2_s_chunks, dim=0).to(device=device))
+    w13_w_chunks.clear()
+    w13_s_chunks.clear()
+    w2_w_chunks.clear()
+    w2_s_chunks.clear()
+
+    copy_or_rebind_param(layer, "w13_weight", w13_w)
+    copy_or_rebind_param(layer, "w2_weight", w2_w)
+    copy_or_rebind_param(layer, "w13_weight_scale", w13_s)
+    copy_or_rebind_param(layer, "w2_weight_scale", w2_s)
+    layer.weight_block_size = None
+
+
 def prepare_tpu_fp8_moe_weights(
     layer: torch.nn.Module,
     *,
@@ -265,11 +454,14 @@ def prepare_tpu_fp8_moe_weights(
     use_mxfp8: bool,
     is_fp4_expert: bool,
 ) -> None:
-    """Format FP8 MoE weights/scales for the TPU Pallas gmm_v2 backend."""
-    if use_mxfp8 or is_fp4_expert:
+    """Format FP8 or MXFP4 MoE weights/scales for the TPU Pallas gmm_v2 backend."""
+    if use_mxfp8:
         raise NotImplementedError(
-            "TPU FP8 MoE currently supports FP8 and block-FP8 experts only."
+            "TPU FP8 MoE currently does not support MXFP8 experts."
         )
+    if is_fp4_expert:
+        _prepare_tpu_dsv4_mxfp4_moe_weights(layer)
+        return
 
     layer.weight_block_size = weight_block_size if block_quant else None
     if block_quant and weight_block_size is None:
@@ -387,7 +579,7 @@ def apply_tpu_fp8_moe(
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu
     # registers those ops. Until then, keep MoE on the same backend-dispatched
-    # fused grouped-GEMM model used by upstream CUDA paths and torchtpu-vllm.
+    # fused grouped-GEMM model used by upstream CUDA paths and vllm-torchtpu.
     if swiglu_limit is not None:
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")

@@ -61,6 +61,7 @@ from sglang.srt.configs.muse_glimmer import (
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
 )
+from sglang.srt.configs.muse_spark import MuseSparkConfig, MuseSparkTextConfig
 from sglang.srt.configs.nanbeige import NanbeigeConfig
 from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
@@ -115,6 +116,8 @@ __all__ = [
     "Olmo3Config",
     "MuseGlimmerConfig",
     "MuseGlimmerAssistantConfig",
+    "MuseSparkConfig",
+    "MuseSparkTextConfig",
     "Glm5NextConfig",
     "Glm5NextTextConfig",
     "KimiLinearConfig",

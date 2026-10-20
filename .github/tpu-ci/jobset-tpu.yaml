@@ -110,7 +110,7 @@ ${WEIGHTS_VOLUME}
                     - |
                       set -uo pipefail
                       cd /sgl-workspace/sglang
-                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=${PLATFORM} SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
                       export SGLANG_TPU_FULL_MATRIX=${FULL_MATRIX}
                       # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
                       # overlay; warmup fills the node disk and the kubelet evicts the pod.

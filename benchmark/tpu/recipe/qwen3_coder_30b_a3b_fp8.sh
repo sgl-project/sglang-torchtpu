@@ -10,7 +10,7 @@
 # CONTEXT_LEN 8192 with a 262144-token KV pool sizes the server for the lm-eval MMLU
 # sweep (test/lm_eval_configs/Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml) at
 # MAX_RUNNING=64; mem_fraction 0.30 is what leaves room for that pool at tp=8.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 exec env \
   MODEL="${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8}" \

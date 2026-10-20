@@ -151,6 +151,13 @@ class BaseKVManager(ABC):
             f"{type(self).__name__} does not support PD role switch teardown"
         )
 
+    def on_forward_launched(self, scheduler, mb_id: int, batch, result) -> None:
+        """PP prefill: this stage launched ``batch`` in microbatch slot ``mb_id``."""
+
+    def on_outputs_copied(self, mb_id: int, next_token_ids) -> None:
+        """PP prefill, last stage: the deferred output send copied slot
+        ``mb_id``'s sampled tokens to the host."""
+
 
 class BaseKVSender(ABC):
     @abstractmethod

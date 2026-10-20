@@ -1,5 +1,7 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -78,6 +80,39 @@ class TestQwen3_5PipelineParallel(CustomTestCase):
         )
 
         self.assertEqual(num_fused_shared_experts, 0)
+
+    def test_mtp_prepared_embeddings_match_token_lookup(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        model = self._make_mtp_weight_loader_stub()
+        with torch.no_grad():
+            model.model.embed_tokens.weight.copy_(torch.arange(12).reshape(4, 3))
+        model.model.forward = lambda ids, positions, batch, embeds: embeds
+        model.pre_fc_norm_embedding = torch.nn.Identity()
+        model.pre_fc_norm_hidden = torch.nn.Identity()
+        model.fc = torch.nn.Linear(6, 3, bias=False)
+        model.lm_head = torch.nn.Identity()
+        model.logits_processor = lambda ids, hidden, head, batch: hidden
+        batch = SimpleNamespace(
+            mm_input_embeds=None,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=SimpleNamespace(hidden_states=torch.ones(2, 3)),
+        )
+        ids = torch.tensor([1, 2])
+        positions = torch.tensor([3, 4])
+        prepared = model.model.embed_tokens(ids).detach().clone()
+        recorder = SimpleNamespace(disable_this_region=nullcontext)
+        with patch(
+            "sglang.srt.models.qwen3_5_mtp.get_global_expert_distribution_recorder",
+            return_value=recorder,
+        ):
+            expected = model(ids, positions, batch)
+            # A prepared input must not trigger a second embedding lookup.
+            with patch.object(
+                model.model.embed_tokens, "forward", side_effect=AssertionError
+            ):
+                actual = model(ids, positions, batch, input_embeds=prepared)
+        torch.testing.assert_close(actual, expected)
 
     def test_mtp_loads_vl_target_embedding_for_last_pp_stage(self):
         model = self._make_mtp_weight_loader_stub()

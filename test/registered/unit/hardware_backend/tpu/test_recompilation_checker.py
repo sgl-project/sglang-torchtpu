@@ -3,6 +3,7 @@
 import datetime
 import random
 import re
+import traceback
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -80,6 +81,22 @@ def _context():
 
 
 class TestRecompilationChecker(CustomTestCase):
+    def test_site_keeps_plugin_and_core_frames(self):
+        frames = [
+            traceback.FrameSummary("/venv/torch/dispatch.py", 1, "dispatch"),
+            traceback.FrameSummary("/repo/python/sglang/srt/runner.py", 20, "run"),
+            traceback.FrameSummary("/repo/sglang_tpu/sampler.py", 30, "sample"),
+            traceback.FrameSummary(recompilation_checker.__file__, 40, "trace"),
+        ]
+        with patch.object(
+            recompilation_checker.traceback, "extract_stack", return_value=frames
+        ):
+            site = recompilation_checker._describe_site("aten.add", (), {})
+        self.assertEqual(
+            site,
+            "aten.add() @ sglang_tpu/sampler.py:30 <- sglang/srt/runner.py:20",
+        )
+
     def test_baseline_entries_are_not_reported(self):
         cache = _FakeCache([500, 500, 30000])
         checker = _checker(cache)

@@ -9,7 +9,7 @@ FROM ${BASE_IMAGE} AS final
 WORKDIR /sgl-workspace/sglang
 
 # Copy source trees
-COPY README.md LICENSE ./
+COPY README.md LICENSE NOTICE ./
 COPY python    ./python
 COPY sglang_tpu ./sglang_tpu
 COPY pyproject.toml ./pyproject.toml
@@ -22,6 +22,14 @@ RUN cd python && rm -f pyproject.toml && cp pyproject_tpu.toml pyproject.toml
 
 # Install SGLang and the TPU plugin in editable mode without reinstalling
 # dependencies. Fast build on top of base.
-RUN pip install --no-deps -e ./python && pip install --no-deps -e .
+# setuptools-scm cannot read a version here (.git is not in the build context),
+# so release builds pass SGLANG_VERSION (fork sglang) and SGLANG_TPU_VERSION
+# (sglang-tpu); CI builds leave them empty and get the 0.0.0.dev0 fallback.
+# Only export when set: an empty pretend version is not the same as an unset one.
+ARG SGLANG_VERSION=""
+ARG SGLANG_TPU_VERSION=""
+RUN if [ -n "$SGLANG_VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG="$SGLANG_VERSION"; fi \
+ && if [ -n "$SGLANG_TPU_VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG_TPU="$SGLANG_TPU_VERSION"; fi \
+ && pip install --no-deps -e ./python && pip install --no-deps -e .
 
 CMD ["/bin/bash"]

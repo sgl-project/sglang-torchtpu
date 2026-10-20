@@ -151,6 +151,9 @@ jobs:
       suite: ${{ matrix.test.suite }}
       test_file: ${{ matrix.test.file }}
       nightly: true
+      # nightly-tpu-4-v7 runs mode B like the PR gate; multi-host, P/D, accuracy
+      # and perf lanes stay on mode A, so each test runs in one mode only.
+      platform: tpu_oot
       run_name: ${{ matrix.test.run_name }}
       weights_pvc: ${{ matrix.test.weights_pvc || 'model-weights' }}
     permissions:

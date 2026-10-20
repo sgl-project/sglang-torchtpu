@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import secrets
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -37,6 +37,10 @@ from sglang_tpu.disaggregation.raiden.serde import (
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+
+
+def _present_ids(*req_ids: Optional[str]) -> Tuple[str, ...]:
+    return tuple(rid for rid in req_ids if rid is not None)
 
 
 class RaidenReceiverMixin:
@@ -114,6 +118,8 @@ class RaidenReceiverMixin:
             self._decode.remote_endpoint[room] = endpoint
             self._decode.remote_swa_blocks[room] = remote_swa_blocks
             self._decode.remote_swa_endpoint[room] = swa_endpoint
+            self._decode.remote_state_rows[room] = list(req.state_blocks)
+            self._decode.remote_state_endpoint[room] = req.state_endpoint
             self._record_announcement_locked(room, str(room))
             aux_index = self._decode.decode_aux_index.get(room)
             # Written under the lock: a room failing concurrently frees its
@@ -143,8 +149,8 @@ class RaidenReceiverMixin:
                 self._decode.remote_total[room] = total
                 missing = self._uncovered_pages(total, spans)
                 if holds_nothing:
-                    # Full prefix hit: BLOCKS and its aux blob complete
-                    # reception on both engines without a closing read.
+                    # Full prefix hit: BLOCKS and its aux blob complete the KV
+                    # engines without a closing read; GDN state is still pulled.
                     self._completed_recv.add(str(room))
                     if self._swa_engine is not None:
                         self._completed_recv.add(self._swa_req_id(room))
@@ -191,6 +197,8 @@ class RaidenReceiverMixin:
         local_swa_blocks: List[int],
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
+        *,
+        local_state_rows: Sequence[int] = (),
     ) -> None:
         if self._pipeline is not None:
             self._pipeline.register_decode(
@@ -198,6 +206,12 @@ class RaidenReceiverMixin:
             )
             return
         if len(bootstrap_infos) != 1:
+            if self._state_engine is not None:
+                raise NotImplementedError(
+                    "Raiden push resharding does not move GDN (linear-attention) "
+                    f"state yet (got {len(bootstrap_infos)} prefill sources for "
+                    "one decode rank); use equal attention TP on prefill and decode."
+                )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
             # head-slice strided into the wider decode block. The plan stages
@@ -228,6 +242,7 @@ class RaidenReceiverMixin:
         with self._state_lock:
             self._decode.local_blocks[room] = local_blocks
             self._decode.local_swa_blocks[room] = local_swa_blocks
+            self._decode.local_state_rows[room] = list(local_state_rows)
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
         payload = PullReq(
@@ -265,20 +280,31 @@ class RaidenReceiverMixin:
             return None
         return self._swa_req_id(int(key))
 
+    def _paired_state_read(self, key: str) -> Optional[str]:
+        """The GDN state read issued alongside the read key, if any; it rides
+        on the same reads as the sliding-window one."""
+        if self._state_engine is None or "#" in key:
+            return None
+        return self._state_req_id(int(key))
+
+    def _paired_reads(self, key: str) -> List[str]:
+        return [
+            rid
+            for rid in (self._paired_swa_read(key), self._paired_state_read(key))
+            if rid is not None
+        ]
+
     def _pull_settled_locked(self, key: str) -> bool:
         """Whether every engine has reported the read ``key`` done or failed.
 
         Raiden holds a read's host staging until it completes or times out,
         whichever engine it is on, so the read's admission stays claimed until
-        both it and its paired sliding-window read have settled.
+        it and its paired sliding-window and state reads have settled.
         """
-        settled = key in self._completed_recv or key in self._native_failed
-        swa_rid = self._paired_swa_read(key)
-        if swa_rid is not None:
-            settled = settled and (
-                swa_rid in self._completed_recv or swa_rid in self._native_failed
-            )
-        return settled
+        return all(
+            rid in self._completed_recv or rid in self._native_failed
+            for rid in (key, *self._paired_reads(key))
+        )
 
     def _settled_cleared_plans_locked(self) -> List[int]:
         """Plan uuids of cleared rooms whose push the engine has now settled.
@@ -308,7 +334,7 @@ class RaidenReceiverMixin:
                 # The framework already dropped this read's room; nothing will
                 # read its completion, so drop it too.
                 self._pulling_cleared.discard(key)
-                for rid in (key, self._paired_swa_read(key) or key):
+                for rid in (key, *self._paired_reads(key)):
                     self._completed_recv.discard(rid)
                     self._failed.discard(rid)
                     self._native_failed.discard(rid)
@@ -431,6 +457,15 @@ class RaidenReceiverMixin:
         previous read has settled. Chunks are taken in prefill order.
         """
         engine = self._ensure_engine()
+        if self._state_engine is not None:
+            with self._state_lock:
+                holds_nothing = (
+                    room in self._decode.final_seen
+                    and room in self._decode.local_blocks
+                    and not self._decode.local_blocks[room]
+                )
+            if holds_nothing:
+                return self._start_state_only_pull(room)
         while True:
             with self._state_lock:
                 queue = self._decode.chunk_queue.get(room)
@@ -470,10 +505,11 @@ class RaidenReceiverMixin:
                     break
                 cost = self._staging_cost(full_pages, self._full_engine_max_blocks)
                 swa_cost = 0
-                # The closing read also carries the sliding-window pages, on
-                # the engine that stages them against its own limit.
-                closing = req_id == str(room) and self._swa_engine is not None
-                if closing:
+                state_cost = 0
+                # The closing read also carries the sliding-window pages and
+                # the GDN state row, each on the engine that stages them.
+                closing = req_id == str(room)
+                if closing and self._swa_engine is not None:
                     remote_swa, local_swa = self._pair_blocks(
                         list(self._decode.remote_swa_blocks.get(room, [])),
                         list(self._decode.local_swa_blocks.get(room, [])),
@@ -491,9 +527,16 @@ class RaidenReceiverMixin:
                     swa_cost = self._staging_cost(
                         swa_pages, self._swa_engine_max_blocks
                     )
+                if closing and self._state_engine is not None:
+                    remote_state, local_state, state_endpoint = self._state_read_locked(
+                        room
+                    )
+                    state_cost = self._state_engine_max_blocks
                 if self._announcement_expired_locked(room, req_id):
                     return started
-                if not self._pulling.admit(req_id, cost, swa_cost):
+                if not self._pulling.admit(
+                    req_id, cost, swa_cost, state_pages=state_cost
+                ):
                     return started
                 # Status moves with the admission, under the same lock an
                 # abort takes: a Transferring write can never follow the
@@ -503,7 +546,16 @@ class RaidenReceiverMixin:
                 remote_slice = [blk for blk, _ in pairs]
                 local_slice = [loc for _, loc in pairs]
                 self._decode.chunk_reads.setdefault(room, []).append(req_id)
-            swa_rid = self._swa_req_id(room) if closing else None
+            swa_rid = (
+                self._swa_req_id(room)
+                if closing and self._swa_engine is not None
+                else None
+            )
+            state_rid = (
+                self._state_req_id(room)
+                if closing and self._state_engine is not None
+                else None
+            )
             if not self._start_read_or_fail(
                 room=room,
                 engine=engine,
@@ -512,7 +564,7 @@ class RaidenReceiverMixin:
                 endpoint=endpoint,
                 remote=remote_slice,
                 local=local_slice,
-                unissued=(swa_rid,) if swa_rid is not None else (),
+                unissued=_present_ids(swa_rid, state_rid),
             ):
                 return False
             if swa_rid is not None and not self._start_read_or_fail(
@@ -523,6 +575,17 @@ class RaidenReceiverMixin:
                 endpoint=swa_endpoint,
                 remote=remote_swa,
                 local=local_swa,
+                unissued=_present_ids(state_rid),
+            ):
+                return False
+            if state_rid is not None and not self._start_read_or_fail(
+                room=room,
+                engine=self._state_engine,
+                req_id=state_rid,
+                uuid=room,
+                endpoint=state_endpoint,
+                remote=remote_state,
+                local=local_state,
             ):
                 return False
         self._reject_oversized_pull(room, *oversized)
@@ -541,6 +604,10 @@ class RaidenReceiverMixin:
                 or (
                     self._swa_engine is not None
                     and room not in self._decode.remote_swa_endpoint
+                )
+                or (
+                    self._state_engine is not None
+                    and room not in self._decode.remote_state_endpoint
                 )
             ):
                 return False
@@ -569,6 +636,9 @@ class RaidenReceiverMixin:
                 self._completed_recv.add(str(room))
                 if self._swa_engine is not None:
                     self._completed_recv.add(self._swa_req_id(room))
+            if self._state_engine is not None:
+                # GDN state cannot be rebuilt from cached KV.
+                return self._start_state_only_pull(room)
             return True
         engine = self._ensure_engine()
         full_pages = len(set(local))
@@ -596,6 +666,7 @@ class RaidenReceiverMixin:
                 )
                 return False
             swa_cost = self._staging_cost(swa_pages, self._swa_engine_max_blocks)
+        state_cost = 0
         with self._state_lock:
             # The receiver polls every scheduler pass; a room whose read is
             # already in flight must not issue again -- a second start_read
@@ -610,12 +681,20 @@ class RaidenReceiverMixin:
                 room, str(room)
             ):
                 return False
-            if not self._pulling.admit(str(room), cost, swa_cost):
+            if self._state_engine is not None:
+                remote_state, local_state, state_endpoint = self._state_read_locked(
+                    room
+                )
+                state_cost = self._state_engine_max_blocks
+            if not self._pulling.admit(
+                str(room), cost, swa_cost, state_pages=state_cost
+            ):
                 return False
             # Status moves with the admission, under the same lock an abort
             # takes: a Transferring write can never follow the abort's Failed.
             self.update_status(room, KVPoll.Transferring)
         swa_rid = self._swa_req_id(room) if self._swa_engine is not None else None
+        state_rid = self._state_req_id(room) if self._state_engine is not None else None
         if not self._start_read_or_fail(
             room=room,
             engine=engine,
@@ -624,7 +703,7 @@ class RaidenReceiverMixin:
             endpoint=endpoint,
             remote=remote,
             local=local,
-            unissued=(swa_rid,) if swa_rid is not None else (),
+            unissued=_present_ids(swa_rid, state_rid),
         ):
             return False
         if swa_rid is not None and not self._start_read_or_fail(
@@ -635,9 +714,65 @@ class RaidenReceiverMixin:
             endpoint=swa_endpoint,
             remote=remote_swa,
             local=local_swa,
+            unissued=_present_ids(state_rid),
+        ):
+            return False
+        if state_rid is not None and not self._start_read_or_fail(
+            room=room,
+            engine=self._state_engine,
+            req_id=state_rid,
+            uuid=room,
+            endpoint=state_endpoint,
+            remote=remote_state,
+            local=local_state,
         ):
             return False
         return True
+
+    def _state_read_locked(self, room: int) -> Tuple[List[int], List[int], str]:
+        """Remote rows, local rows and endpoint of the room's GDN state read."""
+        remote = list(self._decode.remote_state_rows.get(room, []))
+        local = list(self._decode.local_state_rows.get(room, []))
+        if len(remote) != 1 or len(local) != 1:
+            raise RuntimeError(
+                f"Raiden GDN state read of room {room} needs one row per side, "
+                f"got remote={remote} local={local}"
+            )
+        return remote, local, self._decode.remote_state_endpoint.get(room, "")
+
+    def _start_state_only_pull(self, room: int) -> bool:
+        """Pull only the GDN state row of a room whose KV the decode already
+        holds; the read is admitted under the room's id like a whole read."""
+        state_rid = self._state_req_id(room)
+        with self._state_lock:
+            if (
+                str(room) in self._pulling
+                or state_rid in self._completed_recv
+                or state_rid in self._native_failed
+            ):
+                return True
+            if (
+                room in self._aborted
+                or self._is_failed_locked(room)
+                or room not in self._decode.remote_state_endpoint
+                or self._announcement_expired_locked(room, str(room))
+            ):
+                return False
+            remote, local, endpoint = self._state_read_locked(room)
+            if not self._pulling.admit(
+                str(room), 0, state_pages=self._state_engine_max_blocks
+            ):
+                return False
+            self.update_status(room, KVPoll.Transferring)
+        return self._start_read_or_fail(
+            room=room,
+            engine=self._state_engine,
+            req_id=state_rid,
+            uuid=room,
+            endpoint=endpoint,
+            remote=remote,
+            local=local,
+        )
 
     # ----- asymmetric-TP resharding (producer-push) -------------------------
     #
@@ -1187,6 +1322,7 @@ class RaidenKVReceiver(CommonKVReceiver):
             self.kv_mgr._swa_blocks_from_state_indices(state_indices),
             aux_index,
             self.bootstrap_infos,
+            local_state_rows=self.kv_mgr._state_rows_from_state_indices(state_indices),
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
         # The waiting timeout counts from here: the request is now known to

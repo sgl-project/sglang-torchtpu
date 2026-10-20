@@ -83,6 +83,9 @@ class Blocks(WireMessage):
     swa_blocks: list[int]
     swa_endpoint: str
     aux_blob: bytes
+    # The prefill's committed GDN state row and its state engine endpoint.
+    state_blocks: list[int] = msgspec.field(default_factory=list)
+    state_endpoint: str = ""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

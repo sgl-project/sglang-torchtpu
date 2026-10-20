@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
 from sglang_tpu.result_copy_worker import (
     TpuAsyncCopyEvent,
     TPUAsyncCopyWorker,
@@ -178,8 +179,9 @@ def test_worker_preserves_context_and_serializes_copies(monkeypatch):
     assert contexts == []
 
 
+@pytest.mark.parametrize("host_padded", [False, True])
 @pytest.mark.parametrize("copy_draft_tail", [True, False])
-def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail):
+def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail, host_padded):
     """Draft-extend writes draft KV after the verify outputs are produced, so
     under the KV free fence copy_done must also wait for one of its outputs;
     otherwise the extra copy would only delay result processing."""
@@ -202,9 +204,15 @@ def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail):
     )
     event = Mock()
     event.record.side_effect = lambda: issued.append("record")
-    result = SimpleNamespace(
-        copy_done=event, next_draft_input=EagleDraftInput(topk_index=topk_index)
-    )
+    if host_padded:
+        # The experimental worker's commit writes draft KV; kv_fence_tail reads it.
+        draft_input = HostPaddedBlockDraftInput(
+            bonus_tokens=torch.zeros(1), new_seq_lens=torch.zeros(1)
+        )
+        draft_input.kv_fence_tail = topk_index
+    else:
+        draft_input = EagleDraftInput(topk_index=topk_index)
+    result = SimpleNamespace(copy_done=event, next_draft_input=draft_input)
     result.copy_to_cpu = lambda *args: (
         issued.append("copy"),
         result.copy_done.record(),

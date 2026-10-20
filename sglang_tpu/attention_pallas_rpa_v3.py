@@ -18,7 +18,6 @@ from typing import Optional
 
 from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
-    BaseTpuPallasRpaMultiStepDraftBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
 )
@@ -26,7 +25,6 @@ from sglang_tpu.attention_pallas_rpa_base import (
 __all__ = [
     "PallasForwardMetadata",
     "TpuPallasRpaV3AttnBackend",
-    "TpuPallasRpaV3MultiStepDraftBackend",
 ]
 
 
@@ -102,9 +100,3 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
     ):
         # RPA-v3 rebuilds verify metadata and has no graph-capture buffers.
         pass
-
-
-class TpuPallasRpaV3MultiStepDraftBackend(BaseTpuPallasRpaMultiStepDraftBackend):
-    """One RPA-v3 backend per EAGLE draft decode step."""
-
-    attn_backend_cls = TpuPallasRpaV3AttnBackend

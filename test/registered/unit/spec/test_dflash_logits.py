@@ -4,9 +4,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
+    DFlashGroupedConv,
     _grouped_conv,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
@@ -470,6 +472,36 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+def test_grouped_conv_matmul_expand_is_exact():
+    """SGLANG_DFLASH_CONV_MATMUL_EXPAND must reproduce the default conv bit for bit,
+    across a block boundary and with more than one 128-group expansion block."""
+    hidden_size, block_size, taps, group_size = 4096, 8, 2, 16
+    generator = torch.Generator().manual_seed(1)
+    plain = DFlashGroupedConv(hidden_size, block_size, taps, group_size)
+    with envs.SGLANG_DFLASH_CONV_MATMUL_EXPAND.override(True):
+        fast = DFlashGroupedConv(hidden_size, block_size, taps, group_size)
+        assert not DFlashGroupedConv(256, block_size, taps, group_size).matmul_expand
+    assert fast.matmul_expand and not plain.matmul_expand
+    with torch.no_grad():
+        plain.kernel_projection.weight.normal_(0, 0.02, generator=generator)
+        plain.base_kernel.normal_(0, 0.1, generator=generator)
+    fast.load_state_dict(plain.state_dict())
+    plain, fast = plain.to(torch.bfloat16), fast.to(torch.bfloat16)
+    x, y = torch.randn(2, 2 * block_size, hidden_size, generator=generator).to(
+        torch.bfloat16
+    )
+
+    # Both paths eager: inductor fuses the compiled reference's elementwise chain in
+    # fp32 and rounds once, while the expanded path rounds to bf16 after every op.
+    with torch.compiler.set_stance("force_eager"):
+        want_out, want_kernel = plain.prepare(x)
+        got_out, got_kernel = fast.prepare(x)
+        torch.testing.assert_close(got_out, want_out, rtol=0, atol=0)
+        torch.testing.assert_close(
+            fast.finish(y, got_kernel), plain.finish(y, want_kernel), rtol=0, atol=0
+        )
 
 
 if __name__ == "__main__":

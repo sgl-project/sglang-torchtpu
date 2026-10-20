@@ -12,7 +12,7 @@
 #
 # Env (optional):
 #   TP_SIZE=16  EP_SIZE=16  PAGE_SIZE=64  MEM_FRACTION_STATIC=0.92  PORT=30000
-#   PYTHON=/cache/work/.venv/bin/python
+#   PYTHON=python3
 #   SGLANG_HOST_IP=<pod ip>          # default: auto from `hostname -i`
 #   NNODES=1  NODE_RANK=0  DIST_INIT_ADDR=<node0_ip>:<port>   # multi-node TP only
 #   EXTRA_ARGS="..."
@@ -27,7 +27,7 @@ ENABLE_DP_ATTENTION=${ENABLE_DP_ATTENTION:-0}
 PAGE_SIZE=${PAGE_SIZE:-64}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.92}
 PORT=${PORT:-30000}
-PYTHON=${PYTHON:-/cache/work/.venv/bin/python}
+PYTHON=${PYTHON:-python3}
 HOST=0.0.0.0
 
 export SGLANG_HOST_IP=${SGLANG_HOST_IP:-$(hostname -i | awk '{print $1}')}

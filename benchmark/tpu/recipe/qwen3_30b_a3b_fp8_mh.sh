@@ -4,7 +4,7 @@
 # MULTIHOST_LAUNCH.weights_pvc). This script IS the model+config spec; the CI runs it on
 # every host. GKE injects TPU_WORKER_* so launch_server.sh auto-derives NNODES / rank.
 # FP8 + MoE are auto-detected from the checkpoint; EP_SIZE must divide TP.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 # QUANTIZATION= / KV_CACHE_DTYPE= (empty): the checkpoint is already block-fp8 and
 # sglang auto-detects it, so let it. launch_server.sh's fp8 defaults (--quantization fp8

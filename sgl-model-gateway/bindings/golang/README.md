@@ -59,8 +59,8 @@ Run the OpenAI-compatible server and benchmark:
 
 ```bash
 # Set environment variables
-export SGL_TOKENIZER_PATH="/Users/yangyanbo/tokenizer"
-export SGL_GRPC_ENDPOINT="grpc://10.109.185.20:8001"
+export SGL_TOKENIZER_PATH="/path/to/tokenizer"
+export SGL_GRPC_ENDPOINT="grpc://127.0.0.1:8001"
 
 # Run server
 cd examples/oai_server
@@ -68,7 +68,7 @@ bash run.sh
 
 # Run E2E benchmark
 cd ../..
-make e2e E2E_MODEL=/work/models/qwencoder-3b E2E_TOKENIZER=/Users/yangyanbo/tokenizer E2E_INPUT_LEN=1024 E2E_OUTPUT_LEN=512
+make e2e E2E_MODEL=/work/models/qwencoder-3b E2E_TOKENIZER=/path/to/tokenizer E2E_INPUT_LEN=1024 E2E_OUTPUT_LEN=512
 ```
 
 ## Examples

@@ -227,6 +227,74 @@ class TestDraftFactoryStamping(CustomTestCase):
         )
         self.assertEqual(product.prefill_attention_backend_str, "trtllm_mha")
 
+    def test_a_registered_draft_backend_is_built_and_stamped_with_its_name(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from sglang.srt.layers.attention import attention_registry as registry
+
+        container = SimpleNamespace(attn_backends=[SimpleNamespace()])
+        create = mock.Mock(return_value=container)
+        self._publish(attention_backend="triton")
+        factory = self._factory(draft_backend="platform_mla")
+        with mock.patch.dict(
+            registry.DRAFT_ATTENTION_BACKENDS, {"platform_mla": create}
+        ):
+            product = factory._create_backend(
+                "decode_attention_backend",
+                {},
+                "unsupported {backend_type}",
+                stamps_children=True,
+            )
+        create.assert_called_once_with(
+            runner=factory.draft_model_runner, topk=1, speculative_num_steps=2
+        )
+        for obj in [product, *product.attn_backends]:
+            self.assertEqual(obj.decode_attention_backend_str, "platform_mla")
+
+    def test_a_registered_draft_extend_builds_the_target_backend(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from sglang.srt.layers.attention import attention_registry as registry
+
+        target = mock.Mock(return_value=SimpleNamespace())
+        self._publish(attention_backend="triton")
+        factory = self._factory(draft_backend="platform_mla")
+        with (
+            mock.patch.dict(
+                registry.DRAFT_ATTENTION_BACKENDS, {"platform_mla": mock.Mock()}
+            ),
+            mock.patch.dict(registry.ATTENTION_BACKENDS, {"platform_mla": target}),
+        ):
+            product = factory._create_backend(
+                "prefill_attention_backend", {}, "unsupported {backend_type}"
+            )
+        target.assert_called_once_with(factory.draft_model_runner)
+        self.assertEqual(product.prefill_attention_backend_str, "platform_mla")
+
+    def test_a_target_only_backend_is_rejected(self):
+        from unittest import mock
+
+        from sglang.srt.layers.attention import attention_registry as registry
+
+        self._publish(attention_backend="triton")
+        factory = self._factory(draft_backend="target_only")
+        with (
+            mock.patch.dict(registry.ATTENTION_BACKENDS, {"target_only": mock.Mock()}),
+            self.assertRaisesRegex(ValueError, "unsupported target_only"),
+        ):
+            factory._create_backend(
+                "prefill_attention_backend", {}, "unsupported {backend_type}"
+            )
+
+    def test_an_unknown_backend_is_rejected(self):
+        self._publish(attention_backend="triton")
+        with self.assertRaisesRegex(ValueError, "unsupported nope"):
+            self._factory(draft_backend="nope")._create_backend(
+                "decode_attention_backend", {}, "unsupported {backend_type}"
+            )
+
     def test_cutedsl_draft_extend_stamps_the_effective_kernel(self):
         # cutedsl_mla only supports decode; the draft-extend map builds the
         # trtllm-mla backend, and the *constructor* answers the effective

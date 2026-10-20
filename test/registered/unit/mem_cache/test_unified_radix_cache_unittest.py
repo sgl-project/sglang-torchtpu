@@ -7481,6 +7481,46 @@ class UnifiedRadixCacheSuite:
             forward_len - expected_evicted,
         )
 
+    def test_deferred_chunk_keeps_the_swa_window_under_the_branch(self):
+        """A deferred mid-prefill chunk must not free the SWA window under the
+        request's branch point; the end-of-prefill insert lands there."""
+        if (
+            not self.cfg.has_swa
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 1
+            or self.cfg.sliding_window_size != 4
+        ):
+            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        branching_seqlen = 8
+        forward_len = 20
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, forward_len)
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, forward_len)
+        req.swa_branching_seqlen = branching_seqlen
+        req.kv.cache_protected_len = 4
+        kv_indices = self._alloc(allocator, forward_len)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, forward_len)),
+            kv_indices,
+        )
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            self.assertTrue(cache.defer_chunk_checkpoint(req))
+
+        window = kv_indices[
+            branching_seqlen - self.cfg.sliding_window_size : branching_seqlen
+        ]
+        mapping = allocator.full_to_swa_index_mapping
+        self.assertEqual(
+            torch.count_nonzero(mapping[window]).item(), self.cfg.sliding_window_size
+        )
+        self.assertEqual(len(req.prefix_indices), forward_len)
+
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

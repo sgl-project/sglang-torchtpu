@@ -2,7 +2,7 @@ from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
 MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
-ADAPTER = "/home/ying/test_lora"
+ADAPTER = "/path/to/lora-adapter"
 prompt = """
 ### Instruction:
 Write a poem about the transformers Python library.
