@@ -28,6 +28,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Qwen3-Coder-480B-A35B | FP8 | 2 hosts, 1 host, 2P+2D | Optimized |
 | DeepSeek-V3.1 | FP8 | 2 hosts | Optimized |
 | Qwen3.5-397B-A17B (text, VL) | FP8 | 1 host | Optimized |
+| GLM-5.3-Flash | FP8 | 1 host | Optimized |
 | gpt-oss-20b | MXFP4 | 1 host | Quickstart |
 | Qwen3-0.6B | bf16 | 1 chip, 1 host | Quickstart |
 | DeepSeek-R1-0528 | FP8 | 2 hosts | Supported |
@@ -39,8 +40,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Qwen3-Coder-30B-A3B | FP8 | 1 host | Experimental |
 | Kimi-K3, Kimi-K2.5 | bf16, INT4 | 1 host | Experimental |
 | DeepSeek-V4 | FP8 | — | Experimental |
-| GLM-5.2 / GLM-5.3 | FP8 | — | Experimental |
-| GLM-5.3-Flash | FP8 | 1 host | Experimental |
+| GLM-5.2 / GLM-5.3 | FP8 | 1 host | Experimental |
 | Qwen3.8-27B | bf16 | 1 host | Experimental |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
 
@@ -87,6 +87,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Qwen3-Coder-480B-A35B | FP8 channelwise | 2 hosts tp16/ep16/dp2; 1 host; 2P+2D | **Optimized** | Flagship. Nightly gsm8k, agentic tool-call workload, PD resharding, benchmark matrix. |
 | DeepSeek-V3.1 | FP8 | 2 hosts tp16 | **Optimized** | Paged MLA attention. Nightly accuracy and perf. |
 | Qwen3.5-397B-A17B (text and VL) | FP8 | 1 host | **Optimized** | GDN hybrid linear attention. Nightly MMMU-Pro and perf. |
+| GLM-5.3-Flash | FP8 | 1 host tp8 | **Optimized** | DeepSeek Sparse Attention. Serving, MTP, and decode-megakernel recipes. No registered test. |
 | gpt-oss-20b | MXFP4 | 1 host | **Quickstart** | PR gate: spec decode, spec + DP attention, prefix cache + KV offload, PP smoke. Also nightly accuracy and perf. |
 | Qwen3-0.6B | bf16 | 1 chip, 1 host | **Quickstart** | PR gate: smoke, prompt logprobs, compile tracer, compile bundles, plugin-mode smoke. Single-host only (tp>1 OOMs). |
 | DeepSeek-R1-0528 | FP8 | 2 hosts tp16 | **Supported** | Paged MLA attention. Nightly perf green; accuracy suite intermittently red. |
@@ -99,8 +100,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a dummy-weight compile smoke runs; no real checkpoint served in CI. |
 | Kimi-K2.5 | INT4 | shares the K2.6 path | **Experimental** | MoonViT vision tower compiled per image. No K2.5-specific test. |
 | DeepSeek-V4 | FP8 | — | **Experimental** | Compressor, indexer, sparse attention, SparseCore top-k landed. No on-device test. FP4 indexer and online compression rejected. |
-| GLM-5.2 / GLM-5.3 | FP8 | — | **Experimental** | Recipe and DSA sparse-MLA kernels. No registered test. |
-| GLM-5.3-Flash | FP8 | 1 host tp8 | **Experimental** | DeepSeek Sparse Attention. Serving, MTP, and decode-megakernel recipes. No registered test. |
+| GLM-5.2 / GLM-5.3 | FP8 | 1 host tp8+ep8 | **Experimental** | DSA sparse-MLA kernels, shared with GLM-5.3-Flash. The `glm_5_3.sh` recipe was removed as an orphan in #1432. No registered test. |
 | Qwen3.8-27B | bf16 | 1 host tp8 | **Experimental** | Dense hybrid GDN, vision on. Nightly AIME26, GPQA, MMMU-Pro; MTP and DFlash recompile e2e. |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; multi-host collectives | **Experimental** | Runs through the generic diffusion engine; external nightly only, no recent green. |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
