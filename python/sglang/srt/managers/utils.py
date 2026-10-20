@@ -15,6 +15,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,
 )
+from sglang.srt.layers.logprob_processor import BatchedTopLogprobs
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -161,6 +162,7 @@ class GenerationBatchResult:
         e.g., next_token_ids, logits outputs
         """
         if return_logprob:
+            self.logits_output.copy_batched_output_top_logprobs(_async_d2h)
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
                     self.logits_output.next_token_logprobs
@@ -288,6 +290,7 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
     # their forward-stream copies must be complete before pickling starts.
     logits_output.finalize_input_logprobs()
     sampling_mask_output = logits_output.sampling_mask_output
+    batched_top_logprobs = logits_output.batched_output_top_logprobs
 
     return {
         "extend_input_len_per_req": result.extend_input_len_per_req,
@@ -295,6 +298,15 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_logprobs": result.logits_output.next_token_logprobs,
         "next_token_top_logprobs_val": result.logits_output.next_token_top_logprobs_val,
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
+        "batched_top_logprobs_values": (
+            None if batched_top_logprobs is None else batched_top_logprobs.values
+        ),
+        "batched_top_logprobs_indices": (
+            None if batched_top_logprobs is None else batched_top_logprobs.indices
+        ),
+        "batched_top_logprobs_lengths": (
+            None if batched_top_logprobs is None else batched_top_logprobs.lengths
+        ),
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
         "sampling_mask_token_ids": (
@@ -334,6 +346,13 @@ def get_logprob_from_pp_outputs(
 ) -> tuple[LogitsProcessorOutput, list[int], list[int]]:
     """Reconstruct output processing state received from the last PP stage."""
     sampling_mask_output = None
+    batched_top_logprobs = None
+    if next_pp_outputs["batched_top_logprobs_values"] is not None:
+        batched_top_logprobs = BatchedTopLogprobs(
+            values=next_pp_outputs["batched_top_logprobs_values"],
+            indices=next_pp_outputs["batched_top_logprobs_indices"],
+            lengths=next_pp_outputs["batched_top_logprobs_lengths"],
+        )
     if next_pp_outputs["sampling_mask_token_ids"] is not None:
         sampling_mask_output = SamplingMaskOutput(
             token_ids=next_pp_outputs["sampling_mask_token_ids"],
@@ -350,6 +369,7 @@ def get_logprob_from_pp_outputs(
         next_token_logprobs=next_pp_outputs["next_token_logprobs"],
         next_token_top_logprobs_val=next_pp_outputs["next_token_top_logprobs_val"],
         next_token_top_logprobs_idx=next_pp_outputs["next_token_top_logprobs_idx"],
+        batched_output_top_logprobs=batched_top_logprobs,
         next_token_token_ids_logprobs_val=next_pp_outputs[
             "next_token_token_ids_logprobs_val"
         ],

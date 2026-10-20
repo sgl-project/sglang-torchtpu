@@ -19,6 +19,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
 )
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -77,6 +78,20 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertEqual(
             self.platform.get_default_attention_backend(), "pallas_tpu_rpa_v3"
         )
+
+    def test_batch_row_merge_uses_authoritative_host_mirror_only_on_tpu(self):
+        left, right = torch.tensor([3, 7]), torch.tensor([11])
+        host_rows = torch.tensor([3, 7, 11])
+        with patch("sglang_tpu.tpu_platform.merge_rows") as merge:
+            actual = self.platform.merge_batch_rows(left, right, host_rows=host_rows)
+        merge.assert_not_called()
+        self.assertTrue(torch.equal(actual, host_rows))
+        actual.fill_(-1)
+        self.assertTrue(torch.equal(host_rows, torch.tensor([3, 7, 11])))
+
+        generic = SRTPlatform().merge_batch_rows(left, right, host_rows=host_rows)
+        self.assertTrue(torch.equal(generic, host_rows))
+        self.assertNotEqual(generic.data_ptr(), host_rows.data_ptr())
 
 
 class TestTpuPlatformInitialization(CustomTestCase):

@@ -521,6 +521,7 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         if batch.return_logprob:
             logits_output.finalize_input_logprobs()
+            logits_output.copy_batched_output_top_logprobs(torch.Tensor.cpu)
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = (
                     logits_output.next_token_logprobs.tolist()
@@ -1101,6 +1102,7 @@ class SchedulerBatchResultProcessor:
             next_token_ids = [[t] for t in ids]
 
         if batch.return_logprob:
+            logits_output.copy_batched_output_top_logprobs(torch.Tensor.cpu)
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
             if logits_output.next_token_top_logprobs_val:
                 logits_output.next_token_top_logprobs_val = [

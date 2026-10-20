@@ -36,6 +36,7 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.compilation.scoped_cache_guard import allow_tpu_recompilation
 from sglang_tpu.cp_forward import (
     cp_local_embeds,
     cp_token_inputs,
@@ -260,10 +261,7 @@ def _fit_pp_proxy_in_args(
 
 def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
     """Zero-pad a tensor along dim 0 to target_size."""
-    if t.shape[0] >= target_size:
-        return t
-    pad_rows = target_size - t.shape[0]
-    return F.pad(t, (0,) * (2 * (t.ndim - 1)) + (0, pad_rows))
+    return _pad_tensor(t, target_size)
 
 
 def _dp_attn_select_bucket_shape(
@@ -468,6 +466,7 @@ _PINNED_LOGPROB_FIELDS: dict[str, Any] = {
     "top_logprobs_nums": None,
     "token_ids_logprobs": None,
     "extend_input_logprob_token_ids_gpu": None,
+    "extend_input_logprob_token_ids_cpu": None,
 }
 
 
@@ -562,6 +561,12 @@ def _pad_tensor_on_host(
     return padded.to(t.device)
 
 
+@allow_tpu_recompilation
+def _pad_tensor_on_tpu(t: torch.Tensor, padding: tuple[int, ...]) -> torch.Tensor:
+    """Materialize only the pad whose shape depends on the request length."""
+    return F.pad(t, padding)
+
+
 def _pad_tensor(
     t: torch.Tensor, target_size: int, *, dim: int = 0, on_host: bool = False
 ) -> torch.Tensor:
@@ -572,6 +577,8 @@ def _pad_tensor(
         return _pad_tensor_on_host(t, target_size, dim=dim)
     dim = dim % t.ndim
     padding = (0,) * (2 * (t.ndim - dim - 1)) + (0, target_size - t.shape[dim])
+    if t.device.type == "tpu":
+        return _pad_tensor_on_tpu(t, padding)
     return F.pad(t, padding)
 
 
@@ -1167,6 +1174,9 @@ class CompiledForwardShim:
                     cp_layout=cp_layout,
                     embeds_tokens=self._is_first_pp_stage(),
                 )
+        caller_capture = (
+            saved.get("capture_hidden_mode") if not wants_input_logprob else None
+        )
         try:
             # A proxy holds the previous stage's local rows; fit it after localizing.
             pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
@@ -1194,7 +1204,10 @@ class CompiledForwardShim:
                     previous = _pin_fields(forward_batch, finalize_fields)
                     try:
                         return self._finalize_forward(
-                            result, forward_batch, keep_padded=keep_padded
+                            result,
+                            forward_batch,
+                            keep_padded=keep_padded,
+                            caller_capture=caller_capture,
                         )
                     finally:
                         _restore_fields(forward_batch, previous)
@@ -1202,7 +1215,10 @@ class CompiledForwardShim:
                 out = out.then(finalize_pending)
             else:
                 out = self._finalize_forward(
-                    out, forward_batch, keep_padded=keep_padded
+                    out,
+                    forward_batch,
+                    keep_padded=keep_padded,
+                    caller_capture=caller_capture,
                 )
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
@@ -1238,12 +1254,29 @@ class CompiledForwardShim:
         return finish(out)
 
     def _finalize_forward(
-        self, out: Any, forward_batch: Any, *, keep_padded: bool
+        self,
+        out: Any,
+        forward_batch: Any,
+        *,
+        keep_padded: bool,
+        caller_capture: CaptureHiddenMode | None = None,
     ) -> Any:
-        spec_info = forward_batch.spec_info
-        if not keep_padded and (spec_info is None or not spec_info.keep_outputs_padded):
-            out = self.policy.finalize_forward_batch(out, forward_batch)
-        return out
+        previous_capture = None
+        if isinstance(out, torch.Tensor) and caller_capture is not None:
+            # A hidden-state boundary feeds an eager logits stage. Its output
+            # layout follows the caller's capture mode, not the pinned graph mode.
+            previous_capture = forward_batch.capture_hidden_mode
+            forward_batch.capture_hidden_mode = caller_capture
+        try:
+            spec_info = forward_batch.spec_info
+            if not keep_padded and (
+                spec_info is None or not spec_info.keep_outputs_padded
+            ):
+                out = self.policy.finalize_forward_batch(out, forward_batch)
+            return out
+        finally:
+            if previous_capture is not None:
+                forward_batch.capture_hidden_mode = previous_capture
 
     def _finish_forward(
         self, out: Any, forward_batch: Any, wants_input_logprob: bool = False

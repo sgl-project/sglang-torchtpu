@@ -17,8 +17,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.recompilation_checker import (
+    maybe_enable_site_tracing,
+    snapshot_recompilation_baseline,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -27,8 +32,16 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # Platform discovery runs before worker bootstrap configures torch_tpu.
+# Padding can import the guard first, which itself triggers platform discovery.
+arm_cache_guard = LazyImport(
+    "sglang_tpu.compilation.scoped_cache_guard", "arm_cache_guard"
+)
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
+warmup_sampling = LazyImport("sglang_tpu.serving_warmup", "warmup_sampling")
+precompile_sampling = LazyImport("sglang_tpu.serving_warmup", "precompile_sampling")
+warmup_request_relay = LazyImport("sglang_tpu.serving_warmup", "warmup_request_relay")
+merge_rows = LazyImport("sglang_tpu.row_ops", "merge_rows")
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -1284,13 +1297,32 @@ class TpuSRTPlatform(SRTPlatform):
         self._backend_initialized = True
         _register_models()
 
-    def on_warmup_complete(self) -> None:
-        """Freeze torch.compile so serving-time recompiles raise."""
-        from sglang.srt.runtime_context import get_exec, get_spec
-        from sglang_tpu.compilation.recompilation_checker import (
-            maybe_enable_site_tracing,
-        )
+    def precompile_sampling(self, model_runner) -> None:
+        precompile_sampling(model_runner)
 
+    def prewarm_sampling(self, model_runner) -> None:
+        warmup_sampling(model_runner)
+
+    def prewarm_request_relay(self, future_map, max_batch_size: int) -> None:
+        warmup_request_relay(future_map, max_batch_size)
+
+    def merge_batch_rows(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        host_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if host_rows is not None:
+            return host_rows.to(left.device, non_blocking=True, copy=True)
+        return merge_rows(left, right)
+
+    def on_warmup_complete(self) -> None:
+        """Arm native admission and freeze torch.compile after warmup."""
+        # Sampling and request-relay warmup finish after the model graph baseline.
+        snapshot_recompilation_baseline()
+        # Native admission also covers eager programs outside torch.compile.
+        arm_cache_guard()
         # Dispatch modes are thread-local; this runs on the scheduler thread.
         maybe_enable_site_tracing()
         if not get_exec().graph.enable_torch_compile:

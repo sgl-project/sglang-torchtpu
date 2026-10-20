@@ -607,6 +607,7 @@ class TestCompiledForwardShim(CustomTestCase):
             "top_logprobs_nums": None,
             "token_ids_logprobs": None,
             "extend_input_logprob_token_ids_gpu": None,
+            "extend_input_logprob_token_ids_cpu": None,
             "extend_seq_lens_cpu": None,
             "extend_logprob_start_lens_cpu": None,
             "capture_hidden_mode": CaptureHiddenMode.NULL,
@@ -1415,6 +1416,7 @@ class TestHiCacheReloadGate(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
         )
         self.assertEqual(shim(None, None, fb), "out")
         counter.wait.assert_called_once_with()
@@ -1432,6 +1434,7 @@ class TestHiCacheReloadGate(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
         )
         self.assertEqual(shim(None, None, fb), "out")
 
@@ -1448,6 +1451,7 @@ class TestHiCacheReloadGate(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
         )
 
         with unittest.mock.patch("torch.compiler.is_compiling", return_value=True):
@@ -1594,6 +1598,7 @@ class TestPinFields(CustomTestCase):
             top_logprobs_nums=[5],
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=torch.zeros(3),
+            extend_input_logprob_token_ids_cpu=torch.zeros(3),
         )
         saved = _pin_fields(fb, _PINNED_LOGPROB_FIELDS)
 
@@ -1610,6 +1615,7 @@ class TestPinFields(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
         )
         self.assertEqual(_pin_fields(fb, _PINNED_LOGPROB_FIELDS), {})
 
@@ -1619,6 +1625,7 @@ class TestPinFields(CustomTestCase):
             "top_logprobs_nums": [3],
             "token_ids_logprobs": [[7]],
             "extend_input_logprob_token_ids_gpu": None,
+            "extend_input_logprob_token_ids_cpu": None,
         }
         fb = SimpleNamespace(**original)
         _restore_fields(fb, _pin_fields(fb, _PINNED_LOGPROB_FIELDS))
@@ -1659,6 +1666,7 @@ class TestShimInputLogprobPath(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
             extend_seq_lens_cpu=[4, 4],
             extend_logprob_start_lens_cpu=list(starts),
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -1763,6 +1771,67 @@ class TestShimInputLogprobPath(CustomTestCase):
                 self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
                 self.assertTrue(fb.return_logprob)
                 self.assertEqual(fb.extend_logprob_start_lens_cpu, [1, 1])
+
+    def test_hidden_state_finalization_uses_caller_capture(self):
+        for capture in CaptureHiddenMode:
+            for deferred in (False, True):
+                for fail in (False, True):
+                    with self.subTest(capture=capture, deferred=deferred, fail=fail):
+                        fb = self._fb(return_logprob=False, starts=(2, 3))
+                        fb.capture_hidden_mode = capture
+                        padded = torch.zeros(16, 5)
+                        finalized = []
+                        shim = self._shim({}, model=_StubModel())
+
+                        def compiled(*args, **kwargs):
+                            self.assertIs(
+                                fb.capture_hidden_mode, CaptureHiddenMode.FULL
+                            )
+                            return padded
+
+                        def finalize(out, batch):
+                            finalized.append(batch.capture_hidden_mode)
+                            self.assertFalse(batch.return_logprob)
+                            if fail:
+                                raise RuntimeError("finalization failed")
+                            return (
+                                out[:8] if batch.capture_hidden_mode.is_full() else out
+                            )
+
+                        shim.fn = compiled
+                        shim.policy.finalize_forward_batch = finalize
+                        restored_capture = capture
+                        if deferred:
+
+                            def warmup(*args, **kwargs):
+                                out = compiled(*args, **kwargs)
+                                return PendingCall(lambda: out)
+
+                            shim.warmup_async_fn = warmup
+                            pending = shim.warmup_async(None, None, fb)
+                            self.assertEqual(finalized, [])
+                            # A pending warmup must preserve state changed by its
+                            # caller while finalizing with its own capture mode.
+                            restored_capture = CaptureHiddenMode.LAST
+                            fb.capture_hidden_mode = restored_capture
+                            run = pending.wait
+                        else:
+                            run = lambda: shim(None, None, fb)
+                        if fail:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "finalization failed"
+                            ):
+                                run()
+                        else:
+                            out = run()
+                            if capture.is_full():
+                                self.assertEqual(out.shape, (8, 5))
+                            else:
+                                self.assertIs(out, padded)
+                        self.assertEqual(finalized, [capture])
+                        self.assertIs(fb.capture_hidden_mode, restored_capture)
+                        self.assertFalse(fb.return_logprob)
+                        self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
 
     def test_input_logprobs_are_attached(self):
         model = _StubModel()

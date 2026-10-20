@@ -1121,6 +1121,7 @@ class Scheduler(
 
             warmup_scope = collect_warmups()
         with warmup_scope:
+            current_platform.precompile_sampling(self.tp_worker.model_runner)
             self.tp_worker.init_cuda_graphs()
             if self.draft_worker is not None:
                 self.draft_worker.init_cuda_graphs()
@@ -1173,6 +1174,7 @@ class Scheduler(
                 model_runner.prewarm_sampling()
             else:
                 self.draft_worker.prewarm_sampling()
+            current_platform.prewarm_sampling(model_runner)
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool(
@@ -1721,6 +1723,10 @@ class Scheduler(
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
         )
+        current_platform.prewarm_request_relay(
+            self.future_map,
+            min(self.max_running_requests, get_exec().graph.torch_compile_max_bs),
+        )
 
         self._confidence_budget_prepare = None
         if (
@@ -2047,6 +2053,9 @@ class Scheduler(
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
+        if self.server_args.skip_server_warmup:
+            current_platform.on_warmup_complete()
+            self.recompile_stance_set = True
 
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool. Set it

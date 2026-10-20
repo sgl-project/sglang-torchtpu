@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_hidden_size,
 )
 from sglang.srt.layers.logprob_processor import (
+    BatchedTopLogprobs,
     InputLogprobProcessor,
     LogprobStage,
     get_token_ids_logprobs_raw,
@@ -233,6 +234,7 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
+    batched_output_top_logprobs: Optional[BatchedTopLogprobs] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -333,6 +335,15 @@ class LogitsProcessorOutput:
                 self.next_token_global_top_k_token_ids[:global_top_k_rows]
             )
 
+    def copy_batched_output_top_logprobs(self, copy_fn) -> None:
+        if self.batched_output_top_logprobs is None:
+            return
+        (
+            self.next_token_top_logprobs_val,
+            self.next_token_top_logprobs_idx,
+        ) = self.batched_output_top_logprobs.copy_to_cpu(copy_fn)
+        self.batched_output_top_logprobs = None
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return
@@ -365,6 +376,7 @@ class LogitsMetadata:
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    extend_input_logprob_token_ids_cpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
@@ -451,10 +463,14 @@ class LogitsMetadata:
             extend_input_logprob_token_ids_gpu = (
                 forward_batch.extend_input_logprob_token_ids_gpu
             )
+            extend_input_logprob_token_ids_cpu = (
+                forward_batch.extend_input_logprob_token_ids_cpu
+            )
         else:
             top_logprobs_nums = None
             token_ids_logprobs = None
             extend_input_logprob_token_ids_gpu = None
+            extend_input_logprob_token_ids_cpu = None
 
         if forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             draft_extend_select_index = forward_batch.spec_info.select_index
@@ -475,6 +491,7 @@ class LogitsMetadata:
             top_logprobs_nums=top_logprobs_nums,
             token_ids_logprobs=token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
+            extend_input_logprob_token_ids_cpu=extend_input_logprob_token_ids_cpu,
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
@@ -890,15 +907,8 @@ class LogitsProcessor(nn.Module):
             sample_indices = []
             input_logprob_indices_pt = 0
             input_logprob_indices = []
-            pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
+            pt, pruned_ranges = 0, []
             is_packed_aux_hidden_states = isinstance(aux_hidden_states, torch.Tensor)
-            aux_pruned_states_lists = None
-            if aux_hidden_states is not None:
-                aux_pruned_states_lists = (
-                    []
-                    if is_packed_aux_hidden_states
-                    else [[] for _ in aux_hidden_states]
-                )
 
             for idx, (extend_logprob_start_len, extend_len) in enumerate(
                 zip(
@@ -916,23 +926,7 @@ class LogitsProcessor(nn.Module):
                 # We always need at least 1 token to sample because that's required
                 # by a caller.
                 assert extend_len > start_len
-                pruned_states_list.append(
-                    hidden_states[pt + start_len : pt + extend_len]
-                )
-                if hidden_states_before_norm is not None:
-                    pruned_states_before_norm_list.append(
-                        hidden_states_before_norm[pt + start_len : pt + extend_len]
-                    )
-                if aux_pruned_states_lists is not None:
-                    if is_packed_aux_hidden_states:
-                        aux_pruned_states_lists.append(
-                            aux_hidden_states[pt + start_len : pt + extend_len]
-                        )
-                    else:
-                        for j, hidden in enumerate(aux_hidden_states):
-                            aux_pruned_states_lists[j].append(
-                                hidden[pt + start_len : pt + extend_len]
-                            )
+                pruned_ranges.append((pt + start_len, pt + extend_len))
                 # Map each token to its sequence index, for chunked computation
                 # of input logprobs
                 token_to_seq_idx.extend([idx] * (extend_len - start_len))
@@ -947,14 +941,20 @@ class LogitsProcessor(nn.Module):
                 )
                 input_logprob_indices_pt += extend_len - start_len
 
-            pruned_states = torch.cat(pruned_states_list)
+            prune_states = self.input_logprob_processor.prune_states
+            pruned_states = prune_states(hidden_states, pruned_ranges)
             if hidden_states_before_norm is not None:
-                pruned_states_before_norm = torch.cat(pruned_states_before_norm_list)
-            if aux_pruned_states_lists is not None:
+                pruned_states_before_norm = prune_states(
+                    hidden_states_before_norm, pruned_ranges
+                )
+            if aux_hidden_states is not None:
                 aux_pruned_states = (
-                    torch.cat(aux_pruned_states_lists)
+                    prune_states(aux_hidden_states, pruned_ranges)
                     if is_packed_aux_hidden_states
-                    else [torch.cat(lst) for lst in aux_pruned_states_lists]
+                    else [
+                        prune_states(hidden, pruned_ranges)
+                        for hidden in aux_hidden_states
+                    ]
                 )
 
             logits_metadata.sample_indices_cpu = sample_indices

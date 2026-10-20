@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
@@ -81,6 +82,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     SpecDecoderTpuCompilePolicy,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.input_logprobs import TpuInputLogprobProcessor
 from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.sampler import select_logits_output_mode
 from sglang_tpu.top_k import (
@@ -881,10 +883,19 @@ class TestDecoderOutputUnpadding(CustomTestCase):
 
 
 class TestInstallExtendCap(_PolicyTestCase):
-    def _install_policy(self, *, prefill_max_requests, dp_attention):
+    def _install_policy(
+        self,
+        *,
+        prefill_max_requests,
+        dp_attention,
+        inner_decoder=False,
+        logits_processor=None,
+    ):
         model = SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
+            model=SimpleNamespace(forward=MagicMock()),
+            logits_processor=logits_processor,
         )
         # install() reads the compile grid and prefill cap from the published config.
         self.publish_config(
@@ -894,11 +905,13 @@ class TestInstallExtendCap(_PolicyTestCase):
             prefill_max_requests=prefill_max_requests,
         )
         model_runner = SimpleNamespace(
+            device="cpu",
+            dtype=torch.bfloat16,
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
-            model_config=SimpleNamespace(context_len=4096),
+            model_config=SimpleNamespace(context_len=4096, hidden_size=8),
             server_args=SimpleNamespace(
                 prefill_max_requests=prefill_max_requests,
                 unsafe_save_torch_compile_bundle=None,
@@ -907,7 +920,9 @@ class TestInstallExtendCap(_PolicyTestCase):
         )
         t_bucketer = Bucketer(name="Token", buckets=[64, 2048])
         b_bucketer = Bucketer(name="Bs", buckets=[16, 32, 64])
-        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model.model if inner_decoder else model
+        )
         policy.backend = "eager"
 
         with (
@@ -928,6 +943,48 @@ class TestInstallExtendCap(_PolicyTestCase):
             self.assertTrue(policy.install())
 
         return policy
+
+    def test_prompt_processor_installs_and_prewarms_for_eager_logits(self):
+        for inner_decoder in (False, True):
+            for enabled in (False, True):
+                with self.subTest(inner_decoder=inner_decoder, enabled=enabled):
+                    original = InputLogprobProcessor(8)
+                    logits = SimpleNamespace(
+                        input_logprob_processor=original,
+                        compute_input_logprobs=True,
+                        do_tensor_parallel_all_gather_dp_attn=True,
+                    )
+                    with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(enabled):
+                        policy = self._install_policy(
+                            prefill_max_requests=16,
+                            dp_attention=False,
+                            inner_decoder=inner_decoder,
+                            logits_processor=logits,
+                        )
+                    self.assertEqual(logits.compute_input_logprobs, inner_decoder)
+                    if not enabled:
+                        self.assertIs(logits.input_logprob_processor, original)
+                        self.assertIsNone(policy._input_logprob_processor)
+                        continue
+                    processor = logits.input_logprob_processor
+                    self.assertIsInstance(processor, TpuInputLogprobProcessor)
+                    self.assertIs(policy._input_logprob_processor, processor)
+                    self.assertTrue(processor.skip_chunking)
+                    with (
+                        patch.object(
+                            processor, "precompile", return_value=[]
+                        ) as warmup,
+                        patch.object(policy, "_precompile_extend", return_value=[]),
+                        patch.object(policy, "_precompile_decode", return_value=[]),
+                    ):
+                        policy.precompile()
+                    warmup.assert_called_once_with(
+                        2048,
+                        "cpu",
+                        max_batch_size=16,
+                        hidden_size=8,
+                        hidden_dtype=torch.bfloat16,
+                    )
 
     def test_non_dp_uses_configured_prefill_cap(self):
         policy = self._install_policy(prefill_max_requests=16, dp_attention=False)
@@ -2161,6 +2218,43 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     serving uses: ``prepare_forward_batch`` → ``init_forward_metadata``
     → compiled ``forward``."""
 
+    def test_inner_decoder_warmup_runs_outer_logits_after_pending_result(self):
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                mr = _model_runner()
+                policy = _make_policy(mr)
+                hidden = torch.zeros(64, 8)
+                output = PendingCall(lambda: hidden) if queued else hidden
+                policy.owner = SimpleNamespace(forward=MagicMock(return_value=output))
+                policy._input_logprob_processor = MagicMock()
+                mr.model.lm_head = None
+                mr.model.logits_processor = MagicMock(
+                    return_value=LogitsProcessorOutput(
+                        next_token_logits=torch.zeros(4, 8)
+                    )
+                )
+                with (
+                    envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True),
+                    patch(
+                        "sglang_tpu.compilation.decoder_compile_policy._materialize_out"
+                    ) as materialize,
+                ):
+                    pending = policy._run_one(
+                        num_tokens=64, bs=4, mode=ForwardMode.EXTEND
+                    )
+                    if queued:
+                        mr.model.logits_processor.assert_not_called()
+                        materialize.assert_not_called()
+                        pending.wait()
+                materialize.assert_called_once()
+                mr.model.logits_processor.assert_called_once()
+                args = mr.model.logits_processor.call_args.args
+                self.assertIs(args[1], hidden)
+                self.assertTrue(args[3].return_logprob)
+                self.assertEqual(
+                    args[3].extend_input_logprob_token_ids_cpu.device.type, "cpu"
+                )
+
     def test_pipeline_profile_executes_outer_model_synchronously(self):
         mr = _model_runner()
         policy = _make_policy(mr)
@@ -2230,6 +2324,29 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         no_grad.assert_called_once_with()
         cm.__enter__.assert_called_once()
 
+    def test_prompt_logprob_warmup_exercises_eager_tail_only_when_enabled(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                mr = _model_runner()
+                policy = _make_policy(mr)
+                with patch.object(
+                    envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB,
+                    "get",
+                    return_value=enabled,
+                ):
+                    policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
+                batch = mr.model.forward.call_args.args[2]
+                metadata = LogitsMetadata.from_forward_batch(batch)
+                self.assertEqual(metadata.extend_return_logprob, enabled)
+                if enabled:
+                    self.assertEqual(sum(metadata.extend_seq_lens_cpu), 64)
+                    self.assertEqual(sum(metadata.extend_logprob_pruned_lens_cpu), 64)
+                    self.assertEqual(metadata.top_logprobs_nums, [0] * 4)
+                    self.assertEqual(metadata.token_ids_logprobs, [None] * 4)
+                    self.assertEqual(
+                        metadata.extend_input_logprob_token_ids_gpu.shape, (64,)
+                    )
+
     def test_draft_warmup_keeps_target_dp_gather_width(self):
         from sglang.srt.distributed import parallel_state
         from sglang.srt.runtime_context import get_flags
@@ -2254,6 +2371,7 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     def test_materialize_out_syncs_global_top_k_and_flagged_kv_side_effects(self):
         global_top_k_logits = torch.zeros(1)
         global_top_k_token_ids = torch.zeros(1, dtype=torch.int32)
+        input_token_logprobs = torch.zeros(4)
         kv0 = torch.ones(1)
         kv1 = torch.ones(1) * 2
         pool = SimpleNamespace(
@@ -2289,6 +2407,7 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
                     next_token_logits=None,
                     next_token_global_top_k_logits=global_top_k_logits,
                     next_token_global_top_k_token_ids=global_top_k_token_ids,
+                    input_token_logprobs=input_token_logprobs,
                 ),
                 forward_batch.attn_backend,
                 forward_batch.token_to_kv_pool,
@@ -2296,7 +2415,14 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         sync.assert_called_once()
         tensors, kwargs = sync.call_args
         self.assertEqual(
-            tensors[0], [global_top_k_logits, global_top_k_token_ids, kv0, kv1]
+            tensors[0],
+            [
+                global_top_k_logits,
+                global_top_k_token_ids,
+                input_token_logprobs,
+                kv0,
+                kv1,
+            ],
         )
         self.assertEqual(kwargs, {"wait": True})
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))

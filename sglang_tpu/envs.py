@@ -17,6 +17,9 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Reject native cache misses after warmup except inside explicit allowances.
+    SGLANG_TPU_ERROR_ON_RECOMPILES = EnvBool(False)
+
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.

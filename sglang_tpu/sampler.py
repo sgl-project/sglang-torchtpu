@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.output_logprobs import TpuOutputLogprobProcessor
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
 logger = logging.getLogger(__name__)
@@ -474,6 +475,7 @@ class TpuSampler(Sampler):
     def __init__(self):
         super().__init__()
         self._device_params = _DeviceParamCache()
+        self.output_logprob_processor = TpuOutputLogprobProcessor()
 
     def forward(
         self,

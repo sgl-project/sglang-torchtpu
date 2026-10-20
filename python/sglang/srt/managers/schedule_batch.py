@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -3921,11 +3922,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _merge_model_inputs(self, other):
         """Merge model-facing rows after the host pool-index mirror is updated."""
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
+        self.req_pool_indices = current_platform.merge_batch_rows(
+            self.req_pool_indices,
+            other.req_pool_indices,
+            host_rows=self.req_pool_indices_cpu,
         )
-        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self.seq_lens = current_platform.merge_batch_rows(self.seq_lens, other.seq_lens)
+        self.orig_seq_lens = current_platform.merge_batch_rows(
+            self.orig_seq_lens, other.orig_seq_lens
+        )
 
     def _filter_spec_input(self, keep_indices, keep_indices_device):
         self.spec_info.filter_batch(

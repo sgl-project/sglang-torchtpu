@@ -683,6 +683,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    extend_input_logprob_token_ids_cpu: Optional[torch.Tensor] = None
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
@@ -1127,6 +1128,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if batch.extend_input_logprob_token_ids is not None:
+            ret.extend_input_logprob_token_ids_cpu = (
+                batch.extend_input_logprob_token_ids
+            )
             ret.extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )

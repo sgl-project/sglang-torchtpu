@@ -12,6 +12,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
@@ -384,7 +385,8 @@ class SamplingBatchInfo:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
+                merged = current_platform.merge_batch_rows(self_val, other_val)
+                setattr(self, item, merged)
 
     def __len__(self):
         return len(self.temperatures)

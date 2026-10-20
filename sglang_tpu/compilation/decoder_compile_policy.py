@@ -79,6 +79,7 @@ from sglang_tpu.cp_forward import (
 from sglang_tpu.cp_layout import warmup_request_lengths
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.input_logprobs import TpuInputLogprobProcessor
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
@@ -159,6 +160,7 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
             "next_token_global_top_k_logits",
             "next_token_global_top_k_token_ids",
             "next_draft_tokens",
+            "input_token_logprobs",
         ):
             value = getattr(out, field, None)
             if isinstance(value, torch.Tensor):
@@ -498,6 +500,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.tracer = tracer
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
+        self._input_logprob_processor: TpuInputLogprobProcessor | None = None
         self._logged_vl_warmup_variants: set[str] = set()
         # Variant tags actually warmed, so precompile() can tell a family that
         # was compiled from one an override dropped.
@@ -641,13 +644,28 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         compile_fn = compile_owner.forward if is_draft_worker else fn
 
+        logits_processor = getattr(self.model_runner.model, "logits_processor", None)
+        pp_group = self.model_runner.pp_group
+        if (
+            logits_processor is not None
+            and not is_draft_worker
+            and (pp_group is None or pp_group.is_last_rank)
+            and envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        ):
+            # Inner-decoder policies also need the eager prompt-logprob tail.
+            previous = logits_processor.input_logprob_processor
+            self._input_logprob_processor = TpuInputLogprobProcessor(
+                previous.vocab_size,
+                previous.chunking_group,
+                skip_chunking=logits_processor.do_tensor_parallel_all_gather_dp_attn,
+                model=self.model_runner.model,
+            )
+            logits_processor.input_logprob_processor = self._input_logprob_processor
+
         cp_logits_installed = False
         if self._compiles_logits_processor():
-            logits_processor = getattr(
-                self.model_runner.model, "logits_processor", None
-            )
             if logits_processor is not None:
-                # TPUs don't support returning input logprobs -- this errors elsewhere.
+                # Keep data-dependent prompt logprobs outside the compiled forward.
                 logits_processor.compute_input_logprobs = False
                 if self._cp_strategy is not None:
                     install_cp_logits_forward(logits_processor)
@@ -895,6 +913,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Prompt-logprob inputs are rejected on compiled TPU. Ignore this
             # request-only tensor before direct compile flattens ForwardBatch.
             "forward_batch.extend_input_logprob_token_ids_gpu",
+            "forward_batch.extend_input_logprob_token_ids_cpu",
             # These host mirrors are consumed before the compiled model.
             "forward_batch.req_pool_indices_cpu",
             "forward_batch.seq_lens_cpu",
@@ -1335,6 +1354,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         disagg_mode = get_disagg().disaggregation_mode
         pending = []
         if disagg_mode != "decode":
+            pending += self._precompile_prompt_logprobs()
             pending += self._precompile_extend()
             self._assert_cp_family_compiled()
         if disagg_mode != "prefill":
@@ -1358,6 +1378,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             time.perf_counter() - overall,
         )
         return pending
+
+    def _precompile_prompt_logprobs(self) -> list[PendingCall]:
+        if self._input_logprob_processor is None:
+            return []
+        return self._input_logprob_processor.precompile(
+            self.t_bucketer.max_val,
+            self.model_runner.device,
+            max_batch_size=self._extend_compile_cap(),
+            hidden_size=self.model_runner.model_config.hidden_size,
+            hidden_dtype=self.model_runner.dtype,
+        )
 
     def _warmup_host_padding(self) -> None:
         from sglang.srt.arg_groups.overrides import resolving_view
@@ -1690,6 +1721,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 raise ValueError(f"Invalid warmup logits mode: {logits_output_mode}")
         self._seed_dummy_req_to_token(forward_batch)
 
+        if (
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            and mode.is_extend()
+            and not mode.is_target_verify()
+            and spec_info is None
+        ):
+            # FULL capture alone does not exercise the eager prompt-logprob
+            # tail. Run that tail at each configured extend bucket too.
+            forward_batch.return_logprob = True
+            forward_batch.top_logprobs_nums = [0] * bs
+            forward_batch.token_ids_logprobs = [None] * bs
+            forward_batch.extend_input_logprob_token_ids_cpu = torch.zeros(
+                num_tokens, dtype=torch.int64
+            )
+            forward_batch.extend_input_logprob_token_ids_gpu = (
+                forward_batch.extend_input_logprob_token_ids_cpu.to(
+                    self.model_runner.device
+                )
+            )
+
         model = self.model_runner.model
         # Set the DP metadata before the pad shim runs, just like serving does,
         # so precompile traces the same DP graph serving uses. Without it,
@@ -1735,6 +1786,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 )
             else:
                 out = call_with_reserved_frame_stack(entry.forward, *args, **kwargs)
+            if (
+                self._input_logprob_processor is not None
+                and not self._compiles_logits_processor()
+                and mode.is_extend()
+                and not mode.is_target_verify()
+                and spec_info is None
+            ):
+                # An inner decoder returns hidden states; the outer model owns
+                # the eager logits tail and is not called by this warmup.
+                def finish_prompt_logits(hidden_states):
+                    return self._warmup_eager_logits(hidden_states, forward_batch)
+
+                out = (
+                    out.then(finish_prompt_logits)
+                    if isinstance(out, PendingCall)
+                    else finish_prompt_logits(out)
+                )
             if isinstance(out, PendingCall):
                 return out.then(
                     lambda result: _materialize_out(
@@ -1752,6 +1820,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if profile_prefix is not None:
             return (time.perf_counter() - started) * 1000
         return None
+
+    def _warmup_eager_logits(self, hidden_states, forward_batch):
+        model = self.model_runner.model
+        aux_hidden_states = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+        return model.logits_processor(
+            forward_batch.input_ids,
+            hidden_states,
+            model.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
         return _unpad_decoder_outputs(outputs, forward_batch)
@@ -1838,6 +1919,20 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Construct a dummy ForwardBatch at the target bucket shape."""
         tokens_per_req = self._dummy_tokens_per_req(mode, spec_info)
         layout = self._dummy_layout(mode, num_tokens, bs, tokens_per_req)
+        if (
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            and mode.is_extend()
+            and not mode.is_target_verify()
+            and spec_info is None
+        ):
+            # The ordinary dummy layout has one live token per request. Prompt
+            # logprobs consume the live lengths, so cover the whole token bucket.
+            layout = _DummyForwardBatchFields.cp_extend(
+                [num_tokens - bs + 1] + [1] * (bs - 1),
+                device=self.model_runner.device,
+                slot=self._dummy_kv_slot(),
+                out_cache_loc_dtype=self._dummy_out_cache_loc_dtype(mode),
+            )
         return self._forward_batch_from_layout(
             layout,
             bs=bs,
