@@ -31,6 +31,7 @@ from sglang_tpu.k3_megakernel.kernel.stages.common import (
     flat,
     phase,
     stream_scratch,
+    tree_when,
 )
 
 PAGE = 128  # tokens per page (64 rows x 2 packed tokens)
@@ -194,6 +195,29 @@ class MlaStage:
         return [(which == j, cache) for j, cache in enumerate(caches)]
 
     @staticmethod
+    def _each_pool(caches, which, active, fn):
+        """``fn(page-indexable pool)`` for this layer's pool under ``active`` (per-layer pools: a
+        binary ``pl.when`` tree over the candidates instead of one test per pool)."""
+
+        def run():
+            if len(caches) == 1 and len(caches[0].shape) == 5:
+                fn(caches[0].at[which])
+            else:
+                tree_when(which, len(caches), lambda j: fn(caches[j]))
+
+        if active is True:
+            run()
+        else:
+            pl.when(active)(run)
+
+    @staticmethod
+    def _any_pool(caches):
+        """A pool of the right shape for DMA waits (a wait only needs the semaphore and byte count)."""
+        if len(caches) == 1 and len(caches[0].shape) == 5:
+            return caches[0].at[0]
+        return caches[0]
+
+    @staticmethod
     def _when(pred, active, fn):
         cond = active if pred is None else (pred if active is True else active & pred)
         if cond is True:
@@ -201,34 +225,38 @@ class MlaStage:
         else:
             pl.when(cond)(fn)
 
-    def _page_dma(self, caches, which, kv_buf, sems, pages_ref, block, i, active, op):
+    def _page_copy(self, cache, kv_buf, sems, pages_ref, block, i):
         half = PAGE // 2
         slot = block % 2
-        for pred, cache in self._pools(caches, which):
+        return pltpu.make_async_copy(
+            cache.at[pages_ref[block * self.bp + i]],
+            kv_buf.at[slot, pl.ds(i * half, half)],
+            sems.at[slot, i],
+        )
 
-            def body(cache=cache):
-                cp = pltpu.make_async_copy(
-                    cache.at[pages_ref[block * self.bp + i]],
-                    kv_buf.at[slot, pl.ds(i * half, half)],
-                    sems.at[slot, i],
-                )
-                cp.start() if op == "start" else cp.wait()
-
-            self._when(pred, active, body)
+    def _page_dma(self, caches, which, kv_buf, sems, pages_ref, block, i, active, op):
+        if op == "wait":  # any pool's descriptor has this page's byte count
+            cp = self._page_copy(
+                self._any_pool(caches), kv_buf, sems, pages_ref, block, i
+            )
+            self._when(None, active, cp.wait)
+            return
+        self._each_pool(
+            caches,
+            which,
+            active,
+            lambda cache: self._page_copy(
+                cache, kv_buf, sems, pages_ref, block, i
+            ).start(),
+        )
 
     def _start_block(self, caches, which, kv_buf, sems, pages_ref, block, n_pages):
-        for i in range(self.bp):
-            self._page_dma(
-                caches,
-                which,
-                kv_buf,
-                sems,
-                pages_ref,
-                block,
-                i,
-                block * self.bp + i < n_pages,
-                "start",
-            )
+        def starts(cache):  # one pool selection for the whole block
+            for i in range(self.bp):
+                cp = self._page_copy(cache, kv_buf, sems, pages_ref, block, i)
+                self._when(None, block * self.bp + i < n_pages, cp.start)
+
+        self._each_pool(caches, which, True, starts)
 
     def _wait_block(self, caches, which, kv_buf, sems, pages_ref, block, n_pages):
         for i in range(self.bp):
@@ -399,17 +427,18 @@ class MlaStage:
         """DMA ``src`` [1, 2, 640] (the word row holding token ``t``) into the cache."""
         page = pages_ref[t // PAGE]
         row = (t % PAGE) // 2
-        for pred, cache in self._pools(caches, which):
-
-            def body(cache=cache):
-                cp = pltpu.make_async_copy(
-                    src, cache.at[page, pl.ds(row, 1)], wsem.at[0]
-                )
-                cp.start()
-                if not self.async_write:
-                    cp.wait()
-
-            self._when(pred, True, body)
+        self._each_pool(
+            caches,
+            which,
+            True,
+            lambda cache: pltpu.make_async_copy(
+                src, cache.at[page, pl.ds(row, 1)], wsem.at[0]
+            ).start(),
+        )
+        if not self.async_write:
+            pltpu.make_async_copy(
+                src, self._any_pool(caches).at[page, pl.ds(row, 1)], wsem.at[0]
+            ).wait()
 
     def wait_new(self, caches, word_ref, wsem):
         """Drains an ``async_write`` cache write (any pool's descriptor has the same byte count)."""
@@ -486,16 +515,17 @@ class MlaStage:
         """DMA of the word row holding token ``t`` and ``src`` (``[1, 2, 640]``), under ``active``."""
         page = pages_ref[t // PAGE]
         row = (t % PAGE) // 2
-        for pred, cache in self._pools(caches, which):
 
-            def body(cache=cache):
-                hbm = cache.at[page, pl.ds(row, 1)]
-                cp = pltpu.make_async_copy(
-                    *((src, hbm) if to_cache else (hbm, src)), wsem.at[0]
-                )
-                cp.start() if op == "start" else cp.wait()
+        def copy(cache):
+            hbm = cache.at[page, pl.ds(row, 1)]
+            return pltpu.make_async_copy(
+                *((src, hbm) if to_cache else (hbm, src)), wsem.at[0]
+            )
 
-            self._when(pred, active, body)
+        if op == "wait":
+            self._when(None, active, copy(self._any_pool(caches)).wait)
+        else:
+            self._each_pool(caches, which, active, lambda cache: copy(cache).start())
 
     def write_rows(self, new_rows, caches, which, pages_ref, kv0, word_ref, wsem):
         """Stores the R new tokens at ``kv0 - 1 ..``: the R / 2 (+ 1) word rows are built in VMEM and written

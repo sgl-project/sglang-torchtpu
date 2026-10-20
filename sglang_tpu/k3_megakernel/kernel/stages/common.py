@@ -45,6 +45,21 @@ class trace_phases:
         _TRACE_PHASES[0] = self.prev
 
 
+def tree_when(idx, n: int, fn) -> None:
+    """``fn(i)`` for the static ``i`` equal to the traced ``idx`` (0 <= idx < n), through a binary
+    tree of ``pl.when`` (about 2 log2(n) scalar tests instead of n; one branch per per-layer pool)."""
+
+    def rec(lo, hi):
+        if hi - lo == 1:
+            fn(lo)
+            return
+        mid = (lo + hi) // 2
+        pl.when(idx < mid)(lambda: rec(lo, mid))
+        pl.when(idx >= mid)(lambda: rec(mid, hi))
+
+    rec(0, n)
+
+
 def flat_rows(rows: int, cols: int) -> int:
     n = rows * cols // 128
     return -(-n // 8) * 8

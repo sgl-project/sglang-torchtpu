@@ -62,6 +62,7 @@ from sglang_tpu.k3_megakernel.kernel.stages.common import (
     phase,
     stream_chunk,
     trace_phases,
+    tree_when,
 )
 from sglang_tpu.k3_megakernel.kernel.stages.dense_mlp import DenseMlpStage
 from sglang_tpu.k3_megakernel.kernel.stages.head import (
@@ -330,16 +331,13 @@ class _KdaStateIO:
         return out
 
     def _start(self, k, write, row=None):
-        for pred, cps in self._copies(k, write, row):
-            if pred is None:
-                for cp in cps:
-                    cp.start()
-            else:
-
-                @pl.when(pred)
-                def _(cps=cps):
-                    for cp in cps:
-                        cp.start()
+        copies = self._copies(k, write, row)
+        if copies[0][0] is None:
+            for cp in copies[0][1]:
+                cp.start()
+            return
+        # Per-layer pools: a binary pl.when tree selects pool k (log2(n) tests instead of n).
+        tree_when(k, len(copies), lambda kk: [cp.start() for cp in copies[kk][1]])
 
     def _wait(self, write):
         for cp in self._copies(None, write)[0][1]:
