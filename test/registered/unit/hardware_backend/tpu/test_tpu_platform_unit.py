@@ -126,6 +126,14 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 "sglang_tpu.patches.apply_tpu_patches",
                 side_effect=lambda: calls.append(("patch", None)),
             ),
+            patch(
+                "sglang_tpu.tpu_platform.rank_slice._load",
+                side_effect=lambda: calls.append(("rank_slice", None)),
+            ),
+            patch(
+                "sglang_tpu.tpu_platform.traced_rank._load",
+                side_effect=lambda: calls.append(("traced_rank", None)),
+            ),
         ):
             self.platform.init_backend()
 
@@ -140,8 +148,39 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 ),
                 ("cache_key", "--xla_user=1 --xla_override=0"),
                 ("patch", None),
+                ("rank_slice", None),
+                ("traced_rank", None),
             ],
         )
+
+    def test_reentry_during_model_registration_registers_once(self):
+        """init_backend re-entered while registering models (model_runner's OOT import
+        hook does this) must not register the TPU models a second time."""
+        registered = []
+
+        def register(package_name):
+            registered.append(package_name)
+            if len(registered) == 1:
+                self.platform.init_backend()
+
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
+            patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            patch(
+                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key"
+            ),
+            patch("sglang_tpu.patches.apply_tpu_patches"),
+            patch("sglang_tpu.tpu_platform.rank_slice._load"),
+            patch("sglang_tpu.tpu_platform.traced_rank._load"),
+            patch(
+                "sglang.srt.models.registry.ModelRegistry.register",
+                side_effect=register,
+            ),
+        ):
+            self.platform.init_backend()
+
+        self.assertEqual(registered, ["sglang_tpu.models"])
 
 
 class TestTpuCompileCache(CustomTestCase):
@@ -204,10 +243,27 @@ class TestTpuPlatformMemory(CustomTestCase):
             self.assertEqual(free, 10 << 30)
 
 
+def _require_resolved_dp_layout(overrides):
+    """Platform defaults only ever see the resolved DP layout.
+
+    handle_deprecated_dp_attention rewrites `--dp-size N --enable-dp-attention`
+    to attn_dp_size=N, dp_size=1, enable_dp_attention=False before platform
+    defaults run. Handing the hook the deprecated spelling tests a state
+    production never reaches: these cases stayed green while the DP-attention
+    refusals they cover had stopped firing.
+    """
+    if overrides.get("enable_dp_attention"):
+        raise AssertionError(
+            "pass attn_dp_size=N: the pipeline resolves enable_dp_attention "
+            "before platform defaults run"
+        )
+
+
 class TestTpuPlatformServerDefaults(CustomTestCase):
     """apply_server_args_defaults sets correct values."""
 
     def _args(self, **overrides):
+        _require_resolved_dp_layout(overrides)
         # apply_server_args_defaults declares rather than writes, so the assertions read the
         # decisions back with resolution_result, as the projection does.
         defaults = dict(
@@ -244,6 +300,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
             tpu_compile_tracer="dynamo",
+            json_model_override_args=None,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -403,14 +460,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
     def test_unsupported_builtin_spec_algorithm_is_rejected(self):
         args = self._args(speculative_algorithm="NGRAM")
-        with self.assertRaisesRegex(NotImplementedError, "only EAGLE3"):
+        with self.assertRaisesRegex(NotImplementedError, "only EAGLE"):
             self._apply(args)
 
     def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=2,
+            attn_dp_size=2,
             enable_dp_lm_head=False,
         )
         with self.assertRaisesRegex(
@@ -421,18 +477,16 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_dp_attention_allows_valid_dp_lm_head_combos(self):
         # attn_tp_size > 1 with enable_dp_lm_head=True
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=2,
+            attn_dp_size=2,
             enable_dp_lm_head=True,
         )
         self._apply(args)
 
         # attn_tp_size == 1 with enable_dp_lm_head=False
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=8,
+            attn_dp_size=8,
             enable_dp_lm_head=False,
         )
         self._apply(args)
@@ -574,7 +628,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
                 "bf16 KV cache fails in warmup for gpt-oss",
             ),
             (dict(speculative_algorithm="EAGLE3"), {}, "speculative decoding"),
-            (dict(enable_dp_attention=True, dp_size=8), {}, "DP attention"),
+            (dict(attn_dp_size=8), {}, "DP attention"),
             (dict(moe_dp_size=1), {}, "requires --moe-dp-size 8"),
             (dict(enable_torch_compile=False), {}, "requires --enable-torch-compile"),
             (dict(tpu_compile_tracer="direct"), {}, "requires --tpu-compile-tracer"),
@@ -656,6 +710,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     batched RPA backend implements; every other combination is refused by name."""
 
     def _args(self, **overrides):
+        _require_resolved_dp_layout(overrides)
         defaults = dict(
             attention_backend="pallas_tpu_rpa_batched",
             tp_size=8,
@@ -722,7 +777,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
                 dcp_size=1,
                 attention_backend="pallas_tpu_rpa_v3",
                 pp_size=2,
-                enable_dp_attention=True,
+                attn_dp_size=2,
                 enable_torch_compile=False,
             )
         )
@@ -755,9 +810,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
                 self._assert_refused("(?i)kv[-_ ]cache[-_ ]dtype", kv_cache_dtype=dtype)
 
     def test_refuses_dp_attention(self):
-        self._assert_refused(
-            "(?i)dp[-_ ]attention", enable_dp_attention=True, dp_size=2
-        )
+        self._assert_refused("(?i)dp[-_ ]attention", attn_dp_size=2)
 
     def test_refuses_prefill_context_parallelism(self):
         self._assert_refused(
@@ -867,7 +920,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
         # The gate has to be wired into apply_server_args_defaults, or a bad
         # configuration reaches the model runner.
         platform = TpuSRTPlatform()
-        args = self._args(enable_dp_attention=True, dp_size=2, enable_dp_lm_head=True)
+        args = self._args(attn_dp_size=2, enable_dp_lm_head=True)
         with (
             patch("sglang_tpu.patches._prepare_tpu_env"),
             patch.dict(os.environ, {"SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "1"}),
@@ -903,6 +956,51 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
     def test_dsa_pool_is_the_split_pool(self):
         cls = self.platform.get_dsa_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
+
+    def test_draft_backends_run_their_target_backend_per_step(self):
+        from sglang.srt.layers.attention import attention_registry as registry
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+        from sglang_tpu.tpu_platform import _register_attention_backends
+
+        expected = {
+            "pallas_tpu_rpa_v3": TpuPallasRpaV3AttnBackend,
+            "pallas_tpu_rpa_batched": TpuPallasRpaBatchedAttnBackend,
+            "pallas_tpu_mla": TpuPallasMlaAttnBackend,
+            "pallas_tpu_mla_sparse": TpuPallasSparseMlaAttnBackend,
+        }
+        with (
+            patch.dict(registry.ATTENTION_BACKENDS),
+            patch.dict(registry.DRAFT_ATTENTION_BACKENDS, clear=True),
+        ):
+            _register_attention_backends()
+            self.assertEqual(set(registry.DRAFT_ATTENTION_BACKENDS), set(expected))
+            for name, attn_backend_cls in expected.items():
+                with self.subTest(backend=name):
+                    # The draft extend builds the target backend of the same name.
+                    self.assertIn(name, registry.ATTENTION_BACKENDS)
+                    with patch.object(
+                        attn_backend_cls, "__init__", return_value=None
+                    ) as init:
+                        container = registry.DRAFT_ATTENTION_BACKENDS[name](
+                            "runner", 1, 4
+                        )
+                    self.assertEqual(len(container.attn_backends), 3)
+                    self.assertTrue(
+                        all(
+                            type(c) is attn_backend_cls for c in container.attn_backends
+                        )
+                    )
+                    self.assertEqual(
+                        [c.kwargs["speculative_step_id"] for c in init.call_args_list],
+                        [0, 1, 2],
+                    )
 
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):

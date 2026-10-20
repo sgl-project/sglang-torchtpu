@@ -33,14 +33,18 @@ _AITER_MHC_RUNTIME_DISABLED = False
 _AITER_MHC_ACTIVE_LOGGED = False
 
 
+# The platform probes below are fixed for the process and not traceable, so a
+# compiled forward evaluates them once at trace time.
+@torch.compiler.assume_constant_result
+def _aiter_mhc_supported() -> bool:
+    return is_gfx95_supported() and envs.SGLANG_USE_AITER.get()
+
+
 def _use_aiter_mhc() -> bool:
-    return (
-        not _AITER_MHC_RUNTIME_DISABLED
-        and is_gfx95_supported()
-        and envs.SGLANG_USE_AITER.get()
-    )
+    return not _AITER_MHC_RUNTIME_DISABLED and _aiter_mhc_supported()
 
 
+@torch._dynamo.disable
 def _try_aiter_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -92,6 +96,7 @@ def _try_aiter_mhc_pre(
     return result
 
 
+@torch._dynamo.disable
 def _try_aiter_mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -224,10 +229,12 @@ def _use_deep_gemm_hc_prenorm() -> bool:
     return ENABLE_JIT_DEEPGEMM
 
 
+@torch.compiler.assume_constant_result
 def _use_tilelang_mhc_pre() -> bool:
     return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_hip()
 
 
+@torch.compiler.assume_constant_result
 def _use_tilelang_mhc_post() -> bool:
     return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
 
@@ -1945,7 +1952,7 @@ def _mhc_post_torch(
     return out.type_as(x)
 
 
-@torch._dynamo.disable
+# Only the kernel calls stay out of the graph; the torch path is traceable.
 def _mhc_pre_dispatch(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1992,7 +1999,7 @@ def _mhc_pre_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
-    post_mix, comb_mix, layer_input = mhc_pre(
+    post_mix, comb_mix, layer_input = torch._dynamo.disable(mhc_pre)(
         residual=residual,
         fn=fn,
         hc_scale=hc_scale,
@@ -2008,7 +2015,6 @@ def _mhc_pre_dispatch(
     return post_mix, comb_mix, layer_input, norm_weight is not None
 
 
-@torch._dynamo.disable
 def _mhc_post_dispatch(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -2029,7 +2035,7 @@ def _mhc_post_dispatch(
 
     if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
-    return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+    return torch._dynamo.disable(mhc_post)(x, residual, post_layer_mix, comb_res_mix)
 
 
 def hc_pre(

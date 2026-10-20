@@ -14,6 +14,11 @@ from torch.utils._pytree import tree_flatten, tree_leaves, tree_map
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import is_tpu
+from sglang.utils import LazyImport
+
+current_warmup_queue = LazyImport(
+    "sglang_tpu.compilation.warmup_queue", "current_warmup_queue"
+)
 
 WarmupArgsFactory = Callable[[Any], tuple[Any, ...]]
 
@@ -58,11 +63,25 @@ def _specialization_key(*args, **kwargs):
     )
 
 
+def _spmd_specialization_key(*args, **kwargs):
+    structure, leaves = _specialization_key(*args, **kwargs)
+    # Graph identities must serialize identically across ranks, whose local
+    # device ordinals can differ. Each rank runs on its own TPU device.
+    return str(structure), tuple(
+        (leaf[0], str(leaf[1]), leaf[2].type)
+        if len(leaf) == 3
+        else (f"{leaf[0].__module__}.{leaf[0].__qualname__}", leaf[1])
+        for leaf in leaves
+    )
+
+
 def compiled_op(
     *,
     warmup: WarmupArgsFactory | None = None,
     model: torch.nn.Module | None = None,
     uses_rng: bool = False,
+    spmd_safe: bool = False,
+    name: str | None = None,
 ):
     """Compile a tensor helper with the selected TPU tracer.
 
@@ -79,53 +98,70 @@ def compiled_op(
     Direct helper warmups compile without executing; the queue joins compilation
     futures without retaining example inputs. Dynamo warmups still execute to
     trigger tracing and compilation, preserving the generator when ``uses_rng``
-    is set.
+    is set. Warmup is a no-op when compilation is disabled or off TPU.
+
+    ``spmd_safe=True`` lets asynchronous warmup use the queue's shared compiler
+    under ``--use-spmd-compile``. Every rank must warm the same specializations
+    in the same order, with rank-independent code and explicit RNG inputs.
+    ``name`` defaults to the function's qualified name; give configured helper
+    factories distinct names when their closed-over configuration differs.
     """
+    if spmd_safe and uses_rng:
+        raise ValueError("SPMD-safe helpers require explicit RNG inputs")
 
     def decorator(fn):
         compiled_fn = None
         use_direct = False
         signature = inspect.signature(fn)
+        op_name = name or f"{fn.__module__}.{fn.__qualname__}"
+        specialization_key = (
+            _spmd_specialization_key if spmd_safe else _specialization_key
+        )
 
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
             nonlocal compiled_fn, use_direct
             if torch.compiler.is_compiling():
                 return fn(*args, **kwargs)
-            call = fn
-            if is_tpu() and envs.SGLANG_ENABLE_TORCH_COMPILE.get():
-                # Bind to fn's signature: positional warmups and keyword callers share a key.
-                bound = signature.bind(*args, **kwargs)
-                bound.apply_defaults()
-                args, kwargs = tree_map(_canonical_tensor, (bound.args, bound.kwargs))
-                if compiled_fn is None:
-                    use_direct = get_exec().graph.tpu_compile_tracer == "direct"
-                    if use_direct:
-                        # Break direct_compile -> eagle_info -> eagle_utils -> compiled_op.
-                        from sglang_tpu.compilation.direct_compile import (
-                            direct_compile,
-                        )
-
-                        compiled_fn = direct_compile(
-                            fn,
-                            specialization_key=_specialization_key,
-                            model=model,
-                            uses_rng=uses_rng,
-                        )
-                    else:
-                        compiled_fn = torch.compile(
-                            fn, backend="tpu", fullgraph=True, dynamic=False
-                        )
-                if use_direct and _warmup_async:
-                    # Repeated storage/layout warmups share one compiled program.
-                    if _specialization_key(*args, **kwargs) in compiled_fn.cache:
-                        return None
-                    return compiled_fn.precompile(
-                        *args,
-                        async_compile=envs.SGLANG_DIRECT_COMPILE_ASYNC.get(),
-                        **kwargs,
+            if not is_tpu() or not envs.SGLANG_ENABLE_TORCH_COMPILE.get():
+                return None if _warmup_async else fn(*args, **kwargs)
+            # Positional warmups and keyword callers share a specialization.
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            args, kwargs = tree_map(_canonical_tensor, (bound.args, bound.kwargs))
+            if compiled_fn is None:
+                use_direct = get_exec().graph.tpu_compile_tracer == "direct"
+                if use_direct:
+                    # Break direct_compile -> eagle_info -> eagle_utils -> compiled_op.
+                    from sglang_tpu.compilation.direct_compile import (
+                        direct_compile,
                     )
-                call = compiled_fn
+
+                    compiled_fn = direct_compile(
+                        fn,
+                        specialization_key=specialization_key,
+                        model=model,
+                        uses_rng=uses_rng,
+                        spmd_safe=spmd_safe,
+                        name=op_name,
+                    )
+                else:
+                    compiled_fn = torch.compile(
+                        fn, backend="tpu", fullgraph=True, dynamic=False
+                    )
+            if use_direct and _warmup_async:
+                # Shared warmup must register every key with each new queue,
+                # even when this rank already has a cached executable.
+                if (
+                    not spmd_safe
+                    and specialization_key(*args, **kwargs) in compiled_fn.cache
+                ):
+                    return None
+                return compiled_fn.precompile(
+                    *args,
+                    async_compile=envs.SGLANG_DIRECT_COMPILE_ASYNC.get(),
+                    **kwargs,
+                )
             if _warmup_async and uses_rng:
                 device = next(
                     value.device
@@ -139,13 +175,14 @@ def compiled_op(
                 )
                 state = device_module.get_rng_state()
                 try:
-                    return call(*args, **kwargs)
+                    compiled_fn(*args, **kwargs)
                 finally:
                     device_module.set_rng_state(state)
-            return call(*args, **kwargs)
+                return None
+            result = compiled_fn(*args, **kwargs)
+            return None if _warmup_async else result
 
         if warmup is not None:
-            op_name = f"{fn.__module__}.{fn.__qualname__}"
             _compiled_ops[op_name] = RegisteredCompiledOp(
                 op=wrapper,
                 make_warmup_args=warmup,
@@ -157,13 +194,8 @@ def compiled_op(
 
 def warmup_compiled_op(op: Callable, *args, **kwargs) -> None:
     """Submit output-free warmup to the current queue, or finish immediately."""
-    from sglang_tpu.compilation.pending_call import PendingCall
-    from sglang_tpu.compilation.warmup_queue import (
-        current_warmup_queue,
-    )
-
     pending = op(*args, _warmup_async=True, **kwargs)
-    if isinstance(pending, PendingCall):
+    if pending is not None:
         queue = current_warmup_queue()
         if queue is None:
             pending.wait()

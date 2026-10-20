@@ -2,27 +2,51 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
 
 import torch
+import torch.distributed as dist
 
+from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.pending_call import PendingCall
 
+SPMDCompiler = LazyImport("sglang_tpu.compilation.spmd_compiler", "SPMDCompiler")
 logger = get_logger(__name__)
 
 
-@dataclass
 class WarmupQueue:
-    calls: list[PendingCall] = field(default_factory=list)
-    # Run after every warmup finishes. TpuGraphRunner uses these callbacks to
-    # snapshot and attach the target's recompilation checker (when enabled),
-    # then log "TpuGraphRunner precompile done".
-    completions: list[Callable[[], None]] = field(default_factory=list)
+    def __init__(self, group: dist.ProcessGroup | None = None) -> None:
+        self.verify = os.environ.get("VERIFY_SPMD_SAFE", "0") == "1"
+        self.spmd_compiler: SPMDCompiler | None = None
+        self.calls: list[PendingCall] = []
+        # TpuGraphRunner attaches its recompilation checker after every warmup.
+        self.completions: list[Callable[[], None]] = []
+
+        if not dist.is_initialized():
+            if self.verify:
+                raise ValueError(
+                    "SPMD verification requires initialized distributed workers"
+                )
+            return
+        if group is None:
+            group = get_parallel().tp_group.cpu_group
+        use_spmd_compile = get_exec().graph.use_spmd_compile
+        # Agree before compiler construction can enter mode-specific collectives.
+        mode = (self.verify, use_spmd_compile)
+        modes = [None] * dist.get_world_size(group)
+        dist.all_gather_object(modes, mode, group=group)
+        if any(peer != mode for peer in modes):
+            raise ValueError("SPMD compilation flags differ across TPU ranks")
+        if self.verify and not use_spmd_compile:
+            raise ValueError("SPMD verification requires --use-spmd-compile")
+        if use_spmd_compile:
+            self.spmd_compiler = SPMDCompiler(group, verify_spmd_safe=self.verify)
 
     def wait(self) -> None:
         with torch.no_grad():
@@ -41,19 +65,31 @@ def current_warmup_queue() -> WarmupQueue | None:
 
 
 @contextmanager
-def collect_warmups() -> Iterator[WarmupQueue]:
+def collect_warmups(*, group: dist.ProcessGroup | None = None) -> Iterator[WarmupQueue]:
     existing = _CURRENT.get()
     if existing is not None:
         yield existing
         return
-    queue = WarmupQueue()
+    queue = WarmupQueue(group)
+    spmd_compiler = queue.spmd_compiler
     token = _CURRENT.set(queue)
     start = time.perf_counter()
     try:
-        yield queue
+        trace_error: str | None = None
+        try:
+            yield queue
+        except Exception as caught:
+            if spmd_compiler is None:
+                raise
+            logger.exception("SPMD compilation trace failed")
+            trace_error = f"{type(caught).__name__}: {caught}"
         submitted = time.perf_counter()
         count = len(queue.calls)
         logger.info("TPU global warmup: submitted %d calls; joining", count)
+        # Pending calls retain this queue's context, but must compile locally after join.
+        queue.spmd_compiler = None
+        if spmd_compiler is not None:
+            spmd_compiler.finish(trace_error)
         queue.wait()
         finished = time.perf_counter()
         logger.info(
@@ -67,3 +103,6 @@ def collect_warmups() -> Iterator[WarmupQueue]:
         _CURRENT.reset(token)
         queue.calls.clear()
         queue.completions.clear()
+        queue.spmd_compiler = None
+        if spmd_compiler is not None:
+            spmd_compiler.clear()

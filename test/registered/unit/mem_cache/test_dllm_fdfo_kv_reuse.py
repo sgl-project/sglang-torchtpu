@@ -94,6 +94,8 @@ def _make_batch(pool, allocator, reqs, extend_lens):
     )
     return SimpleNamespace(
         device="cpu",
+        input_tensor_device=None,
+        metadata_device=lambda: "cpu",
         reqs=reqs,
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from https://github.com/google-pytorch/torchtpu-vllm/tree/main/src/vllm_torchtpu/kernels/quantized_matmul/
+# Adapted from https://github.com/vllm-project/vllm-torchtpu/tree/main/src/vllm_torchtpu/kernels/quantized_matmul/
 """TPU quantized matmul kernels."""
 
 from threading import Lock
@@ -109,7 +109,7 @@ def _get_vmem_limit(
     vmem_scratch *= 2
 
     # TPU v7 has a smaller usable VMEM budget than v6. 48 MiB is the
-    # torchtpu-vllm v7 limit and is conservative on v6 as well.
+    # vllm-torchtpu v7 limit and is conservative on v6 as well.
     return min((vmem_in_out + vmem_scratch) // 8, 48 * 1024 * 1024)
 
 
@@ -121,7 +121,7 @@ def _get_tuned_value(
     block_size: int,
 ) -> _TunedValue:
     # Keep the custom-op boundary compact first. More exhaustive shape tuning can
-    # be ported from torchtpu-vllm after correctness/perf are established.
+    # be ported from vllm-torchtpu after correctness/perf are established.
     batch_block_size = 16 if n_batch <= 16 else 128
     out_block_size = 1024 if n_out % 1024 == 0 else 512 if n_out % 512 == 0 else 256
     in_block_size = block_size

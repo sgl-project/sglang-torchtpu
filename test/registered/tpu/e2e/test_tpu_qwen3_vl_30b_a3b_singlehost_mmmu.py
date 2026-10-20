@@ -26,20 +26,10 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 # Budget: the ViT and the VL decoder graph captures, ~21 min cold.
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "2700"))
 
+# Deployment environment only: the serving settings are the recipe's, so this
+# gate and the P/D gate serve the same configuration.
 LAUNCH_ENV = {
     "MODEL": MODEL,
-    # Concurrency has to come down with the compile cap: reconcile_tpu_batch_limits
-    # raises torch_compile_max_bs back to max_running_requests, so a higher CONC
-    # would restore the larger bs grid. 8 gives bs buckets [1, 2, 4, 8] and
-    # matches the eval's num_threads.
-    "CONC": "8",
-    "TORCH_COMPILE_MAX_BS": "8",
-    # The VL EXTEND grid multiplies the token buckets by its input variants;
-    # four buckets bound the startup. 8192 must stay to cover MAX_PREFILL_TOKENS.
-    "TPU_COMPILE_TOKENS": "512 1024 2048 8192",
-    # bf16 checkpoint with no KV scales; launch_server.sh's fp8_e4m3 default
-    # would score the gate through scaling factors of 1.0.
-    "KV_CACHE_DTYPE": "bfloat16",
     # A cold start writes ~49 GB of per-rank executables to the tier-2 compile
     # cache and the same again to its tier-3 backup. CI keeps both in the pod's
     # 64Gi /dev/shm, and a fresh pod has nothing to reuse, so skip the cache.
@@ -48,7 +38,7 @@ LAUNCH_ENV = {
     # cached guard list per recompile. Serving-time recompiles stay fatal via
     # the scheduler's fail_on_recompile stance.
     "TORCH_LOGS": "-dynamo",
-    "EXTRA_ARGS": f"--served-model-name {SERVED_MODEL_NAME}",
+    "SERVED_MODEL_NAME": SERVED_MODEL_NAME,
 }
 
 MODEL_CONFIG = {

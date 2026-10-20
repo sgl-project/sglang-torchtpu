@@ -4,8 +4,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -266,6 +268,58 @@ def test_overlap_chunked_abort_releases_parked_pages_once_after_drain():
     scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
     scheduler.output_streamer.stream_output.assert_not_called()
     assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+@patch("sglang.srt.managers.scheduler.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+def test_aborted_final_result_keeps_pages_until_its_sender_drains(
+    release_at_result, release_after_drain, pp_size
+):
+    """A sender that may still read an aborted request's pages kept reading
+    them after the result point freed them. Its pages now wait for its drain;
+    a pipeline stage does not free them on its own drain, since its free pages
+    would then differ from the other stages' and their next batches diverge,
+    but on the in-flight queue's release consensus, which they join."""
+    scheduler = _Scheduler()
+    scheduler.attn_tp_cpu_group = scheduler.attn_cp_cpu_group = None
+    scheduler.scheduler_stage_metrics = None
+    scheduler.pp_group = SimpleNamespace(is_first_rank=True)
+    req = _Req(inflight_middle_chunks=0)
+    sender = req.disagg_kv_sender = Mock(group_failure_requires_drain=True)
+    sender.drained.return_value = pp_size > 1  # a drained stage still waits
+    sender.poll.return_value = KVPoll.Failed
+    with (
+        patch(
+            "sglang.srt.managers.scheduler.get_parallel",
+            return_value=SimpleNamespace(pp_size=pp_size),
+        ),
+        patch(
+            "sglang.srt.managers.scheduler.current_platform",
+            SimpleNamespace(is_tpu=lambda: False),
+        ),
+        patch.object(
+            scheduler_pp_mixin,
+            "poll_and_all_reduce_attn_cp_tp_group",
+            lambda pollers, *groups: [int(p.poll()) for p in pollers],
+        ),
+    ):
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        assert scheduler._deferred_chunked_sender_aborts == [req]
+        scheduler._drain_deferred_chunked_sender_aborts()
+        assert req.kv.holds_kv
+        if pp_size == 1:
+            sender.drained.return_value = True
+            scheduler._drain_deferred_chunked_sender_aborts()
+        else:
+            assert scheduler._pp_pd_get_prefill_transferred_ids() == [req.rid]
+            scheduler.process_disagg_prefill_inflight_queue([req.rid])
+    release_at_result.assert_not_called()
+    release_after_drain.assert_called_once_with(
+        req, scheduler.tree_cache, is_insert=False
+    )
+    sender.clear.assert_called_once_with()
+    assert scheduler._deferred_chunked_sender_aborts == []
 
 
 def test_aborted_result_releases_mamba_allocated_before_kv():

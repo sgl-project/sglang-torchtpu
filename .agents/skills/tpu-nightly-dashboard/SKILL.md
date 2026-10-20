@@ -62,8 +62,8 @@ fields and don't hand-roll `dump_metric` labels in nightly tests.
 - **Test-list filter chips come from `register_tpu_ci(labels=[...])`.** Every
   nightly TPU test registration carries free-form tags — topology
   (`singlehost`/`multihost`), model slug (`gpt-oss-120b`, `qwen3-coder-480b`, …),
-  feature (`pd`, `spec`, `dpa`, `prefix-cache`, `kv-offload`, …). keel scans them
-  from source and renders chips that OR-filter the dashboard's test list. A new
+  feature (`pd`, `spec`, `dpa`, `prefix-cache`, `kv-offload`, …). The dashboard
+  scans them from source and renders chips that OR-filter its test list. A new
   test copies the vocabulary of its neighbors; labels never affect scheduling.
   These are distinct from the *metric* labels `dump_metric` records carry.
 - **Publishing:** scheduled runs always ingest; a dispatch ingests only with

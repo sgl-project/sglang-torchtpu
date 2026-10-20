@@ -1621,6 +1621,26 @@ class IndexerKPool(MultiPlatformOp):
             return None
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
+    def forward_tpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        # On TPU the attention backend runs the indexer (as Indexer.forward_tpu).
+        return get_attn_backend().forward_indexer(
+            self,
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,

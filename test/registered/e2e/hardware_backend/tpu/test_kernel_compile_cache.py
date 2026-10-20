@@ -26,7 +26,14 @@ def worker():
     from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
     server_args = SimpleNamespace(
-        device="tpu", tp_size=1, pp_size=1, nnodes=1, node_rank=0, use_ray=False
+        device="tpu",
+        tp_size=1,
+        pp_size=1,
+        nnodes=1,
+        node_rank=0,
+        use_ray=False,
+        dp_size=1,
+        attn_dp_size=1,
     )
     initialize_torch_tpu_worker(server_args, tp_rank=0)
 

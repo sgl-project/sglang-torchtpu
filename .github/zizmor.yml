@@ -1,0 +1,7 @@
+# zizmor config for scripts/ci/tpu/check_workflows.sh.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Tag refs (@v4) are accepted; this repo does not pin actions to SHAs.
+        "*": ref-pin

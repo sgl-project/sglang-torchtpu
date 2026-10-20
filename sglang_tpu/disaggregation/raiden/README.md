@@ -1,7 +1,7 @@
 # Raiden TPU disaggregation backend
 
 `--disaggregation-transfer-backend raiden` moves KV pages between TPU prefill
-and decode hosts with the [tpu-sync](../../../../../../tpu-sync) DMA engine —
+and decode hosts with the [tpu-sync](https://github.com/google/tpu-sync) DMA engine —
 the TPU analogue of the CUDA mooncake/nixl backends.
 
 ## How it works
@@ -62,11 +62,12 @@ Schedules are built in `reshard_schedule.py` (unit-tested in
 the total kv-head count evenly; the byte granule is one kv-head's contiguous K+V.
 
 DP-attention replicas that co-locate on a decode host get distinct raiden control
-ports via `base + 4*node_worker_rank`, where the node worker rank counts the
+ports via `base + 6*node_worker_rank`, where the node worker rank counts the
 attention-TP ranks of every context-parallel, attention-DP, and system-DP
-replica on the node (reduces to `base + 4*attn_tp_rank` for a single replica);
-each rank owns 4 ports —
-full-engine control/data, then SWA-engine control/data.
+replica on the node (reduces to `base + 6*attn_tp_rank` for a single replica);
+each rank owns 6 ports —
+full-engine control/data, SWA-engine control/data, then GDN-state-engine
+control/data.
 
 ## Hybrid sliding-window models
 
@@ -90,22 +91,36 @@ ends — so it always travels on the closing push, even when chunks already cove
 every full-attention page. Completion is unchanged: `is_send_done` /
 `is_recv_done` already require `swa:<room>` whenever a second engine exists.
 
+## Hybrid linear-attention (GDN) models
+
+`HybridLinearKVPool` registers only its full-attention layers on the full
+engine; the `TpuMambaPool` conv and recurrent tensors (one row per state slot)
+go on a third engine with `max_blocks=1`. Each side maps its request's
+`StateType.MAMBA` slot through `TpuMambaPool.committed_row`, so prefill and
+decode may use different checkpoint widths. The state row rides the `BLOCKS`
+reply and is read as `state:<room>` alongside the whole read (or the closing
+read of a chunked transfer); a full prefix hit still moves it, since state
+cannot be rebuilt from cached KV. Push-resharding and pipeline transfer raise
+`NotImplementedError` for these models.
+
 ## Scope (v1)
 
 Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models (incl. hybrid
-sliding-window at symmetric TP and under push-resharding), decode in
+sliding-window at symmetric TP and under push-resharding, and hybrid GDN at
+symmetric TP), decode in
 chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
 push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
-as this fork (tpu-sync `build.sh`). Not covered: MLA, Mamba/NSA,
-speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
+as this fork (tpu-sync `build.sh`). Not covered: MLA,
+NSA, Mamba/GDN under push-resharding or pipeline transfer, speculative draft
+KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 ## Tunables (env)
 
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `SGLANG_RAIDEN_PIPELINE_TRANSFER` | `0` | named layer pools for a PP producer and a DP, TP, or matching-PP consumer; set to `1` on a decode that is not itself a pipeline |
-| `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 4*node_worker_rank` over every PP/CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
+| `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 6*node_worker_rank` over every PP/CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`, GDN state engine control/data = `+4`/`+5`) |
 | `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; each rank's pool is sized for at most one max-length transfer per running request and seats in-flight transfers page by page. Startup fails with the required and available sizes when not even one max-length transfer fits |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
@@ -142,7 +157,7 @@ Drive both through the standard SGLang PD router, same as mooncake.
   `python -m pytest test/manual/kv_transfer/test_raiden_serde.py`
 - Resharding schedule byte-math (host-only, proto mocked):
   `python -m pytest test/manual/kv_transfer/test_reshard_schedule.py`
-- End-to-end correctness + throughput: TPU VM only (via the team cdk flow);
+- End-to-end correctness + throughput: TPU VM only;
   compare decode output token-for-token against a single-instance run.
 
 ## Pipeline-parallel prefill
@@ -175,13 +190,18 @@ full throughput the controller also needs its own thread pool for worker
 RPCs ([tpu-sync main 6b3e8206](https://github.com/google/tpu-sync/commit/6b3e8206f5a0f4ad7bf4717790bff4c8eb7e1c1c)):
 a transfer coordinates every source stage, and on asyncio's default
 executor concurrent transfers queue behind each other.
-Each engine registers the full-attention and sliding-window layers it owns
-as `fa.lN` and `swa.lN`. By default a single native transfer moves both
-namespaces after the prefill finishes. Full-attention and window page lists
-remain independent, and a cached decode prefix is clipped from each layer's
-transfer.
+Each worker registers the full-attention and sliding-window layers it owns
+as `fa.lN` and `swa.lN`. tpu-sync requires every layer of one engine to hold
+the same number of blocks, so a worker with hybrid SWA memory wraps its
+sliding-window layers in a second engine (control port `+2`, as on the TP
+path) registered with a second controller on stage zero. The window pages of
+the closing transfer and of each stage group move as a twin native transfer
+`swa:<id>` on that engine, announced in the same READY, and a transfer settles
+only once its twin has. By default the closing transfer and its twin move after
+the prefill finishes. Full-attention and window page lists remain independent,
+and a cached decode prefix is clipped from each layer's transfer.
 
-Two opt-in modes overlap the hand-off with the prefill; both are set on the
+Three opt-in modes overlap the hand-off with the prefill; all are set on the
 prefill (`SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` on the decode):
 
 | Env var | Default | Meaning |
@@ -190,6 +210,7 @@ prefill (`SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` on the decode):
 | `SGLANG_RAIDEN_PIPELINE_PART_PAGES` | `16` | minimum pages per early part; fewer ride the closing transfer |
 | `SGLANG_RAIDEN_PIPELINE_STAGE_PARTS` | `0` | each group of stages moves its layers (`<room>.s<g>`) once its forwards of the final chunk complete, instead of after the last stage samples; the first token follows from the last stage |
 | `SGLANG_RAIDEN_PIPELINE_STAGE_GROUP` | `1` | consecutive stages per group transfer |
+| `SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE` | `0` | each stage registers its share of the closing transfer when it launches the final chunk, the last stage once the PP loop has copied that forward's sampled tokens, so no stage waits for its result; the first token comes with the last stage's share; not with stage groups |
 | `SGLANG_RAIDEN_PIPELINE_COORD_WORKERS` | `1` | decode threads coordinating transfers, one controller client each |
 
 A stage group is fenced on a host copy of one element of its forward's
@@ -199,14 +220,24 @@ name non-contiguous source ranks, which needs a tpu-sync planner that accepts
 any subset of a controller's registered transfer ranks. Each early part and
 stage group holds its own decode staging reservation.
 
-Each worker owns one Raiden engine. Pipeline stages share one controller hosted
-by stage zero; independent attention-DP workers each own one. Pool geometry and
-materialized TPU layouts must match between peers. Every pipeline stage needs
-at least one full-attention layer. Speculative decoding is supported only on
-the decode, and only when its draft has no separate KV pool and takes no draft
-hidden states from the prefill.
+With early close, the decode starts the transfer only once the last stage has
+announced its share, after its forward, which needs every earlier stage's. A
+request returning logprobs or a sampling mask, using a grammar or a KV
+checksum, or still bootstrapping gets its first token at the result point.
+
+Each worker owns one Raiden engine, and with hybrid SWA memory a second one for
+its sliding-window layers. Pipeline stages share stage zero's controller for
+each kind of engine; independent attention-DP workers each host their own.
+Pool geometry and materialized TPU layouts must match between peers, and
+prefill and decode must both use hybrid SWA memory or both run with
+`--disable-hybrid-swa-memory`. Every pipeline stage needs at least one
+full-attention layer and, with hybrid SWA memory, at least one sliding-window
+layer. Speculative decoding is supported only on the decode, and only when its
+draft has no separate KV pool and takes no draft hidden states from the
+prefill.
 Host staging uses bounded leases when the installed Raiden supports per-pool
-staging. Older PP-capable wheels use full host mirrors; startup measures their
+staging, which hybrid SWA memory requires. Older PP-capable wheels use full
+host mirrors; startup measures their
 materialized block-major page layouts and bounds their
 peak allocation, including a temporary replacement buffer, against each
 rank's share of `SGLANG_RAIDEN_HOST_POOL_GB`. Over-budget mirrors are rejected;
@@ -224,4 +255,5 @@ source pages remain reserved until the unclaimed registration expires
 
 The pipeline unit tests are in
 `test/registered/unit/hardware_backend/tpu/test_raiden_pipeline.py`,
-`test_raiden_pipeline_overlap.py` and `test_raiden_pipeline_rank4.py`.
+`test_raiden_pipeline_overlap.py`, `test_raiden_pipeline_rank4.py` and
+`test_raiden_pipeline_swa.py`.

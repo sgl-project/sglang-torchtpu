@@ -2,8 +2,9 @@
 
 The serving settings are the ones the single-host MMMU-Pro gate launches through
 recipe/qwen3_vl_30b_a3b/server.sh. Keep the two in sync: the P/D gate is meant
-to differ from the single-host gate only in the disaggregated handoff. Only
-model locations, service ports, and readiness budgets come from the deployment
+to differ from the single-host gate only in the disaggregated handoff -- the
+sampler, the warmup skip, and the disaggregation_* settings below. Only model
+locations, service ports, and readiness budgets come from the deployment
 environment.
 """
 

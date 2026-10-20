@@ -146,6 +146,7 @@ def _snapshot(url: str, timeout: int) -> Dict:
                     "context_length",
                     "tp_size",
                     "dp_size",
+                    "attn_dp_size",
                     "ep_size",
                     "enable_dp_attention",
                     "page_size",

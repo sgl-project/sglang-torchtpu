@@ -13,6 +13,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.session.streaming_session import SessionSlot
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -119,6 +121,13 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         cache.release_radix_session("fallback")
         self.assertEqual(full.session_ref(leaf), 0)
         cache.sanity_check()
+
+    def test_swa_lock_release_on_streaming_session_node_is_a_noop(self):
+        """A later streaming-session turn locks the slot's virtual node; releasing
+        its SWA lock must be a no-op like its other locks, not a tree lookup."""
+        node = SessionSlot().virtual_node
+        self.cache.dec_swa_lock_only(node, DecLockRefParams())
+        self.cache.sanity_check()
 
     def test_register_and_release_update_full_component_reference(self):
         leaf = insert(self.cache, [1, 2, 3, 4])

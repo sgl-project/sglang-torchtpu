@@ -2,8 +2,7 @@
 
 All TPU-only code of `sglang-torchtpu` lives in this package (dist `sglang-tpu`).
 The sglang fork in `python/` shrinks toward a pinned upstream commit as its TPU
-edits move here or go upstream as seams. The plan is `plugin-refactor-proposal.md`
-(the launch-plan doc set); this file is the operational summary.
+edits move here or go upstream as seams. This file is the operational summary.
 
 ## Install
 
@@ -22,7 +21,7 @@ fork already satisfies the plugin's `sglang` requirement.
 | Mode | Select with | Platform class | `is_out_of_tree()` | Status |
 |---|---|---|---|---|
 | A (default) | `SGLANG_PLATFORM=tpu` or unset | `sglang_tpu.tpu_platform.TpuSRTPlatform` (`PlatformEnum.TPU`) | False | the shipped path |
-| B | `SGLANG_PLATFORM=tpu_oot` | `sglang_tpu.platform.TpuOOTPlatform` (`PlatformEnum.OOT`, `is_tpu()` True) | True | opt-in until the divergences below close |
+| B | `SGLANG_PLATFORM=tpu_oot` | `sglang_tpu.platform.TpuOOTPlatform` (`PlatformEnum.OOT`, `is_tpu()` True) | True | what the PR gate and the single-host nightly run; opt-in for users until the divergences below close |
 
 `tpu_oot` only activates when named: with `SGLANG_PLATFORM` unset the loader
 calls every installed `activate()` and errors when two answer.
@@ -107,7 +106,7 @@ process and only on TPU, since every host installs the plugin.
 stay where they are (`test/run_suite.py` only collects `test/registered/**`).
 The e2e smoke suites honour an inherited `SGLANG_PLATFORM`, so mode B is
 `SGLANG_PLATFORM=tpu_oot python test/registered/tpu/e2e/<file>.py`.
-The `test_tpu_oot_*.py` wrappers run three of them that way: the Qwen3 smoke
-(dense MHA) in the PR gate, gpt-oss-20b EAGLE3 (hybrid SWA) and Kimi-K3-tiny
-(MLA with linear attention) nightly. The rest of CI stays on mode A; move the
-nightly two into the PR gate before `tpu_oot` becomes the default.
+CI picks the mode per lane (`render_jobset.py --platform`, the `platform`
+input of `_tpu-test.yml`), so each test runs in one mode only: the PR gate
+(stage-a, stage-b) and the single-host nightly (`nightly-tpu-4-v7`) run mode B;
+the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.

@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import Any, Callable, List, Optional
 
+import torch
+
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
 from sglang.srt.utils.network import NetworkAddress
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang_tpu.mamba_pool import TpuMambaPool
 
 # One logger for the whole package, deliberately keeping the name of the module
 # this code used to live in: emitted record names and the existing test
@@ -27,12 +28,12 @@ logger = logging.getLogger("sglang_tpu.disaggregation.raiden.conn")
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
 
-# Parallelism of a resharding push: the blocks of one push are spread over this
-# many TCP connections, the count raiden's same-layout reads use per rank. On a
-# single connection a push fills only a fraction of the prefill rank's NIC.
-RESHARD_PUSH_PARALLELISM = 4
+# Ports each rank reserves: control+data for the full, SWA and GDN state engines.
+PORTS_PER_RANK = 6
+SWA_PORT_OFFSET = 2
+STATE_PORT_OFFSET = 4
 
-# Base of the per-rank control ports (`base + 4*local_rank`). Not 30000: that
+# Base of the per-rank control ports (`base + 6*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
 # uvicorn then dies with EADDRINUSE and takes the server down before any
 # transfer is attempted.
@@ -62,6 +63,10 @@ class RaidenKVCacheGroups:
     # Trailing tensors of full / swa that belong to a separate draft pool.
     num_draft_full: int = 0
     num_draft_swa: int = 0
+    # Per-layer GDN state tensors, dim 0 = state row; only the target pool's.
+    state: List[torch.Tensor] = field(default_factory=list)
+    # Maps a request's mamba slot to the state row a transfer moves.
+    committed_state_row: Optional[Callable[[int], int]] = None
 
 
 def get_raiden_kv_caches(
@@ -74,13 +79,20 @@ def get_raiden_kv_caches(
     SWA pools allocate full-attention and sliding-window pages independently, so
     they must not share one Raiden block-id list. Speculative decoding uses the
     same page indices for target and draft KV, so append the draft tensors to
-    the matching namespace and move them in the same Raiden transfer.
+    the matching namespace and move them in the same Raiden transfer. A hybrid
+    linear-attention target pool also contributes its GDN state tensors.
     """
 
     def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
         layers_mapping = getattr(current_pool, "layers_mapping", None)
         start = current_pool.start_layer
-        if hasattr(current_pool, "get_fused_kv_buffer"):
+        if isinstance(current_pool, HybridLinearKVPool):
+            # Only full-attention layers own KV; GDN layers ship as state.
+            layer_ids = sorted(current_pool.full_attention_layer_id_mapping)
+            buffers = [
+                current_pool.get_fused_kv_buffer(layer_id) for layer_id in layer_ids
+            ]
+        elif hasattr(current_pool, "get_fused_kv_buffer"):
             layer_ids = (
                 sorted(layers_mapping)
                 if layers_mapping
@@ -128,11 +140,19 @@ def get_raiden_kv_caches(
         full_ids.extend(draft_groups.full_layer_ids)
         swa_ids.extend(draft_groups.swa_layer_ids)
 
-    for name, group in (("full", full), ("SWA", swa)):
+    state: List[torch.Tensor] = []
+    committed_state_row = None
+    if isinstance(pool, HybridLinearKVPool) and isinstance(
+        pool.mamba_pool, TpuMambaPool
+    ):
+        state = pool.mamba_pool.get_state()
+        committed_state_row = pool.mamba_pool.committed_row
+
+    for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
         block_counts = {int(buf.shape[0]) for buf in group}
         if len(block_counts) > 1:
             raise RuntimeError(
-                f"Raiden requires uniform {name} KV block counts; got "
+                f"Raiden requires uniform {name} block counts; got "
                 f"{sorted(block_counts)}"
             )
     return RaidenKVCacheGroups(
@@ -142,4 +162,6 @@ def get_raiden_kv_caches(
         swa_layer_ids=swa_ids,
         num_draft_full=num_draft_full,
         num_draft_swa=num_draft_swa,
+        state=state,
+        committed_state_row=committed_state_row,
     )

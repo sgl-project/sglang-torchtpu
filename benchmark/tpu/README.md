@@ -17,8 +17,10 @@ warmup_buckets.py    # request-sender used by warmup.sh
 ## Usage
 
 The Python launcher (`python -m benchmark.tpu.launch_server --config ...`)
-preserves hardware metadata such as `TPU_TOPOLOGY`. For one-host-per-engine P/D,
-it removes cross-host rendezvous settings so each engine initializes locally.
+runs a per-model recipe; [`recipe/README.md`](recipe/README.md) is the index of
+them and the config format. It preserves hardware metadata such as
+`TPU_TOPOLOGY`. For one-host-per-engine P/D, it removes cross-host rendezvous
+settings so each engine initializes locally.
 The shared serving recipes include the shell launcher's diagnostic, telemetry,
 recompilation logging, and online Hugging Face defaults. Override them with
 `--runtime-envs`, for example `'{"HF_HUB_OFFLINE":"1","TRANSFORMERS_OFFLINE":"1"}'`.

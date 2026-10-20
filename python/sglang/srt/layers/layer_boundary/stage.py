@@ -169,11 +169,12 @@ class StageBoundary:
         )
         return hidden_states
 
-    def finish(self, hidden_states, forward_batch):
+    def finish(self, hidden_states, forward_batch, *, summed_by_compute=False):
         """Hand this stage's output to the following stage: an attention's
         actual contribution, or an FFN's or a mixer's output with its sum
         completed or carried on. An FFN whose boundary has fusions (which may
-        take a MoE finalize handoff) finishes through exit() instead."""
+        take a MoE finalize handoff) finishes through exit() instead.
+        ``summed_by_compute``: see ``ExitPolicy.ffn_exit``."""
         if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
             produced = self.plan.produced(forward_batch)
             return stream_of(forward_batch).record(
@@ -185,14 +186,17 @@ class StageBoundary:
             raise RuntimeError(
                 "an FFN whose boundary has fusions finishes through exit()"
             )
-        return self.exit(forward_batch).finish(hidden_states)
+        return self.exit(forward_batch, summed_by_compute=summed_by_compute).finish(
+            hidden_states
+        )
 
-    def exit(self, forward_batch):
+    def exit(self, forward_batch, *, summed_by_compute=False):
         """Select and scope one FFN or single-stage mixer's output decision,
         for an FFN whose MoE may hand off its finalize (see finish()).
 
         Args:
             forward_batch: Active batch whose stream receives the compute result.
+            summed_by_compute: FFN only; see ``ExitPolicy.ffn_exit``.
 
         Returns:
             A context manager publishing the producer's finalize choice during
@@ -201,14 +205,16 @@ class StageBoundary:
             when compute is skipped for an empty input. It completes or carries work
             using the same decision rather than selecting a second path.
         """
-        result = (
-            self.plan.output.ffn_exit(forward_batch, stream=stream_of(forward_batch))
-            if self.kind is StageKind.FFN
-            else self.plan.output.mixer_exit(
+        if self.kind is not StageKind.FFN:
+            assert not summed_by_compute, "only an FFN's compute sums its output"
+            return self.plan.output.mixer_exit(
                 forward_batch, stream=stream_of(forward_batch)
             )
+        return self.plan.output.ffn_exit(
+            forward_batch,
+            stream=stream_of(forward_batch),
+            summed_by_compute=summed_by_compute,
         )
-        return result
 
     def from_pp(self, tensors, forward_batch, *, allow_missing_residual: bool = False):
         """Restore the residual stream from a pipeline handoff.
@@ -262,12 +268,16 @@ class StageBoundary:
             hidden_states = stream.complete(hidden_states)
         return hidden_states, stream.snapshot(hidden_states)
 
-    def complete_now(self, hidden_states, forward_batch):
+    def complete_now(self, hidden_states, forward_batch, *, summed_by_compute=False):
         """Complete an FFN output outside exit() (the operation-scheduled TBO
         path, which never defers): the sum it owes, then the move onto the
-        rows the layer hands on."""
+        rows the layer hands on. ``summed_by_compute``: see
+        ``ExitPolicy.ffn_exit``."""
         return self.plan.output.complete_now(
-            hidden_states, stream_of(forward_batch), forward_batch
+            hidden_states,
+            stream_of(forward_batch),
+            forward_batch,
+            summed_by_compute=summed_by_compute,
         )
 
     def sum_part(self, hidden_states, forward_batch, group: SumGroup):

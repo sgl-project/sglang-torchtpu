@@ -7,6 +7,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
@@ -16,6 +17,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 
 if TYPE_CHECKING:
@@ -23,6 +25,11 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
+
+
+# Platform discovery runs before worker bootstrap configures torch_tpu.
+rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
+traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -166,7 +173,7 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
         )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(f"{feature} does not support speculative decoding.")
-    if cfg.enable_dp_attention:
+    if cfg.attn_dp_size > 1:
         raise NotImplementedError(f"{feature} does not support DP attention.")
     if cfg.moe_dp_size != attn_cp_size:
         raise NotImplementedError(
@@ -298,7 +305,7 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     stage_is_tp_pair = (
         cfg.tp_size == 2
         and cfg.attn_cp_size == 1
-        and not cfg.enable_dp_attention
+        and cfg.attn_dp_size == 1
         and cfg.ep_size == 1
     )
     if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size and not stage_is_tp_pair:
@@ -474,6 +481,7 @@ def _validate_dsa(server_args) -> None:
             cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=cfg.revision,
+            model_override_args=json.loads(cfg.json_model_override_args or "{}"),
         )
     except Exception:
         # A model that cannot be loaded here fails later with its real error.
@@ -513,7 +521,49 @@ def _register_attention_backends() -> None:
     """Add the attention backends that only this package knows to the registry."""
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
+        register_draft_attention_backend,
     )
+    from sglang_tpu.attention_pallas_rpa_base import (
+        TpuPallasRpaMultiStepDraftBackend,
+    )
+
+    @register_draft_attention_backend("pallas_tpu_rpa_v3")
+    def create_pallas_tpu_rpa_v3_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasRpaV3AttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_rpa_batched")
+    def create_pallas_tpu_rpa_batched_draft_backend(
+        runner, topk, speculative_num_steps
+    ):
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasRpaBatchedAttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_mla")
+    def create_pallas_tpu_mla_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasMlaAttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_mla_sparse")
+    def create_pallas_tpu_mla_sparse_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasSparseMlaAttnBackend
+        )
 
     @register_attention_backend("pallas_tpu_mla_sparse")
     def create_pallas_tpu_mla_sparse_backend(runner):
@@ -528,6 +578,15 @@ def _register_attention_backends() -> None:
         from sglang_tpu.dsv4 import DSV4TPUAttnBackend
 
         return DSV4TPUAttnBackend(runner)
+
+
+def _register_models() -> None:
+    """Add the model implementations that only this package provides to the registry."""
+    from sglang.srt.models.registry import ModelRegistry
+
+    # A module that fails to import is logged and skipped, so it can't take the
+    # other models down with it; an arch core already serves raises.
+    ModelRegistry.register("sglang_tpu.models")
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
@@ -601,9 +660,9 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU: the DCP attention runs "
             "plain decode and extend batches only."
         )
-    if cfg.enable_dp_attention:
+    if cfg.attn_dp_size > 1:
         raise ValueError(
-            "--enable-dp-attention is not supported with "
+            "DP attention (--attn-dp-size > 1) is not supported with "
             "--decode-context-parallel-size > 1 on TPU."
         )
     if cfg.attn_cp_size > 1:
@@ -692,6 +751,13 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
 
 
+def _experimental_spec_enabled() -> bool:
+    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    return experimental_spec_enabled()
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -700,6 +766,16 @@ class TpuSRTPlatform(SRTPlatform):
     device_type: str = "tpu"
 
     supported_quantization: list[str] = []
+
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        return traced_rank(rank, group_size=group_size)
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        return rank_slice(tensor, dim, parts, rank)
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
@@ -717,8 +793,12 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
+        from sglang_tpu.kimi_k3 import static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
+        # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
+        # weights have loaded (its binder runs post-load).
+        static_fp8_parts()
         cfg = resolving_view(server_args)
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
@@ -840,20 +920,23 @@ class TpuSRTPlatform(SRTPlatform):
         # axis. SGLang's global page_size=1 default is valid for token-granular
         # GPU kernels, but is inefficient here: it makes page_indices
         # token-granular and turns KV fetches into many tiny DMAs.
-        # Builtin TPU speculative decoding currently supports EAGLE3 only.
+        # Builtin TPU speculative decoding supports linear EAGLE/MTP and DFLASH.
         # Registered algorithms own their validation and backend integration.
         spec_algo = cfg.speculative_algorithm
         if spec_algo is not None:
-            if spec_algo == "EAGLE3":
+            if spec_algo in ("EAGLE", "EAGLE3", "NEXTN"):
                 if cfg.speculative_use_rejection_sampling:
                     raise NotImplementedError(
-                        "EAGLE3 rejection sampling is not supported on TPU yet."
+                        "EAGLE-family rejection sampling is not supported on TPU yet."
                     )
                 if (cfg.speculative_eagle_topk or 1) > 1:
                     raise NotImplementedError(
-                        "EAGLE3 topk > 1 is not supported on TPU yet."
+                        "EAGLE-family topk > 1 is not supported on TPU yet."
                     )
             elif spec_algo == "DFLASH":
+                pass
+            elif spec_algo == "DSPARK" and _experimental_spec_enabled():
+                # Served by sglang_tpu.experimental.TpuBlockSpecWorker.
                 pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -864,14 +947,13 @@ class TpuSRTPlatform(SRTPlatform):
                 if spec_algo.upper() in SpeculativeAlgorithm.__members__:
                     raise NotImplementedError(
                         f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                        "yet (only EAGLE3 and DFLASH among builtin algorithms)."
+                        "yet (only EAGLE, EAGLE3, NEXTN and DFLASH among builtin algorithms)."
                     )
 
-        # Attention DP is declared by width (--attn-dp-size); the deprecated
-        # --dp-size N --enable-dp-attention spelling may not have resolved yet here.
+        # Platform defaults run after handle_deprecated_dp_attention, so the
+        # deprecated --dp-size N --enable-dp-attention spelling has already
+        # resolved to attn_dp_size=N here.
         attn_dp_size = cfg.attn_dp_size
-        if attn_dp_size == 1 and cfg.enable_dp_attention:
-            attn_dp_size = cfg.dp_size
         if attn_dp_size > 1:
             attn_tp_size = cfg.tp_size // attn_dp_size
             if attn_tp_size > 1 and not cfg.enable_dp_lm_head:
@@ -1082,6 +1164,39 @@ class TpuSRTPlatform(SRTPlatform):
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
+    def get_batch_input_device(self, batch) -> str | None:
+        """Keep eligible prefill inputs on CPU until backend padding."""
+        from sglang.srt.layers.cp.base import get_cp_strategy
+        from sglang.srt.utils.common import print_warning_once
+        from sglang_tpu.allocator_tpu import host_return_allocators
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.host_padding import _can_stage_forward_metadata
+
+        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get():
+            return None
+        # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
+        allocator = batch.token_to_kv_pool_allocator
+        checks = (
+            ("forward metadata is not staged", _can_stage_forward_metadata(batch)),
+            ("context parallelism is on", get_cp_strategy() is None),
+            ("the allocator returns device indices", host_return_allocators(allocator)),
+            # Page size 1 uses alloc(), which has no host-return contract.
+            ("page size is 1", allocator.page_size > 1),
+            (
+                "req_to_token is on the device",
+                batch.req_to_token_pool.req_to_token.device.type == "cpu",
+            ),
+        )
+        for reason, ok in checks:
+            if not ok:
+                print_warning_once(
+                    "SGLANG_TPU_HOST_PADDING is set, but prefill inputs upload at "
+                    f"the live length because {reason}. This may compile a program "
+                    "per prompt length."
+                )
+                return None
+        return "cpu"
+
     def supports_torch_compile(self) -> bool:
         return True
 
@@ -1150,6 +1265,9 @@ class TpuSRTPlatform(SRTPlatform):
         os.environ.setdefault(
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
         )
+        # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
+        # synchronize) called by SGLang's generic runtime bootstrap.
+        os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
 
         # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
         # read by libtpu at init, so it MUST be set before `import torch_tpu`.
@@ -1185,8 +1303,20 @@ class TpuSRTPlatform(SRTPlatform):
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        # Resolve after worker setup, before Dynamo can trace either helper.
+        rank_slice._load()
+        traced_rank._load()
         _register_attention_backends()
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
+            from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
+
+            register_fp8_linear_small_m_op()
+        # Set before registering: importing the model registry imports model_runner,
+        # which calls init_backend again on the OOT path.
         self._backend_initialized = True
+        _register_models()
 
     def on_warmup_complete(self) -> None:
         """Freeze torch.compile so serving-time recompiles raise."""
@@ -1233,6 +1363,10 @@ class TpuSRTPlatform(SRTPlatform):
 
         make_stage_groups_standalone(get_parallel())
         validate_chips_for_pp(get_parallel())
+        # Before the first collective and before torch.compile traces the model.
+        from sglang_tpu.twolevel_allreduce import register_from_parallel_state
+
+        register_from_parallel_state()
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration

@@ -37,7 +37,7 @@ rm -rf nohup.out && \
 nohup python3 -m sglang.launch_server \
     --model-path /code/models/DeepSeek-R1/ \
     --tp 16 --nnodes 2 --node-rank 0 \
-    --dist-init-addr 10.74.249.153:5000 \
+    --dist-init-addr "${DIST_INIT_ADDR:?Set DIST_INIT_ADDR to the first node host:port}" \
     --host 0.0.0.0 --port 33301 \
     --page-size 64 \
     --enable-hierarchical-cache \

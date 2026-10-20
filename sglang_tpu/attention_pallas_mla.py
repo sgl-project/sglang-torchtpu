@@ -50,6 +50,7 @@ from sglang_tpu.attention_pallas_rpa_base import (
 from sglang_tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
+from sglang_tpu.kv_pool import NOPE_MLA_ROPE_DIM
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 if TYPE_CHECKING:
@@ -98,6 +99,7 @@ def _build_pallas_mla_kernel_op():
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         segments: str = "all",
+        decode_query_size: int = 1,
     ) -> tuple[jax.Array, jax.Array]:
         return _jax_mla(
             ql_nope,
@@ -115,12 +117,13 @@ def _build_pallas_mla_kernel_op():
             v_scale=v_scale,
             decode_batch_size=_MLA_DECODE_BATCH_SIZE,
             segments=segments,
+            decode_query_size=decode_query_size,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=(10, 11, 12, 13),
+        static_argnums=(10, 11, 12, 13, 14),
         donate_argnums=(4,),
         input_output_aliases={4: 1},
         warn_deprecated=False,
@@ -146,6 +149,7 @@ def _build_pallas_mla_kernel_op():
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         segments: str = "all",
+        decode_query_size: int = 1,
     ) -> torch.Tensor:
         # JAX is CPU-only here, so Mosaic needs the TPU generation patched in.
         # Inside the custom op like the RPA base: Dynamo can't trace the patch's lock.
@@ -165,6 +169,7 @@ def _build_pallas_mla_kernel_op():
                 k_scale,
                 v_scale,
                 segments,
+                decode_query_size,
             )
         return output
 
@@ -268,9 +273,17 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         out = self._op(
-            *self._mla_kernel_args(q=q, k=k, layer=layer, q_rope=q_rope, k_rope=k_rope),
+            *self._mla_kernel_args(
+                q=q,
+                k=k,
+                layer=layer,
+                forward_batch=forward_batch,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            ),
             # Only this dense kernel takes ``segments``. The sparse op does not.
             segments=self.forward_metadata.segments,
+            decode_query_size=self.forward_metadata.decode_query_size,
         )
         # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model
         # views it back to 3D and folds W_UV.
@@ -284,6 +297,7 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         layer: "RadixAttention",
+        forward_batch: ForwardBatch,
         q_rope: Optional[torch.Tensor],
         k_rope: Optional[torch.Tensor],
     ) -> tuple:
@@ -312,9 +326,16 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         # every input must be made dense explicitly or the kernel reads
         # scrambled data.
         ql_nope = q.reshape(num_tokens, layer.tp_q_head_num, kv_lora_rank).contiguous()
-        q_pe = q_rope.reshape(num_tokens, layer.tp_q_head_num, rope_dim).contiguous()
         new_kv_c = k.reshape(num_tokens, kv_lora_rank).contiguous()
-        new_k_pe = k_rope.reshape(num_tokens, rope_dim).contiguous()
+        if rope_dim == 0:
+            # NoPE model: the kernels need a rope segment, so attend with zeros.
+            q_pe = q.new_zeros(num_tokens, layer.tp_q_head_num, NOPE_MLA_ROPE_DIM)
+            new_k_pe = k.new_zeros(num_tokens, NOPE_MLA_ROPE_DIM)
+        else:
+            q_pe = q_rope.reshape(
+                num_tokens, layer.tp_q_head_num, rope_dim
+            ).contiguous()
+            new_k_pe = k_rope.reshape(num_tokens, rope_dim).contiguous()
 
         # fp8 KV cache: the kernel writes new_kv_c / new_k_pe into the cache
         # itself and requires them in the cache dtype. Quantize per-tensor with
@@ -337,7 +358,7 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             new_kv_c,
             new_k_pe,
             *self._kv_cache_buffers(layer.layer_id),
-            self.forward_metadata.kv_lens,
+            self._kv_lens(forward_batch),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,

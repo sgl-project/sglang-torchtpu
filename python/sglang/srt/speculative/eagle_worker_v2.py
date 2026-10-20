@@ -61,6 +61,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_flags,
     get_model,
     get_parallel,
     get_schedule,
@@ -237,6 +238,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        self.retraction_draft_kv_pools = self._carriable_draft_kv_pools()
         self.init_token_map()
         self.init_lm_head()
 
@@ -770,7 +772,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The loop derives step i's KV length as seq_lens + i + 1 in-graph
         # instead of stacking each step backend's eagerly built metadata. That
         # holds only while step i's backend carries speculative_step_id == i,
-        # which is how BaseTpuPallasRpaMultiStepDraftBackend constructs them.
+        # which is how TpuPallasRpaMultiStepDraftBackend constructs them.
         assert all(b.speculative_step_id == i for i, b in enumerate(attn_backends))
         out_cache_loc = per_step_draft_out_cache_loc(
             forward_batch.out_cache_loc,
@@ -819,7 +821,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return tree_outputs
 
     def _should_fuse_draft_steps(self) -> bool:
-        return _is_tpu and self.speculative_num_steps > 1
+        return (
+            _is_tpu
+            and get_flags().capture.enable_torch_compile
+            and self.speculative_num_steps > 1
+        )
 
     def _fused_draft_steps(
         self,

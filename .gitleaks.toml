@@ -1,0 +1,60 @@
+# gitleaks config for the TPU security check (.github/workflows/tpu-security-checks.yml).
+# Extends the default rules; the allowlists below only silence false positives
+# found in a full-history scan. Every other default rule still applies, and the
+# patterns are narrow enough that a random token still fails them.
+title = "sglang-torchtpu"
+
+[extend]
+useDefault = true
+
+# Tokenizer parity fixtures store token_sha256 digests; the gateway tests ship
+# a throwaway mTLS key; the tensorcast tests use a fixed local key.
+[[allowlists]]
+description = "Test fixtures"
+paths = [
+  '''(^|/)tests?/fixtures/''',
+  '''sgl-model-gateway/tests/security/''',
+  '''mem_cache/storage/tensorcast_store/(configs/|test_)''',
+]
+
+# Placeholder credentials in docs and examples.
+[[allowlists]]
+description = "Documented placeholder keys"
+regexTarget = "secret"
+regexes = [
+  '''^sk-proj-1234567890$''',
+  '''^(router-key|secret-key-123|secret-api-key-12345|your-router-api-key)$''',
+]
+
+# generic-api-key matches any `key = <word>`, so code such as
+# `key.dtype == torch.bfloat16` or `key="gpt_oss_120b_eagle3"` trips it.
+# Only for that rule, skip values written as code: lowercase snake_case with
+# at least one underscore, lowercase dotted names, `name=value` kwargs, and a
+# few one-off names.
+[[allowlists]]
+description = "Code identifiers caught by generic-api-key"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^[a-z][a-z0-9]*(_[a-z0-9]+)+$''',
+  '''^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)+$''',
+  '''^[a-z_][a-z0-9_.]*=[A-Za-z0-9_.]+$''',
+  '''^[A-Za-z0-9]+ForCausalLM$''',
+  '''^h100-235b-bf16-(instruct|thinking)$''',
+  '''^(0123456789abcdef|fedcba9876543210)+$''',
+]
+
+# Bare hex digests (checksums, commit SHAs, test keys) in tests and in the
+# router workflow's pinned tokenizer revision. Elsewhere they still fail.
+[[allowlists]]
+description = "Hex digests in tests"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^([0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$''']
+paths = [
+  '''(^|/)test/''',
+  '''(^|/)tests/''',
+  '''(^|/)test_[^/]+\.py$''',
+  '''^\.github/workflows/pr-test-sgl-router\.yml$''',
+]

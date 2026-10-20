@@ -3554,8 +3554,10 @@ def _warn_if_called_from_outside(name: str, replacement: str):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             # Dynamo cannot trace sys._getframe; compiled forwards (TPU) reach
-            # these getters through exempt helpers such as all_gather.
-            if name not in _ALREADY_WARNED and not torch.compiler.is_compiling():
+            # these getters through exempt helpers such as all_gather. Check
+            # is_compiling first: tracing the set lookup guards the graph on the
+            # set's contents, so the next eager warning invalidates it.
+            if not torch.compiler.is_compiling() and name not in _ALREADY_WARNED:
                 caller = sys._getframe(1).f_globals.get("__name__", "")
                 if not caller.startswith(_EXEMPT_CALLERS):
                     _ALREADY_WARNED.add(name)

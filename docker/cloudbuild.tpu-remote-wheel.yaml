@@ -3,7 +3,7 @@ substitutions:
   _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu"
   _TAG: "latest"
   _BASE_IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu:latest"
-  _WHEEL: "torch-tpu"
+  _WHEEL: "torch_tpu"
 
 serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
 

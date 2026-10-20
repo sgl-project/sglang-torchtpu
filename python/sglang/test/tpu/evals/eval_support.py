@@ -330,7 +330,20 @@ def lm_eval_runner(config_path: str, report_only: bool = False):
         except requests.RequestException:
             pass
 
-        results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
+        # lm_eval.simple_evaluate() calls torch.manual_seed(), which triggers
+        # torch.tpu.manual_seed_all() -> PjrtBackend::EnsureInitialized() if
+        # torch_tpu was autoloaded in this HTTP client process while the server
+        # process owns /dev/vfio/*.
+        import torch
+
+        tpu_mod = getattr(torch, "tpu", None)
+        if tpu_mod is not None and not tpu_mod.is_initialized():
+            from unittest.mock import patch
+
+            with patch.object(tpu_mod, "is_available", return_value=False):
+                results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
+        else:
+            results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
 
         # Threshold fields are ignored when this runner is report-only.
         rtol = cfg.get("rtol", LMEvalMixin.default_rtol)
@@ -726,6 +739,24 @@ QWEN3_5_397B = {
     },
 }
 
+QWEN3_8_27B = {
+    "served_model_name": "Qwen/Qwen3.8-27B",
+    "display_name": "Qwen3.8 27B",
+    "variant": "TP8",
+    "config_module": "recipe/configs/qwen3_8_27b/accuracy.py",
+    # The model card's thinking-mode sampling; its top_k=20 comes from the
+    # checkpoint's generation_config.json, which the server applies by default.
+    "sampling": {
+        # At 32768, 10.8% of AIME26 samples truncated without an answer; at
+        # 81920, 3.3% (measured on tpu7x, 2026-10-12).
+        "max_tokens": 81920,
+        "num_threads": 64,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "chat_template_kwargs": {"enable_thinking": True},
+    },
+}
+
 KIMI_K26 = {
     "served_model_name": "/weights/Kimi-K2.6",
     "display_name": "Kimi K2.6",
@@ -868,8 +899,8 @@ def read_bench_point(out_dir: str, point: dict[str, Any]) -> dict[str, Any] | No
 # The framed-payload egress every TPU perf test shares (the standard set by
 # test_tpu_qwen3_coder_480b_multihost_agentic.py): metrics are dumped per-number
 # via dump_metric when a leg is clean, and the WHOLE measurement summary is also
-# printed once, machine-readable, between these markers. Keel keys on the marker
-# text, so it never changes.
+# printed once, machine-readable, between these markers. The dashboard keys on the
+# marker text, so it never changes.
 RESULT_BEGIN = "=== TPU_BENCH_RESULT_JSON BEGIN ==="
 RESULT_END = "=== TPU_BENCH_RESULT_JSON END ==="
 
@@ -1142,8 +1173,8 @@ def bench_serving_runner(
                     # costs a few hundred bytes a night and cannot be done
                     # retroactively once the job log expires; charting them all
                     # would bury the one number anyone opens the page for under
-                    # forty series. To chart one later, promote it on the keel
-                    # side -- the historical records already carry the data.
+                    # forty series. To chart one later, promote it on the
+                    # dashboard side -- the historical records already carry the data.
                     labels.update(dashboard_labels(point))
                     labels["headline"] = "1"
                 else:

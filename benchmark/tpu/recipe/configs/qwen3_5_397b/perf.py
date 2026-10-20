@@ -3,9 +3,8 @@
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/qwen3_5_397b/perf.py
 
-Ported from the measured recipe on branch haolin/qwen35-recipe-dp-attention
-(benchmark/tpu/recipe/qwen3_5_397b/server.sh), which published this model's
-numbers at this exact 8k1k shape. Every value below that departs from the base
+Ported from a measured serving recipe for this model at this exact 8k1k
+shape. Every value below that departs from the base
 config came from a measurement there; the comments say which.
 
 A hybrid model: 45 of 60 layers are GDN linear attention with a fixed-size
@@ -18,7 +17,7 @@ delayer has nothing to align, and the whole lane measures the TP path.
 
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
+from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG, LIBTPU_FLAGS
 
 INPUT_TOKENS = 8192
 OUTPUT_TOKENS = 1024
@@ -35,6 +34,18 @@ MAX_RUNNING = CONCURRENCY + 4
 # equivalents), so the pool is the in-flight contexts plus every slot's charge.
 # Sizing it at CONCURRENCY * CONTEXT_LENGTH over-commits and only 15 fit.
 MAX_TOTAL_TOKENS = CONCURRENCY * CONTEXT_LENGTH + MAX_RUNNING * 2048
+
+# One departure from the base set, measured here: the SparseCore GATHER offload
+# stays ON (off, the s32[40960] inverse-permutation gather costs ~24 ms/step).
+# The all-gather collective offload takes its slot.
+_LIBTPU_FLAGS = [
+    (
+        "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
+        if flag == "--xla_tpu_offload_gather_to_sparsecore=false"
+        else flag
+    )
+    for flag in LIBTPU_FLAGS
+]
 
 CONFIG = deepcopy(_FP8_BASE_CONFIG)
 CONFIG["server_args"].update(
@@ -65,25 +76,7 @@ CONFIG["server_args"].update(
 )
 CONFIG["runtime_env"].update(
     {
-        # Two departures from the base set, both measured on this model:
-        # scoped_vmem 32768 (65536 starves memory-space assignment: median ITL
-        # 16.84 vs 9.64 ms), and the SparseCore GATHER offload left ON (off, the
-        # s32[40960] inverse-permutation gather costs ~24 ms/step on TensorCore).
-        # The three sparse-core COLLECTIVE offload disables are kept.
-        "LIBTPU_INIT_ARGS": " ".join(
-            [
-                "--xla_tpu_enable_async_collective_fusion=true",
-                "--xla_tpu_overlap_compute_collective_tc=true",
-                "--xla_tpu_enable_async_collective_fusion_multiple_steps=true",
-                "--xla_tpu_enable_latency_hiding_scheduler=true",
-                "--xla_latency_hiding_scheduler_rerun=10",
-                "--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative",
-                "--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative",
-                "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
-                "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
-                "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
-            ]
-        ),
+        "LIBTPU_INIT_ARGS": " ".join(_LIBTPU_FLAGS),
         # Decode takes the dense MoE permute below this, a prefill chunk the
         # SparseCore gather above it. Must clear MAX_RUNNING * topk (10 here):
         # at 1024 a batch over 102 drops the unpermute onto the gather path,

@@ -5,6 +5,7 @@ Unsupported sampling features retain the full-vocabulary PyTorch path."""
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import NamedTuple, Optional
 
 import torch
@@ -20,6 +21,8 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
 logger = logging.getLogger(__name__)
@@ -213,6 +216,16 @@ def _filter_gathered_top_k_probs(
     )
 
 
+def _is_speculative_batch(forward_batch) -> bool:
+    # Draft and verify forwards carry spec_info even when their spec_algorithm
+    # field differs between precompile and serving. Return before reading either
+    # spec_algorithm or sampling_info so Dynamo does not guard those fields.
+    if getattr(forward_batch, "spec_info", None) is not None:
+        return True
+    spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
+    return spec_algorithm is not None and not spec_algorithm.is_none()
+
+
 def distributed_top_k_for_batch(
     forward_batch,
     *,
@@ -225,17 +238,10 @@ def distributed_top_k_for_batch(
         return None
     if forward_batch is None:
         return None
-    # Draft and verify forwards carry spec_info even when their spec_algorithm
-    # field differs between precompile and serving. Return before reading either
-    # spec_algorithm or sampling_info so Dynamo does not guard those fields.
-    if getattr(forward_batch, "spec_info", None) is not None:
-        return None
-    spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
-    has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
     # Speculative decoding never uses the distributed TopK path. Check this
     # before sampling_info so compiled speculative forwards do not specialize
     # on request-specific sampling state.
-    if has_speculative_decode:
+    if _is_speculative_batch(forward_batch):
         return None
     if getattr(forward_batch, "sampling_info", None) is None:
         return None
@@ -284,6 +290,10 @@ def distributed_top_k_for_batch(
 def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
     """Select full-vocabulary logits or distributed TopK candidates."""
 
+    # Model capability negotiation uses a CPU collective, which speculative
+    # forwards never need because they require full-vocabulary logits.
+    if _is_speculative_batch(forward_batch):
+        return LogitsOutputMode.FULL_VOCAB
     candidate_width = distributed_top_k_candidate_width_for_model(model)
     if candidate_width is None:
         return LogitsOutputMode.FULL_VOCAB
@@ -363,9 +373,108 @@ def _capture_sampling_mask(
     )
 
 
+_PARAM_DEFAULTS = {
+    "temperatures": 1,
+    "top_ps": 1,
+    "top_ks": 1,
+    "min_ps": 0,
+    "sampling_seed": 0,
+}
+
+
+def supports_padded_sampling(info: SamplingBatchInfo) -> bool:
+    """Whether all sampling consumers accept physical rows independently of requests.
+
+    Biases, penalties, grammar and observers run before the sampler and still
+    carry live-row state. Keep their existing contract until they are bucketed
+    together with logits, rather than padding only their sampling parameters.
+    """
+    return (
+        info.sampling_params_on_cpu
+        and not info.has_custom_logit_processor
+        and info.sampling_mask_batch_indices is None
+        and info.sampling_support_logprobs_capture_indices is None
+        and not any(info.grammars or ())
+        and info.logit_bias is None
+        and info.acc_additive_penalties is None
+        and info.acc_scaling_penalties is None
+        and not (
+            info.penalizer_orchestrator is not None
+            and info.penalizer_orchestrator.is_required
+        )
+    )
+
+
+def sampling_params_to_device(
+    info: SamplingBatchInfo, *, padded_size: int | None = None
+) -> SamplingBatchInfo:
+    """Upload parameters with the same row count as the sampling inputs.
+
+    Leave the scheduler's host snapshot intact while overlap scheduling filters
+    or merges subsequent batches. A caller using bucketed logits supplies their
+    row count; other callers upload live rows directly, without a device slice.
+    Device-backed inputs need no preparation.
+    """
+    if not info.sampling_params_on_cpu:
+        return info
+    size = len(info)
+    padded_size = size if padded_size is None else padded_size
+    return replace(
+        info, sampling_params_on_cpu=False, **_upload_params(info, padded_size)
+    )
+
+
+def _upload_params(info: SamplingBatchInfo, padded_size: int) -> dict:
+    size = len(info)
+    if padded_size < size:
+        raise ValueError("Sampling parameter rows cannot be smaller than the batch")
+    params = {}
+    for name, fill in _PARAM_DEFAULTS.items():
+        value = getattr(info, name)
+        if value is None:
+            continue
+        padded = value.new_full((padded_size, *value.shape[1:]), fill)
+        padded[:size].copy_(value)
+        params[name] = padded.to(info.device, non_blocking=True)
+    return params
+
+
+class _DeviceParamCache:
+    """Reuse uploaded sampling parameters while a batch keeps its composition.
+
+    Each upload costs a fixed host launch, so per-step uploads dominate small
+    decode steps. filter_batch and merge_batch rebind the host tensors, so tensor
+    identity marks a composition change. Two entries cover alternating batches.
+    """
+
+    _CAPACITY = 2
+
+    def __init__(self):
+        self._entries: list[tuple[tuple, int, dict]] = []
+
+    def materialize(
+        self, info: SamplingBatchInfo, padded_size: int
+    ) -> SamplingBatchInfo:
+        host = tuple(getattr(info, name) for name in _PARAM_DEFAULTS)
+        for index, (cached_host, cached_size, params) in enumerate(self._entries):
+            if cached_size == padded_size and all(
+                a is b for a, b in zip(cached_host, host)
+            ):
+                self._entries.append(self._entries.pop(index))
+                return replace(info, sampling_params_on_cpu=False, **params)
+        params = _upload_params(info, padded_size)
+        # Holding the host tensors keeps their identities from being reused.
+        self._entries = [*self._entries, (host, padded_size, params)][-self._CAPACITY :]
+        return replace(info, sampling_params_on_cpu=False, **params)
+
+
 class TpuSampler(Sampler):
     """Consume a pre-gather global TopK for eligible TPU sampling batches.
     Every other batch delegates to the full-vocabulary sampler implementation."""
+
+    def __init__(self):
+        super().__init__()
+        self._device_params = _DeviceParamCache()
 
     def forward(
         self,
@@ -378,10 +487,54 @@ class TpuSampler(Sampler):
     ):
         """Sample from exact global TopK when full logits gathering was skipped.
         Full-logit outputs retain the base sampler's processing and return contract."""
+        if is_host_padded(sampling_info):
+            sampling_info = sampling_info.on_device()
+            padded_bs = sampling_info.temperatures.shape[0]
+            logits = logits_output.next_token_logits
+            # An eager outer logits processor (multimodal wrappers) emits live
+            # rows; HOST_PADDED sampling runs at the batch bucket.
+            if logits is not None and logits.shape[0] < padded_bs:
+                logits_output.next_token_logits = torch.nn.functional.pad(
+                    logits, (0, 0, 0, padded_bs - logits.shape[0])
+                )
+
+        live_rows = None
+        if sampling_info.sampling_params_on_cpu:
+            live_rows = len(sampling_info)
+            logits = (
+                logits_output.next_token_global_top_k_logits
+                if logits_output.has_next_token_global_top_k
+                else logits_output.next_token_logits
+            )
+            physical_rows = logits.shape[0]
+            if physical_rows != live_rows and (
+                return_logprob or not supports_padded_sampling(sampling_info)
+            ):
+                raise ValueError("This sampling mode requires live-row logits")
+            if (
+                sampling_info.sampling_seed is not None
+                and positions.shape[0] != physical_rows
+            ):
+                raise ValueError(
+                    "Seeded sampling positions must match physical logits rows"
+                )
+            # The producer retains physical logits and forward metadata. Never
+            # slice or re-pad them here. Only CPU parameters need materializing
+            # at the producer's extent (prefill can use a fixed batch cap).
+            if (
+                sampling_info.is_all_greedy
+                and not logits_output.has_next_token_global_top_k
+            ):
+                # Greedy argmax reads no sampling parameters.
+                sampling_info = replace(sampling_info, sampling_params_on_cpu=False)
+            else:
+                sampling_info = self._device_params.materialize(
+                    sampling_info, physical_rows
+                )
 
         # No global TopK: sample from the full-vocabulary logits instead.
         if not logits_output.has_next_token_global_top_k:
-            return super().forward(
+            token_ids = super().forward(
                 logits_output,
                 sampling_info,
                 return_logprob,
@@ -389,6 +542,7 @@ class TpuSampler(Sampler):
                 token_ids_logprobs,
                 positions,
             )
+            return token_ids
 
         if return_logprob:
             raise ValueError("distributed TPU top-k cannot return full logprobs")
@@ -442,13 +596,29 @@ class TpuSampler(Sampler):
         if (
             top_k is not None
             and 1 < top_k <= MAX_DISTRIBUTED_TOP_K
+            # A Python k compiles per value; HOST_PADDED stays on the warmed tensor-k path.
+            and not is_host_padded(sampling_info)
             and sampling_info.sampling_seed is None
             and sampling_info.need_top_k_sampling
             and (not needs_top_p_or_min_p or _use_bsearch_filtering(probs))
         ):
             from sglang_tpu.top_k import tpu_top_k
 
-            global_top_k_probs, global_top_k_token_ids = tpu_top_k(probs, top_k)
+            candidate_width = (
+                min(MAX_DISTRIBUTED_TOP_K, probs.shape[-1])
+                if tpu_envs.SGLANG_TPU_HOST_PADDING.get()
+                else top_k
+            )
+            global_top_k_probs, global_top_k_token_ids = tpu_top_k(
+                probs, candidate_width
+            )
+            if tpu_envs.SGLANG_TPU_HOST_PADDING.get():
+                # Keep the candidate shape independent of the requested k.
+                # Rank masking retains exactly the requested number of candidates.
+                ranks = torch.arange(candidate_width, device=probs.device)
+                global_top_k_probs = global_top_k_probs.masked_fill(
+                    ranks[None, :] >= sampling_info.top_ks[:, None], 0
+                )
             if needs_top_p_or_min_p:
                 # Filtering the gathered block replaces ~30 full-vocabulary
                 # reductions with ~30 reductions over top_k columns.

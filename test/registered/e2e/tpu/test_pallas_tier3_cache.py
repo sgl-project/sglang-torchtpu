@@ -91,7 +91,7 @@ def _singlehost_environment() -> dict[str, str]:
         [
             sys.executable,
             "-m",
-            "torch_tpu._internal.distributed.launchers.singlehost_wrapper",
+            "torch.tpu.distributed",
         ],
         capture_output=True,
         check=False,

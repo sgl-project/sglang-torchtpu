@@ -6,6 +6,7 @@ reporting it on every engine. No TPU or tpu-sync is needed.
 """
 
 import concurrent.futures
+import json
 import sys
 import threading
 import time
@@ -15,13 +16,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import pipeline as pl
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
+from sglang_tpu.disaggregation.raiden.serde import MessageTag
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 ROOM = 123456789
 
@@ -122,6 +126,7 @@ class Manager:
         for method in (
             "_poll_engine_status",
             "_fail_room_locked",
+            "_mark_aborted_locked",
             "is_aborted",
             "_tombstone_reason_locked",
             "_reply_room_failed",
@@ -779,6 +784,236 @@ def test_rank_above_zero_fails_a_group_that_never_lands(staged, monkeypatch):
     monkeypatch.setattr(pl.time, "monotonic", lambda: now)
     poll(d)
     assert str(ROOM) in d.manager._failed
+
+
+def give_aux_buffers(actor, rows=4):
+    """First-token metadata rows like MetadataBuffers': token, then room."""
+    actor.aux_rows = (
+        torch.zeros((rows, 16), dtype=torch.int32),
+        torch.zeros((rows, 8), dtype=torch.int64),
+    )
+    actor.manager.kv_args.aux_data_ptrs = [t.data_ptr() for t in actor.aux_rows]
+    actor.manager.kv_args.aux_item_lens = [t[0].nbytes for t in actor.aux_rows]
+
+
+def row_writer(actor, row, room):
+    def write(token):
+        actor.aux_rows[0][row][0] = token
+        actor.aux_rows[1][row][0] = room
+
+    return write
+
+
+def first_token_aux(stage, token):
+    """The last stage's metadata row once the PP loop copied its first token."""
+    row_writer(stage, 0, ROOM)(token)
+    mgr = stage.manager
+    return pl.read_aux_blob(mgr.kv_args.aux_data_ptrs, mgr.kv_args.aux_item_lens, 0)
+
+
+def early_close_world(world):
+    """Early close: stage 0 hands its share over at launch; the last stage has
+    yet to copy its sampled tokens."""
+    for s in world.stages:
+        s.early_close = True
+        give_aux_buffers(s)
+    give_aux_buffers(world.decode)
+    world.decode.register_decode(ROOM, list(range(100, 112)), [200], 0, world.infos)
+    world.pump()
+    world.stages[0].close_early(ROOM, list(range(10, 15)), [30])
+    world.pump()
+
+
+def claim_without_landing(world):
+    """The decode's coordinations are accepted but land only when reported."""
+    world.decode.client_type = lambda address: SimpleNamespace(
+        coordinate_transfer=lambda **kw: world.controller.transfers.append(kw) or True
+    )
+
+
+def test_early_close_gates_the_transfer_on_the_last_stages_tokens(world):
+    """Stage 0 registers pages its forward may still be writing; the decode
+    starts only once the last stage, whose forward needs stage 0's, has closed
+    its share with the first token. The result point then adds nothing."""
+    early_close_world(world)
+    assert set(world.controller.registered[str(ROOM)]) == {0}
+    assert world.decode.maybe_start_pull(ROOM) is False
+    assert not world.controller.transfers
+    last = world.stages[1]
+    last.close_early(ROOM, list(range(10, 15)), [30], first_token_aux(last, 42))
+    world.pump()
+    assert world.decode.aux_rows[0][0][0] == 42
+    assert world.decode.maybe_start_pull(ROOM) is True
+    (closing,) = world.controller.transfers
+    assert [u.data_replica_idx for u in closing["src_units"]] == [0, 1]
+    for actor in (*world.stages, world.decode):
+        poll(actor)
+    assert str(ROOM) in world.decode.manager._completed_recv
+    queued = len(world.stages[0].manager.bus["queue"])
+    for s in world.stages:
+        prefill_pages(s, list(range(10, 15)), swa=[30])
+        assert s.finalize_send(ROOM, None)
+    assert len(world.stages[0].manager.bus["queue"]) == queued
+
+
+def test_early_close_sends_metadata_at_the_result_point_when_needed(world):
+    """A last-stage share closed without the first token (logprobs, ...) gets
+    the result point's metadata, alone; the decode holds the room until then."""
+    early_close_world(world)
+    world.stages[1].close_early(ROOM, list(range(10, 15)), [30])
+    world.pump()
+    assert world.decode.maybe_start_pull(ROOM) is True
+    assert world.decode.aux_rows[1][0][0] == 0
+    bus = world.stages[0].manager.bus["queue"]
+    for s in world.stages:
+        row_writer(s, 1, ROOM)(42)
+        prefill_pages(s, list(range(10, 15)), swa=[30])
+        assert s.finalize_send(ROOM, 1)
+    assert [json.loads(frames[2]).get("aux_only") for _, frames in bus] == [True]
+    world.pump()
+    assert world.decode.aux_rows[0][0][0] == 42
+
+
+def test_early_close_of_an_aborted_room_registers_nothing(world):
+    early_close_world(world)
+    last = world.stages[1]
+    last.manager._aborted[ROOM] = time.time()
+    last.close_early(ROOM, list(range(10, 15)), [30], first_token_aux(last, 42))
+    assert 1 not in world.controller.registered[str(ROOM)]
+    poll(last)
+    assert not last.active(ROOM)
+
+
+def test_early_close_after_early_parts_closes_only_the_rest(world):
+    for s in world.stages:
+        s.early_close = True
+    dst_full = list(range(100, 112))
+    world.decode.register_decode(ROOM, dst_full, [200], None, world.infos)
+    world.pump()
+    for s in world.stages:
+        start = prefill_pages(s, list(range(10, 18)))
+        s.offer_part(ROOM, start, list(range(10, 18)))  # one 8-page early part
+        s.close_early(ROOM, list(range(10, 21)), [30])
+        assert (s.sent[ROOM]["start"], s.sent[ROOM]["parts"]) == (8, 1)
+    world.pump()
+    assert world.decode.maybe_start_pull(ROOM)
+    closing = next(t for t in world.controller.transfers if t["req_id"] == str(ROOM))
+    assert closing["dst_device_block_ids"] == dst_full[8:11] * 2 + [200] * 2
+    for actor in (*world.stages, world.decode):
+        poll(actor)
+    assert str(ROOM) in world.decode.manager._completed_recv
+
+
+def test_early_close_page_mismatch_fails_the_room_and_keeps_claimed_pages(world):
+    """Pages registered before the result point that differ from its own would
+    let the decode read pages the request may no longer own: the room fails on
+    both sides, and the claimed transfer keeps the pages until it settles."""
+    early_close_world(world)
+    claim_without_landing(world)
+    world.stages[1].close_early(ROOM, list(range(10, 15)), [30])
+    world.pump()
+    assert world.decode.maybe_start_pull(ROOM)
+    s = world.stages[0]
+    bus = s.manager.bus["queue"]
+    prefill_pages(s, [10, 11, 12, 13, 99], swa=[30])
+    assert not s.finalize_send(ROOM, None)
+    assert "differ" in s.manager.failure_records[ROOM]
+    assert [frames[0] for _, frames in bus] == [MessageTag.ROOM_FAILED]
+    poll(s)
+    assert s.active(ROOM) and str(ROOM) in s.manager._failed
+    s.engine.sent = [str(ROOM)]
+    poll(s)
+    assert not s.active(ROOM)
+
+
+def test_early_close_refuses_stage_groups_and_a_loop_without_deferred_sends(
+    monkeypatch,
+):
+    """Stage groups replace the closing transfer, and without the deferred
+    output send the last stage would silently close at its result point."""
+    t = object.__new__(pl.PipelineTransfer)
+    t.producer = True
+
+    def depth(value):
+        monkeypatch.setattr(
+            pl, "get_parallel", lambda: SimpleNamespace(pp_async_batch_depth=value)
+        )
+
+    depth(1)
+    with envs.SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE.override(True):
+        with envs.SGLANG_RAIDEN_PIPELINE_STAGE_PARTS.override(True):
+            with pytest.raises(ValueError, match="stage groups"):
+                t._init_overlap_state()
+        depth(0)
+        with pytest.raises(ValueError, match="pp-async-batch-depth"):
+            t._init_overlap_state()
+        depth(1)
+        t._init_overlap_state()
+    assert t.early_close and t.final_chunks is not None
+
+
+def test_result_point_abort_keeps_pages_a_claimed_stage_group_transfer_reads(
+    staged, monkeypatch
+):
+    """Stage groups register a stage's pages before the result point. An abort
+    retired there freed them at once, under a transfer the decode may still be
+    reading; and a stage freeing them on its own drain lets the stages' free
+    pages, and so their next batches, differ. Each stage holds them until the
+    in-flight queue's release consensus, which needs every stage drained."""
+    from sglang.srt.disaggregation import prefill
+    from sglang.srt.managers import scheduler
+
+    w = staged
+    claim_without_landing(w)
+    w.decode.register_decode(ROOM, list(range(100, 112)), [200], None, w.infos)
+    w.pump()
+    for s in w.stages:
+        fence = Fence()
+        fence.ready = True
+        s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
+    w.pump()
+    assert w.decode.maybe_start_pull(ROOM)
+    s = w.stages[0]
+    sender = RaidenKVSender.__new__(RaidenKVSender)
+    sender.bootstrap_room = ROOM
+    sender.kv_mgr = SimpleNamespace(_pipeline=s, sender_has_active_io=s.active)
+    sender.abort = lambda: s.manager._aborted.update({ROOM: time.time()})
+    sender.clear = lambda: None
+    released = []
+    for module in (prefill, scheduler):
+        monkeypatch.setattr(
+            module, "release_kv_cache", lambda req, *a, **k: released.append(req)
+        )
+    monkeypatch.setattr(scheduler, "get_parallel", lambda: SimpleNamespace(pp_size=2))
+    sched = scheduler.Scheduler.__new__(scheduler.Scheduler)
+    sched.transfer_backend = TransferBackend.RAIDEN
+    sched.disagg_prefill_pending_chunk_rids = set()
+    sched.req_to_metadata_buffer_idx_allocator = None
+    sched.tree_cache = SimpleNamespace(finish=lambda *args: None)
+    sched._deferred_chunked_sender_aborts = []
+    sched.disagg_prefill_inflight_queue = []
+    sched.scheduler_stage_metrics = None
+    req = SimpleNamespace(
+        rid="r",
+        kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+        metadata_buffer_index=-1,
+        disagg_kv_sender=sender,
+        to_finish=None,
+        pending_bootstrap=False,
+        cache_request_handle=None,
+    )
+    assert sched._retire_aborted_prefill_result(req)
+    assert released == [] and sched._deferred_chunked_sender_aborts == [req]
+    poll(s)
+    assert not sender.drained()  # the decode still reads group 0's pages
+    s.engine.sent = [pl.stage_req_id(ROOM, 0)]
+    poll(s)
+    assert sender.drained()
+    sched._drain_deferred_chunked_sender_aborts()
+    sched.process_disagg_prefill_inflight_queue([])
+    assert released == []
+    sched.process_disagg_prefill_inflight_queue([req.rid])
+    assert released == [req] and not sched._deferred_chunked_sender_aborts
 
 
 if __name__ == "__main__":

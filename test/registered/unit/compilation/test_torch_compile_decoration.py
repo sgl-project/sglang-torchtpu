@@ -16,6 +16,25 @@ from sglang.srt.compilation.compile import (
     _mark_dynamic_forward_batch,
     _runtime_dynamic_dim_for_argument,
 )
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
+from sglang.test.test_utils import CustomTestCase
+
+
+class TestEagerDraftWarmup(CustomTestCase):
+    def test_noop_accepts_optional_fused_draft_callback(self):
+        """Eager EAGLE/MTP startup must accept the worker warmup call.
+
+        The worker passes a third argument even without compilation; the
+        default policy must accept it without executing a draft forward.
+        """
+
+        def unexpected_forward(*args):
+            self.fail("An eager warmup must not execute the fused draft callback")
+
+        policy = NoopCompilePolicy()
+        policy.precompile_draft(None, None)
+        policy.precompile_draft(None, None, None)
+        policy.precompile_draft(None, None, unexpected_forward)
 
 
 class _MropeModel:
@@ -40,7 +59,7 @@ class _StringAnnotatedMropeModel:
 
 def test_compiled_op_imports_and_runs_without_jax():
     module_path = importlib.util.find_spec("sglang.srt.compilation.compiled_op").origin
-    with patch.dict(sys.modules, {"jax": None}):
+    with patch.dict(sys.modules, {"jax": None, "sglang_tpu": None}):
         module = runpy.run_path(module_path)
 
         @module["compiled_op"]()
@@ -48,6 +67,8 @@ def test_compiled_op_imports_and_runs_without_jax():
             return x + 1
 
         x = torch.tensor([1, 2])
+        self_contained_warmup = module["warmup_compiled_op"]
+        assert self_contained_warmup(helper, x) is None
         torch.testing.assert_close(helper(x), x + 1)
 
 

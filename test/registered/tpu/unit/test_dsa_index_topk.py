@@ -13,6 +13,9 @@ wrong without raising an error:
   token, and nothing else may change. Padded batch rows must not be stored.
 * The selection. Keys must be ranked by the indexer's score, and a query may
   only select keys at or before its own position.
+* Speculative verify. With ``decode_query_size`` every decode-range request
+  has that many query rows and runs on the kernel's decode passes; a batch
+  whose rows are not all that wide must fall back to the mixed pass.
 
 The kernel computes scores with bf16 precision, so its picks can differ from
 the reference near the cut-off. The tests therefore compare scores: no picked
@@ -94,9 +97,12 @@ class _Step(msgspec.Struct, frozen=True):
     scores: list
 
 
-def _build_step(*, lens, token_bucket, is_decode, padded_rows=0, seed=0):
+def _build_step(
+    *, lens, token_bucket, is_decode, padded_rows=0, padded_q_len=1, seed=0
+):
     """Build a step. ``lens`` has one ``(q_len, kv_len)`` per real request;
-    ``kv_len`` already counts the ``q_len`` new tokens."""
+    ``kv_len`` already counts the ``q_len`` new tokens. Padded rows have
+    ``padded_q_len`` query tokens each."""
     rng = np.random.default_rng(seed)
     num_active = len(lens)
     pages_needed = [-(-kv_len // _PAGE_SIZE) for _, kv_len in lens]
@@ -158,10 +164,10 @@ def _build_step(*, lens, token_bucket, is_decode, padded_rows=0, seed=0):
         expected[rows, :INDEX_HEAD_DIM] = k_fp8[new].view(np.uint8)
         expected[rows, INDEX_HEAD_DIM] = k_byte[new, 0]
 
-    # A padded row has one query token and reuses request 0's page table row.
+    # A padded row reuses request 0's page table row.
     page_table[num_active:] = page_table[0]
-    q_lens = [q_len for q_len, _ in lens] + [1] * padded_rows
-    kv_lens = [kv_len for _, kv_len in lens] + [1] * padded_rows
+    q_lens = [q_len for q_len, _ in lens] + [padded_q_len] * padded_rows
+    kv_lens = [kv_len for _, kv_len in lens] + [padded_q_len] * padded_rows
     return _Step(
         num_active_tokens=token,
         query=query,
@@ -179,7 +185,7 @@ def _build_step(*, lens, token_bucket, is_decode, padded_rows=0, seed=0):
     )
 
 
-def _run(step):
+def _run(step, decode_query_size=1):
     rows, cache = dsa_indexer_step(
         jnp.asarray(step.query),
         jnp.asarray(step.key),
@@ -191,6 +197,7 @@ def _run(step):
         jnp.asarray(step.distribution),
         weight_scale=_WEIGHT_SCALE,
         topk=_TOPK,
+        decode_query_size=decode_query_size,
     )
     return np.asarray(rows), np.asarray(cache)
 
@@ -259,6 +266,40 @@ class TestDsaIndexTopk(CustomTestCase):
             lens=[(1, 900), (1, 37)], token_bucket=4, is_decode=True, padded_rows=2
         )
         rows, cache = _run(step)
+
+        np.testing.assert_array_equal(cache, step.expected_cache)
+        self._assert_selection(step, rows)
+
+    def test_verify_runs_batched_and_tail_decode_passes(self):
+        # Nine 4-row windows: eight through the batched pass, one through the
+        # tail. KV lengths sit on both sides of top-k.
+        kv_lens = (700, 120, 300, 260, 900, 50, 257, 1000, 400)
+        step = _build_step(
+            lens=[(4, n) for n in kv_lens], token_bucket=36, is_decode=True
+        )
+        rows, cache = _run(step, decode_query_size=4)
+
+        np.testing.assert_array_equal(cache, step.expected_cache)
+        self._assert_selection(step, rows)
+
+    def test_verify_skips_padded_rows(self):
+        step = _build_step(
+            lens=[(4, 900), (4, 37)],
+            token_bucket=16,
+            is_decode=True,
+            padded_rows=2,
+            padded_q_len=4,
+        )
+        rows, cache = _run(step, decode_query_size=4)
+
+        np.testing.assert_array_equal(cache, step.expected_cache)
+        self._assert_selection(step, rows)
+
+    def test_verify_non_uniform_falls_back_to_mixed(self):
+        step = _build_step(
+            lens=[(4, 500), (2, 300), (4, 800)], token_bucket=10, is_decode=True
+        )
+        rows, cache = _run(step, decode_query_size=4)
 
         np.testing.assert_array_equal(cache, step.expected_cache)
         self._assert_selection(step, rows)

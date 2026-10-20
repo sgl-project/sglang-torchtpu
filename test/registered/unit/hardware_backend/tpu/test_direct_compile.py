@@ -14,6 +14,8 @@ from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayou
 from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import dp_attention
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -193,6 +195,25 @@ class TestPPProxyPytree(CustomTestCase):
         self.assertEqual(path[-1], tree_util.DictKey("hidden_states"))
 
 
+class TestAuxHiddenStatePytree(CustomTestCase):
+    def test_aux_list_output_flattens_to_tensor_leaves_and_rebuilds(self):
+        """A target verify that returns (hidden, aux) for DFlash capture must trace.
+
+        Unregistered, the aux list is one opaque leaf and direct_compile rejects
+        the output as a non-tensor.
+        """
+        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
+        leaves, treespec = tree_util.tree_flatten(
+            (hidden, AuxHiddenStateList([first, second]))
+        )
+        self.assertEqual(
+            [id(leaf) for leaf in leaves], [id(hidden), id(first), id(second)]
+        )
+        _, rebuilt = tree_util.tree_unflatten(treespec, [hidden, second, first])
+        self.assertIsInstance(rebuilt, AuxHiddenStateList)
+        self.assertEqual([id(t) for t in rebuilt], [id(second), id(first)])
+
+
 def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
     def fn(value, unused_runtime):
         kv_pool.value.add_(model.kv_bias)
@@ -209,6 +230,21 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
         kv_pool=kv_pool,
         **compile_options,
     )
+
+
+class TestAuxHiddenStatePytree(CustomTestCase):
+    def test_aux_states_flatten_to_tensor_leaves_and_rebuild(self):
+        """An EAGLE3 target's (hidden, aux) output must reach direct_compile as
+        tensor leaves; an opaque list leaf fails its all-TPU-tensors check."""
+        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
+        leaves, treespec = tree_util.tree_flatten(
+            (hidden, AuxHiddenStateList([first, second]))
+        )
+        self.assertEqual(len(leaves), 3)
+        self.assertTrue(all(isinstance(leaf, torch.Tensor) for leaf in leaves))
+        _, aux = tree_util.tree_unflatten(treespec, leaves)
+        self.assertIsInstance(aux, AuxHiddenStateList)
+        self.assertIs(aux[1], second)
 
 
 class TestDirectCompile(CustomTestCase):
@@ -230,10 +266,16 @@ class TestDirectCompile(CustomTestCase):
                     patch(
                         "sglang.srt.compilation.compiled_op.is_tpu", return_value=tpu
                     ),
-                    patch("torch.compile", side_effect=compile_on_cpu),
+                    patch("torch.compile", side_effect=compile_on_cpu) as compiler,
                     get_context().override_server_args(tpu_compile_tracer="dynamo"),
                 ):
-                    op = compiled_op(uses_rng=True)(draw)
+                    eager_calls = []
+
+                    def eager(*, value):
+                        eager_calls.append(value)
+                        return draw(value=value)
+
+                    op = compiled_op(uses_rng=True)(draw if enabled and tpu else eager)
                     state = torch.random.get_rng_state()
                     with collect_warmups() as queue:
                         warmup_compiled_op(op, value=value)
@@ -243,6 +285,9 @@ class TestDirectCompile(CustomTestCase):
                         self.assertEqual(queue.calls, [])
                     warmup_compiled_op(op, value=value)
                     self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
+                    if not enabled or not tpu:
+                        self.assertEqual(eager_calls, [])
+                        compiler.assert_not_called()
                     actual = op(value=value)
                     after = torch.random.get_rng_state()
                     self.assertFalse(torch.equal(after, state))
@@ -257,11 +302,17 @@ class TestDirectCompile(CustomTestCase):
 
             state = torch.random.get_rng_state()
             with (
-                envs.SGLANG_ENABLE_TORCH_COMPILE.override(False),
+                envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+                patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+                patch("torch.compile", side_effect=lambda fn, **kwargs: fn),
+                get_context().override_server_args(tpu_compile_tracer="dynamo"),
                 self.assertRaisesRegex(RuntimeError, "warmup failed"),
             ):
                 warmup_compiled_op(fail, value)
             self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
+
+        with self.assertRaisesRegex(ValueError, "explicit RNG inputs"):
+            compiled_op(spmd_safe=True, uses_rng=True)
 
     def test_cold_call_and_synchronous_mode_return_real_results(self):
         def compile_helper(fn, **kwargs):
@@ -304,8 +355,12 @@ class TestDirectCompile(CustomTestCase):
                     artifact.executable = None
                     artifact.pending_compile = future
 
-                def compile_helper(args, kwargs, *, async_compile):
+                def compile_helper(
+                    args, kwargs, *, async_compile, spmd_compiler, graph
+                ):
                     self.assertEqual(async_compile, asynchronous)
+                    self.assertIsNone(spmd_compiler)
+                    self.assertIsNone(graph)
                     return artifact
 
                 with (
@@ -1052,7 +1107,7 @@ class TestDirectCompile(CustomTestCase):
         compiler = direct_compile.tpu_torch_compile
         value = compiler.placeholder([2], torch.int64, False)
         with direct_compile.execution_mode.set_eager_mode(
-            direct_compile.execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+            direct_compile.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
         ):
             result = torch.isnan(value)
 
@@ -1070,7 +1125,7 @@ class TestDirectCompile(CustomTestCase):
                 weight = compiler.placeholder([2, 8], torch.float32, False)
                 value = compiler.placeholder([2, 8], torch.float32, False)
                 with direct_compile.execution_mode.set_eager_mode(
-                    direct_compile.execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+                    direct_compile.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
                 ):
                     scores = value + weight
                     outputs = (
@@ -1567,23 +1622,33 @@ class TestDirectCompileDpRanks(unittest.TestCase):
             for device in (torch.device("tpu"), value.device)
         }
         values = torch.tensor([2.0, 3.0], device="tpu")
-        backend = SimpleNamespace(forward_metadata=None)
+        backend = AttentionBackend()
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=2,
+            input_ids=values,
+            req_pool_indices=None,
+            seq_lens=None,
+            out_cache_loc=None,
+            seq_lens_sum=0,
+        )
+        inputs = (values, None, forward_batch)
         with (
             patch.object(dp_attention, "_RANK_TENSORS", cache),
             forward_context(ForwardContext(attn_backend=backend)),
         ):
             compiled, warmup_async = policy._direct_compile(model.forward)
             torch.testing.assert_close(
-                warmup_async(values, None, None).wait().cpu(),
-                model(values, None, None).cpu(),
+                warmup_async(*inputs).wait().cpu(),
+                model(*inputs).cpu(),
             )
             # Reuse one executable while changing both scalar rank buffers.
             # Constants baked during tracing would return the first rank's result.
             for tp_rank, dp_rank in ((0, 0), (0, 1), (1, 0), (1, 1)):
                 ranks["attn_tp"].fill_(tp_rank)
                 ranks["attn_dp"].fill_(dp_rank)
-                expected = model(values, None, None).cpu()
-                actual = compiled(values, None, None).cpu()
+                expected = model(*inputs).cpu()
+                actual = compiled(*inputs).cpu()
                 torch.testing.assert_close(actual, expected)
                 self.assertIs(dp_attention._RANK_TENSORS, cache)
 

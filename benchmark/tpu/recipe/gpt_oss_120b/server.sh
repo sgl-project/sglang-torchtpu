@@ -5,11 +5,11 @@
 #   ISL=1024 OSL=1024 CONCUR=64 ./server.sh      # sized for the 1k/1k sweep
 #   ISL=8192 OSL=1024 CONCUR=64 ./server.sh      # sized for the 8k/1k sweep
 #
-# Pair with ./bench.sh (shared-prefix / prefix-cache-hit concurrency sweep).
+# Pair with ../../bench_serving.sh for the concurrency sweep.
 # CONCUR is the LARGEST concurrency the sweep will drive: max-running-requests
 # and torch_compile_max_bs are set from it, and the derived bs buckets are
 # powers of two up to it, so one server covers c=1..CONCUR without a relaunch.
-set -uo pipefail
+set -euo pipefail
 
 ISL=${ISL:-1024}
 OSL=${OSL:-1024}

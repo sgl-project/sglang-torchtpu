@@ -20,19 +20,27 @@ class StagingAdmission:
     startup and rejects a read it cannot seat, so a consumer must not issue
     reads that together need more pages than the pool holds. Reads that are
     not admitted stay pending and are retried. A hybrid model's sliding-window
-    pages are seated by a second engine with its own pool, so a read that
-    carries them is charged against both pools. Keys are whatever identifies
-    one read -- a room, or a room's chunk.
+    pages and GDN state rows are seated by their own engines with their own
+    pools, so a read that carries them is charged against each of those pools.
+    Keys are whatever identifies one read -- a room, or a room's chunk.
 
     Reads are admitted in the order they ask: a read that did not fit holds
     the head of the line until it is admitted or forgotten, so a stream of
     smaller reads cannot keep a larger one waiting indefinitely.
     """
 
-    def __init__(self, capacity: int, swa_capacity: Optional[int] = None):
+    def __init__(
+        self,
+        capacity: int,
+        swa_capacity: Optional[int] = None,
+        state_capacity: Optional[int] = None,
+    ):
         self.capacity = max(1, int(capacity))
         self.swa_capacity = None if swa_capacity is None else max(1, int(swa_capacity))
-        self._in_flight: Dict[Any, Tuple[int, int]] = {}
+        self.state_capacity = (
+            None if state_capacity is None else max(1, int(state_capacity))
+        )
+        self._in_flight: Dict[Any, Tuple[int, int, int]] = {}
         self._waiting: Optional[Any] = None
 
     def __len__(self) -> int:
@@ -47,35 +55,47 @@ class StagingAdmission:
         return self._waiting
 
     def pages(self) -> int:
-        return sum(pages for pages, _ in self._in_flight.values())
+        return sum(pages for pages, _, _ in self._in_flight.values())
 
     def swa_pages(self) -> int:
-        return sum(swa_pages for _, swa_pages in self._in_flight.values())
+        return sum(swa_pages for _, swa_pages, _ in self._in_flight.values())
 
-    def admit(self, key: Any, pages: int, swa_pages: int = 0) -> bool:
-        """Reserves ``pages`` of the pool (and ``swa_pages`` of the
-        sliding-window pool) for ``key``. False means try again later."""
+    def state_pages(self) -> int:
+        return sum(state_pages for _, _, state_pages in self._in_flight.values())
+
+    def admit(
+        self, key: Any, pages: int, swa_pages: int = 0, state_pages: int = 0
+    ) -> bool:
+        """Reserves ``pages`` of the pool (``swa_pages`` of the sliding-window
+        pool, ``state_pages`` of the GDN state pool) for ``key``. False means
+        try again later."""
         if key in self._in_flight:
             return True
-        pages, swa_pages = int(pages), int(swa_pages)
-        if pages > self.capacity or (
-            swa_pages > 0
-            and (self.swa_capacity is None or swa_pages > self.swa_capacity)
+        pages, swa_pages, state_pages = int(pages), int(swa_pages), int(state_pages)
+        if (
+            pages > self.capacity
+            or _exceeds(swa_pages, self.swa_capacity)
+            or _exceeds(state_pages, self.state_capacity)
         ):
             raise ValueError(
-                f"read {key!r} needs {pages} pages and {swa_pages} sliding-window "
-                f"pages, more than the pool holds ({self.capacity} and "
-                f"{self.swa_capacity})"
+                f"read {key!r} needs {pages} pages, {swa_pages} sliding-window "
+                f"pages and {state_pages} state rows, more than the pool holds "
+                f"({self.capacity}, {self.swa_capacity} and {self.state_capacity})"
             )
         if self._waiting is not None and self._waiting != key:
             return False
-        if self.pages() + pages > self.capacity or (
-            swa_pages > 0 and self.swa_pages() + swa_pages > self.swa_capacity
+        if (
+            self.pages() + pages > self.capacity
+            or (swa_pages > 0 and self.swa_pages() + swa_pages > self.swa_capacity)
+            or (
+                state_pages > 0
+                and self.state_pages() + state_pages > self.state_capacity
+            )
         ):
             self._waiting = key
             return False
         self._waiting = None
-        self._in_flight[key] = (pages, swa_pages)
+        self._in_flight[key] = (pages, swa_pages, state_pages)
         return True
 
     def release(self, key: Any) -> None:
@@ -88,6 +108,10 @@ class StagingAdmission:
 
     def rooms(self) -> List[Any]:
         return list(self._in_flight)
+
+
+def _exceeds(pages: int, capacity: Optional[int]) -> bool:
+    return pages > 0 and (capacity is None or pages > capacity)
 
 
 def slot_host_bytes(kv_caches: List[Any], max_blocks: int) -> int:

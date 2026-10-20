@@ -186,7 +186,7 @@ class MooncakeStoreConfig:
     @staticmethod
     def load_from_env() -> "MooncakeStoreConfig":
         """Load config from a file specified in the environment variable.
-        export MOONCAKE_MASTER=10.13.3.232:50051
+        export MOONCAKE_MASTER=10.0.0.1:50051
         export MOONCAKE_PROTOCOL="rdma"
         export MOONCAKE_DEVICE=""
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"

@@ -162,9 +162,30 @@ class SRTPlatform(DeviceMixin):
         """
         return "inductor"
 
+    def get_batch_input_device(self, batch) -> Optional[str]:
+        """Placement of host-created forward inputs before backend preparation.
+
+        None preserves each caller's normal device. Scheduler state and
+        device-produced tokens keep their own devices.
+        """
+        return None
+
     def supports_torch_compile(self) -> bool:
         """Whether this platform consumes annotation-driven compile policies."""
         return False
+
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        """Return the traced rank, optionally within a contiguous parallel group."""
+        return None
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        """Select one evenly divided tensor shard for this rank."""
+        assert tensor.shape[dim] % parts == 0
+        return tensor.split(tensor.shape[dim] // parts, dim=dim)[rank].contiguous()
 
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""

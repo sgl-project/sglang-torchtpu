@@ -172,7 +172,7 @@ class SpeculativeAlgorithm(Enum):
 
     def supports_tpu_direct_compile(self) -> bool:
         """Whether this algorithm supports TPU direct compilation."""
-        return self.is_eagle3() or self.is_dflash()
+        return self.is_eagle3() or self.is_dflash_family()
 
     def supports_kv_free_fence(self, *, copies_draft_tail: bool) -> bool:
         """Whether some tensor a forward's result copies to host is computed

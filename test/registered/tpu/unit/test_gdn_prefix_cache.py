@@ -78,6 +78,7 @@ class TestGDNPrefixCache(CustomTestCase):
 
         pool = TpuMambaPool.__new__(TpuMambaPool)
         pool.device = "tpu"
+        pool.checkpoint_width = 1
         pool.mamba_cache = TpuPerLayerState(conv=[[full[0]]], temporal=[full[1]])
         snapshot = [t[2].cpu().clone() for t in full]
         pool.copy_from(torch.tensor([2, 2]), torch.tensor([3, 4]))
@@ -102,6 +103,7 @@ class TestGDNPrefixCache(CustomTestCase):
 
         pool = TpuMambaPool.__new__(TpuMambaPool)
         pool.device = "tpu"
+        pool.checkpoint_width = 1
         # Multiple layers, both production state dtypes, and three buckets.
         conv = [torch.randn(40, 3, 1024, dtype=torch.bfloat16) for _ in range(2)]
         rec = [torch.randn(40, 4, 128, 128) for _ in range(2)]
@@ -327,9 +329,15 @@ class TestGDNPrefixCache(CustomTestCase):
         backend._distribution_cache = {}
         backend._mamba_chunk_size = 64
         backend._extra_buffer_enabled = True
+        backend._spec_window = 1
+        backend._slot_memo = None
         backend.req_to_token_pool = SimpleNamespace(
             get_mamba_indices=lambda x: x,
             translate_mamba_indices=lambda x: x,
+            req_index_to_mamba_index_mapping=torch.arange(
+                4, dtype=torch.int32, device="tpu"
+            ),
+            mamba_v2p_table=None,
         )
 
         def t(x, dtype=torch.int64):

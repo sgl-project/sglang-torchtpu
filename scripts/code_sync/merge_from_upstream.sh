@@ -54,18 +54,22 @@ fi
 
 git checkout -B "$BRANCH" "$BASE_BRANCH"
 
-# Attempt the merge. On conflict, commit the conflicted state so the upstream
-# changes still reach a PR; a human resolves the markers on the PR branch.
-CONFLICTS=""
-if git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
-  echo "Clean merge of upstream/${UPSTREAM_BRANCH} (${UP_SHA})."
-else
-  CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+# The CI allowlist is repository policy, not an upstream contributor ranking.
+# Restore it from the local base before committing even when upstream's change
+# would merge cleanly. Other merge conflicts keep the existing review workflow.
+if ! git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}"; then
+  git rev-parse --verify MERGE_HEAD >/dev/null || exit 1
+fi
+git restore --source="$BASE_BRANCH" --staged --worktree -- .github/CI_PERMISSIONS.json
+CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+if [ -n "$CONFLICTS" ]; then
   echo "Merge has conflicts in:"
   echo "$CONFLICTS"
   git add -A
-  git commit --no-edit
+else
+  echo "Clean merge of upstream/${UPSTREAM_BRANCH} (${UP_SHA}); local CI allowlist preserved."
 fi
+git commit --no-edit
 
 git push origin "$BRANCH" --force
 
