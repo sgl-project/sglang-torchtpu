@@ -529,6 +529,27 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Ensure that text items are properly duplicated too
         self.assertEqual(req.text, expected_text)
 
+    def test_parallel_samples_get_one_bootstrap_room_each(self):
+        """PD pairs the prefill and decode copies of a sample by bootstrap room,
+        so parallel samples must not share one; expanded fields are sample-major."""
+        for rooms, expected in (
+            (100, [100, 101, 102, 103, 104, 105]),
+            ([100, 200], [100, 200, 101, 201, 102, 202]),
+            ([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]),
+            ([None, None], [None] * 6),
+        ):
+            with self.subTest(rooms=rooms):
+                req = GenerateReqInput(
+                    text=["a", "b"], sampling_params={"n": 3}, bootstrap_room=rooms
+                )
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.bootstrap_room, expected)
+        req = GenerateReqInput(
+            text=["a", "b"], sampling_params={"n": 3}, bootstrap_room=[1, 2, 3]
+        )
+        with self.assertRaisesRegex(ValueError, "bootstrap_room has 3 entries"):
+            req.normalize_batch_and_arguments()
+
     def test_specific_parallel_n_per_sample(self):
         """Test parallel expansion when different samples have different n values."""
         req = copy.deepcopy(self.base_req)

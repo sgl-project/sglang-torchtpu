@@ -2036,8 +2036,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
+            # Cache the common prefix for parallel sampling. PD pairs the engines'
+            # requests by bootstrap room, one per sample, so there is no warmup.
+            is_pd = self.disaggregation_mode in (
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.DECODE,
+            )
+            for i in range(0 if is_pd else batch_size):
                 tmp_obj = copy.copy(objs[i])
                 # Warmup borrows the samples' LoRA references; only samples release
                 # them. Keep LoRA on tokenized_obj for the correct prefix-cache key.
@@ -2071,9 +2076,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for j in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    # Expanded fields are sample-major: sample j of prompt i.
+                    room = obj.bootstrap_room[j * batch_size + i]
+                    if room is not None:
+                        tmp_obj.bootstrap_room = room
+                        tokenized_obj.bootstrap_room = room
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)

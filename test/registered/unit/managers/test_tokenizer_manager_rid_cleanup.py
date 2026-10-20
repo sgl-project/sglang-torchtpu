@@ -1296,6 +1296,63 @@ class TestLoRARequestLifecycle(CustomTestCase):
             await asyncio.gather(response, return_exceptions=True)
             await generator.aclose()
 
+    async def _drive_pd_parallel_request(self, mode):
+        tm = _make_tm_for_generate(self)
+        tm.disaggregation_mode = mode
+        obj = GenerateReqInput(
+            text=["first", "second"],
+            sampling_params={"n": 2, "max_new_tokens": 4},
+            bootstrap_room=[100, 200],
+        )
+        tm._tokenize_one_request = AsyncMock(
+            side_effect=lambda req: SimpleNamespace(
+                rid=req.rid,
+                input_ids=[1],
+                mm_inputs=None,
+                time_stats=tm.rid_to_state[req.rid].time_stats,
+                sampling_params=SimpleNamespace(max_new_tokens=4),
+                bootstrap_room=req.bootstrap_room,
+            )
+        )
+        sent = asyncio.Queue()
+        dispatched = []
+
+        async def send(tokenized):
+            tm._mark_state_dispatched(tokenized.rid)
+            dispatched.append(tokenized)
+            sent.put_nowait(tokenized)
+
+        tm._send_one_request = send
+        generator = tm.generate_request(obj)
+        response = asyncio.create_task(generator.__anext__())
+        try:
+            while not response.done():
+                try:
+                    req = await asyncio.wait_for(sent.get(), timeout=1)
+                except asyncio.TimeoutError:
+                    break
+                await tm._handle_batch_output(_make_batch_str_output(req.rid))
+            outputs = await asyncio.wait_for(response, timeout=1)
+        finally:
+            response.cancel()
+            await asyncio.gather(response, return_exceptions=True)
+            await generator.aclose()
+        return dispatched, outputs
+
+    def test_pd_parallel_samples_get_their_own_rooms_without_warmup(self):
+        """Both PD engines expand the request the same way and pair each sample
+        by bootstrap room, so a warmup or a shared room pairs the wrong requests."""
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                dispatched, outputs = asyncio.run(self._drive_pd_parallel_request(mode))
+                self.assertEqual(
+                    [r.sampling_params.max_new_tokens for r in dispatched], [4] * 4
+                )
+                self.assertEqual(
+                    [r.bootstrap_room for r in dispatched], [100, 101, 200, 201]
+                )
+                self.assertEqual(len(outputs), 4)
+
     def test_parallel_warmups_do_not_release_sample_references(self):
         """Prefix warmups must not let an adapter unload while samples use it."""
         asyncio.run(self._drive_parallel_request())
