@@ -49,7 +49,8 @@ def _serves_chain(spec_algorithm) -> bool:
 
 
 def initialize_host_batch(result, *args, **kwargs):
-    # Every batch of a process a TpuSpecWorker serves is host padded, whatever the algorithm.
+    # Every batch of a process a TpuSpecWorker serves is host padded, whatever the
+    # algorithm. Only the worker the binding selects registers the padder.
     padder = get_host_batch_padder()
     if padder is not None:
         if not result.enable_overlap:
