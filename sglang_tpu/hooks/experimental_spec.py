@@ -193,8 +193,8 @@ def _relay_disagg_seed(
 
 
 def _reset_pd_checkpoints(batch: ScheduleBatch) -> None:
-    # The transferred GDN state lands in checkpoint row 0 of each slot, but a
-    # reused decode slot keeps its previous read offset; prebuilt skips extend's clear.
+    # The transferred GDN state lands in each slot's own row, but a reused decode
+    # slot keeps its previous read offset; prebuilt skips extend's reset.
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang_tpu.mamba_pool import TpuMambaPool
 

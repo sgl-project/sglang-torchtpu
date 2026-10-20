@@ -769,7 +769,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             for i in (1, 3)
         ]
         _reset_pd_checkpoints(SimpleNamespace(req_to_token_pool=pool, reqs=reqs))
-        self.assertEqual(mamba_pool.checkpoint_read_offsets.tolist(), [2, 0, 2, 0])
+        self.assertEqual(mamba_pool.checkpoint_read_offsets.tolist(), [2, -1, 2, -1])
 
     def test_pd_carry_seed_writes_at_the_batch_bucket(self):
         """The decode-side carry write must keep the warmed bucket shape; padded

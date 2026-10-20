@@ -113,14 +113,14 @@ class TestGDNAttentionOp(CustomTestCase):
         # Keep reference snapshots on the host: donated TPU buffers must not
         # share lazy clone storage across independent executions.
         conv_initial, rec_initial = conv.cpu(), rec.cpu()
-        # Plain runs address the state row directly; verify runs pass slot 1,
-        # whose checkpoint rows are [width, 2 * width), and the per-slot table.
+        # Plain runs address the state row directly; verify runs pass the base
+        # of the checkpoint rows [width, 2 * width) and a per-sequence offset.
         indices = torch.tensor([base], dtype=torch.int32, device=device)
-        slot = torch.tensor([1], dtype=torch.int32, device=device)
+        window = torch.tensor([width], dtype=torch.int32, device=device)
         distribution = torch.ones(3, dtype=torch.int32, device=device)
 
         def table(offset):
-            return torch.tensor([0, offset], dtype=torch.int32, device=device)
+            return torch.tensor([offset], dtype=torch.int32, device=device)
 
         def run(q, bb, aa, c, r, prefix, offset=None, num_spec_tokens=0):
             count = q.shape[0]
@@ -133,7 +133,7 @@ class TestGDNAttentionOp(CustomTestCase):
                 r,
                 *weights,
                 torch.tensor([0, count], dtype=torch.int32, device=device),
-                slot if spec else indices,
+                window if spec else indices,
                 distribution,
                 torch.tensor([prefix + count], dtype=torch.int32, device=device),
                 n_kq,
@@ -143,7 +143,6 @@ class TestGDNAttentionOp(CustomTestCase):
                 kernel_size,
                 read_offsets=offset,
                 num_spec_tokens=num_spec_tokens,
-                spec_window=width if spec else 1,
             )
 
         output = run(qkv, b, a, conv, rec, 16, table(0), width - 1)
