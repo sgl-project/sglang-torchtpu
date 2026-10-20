@@ -435,6 +435,7 @@ class StackKernel:
         kda_mxu: bool = False,
         moe_up_tree: bool = False,
         kda_fast_core: bool = False,
+        kda_ckpt_all: bool | str = True,
         fused_head: bool = True,
         head_vocab: int = 163840,
         verify_rows: int = 1,
@@ -634,6 +635,17 @@ class StackKernel:
         self.kda.skip_core = self.mla.skip_core = "attn_core" in debug_skip
         self.kda.mxu = kda_mxu  # KDA recurrence contractions on the MXU (f32 reorder)
         self.kda.fast_core = kda_fast_core
+        # Verify rows: all R checkpoint states staged in VMEM and written by one DMA per family (pool rows
+        # write_base .. write_base + R - 1 are contiguous) when they fit; prefill blocks keep the slots.
+        ck_bytes = (
+            self.R * 4 * (self.kda.heads * HEAD_DIM * HEAD_DIM + 8 * 3 * self.kda.hd)
+        )
+        self._ck_all = (
+            bool(kda_ckpt_all)
+            and self.rows_mode
+            and not self.prefill_blocks
+            and (ck_bytes <= 4 << 20 or kda_ckpt_all == "force")
+        )
         self.dense = DenseMlpStage(d, topo, rows=self.R, relax=rx_attn)
         # Dense MLP and (without pair_oproj) attention o_proj share one all-reduce.
         self._hidden_spec = self.dense.ar if rx.pair_oproj else self.kda.out.full_spec
@@ -981,6 +993,12 @@ class StackKernel:
                     pltpu.VMEM((h_k, HEAD_DIM, HEAD_DIM), jnp.float32),
                     pltpu.SemaphoreType.DMA((2, 2)),
                 ]
+            if self._ck_all:  # all R checkpoint states, written by one DMA per family after the last row
+                s["kda"] += [
+                    pltpu.VMEM((R, 3, 1, 3 * kd.hd), jnp.float32),
+                    pltpu.VMEM((R, h_k, HEAD_DIM, HEAD_DIM), jnp.float32),
+                    pltpu.SemaphoreType.DMA((2,)),
+                ]
         s["mla"] = (
             []
             if self.use_arena
@@ -1189,8 +1207,10 @@ class StackKernel:
                 r["meta"][1],
                 *ck[3 * i : 3 * i + 3],
             )
-            for i in range(len(ck) // 3)
+            for i in range(2 if ck else 0)
         ]
+        self._ck_rows = tuple(ck[6:9]) if self._ck_all and ck else None
+        self._kda_pools = (conv_pools, rec_pools)
         self._kv_len, self._t = r["meta"][0], None
         if self.rows_mode:
             self._row_v, self._row_sem = sc["verify"]
@@ -1357,6 +1377,14 @@ class StackKernel:
 
             @pl.when((tables[0, l] == _KDA) & (not self._aux_off))
             def _():
+                if self._ck_rows is not None:
+                    if (
+                        "attn" in self.debug_skip
+                    ):  # the skipped attention balanced B1's write-back instead
+                        self._state.wait_write()
+                    else:
+                        self._ck_rows_wait()
+                    return
                 self._state.wait_write()
                 if self.rows_mode and "attn" not in self.debug_skip:
                     for io in self._ck_io[: min(2, self.R - 1)]:
@@ -1456,12 +1484,61 @@ class StackKernel:
         self._state.start_write(k)
         return out
 
+    def _ck_rows_desc(self, conv, rec, kidx, base):
+        cbuf, rbuf, sem = self._ck_rows
+        rows = pl.ds(base, self.R)
+        dst = (
+            (conv.at[kidx, rows], rec.at[kidx, rows])
+            if self.stacked
+            else (conv.at[rows], rec.at[rows])
+        )
+        return [
+            pltpu.make_async_copy(cbuf, dst[0], sem.at[0]),
+            pltpu.make_async_copy(rbuf, dst[1], sem.at[1]),
+        ]
+
+    def _ck_rows_copies(self, k, base):
+        """Starters of the R-row checkpoint DMAs of KDA layer ``k``: one flat ``pl.when`` per pool
+        (measured at TP32 B8: 0.06 ms per accepted token faster than a ``tree_when`` selection here)."""
+        conv_pools, rec_pools = self._kda_pools
+        if self.stacked:
+            return [
+                lambda: [
+                    cp.start()
+                    for cp in self._ck_rows_desc(conv_pools[0], rec_pools[0], k, base)
+                ]
+            ]
+        out = []
+        for kk, (conv, rec) in enumerate(zip(conv_pools, rec_pools)):
+
+            def start(conv=conv, rec=rec, kk=kk):
+                @pl.when(k == kk)
+                def _():
+                    for cp in self._ck_rows_desc(conv, rec, 0, base):
+                        cp.start()
+
+            out.append(start)
+        return out
+
+    def _ck_rows_wait(self):
+        conv_pools, rec_pools = self._kda_pools
+        for cp in self._ck_rows_desc(conv_pools[0], rec_pools[0], 0, 0):
+            cp.wait()
+
     def _kda_rows(self, l, k, x):
         """Verify rows: the state after row t goes to checkpoint row ``meta[2] + t``; the last
         write stays in flight (drained at the hand-off, like B1's write-back)."""
 
         def checkpoint(t, conv_t, rec_t):
             meta = self._r["meta"]
+            if self._ck_rows is not None:
+                cbuf, rbuf, _ = self._ck_rows
+                cbuf[t, :, 0, :] = conv_t
+                rbuf[t] = rec_t
+                if t == self.R - 1:
+                    for cp in self._ck_rows_copies(k, meta[2]):
+                        cp()
+                return
             if self._blk is None:
                 row = meta[2] + t
             else:
