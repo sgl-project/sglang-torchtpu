@@ -18,7 +18,7 @@ Status words inside the tables use the matrix vocabulary: **CI** = every PR, **N
 
 ## Summary
 
-The tables below are the short view. The sections that follow give per-row topology, notes, and the matrix status words. Model rows are ordered by tier, Optimized first, and grouped by family (same provider or architecture) within a tier; one row covers several checkpoints only when they share an architecture, a tier, and their tests.
+The tables below are the short view. The sections that follow give per-row topology, notes, and the matrix status words.
 
 ### Models
 
