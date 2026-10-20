@@ -36,8 +36,9 @@ GENERATE_TIMEOUT = 900
 # Long enough that the first turn's decode crosses several track boundaries.
 TURN1_NEW_TOKENS = 384
 
-# Measured 0.715 with radix on, 0.705 off (chat, 512 max tokens, 200 examples).
-GSM8K_BASELINE = float(os.environ.get("GSM8K_THRESHOLD_QWEN3_8_27B_MTP", "0.65"))
+# Measured 0.975 with radix on and off (chat, 2048 max tokens, 200 examples);
+# Qwen3.8 always thinks first, and a 512-token cap cut most answers off.
+GSM8K_BASELINE = float(os.environ.get("GSM8K_THRESHOLD_QWEN3_8_27B_MTP", "0.90"))
 SPEC_ACCEPT_LENGTH_THRESHOLD = float(
     os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.5")
 )
@@ -166,7 +167,7 @@ class TestQwen38MtpRadix(TPULauncherTestCase):
                         "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
                         "num_examples": 200,
                         "num_threads": CONCURRENCY,
-                        "max_tokens": 512,
+                        "max_tokens": 2048,
                         "temperature": 0.0,
                         "api": "chat",
                     }

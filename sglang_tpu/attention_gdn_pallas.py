@@ -511,11 +511,6 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         """Slot allocation's mapping write and clear_slots, once per new-request count."""
         pool = self.req_to_token_pool
         mapping = pool.req_index_to_mamba_index_mapping
-        track_mapping = (
-            pool.req_index_to_mamba_ping_pong_track_buffer_mapping
-            if pool.enable_mamba_extra_buffer
-            else None
-        )
         with torch.no_grad():
             for count in range(1, pool.size + 1):
                 # Allocator slot ids arrive as CPU int64; request row 0 and state
@@ -525,12 +520,6 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
                     device=mapping.device, dtype=torch.int32
                 )
                 pool.mamba_pool.clear_slots(slots)
-                if track_mapping is not None:
-                    # Extra-buffer allocation also writes each request's track slots.
-                    track_slots = torch.zeros(
-                        (count, track_mapping.shape[1]), dtype=torch.int64
-                    )
-                    track_mapping[[0] * count] = track_slots.to(track_mapping.device)
             mapping[0:1].cpu()
             if get_disagg().disaggregation_mode != "null":
                 # The P/D state payload reads one row by Python int, a constant
