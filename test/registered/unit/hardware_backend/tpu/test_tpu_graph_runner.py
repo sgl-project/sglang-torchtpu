@@ -901,6 +901,7 @@ class TestDraftTorchCompileInstall(CustomTestCase):
                 f"{self._SETUP_MOD}.capture_decode_graph",
                 side_effect=lambda **_: events.append("decode") or MagicMock(),
             ),
+            # The TPU platform installs torch.compile through decode capture.
             patch(f"{self._SETUP_MOD}.current_platform", TpuSRTPlatform()),
             get_context().override_server_args(forward_hooks=[{"name": "capture"}]),
             get_flags().capture.override(enable_torch_compile=True),

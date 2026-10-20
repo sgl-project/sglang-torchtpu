@@ -121,24 +121,3 @@ class TpuBlockDraftWorker(TpuDraftWorker):
                 f"{type(compile_policy).__name__}."
             )
         return compile_policy
-
-    @property
-    def draft_runner(self) -> ModelRunner:
-        """Read by TpuSchedulerExtension.precompile_spec_ops."""
-        return self.model_runner
-
-    @property
-    def graph_memory_usage(self) -> dict[str, float]:
-        return self.model_runner.graph_memory_usage
-
-    @property
-    def graph_time_usage(self) -> dict[str, float]:
-        return self.model_runner.graph_time_usage
-
-    @property
-    def weight_load_time(self) -> float:
-        return self.model_runner.weight_load_time
-
-    @property
-    def preloaded_weights_bytes(self) -> int:
-        return self.model_runner.preloaded_weights_bytes

@@ -929,10 +929,13 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang_tpu.spec_execution import settle_spec_execution
 
+        # NEXTN is renamed to EAGLE (MTP) only after the platform defaults run.
+        spec_name = cfg.speculative_algorithm
         if settle_spec_execution(
             server_args,
             algorithm=SpeculativeAlgorithm.__members__.get(
-                cfg.speculative_algorithm, SpeculativeAlgorithm.NONE
+                "EAGLE" if spec_name == "NEXTN" else spec_name,
+                SpeculativeAlgorithm.NONE,
             ),
         ).host_padded:
             declare_resolution(

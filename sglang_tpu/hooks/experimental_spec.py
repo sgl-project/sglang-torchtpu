@@ -32,6 +32,7 @@ from sglang_tpu.experimental import (
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+from sglang_tpu.spec_execution import resolve_spec_execution
 
 
 def _target_pp_size() -> int:
@@ -44,8 +45,10 @@ def _target_pp_size() -> int:
 
 
 def _serves_chain(spec_algorithm) -> bool:
-    """Whether TpuChainSpecWorker serves spec_algorithm at the configured target PP."""
-    return is_experimental_chain(spec_algorithm, pp_size=_target_pp_size())
+    """Whether the binding sends spec_algorithm to TpuChainSpecWorker at the target PP."""
+    return resolve_spec_execution(
+        spec_algorithm, pp_size=_target_pp_size()
+    ).chain_worker
 
 
 def initialize_host_batch(result, *args, **kwargs):

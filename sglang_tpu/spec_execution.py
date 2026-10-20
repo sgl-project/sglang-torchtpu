@@ -73,7 +73,6 @@ _CHAIN = SpecExecutionBinding(
     chain_worker=True,
 )
 
-
 # MTP drafts (as ModelConfig names a draft) TPU serving is exercised on: Qwen3.8 and
 # GLM-5.3-Flash. Others the MTP drafter loads keep the compatibility worker by
 # default; an explicit opt-in still sends them to the plugin worker.
@@ -271,34 +270,6 @@ def _chain_unsupported_reason(
     return None
 
 
-def _dp_attention_unsupported_reason(
-    cfg, *, algorithm: SpeculativeAlgorithm
-) -> str | None:
-    from sglang.srt.speculative.spec_tp_sync import (
-        SpecTpSyncSite,
-        parse_spec_tp_sync,
-    )
-
-    if algorithm.is_dflash_family():
-        return "does not support DP attention"
-    if (
-        envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
-        or cfg.speculative_skip_dp_mlp_sync
-    ):
-        return "does not mix prefill and decode steps across DP ranks"
-    # SpecTpSync syncs nothing on a one-rank attention-TP group.
-    if cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size > 1:
-        sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
-        if (SpecTpSyncSite.SPEC_ACCEPT_GREEDY in sites) != (
-            SpecTpSyncSite.SPEC_ACCEPT_SAMPLE in sites
-        ):
-            return (
-                "needs SGLANG_SPEC_TP_SYNC to enable both or neither spec-accept "
-                "site under DP attention"
-            )
-    return None
-
-
 def _eagle3_draft_unsupported_reason(server_args: ServerArgs) -> str | None:
     """What ``TpuEagle3DraftWorker`` rejects in the draft checkpoint."""
     from sglang.srt.arg_groups.overrides import resolving_view
@@ -403,6 +374,34 @@ def _dspark_draft_unsupported_reason(server_args: ServerArgs) -> str | None:
         )
     except ValueError as e:
         return f"cannot serve this draft ({e})"
+    return None
+
+
+def _dp_attention_unsupported_reason(
+    cfg, *, algorithm: SpeculativeAlgorithm
+) -> str | None:
+    from sglang.srt.speculative.spec_tp_sync import (
+        SpecTpSyncSite,
+        parse_spec_tp_sync,
+    )
+
+    if algorithm.is_dflash_family():
+        return "does not support DP attention"
+    if (
+        envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        or cfg.speculative_skip_dp_mlp_sync
+    ):
+        return "does not mix prefill and decode steps across DP ranks"
+    # SpecTpSync syncs nothing on a one-rank attention-TP group.
+    if cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size > 1:
+        sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
+        if (SpecTpSyncSite.SPEC_ACCEPT_GREEDY in sites) != (
+            SpecTpSyncSite.SPEC_ACCEPT_SAMPLE in sites
+        ):
+            return (
+                "needs SGLANG_SPEC_TP_SYNC to enable both or neither spec-accept "
+                "site under DP attention"
+            )
     return None
 
 

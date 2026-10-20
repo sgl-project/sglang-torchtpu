@@ -53,6 +53,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
 )
 from sglang_tpu.experimental.speculative.spec_types import SpecState
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows
+from sglang_tpu.future_map import TpuFutureMap
 from sglang_tpu.hooks.experimental_spec import (
     keep_host_padded_extend_outputs,
 )
@@ -132,6 +133,7 @@ class TestExperimentalEagle3(CustomTestCase):
             patch("sglang_tpu.experimental._host_batch_padder", None),
         ):
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.clear()
+            register_host_batch_padder(lambda bs: 4)
             for platform in (TpuSRTPlatform(), TpuOOTPlatform()):
                 with patch("sglang.srt.platforms.current_platform", platform):
                     for algo, worker, policy in (
@@ -160,10 +162,14 @@ class TestExperimentalEagle3(CustomTestCase):
                                 args = ServerArgs(model_path="dummy")
                                 self.assertIs(algo.create_worker(args), worker)
                                 self.assertIs(
-                                    _resolve_spec_compile_policy_mixin(
-                                        algo, pp_size=1
-                                    ),
+                                    _resolve_spec_compile_policy_mixin(algo, pp_size=1),
                                     policy,
+                                )
+                                batch = SimpleNamespace(
+                                    spec_algorithm=algo, enable_overlap=True
+                                )
+                                self.assertEqual(
+                                    initialize_host_batch(batch).host_pad_bs(2), 4
                                 )
                     with get_context().override_server_args(
                         pp_size=2, speculative_algorithm="EAGLE3"
@@ -176,15 +182,17 @@ class TestExperimentalEagle3(CustomTestCase):
                         self.assertIs(
                             TpuEagleWorker.draft_worker_cls, TpuEagleDraftWorker
                         )
-                        # Only a TpuSpecWorker registers the host-batch padder.
+                        # The compatibility worker registers no padder, so its
+                        # process keeps core's batch rows.
                         self.assertFalse(issubclass(TpuEagleWorker, TpuSpecWorker))
                         batch = SimpleNamespace(
                             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
                             enable_overlap=True,
                         )
-                        self.assertNotIn(
-                            "host_pad_bs", vars(initialize_host_batch(batch))
-                        )
+                        with patch("sglang_tpu.experimental._host_batch_padder", None):
+                            self.assertNotIn(
+                                "host_pad_bs", vars(initialize_host_batch(batch))
+                            )
                         from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
                             DSparkWorkerV2,
                         )
@@ -199,11 +207,6 @@ class TestExperimentalEagle3(CustomTestCase):
                             ),
                             TpuBlockSpecDecodeCompilePolicyMixin,
                         )
-            register_host_batch_padder(lambda bs: 4)
-            batch = SimpleNamespace(
-                spec_algorithm=SpeculativeAlgorithm.EAGLE3, enable_overlap=True
-            )
-            self.assertEqual(initialize_host_batch(batch).host_pad_bs(2), 4)
 
     def _selection_routes(self):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -776,6 +779,7 @@ assert not any(name.startswith('sglang_tpu.graph_runner') for name in sys.module
         ):
             worker._warmup_relay_and_results()
         relay = flush.call_args.args[0]
+        self.assertIsInstance(relay, TpuFutureMap)
         self.assertIsNone(relay.tpu_direct_handoff)
         self.assertFalse(relay.need_topk)
         self.assertEqual(relay.output_tokens_buf[0].item(), 0)
