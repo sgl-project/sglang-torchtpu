@@ -18,29 +18,29 @@ Status words inside the tables use the matrix vocabulary: **CI** = every PR, **N
 
 ## Summary
 
-The tables below are the short view. The sections that follow give per-row topology, notes, and the matrix status words. Model rows are grouped by family (same provider or architecture); one row covers several checkpoints only when they share an architecture, a tier, and their tests.
+The tables below are the short view. The sections that follow give per-row topology, notes, and the matrix status words. Model rows are ordered by tier, Optimized first, and grouped by family (same provider or architecture) within a tier; one row covers several checkpoints only when they share an architecture, a tier, and their tests.
 
 ### Models
 
 | Model | Quantization | Topology | Tier |
 | --- | --- | --- | --- |
 | gpt-oss-120b | MXFP4 | 1 host, 2 hosts, 2P+2D | Optimized |
-| gpt-oss-20b | MXFP4 | 1 host | Quickstart |
 | Qwen3-Coder-480B-A35B | FP8 | 2 hosts, 1 host, 2P+2D | Optimized |
-| Qwen3-30B-A3B | FP8 | 1 host | Supported |
-| Qwen3-Coder-30B-A3B | FP8 | 1 host | Experimental |
-| Qwen3-0.6B | bf16 | 1 chip, 1 host | Quickstart |
-| Qwen3-VL-8B | bf16 | 1 host, 2P+2D | Supported |
 | Qwen3.5-397B-A17B (text, VL) | FP8 | 1 host | Optimized |
-| Qwen3.8-27B | bf16 | 1 host | Experimental |
 | GLM-5.3-Flash | FP8 | 1 host | Optimized |
-| GLM-5.2 / GLM-5.3 | FP8 | 1 host | Experimental |
+| gpt-oss-20b | MXFP4 | 1 host | Quickstart |
+| Qwen3-0.6B | bf16 | 1 chip, 1 host | Quickstart |
+| Qwen3-30B-A3B | FP8 | 1 host | Supported |
+| Qwen3-VL-8B | bf16 | 1 host, 2P+2D | Supported |
 | DeepSeek-V3.1, DeepSeek-R1-0528 | FP8 | 2 hosts | Supported |
-| DeepSeek-V4 | FP8 | — | Experimental |
 | Kimi-K2.6 | INT4 W4A16 | 2 hosts | Supported |
+| MiMo-V2.5-Pro | FP8 | 2 hosts | Supported |
+| Qwen3-Coder-30B-A3B | FP8 | 1 host | Experimental |
+| Qwen3.8-27B | bf16 | 1 host | Experimental |
+| GLM-5.2 / GLM-5.3 | FP8 | 1 host | Experimental |
+| DeepSeek-V4 | FP8 | — | Experimental |
 | Kimi-K2.5 | INT4 | 1 host | Experimental |
 | Kimi-K3 | bf16 | 1 host | Experimental |
-| MiMo-V2.5-Pro | FP8 | 2 hosts | Supported |
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | Experimental |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
 
@@ -84,22 +84,22 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Model | Quantization | Topology verified | Tier | Notes |
 | --- | --- | --- | --- | --- |
 | gpt-oss-120b | MXFP4 | 1 host tp8+ep8; 2 hosts tp16; 2P+2D | **Optimized** | Flagship. Nightly accuracy (gsm8k, gpqa, aime25, mmlu-pro), four perf configs, PD, spec decode, KV offload, resharding. |
-| gpt-oss-20b | MXFP4 | 1 host | **Quickstart** | PR gate: spec decode, spec + DP attention, prefix cache + KV offload, PP smoke. Also nightly accuracy and perf. |
 | Qwen3-Coder-480B-A35B | FP8 channelwise | 2 hosts tp16/ep16/dp2; 1 host; 2P+2D | **Optimized** | Flagship. Nightly gsm8k, agentic tool-call workload, PD resharding, benchmark matrix. |
-| Qwen3-30B-A3B | FP8 | 1 host (PCP) | **Supported** | PR-gate e2e for prefill context parallel. Multi-host smoke retired. |
-| Qwen3-Coder-30B-A3B | FP8 | 1 host | **Experimental** | Recipe available. PR-gate test disabled pending runner capacity; intended Quickstart model. |
-| Qwen3-0.6B | bf16 | 1 chip, 1 host | **Quickstart** | PR gate: smoke, prompt logprobs, compile tracer, compile bundles, plugin-mode smoke. Single-host only (tp>1 OOMs). |
-| Qwen3-VL-8B | bf16 | 1 host; 2P+2D | **Supported** | EAGLE3 spec decode, MMMU-Pro nightly (report-only). Vision encoder compiled with bucketed shapes. |
 | Qwen3.5-397B-A17B (text and VL) | FP8 | 1 host | **Optimized** | GDN hybrid linear attention. Nightly MMMU-Pro and perf. |
-| Qwen3.8-27B | bf16 | 1 host tp8 | **Experimental** | Dense hybrid GDN, vision on. Nightly AIME26, GPQA, MMMU-Pro; MTP and DFlash recompile e2e. |
 | GLM-5.3-Flash | FP8 | 1 host tp8 | **Optimized** | DeepSeek Sparse Attention. Serving, MTP, and decode-megakernel recipes. No registered test. |
-| GLM-5.2 / GLM-5.3 | FP8 | 1 host tp8+ep8 | **Experimental** | DSA sparse-MLA kernels, shared with GLM-5.3-Flash. The `glm_5_3.sh` recipe was removed as an orphan in #1432. No registered test. |
+| gpt-oss-20b | MXFP4 | 1 host | **Quickstart** | PR gate: spec decode, spec + DP attention, prefix cache + KV offload, PP smoke. Also nightly accuracy and perf. |
+| Qwen3-0.6B | bf16 | 1 chip, 1 host | **Quickstart** | PR gate: smoke, prompt logprobs, compile tracer, compile bundles, plugin-mode smoke. Single-host only (tp>1 OOMs). |
+| Qwen3-30B-A3B | FP8 | 1 host (PCP) | **Supported** | PR-gate e2e for prefill context parallel. Multi-host smoke retired. |
+| Qwen3-VL-8B | bf16 | 1 host; 2P+2D | **Supported** | EAGLE3 spec decode, MMMU-Pro nightly (report-only). Vision encoder compiled with bucketed shapes. |
 | DeepSeek-V3.1, DeepSeek-R1-0528 | FP8 | 2 hosts tp16 | **Supported** | DeepSeek-V3 architecture, paged MLA attention. Nightly accuracy and perf for both; the R1 accuracy suite is intermittently red. |
-| DeepSeek-V4 | FP8 | — | **Experimental** | Compressor, indexer, sparse attention, SparseCore top-k landed. No on-device test. FP4 indexer and online compression rejected. |
 | Kimi-K2.6 | INT4 W4A16 | 2 hosts | **Supported** | Nightly perf green; MMMU accuracy shards red at the time of writing. |
+| MiMo-V2.5-Pro | FP8 | 2 hosts dp2 | **Supported** | Nightly gsm8k. |
+| Qwen3-Coder-30B-A3B | FP8 | 1 host | **Experimental** | Recipe available. PR-gate test disabled pending runner capacity; intended Quickstart model. |
+| Qwen3.8-27B | bf16 | 1 host tp8 | **Experimental** | Dense hybrid GDN, vision on. Nightly AIME26, GPQA, MMMU-Pro; MTP and DFlash recompile e2e. |
+| GLM-5.2 / GLM-5.3 | FP8 | 1 host tp8+ep8 | **Experimental** | DSA sparse-MLA kernels, shared with GLM-5.3-Flash. The `glm_5_3.sh` recipe was removed as an orphan in #1432. No registered test. |
+| DeepSeek-V4 | FP8 | — | **Experimental** | Compressor, indexer, sparse attention, SparseCore top-k landed. No on-device test. FP4 indexer and online compression rejected. |
 | Kimi-K2.5 | INT4 | shares the K2.6 path | **Experimental** | MoonViT vision tower compiled per image. No K2.5-specific test. |
 | Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a dummy-weight compile smoke runs; no real checkpoint served in CI. |
-| MiMo-V2.5-Pro | FP8 | 2 hosts dp2 | **Supported** | Nightly gsm8k. |
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | **Experimental** | Text and vision. Accuracy and perf suites registered; red at the time of writing. Moves to Supported when green. |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; multi-host collectives | **Experimental** | Runs through the generic diffusion engine; external nightly only, no recent green. |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
