@@ -11,7 +11,7 @@ Trip conditions (all required):
   2. Multiple requests share a long prefix (so one req's tombstoned leaf
      poisons match_prefix for others walking the same radix path).
   3. Memory pressure forces retract while at least one req has tombstoned
-     its leaf (decode_batch_idx >= sliding_window_size at retract time).
+     its leaf (a window past its locked prefix at retract time).
 
 After main #19427 changed `old_prefix_len = req.cache_protected_len`
 (stable), tombstone-induced shrinks in match's `best_value_len` across

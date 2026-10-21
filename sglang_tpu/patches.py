@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU compatibility patches for SGLang.
 
-Ported from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/platforms/tpu_platform.py.
+Ported from https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/platforms/tpu_platform.py.
 Must run in every process (including spawned workers) because
 module-level state is re-initialized on import in spawned processes.
 All patches are idempotent.
@@ -47,6 +47,7 @@ _IMPORTANT_TPU_ENV_VARS = (
     "LIBTPU_INIT_ARGS",
     "XLA_FLAGS",
     "SGLANG_NATIVE_MOVE_KV_CACHE",
+    "TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS",
 )
 
 
@@ -871,11 +872,22 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
 def _patch_pd_decode_swa_hicache() -> None:
     """Allow PD decode prefix cache + RAM offload on sliding-window models.
 
-    Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
+    Only full-attention KV goes to RAM. Also hold PD decode requests that reuse
+    an unfinished raiden restore, on any model. See ``pd_decode_swa_hicache``.
     """
     from sglang_tpu import pd_decode_swa_hicache
 
     pd_decode_swa_hicache.install()
+
+
+def _patch_hicache_write_back_copy_ahead() -> None:
+    """Copy the next eviction victims to host ahead of raiden write_back evictions.
+
+    See ``hicache_write_back_copy_ahead``.
+    """
+    from sglang_tpu import hicache_write_back_copy_ahead
+
+    hicache_write_back_copy_ahead.install()
 
 
 def _patch_pd_decode_async_prefill_info() -> None:
@@ -964,6 +976,7 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _patch_hicache_write_back_copy_ahead()
     _patch_pd_decode_async_prefill_info()
     _patch_host_heap_trim()
     _patch_profile_auto()

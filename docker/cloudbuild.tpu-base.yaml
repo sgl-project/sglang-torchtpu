@@ -22,15 +22,9 @@ steps:
       - -c
       - |
         set -euo pipefail
-        TOKEN="$$(curl -sf -H 'Metadata-Flavor: Google' \
-          http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
-          | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')"
-        printf '%s' "$$TOKEN" > /workspace/gcp_token
         DOCKER_BUILDKIT=1 docker build \
           -f docker/tpu-base.Dockerfile \
-          --secret id=gcp_token,src=/workspace/gcp_token \
           -t "${_IMAGE}:${_TAG}" .
-        rm -f /workspace/gcp_token
 
 images:
   - "${_IMAGE}:${_TAG}"

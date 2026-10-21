@@ -57,6 +57,16 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
+from sglang_tpu.experimental import (
+    is_experimental_chain,
+    is_experimental_spec_worker,
+)
+from sglang_tpu.experimental.compilation.block_compile_policy import (
+    TpuBlockSpecDecodeCompilePolicyMixin,
+)
+from sglang_tpu.experimental.compilation.chain_compile_policy import (
+    TpuChainSpecDecodeCompilePolicyMixin,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -66,9 +76,11 @@ if TYPE_CHECKING:
 
 def _spec_enabled(model_runner: ModelRunner) -> bool:
     """Whether this runner uses speculative decoding on TPU."""
+    algo = model_runner.spec_algorithm
     return (
-        model_runner.spec_algorithm.is_eagle3()
-        or model_runner.spec_algorithm.is_dflash()
+        (algo.is_eagle() and not algo.is_frozen_kv_mtp())
+        or algo.is_dflash()
+        or is_experimental_spec_worker(algo)
     )
 
 
@@ -76,6 +88,11 @@ def _resolve_spec_compile_policy_mixin(
     spec_algorithm: SpeculativeAlgorithm,
 ) -> type[BaseSpecDecodeCompilePolicyMixin]:
     """Resolve speculative compile policy mixin class based on algorithm."""
+    # Checked first: the experimental workers also serve DFLASH, MTP and EAGLE3.
+    if is_experimental_chain(spec_algorithm):
+        return TpuChainSpecDecodeCompilePolicyMixin
+    if is_experimental_spec_worker(spec_algorithm):
+        return TpuBlockSpecDecodeCompilePolicyMixin
     if spec_algorithm.is_dflash():
         return DFlashSpecDecodeCompilePolicyMixin
     return Eagle3SpecDecodeCompilePolicyMixin
@@ -220,6 +237,15 @@ class TpuGraphRunner:
             if callable(getattr(self.model, "named_modules", None))
             else (("", self.model),)
         )
+        if (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_eagle()
+            and not model_runner.spec_algorithm.is_eagle3()
+        ):
+            # Native MTP wraps an annotated target backbone with its projection
+            # and logits processor. The speculative policy must own the complete
+            # draft, then compile its backbone and logits regions itself.
+            modules = (("", self.model),)
         warmup_start = time.perf_counter()
         installed_any = False
         installed_policies: list[CompilePolicy] = []

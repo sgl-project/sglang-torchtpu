@@ -169,8 +169,7 @@ def write_cache_indices(
         # host-resident — the write becomes a trivial CPU scatter with no recompile,
         # at the cost of a per-forward `page_indices` H2D copy in the attention
         # backend. Static analysis predicts host-resident is a regression (the slot
-        # indices are device-produced and device-consumed; see
-        # docs/tpu-prs/PR_BODY-write-cache-vectorize.md), but the two approaches
+        # indices are device-produced and device-consumed), but the two approaches
         # should be measured (TTFT / throughput) to confirm.
         _write_req_to_token_vectorized(
             req_to_token_pool.req_to_token,
@@ -217,6 +216,7 @@ def get_last_loc(
         "pallas_tpu_rpa_v3",
         "pallas_tpu_rpa_batched",
         "pallas_tpu_mla",
+        "pallas_tpu_mla_sparse",
         "pallas_tpu_flash",
     )
     uses_triton_dispatch = (
@@ -296,6 +296,7 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
     out_cache_loc_host: Optional[torch.Tensor] = None,
+    return_host: bool = False,
 ):
     # Over estimate the number of tokens: assume each request needs a new page
     # (one page per CLASS per request under sharding — the min-class
@@ -322,6 +323,9 @@ def alloc_paged_token_slots_extend(
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+    if return_host or (batch is not None and batch.input_tensor_device == "cpu"):
+        # Opt-in allocators may defer the upload until forward-input padding.
+        extra_alloc_kwargs["return_host"] = True
     if out_cache_loc_host is not None:
         extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
 
@@ -498,7 +502,9 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
     )
-    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    req_pool_indices_device = req_pool_indices_cpu.to(
+        batch.metadata_device(), non_blocking=True
+    )
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)

@@ -78,6 +78,7 @@ MODEL_CONFIG = {
             # they validate. Only the sites that can differ across ranks are
             # broadcast; the deterministic ones would cost a collective per step.
             "SGLANG_SPEC_TP_SYNC": "rng",
+            "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
             "EXTRA_ARGS": (
                 f"--served-model-name {MODEL} "
                 "--speculative-algorithm DFLASH "

@@ -30,7 +30,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
     ):
         repo_root = Path(__file__).resolve().parents[4]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
-        wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+        wrapper_module = "torch.tpu.distributed"
         worker_command = shlex.join(
             [
                 str(worker),

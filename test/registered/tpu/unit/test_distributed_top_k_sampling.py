@@ -90,7 +90,7 @@ class TestDistributedTopKSampling(CustomTestCase):
     def test_exactness_and_speed_regression(self):
         repo_root = Path(__file__).resolve().parents[4]
         worker = Path(__file__).resolve()
-        wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+        wrapper_module = "torch.tpu.distributed"
         python = shlex.quote(sys.executable)
         command = "\n".join(
             (

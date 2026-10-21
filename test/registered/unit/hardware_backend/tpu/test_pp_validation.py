@@ -31,6 +31,9 @@ from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
 def _args(**overrides):
+    # Platform defaults run after handle_deprecated_dp_attention, so they only
+    # ever see attn_dp_size=N; the deprecated spelling is a state they never get.
+    assert not overrides.get("enable_dp_attention"), "pass attn_dp_size=N"
     defaults = dict(
         dtype=None,
         attention_backend=None,
@@ -162,7 +165,7 @@ class TestPipelineParallelValidation(CustomTestCase):
         """Only two-device stages of plain tensor parallelism were validated."""
         for overrides in (
             dict(tp_size=4),
-            dict(tp_size=2, dp_size=2, enable_dp_attention=True),
+            dict(tp_size=2, attn_dp_size=2),
             dict(tp_size=2, ep_size=2),
         ):
             with self.subTest(**overrides):

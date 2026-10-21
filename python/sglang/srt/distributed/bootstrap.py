@@ -92,12 +92,12 @@ def init_parallel_runtime(
     server_args: ServerArgs,
     device: str,
     dist_port: int,
-) -> None:
+) -> float:
     """Initialize the parallel runtime once, after publishing configuration.
 
     Set up CPU thread binding, the current device, and the shared Mooncake
     engine before creating process groups. Draft workers reuse their target's
-    groups and must not call this function.
+    groups and must not call this function. Return the elapsed initialization time.
     """
     global _PARALLEL_INITIALISED
     if _PARALLEL_INITIALISED:
@@ -185,7 +185,9 @@ def init_parallel_runtime(
     ):
         _prewarm_eplb_p2p()
 
-    logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
+    elapsed = time.perf_counter() - tic
+    logger.info(f"Init parallel ends. elapsed={elapsed:.2f} s")
+    return elapsed
 
 
 def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> float:
@@ -225,7 +227,7 @@ def _resolve_backend(*, device: str, tp_size: int, pp_size: int = 1) -> str:
     backend = get_default_distributed_backend(device)
     # tpu_dist bootstrap requires exactly one TPU device per process.
     # On multi-chip hosts with world_size==1, PJRT sees multiple chips
-    # and raises. Match torchtpu-vllm: use gloo for a single-process TPU
+    # and raises. Match vllm-torchtpu: use gloo for a single-process TPU
     # world. A pipeline-parallel world (tp_size * pp_size > 1) is a real
     # slice with one device per process and keeps tpu_dist.
     if device == "tpu" and tp_size * pp_size == 1:

@@ -37,6 +37,7 @@ from sglang.srt.arg_groups.overrides import (
     resolution_result,
     resolved_view,
 )
+from sglang.srt.distributed import bootstrap
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -2380,6 +2381,29 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             f"expected the replacement to be named, got {messages}",
         )
 
+    def test_a_later_warning_does_not_invalidate_a_compiled_graph(self):
+        """A graph that traced a deprecated getter must survive an eager caller
+        warning about another getter afterwards; with compilation frozen, a
+        guard on the warned-name set turned that warning into a crash."""
+        import torch
+
+        from sglang.srt.distributed import parallel_state
+
+        stand_in = SimpleNamespace(world_size=1, rank_in_group=0)
+        fn = torch.compile(
+            lambda x: x + parallel_state.get_tp_group().world_size,
+            backend="eager",
+            fullgraph=True,
+        )
+        x = torch.zeros(2)
+        with get_parallel().override(tp_group=stand_in):
+            fn(x)
+            name = "test-only-getter"
+            parallel_state._ALREADY_WARNED.add(name)
+            self.addCleanup(parallel_state._ALREADY_WARNED.discard, name)
+            with torch.compiler.set_stance("fail_on_recompile"):
+                fn(x)
+
     def test_a_scope_reaches_callers_that_went_straight_to_the_getter(self):
         from sglang.srt.distributed import parallel_state
 
@@ -2649,11 +2673,10 @@ class TestTheParallelPhase(CustomTestCase):
         tp_group.all_reduce.assert_not_called()
 
     def test_building_twice_is_refused(self):
-        from sglang.srt.distributed import bootstrap
-
         bootstrap.reset_parallel_initialised()
         self.addCleanup(bootstrap.reset_parallel_initialised)
         with (
+            patch.object(bootstrap.time, "perf_counter", side_effect=[3.0, 7.5]),
             patch.object(bootstrap, "_resolve_backend", return_value="gloo"),
             patch.object(bootstrap, "_resolve_dist_init_method", return_value="env://"),
             patch.object(bootstrap, "_set_all_reduce_flags"),
@@ -2675,7 +2698,7 @@ class TestTheParallelPhase(CustomTestCase):
                 device="cpu",
                 dist_port=12345,
             )
-            bootstrap.init_parallel_runtime(**kwargs)
+            self.assertEqual(bootstrap.init_parallel_runtime(**kwargs), 4.5)
             with self.assertRaises(RuntimeError) as caught:
                 bootstrap.init_parallel_runtime(**kwargs)
         self.assertIn("ran twice", str(caught.exception))

@@ -25,11 +25,13 @@ from sglang_tpu.compilation.compiled_forward_shim import (
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
     _COMPILE_BAR_FORMAT,
+    EagerLogitsCase,
     _get_hbm_usage_mb,
     _hbm_delta_str,
     _warmup_progress,
 )
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 
 logger = get_logger(__name__)
 
@@ -93,7 +95,39 @@ class BaseSpecDecodeCompilePolicyMixin:
             pending += self._precompile_target_verify()
         if disagg_mode != "decode":
             pending += self._precompile_extend_full()
+        cases = self._eager_logits_cases(disagg_mode)
+        pending.append(PendingCall(lambda: self.warmup_eager_logits(cases)))
         return pending
+
+    def _eager_logits_cases(self, disagg_mode: str) -> list[EagerLogitsCase]:
+        """The TARGET_VERIFY and EXTEND(FULL) shapes the target precompile warms."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        cases = []
+        if disagg_mode != "prefill":
+            cases += [
+                EagerLogitsCase(
+                    num_tokens=bs * self.draft_token_num,
+                    bs=bs,
+                    mode=ForwardMode.TARGET_VERIFY,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    spec_info=self.make_verify_spec_info(),
+                )
+                for bs in self.b_bucketer.buckets
+            ]
+        if disagg_mode != "decode":
+            bs = self._extend_compile_cap()
+            cases += [
+                EagerLogitsCase(
+                    num_tokens=num_tokens,
+                    bs=bs,
+                    mode=ForwardMode.EXTEND,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                for num_tokens in self.t_bucketer.buckets
+                if num_tokens >= bs
+            ]
+        return cases
 
     def _precompile_target_verify(self) -> list[PendingCall]:
         """Compile TARGET_VERIFY across the batch-size buckets."""
@@ -143,7 +177,7 @@ class BaseSpecDecodeCompilePolicyMixin:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
-        variants = self._extend_input_variants()
+        variants = self._extend_serving_variants()
         valid_shapes = [
             (t, bs, has_spec_info, variant)
             for t in self.t_bucketer.buckets
@@ -288,11 +322,22 @@ class BaseSpecDecodeCompilePolicyMixin:
         ):
             return super().finalize_forward_batch(outputs, forward_batch)
 
+        fm = getattr(forward_batch, "forward_mode", None)
+        sampling_info = forward_batch.sampling_info
+        host_padded = sampling_info is not None and is_host_padded(sampling_info)
+        is_verify = fm is not None and fm.is_target_verify()
         if next_token_logits is not None and real_b < next_token_logits.shape[0]:
-            fm = getattr(forward_batch, "forward_mode", None)
-            logit_rows = (
-                real_q if (fm is not None and fm.is_target_verify()) else real_b
-            )
+            if is_verify:
+                logit_rows = real_q
+            elif host_padded:
+                # HOST_PADDED sampling rows are padded to the batch bucket; sample at that shape.
+                logit_rows = sampling_info.temperatures.shape[0]
+                assert logit_rows <= next_token_logits.shape[0], (
+                    logit_rows,
+                    next_token_logits.shape,
+                )
+            else:
+                logit_rows = real_b
             if logit_rows < next_token_logits.shape[0]:
                 outputs.next_token_logits = next_token_logits[:logit_rows]
 
@@ -301,8 +346,15 @@ class BaseSpecDecodeCompilePolicyMixin:
 
         cap = getattr(forward_batch, "capture_hidden_mode", None)
         n_real = real_b if (cap is not None and cap.is_last()) else real_q
+        # HOST_PADDED extend hands its hidden to the draft KV writer at the token
+        # bucket; a [:real_q] trim would re-pad per prompt length.
+        keep_hidden_padded = host_padded and not is_verify
 
-        if hidden_states is not None and n_real < hidden_states.shape[0]:
+        if (
+            hidden_states is not None
+            and n_real < hidden_states.shape[0]
+            and not keep_hidden_padded
+        ):
             outputs.hidden_states = hidden_states[:n_real]
 
         _restore_forward_batch_inputs(forward_batch, real_q, real_b)

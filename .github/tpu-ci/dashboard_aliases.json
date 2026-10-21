@@ -1,4 +1,4 @@
 {
-  "_comment": "Series-id rename registry for the TPU nightly dashboard. A MODEL_CONFIG `id` is never renamed in place; when one truly must change, record it here as old-id -> new-id and keel merges the series at render time. Lint: ids unique, map acyclic, targets must be live ids, sources must not be. See README.md, Dashboard / Series identity.",
+  "_comment": "Series-id rename registry for the TPU nightly dashboard. A MODEL_CONFIG `id` is never renamed in place; when one truly must change, record it here as old-id -> new-id and the dashboard merges the series at render time. Lint: ids unique, map acyclic, targets must be live ids, sources must not be. See README.md, Dashboard / Series identity.",
   "aliases": {}
 }

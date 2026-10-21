@@ -17,22 +17,29 @@ GDN backend passes the per-layer table straight to the op with no per-forward
 transpose.
 
 
-Slot 0 is a reserved null block (padded / invalid tokens); real slots are
-``1 .. size``. The kernel masks reads on fresh requests via
-``has_initial_state`` (derived from ``seq_lens - query_lens``), so slot reuse
-needs **no** explicit clearing — hence ``clear_slots`` is a no-op here and no
-dynamic in-place scatter is required on device.
+Slot 0 is reserved for padding and real slots are ``1 .. size``, one state row
+each. With speculation, rows past the slots hold one ``checkpoint_width`` window
+per request pool row, one state per verify input, so radix snapshots cost one
+row as core's mamba budget assumes. A per-slot read offset names the committed
+state: ``AT_SLOT`` is the slot's own row (after extend, a radix copy or a P/D
+transfer), and ``t >= 0`` is row ``t`` of the request's window (after a verify).
+
+The kernel masks reads on fresh requests via ``has_initial_state`` (derived
+from ``seq_lens - query_lens``), so slot reuse needs no full-state clearing.
+``clear_slots`` only resets the small checkpoint-offset vector when present.
 
 Selected by ``TpuSRTPlatform.get_mamba_pool_cls`` and instantiated from
 ``HybridReqToTokenPool._init_mamba_pool``.
 """
 
 import logging
+import math
 from typing import List, Optional
 
 import msgspec
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.configs.mamba_utils import (
     BaseLinearStateParams,
     KimiLinearStateShape,
@@ -43,6 +50,52 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 GB = 1024**3
+
+# Read offset of a slot whose committed state is its own row, not a window row.
+AT_SLOT = -1
+
+
+@compiled_op()
+def committed_read_offsets(read_offsets, indices, steps):
+    """(int64 slots, int32 read offsets) select_checkpoints commits, in one
+    launch. Negative steps (inactive requests) and the null slot keep their
+    previous offset."""
+    indices = indices.to(torch.int64)
+    steps = steps.to(torch.int32)
+    previous = read_offsets.index_select(0, indices)
+    return indices, torch.where((indices > 0) & (steps >= 0), steps, previous)
+
+
+@compiled_op()
+def verify_track_steps(committed_lens, last_steps, interval: int):
+    """Window step whose checkpoint lands on a track-interval boundary, or -1.
+
+    committed_lens are the lengths before the verify. Matches core's post-verify
+    commit (spec_utils._verify_commit_step_indices) for linear chains, where the
+    window step is the accepted token's index.
+    """
+    pre = committed_lens.to(torch.int64)
+    post = pre + last_steps.to(torch.int64) + 1
+    crossed = pre // interval != post // interval
+    return torch.where(crossed, post // interval * interval - pre - 1, -1)
+
+
+@compiled_op()
+def checkpoint_snapshot_pairs(
+    track_slots, req_pool_indices, steps, window_start: int, width: int, bucket: int
+):
+    """(src rows, dst slots, count) copying window checkpoint steps into track
+    slots, valid pairs first and padded to bucket. A negative step or a track
+    slot <= 0 (no buffer, or padding) skips its row."""
+    valid = (steps >= 0) & (track_slots > 0)
+    order = torch.argsort((~valid).to(torch.int32), stable=True)
+    rows = window_start + req_pool_indices.clamp(min=0) * width + steps.clamp(min=0)
+    src = rows.to(torch.int32).index_select(0, order)
+    dst = track_slots.to(torch.int32).index_select(0, order)
+    padding = bucket - src.shape[0]
+    src = torch.nn.functional.pad(src, (0, padding))
+    dst = torch.nn.functional.pad(dst, (0, padding))
+    return src, dst, valid.sum(dtype=torch.int32).reshape(1)
 
 
 class TpuPerLayerState(msgspec.Struct, frozen=True):
@@ -99,10 +152,25 @@ class TpuMambaPool(MambaPool):
         # NOTE: deliberately does NOT call super().__init__ — the base
         # allocator is CUDA/NPU/CPU-specific. We reproduce only the pieces the
         # TPU GDN path needs.
-        if speculative_num_draft_tokens is not None:
-            raise NotImplementedError(
-                "Speculative decoding is not supported for the TPU GDN state pool yet."
+        self.checkpoint_width = speculative_num_draft_tokens or 1
+        if self.checkpoint_width < 1:
+            raise ValueError("GDN checkpoint width must be positive")
+        if self.checkpoint_width > 1 and (speculative_eagle_topk or 1) != 1:
+            raise NotImplementedError("TPU GDN supports linear-chain speculation only")
+        self.spec_state_size = spec_state_size
+        if self.checkpoint_width > 1:
+            # Windows are indexed by request pool row, 0 .. spec_state_size.
+            self.window_start: Optional[int] = size + 1
+            state_slots = (
+                self.window_start + (spec_state_size + 1) * self.checkpoint_width
             )
+            self.checkpoint_read_offsets = torch.full(
+                (size + 1,), AT_SLOT, dtype=torch.int32, device=device
+            )
+        else:
+            self.window_start = None
+            state_slots = size + 1
+            self.checkpoint_read_offsets = None
         if enable_linear_replayssm:
             raise NotImplementedError(
                 "GDN ReplaySSM ring buffers are not supported on the TPU GDN "
@@ -121,6 +189,9 @@ class TpuMambaPool(MambaPool):
         n_v, d_v, d_k = cache_params.shape.temporal
 
         num_mamba_layers = len(mamba_layer_ids)
+        # Read by the inherited P/D state-registration helpers.
+        self.mamba_layer_ids = list(mamba_layer_ids)
+        self.conv_shard_groups = cache_params.shape.conv_shard_groups
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -168,7 +239,7 @@ class TpuMambaPool(MambaPool):
         conv_state = [
             [
                 torch.zeros(
-                    (size + 1, conv_dim_km1[1], 1, conv_dim_km1[0]),
+                    (state_slots, conv_dim_km1[1], 1, conv_dim_km1[0]),
                     dtype=conv_dtype,
                     device=device,
                 )
@@ -177,11 +248,11 @@ class TpuMambaPool(MambaPool):
             for conv_dim_km1 in conv_state_shapes
         ]
 
-        # recurrent: kernel-native [size+1, n_v, d_k, d_v] per layer
+        # recurrent: kernel-native [state_slots, n_v, d_k, d_v] per layer
         # (GPU stores [..., n_v, d_v, d_k]; we swap the trailing two axes).
         temporal_state = [
             torch.zeros(
-                (size + 1, n_v, d_k, d_v),
+                (state_slots, n_v, d_k, d_v),
                 dtype=ssm_dtype,
                 device=device,
             )
@@ -207,17 +278,125 @@ class TpuMambaPool(MambaPool):
         # Keeping IDs here avoids variable-size TPU casts/pads and host readbacks.
         return "cpu"
 
+    @classmethod
+    def cache_bytes_per_request(cls, cache_params):
+        # Both TPU state regions use fp32, including the conv taps.
+        elements = sum(math.prod(shape) for shape in cache_params.shape.conv)
+        elements += math.prod(cache_params.shape.temporal)
+        return elements * 4 * len(cache_params.layers)
+
+    def get_speculative_mamba2_params_all_layers(self) -> TpuPerLayerState:
+        """Verify checkpoints live in the main cache."""
+        return self.mamba_cache
+
+    def select_checkpoints(self, indices, last_correct_step_indices):
+        """Record the state after the final accepted verify input, without copying HBM."""
+        if self.checkpoint_read_offsets is None:
+            raise RuntimeError("GDN checkpoint storage was not allocated")
+        indices, offsets = committed_read_offsets(
+            self.checkpoint_read_offsets,
+            indices.to(self.device),
+            last_correct_step_indices.to(self.device),
+        )
+        self.checkpoint_read_offsets.index_copy_(0, indices, offsets)
+
     def clear_slots(self, indices: torch.Tensor):
-        """No-op on TPU.
+        """Point the slots' committed state back at their own rows.
 
         The fused GDN kernel zeroes a slot's contribution whenever
         ``has_initial_state`` is False (a fresh request), so reused slots need
-        no explicit clearing and we avoid a dynamic in-place device scatter.
+        no full-state clearing. Only the small checkpoint-offset vector is reset.
         Note that the masking is derived from ``query_lens``, so anything that
         corrupts ``query_start_loc`` makes the predicate read True for a fresh
         request and resurrects the previous occupant's state.
         """
-        return
+        if self.checkpoint_read_offsets is not None:
+            self.checkpoint_read_offsets.index_fill_(
+                0, indices.to(device=self.device, dtype=torch.int64), AT_SLOT
+            )
+
+    def window_bases(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
+        """First state row of each request's checkpoint window."""
+        assert self.window_start is not None, "no checkpoint windows without spec"
+        return self.window_start + req_pool_indices.clamp(min=0) * self.checkpoint_width
+
+    def committed_state_rows(
+        self, slots: torch.Tensor, req_pool_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """State row holding each slot's committed state."""
+        if self.checkpoint_read_offsets is None:
+            return slots
+        offsets = self.checkpoint_read_offsets.index_select(0, slots.to(torch.int64))
+        return torch.where(
+            offsets < 0, slots, self.window_bases(req_pool_indices) + offsets
+        )
+
+    def checkpoint_rows(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
+        """[num_reqs, checkpoint_width] window rows a verify writes."""
+        steps = torch.arange(
+            self.checkpoint_width, dtype=req_pool_indices.dtype, device=self.device
+        )
+        return self.window_bases(req_pool_indices).unsqueeze(1) + steps
+
+    @torch.no_grad()
+    def snapshot_checkpoints(
+        self,
+        track_slots: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        steps: torch.Tensor,
+    ) -> None:
+        """Copy window checkpoint steps[i] of request i into track_slots[i] (radix
+        snapshot after a verify); a negative step or track slot skips that row."""
+        track_slots = track_slots.to(self.device)
+        states = self._copy_states()
+        if states[0].device.type == "cpu":
+            valid = ((steps >= 0) & (track_slots > 0)).nonzero(as_tuple=True)[0]
+            src = (self.window_bases(req_pool_indices) + steps)[valid].long()
+            for state in states:
+                state.index_copy_(
+                    0, track_slots[valid].long(), state.index_select(0, src)
+                )
+            return
+        from sglang_tpu.mamba_state_copy import (
+            compiled_state_copy,
+            copy_bucket_size,
+        )
+
+        src, dst, count = checkpoint_snapshot_pairs(
+            track_slots,
+            req_pool_indices,
+            steps,
+            self.window_start,
+            self.checkpoint_width,
+            copy_bucket_size(steps.shape[0]),
+        )
+        compiled_state_copy()(states, src, dst, count)
+
+    def warmup_snapshot_checkpoints(self, batch_size: int, track_grid: int) -> None:
+        """Compile and load the post-verify radix snapshot for one padded batch size."""
+        from sglang.srt.compilation.compiled_op import warmup_compiled_op
+        from sglang_tpu.mamba_state_copy import copy_bucket_size
+
+        req_pool_indices = torch.zeros(
+            batch_size, dtype=torch.int64, device=self.device
+        )
+        committed_lens = torch.zeros_like(req_pool_indices)
+        last_steps = torch.full_like(req_pool_indices, -1)
+        warmup_compiled_op(verify_track_steps, committed_lens, last_steps, track_grid)
+        warmup_compiled_op(
+            checkpoint_snapshot_pairs,
+            torch.zeros(batch_size, dtype=torch.int32, device=self.device),
+            req_pool_indices,
+            last_steps,
+            self.window_start,
+            self.checkpoint_width,
+            copy_bucket_size(batch_size),
+        )
+        # A queued warmup only compiles; executing loads the programs, as serving
+        # would on its first verify. No step crosses a boundary, so nothing is copied.
+        steps = verify_track_steps(committed_lens, last_steps, track_grid)
+        track_slots = torch.zeros(batch_size, dtype=torch.int32)
+        self.snapshot_checkpoints(track_slots, req_pool_indices, steps)
 
     def _copy_states(self):
         return [
@@ -226,10 +405,29 @@ class TpuMambaPool(MambaPool):
             for state in states
         ]
 
+    def get_state(self) -> list[torch.Tensor]:
+        """The per-layer conv and recurrent tensors the GDN/KDA kernels mutate."""
+        return self._copy_states()
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Install a list laid out like get_state."""
+        num_layers = self.num_mamba_layers
+        num_kinds = len(self.mamba_cache.conv)
+        assert len(state) == (num_kinds + 1) * num_layers, len(state)
+        self.mamba_cache = TpuPerLayerState(
+            conv=[
+                state[kind * num_layers : (kind + 1) * num_layers]
+                for kind in range(num_kinds)
+            ],
+            temporal=state[num_kinds * num_layers :],
+        )
+
     @torch.no_grad()
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         if src_indices.numel() == 0:
             return
+        # Slot rows only: with extra_buffer radix caching, copies run between
+        # snapshot slots and a request's slot before its extend.
         states = self._copy_states()
         if states[0].device.type == "cpu":
             # CPU reference for layout and allocator tests.
@@ -285,14 +483,11 @@ class TpuMambaPool(MambaPool):
             copy_bucket_size(max_requests),
         )
 
-    # The four below are inherited from MambaPool, which indexes the layer axis
+    # The two below are inherited from MambaPool, which indexes the layer axis
     # as `state[:, slots]` on a stacked tensor. This pool has no layer axis to
     # index -- state is one tensor per layer -- so the inherited versions would
-    # silently address the *slot* axis instead. The two RDMA ones additionally
-    # walk `vars(self.mamba_cache)`, which a msgspec.Struct does not support.
-    # None is reachable on TPU today (host/hierarchical cache and RDMA
-    # disaggregation are both unsupported here), so they raise rather than
-    # pretend.
+    # silently address the *slot* axis instead. Host offload of GDN state is
+    # unsupported on TPU, so they raise rather than pretend.
 
     def get_cpu_copy(self, indices):
         raise NotImplementedError(
@@ -308,17 +503,24 @@ class TpuMambaPool(MambaPool):
             "so MambaPool.load_cpu_copy's `[:, indices]` does not apply."
         )
 
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "RDMA registration of GDN state is not supported on TPU: "
-            "TpuMambaPool stores one tensor per layer, so the per-layer strides "
-            "MambaPool.get_contiguous_buf_infos derives from a stacked buffer "
-            "do not exist."
-        )
+    def _iter_transfer_state_entries(self):
+        """One [state_slots, ...] tensor per layer, laid out as get_state.
 
-    def get_state_dim_per_tensor(self):
-        raise NotImplementedError(
-            "RDMA registration of GDN state is not supported on TPU; see "
-            "TpuMambaPool.get_contiguous_buf_infos. The TP-sliceable axis this "
-            "reports as dim 2 of a stacked buffer is dim 1 of a per-layer one."
-        )
+        P/D registration reads these. Slice axes follow the kernel-native
+        layouts: conv [slots, K-1, 1, conv_dim], recurrent [slots, n_v, d_k, d_v].
+        """
+        for conv in self.mamba_cache.conv:
+            for tensor, layer_id in zip(conv, self.mamba_layer_ids, strict=True):
+                yield "conv", tensor, 2, layer_id
+        for tensor, layer_id in zip(
+            self.mamba_cache.temporal, self.mamba_layer_ids, strict=True
+        ):
+            yield "temporal", tensor, 0, layer_id
+
+    def committed_row(self, slot: int) -> int:
+        """State row a P/D transfer reads or writes for slot.
+
+        Extend leaves its state in the slot row, and P/D decode resets the slot's
+        read offset to AT_SLOT before its first verify, so both sides use it.
+        """
+        return slot

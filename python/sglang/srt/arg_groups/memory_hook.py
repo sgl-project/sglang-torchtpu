@@ -238,9 +238,9 @@ def handle_gpu_memory_settings(server_args: Any):
                 cfg.torch_compile_max_bs,
                 cfg.tpu_compile_bs,
                 cfg.max_running_requests,
-                attn_dp_size=(
-                    cfg.dp_size if resolved_view(server_args).enable_dp_attention else 1
-                ),
+                # `--dp-size N --enable-dp-attention` has already resolved to
+                # attn_dp_size=N, dp_size=1 (handle_deprecated_dp_attention).
+                attn_dp_size=cfg.attn_dp_size,
                 attn_tp_size=attn_tp_size_of(cfg) if attn_dp_enabled_of(cfg) else 1,
             )
         )

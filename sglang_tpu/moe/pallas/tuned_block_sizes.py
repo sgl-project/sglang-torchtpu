@@ -513,6 +513,13 @@ TUNED_BLOCK_SIZES = {
     ),
 }
 
+# Same key, measured on gmm_v2 itself (VMEM fit included). The only entries
+# a bf16/FP8 gmm_v2 call pins; the v1 entries above stay off that path.
+GMM_V2_TUNED_BLOCK_SIZES = {
+    (65536, 4096, 512, 288, 288, "bfloat16", "float8_e4m3fn", 4096): (256, 4096, 512),
+    (65536, 256, 4096, 288, 288, "bfloat16", "float8_e4m3fn", 256): (256, 256, 4096),
+}
+
 
 # TODO (jacobplatin): make this more generic
 def round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
@@ -591,9 +598,12 @@ def get_tuned_block_sizes(
     lhs_dtype: str,
     rhs_dtype: str,
     quant_block_size: int,
+    gmm_v2_only: bool = False,
 ):
     """
     Retrieves optimized (TM, TK, TN) tiling parameters for the GMM kernel.
+    With ``gmm_v2_only``, looks up ``GMM_V2_TUNED_BLOCK_SIZES`` alone and
+    returns None on a miss.
     """
     # GMM inputs must align to tile sizes; however, tile sizes themselves
     # are often powers of 2 or mxu multiples.
@@ -608,6 +618,8 @@ def get_tuned_block_sizes(
         quant_block_size,
     )
 
+    if gmm_v2_only:
+        return GMM_V2_TUNED_BLOCK_SIZES.get(key)
     if key not in TUNED_BLOCK_SIZES:
         default_val = get_default_gmm_block_sizes(m, k, n, num_current_groups)
         logger.debug(

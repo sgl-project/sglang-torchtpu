@@ -15,19 +15,18 @@ import json
 import logging
 import math
 import os
-import re
-import shutil
 import subprocess
 import sys
-import tempfile
-import time
-import traceback
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 
 from sglang_tpu.patches import build_slicebuilder_addresses
 
 logger = logging.getLogger(__name__)
+
+_MODULE_NAME = "sglang_tpu.node_normalization"
+_PRINT_LOCAL_DEVICE_COORDS_FLAG = "--print_local_device_coords"
+_LOCAL_DEVICE_COORDS_PREFIX = "TORCH_TPU_LOCAL_DEVICE_COORDS="
 
 
 def dimensions(value: str) -> tuple[int, ...]:
@@ -124,192 +123,70 @@ def canonical_host_order(ranks: list[int]) -> list[int]:
     return sorted(range(len(ranks)), key=ranks.__getitem__)
 
 
-def _coordinate_worker(local_rank, config, host_index, timeout, writer):
-    # As with scheduler workers, set rank metadata before initializing PJRT.
-    os.environ.update(config.environment(host_index))
-    os.environ.update(
-        RANK=str(host_index * config.devices_per_host + local_rank),
-        LOCAL_RANK=str(local_rank),
-        WORLD_SIZE=str(len(config.hosts) * config.devices_per_host),
-        LOCAL_WORLD_SIZE=str(config.devices_per_host),
-    )
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
+def _query_local_device_coords(timeout: int = 300) -> list[int]:
+    """Queries local TPU device coordinates in an isolated child process."""
+    child_env = dict(os.environ)
+    child_env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", _MODULE_NAME, _PRINT_LOCAL_DEVICE_COORDS_FLAG],
+            capture_output=True,
+            check=True,
+            env=child_env,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError("TPU coordinate discovery timed out") from error
+    except (OSError, subprocess.SubprocessError) as error:
+        detail = (
+            getattr(error, "stderr", None)
+            or getattr(error, "stdout", None)
+            or str(error)
+        )
+        raise RuntimeError(
+            f"TPU coordinate worker failed:\n{detail.strip()}"
+        ) from error
 
-    import torch.distributed as dist
+    for line in reversed(result.stdout.splitlines()):
+        if line.startswith(_LOCAL_DEVICE_COORDS_PREFIX):
+            coords = json.loads(line.removeprefix(_LOCAL_DEVICE_COORDS_PREFIX))
+            if not isinstance(coords, list) or any(type(c) is not int for c in coords):
+                raise ValueError(f"Invalid TPU coordinate payload: {coords!r}")
+            return coords
+    raise RuntimeError(
+        f"Could not find local TPU device coordinates in child process output: {result.stdout}"
+    )
+
+
+def _print_local_device_coords() -> None:
+    """Prints the local TPU device coordinates for `_query_local_device_coords`."""
     from torch_tpu._internal.distributed import tpu_distributed
 
-    # Legacy path for torch_tpu without torch.tpu.distributed.set_tpu_launch_env
-    # (the 2026.9.22 release): newer torch_tpu removed this module (#4287) and
-    # takes the public path in query_node_rank. Delete with that pin.
-    from torch_tpu._internal.distributed.launchers.multihost_wrapper import (
-        calculate_topological_node_rank,
-    )
-
-    from sglang.srt.utils import kill_itself_when_parent_died
-
-    kill_itself_when_parent_died()
-    dist.init_process_group("gloo", timeout=timedelta(seconds=timeout))
-    try:
-        coords = tpu_distributed.local_device_coords()
-        if local_rank == 0:
-            # TorchTPU accepts partial coordinates; discovery requires an exact
-            # valid chip location and must never fall back to the pod index.
-            if len(coords) != 3 or any(
-                type(c) is not int or not 0 <= c < bound
-                for c, bound in zip(coords, config.topology)
-            ):
-                raise ValueError(f"Invalid slice-relative TPU coordinates: {coords}")
-            writer.send(
-                calculate_topological_node_rank(
-                    coords,
-                    ",".join(map(str, config.topology)),
-                    fallback_index=None,
-                    chips_per_host=config.chips_per_host,
-                )
-            )
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
-        writer.close()
-
-
-def _exit_without_native_teardown(local_rank, error_dir, worker, *args):
-    # libtpu's atexit teardown sends vBAR StopSession, which can hang forever
-    # on GKE. Exit like a killed server instead: closing the device files
-    # releases the chips for the scheduler workers that start next. Failures
-    # too: mp.spawn would record them and then run the teardown via sys.exit.
-    status = 0
-    try:
-        worker(local_rank, *args)
-    except Exception:
-        with open(os.path.join(error_dir, str(local_rank)), "w") as file:
-            file.write(traceback.format_exc())
-        status = 1
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(status)
-
-
-_PUBLIC_RANK_PREFIX = "SGLANG_TPU_NODE_RANK="
-# Runs in a child so that set_tpu_launch_env's environment writes, and the PJRT
-# client its coordinate query starts, stay out of this process.
-_PUBLIC_RANK_PROBE = f"""
-import os, sys
-try:
-    import torch_tpu  # noqa: F401 (registers torch.tpu)
-    from torch.tpu.distributed import set_tpu_launch_env
-except (ImportError, AttributeError):
-    print("{_PUBLIC_RANK_PREFIX}unavailable")
-    sys.exit(0)
-set_tpu_launch_env(nnodes=int(sys.argv[1]), nproc_per_node=int(sys.argv[2]))
-print("{_PUBLIC_RANK_PREFIX}" + os.environ["NODE_RANK"])
-"""
-
-
-def _query_public_node_rank(config: TopologyConfig, timeout: int) -> int | None:
-    """This host's node rank from torch.tpu.distributed.set_tpu_launch_env.
-
-    None when torch_tpu has no such API, or when the chips per host are not the
-    2x2x1 it assumes.
-    """
-    if tuple(config.chips_per_host) != (2, 2, 1):
-        return None
-    env = dict(os.environ)
-    env.update(config.environment(0))
-    # Make torch_tpu derive the rank from coordinates: it never overwrites a set
-    # NODE_RANK, and without coordinates it would fall back to the pod index.
-    for name in ("NODE_RANK", "JOB_COMPLETION_INDEX"):
-        env.pop(name, None)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _PUBLIC_RANK_PROBE,
-            str(len(config.hosts)),
-            str(config.devices_per_host),
-        ],
-        env=env,
-        stdout=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
-    lines = [
-        line
-        for line in result.stdout.splitlines()
-        if line.startswith(_PUBLIC_RANK_PREFIX)
-    ]
-    if result.returncode != 0 or not lines:
-        raise RuntimeError(
-            "torch.tpu.distributed.set_tpu_launch_env failed to derive NODE_RANK "
-            f"(exit {result.returncode}); see its traceback above"
-        )
-    value = lines[-1].removeprefix(_PUBLIC_RANK_PREFIX)
-    if value == "unavailable":
-        return None
-    logger.info("TPU node rank %s from torch.tpu.distributed.set_tpu_launch_env", value)
-    return int(value)
+    coords = list(tpu_distributed.local_device_coords())
+    print(f"{_LOCAL_DEVICE_COORDS_PREFIX}{json.dumps(coords)}")
 
 
 def query_node_rank(config: TopologyConfig, host_index: int, timeout: int) -> int:
-    # canonical_host_order validates the ranks of all hosts together.
-    rank = _query_public_node_rank(config, timeout)
-    if rank is not None:
-        return rank
-    # GKE needs a full SliceBuilder world before local_device_coords() works.
-    # Use disposable spawn workers: discovery must release PJRT before the
-    # existing scheduler launcher starts model workers. No torchrun/server CLI.
-    import torch.multiprocessing as mp
+    from torch_tpu._internal.distributed.distributed import (
+        _calculate_topological_node_rank,
+    )
 
-    reader, writer = mp.get_context("spawn").Pipe(duplex=False)
-    error_dir = tempfile.mkdtemp(prefix="sglang-tpu-discovery-")
-    context = None
-    deadline = time.monotonic() + timeout
-    try:
-        context = mp.spawn(
-            _exit_without_native_teardown,
-            args=(error_dir, _coordinate_worker, config, host_index, timeout, writer),
-            nprocs=config.devices_per_host,
-            join=False,
-        )
-        writer.close()
-        try:
-            while not context.join(timeout=max(0, deadline - time.monotonic())):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("TPU coordinate discovery timed out")
-        except mp.ProcessExitedException:
-            # One failure breaks its peers' collectives, often before the
-            # failing worker records its own error. Let peers exit briefly,
-            # then report each distinct error rather than whichever landed first.
-            grace = time.monotonic() + 5
-            for process in context.processes:
-                process.join(timeout=max(0, min(grace, deadline) - time.monotonic()))
-            errors = {}
-            for name in sorted(os.listdir(error_dir), key=int):
-                with open(os.path.join(error_dir, name)) as file:
-                    text = file.read()
-                # Peer addresses and ports differ; the failure kind does not.
-                last = text.strip().splitlines()[-1]
-                kind = re.sub(r"\d+", "N", re.sub(r"\[[^\]/]*\]", "[peer]", last))
-                errors.setdefault(kind, f"worker {name}: {text}")
-            if not errors:
-                raise
-            raise RuntimeError(
-                "TPU coordinate workers failed:\n" + "\n".join(errors.values())
-            ) from None
-        rank = reader.recv()
-        if type(rank) is not int or not 0 <= rank < len(config.hosts):
-            raise ValueError(f"TorchTPU returned invalid node rank: {rank}")
-        return rank
-    finally:
-        if context is not None:
-            for process in context.processes:
-                if process.is_alive():
-                    process.kill()
-            for process in context.processes:
-                process.join()
-        reader.close()
-        writer.close()
-        shutil.rmtree(error_dir, ignore_errors=True)
+    coords = _query_local_device_coords(timeout=timeout)
+    if len(coords) != 3 or any(
+        type(c) is not int or not 0 <= c < bound
+        for c, bound in zip(coords, config.topology)
+    ):
+        raise ValueError(f"Invalid slice-relative TPU coordinates: {coords}")
+    rank = _calculate_topological_node_rank(
+        coords,
+        ",".join(map(str, config.topology)),
+        fallback_index=None,
+        chips_per_host=config.chips_per_host,
+    )
+    if type(rank) is not int or not 0 <= rank < len(config.hosts):
+        raise ValueError(f"TorchTPU returned invalid node rank: {rank}")
+    return rank
 
 
 def discover_host_order(
@@ -444,3 +321,8 @@ def prepare_tpu_environment(server_args) -> None:
         node_rank,
         dist_init_addr,
     )
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == [_PRINT_LOCAL_DEVICE_COORDS_FLAG]:
+        _print_local_device_coords()

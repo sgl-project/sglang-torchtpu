@@ -55,13 +55,13 @@ spec:
           - --page-size
           - "64"
           #          - --init-expert-location
-          #          - /home/aiges/tuned/attachment_ep_statistics/prefill_in1024.json
+          #          - /path/to/tuned/attachment_ep_statistics/prefill_in1024.json
           - --ep-dispatch-algorithm
           - dynamic
           - --eplb-algorithm
           - deepseek
           #          - --deepep-config
-          #          -  /home/aiges/tuned/tuned_8sms.json
+          #          -  /path/to/tuned/tuned_8sms.json
           - --enable-dp-lm-head
           - --attn-dp-size
           - "16"
@@ -201,13 +201,13 @@ spec:
           - --page-size
           - "64"
           #- --init-expert-location
-          #- /home/aiges/tuned/attachment_ep_statistics/prefill_in1024.json
+          #- /path/to/tuned/attachment_ep_statistics/prefill_in1024.json
           - --ep-dispatch-algorithm
           - dynamic
           - --eplb-algorithm
           - deepseek
 #          - --deepep-config
-#          -  /home/aiges/tuned/tuned_8sms.json
+#          -  /path/to/tuned/tuned_8sms.json
           - --enable-dp-lm-head
           - --attn-dp-size
           - "16"
@@ -753,7 +753,7 @@ deepseekr10528-prefill-main-0            1/1     Running   0          74m
 deepseekr10528-prefill-main-0-1          1/1     Running   0          74m
 [root@ecs-cbm-x1-pd-cpu-001 main_doc]# kubectl  get svc |grep dee
 deepseekr10528-decode-main    ClusterIP   None             <none>        <none>           97m
-deepseekr10528-lb-service     NodePort    172.16.242.169   <none>        8000:30800/TCP   22m
+deepseekr10528-lb-service     NodePort    10.0.0.10   <none>        8000:30800/TCP   22m
 deepseekr10528-prefill-main   ClusterIP   None             <none>        <none>           97m
 ```
 

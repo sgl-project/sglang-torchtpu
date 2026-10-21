@@ -53,8 +53,7 @@ _VMEM_PREFETCH_OVERRIDES = (
     # prefetches avoids the deadlock; memory-space assignment itself stays
     # enabled. Applied only for small explicit KV pools (see
     # apply_small_kv_pool_vmem_prefetch_override) so unaffected deployments
-    # keep the default prefetch schedule bit-for-bit. The gf (ghostfish)
-    # flag namespace is the one tpu7x's compiler backend reads.
+    # keep the default prefetch schedule bit-for-bit.
     "--xla_gf_vmem_max_outstanding_prefetches=1",
 )
 
@@ -119,6 +118,7 @@ def _set_renamed_compilation_cache_envs() -> list[str]:
 
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
+    os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
     added = _set_renamed_compilation_cache_envs()
     if added:
         logger.info(

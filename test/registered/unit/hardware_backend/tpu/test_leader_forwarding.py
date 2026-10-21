@@ -1,8 +1,10 @@
+import asyncio
 import errno
 import os
 import signal
 import socket
 import socketserver
+import struct
 import threading
 import unittest
 from contextlib import ExitStack, contextmanager
@@ -82,6 +84,106 @@ class TestLeaderForwarding(unittest.TestCase):
             for port in ports:
                 with self.assertRaises(ConnectionRefusedError):
                     socket.create_connection(("127.0.0.1", port), timeout=5)
+
+    def test_failed_connection_keeps_listener_serving(self):
+        """An unexpected per-connection error is logged and does not stop serving."""
+        forward = leader_forwarding._forward_connection_inner
+        calls = []
+
+        async def fail_first(target_host, port, client):
+            calls.append(port)
+            if len(calls) == 1:
+                async with client:
+                    raise RuntimeError("handler is closed")
+            await forward(target_host, port, client)
+
+        with socketserver.ThreadingTCPServer(
+            ("127.0.0.2", 0), StreamingTarget
+        ) as target:
+            thread = threading.Thread(target=target.serve_forever, daemon=True)
+            thread.start()
+            port = target.server_address[1]
+            try:
+                with (
+                    patch.object(
+                        leader_forwarding, "_forward_connection_inner", fail_first
+                    ),
+                    patch.object(leader_forwarding.os, "kill") as kill,
+                    self.assertLogs(leader_forwarding.logger, "WARNING") as logs,
+                    leader_forwarding._forward_ports("127.0.0.1", "127.0.0.2", [port]),
+                ):
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+                        self.assertEqual(c.recv(4096), b"")
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+                        c.sendall(b"request")
+                        c.shutdown(socket.SHUT_WR)
+                        response = b""
+                        while data := c.recv(4096):
+                            response += data
+                    self.assertTrue(response.startswith(b"port-%d:" % port))
+                kill.assert_not_called()
+                self.assertIn("RuntimeError: handler is closed", "\n".join(logs.output))
+            finally:
+                target.shutdown()
+                thread.join()
+
+    def test_client_reset_keeps_listener_serving(self):
+        """A client that resets its connection must not shut the worker down."""
+        for loop in ("asyncio", "uvloop"):
+            with self.subTest(loop=loop):
+                if loop == "uvloop":
+                    try:
+                        import uvloop
+                    except ImportError:
+                        self.skipTest("uvloop is not installed")
+                    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+                    self.addCleanup(asyncio.set_event_loop_policy, None)
+                self._reset_then_serve()
+
+    def _reset_then_serve(self):
+        client_reset = threading.Event()
+
+        class RespondAfterReset(socketserver.BaseRequestHandler):
+            def handle(self):
+                request = b""
+                while data := self.request.recv(4096):
+                    request += data
+                if request == b"reset":
+                    # Answer only after the client is gone, so the leader forwarder
+                    # writes and half-closes toward a reset socket.
+                    client_reset.wait(5)
+                self.request.sendall(b"response:" + request)
+
+        with socketserver.ThreadingTCPServer(
+            ("127.0.0.2", 0), RespondAfterReset
+        ) as target:
+            thread = threading.Thread(target=target.serve_forever, daemon=True)
+            thread.start()
+            port = target.server_address[1]
+            try:
+                with (
+                    patch.object(leader_forwarding.os, "kill") as kill,
+                    leader_forwarding._forward_ports("127.0.0.1", "127.0.0.2", [port]),
+                ):
+                    client = socket.create_connection(("127.0.0.1", port), timeout=5)
+                    client.sendall(b"reset")
+                    client.shutdown(socket.SHUT_WR)
+                    client.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    client.close()
+                    client_reset.set()
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+                        c.sendall(b"healthy")
+                        c.shutdown(socket.SHUT_WR)
+                        response = b""
+                        while data := c.recv(4096):
+                            response += data
+                    self.assertEqual(response, b"response:healthy")
+                kill.assert_not_called()
+            finally:
+                target.shutdown()
+                thread.join()
 
     def test_unready_target_rejects_connection_then_accepts_retry(self):
         with socket.socket() as probe:

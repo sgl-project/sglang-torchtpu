@@ -39,12 +39,23 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+# fn(runner, topk, speculative_num_steps) -> multi-step draft decode container;
+# the draft extend of the same name builds the ATTENTION_BACKENDS entry.
+DRAFT_ATTENTION_BACKENDS = {}
 HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
 def register_attention_backend(name):
     def decorator(fn):
         ATTENTION_BACKENDS[name] = fn
+        return fn
+
+    return decorator
+
+
+def register_draft_attention_backend(name):
+    def decorator(fn):
+        DRAFT_ATTENTION_BACKENDS[name] = fn
         return fn
 
     return decorator
@@ -519,8 +530,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
-        elif kimi_linear_config(runner.model_config) is not None:
-            if _is_npu:
+        elif (
+            kimi_linear_config(runner.model_config) is not None
+            or glm5_next_config(runner.model_config) is not None
+        ):
+            # Kimi-Linear and GLM-5.3 share the KDA layer.
+            if _is_npu and kimi_linear_config(runner.model_config) is not None:
                 from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
                     AscendKDAAttnBackend,
                     AscendKDAHybridLinearAttnBackend,
@@ -533,14 +548,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     TpuKDAAttnBackend,
                 )
 
-                logger.info(
-                    "Using TPU KDA linear-attention backend for Kimi linear models."
-                )
+                logger.info("Using TPU KDA linear-attention backend.")
                 linear_attn_backend = TpuKDAAttnBackend(runner)
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
-        elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

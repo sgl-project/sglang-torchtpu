@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/layers/vllm/quantization/fp8.py
+# Adapted from https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/layers/vllm/quantization/fp8.py
 # Copyright 2025 Google LLC
 """TPU FP8 MoE helpers.
 
@@ -131,9 +131,15 @@ def _own_storage(t: torch.Tensor) -> torch.Tensor:
     ``base[:, None, None, :]`` on a contiguous ``[E, N]`` tensor is *already*
     contiguous, so ``.contiguous()`` returns the view unchanged and the
     parameter keeps the base's 2-D device buffer while declaring a 4-D shape.
-    torch_tpu then has to reconcile the two on every use.
+    torch_tpu then has to reconcile the two on every use. On torch_tpu 0.2 even
+    a device-side clone (or ``empty().copy_()``) of that shape is relaid out by
+    an ``execute_as_strided`` program at every compiled call; a buffer moved
+    from the host is not, so device tensors go through the host (load time
+    only). A host tensor that owns its buffer is returned as is.
     """
-    return t if t._base is None else t.clone()
+    if t.device.type == "cpu":
+        return t if t._base is None else t.clone()
+    return t.cpu().to(t.device)
 
 
 def _to_tpu_fp8_moe_scale_layout(
@@ -573,7 +579,7 @@ def apply_tpu_fp8_moe(
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu
     # registers those ops. Until then, keep MoE on the same backend-dispatched
-    # fused grouped-GEMM model used by upstream CUDA paths and torchtpu-vllm.
+    # fused grouped-GEMM model used by upstream CUDA paths and vllm-torchtpu.
     if swiglu_limit is not None:
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")

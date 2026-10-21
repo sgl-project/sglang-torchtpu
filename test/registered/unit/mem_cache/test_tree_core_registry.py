@@ -488,6 +488,22 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
         params.tree_components = (ComponentType.FULL, ComponentType.C128)
         self.assertEqual(select_tree_core_backend(params), "python")
 
+    def test_stale_window_eviction_uses_python_for_swa_caches(self):
+        # The stale SWA window demotion walks Python tree nodes and LRUs.
+        swa = (ComponentType.FULL, ComponentType.SWA)
+        for components, enabled, expected in (
+            (swa, True, "python"),
+            (swa, False, "rust"),
+            ((ComponentType.FULL,), True, "rust"),
+        ):
+            with (
+                self.subTest(components=components, enabled=enabled),
+                envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.override(enabled),
+            ):
+                params = _cache_init_params()
+                params.tree_components = components
+                self.assertEqual(select_tree_core_backend(params), expected)
+
     def test_unsupported_platform_and_torch_use_python(self):
         for platform in ("darwin", "win32"):
             with (

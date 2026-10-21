@@ -12,8 +12,8 @@ kernel.
 
 Each TP rank runs attention purely on its local heads (QKV projection is
 column-parallel; the all-reduce happens after o_proj), so no JAX mesh /
-shard_map is needed here — unlike the torchtpu-vllm paged-attention backend
-this module is adapted from (https://github.com/google-pytorch/torchtpu-vllm/tree/main/src/vllm_torchtpu/kernels/).
+shard_map is needed here — unlike the vllm-torchtpu paged-attention backend
+this module is adapted from (https://github.com/vllm-project/vllm-torchtpu/tree/main/src/vllm_torchtpu/kernels/).
 """
 
 from __future__ import annotations

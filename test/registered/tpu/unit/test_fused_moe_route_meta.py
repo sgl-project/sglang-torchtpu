@@ -139,14 +139,19 @@ class TestSingleTokenRouteMetaMxfp4Situ(CustomTestCase):
             activation=self.ACT,
             num_global=num_global,
         )
-        with mock.patch.object(
-            route_meta,
-            "single_token_route_meta",
-            wraps=route_meta.single_token_route_meta,
-        ) as spy:
-            out = run(DENSE_THRESHOLD)
-        self.assertTrue(spy.called)
-        ref = run(0)  # argsort + gather path
+        from sglang_tpu.envs import envs as tpu_envs
+
+        # This class covers the route-meta + gmm_v2 path; the fused
+        # single-token MXFP4 kernel has its own test (test_single_token_moe.py).
+        with tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.override(False):
+            with mock.patch.object(
+                route_meta,
+                "single_token_route_meta",
+                wraps=route_meta.single_token_route_meta,
+            ) as spy:
+                out = run(DENSE_THRESHOLD)
+            self.assertTrue(spy.called)
+            ref = run(0)  # argsort + gather path
         self.assertTrue(np.all(np.isfinite(out)))
         scale = max(float(np.max(np.abs(ref))), 1e-6)
         self.assertLess(float(np.max(np.abs(out - ref))) / scale, 1e-2)

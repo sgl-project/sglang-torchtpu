@@ -121,6 +121,10 @@ def alloc_extend_vectorized_cpu(
 
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+    # Set by the non-spec host-padding policy; wrapped allocators retain
+    # their existing device-return contract.
+    defer_decode_upload: bool = False
+
     def clear(self) -> None:
         # Slot 0 is reserved as the dummy-padding page, so page IDs start at 1.
         self.free_pages = torch.arange(
@@ -199,6 +203,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
         out_indices_cpu: torch.Tensor = None,
+        return_host: bool = False,
     ):
         if self.debug_mode:
             assert torch.all(
@@ -241,7 +246,11 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_indices_cpu,
             self.page_size,
         )
-        out_indices = out_indices_cpu.to(self.device, non_blocking=True)
+        out_indices = (
+            out_indices_cpu
+            if return_host
+            else out_indices_cpu.to(self.device, non_blocking=True)
+        )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -299,7 +308,11 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
             if out_indices_cpu is not None:
                 out_indices_cpu.copy_(host_indices)
-            out_indices = host_indices.to(self.device, non_blocking=True)
+            out_indices = (
+                host_indices
+                if self.defer_decode_upload
+                else host_indices.to(self.device, non_blocking=True)
+            )
         else:
             # Device formula on fixed-shape (bs,) inputs (bs is bucketed).
             per_req_new_page_dev = per_req_new_page.to(self.device, non_blocking=True)
@@ -383,3 +396,23 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             free_index = free_index.cpu()
         free_index = free_index.to(dtype=torch.int32)
         super().free_segment(free_index, start_pos=start_pos)
+
+
+def host_return_allocators(allocator) -> list[TpuPagedTokenToKVPoolAllocator]:
+    """TPU allocators behind ``allocator`` that can return host-resident indices.
+
+    Empty when any inner allocator would keep its device-return contract. An SWA
+    allocator qualifies when both inner allocators are plain TPU allocators; its
+    full-to-SWA mapping is host-resident on TPU.
+    """
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+    if type(allocator) is TpuPagedTokenToKVPoolAllocator:
+        return [allocator]
+    if type(allocator) is SWATokenToKVPoolAllocator:
+        inner = [allocator.full_attn_allocator, allocator.swa_attn_allocator]
+        if all(type(a) is TpuPagedTokenToKVPoolAllocator for a in inner) and (
+            allocator.full_to_swa_index_mapping.device.type == "cpu"
+        ):
+            return inner
+    return []

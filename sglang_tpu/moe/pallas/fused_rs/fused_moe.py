@@ -110,6 +110,30 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk):
     return lhs_indices, group_sizes, output_indices, topk_slot_indices
 
 
+def _compute_expert_tp_routing(
+    topk_indices: jax.Array, *, num_experts: int, topk: int, ep_size: int
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Expert-TP routing over virtual experts ``shard * E + expert``.
+
+    Every (token, slot) is routed to all ``ep_size`` slices of its expert, as
+    kernel slot ``slot * ep_size + shard``. Sorting by virtual expert is the
+    real expert-sorted order repeated once per shard, so derive it from the
+    real routing instead of sorting and bincounting ``ep_size`` times as many
+    rows over ``ep_size`` times as many experts.
+    """
+    lhs_real, group_sizes_real, _, slot_real = _compute_rs_routing(
+        topk_indices, num_experts=num_experts, topk=topk
+    )
+    real_order = lhs_real * topk + slot_real  # flat (token, slot), expert-sorted
+    shards = jnp.arange(ep_size, dtype=jnp.int32)
+    virtual_order = (real_order[None, :] * ep_size + shards[:, None]).reshape(-1)
+    kernel_topk = topk * ep_size
+    lhs_indices = virtual_order // kernel_topk
+    topk_slot_indices = virtual_order % kernel_topk
+    group_sizes = jnp.tile(group_sizes_real, ep_size)
+    return lhs_indices, group_sizes, lhs_indices, topk_slot_indices
+
+
 # ============================================================================
 # Per-chip MoE body (nodedup kernel variant)
 # ============================================================================
@@ -137,6 +161,7 @@ def moe_gmm_local_rs_nodedup(
     has_post_norm: bool = False,
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
+    expert_tp: bool = False,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -148,11 +173,10 @@ def moe_gmm_local_rs_nodedup(
     chunk_size = num_tokens // ep_size
     num_experts = w1.shape[0] * ep_size  # global num_experts
     num_local_experts = w1.shape[0]
-    my_id = (
-        group_offset[1]
-        if group_offset.shape[0] > 1
-        else jax.lax.axis_index(ep_axis_name)
-    )
+    # Experts are assigned in contiguous, equal-sized blocks by logical rank.
+    # Derive the rank from the offset already needed for routing instead of
+    # carrying a second scalar through every compiled MoE call.
+    my_id = group_offset[0] // num_local_experts
 
     # Compiler workaround for the non-SP fused remote-DMA graph: materialize
     # IDs and weights from logical rank 0 in one BF16 psum and feed both
@@ -178,12 +202,27 @@ def moe_gmm_local_rs_nodedup(
         topk_indices = routing[..., 0].astype(jnp.int32)
         topk_weights = routing[..., 1].astype(topk_weights.dtype)
 
+    # Expert TP: every rank holds a 1/ep_size slice of every expert's
+    # intermediate dim, addressed as virtual experts
+    # [rank * E, (rank + 1) * E). Route each (token, slot) to all ep_size
+    # slices; each partial output lands in its own slot and the partials are
+    # summed after the kernel, so the kernel's direct writes never collide and
+    # every rank does 1/ep_size of the work of each routed expert.
+    kernel_topk = topk * ep_size if expert_tp else topk
+
     # Routing — inlined here so bincount lives in the SAME shard_map as the
     # kernel call. Mirrors v1 where bincount is co-located with the heavy
     # ``hidden_states[token_indices_sorted]`` gather, letting XLA fuse them.
-    lhs_indices, group_sizes, output_indices, topk_slot_indices = _compute_rs_routing(
-        topk_indices, num_experts=num_experts, topk=topk
-    )
+    if expert_tp:
+        lhs_indices, group_sizes, output_indices, topk_slot_indices = (
+            _compute_expert_tp_routing(
+                topk_indices, num_experts=num_local_experts, topk=topk, ep_size=ep_size
+            )
+        )
+    else:
+        lhs_indices, group_sizes, output_indices, topk_slot_indices = (
+            _compute_rs_routing(topk_indices, num_experts=num_experts, topk=topk)
+        )
     size_m = lhs_indices.shape[0]
     _assert_fused_rs_smem_safe(size_m)
 
@@ -235,8 +274,17 @@ def moe_gmm_local_rs_nodedup(
     # case all routed rows land on that device. This is much tighter than the
     # old global-expert bound while keeping the communication schedule wholly
     # independent of runtime routing and physical rank order.
+    #
+    # Expert TP routes each (token, slot) to exactly one slice per device, so a
+    # device holds exactly size_m / ep_size rows, over at most that many of its
+    # (many more) virtual experts.
+    if expert_tp:
+        max_rows = size_m // ep_size
+        max_groups = min(num_local_experts, max_rows)
+    else:
+        max_rows, max_groups = size_m, num_local_experts
     max_num_gm = jnp.array(
-        num_local_experts + (size_m + tile_m - 1) // tile_m - 1,
+        max_groups + (max_rows + tile_m - 1) // tile_m - 1,
         dtype=jnp.int32,
     )
 
@@ -262,8 +310,9 @@ def moe_gmm_local_rs_nodedup(
         ep_axis_name=ep_axis_name,
         max_num_gm=max_num_gm,
         caller_tile_m=tile_m,
-        top_k=topk,
+        top_k=kernel_topk,
         fp8_direct_write=fp8_direct_write,
+        expert_tp=expert_tp,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -277,7 +326,15 @@ def moe_gmm_local_rs_nodedup(
             topk_weights, my_id * chunk_size, chunk_size, axis=0
         )
     )
-    out_3d = out_buf.reshape(chunk_size, topk, hidden_size)
+    if expert_tp:
+        out_3d = (
+            out_buf.reshape(chunk_size, topk, ep_size, hidden_size)
+            .astype(jnp.float32)
+            .sum(axis=2)
+            .astype(out_buf.dtype)
+        )
+    else:
+        out_3d = out_buf.reshape(chunk_size, topk, hidden_size)
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
     if post_expert_norm_weight is not None:
         norm_size = post_expert_norm_weight.shape[0]  # actual hidden_size (unpadded)
@@ -336,6 +393,7 @@ def expert_parallel_gmm_rs(
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
+    expert_tp: bool = False,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -401,6 +459,7 @@ def expert_parallel_gmm_rs(
             has_post_norm=_has_pn_rs,
             sp_enabled=sp_enabled,
             fp8_direct_write=fp8_direct_write,
+            expert_tp=expert_tp,
         ),
         mesh=mesh,
         in_specs=(
@@ -455,6 +514,7 @@ def expert_parallel_gmm_rs(
         "activation",
         "scoring_fn",
         "fp8_direct_write",
+        "expert_tp",
     ),
     compiler_options={
         # "xla_enable_transpose_trace": True,
@@ -479,6 +539,7 @@ def fused_moe_func_rs(
     topk_indices: jax.Array | None = None,
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
+    expert_tp: bool = False,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -537,6 +598,7 @@ def fused_moe_func_rs(
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_direct_write=fp8_direct_write,
+        expert_tp=expert_tp,
     )
 
     return result[:num_tokens, :hidden_size]

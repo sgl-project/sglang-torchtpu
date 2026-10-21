@@ -2,6 +2,7 @@
 
 import os
 from copy import deepcopy
+from typing import Any
 
 # Overlap compute with collectives; the sparse-core collective offloads stay off
 # (they regressed these serving shapes). The joined string is part of the
@@ -76,3 +77,43 @@ _FP8_BASE_CONFIG["runtime_env"].update(
         "LIBTPU_INIT_ARGS": " ".join(LIBTPU_FLAGS),
     }
 )
+
+
+PD_SINGLEHOST_GROUP = {"hosts": 2, "prefill_engines": 1, "decode_engines": 1}
+
+
+def pd_singlehost_role_configs(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One-host-per-engine raiden P/D roles serving config's model and flags.
+
+    Both roles keep config's spec flags: the draft KV pool and the draft seed
+    cross the handoff, so their layouts must match.
+
+    Returns:
+      (PREFILL_CONFIG, DECODE_CONFIG).
+    """
+    common = deepcopy(config)
+    common["server_args"].update(
+        host="0.0.0.0",
+        disaggregation_transfer_backend="raiden",
+    )
+    common["runtime_env"].update(
+        SGLANG_RAIDEN_KV_PORT=os.environ.get("SGLANG_RAIDEN_KV_PORT", "31000"),
+        SGLANG_RAIDEN_RESHARD="0",
+        LB_PORT=os.environ.get("LB_PORT", "8000"),
+        HEALTH_TIMEOUT=os.environ.get("WAIT_SECS", "3600"),
+    )
+    prefill = deepcopy(common)
+    prefill["server_args"].update(
+        port=int(os.environ.get("PREFILL_PORT", "30000")),
+        disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=int(os.environ.get("BOOTSTRAP_PORT", "8998")),
+    )
+    decode = deepcopy(common)
+    decode["server_args"].update(
+        port=int(os.environ.get("DECODE_PORT", "30000")),
+        disaggregation_mode="decode",
+        disaggregation_decode_retraction_backup="cpu_tensor",
+    )
+    return prefill, decode

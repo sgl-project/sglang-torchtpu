@@ -218,5 +218,79 @@ class TestAccuracyRecipes(unittest.TestCase):
         self.assertEqual(declared, set(self.MULTIHOST))
 
 
+class TestWorkloadProfiles(unittest.TestCase):
+    """A profile sizes a workload; it must not restate how a model is served."""
+
+    def test_profiles_set_only_sizing_keys(self):
+        """A stray key here would silently re-serve the model.
+
+        apply_profile() feeds the cookbook generator, so that would publish a
+        different parallelism or backend than the gates validated.
+        """
+        from benchmark.tpu.recipe.configs.profiles import PROFILE_KEYS, PROFILES
+
+        for name, profile in PROFILES.items():
+            with self.subTest(profile=name):
+                self.assertEqual(set(profile["server_args"]) - set(PROFILE_KEYS), set())
+
+    def test_apply_profile_does_not_modify_its_inputs(self):
+        from benchmark.tpu.recipe.configs.profiles import PROFILES, apply_profile
+
+        config = deepcopy(CONFIG)
+        original, profile = deepcopy(config), PROFILES["chat_1k1k"]
+        original_profile = deepcopy(profile)
+        sized = apply_profile(config, profile)
+        self.assertEqual(config, original)
+        self.assertEqual(profile, original_profile)
+        self.assertEqual(sized["server_args"]["max_running_requests"], 64)
+        # The chunk follows the profile's prefill bucket, not the base's.
+        self.assertEqual(
+            sized["server_args"]["chunked_prefill_size"], profile["prefill_tokens"]
+        )
+
+
+class TestRenderedCookbookCommands(unittest.TestCase):
+    """Every generated cookbook command must be one the server accepts.
+
+    The page tells a reader to paste it on a clean host, so a flag the server
+    has since renamed is a bring-up failure nobody sees in CI.
+    """
+
+    PAGES = (
+        "docs/cookbook/autoregressive/OpenAI/GPT-OSS.mdx",
+        "docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx",
+    )
+
+    def test_generated_blocks_parse_as_server_args(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        sys.path.insert(0, str(ROOT / "scripts/ci/tpu"))
+        import render_recipe
+
+        for page in self.PAGES:
+            text = (ROOT / page).read_text()
+            markers = list(render_recipe.MARKER.finditer(text))
+            self.assertTrue(markers, page)
+            for match in markers:
+                attrs = render_recipe.parse_attrs(match.group("attrs"))
+                with self.subTest(page=page, **attrs):
+                    block = render_recipe.render(attrs["config"], attrs["profile"])
+                    argv = []
+                    for line in block.splitlines():
+                        line = line.strip().removesuffix(" \\")
+                        if line.startswith("--"):
+                            argv.extend(line.split())
+                    parser = argparse.ArgumentParser()
+                    ServerArgs.add_cli_args(parser)
+                    try:
+                        parser.parse_args(argv)
+                    except SystemExit as exit_code:
+                        self.fail(
+                            f"{page}: server rejects its own command ({exit_code})"
+                        )
+
+
 if __name__ == "__main__":
     unittest.main()

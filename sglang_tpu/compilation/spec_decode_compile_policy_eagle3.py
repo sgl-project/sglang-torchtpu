@@ -196,9 +196,13 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self._draft_eager_model_forward: Callable[..., Any] | None = None
         self._draft_eager_logits_forward: Callable[..., Any] | None = None
 
-        if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
+        if self.speculative_algorithm and self.speculative_algorithm not in (
+            "EAGLE",
+            "EAGLE3",
+            "NEXTN",
+        ):
             raise ValueError(
-                f"TPU torch.compile precompilation only supports EAGLE3, "
+                f"TPU EAGLE-family precompilation supports EAGLE, EAGLE3 and NEXTN, "
                 f"got {self.speculative_algorithm!r}."
             )
 
@@ -223,6 +227,11 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     def install(self) -> bool:
         """Capture EAGLE's eager regions before the base policy replaces them."""
         if self.is_draft_worker and self.owner is not None:
+            from sglang.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
+            from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+
+            if isinstance(self.owner, (Qwen3_5ForCausalLMMTP, LlamaForCausalLMEagle3)):
+                self.owner.model.embed_tokens.lift_rank_to_input()
             self._draft_eager_backbone_forward = self.owner.model.forward
             self._draft_eager_model_forward = self.owner.forward
             self._draft_eager_logits_forward = self.owner.logits_processor.forward
@@ -924,14 +933,18 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
         self._precompile_shapes("FUSED DRAFT", bs_buckets, run)
 
+    def _draft_extend_bs_buckets(self) -> list[int]:
+        """The DRAFT_EXTEND_V2 batch buckets a serving step can reach."""
+        assert self.b_bucketer is not None
+        return _draft_extend_precompile_bs_buckets(
+            list(self.b_bucketer.buckets),
+            int(self.model_runner.req_to_token_pool.size),
+        )
+
     def _precompile_draft_extend(self, attn_backend: Any) -> None:
         """Compile DRAFT_EXTEND_V2(FULL) across the bs buckets."""
-        assert self.b_bucketer is not None
-        all_bs_buckets = list(self.b_bucketer.buckets)
         local_req_capacity = int(self.model_runner.req_to_token_pool.size)
-        bs_buckets = _draft_extend_precompile_bs_buckets(
-            all_bs_buckets, local_req_capacity
-        )
+        bs_buckets = self._draft_extend_bs_buckets()
         tokens_per_req = self.draft_token_num
         logger.info(
             "[spec compile policy] DRAFT_EXTEND_V2(FULL): %d shapes "

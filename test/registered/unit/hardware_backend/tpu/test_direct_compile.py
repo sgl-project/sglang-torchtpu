@@ -15,6 +15,7 @@ from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import dp_attention
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -194,6 +195,25 @@ class TestPPProxyPytree(CustomTestCase):
         self.assertEqual(path[-1], tree_util.DictKey("hidden_states"))
 
 
+class TestAuxHiddenStatePytree(CustomTestCase):
+    def test_aux_list_output_flattens_to_tensor_leaves_and_rebuilds(self):
+        """A target verify that returns (hidden, aux) for DFlash capture must trace.
+
+        Unregistered, the aux list is one opaque leaf and direct_compile rejects
+        the output as a non-tensor.
+        """
+        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
+        leaves, treespec = tree_util.tree_flatten(
+            (hidden, AuxHiddenStateList([first, second]))
+        )
+        self.assertEqual(
+            [id(leaf) for leaf in leaves], [id(hidden), id(first), id(second)]
+        )
+        _, rebuilt = tree_util.tree_unflatten(treespec, [hidden, second, first])
+        self.assertIsInstance(rebuilt, AuxHiddenStateList)
+        self.assertEqual([id(t) for t in rebuilt], [id(second), id(first)])
+
+
 def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
     def fn(value, unused_runtime):
         kv_pool.value.add_(model.kv_bias)
@@ -210,6 +230,21 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
         kv_pool=kv_pool,
         **compile_options,
     )
+
+
+class TestAuxHiddenStatePytree(CustomTestCase):
+    def test_aux_states_flatten_to_tensor_leaves_and_rebuild(self):
+        """An EAGLE3 target's (hidden, aux) output must reach direct_compile as
+        tensor leaves; an opaque list leaf fails its all-TPU-tensors check."""
+        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
+        leaves, treespec = tree_util.tree_flatten(
+            (hidden, AuxHiddenStateList([first, second]))
+        )
+        self.assertEqual(len(leaves), 3)
+        self.assertTrue(all(isinstance(leaf, torch.Tensor) for leaf in leaves))
+        _, aux = tree_util.tree_unflatten(treespec, leaves)
+        self.assertIsInstance(aux, AuxHiddenStateList)
+        self.assertIs(aux[1], second)
 
 
 class TestDirectCompile(CustomTestCase):
@@ -991,7 +1026,7 @@ class TestDirectCompile(CustomTestCase):
         compiler = direct_compile.tpu_torch_compile
         value = compiler.placeholder([2], torch.int64, False)
         with direct_compile.execution_mode.set_eager_mode(
-            direct_compile.execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+            direct_compile.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
         ):
             result = torch.isnan(value)
 
@@ -1009,7 +1044,7 @@ class TestDirectCompile(CustomTestCase):
                 weight = compiler.placeholder([2, 8], torch.float32, False)
                 value = compiler.placeholder([2, 8], torch.float32, False)
                 with direct_compile.execution_mode.set_eager_mode(
-                    direct_compile.execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+                    direct_compile.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
                 ):
                     scores = value + weight
                     outputs = (

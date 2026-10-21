@@ -164,7 +164,7 @@ def process_mxfp4_moe_weights_bf16(
     torch.Tensor,  # w2_bias     (E, 1, hidden_N_padded)               fp32
 ]:
     """Dequantize HF GPT-OSS MXFP4 weights to **bf16** in gmm_v2's (g, k, n)
-    layout (the torchtpu-vllm "dequant at load" approach). Same layout as
+    layout (the vllm-torchtpu "dequant at load" approach). Same layout as
     :func:`process_mxfp4_moe_weights_native`
 
     ``padded_intermediate`` is ``N_int_padded``, the width each of gate and up

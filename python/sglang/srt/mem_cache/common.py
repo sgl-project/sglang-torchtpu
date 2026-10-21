@@ -10,6 +10,7 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
@@ -171,16 +172,28 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
-def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+def checkpoint_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, mid_prefill: bool = False
+) -> None:
     """Publish what the running request has computed so far, unless it is
-    barred from the tree."""
+    barred from the tree. ``mid_prefill`` marks a prefill chunk with more
+    chunks to come."""
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if req.skip_radix_cache_insert:
         return
+    start, end = req.extend_range.start, req.extend_range.end
+    stride = envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.get()
+    if (
+        mid_prefill
+        and stride > 0
+        and end // stride == start // stride
+        and tree_cache.defer_chunk_checkpoint(req)
+    ):
+        return
 
-    tree_cache.checkpoint(req, up_to=req.extend_range.end)
+    tree_cache.checkpoint(req, up_to=end)
 
 
 def evict_from_tree_cache(

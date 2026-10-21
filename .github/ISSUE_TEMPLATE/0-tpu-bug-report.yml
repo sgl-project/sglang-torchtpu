@@ -1,0 +1,65 @@
+name: 🐞 TPU bug report
+description: Report a bug in SGLang on TPU (torch_tpu backend).
+title: "[TPU][Bug] "
+labels: ['Bug', 'tpu']
+
+body:
+- type: checkboxes
+  attributes:
+    label: Checklist
+    options:
+      - label: I searched related issues but found no solution.
+      - label: The bug persists on the latest image or main.
+      - label: Issues without environment info and a minimal reproducible demo are hard to resolve and may receive no feedback.
+      - label: Please use English. Otherwise, it will be closed.
+- type: textarea
+  attributes:
+    label: Describe the bug
+    description: A clear, concise description of the bug, including the error message or wrong output.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Reproduction
+    description: The exact launch command and client request, and the model (with quantization) you served.
+    placeholder: |
+      python3 -m sglang.launch_server --model-path ... --tp 4 ...
+      curl http://localhost:30000/generate ...
+  validations:
+    required: true
+- type: input
+  attributes:
+    label: TPU chip and topology
+    description: Chip generation, chips per host, and number of hosts.
+    placeholder: e.g. TPU7x, 4 chips/host, 2 hosts (tp=16)
+  validations:
+    required: true
+- type: dropdown
+  attributes:
+    label: How did you install SGLang?
+    options:
+      - Docker image
+      - From source (this repo)
+      - Other
+  validations:
+    required: true
+- type: input
+  attributes:
+    label: Image tag or commit
+    description: The Docker image tag, or `git rev-parse HEAD` if you built from source.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Environment
+    description: |
+      Paste the output of:
+      `python3 -m pip list 2>/dev/null | grep -iE "^(sglang|torch|torch-tpu|torchvision|libtpu|jax|jaxlib|tpu-sync-torch|transformers) "`
+    render: text
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Server log
+    description: The server log around the failure. Include the first traceback, not only the last line.
+    render: text

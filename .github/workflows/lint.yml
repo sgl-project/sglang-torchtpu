@@ -41,6 +41,15 @@ jobs:
       - name: Test TPU CI registry loading without runtime dependencies
         run: python -E -S -B -m unittest discover -s .github/tpu-ci/tests -v
 
+      # Cookbook launch commands are generated from the TPU serving recipes;
+      # this catches a hand-edited block. The recipes are plain dicts, so no
+      # TPU and no runtime dependencies are needed.
+      - name: Check generated cookbook recipe blocks
+        run: |
+          python -E -S -B scripts/ci/tpu/render_recipe.py \
+            --check docs/cookbook/autoregressive/OpenAI/GPT-OSS.mdx \
+            --check docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx
+
       - name: Install pre-commit hook
         run: |
           python -m pip install pre-commit

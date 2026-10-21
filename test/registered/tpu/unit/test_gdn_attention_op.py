@@ -85,6 +85,151 @@ class TestGDNAttentionOp(CustomTestCase):
     D_V = 128
     K = 4
 
+    def test_speculative_checkpoints_and_resume(self):
+        """Verify checkpoints and rejection rollback match sequential decoding.
+
+        This runs through torch_tpu with JAX pinned to CPU, just like serving.
+        Both conv and recurrent state must resume from the selected checkpoint.
+        """
+        from sglang_tpu.attention_gdn_pallas import (
+            build_gdn_pallas_op,
+        )
+
+        op = build_gdn_pallas_op()
+        torch.manual_seed(17)
+        n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
+        width = 3
+        base = width
+        dim = 2 * n_kq * d_k + n_v * d_v
+        device = "tpu"
+
+        def tensor(shape):
+            return (torch.randn(shape) * 0.1).to(device)
+
+        weights = [tensor((dim, 1, kernel_size)), None, tensor((n_v,)), tensor((n_v,))]
+        qkv, b, a = tensor((width, dim)), tensor((width, n_v)), tensor((width, n_v))
+        conv = tensor((2 * width, kernel_size - 1, dim))
+        rec = tensor((2 * width, n_v, d_k, d_v))
+        # Keep reference snapshots on the host: donated TPU buffers must not
+        # share lazy clone storage across independent executions.
+        conv_initial, rec_initial = conv.cpu(), rec.cpu()
+        # Plain runs address the state row directly; verify runs pass the base
+        # of the checkpoint rows [width, 2 * width) and a per-sequence offset.
+        indices = torch.tensor([base], dtype=torch.int32, device=device)
+        window = torch.tensor([width], dtype=torch.int32, device=device)
+        distribution = torch.ones(3, dtype=torch.int32, device=device)
+
+        def table(offset):
+            return torch.tensor([offset], dtype=torch.int32, device=device)
+
+        def run(q, bb, aa, c, r, prefix, offset=None, num_spec_tokens=0):
+            count = q.shape[0]
+            spec = num_spec_tokens > 0
+            return op(
+                q,
+                bb,
+                aa,
+                c,
+                r,
+                *weights,
+                torch.tensor([0, count], dtype=torch.int32, device=device),
+                window if spec else indices,
+                distribution,
+                torch.tensor([prefix + count], dtype=torch.int32, device=device),
+                n_kq,
+                n_v,
+                d_k,
+                d_v,
+                kernel_size,
+                read_offsets=offset,
+                num_spec_tokens=num_spec_tokens,
+            )
+
+        output = run(qkv, b, a, conv, rec, 16, table(0), width - 1)
+        compiled_verify = torch.compile(
+            lambda q, bb, aa, c, r, offsets: run(
+                q, bb, aa, c, r, 16, offsets, width - 1
+            ),
+            backend="tpu",
+            fullgraph=True,
+        )
+        output_cpu = output.cpu()
+        compiled_conv = conv_initial.to(device, copy=True)
+        compiled_rec = rec_initial.to(device, copy=True)
+        compiled_output = compiled_verify(
+            qkv, b, a, compiled_conv, compiled_rec, table(0)
+        )
+        torch.testing.assert_close(
+            compiled_output.cpu(), output_cpu, rtol=2e-2, atol=2e-2
+        )
+        torch.testing.assert_close(
+            compiled_conv.cpu(), conv.cpu(), rtol=2e-2, atol=2e-2
+        )
+        torch.testing.assert_close(compiled_rec.cpu(), rec.cpu(), rtol=2e-2, atol=2e-2)
+        ref_conv = conv_initial.to(device, copy=True)
+        ref_rec = rec_initial.to(device, copy=True)
+        outputs, checkpoints = [], []
+        for step in range(width):
+            outputs.append(
+                run(
+                    qkv[step : step + 1],
+                    b[step : step + 1],
+                    a[step : step + 1],
+                    ref_conv,
+                    ref_rec,
+                    16 + step,
+                )
+            )
+            torch.testing.assert_close(
+                conv[base + step].cpu(), ref_conv[base].cpu(), rtol=2e-2, atol=2e-2
+            )
+            torch.testing.assert_close(
+                rec[base + step].cpu(), ref_rec[base].cpu(), rtol=2e-2, atol=2e-2
+            )
+            checkpoints.append((ref_conv.cpu(), ref_rec.cpu()))
+        torch.testing.assert_close(
+            output.cpu(), torch.cat(outputs).cpu(), rtol=2e-2, atol=2e-2
+        )
+        # The null group's state must remain untouched.
+        torch.testing.assert_close(conv[:base].cpu(), conv_initial[:base].cpu())
+        torch.testing.assert_close(rec[:base].cpu(), rec_initial[:base].cpu())
+
+        next_q, next_b, next_a = tensor((1, dim)), tensor((1, n_v)), tensor((1, n_v))
+        for offset in range(width):
+            with self.subTest(resume_checkpoint=offset):
+                resume_conv = conv.cpu().to(device, copy=True)
+                resume_rec = rec.cpu().to(device, copy=True)
+                expected_conv = checkpoints[offset][0].to(device, copy=True)
+                expected_rec = checkpoints[offset][1].to(device, copy=True)
+                actual = run(
+                    next_q,
+                    next_b,
+                    next_a,
+                    resume_conv,
+                    resume_rec,
+                    17 + offset,
+                    table(offset),
+                    width - 1,
+                )
+                expected = run(
+                    next_q, next_b, next_a, expected_conv, expected_rec, 17 + offset
+                )
+                torch.testing.assert_close(
+                    actual.cpu(), expected.cpu(), rtol=2e-2, atol=2e-2
+                )
+                torch.testing.assert_close(
+                    resume_conv[base].cpu(),
+                    expected_conv[base].cpu(),
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
+                torch.testing.assert_close(
+                    resume_rec[base].cpu(),
+                    expected_rec[base].cpu(),
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
+
     def test_op_registered_and_idempotent(self):
         from sglang_tpu.attention_gdn_pallas import (
             build_gdn_pallas_op,

@@ -42,6 +42,12 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+def _device_supports_input_scattered() -> bool:
+    """Devices --enable-attn-tp-input-scattered runs on: CUDA and NPU here;
+    an out-of-tree platform plugin opts in by hooking this function."""
+    return _is_cuda or _is_npu
+
+
 class AttentionInputs:
     def __init__(
         self,
@@ -91,7 +97,7 @@ class AttnTpContext:
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
             get_parallel().enable_attn_tp_input_scattered
-            and (_is_cuda or _is_npu)
+            and _device_supports_input_scattered()
             and q_lora_rank is not None
             and (is_mhc or not is_dsa)
             and get_parallel().tp_size > 1

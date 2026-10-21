@@ -1,11 +1,9 @@
 """GPT-OSS-20B (MXFP4 MoE) throughput config: tp8/ep8 on one tpu7x host, sized
 for one 8k1k sweep point at concurrency 16.
 
-accuracy.py in this directory owns HOW this model is served (tp8/ep8, the
-checkpoint's own mxfp4, the dynamo tracer with the overlap scheduler off, the
-SparseCore gather off); this file changes only what the measurement needs, so
-the number is the accuracy-serving config's, not the 120b lane's direct-tracer
-one.
+server.py owns how this model is served. This derives from accuracy.py instead,
+on purpose: the sweep measures the configuration the accuracy nightly scores,
+down to that lane's page size, mem fraction and tracer.
 
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/gpt_oss_20b/perf.py

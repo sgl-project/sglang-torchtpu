@@ -41,6 +41,11 @@ class RaidenFutureEvent:
 
     def __init__(self, future):
         self._future = future
+        # A poll past this raises like a blocking wait: the copy's pages can be
+        # neither reused nor released while it may still land.
+        self._poll_deadline = (
+            time.monotonic() + envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.get()
+        )
 
     def _raise_if_failed(self) -> None:
         """Surface a ready DMA's error; ``ok()`` is a non-blocking probe."""
@@ -52,6 +57,11 @@ class RaidenFutureEvent:
         if self._future is None:
             return True
         if not self._future.is_ready():
+            if time.monotonic() > self._poll_deadline:
+                raise TimeoutError(
+                    "raiden DMA still pending "
+                    f"{envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.get()}s after issue"
+                )
             return False
         self._raise_if_failed()
         return True

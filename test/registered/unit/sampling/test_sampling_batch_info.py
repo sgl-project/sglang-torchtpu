@@ -20,6 +20,7 @@ from sglang.srt.sampling.sampling_batch_info import (
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.sampler import sampling_params_to_device
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"
@@ -879,6 +880,479 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(entry.indices.dtype, torch.long)
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
+
+
+class TestHostSamplingMode(CustomTestCase):
+    """Scheduler row ownership must survive bucketing and overlap snapshots."""
+
+    def _host_info(self, size):
+        return _make_info(size, sampling_params_on_cpu=True)
+
+    def _sampler(self):
+        from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
+        from sglang_tpu.sampler import TpuSampler, _DeviceParamCache
+
+        # Exercise real sampling math without distributed CPU setup.
+        sampler = TpuSampler.__new__(TpuSampler)
+        torch.nn.Module.__init__(sampler)
+        sampler.rl_on_policy_target = None
+        sampler.enable_deterministic = True
+        sampler.use_log_softmax_logprob = False
+        sampler.use_ascend_backend = False
+        sampler.output_logprob_processor = OutputLogprobProcessor()
+        sampler._device_params = _DeviceParamCache()
+        return sampler
+
+    def test_parameter_uploads_follow_batch_composition(self):
+        """Uploads happen only when the sampled rows change.
+
+        Each upload is a fixed host launch per decode step; a stale reuse would
+        sample with another batch's parameters.
+        """
+        from unittest.mock import patch
+
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang_tpu import sampler as sampler_module
+
+        sampler = self._sampler()
+
+        def sample(info, physical_rows):
+            logits = torch.full((physical_rows, 8), -torch.inf)
+            logits[:, 2] = 0
+            size = len(info)
+            return sampler(
+                LogitsProcessorOutput(next_token_logits=logits),
+                info,
+                False,
+                [0] * size,
+                [[]] * size,
+                torch.arange(physical_rows),
+            )
+
+        with patch.object(
+            sampler_module, "_upload_params", wraps=sampler_module._upload_params
+        ) as upload:
+            greedy = self._host_info(3)
+            greedy.is_all_greedy = greedy.is_any_greedy = True
+            for _ in range(2):
+                tokens = sample(greedy, 4)
+                torch.testing.assert_close(tokens[:3], torch.full((3,), 2))
+            self.assertEqual(upload.call_count, 0)
+
+            sampled = self._host_info(3)
+            sample(sampled, 4)
+            sample(sampled, 4)
+            self.assertEqual(upload.call_count, 1)
+            sample(sampled, 8)  # A different physical extent needs new rows.
+            self.assertEqual(upload.call_count, 2)
+            sampled.filter_batch([2, 0], torch.empty(2, device="meta"))
+            sample(sampled, 2)
+            sample(sampled, 2)
+            self.assertEqual(upload.call_count, 3)
+            other = self._host_info(1)
+            other.temperatures = torch.full((1, 1), 0.5)
+            sampled.merge_batch(other)
+            uploaded = sampler._device_params.materialize(sampled, 4)
+            self.assertEqual(upload.call_count, 4)
+            self.assertEqual(uploaded.temperatures[:, 0].tolist(), [1.0, 1.0, 0.5, 1.0])
+            self.assertTrue(sampled.sampling_params_on_cpu)
+
+    def test_filter_merge_and_forward_snapshot_keep_logical_rows(self):
+        info = self._host_info(3)
+        info.temperatures = torch.tensor([[0.5], [0.7], [0.9]])
+        info.top_ks = torch.tensor([1, 5, 20], dtype=torch.int32)
+        info.top_ps = torch.tensor([1.0, 0.8, 0.9])
+        info.min_ps = torch.tensor([0.0, 0.1, 0.2])
+        info.sampling_seed = torch.tensor([42, 43, 44])
+        snapshot = info.copy_for_forward()
+        # Device row indices cannot be read: host filtering must use the list.
+        info.filter_batch([2, 0], torch.empty(2, device="meta", dtype=torch.int64))
+        other = self._host_info(1)
+        other.top_ks = torch.tensor([7], dtype=torch.int32)
+        other.sampling_seed = torch.tensor([99])
+        info.merge_batch(other)
+        uploaded = sampling_params_to_device(info)
+        self.assertFalse(uploaded.sampling_params_on_cpu)
+        self.assertTrue(info.sampling_params_on_cpu)
+        self.assertIs(sampling_params_to_device(uploaded), uploaded)
+        self.assertEqual(len(uploaded), 3)
+        self.assertEqual(uploaded.top_ks.tolist(), [20, 1, 7])
+        self.assertEqual(uploaded.sampling_seed.tolist(), [44, 42, 99])
+        self.assertEqual(snapshot.top_ks.tolist(), [1, 5, 20])
+        torch.testing.assert_close(uploaded.top_ps, torch.tensor([0.9, 1.0, 1.0]))
+        torch.testing.assert_close(uploaded.min_ps, torch.tensor([0.2, 0.0, 0.0]))
+        uploaded.temperatures.zero_()
+        self.assertGreater(info.temperatures.sum().item(), 0)
+
+    def test_transfers_keep_requested_rows_without_device_slices(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        for size in (0, 1, 3, 4, 5):
+            with self.subTest(size=size):
+                info = self._host_info(size)
+                info.device = "meta"
+                shapes = []
+                device_slices = []
+
+                class ObserveCopies(TorchDispatchMode):
+                    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                        if func == torch.ops.aten._to_copy.default:
+                            shapes.append(args[0].shape[0])
+                        if (
+                            func == torch.ops.aten.slice.Tensor
+                            and args[0].device.type == "meta"
+                        ):
+                            device_slices.append(args[0].shape)
+                        return func(*args, **(kwargs or {}))
+
+                padded_size = 1 << max(size - 1, 0).bit_length()
+                with ObserveCopies():
+                    uploaded = sampling_params_to_device(info, padded_size=padded_size)
+                self.assertEqual(shapes, [padded_size] * 4)
+                self.assertEqual(len(uploaded), padded_size)
+                self.assertEqual(device_slices, [])
+                self.assertEqual(info.temperatures.device.type, "cpu")
+
+    def test_sampler_keeps_bucket_rows_until_tokens_are_selected(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        sampler = self._sampler()
+
+        for greedy, global_top_k, filtered in (
+            (True, False, False),
+            (False, False, False),
+            (False, False, True),
+            (False, True, False),
+        ):
+            for size in (1, 3, 5):
+                with self.subTest(greedy=greedy, global_top_k=global_top_k, size=size):
+                    info = self._host_info(size)
+                    info.is_all_greedy = greedy
+                    info.is_any_greedy = greedy
+                    info.need_top_k_sampling = filtered
+                    info.need_top_p_sampling = filtered
+                    info.need_min_p_sampling = filtered
+                    info.temperatures = torch.arange(1, size + 1).float()[:, None]
+                    info.top_ks.fill_(1)
+                    physical_rows = 8  # Fixed prefill cap, not the live-row bucket.
+                    logits = torch.full((physical_rows, 8), -torch.inf)
+                    logits[:, 2] = 0
+                    if global_top_k:
+                        # The only finite candidate is column zero; candidate
+                        # IDs differ by row to detect row reordering or ghosts.
+                        output = LogitsProcessorOutput(
+                            next_token_logits=None,
+                            next_token_global_top_k_logits=torch.zeros(
+                                physical_rows, 1
+                            ),
+                            next_token_global_top_k_token_ids=torch.arange(
+                                physical_rows
+                            )[:, None],
+                        )
+                        expected = torch.arange(size)
+                    else:
+                        output = LogitsProcessorOutput(next_token_logits=logits)
+                        expected = torch.full((size,), 2)
+                    reductions = []
+                    repads = []
+
+                    class ObserveSampling(TorchDispatchMode):
+                        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                            if func == torch.ops.aten.cat.default:
+                                repads.append(func)
+                            if func in (
+                                torch.ops.aten.argmax.default,
+                                torch.ops.aten._softmax.default,
+                            ):
+                                reductions.append(args[0].shape[0])
+                            return func(*args, **(kwargs or {}))
+
+                    with ObserveSampling():
+                        actual = sampler(
+                            output,
+                            info,
+                            False,
+                            [0] * size,
+                            [[]] * size,
+                            torch.arange(size),
+                        )
+                    self.assertEqual(actual.shape, (physical_rows,))
+                    torch.testing.assert_close(actual.cpu()[:size], expected)
+                    self.assertTrue(reductions)
+                    self.assertEqual(set(reductions), {physical_rows})
+                    self.assertEqual(repads, [])
+                    self.assertEqual(len(info), size)
+                    self.assertTrue(info.sampling_params_on_cpu)
+                    original_logits = (
+                        output.next_token_global_top_k_logits
+                        if global_top_k
+                        else output.next_token_logits
+                    )
+                    self.assertEqual(original_logits.shape[0], physical_rows)
+
+    def test_non_spec_padding_eligibility_preserves_auxiliary_contracts(self):
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from sglang.srt.runtime_context import get_context
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            Qwen3VLDecoderTpuCompilePolicy,
+        )
+        from sglang_tpu.envs import envs
+
+        runtime = get_context().override_server_args(
+            tp_size=1, pp_size=1, enable_mixed_chunk=False
+        )
+        runtime.install()
+        self.addCleanup(runtime.restore)
+        info = self._host_info(3)
+        config = SimpleNamespace(
+            is_generation=True,
+            use_ngram_embedding=False,
+            use_engram=False,
+            is_encoder_decoder=False,
+        )
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=SimpleNamespace(model_config=config)
+        )
+        batch = SimpleNamespace(
+            sampling_info=info,
+            spec_info=None,
+            seq_lens=torch.ones(3),
+            forward_mode=ForwardMode.DECODE,
+            is_prefill_only=False,
+            return_logprob=False,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_pooled_hidden_states=False,
+            return_hidden_states_before_norm=False,
+        )
+        with envs.SGLANG_TPU_HOST_PADDING.override(True):
+            self.assertTrue(policy.keep_outputs_padded(batch))
+            batch._tpu_real_b = 3
+            batch.seq_lens = torch.ones(8)
+            self.assertTrue(policy.keep_outputs_padded(batch))
+            for obj, field, value in (
+                (batch, "return_logprob", True),
+                (batch, "is_prefill_only", True),
+                (batch, "capture_hidden_mode", CaptureHiddenMode.FULL),
+                (batch, "spec_info", object()),
+                (batch, "_tpu_real_b", 4),  # beam tail before padding
+                (info, "sampling_params_on_cpu", False),
+                (info, "grammars", [object()]),
+                (info, "logit_bias", torch.zeros(3, 8)),
+                (info, "has_custom_logit_processor", True),
+                (info, "acc_additive_penalties", torch.zeros(3, 8)),
+                (info, "sampling_mask_batch_indices", torch.tensor([1])),
+                (config, "use_ngram_embedding", True),
+            ):
+                with self.subTest(field=field):
+                    previous = getattr(obj, field)
+                    setattr(obj, field, value)
+                    self.assertFalse(policy.keep_outputs_padded(batch))
+                    setattr(obj, field, previous)
+        with envs.SGLANG_TPU_HOST_PADDING.override(False):
+            self.assertFalse(policy.keep_outputs_padded(batch))
+
+    def test_seeded_bucket_sampling_matches_live_rows(self):
+        from dataclasses import replace
+
+        from sglang.srt.layers import sampler as sampler_module
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        # Test seeded math eagerly; CPU Inductor requires Python development
+        # headers, which are not part of the unit-test runtime contract.
+        compiled_draw = sampler_module.multinomial_with_seed
+        eager_draw = compiled_draw._torchdynamo_orig_callable
+        seed_patch = patch.object(sampler_module, "multinomial_with_seed", eager_draw)
+        seed_patch.start()
+        self.addCleanup(seed_patch.stop)
+
+        def cpu_hash(seed, positions, columns):
+            # Replace only the native hash kernel (sgl_kernel on CPU). The
+            # fixture depends on every input, so seed/position row misalignment
+            # changes the draw. Distributional validation belongs on hardware.
+            self.assertEqual(seed.shape, positions.shape)
+            return (
+                seed.to(torch.int64)[:, None] * 1000003
+                + positions[:, None] * 9176
+                + columns[None, :] * 2654435761
+            ) & 0xFFFFFFFF
+
+        hash_patch = patch.object(sampler_module, "murmur_hash32", cpu_hash)
+        hash_patch.start()
+        self.addCleanup(hash_patch.stop)
+        sampler = self._sampler()
+        info = self._host_info(3)
+        info.sampling_seed = torch.tensor([42, 7, 123])
+        info.temperatures = torch.tensor([[0.5], [1.0], [1.5]])
+        logits = torch.arange(24).reshape(3, 8).float() / 8
+        positions = torch.tensor([10, 20, 30])
+        for filtered in (False, True):
+            with self.subTest(filtered=filtered):
+                info.need_top_k_sampling = filtered
+                info.need_top_p_sampling = filtered
+                # The existing reference sampler rejects seeded min-p.
+                info.need_min_p_sampling = False
+                info.top_ks = torch.tensor([2, 3, 4], dtype=torch.int32)
+                info.top_ps = torch.tensor([0.8, 0.9, 1.0])
+                info.min_ps = torch.tensor([0.0, 0.1, 0.2])
+                expected = sampler(
+                    LogitsProcessorOutput(next_token_logits=logits.clone()),
+                    replace(info, sampling_params_on_cpu=False),
+                    False,
+                    [0] * 3,
+                    [[]] * 3,
+                    positions,
+                )
+                actual = sampler(
+                    LogitsProcessorOutput(
+                        next_token_logits=torch.nn.functional.pad(logits, (0, 0, 0, 5))
+                    ),
+                    info,
+                    False,
+                    [0] * 3,
+                    [[]] * 3,
+                    torch.nn.functional.pad(positions, (0, 5)),
+                )
+                self.assertEqual(actual.shape, (8,))
+                torch.testing.assert_close(actual.cpu()[:3], expected)
+
+    def test_logprobs_and_custom_processors_preserve_live_row_contract(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        sampler = self._sampler()
+        for custom in (False, True):
+            with self.subTest(custom=custom):
+                info = self._host_info(3)
+                info.is_all_greedy = True
+                if custom:
+                    info.has_custom_logit_processor = True
+                    info.custom_params = [{"token_ids": [3]}] * 3
+                    info.custom_logit_processor = {
+                        0: ProcessorEntry(
+                            DisallowedTokensLogitsProcessor(),
+                            [0, 1, 2],
+                            torch.arange(3),
+                        )
+                    }
+                logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]]).repeat(3, 1)
+                output = LogitsProcessorOutput(next_token_logits=logits)
+                actual = sampler(
+                    output, info, not custom, [0] * 3, [[]] * 3, torch.arange(3)
+                )
+                torch.testing.assert_close(actual, torch.full((3,), 2 if custom else 3))
+                self.assertEqual(output.next_token_logits.shape, (3, 4))
+                if not custom:
+                    torch.testing.assert_close(
+                        output.next_token_logprobs,
+                        torch.log_softmax(logits, dim=-1)[:, 3],
+                    )
+
+    def test_factory_hook_selects_host_storage_only_for_non_spec_tpu_sampling(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.plugins.hook_registry import (
+            HookRegistry,
+            HookType,
+            _propagate_patch,
+        )
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.envs import envs
+        from sglang_tpu.hooks.host_padding import sampling_from_batch
+        from sglang_tpu.host_padding import _can_stage_forward_metadata
+
+        override = get_context().override_server_args(sampling_backend="tpu")
+        override.install()
+        self.addCleanup(override.restore)
+        target = "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch"
+        raw = vars(SamplingBatchInfo)["from_schedule_batch"]
+        original = SamplingBatchInfo.from_schedule_batch
+        HookRegistry._apply_target(
+            target, [(HookType.AROUND, sampling_from_batch, None)]
+        )
+        wrapped = SamplingBatchInfo.from_schedule_batch
+
+        def restore():
+            SamplingBatchInfo.from_schedule_batch = raw
+            _propagate_patch(wrapped, original, SamplingBatchInfo)
+
+        self.addCleanup(restore)
+        batch = ScheduleBatch(
+            device="cpu",
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            reqs=[
+                SimpleNamespace(
+                    sampling_params=SamplingParams(temperature=0.7, top_k=5, top_p=0.8),
+                    custom_logit_processor=None,
+                    return_sampling_mask=False,
+                )
+            ],
+        )
+        batch.model_config = SimpleNamespace(
+            is_generation=True,
+            is_multimodal=False,
+            is_encoder_decoder=False,
+            use_ngram_embedding=False,
+            use_engram=False,
+        )
+        batch.prefill_input_ids_cpu = torch.tensor([1, 2, 3])
+        # Exercise all four combinations; neither mode may imply the other.
+        for host_sampling in (False, True):
+            for host_inputs in (False, True):
+                mode = get_context().override_server_args(
+                    sampling_backend="tpu" if host_sampling else "pytorch",
+                    enable_torch_compile=host_inputs,
+                    enable_mixed_chunk=False,
+                )
+                mode.install()
+                try:
+                    with envs.SGLANG_TPU_HOST_PADDING.override(True):
+                        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                        self.assertEqual(info.sampling_params_on_cpu, host_sampling)
+                        self.assertEqual(
+                            _can_stage_forward_metadata(batch), host_inputs
+                        )
+                finally:
+                    mode.restore()
+        with envs.SGLANG_TPU_HOST_PADDING.override(True):
+            info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+            self.assertIs(type(info), SamplingBatchInfo)
+            self.assertTrue(info.sampling_params_on_cpu)
+            self.assertEqual(info.top_ks.tolist(), [5])
+            torch.testing.assert_close(info.top_ps, torch.tensor([0.8]))
+            batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+            self.assertFalse(
+                SamplingBatchInfo.from_schedule_batch(
+                    batch, VOCAB_SIZE
+                ).sampling_params_on_cpu
+            )
+        batch.spec_algorithm = SpeculativeAlgorithm.NONE
+        with envs.SGLANG_TPU_HOST_PADDING.override(False):
+            self.assertFalse(
+                SamplingBatchInfo.from_schedule_batch(
+                    batch, VOCAB_SIZE
+                ).sampling_params_on_cpu
+            )
+
+    def test_merge_rejects_incompatible_modes_before_mutating(self):
+        info = self._host_info(2)
+        other = _make_info(1)
+        with self.assertRaisesRegex(ValueError, "storage modes"):
+            info.merge_batch(other)
+        self.assertEqual(len(info), 2)
+        info.penalizer_orchestrator.merge.assert_not_called()
+
+    def test_penalties_use_logits_device_when_parameters_are_on_host(self):
+        info = self._host_info(3)
+        info.device = "meta"
+        info.penalizer_orchestrator.is_required = True
+        info.update_penalties()
+        self.assertEqual(info.acc_additive_penalties.device.type, "meta")
+        self.assertEqual(info.acc_additive_penalties.shape, (3, VOCAB_SIZE))
 
 
 if __name__ == "__main__":
