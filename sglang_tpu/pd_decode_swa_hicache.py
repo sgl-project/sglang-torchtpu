@@ -149,21 +149,24 @@ def _validate_full_only_host_cache_config(
         ),
         (page_size > 1, "--page-size must be > 1 for the page-aligned SWA tail"),
         (
-            spec_algorithm.is_none()
-            or spec_algorithm.is_eagle3()
-            or spec_algorithm.is_dflash(),
-            "Only EAGLE3 and DFlash are supported for speculative decoding in this mode",
+            spec_algorithm.supports_pd_decode_swa_hicache(),
+            f"speculative algorithm {spec_algorithm.name} is not supported in this mode",
         ),
-        # Draft KV reaches RAM only through upstream's draft sidecar pool. A
-        # packed draft lives inside the full KV pool, which this build does
-        # not lay out for.
+        # EAGLE3 and DFlash draft KV reaches RAM through upstream's draft sidecar pool.
         (
-            spec_algorithm.is_none()
+            not (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash())
             or (
                 hicache_draft_plan is not None
                 and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
             ),
-            "Draft KV must use the HiCache draft sidecar",
+            "EAGLE3 and DFlash draft KV must use the HiCache draft sidecar",
+        ),
+        # A packed draft lives inside the full KV pool, which this build does
+        # not lay out for.
+        (
+            hicache_draft_plan is None
+            or hicache_draft_plan.mode != HiCacheDraftMode.PACKED,
+            "A packed draft KV pool is not supported",
         ),
         # Upstream auto-sizes the host pool for it, and so would this build.
         (

@@ -57,6 +57,8 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_swa_hicache as tpu
 from sglang_tpu.raiden_hybrid_cache_controller import TpuRaidenHybridCacheController
@@ -191,9 +193,23 @@ def make_ctx():
 
 
 def spec(*, eagle3=False, dflash=False, none=False):
-    return SimpleNamespace(
-        is_none=lambda: none, is_eagle3=lambda: eagle3, is_dflash=lambda: dflash
-    )
+    if none:
+        return SpeculativeAlgorithm.NONE
+    if eagle3:
+        return SpeculativeAlgorithm.EAGLE3
+    if dflash:
+        return SpeculativeAlgorithm.DFLASH
+    return SpeculativeAlgorithm.EAGLE
+
+
+class _OptedInSpec(CustomSpecAlgo):
+    def supports_pd_decode_swa_hicache(self) -> bool:
+        return True
+
+
+def plugin_spec(*, opted_in):
+    cls = _OptedInSpec if opted_in else CustomSpecAlgo
+    return cls("PLUGIN", factory=MagicMock())
 
 
 def real_swa_cache(*, is_eagle=False):
@@ -360,11 +376,67 @@ class TestCacheConstruction(CustomTestCase):
             tpu._build_kv_cache(upstream_build, **build_kwargs())
         self.assertFalse(tpu._is_building_full_only_host_cache)
 
+    def test_builtin_algorithms_accepted(self):
+        accepted = {
+            algo
+            for algo in SpeculativeAlgorithm
+            if algo.supports_pd_decode_swa_hicache()
+        }
+        self.assertEqual(
+            accepted,
+            {
+                SpeculativeAlgorithm.NONE,
+                SpeculativeAlgorithm.EAGLE3,
+                SpeculativeAlgorithm.DFLASH,
+            },
+        )
+
+    def test_opted_in_plugin_algorithm_builds(self):
+        cache = MagicMock()
+
+        def upstream_build(**kwargs):
+            mark_full_only(cache)
+            return tpu._create_tree_cache(lambda ctx: cache, make_ctx())
+
+        with (
+            patch(TPU + ".get_disagg", return_value=disagg()),
+            patch(TPU + ".get_memory", return_value=memory()),
+            patch(TPU + ".auto_size_hicache"),
+        ):
+            built = tpu._build_kv_cache(
+                upstream_build,
+                **build_kwargs(spec_algorithm=plugin_spec(opted_in=True)),
+            )
+        self.assertIs(built, cache)
+
     def test_unsupported_configs_are_rejected(self):
         for overrides, mem, dis, tree_core, reason in (
             ({"page_size": 1}, {}, {}, "python", "page-size"),
             # MTP and the other drafts are not validated in this mode.
-            ({"spec_algorithm": spec()}, {}, {}, "python", "Only EAGLE3 and DFlash"),
+            (
+                {"spec_algorithm": spec()},
+                {},
+                {},
+                "python",
+                "speculative algorithm .* is not supported",
+            ),
+            (
+                {"spec_algorithm": plugin_spec(opted_in=False)},
+                {},
+                {},
+                "python",
+                "speculative algorithm .* is not supported",
+            ),
+            (
+                {
+                    "spec_algorithm": plugin_spec(opted_in=True),
+                    "hicache_draft_plan": SimpleNamespace(mode=HiCacheDraftMode.PACKED),
+                },
+                {},
+                {},
+                "python",
+                "packed",
+            ),
             # Draft KV reaches RAM only as upstream's draft sidecar.
             ({"spec_algorithm": spec(eagle3=True)}, {}, {}, "python", "sidecar"),
             ({"spec_algorithm": spec(dflash=True)}, {}, {}, "python", "sidecar"),

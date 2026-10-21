@@ -114,6 +114,9 @@ class CustomSpecAlgo:
     def supports_tpu_direct_compile(self) -> bool:
         return False
 
+    def supports_pd_decode_swa_hicache(self) -> bool:
+        return False
+
     def supports_kv_free_fence(self, *, copies_draft_tail: bool) -> bool:
         # Whether some tensor a forward's result copies to host is computed
         # after the forward's last KV write.
