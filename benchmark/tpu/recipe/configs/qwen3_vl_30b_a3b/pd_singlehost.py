@@ -54,6 +54,9 @@ _COMMON_CONFIG = {
         "mm_process_config": MM_PROCESS_CONFIG,
         # The ViT and decoder graph captures outlast the 300s default.
         "watchdog_timeout": 3600,
+        # As in the single-host recipe: direct tracing compiles the ViT and
+        # decoder warmups concurrently instead of one after another.
+        "tpu_compile_tracer": "direct",
         # The sampler every TPU P/D gate pins (pd_reshard_harness.py notes the
         # distributed top-k crash behind it). Greedy decoding picks the argmax
         # token with either sampler.

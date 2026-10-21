@@ -28,7 +28,7 @@ register_tpu_ci(
     est_time=3600,
     suite="tpu-integration",
     nightly=True,
-    labels=["singlehost", "qwen3-vl-30b-a3b", "pd", "moe", "multimodal"],
+    labels=["singlehost", "qwen3-vl-30b-a3b", "pd", "multimodal", "compile-tracer"],
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -77,6 +77,7 @@ RETRACTION_BACKUP = "cpu_tensor"
 # Must match the recipe: the decode engine processes each request's images
 # again, and a different cap there changes the prompt length it expects.
 MM_PROCESS_CONFIG = {"image": {"min_pixels": 65536, "max_pixels": 313600}}
+COMPILE_TRACER = "direct"
 
 # The single-host gate, unchanged, so the two scores compare directly.
 MMMU_GATE = {
@@ -145,6 +146,11 @@ def engine_configuration_failures(
             failures.append(
                 f"{role} reports nnodes={info.get('nnodes')!r}, expected "
                 f"{HOSTS_PER_ENGINE}"
+            )
+        if info.get("tpu_compile_tracer") != COMPILE_TRACER:
+            failures.append(
+                f"{role} reports tpu_compile_tracer="
+                f"{info.get('tpu_compile_tracer')!r}, expected {COMPILE_TRACER!r}"
             )
         if info.get("mm_process_config") != MM_PROCESS_CONFIG:
             failures.append(
@@ -288,6 +294,12 @@ class TestPdSingleHostQwen3Vl30bA3bConfiguration(unittest.TestCase):
             # accepts the spaces json.dumps adds.
             flag = plan["command"].index("--mm-process-config")
             self.assertEqual(json.loads(plan["command"][flag + 1]), MM_PROCESS_CONFIG)
+
+    def test_both_engines_trace_with_direct_compile(self) -> None:
+        # The gate must exercise the tracer the recipes serve with; a dynamo
+        # engine would hide a direct-only compile failure behind a pass.
+        for plan in self.plans.values():
+            self.assertEqual(plan["server_args"]["tpu_compile_tracer"], COMPILE_TRACER)
 
     def test_bf16_checkpoint_is_served_unquantized(self) -> None:
         for plan in self.plans.values():
