@@ -29,6 +29,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     draft_uses_compressed_kv_attention,
     resolve_runtime_config,
 )
+from sglang_tpu.experimental.models.dspark import run_markov_block
 from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftLattice,
     DraftSampler,
@@ -96,7 +97,8 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
             base_logits, _ = draft_model.compute_base_logits(
                 draft_hidden.reshape(bs * self.num_drafts, -1)
             )
-        draft_tokens, draft_logits = draft_model.markov_head.sample_block(
+        draft_tokens, draft_logits = run_markov_block(
+            draft_model.markov_head,
             base_logits.view(bs, self.num_drafts, -1),
             first_prev_tokens=bonus_tokens,
             hidden_states=draft_hidden,
