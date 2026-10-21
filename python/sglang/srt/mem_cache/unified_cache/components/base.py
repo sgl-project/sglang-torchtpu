@@ -171,11 +171,12 @@ class TreeComponent(ABC):
     def _refresh_session_partition(self, node: UnifiedTreeNode) -> None:
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
+        # A session-coverage change repositions the node; it is not a use.
         if lru.in_list(node):
-            lru.reset_node_mru(node)
+            lru.reset_node_mru(node, is_use=False)
         host_lru = self.tree_core.host_lru_lists[ct]
         if host_lru.in_list(node):
-            host_lru.reset_node_mru(node)
+            host_lru.reset_node_mru(node, is_use=False)
 
     def _find_reusable_session_leaf(
         self, node: Optional[UnifiedTreeNode]
