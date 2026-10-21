@@ -9,7 +9,8 @@ to host RAM:
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
 - A request that reuses pages of an unfinished RAM restore waits for it.
-- With EAGLE3, the draft KV goes to RAM together with the full-attention KV.
+- With EAGLE3, or DFlash/DSpark on the experimental worker, the draft KV goes
+  to RAM together with the full-attention KV.
 
 ``install()`` wraps a few upstream functions and registers a host stack
 strategy. Each behaves exactly like upstream unless the decode cache is one of
@@ -53,6 +54,8 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang_tpu.experimental import is_experimental_spec_worker
 from sglang_tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
@@ -123,7 +126,7 @@ def _should_use_full_only_host_cache(
 def _validate_full_only_host_cache_config(
     *,
     page_size: int,
-    spec_algorithm: Any,
+    spec_algorithm: SpeculativeAlgorithm,
     hicache_draft_plan: Optional[HiCacheDraftPlan],
 ) -> None:
     """Raise for settings the full-only cache does not support."""
@@ -142,9 +145,14 @@ def _validate_full_only_host_cache_config(
             "--hicache-storage-backend (L3) restores are not supported",
         ),
         (page_size > 1, "--page-size must be > 1 for the page-aligned SWA tail"),
+        # Block-draft KV at i reads only tokens up to i and is written for every
+        # committed token, so unigram keys fit; core's DFlash worker is untested.
         (
-            spec_algorithm.is_none() or spec_algorithm.is_eagle3(),
-            "Only EAGLE3 is supported for speculative decoding in this mode",
+            spec_algorithm.is_none()
+            or spec_algorithm.is_eagle3()
+            or is_experimental_spec_worker(spec_algorithm),
+            "speculative decoding supports only EAGLE3, or DFLASH/DSPARK with "
+            "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1",
         ),
         # Draft KV reaches RAM only through upstream's draft sidecar pool. A
         # packed draft lives inside the full KV pool, which this build does
@@ -155,7 +163,7 @@ def _validate_full_only_host_cache_config(
                 hicache_draft_plan is not None
                 and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
             ),
-            "EAGLE3 draft KV must use the HiCache draft sidecar",
+            "draft KV must use the HiCache draft sidecar",
         ),
         # Upstream auto-sizes the host pool for it, and so would this build.
         (
@@ -177,7 +185,7 @@ def _build_kv_cache(
     enable_hierarchical_cache: bool,
     tp_worker: Any,
     page_size: int,
-    spec_algorithm: Any,
+    spec_algorithm: SpeculativeAlgorithm,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     **other_kwargs,
 ):
@@ -268,7 +276,7 @@ def _build_full_only_host_stack(
     Like ``build_hybrid_swa_stack`` without the SWA pool, so the full pool gets the
     whole host budget.
     """
-    # EAGLE3 draft KV registers as a sidecar after this build, never packed.
+    # Draft KV registers as a sidecar after this build, never packed.
     assert not params.mtp_draft_device_pools, "packed MTP draft KV is not supported"
     full_layer_mapping, swa_layer_mapping = hybrid_pool_assembler._swa_layer_mappings(
         kvcache

@@ -56,8 +56,10 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_swa_hicache as tpu
+from sglang_tpu.envs import envs as tpu_envs
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
 BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
@@ -186,10 +188,6 @@ def make_ctx():
     )
 
 
-def spec(*, eagle3=False, none=False):
-    return SimpleNamespace(is_none=lambda: none, is_eagle3=lambda: eagle3)
-
-
 def real_swa_cache(*, is_eagle=False):
     """A real FULL + SWA unified tree over mocked pools, without HiCache."""
     allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
@@ -219,7 +217,7 @@ def build_kwargs(**overrides):
         enable_hierarchical_cache=True,
         tp_worker=SimpleNamespace(is_hybrid_swa=True),
         page_size=64,
-        spec_algorithm=spec(none=True),
+        spec_algorithm=SpeculativeAlgorithm.NONE,
         hicache_draft_plan=None,
     )
     kwargs.update(overrides)
@@ -315,12 +313,49 @@ class TestCacheConstruction(CustomTestCase):
             tpu._build_kv_cache(
                 upstream_build,
                 **build_kwargs(
-                    spec_algorithm=spec(eagle3=True), hicache_draft_plan=draft_plan
+                    spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+                    hicache_draft_plan=draft_plan,
                 ),
             )
         auto_size.assert_called_once_with(ctx.params, draft_plan, enabled=True)
         register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
         self.assertIsNone(tpu._building_draft_plan)
+
+    def test_block_drafts_need_the_experimental_worker_and_a_sidecar(self):
+        # The experimental block worker keeps draft KV for every cached token;
+        # core's DFlash worker is not validated with this cache.
+        sidecar = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
+        packed = SimpleNamespace(mode=HiCacheDraftMode.PACKED)
+        for algorithm, experimental, draft_plan, error in (
+            (SpeculativeAlgorithm.DFLASH, True, sidecar, None),
+            (SpeculativeAlgorithm.DSPARK, True, sidecar, None),
+            (SpeculativeAlgorithm.DFLASH, False, sidecar, "EXPERIMENTAL_SPEC_WORKER"),
+            (SpeculativeAlgorithm.DSPARK, False, sidecar, "EXPERIMENTAL_SPEC_WORKER"),
+            (SpeculativeAlgorithm.DFLASH, True, None, "sidecar"),
+            (SpeculativeAlgorithm.DSPARK, True, packed, "sidecar"),
+        ):
+            with (
+                self.subTest(f"{algorithm.name} {experimental=} {draft_plan=}"),
+                patch(TPU + ".get_disagg", return_value=disagg()),
+                patch(TPU + ".get_memory", return_value=memory()),
+                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(
+                    experimental
+                ),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            ):
+                upstream = MagicMock()
+                kwargs = build_kwargs(
+                    spec_algorithm=algorithm, hicache_draft_plan=draft_plan
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        tpu._build_kv_cache(upstream, **kwargs)
+                    upstream.assert_not_called()
+                    continue
+                tpu._build_kv_cache(upstream, **kwargs)
+                call = upstream.call_args.kwargs
+                self.assertFalse(call["enable_hierarchical_cache"])
+                self.assertIs(call["hicache_draft_plan"], sidecar)
 
     def test_full_only_build_requires_the_full_only_stack(self):
         # E.g. a cache type the SWA host strategy does not build.
@@ -354,13 +389,25 @@ class TestCacheConstruction(CustomTestCase):
     def test_unsupported_configs_are_rejected(self):
         for overrides, mem, dis, tree_core, reason in (
             ({"page_size": 1}, {}, {}, "python", "page-size"),
-            # DFlash and the other drafts are not validated in this mode.
-            ({"spec_algorithm": spec()}, {}, {}, "python", "Only EAGLE3"),
+            # NGRAM and the other drafts are not validated in this mode.
+            (
+                {"spec_algorithm": SpeculativeAlgorithm.NGRAM},
+                {},
+                {},
+                "python",
+                "supports only EAGLE3",
+            ),
             # EAGLE3 draft KV reaches RAM only as upstream's draft sidecar.
-            ({"spec_algorithm": spec(eagle3=True)}, {}, {}, "python", "sidecar"),
+            (
+                {"spec_algorithm": SpeculativeAlgorithm.EAGLE3},
+                {},
+                {},
+                "python",
+                "sidecar",
+            ),
             (
                 {
-                    "spec_algorithm": spec(eagle3=True),
+                    "spec_algorithm": SpeculativeAlgorithm.EAGLE3,
                     "hicache_draft_plan": SimpleNamespace(mode=HiCacheDraftMode.PACKED),
                 },
                 {},
