@@ -280,9 +280,12 @@ def _chain_unsupported_reason(
         and cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
     ):
         return "needs --speculative-num-draft-tokens = --speculative-num-steps + 1"
+    # The chain worker drives no adaptive controller, so it would ignore the flag.
+    if cfg.speculative_adaptive:
+        return "does not support adaptive speculation"
     if algorithm.is_eagle3():
-        if cfg.enable_multi_layer_eagle or cfg.speculative_adaptive:
-            return "does not support multi-layer or adaptive EAGLE3"
+        if cfg.enable_multi_layer_eagle:
+            return "does not support multi-layer EAGLE3"
         return _eagle3_draft_unsupported_reason(server_args)
     if _is_mtp(algorithm):
         return _mtp_draft_unsupported_reason(server_args)

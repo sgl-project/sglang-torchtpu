@@ -545,14 +545,14 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 dict(enable_multi_layer_eagle=True),
                 {},
                 {},
-                "multi-layer or adaptive",
+                "multi-layer EAGLE3",
             ),
             (
                 "EAGLE3",
                 dict(speculative_adaptive=True),
                 {},
                 {},
-                "multi-layer or adaptive",
+                "adaptive speculation",
             ),
             (
                 "EAGLE3",
@@ -679,6 +679,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 {},
                 "num-draft-tokens",
             ),
+            (dict(speculative_adaptive=True), {}, "adaptive speculation"),
         ]
 
     def test_nextn_uses_the_chain_worker_only_where_it_is_supported(self):
