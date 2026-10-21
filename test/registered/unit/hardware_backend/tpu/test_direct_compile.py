@@ -311,9 +311,6 @@ class TestDirectCompile(CustomTestCase):
                 warmup_compiled_op(fail, value)
             self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
 
-        with self.assertRaisesRegex(ValueError, "explicit RNG inputs"):
-            compiled_op(spmd_safe=True, uses_rng=True)
-
     def test_cold_call_and_synchronous_mode_return_real_results(self):
         def compile_helper(fn, **kwargs):
             compiled = MagicMock(side_effect=fn)
@@ -325,7 +322,10 @@ class TestDirectCompile(CustomTestCase):
 
         with (
             patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
-            patch.object(direct_compile, "direct_compile", side_effect=compile_helper),
+            patch(
+                "sglang.srt.compilation.compiled_op.direct_compile",
+                new=compile_helper,
+            ),
             get_context().override_server_args(tpu_compile_tracer="direct"),
             envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
         ):

@@ -72,8 +72,7 @@ def test_compiled_op_imports_and_runs_without_jax():
         torch.testing.assert_close(helper(x), x + 1)
 
 
-@pytest.mark.parametrize("spmd_safe", (False, True))
-def test_compiled_op_accepts_custom_ops(spmd_safe):
+def test_compiled_op_accepts_custom_ops():
     module_path = importlib.util.find_spec("sglang.srt.compilation.compiled_op").origin
     module = runpy.run_path(module_path)
 
@@ -82,7 +81,7 @@ def test_compiled_op_accepts_custom_ops(spmd_safe):
         return x * 2
 
     x = torch.tensor([1, 2])
-    op = module["compiled_op"](spmd_safe=spmd_safe, warmup=lambda _: (x,))(scale)
+    op = module["compiled_op"](warmup=lambda _: (x,))(scale)
     assert module["_compiled_ops"]["compiled_op_test::scale"].op is op
     assert module["warmup_compiled_op"](op, x) is None
     assert torch.equal(op(x), x * 2)

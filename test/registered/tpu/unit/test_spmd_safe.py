@@ -18,8 +18,6 @@ from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayou
 from torch_tpu._internal.distributed import tpu_distributed  # noqa: F401
 from torch_tpu._internal.utils import hardware
 
-from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -99,17 +97,7 @@ class TestSPMDSafe(CustomTestCase):
                         sorted(w["rank"] for w in workers), list(range(world_size))
                     )
                     for record in workers:
-                        if mode == "matching":
-                            self.assertEqual(len(record["keys"]), 2)
-                            self.assertIn(_KEY, record["keys"])
-                            self.assertTrue(
-                                any(
-                                    key.startswith("test/helper:")
-                                    for key in record["keys"]
-                                )
-                            )
-                        else:
-                            self.assertEqual(record["keys"], [_KEY])
+                        self.assertEqual(record["keys"], [_KEY])
                         self.assertEqual(record["passed"], mode == "matching")
                         self.assertEqual(
                             set(record["differences"]),
@@ -191,37 +179,6 @@ def _run_shared_checks(group) -> None:
         checks.assertEqual(traced, [rank] if not enabled or rank == 0 else [])
         checks.assertTrue(torch.equal(compiled(view).cpu(), view.cpu() * 2))
 
-    traced = []
-
-    @compiled_op(spmd_safe=True)
-    def helper(value, scale):
-        traced.append(rank)
-        return value * scale
-
-    with (
-        envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
-        envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
-        get_context().override_server_args(
-            use_spmd_compile=True, tpu_compile_tracer="direct"
-        ),
-    ):
-        # Rank-local cache contents must not change the shared queue's graph grid.
-        if rank == 1:
-            checks.assertTrue(torch.equal(helper(view, 2).cpu(), view.cpu() * 2))
-        traced.clear()
-        for _ in range(2):
-            with patch.object(tc, "execute", wraps=tc.execute) as execute:
-                with collect_warmups(group=group) as queue:
-                    warmup_compiled_op(helper, view, 2)
-                    warmup_compiled_op(helper, view, 2)
-                    checks.assertEqual(len(queue.spmd_compiler.submissions), 1)
-                    checks.assertEqual(len(queue.calls), 2)
-                execute.assert_not_called()
-            checks.assertEqual(traced, [rank] if rank == 0 else [])
-            traced.clear()
-            checks.assertTrue(torch.equal(helper(view, 2).cpu(), view.cpu() * 2))
-            checks.assertEqual(traced, [])
-
     for mode in ("stride", "offset", "binding"):
         value = view
         if rank == 1 and mode == "stride":
@@ -290,24 +247,9 @@ def _run_worker(mode: str) -> None:
             lift_rank=False,
         )
 
-        @compiled_op(spmd_safe=True, name="test/helper")
-        def helper(value):
-            return value + 1
-
-        with (
-            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
-            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
-            get_context().override_server_args(
-                use_spmd_compile=True, tpu_compile_tracer="direct"
-            ),
-        ):
-            if mode == "matching" and rank == 1:
-                helper(value)
+        with get_context().override_server_args(use_spmd_compile=True):
             with collect_warmups(group=group) as queue:
                 queue.calls.append(compiled.warmup_async(value))
-                if mode == "matching":
-                    warmup_compiled_op(helper, value)
-                    warmup_compiled_op(helper, value)
         raise AssertionError("Verification must exit before warmup execution")
     finally:
         dist.destroy_process_group()

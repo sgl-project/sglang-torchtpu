@@ -19,6 +19,7 @@ from sglang.utils import LazyImport
 current_warmup_queue = LazyImport(
     "sglang_tpu.compilation.warmup_queue", "current_warmup_queue"
 )
+direct_compile = LazyImport("sglang_tpu.compilation.direct_compile", "direct_compile")
 
 WarmupArgsFactory = Callable[[Any], tuple[Any, ...]]
 
@@ -63,25 +64,11 @@ def _specialization_key(*args, **kwargs):
     )
 
 
-def _spmd_specialization_key(*args, **kwargs):
-    structure, leaves = _specialization_key(*args, **kwargs)
-    # Graph identities must serialize identically across ranks, whose local
-    # device ordinals can differ. Each rank runs on its own TPU device.
-    return str(structure), tuple(
-        (leaf[0], str(leaf[1]), leaf[2].type)
-        if len(leaf) == 3
-        else (f"{leaf[0].__module__}.{leaf[0].__qualname__}", leaf[1])
-        for leaf in leaves
-    )
-
-
 def compiled_op(
     *,
     warmup: WarmupArgsFactory | None = None,
     model: torch.nn.Module | None = None,
     uses_rng: bool = False,
-    spmd_safe: bool = False,
-    name: str | None = None,
 ):
     """Compile a tensor helper with the selected TPU tracer.
 
@@ -95,32 +82,20 @@ def compiled_op(
     A ``warmup`` factory registers the helper for the speculative-op grid.
     Model-specific owners can instead
     call ``warmup_compiled_op(op, ...)`` with their own representative inputs.
-    Direct helper warmups compile without executing. Ordinary precompile releases
-    example inputs after submission; shared compilation retains them until the
-    queue binds distributed executables. Dynamo warmup executes to trigger
+    Direct helper warmups compile without executing and release example inputs
+    after submission. Dynamo warmup executes to trigger
     compilation, preserving the generator when ``uses_rng`` is set. Warmup is a
     no-op when compilation is disabled or off TPU.
-
-    ``spmd_safe=True`` lets asynchronous warmup use the queue's shared compiler
-    under ``--use-spmd-compile``. Every rank must warm the same specializations
-    in the same order, with rank-independent code and explicit RNG inputs.
-    ``name`` defaults to the function's qualified name; give configured helper
-    factories distinct names when their closed-over configuration differs.
     """
-    if spmd_safe and uses_rng:
-        raise ValueError("SPMD-safe helpers require explicit RNG inputs")
 
     def decorator(fn):
         compiled_fn = None
         use_direct = False
         signature = inspect.signature(fn)
-        op_name = name or (
+        op_name = (
             fn._qualname
             if isinstance(fn, torch.library.CustomOpDef)
             else f"{fn.__module__}.{fn.__qualname__}"
-        )
-        specialization_key = (
-            _spmd_specialization_key if spmd_safe else _specialization_key
         )
 
         @functools.wraps(fn)
@@ -137,30 +112,18 @@ def compiled_op(
             if compiled_fn is None:
                 use_direct = get_exec().graph.tpu_compile_tracer == "direct"
                 if use_direct:
-                    # Break direct_compile -> eagle_info -> eagle_utils -> compiled_op.
-                    from sglang_tpu.compilation.direct_compile import (
-                        direct_compile,
-                    )
-
                     compiled_fn = direct_compile(
                         fn,
-                        specialization_key=specialization_key,
+                        specialization_key=_specialization_key,
                         model=model,
                         uses_rng=uses_rng,
-                        spmd_safe=spmd_safe,
-                        name=op_name,
                     )
                 else:
                     compiled_fn = torch.compile(
                         fn, backend="tpu", fullgraph=True, dynamic=False
                     )
             if use_direct and _warmup_async:
-                # Shared warmup must register every key with each new queue,
-                # even when this rank already has a cached executable.
-                if (
-                    not spmd_safe
-                    and specialization_key(*args, **kwargs) in compiled_fn.cache
-                ):
+                if _specialization_key(*args, **kwargs) in compiled_fn.cache:
                     return None
                 return compiled_fn.precompile(
                     *args,
