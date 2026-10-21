@@ -574,6 +574,20 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             ),
             (
                 "EAGLE3",
+                {},
+                {"SGLANG_TPU_ENABLE_BSEARCH_SAMPLING": "0"},
+                {},
+                "SGLANG_TPU_ENABLE_BSEARCH_SAMPLING",
+            ),
+            (
+                "DFLASH",
+                {},
+                {"SGLANG_TPU_ENABLE_BSEARCH_SAMPLING": "0"},
+                {},
+                "SGLANG_TPU_ENABLE_BSEARCH_SAMPLING",
+            ),
+            (
+                "EAGLE3",
                 dict(return_hidden_states_mode="last"),
                 {},
                 {},
@@ -701,12 +715,14 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         from sglang_tpu.envs import envs as tpu_envs
 
         flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
-        for algo, overrides in (
-            ("DFLASH", dict(return_hidden_states_mode="full")),
-            ("DSPARK", dict(speculative_accept_threshold_single=0.5)),
+        for algo, overrides, env in (
+            ("DFLASH", dict(return_hidden_states_mode="full"), {}),
+            ("DSPARK", dict(speculative_accept_threshold_single=0.5), {}),
+            ("DSPARK", {}, {"SGLANG_TPU_ENABLE_BSEARCH_SAMPLING": "0"}),
         ):
             with (
-                self.subTest(algorithm=algo, **overrides),
+                self.subTest(algorithm=algo, **overrides, **env),
+                patch.dict(os.environ, env),
                 flag.override(True),
                 tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
             ):
@@ -743,6 +759,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 {},
                 "does not return hidden states",
             ),
+            ({}, {"SGLANG_TPU_ENABLE_BSEARCH_SAMPLING": "0"}, "BSEARCH_SAMPLING"),
         ]
 
     def test_nextn_uses_the_chain_worker_only_where_it_is_supported(self):

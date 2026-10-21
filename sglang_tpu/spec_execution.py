@@ -248,6 +248,10 @@ def _plugin_unsupported_reason(
         # but its verify forward pads tokens to an attention-TP-aligned bucket that
         # the DP-synced token counts do not cover, so verify fails on its first step.
         return "does not support DP attention"
+    # The plugin workers filter sampled rows only with the sort-free sampler, and
+    # would refuse the first filtered request otherwise.
+    if not algorithm.is_dspark() and not envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get():
+        return "needs SGLANG_TPU_ENABLE_BSEARCH_SAMPLING for top-k/top-p/min-p sampling"
     # Sampled drafts are accepted on the target and draft probabilities alone,
     # which the thresholds do not relax. DSPARK has no other worker to honor them.
     if not algorithm.is_dspark() and (

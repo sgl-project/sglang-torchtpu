@@ -69,7 +69,8 @@ reject:
   bucket-aligned verify rows exceed the DP-synced token counts);
 - EAGLE3, native MTP and DFlash: `--speculative-accept-threshold-single` or
   `--speculative-accept-threshold-acc` other than 1.0, which sampled drafts do
-  not apply;
+  not apply, and `SGLANG_TPU_ENABLE_BSEARCH_SAMPLING=0`, since the plugin workers
+  filter sampled rows only with the sort-free sampler;
 - EAGLE3 and native MTP: non-static ragged verify, a draft window, top-k other
   than 1, draft-token counts other than steps + 1, adaptive speculation, and a
   hidden-state return mode (the chain worker drops the target's hidden states);
