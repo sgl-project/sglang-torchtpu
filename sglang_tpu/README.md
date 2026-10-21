@@ -81,7 +81,8 @@ loads what they reject, and fails the launch naming the rollback variables:
 - DFlash and DSpark: non-static ragged verify; DFlash also
   LiLiCorr or Domino drafts, a `mask_embedding.pt` beside the draft, and a
   missing or out-of-vocabulary `dflash_config.mask_token_id`; DSpark a draft its
-  runtime config rejects.
+  runtime config rejects, and a gamma other than the one its draft model builds
+  (the checkpoint's block size, else 16).
 
 `--tpu-compile-tracer direct` fails when the selected compatibility driver is not
 direct-compiled. Tree top-k stays rejected. PP-prefill retains the compatibility

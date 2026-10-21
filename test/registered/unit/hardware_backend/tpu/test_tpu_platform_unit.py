@@ -1149,15 +1149,16 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             )
             self.assertEqual(requested, [("org/target", "target-only-sha")])
 
-    def _dspark_reason(self, **overrides):
+    def _dspark_reason(self, *, checkpoint_block_size=None, **overrides):
         from sglang_tpu import spec_execution
 
-        # A dense DSpark draft whose checkpoint names no block size.
+        # A dense DSpark draft; without a block size its model builds gamma 16.
         hf_config = SimpleNamespace(
             architectures=["DSparkDraftModel"],
             dspark_config=dict(
                 markov_rank=1, markov_head_type="vanilla", mask_token_id=7
             ),
+            block_size=checkpoint_block_size,
         )
         with (
             patch.object(
@@ -1181,13 +1182,27 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
     def test_dspark_draft_check_reads_the_verify_window_the_launch_settles(self):
         """The block size, else the checkpoint's, else the default sets gamma
-        before the draft is checked, as the speculative arguments resolve it."""
-        self.assertIsNone(self._dspark_reason(speculative_dspark_block_size=16))
-        self.assertIsNone(self._dspark_reason())
-        self.assertIsNone(self._dspark_reason(speculative_num_draft_tokens=5))
-        self.assertRegex(
-            self._dspark_reason(speculative_dspark_block_size=0), "positive"
-        )
+        before the draft is checked, as the speculative arguments resolve it;
+        the drafter serves only the gamma its draft model builds."""
+        model_gamma = "needs the draft model's gamma"
+        for checkpoint, overrides, reason in (
+            (None, dict(speculative_dspark_block_size=16), None),
+            (None, dict(speculative_num_draft_tokens=17), None),
+            # The launch default gamma 7 is not the model's default 16.
+            (None, {}, f"{model_gamma} 16 .*not 7"),
+            (None, dict(speculative_num_draft_tokens=5), f"{model_gamma} 16"),
+            (None, dict(speculative_dspark_block_size=0), "positive"),
+            (7, {}, None),
+            (7, dict(speculative_dspark_block_size=16), f"{model_gamma} 7"),
+        ):
+            with self.subTest(checkpoint_block_size=checkpoint, **overrides):
+                actual = self._dspark_reason(
+                    checkpoint_block_size=checkpoint, **overrides
+                )
+                if reason is None:
+                    self.assertIsNone(actual)
+                else:
+                    self.assertRegex(actual, reason)
 
     def test_compatibility_route_keeps_eager_configuration(self):
         from sglang_tpu.envs import envs as tpu_envs

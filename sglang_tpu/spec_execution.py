@@ -425,15 +425,14 @@ def _dspark_draft_unsupported_reason(server_args: ServerArgs) -> str | None:
         server_args, path=cfg.speculative_draft_model_path
     ).hf_config
     try:
+        draft_config = parse_dspark_draft_config(draft_hf_config=hf_config)
         # The verify window the speculative arguments will settle on.
         gamma = resolve_launch_gamma(
             block_size=cfg.speculative_dspark_block_size,
-            checkpoint_gamma=parse_dspark_draft_config(
-                draft_hf_config=hf_config
-            ).resolve_gamma(default=None),
+            checkpoint_gamma=draft_config.resolve_gamma(default=None),
             num_draft_tokens=cfg.speculative_num_draft_tokens,
         )
-        resolve_runtime_config(
+        runtime_config = resolve_runtime_config(
             draft_hf_config=hf_config,
             speculative_num_draft_tokens=(
                 cfg.speculative_num_draft_tokens if gamma is None else gamma + 1
@@ -442,6 +441,15 @@ def _dspark_draft_unsupported_reason(server_args: ServerArgs) -> str | None:
         )
     except ValueError as e:
         return f"cannot serve this draft ({e})"
+    # DSparkDraftModel builds with the checkpoint's block size, else
+    # DFlashDraftModel's default of 16, and the drafter's sampler needs that gamma.
+    model_gamma = draft_config.resolve_gamma(default=16)
+    if runtime_config.gamma != model_gamma:
+        return (
+            f"needs the draft model's gamma {model_gamma} "
+            f"(--speculative-dspark-block-size {model_gamma}), "
+            f"not {runtime_config.gamma}"
+        )
     return None
 
 
