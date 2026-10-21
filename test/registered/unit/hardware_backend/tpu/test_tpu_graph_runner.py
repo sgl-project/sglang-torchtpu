@@ -494,18 +494,16 @@ class TestTpuGraphRunner(CustomTestCase):
                 pp_size=1, speculative_num_steps=3, speculative_algorithm="EAGLE3"
             ),
         )
-        # The default route serves EAGLE3 on the chain worker and its policy.
-        self.assertTrue(
-            issubclass(
-                _augment_spec_policy(DecoderTpuCompilePolicy, mr),
-                TpuChainSpecDecodeCompilePolicyMixin,
+        # Opted in, EAGLE3 runs on the chain worker and its policy.
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            self.assertTrue(
+                issubclass(
+                    _augment_spec_policy(DecoderTpuCompilePolicy, mr),
+                    TpuChainSpecDecodeCompilePolicyMixin,
+                )
             )
-        )
-        with (
-            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
-            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
-        ):
-            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        # By default it keeps the compatibility worker's policy.
+        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))

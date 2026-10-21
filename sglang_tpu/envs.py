@@ -113,12 +113,12 @@ class TpuEnvs:
     SGLANG_TPU_HOST_PADDING = EnvBool(False)
 
     # Speculative decoding
-    # Default to the plugin workers at PP=1: DFLASH/DSPARK on
-    # sglang_tpu.experimental.TpuBlockSpecWorker, MTP and EAGLE3 on
-    # TpuChainSpecWorker. Set 0 for the compatibility route;
-    # SGLANG_TPU_HOST_PADDING_NO_D2H=1 also selects the plugin workers. Left
-    # unset, launches the plugin workers cannot serve use compatibility instead.
-    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
+    # At PP=1, route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker
+    # and MTP and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H=1
+    # also does. A launch the plugin workers cannot serve fails before load.
+    # Off by default until the plugin workers serve every configuration the
+    # compatibility workers do.
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
     # Same effect as SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1. Non-speculative
     # batches ignore it.
     SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)

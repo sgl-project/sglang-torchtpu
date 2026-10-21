@@ -125,17 +125,16 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
         )
 
     def test_direct_with_eagle3(self):
-        state = self._run_eagle3(overrides=EAGLE3_SERVER_ARGS)
+        """The default route: the compatibility worker without overlap scheduling."""
+        state = self._run_eagle3(
+            overrides={**EAGLE3_SERVER_ARGS, "disable_overlap_schedule": True}
+        )
         self.assertEqual(state["torch_compile_dynamo_frames"], 0)
 
-    def test_direct_with_eagle3_compatibility_worker(self):
-        """The rollback route: the compatibility worker without overlap scheduling."""
+    def test_direct_with_eagle3_plugin_worker(self):
         state = self._run_eagle3(
-            overrides={**EAGLE3_SERVER_ARGS, "disable_overlap_schedule": True},
-            env={
-                "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "0",
-                "SGLANG_TPU_HOST_PADDING_NO_D2H": "0",
-            },
+            overrides=EAGLE3_SERVER_ARGS,
+            env={"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1"},
         )
         self.assertEqual(state["torch_compile_dynamo_frames"], 0)
 

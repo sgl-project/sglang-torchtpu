@@ -56,14 +56,16 @@ either.
 
 ## Speculative worker selection
 
-At PP=1 both platform identities select a plugin worker by default:
-`TpuChainSpecWorker` for EAGLE3 top-k-1 chains and for native MTP (NEXTN) on the
-drafts TPU serving has exercised (Qwen3.8 and GLM-5.3-Flash MTP), and
-`TpuBlockSpecWorker` for DFlash/DSpark. These paths require overlap scheduling;
-argument resolution enables torch compilation for them.
+The plugin workers are opt-in: with `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`
+(or `SGLANG_TPU_HOST_PADDING_NO_D2H=1`), both platform identities serve, at PP=1,
+EAGLE3 top-k-1 chains and native MTP (NEXTN) on `TpuChainSpecWorker` and
+DFlash/DSpark on `TpuBlockSpecWorker`. These paths require overlap scheduling;
+argument resolution enables torch compilation for them. Unset, every algorithm
+keeps its compatibility worker, and DSpark, which only the plugin worker serves,
+is not admitted.
 
-Argument resolution also checks, before any model loads, what the plugin workers
-reject:
+With the plugin workers selected, argument resolution checks before any model
+loads what they reject, and fails the launch naming the rollback variables:
 - every route: disabled overlap, a non-fixed simulated-acceptance token mode,
   and attention DP, which no plugin worker serves yet (the chain worker's
   bucket-aligned verify rows exceed the DP-synced token counts);
@@ -81,26 +83,18 @@ reject:
   missing or out-of-vocabulary `dflash_config.mask_token_id`; DSpark a draft its
   runtime config rejects.
 
-Such a launch runs on the compatibility worker and logs why, as does native MTP
-on a draft not yet exercised. The fallback lasts for that launch only and leaves
-`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER` as set. A P/D server does not fall
-back on its own for a configuration the plugin worker rejects, since its peer may
-not: it fails, and both servers then need the compatibility route set
-explicitly. With the plugin worker requested
-explicitly (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1` or
-`SGLANG_TPU_HOST_PADDING_NO_D2H=1`) the launch fails instead, and
 `--tpu-compile-tracer direct` fails when the selected compatibility driver is not
 direct-compiled. Tree top-k stays rejected. PP-prefill retains the compatibility
 driver. TPU PP decode remains unsupported.
 
-For the compatibility route set both
-`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0` and
-`SGLANG_TPU_HOST_PADDING_NO_D2H=0` before launch.
-At PP=1, DSpark requires the plugin route and fails at argument resolution when
-the plugin worker cannot serve it. The existing environment name is
-retained for deployment compatibility. The
-default switch does not establish TPU compilation or serving parity: validate the
-selected model, topology, request features and warmup on TPU before deployment.
+The same settlement serves a route that selects the plugin workers by default:
+there a launch they cannot serve falls back to the compatibility worker for that
+launch and logs why, as does native MTP on a draft not yet exercised, while a P/D
+server fails, since its peer may settle differently. The default stays off until
+the plugin workers serve what the compatibility workers do: they do not yet
+return DFlash sampling masks, apply `/set_internal_state` updates of the accept
+thresholds, or serve attention DP, and their accuracy, throughput and memory
+against the compatibility workers are not measured.
 
 ## Layout
 

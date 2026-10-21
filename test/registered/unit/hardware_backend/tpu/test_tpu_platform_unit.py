@@ -322,6 +322,14 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         # A launch's speculative fallback lasts until the next launch settles.
         self.addCleanup(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.clear)
+        # The plugin workers stay opt-in, but the settlement also serves a route
+        # that selects them by default; these cases run with that default on.
+        # test_shipped_default_keeps_the_compatibility_workers covers the shipped one.
+        default_on = patch.object(
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER, "default", True
+        )
+        default_on.start()
+        self.addCleanup(default_on.stop)
 
     def _args(self, **overrides):
         _require_resolved_dp_layout(overrides)
@@ -691,6 +699,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                         SpeculativeAlgorithm[algo], pp_size=1
                     ).host_padded
                 )
+                self.assertFalse(self._resolved(args, "enable_torch_compile"))
+
+    def test_shipped_default_keeps_the_compatibility_workers(self):
+        """Unset, the switch selects main's compatibility workers, with nothing to settle."""
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.spec_execution import resolve_spec_execution
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        for algo in ("EAGLE3", "DFLASH"):
+            with (
+                self.subTest(algorithm=algo),
+                patch.object(flag, "default", False),
+                flag.override(True),
+                tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            ):
+                flag.clear()
+                args = self._args(speculative_algorithm=algo)
+                self._apply(args)
+                self.assertFalse(
+                    resolve_spec_execution(
+                        SpeculativeAlgorithm[algo], pp_size=1
+                    ).host_padded
+                )
+                self.assertFalse(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
                 self.assertFalse(self._resolved(args, "enable_torch_compile"))
 
     def test_default_route_keeps_supported_configs_on_the_plugin_worker(self):

@@ -112,7 +112,7 @@ class TestExperimentalEagle3(CustomTestCase):
         with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
             self.assertIsNone(_select_worker(SpeculativeAlgorithm.EAGLE3))
 
-    def test_unset_default_routes_factory_policy_and_host_metadata_together(self):
+    def test_opt_in_routes_factory_policy_and_host_metadata_together(self):
         from sglang_tpu.experimental import register_host_batch_padder
         from sglang_tpu.experimental.compilation.block_compile_policy import (
             TpuBlockSpecDecodeCompilePolicyMixin,
@@ -131,7 +131,6 @@ class TestExperimentalEagle3(CustomTestCase):
             envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
             patch("sglang_tpu.experimental._host_batch_padder", None),
         ):
-            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.clear()
             register_host_batch_padder(lambda bs: 4)
             for platform in (TpuSRTPlatform(), TpuOOTPlatform()):
                 with patch("sglang.srt.platforms.current_platform", platform):
