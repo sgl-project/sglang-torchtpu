@@ -736,16 +736,16 @@ for one request, 6x the default path.**
 
 One request; TPOT on random token ids, decode rate on 20 GSM8K questions:
 
-| Workload | Megakernel + DSpark | Megakernel | Default path (3.7.4) |
+| Workload | Megakernel + DSpark | Megakernel, no DSpark | Default path (3.7.4) |
 | --- | --- | --- | --- |
-| 1k in / 8k out | **1.42 ms (5.5x)** | 3.80 ms | 7.86 ms |
-| 1k in / 1k out | **1.52 ms (5.1x)** | 3.68 ms | 7.81 ms |
-| 8k in / 1k out | **1.92 ms (4.1x)** | 3.97 ms | 7.94 ms |
-| GSM8K questions (chat) | **≈759 tok/s (≈6x)**, accept length 5.58 | — | ≈127 tok/s |
+| 1k in / 8k out | **1.42 ms (5.5x)** | 3.80 ms (2.1x) | 7.86 ms |
+| 1k in / 1k out | **1.52 ms (5.1x)** | 3.68 ms (2.1x) | 7.81 ms |
+| 8k in / 1k out | **1.92 ms (4.1x)** | 3.97 ms (2.0x) | 7.94 ms |
+| GSM8K questions (chat) | **≈759 tok/s (≈6x)**, accept length 5.58 | ≈270 tok/s (2.1x) | ≈127 tok/s |
 
-- Accuracy: 20/20 on the GSM8K questions; full GSM8K 0.978 with DSpark (accept
-  length 5.65).
-- Without DSpark, a 3-token prompt decodes at 3.62 ms per token.
+- Full GSM8K: 0.978 with DSpark (accept length 5.65).
+- Without DSpark, the decode rate does not depend on the text, and a 3-token
+  prompt decodes at 3.62 ms per token.
 - Prompts prefill more slowly than on the default path, because the chunks run
   through the decode kernel: about 1.0 s for 1k tokens and 8 s for 8k, against
   0.2 s and 1.5 s.
