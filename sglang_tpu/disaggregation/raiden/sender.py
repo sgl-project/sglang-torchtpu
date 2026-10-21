@@ -22,6 +22,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
+from sglang_tpu.disaggregation.pp_consensus import poll_with_pp_consensus
 from sglang_tpu.disaggregation.raiden import dram_offload_channel as raiden_offload
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
@@ -135,6 +136,7 @@ class RaidenSenderMixin:
                     )
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
+                self._finish_pp_bootstrap_locked(room)
         if failed_reason is not None:
             self._reply_room_failed(
                 room=room,
@@ -520,6 +522,18 @@ class RaidenSenderMixin:
                 self.update_status(room, KVPoll.WaitingForInput)
             return True
 
+    def _finish_pp_bootstrap_locked(self, room: int) -> None:
+        """On a pipeline-parallel prefill, end a requested room's Bootstrapping
+        as soon as the request lands: only stage 0 polls bootstrapping rooms, and
+        it waits on every stage's status (poll_with_pp_consensus)."""
+        if (
+            self.pp_size > 1
+            and room not in self._aborted
+            and self._decode_requested_locked(room)
+            and self.request_status.get(room) == KVPoll.Bootstrapping
+        ):
+            self.update_status(room, KVPoll.WaitingForInput)
+
     def awaiting_decode_since(self, room: int, since: float) -> Optional[float]:
         """When the prefill started waiting on the decode for ``room``.
 
@@ -871,6 +885,7 @@ class RaidenSenderMixin:
                 )
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
+                self._finish_pp_bootstrap_locked(room)
         if failed_reason is not None:
             self._reply_room_failed(
                 room=room,
@@ -1444,6 +1459,8 @@ class RaidenKVSender(CommonKVSender):
                         preserve_reason=True,
                     )
                     self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                # A decode request that outran this sender found no room to start.
+                self.kv_mgr._finish_pp_bootstrap_locked(self.bootstrap_room)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         super().init(num_kv_indices, aux_index)
@@ -1562,6 +1579,9 @@ class RaidenKVSender(CommonKVSender):
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
         return status
+
+    def poll_pp_consensus(self) -> KVPoll:
+        return poll_with_pp_consensus(self)
 
     def drained(self) -> bool:
         """No transfer of this room still runs on this rank."""

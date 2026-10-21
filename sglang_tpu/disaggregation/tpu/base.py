@@ -66,6 +66,7 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import ServerArgs
+from sglang_tpu.disaggregation.pp_consensus import poll_with_pp_consensus
 from sglang_tpu.disaggregation.tpu import transfer as tpu_transfer
 from sglang_tpu.disaggregation.tpu.host_staging import StageBuf
 from sglang_tpu.disaggregation.tpu.serde import Transfer
@@ -568,6 +569,11 @@ class TpuKVSenderBase(CommonKVSender):
                 self.conclude_state = KVPoll.Failed
                 return KVPoll.Failed
         return status
+
+    def poll_pp_consensus(self) -> KVPoll:
+        # Every stage starts a room when the decode's transfer info arrives
+        # (_handle_transfer), so stage 0 can wait on all of them.
+        return poll_with_pp_consensus(self)
 
     def failure_exception(self):
         if self.conclude_state is None:
