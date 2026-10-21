@@ -1098,6 +1098,20 @@ class LogitsProcessor(nn.Module):
             local_shape=tuple(local_hidden_states.shape),
         )
 
+        # Under DP attention with a DP LM head and attention TP > 1, the
+        # vocab-parallel gather below is a collective whose row count is this DP
+        # rank's REQUEST count. Unlike the token axis (MAX_LEN padded), that axis
+        # is not equalised across DP ranks, so a rank that has drained to zero
+        # requests would issue a differently shaped -- or, at zero rows, an
+        # illegal -- collective while its peers issue a full one, and the whole
+        # step deadlocks. Pad every rank to the same row count first, then trim.
+        real_rows = hidden_states.shape[0]
+        padded_rows = self._dp_padded_logit_rows(real_rows, logits_metadata)
+        if padded_rows > real_rows:
+            hidden_states = torch.nn.functional.pad(
+                hidden_states, (0, 0, 0, padded_rows - real_rows)
+            )
+
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("pre_lm_head_sync_enter")
             torch.cuda.synchronize()
@@ -1162,6 +1176,9 @@ class LogitsProcessor(nn.Module):
             _trace_e2e_logits(
                 "tp_logits_gather_returned", logits_shape=tuple(logits.shape)
             )
+
+        if padded_rows > real_rows:
+            logits = logits[:real_rows]
 
         if not used_tp_lm_head_all_to_all:
             _trace_e2e_logits(
@@ -1300,6 +1317,30 @@ class LogitsProcessor(nn.Module):
             _trace_e2e_logits("dp_hidden_gather_collective_returned")
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
+
+    def _dp_padded_logit_rows(
+        self, real_rows: int, logits_metadata: LogitsMetadata
+    ) -> int:
+        """Row count every DP rank must feed the LM head, or real_rows.
+
+        The attention-TP vocab gather is only collective-safe if every DP rank
+        runs it at the same size, so take the max over the per-rank logprob
+        counts the scheduler already synchronises, with a floor of 1 so an idle
+        rank still issues a legal (non-zero) collective. Mirrors what
+        tpu-inference does with padded_num_reqs_per_dp_rank.
+        """
+        if not (self.use_attn_tp_group and self.attn_tp_size > 1):
+            return real_rows
+        # Decode/idle only. There the row count is one per request, which is
+        # exactly what the scheduler synchronises. On an extend step the rows
+        # are per TOKEN, so the per-request counts are the wrong unit and
+        # padding to them corrupts the batch the scheduler prepares next.
+        if not logits_metadata.forward_mode.is_decode_or_idle():
+            return real_rows
+        counts = logits_metadata.global_num_tokens_for_logprob_cpu
+        if counts is None:
+            return real_rows
+        return max(max(counts), 1, real_rows)
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
         if logits.shape[0] == 0:
