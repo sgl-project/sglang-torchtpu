@@ -35,6 +35,7 @@ def _prefill_manager(pp_size):
     mgr._prefill = PrefillState(announce_pages=1)
     mgr._pipeline = None
     mgr._state_lock = threading.Lock()
+    mgr._status_lock = threading.Lock()
     mgr._aborted = {}
     mgr._failed = set()
     mgr.failure_lock = threading.Lock()
