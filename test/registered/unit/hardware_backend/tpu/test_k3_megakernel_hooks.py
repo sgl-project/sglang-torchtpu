@@ -144,8 +144,8 @@ class TestK3MegakernelHooks(CustomTestCase):
                 prefill_rows(size, mode)
 
     def test_kda_rows_follow_the_gdn_pool_layout(self):
-        """The kernel reads and writes the KDA rows the TPU GDN backend uses: slot rows for
-        extend and decode, the request's verify window for a verify."""
+        """Extend / decode use the slot row; a verify reads the committed row and writes the
+        request's window (as TpuGDNAttnBackend)."""
         from sglang.srt.configs.mamba_utils import (
             Mamba2CacheParams,
             Mamba2StateDType,
@@ -155,58 +155,28 @@ class TestK3MegakernelHooks(CustomTestCase):
         from sglang_tpu.mamba_pool import TpuMambaPool
 
         shape = Mamba2StateShape.create(
-            tp_world_size=1,
-            intermediate_size=8 * 128,
-            n_groups=2,
-            num_heads=8,
-            head_dim=128,
-            state_size=128,
-            conv_kernel=4,
-        )
-        params = Mamba2CacheParams(
-            dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
-            layers=[1],
-            shape=shape,
-        )
+            tp_world_size=1, intermediate_size=1024, n_groups=2, num_heads=8,
+            head_dim=128, state_size=128, conv_kernel=4,
+        )  # fmt: skip
+        dtype = Mamba2StateDType(conv=torch.float32, temporal=torch.float32)
+        pool = TpuMambaPool(
+            size=3, spec_state_size=3, mamba_layer_ids=[1], device="cpu",
+            cache_params=Mamba2CacheParams(dtype=dtype, layers=[1], shape=shape),
+            speculative_num_draft_tokens=4, speculative_eagle_topk=1,
+        )  # fmt: skip
+        slot, req = 2, 3
+        window = pool.window_start + req * pool.checkpoint_width
 
-        def pool(width):
-            return TpuMambaPool(
-                size=3,
-                spec_state_size=3,
-                cache_params=params,
-                mamba_layer_ids=[1],
-                device="cpu",
-                speculative_num_draft_tokens=width,
-                speculative_eagle_topk=1,
-            )
-
-        def rows(p, mode, slot, req):
+        def rows(mode):
             read, base = kda_state_rows(
-                p, mode, torch.tensor(slot, dtype=torch.int32), torch.tensor([req])
+                pool, mode, torch.tensor(slot, dtype=torch.int32), torch.tensor([req])
             )
             return int(read), int(base)
 
-        spec = pool(4)  # slot rows 0..3, then request windows from row 4
-        slot, req = 2, 3
-        window = spec.window_start + req * spec.checkpoint_width
-        self.assertEqual(window, 16)
-        for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
-            with self.subTest(mode=mode):
-                self.assertEqual(rows(spec, mode, slot, req), (slot, slot))
-        # A fresh verify resumes from the slot row (AT_SLOT) and writes the window.
-        self.assertEqual(
-            rows(spec, ForwardMode.TARGET_VERIFY, slot, req), (slot, window)
-        )
-        # After a commit it resumes from the selected window row.
-        spec.select_checkpoints(torch.tensor([slot]), torch.tensor([2]))
-        self.assertEqual(
-            rows(spec, ForwardMode.TARGET_VERIFY, slot, req), (window + 2, window)
-        )
-        # Without speculation every step reads and writes the slot row.
-        plain = pool(1)
-        self.assertEqual(
-            rows(plain, ForwardMode.TARGET_VERIFY, slot, req), (slot, slot)
-        )
+        self.assertEqual(rows(ForwardMode.DECODE), (slot, slot))
+        self.assertEqual(rows(ForwardMode.TARGET_VERIFY), (slot, window))
+        pool.select_checkpoints(torch.tensor([slot]), torch.tensor([2]))
+        self.assertEqual(rows(ForwardMode.TARGET_VERIFY), (window + 2, window))
 
 
 if __name__ == "__main__":

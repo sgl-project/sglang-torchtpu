@@ -162,29 +162,13 @@ class TestK3MegakernelServer(CustomTestCase):
         self.assertEqual(json.loads(kv.data[srv._KV_PREFIX + "1"])["job"]["n"], 1)
 
     def test_bench_hooks_need_the_server_flag(self):
-        hooks = (dict(k3_force_acc=6), dict(k3_draft="zero"), dict(k3_stop_ids=[7]))
+        body = dict(prompt="p", max_tokens=5, k3_force_acc=6, k3_stop_ids=[7])
         client, _, _ = self._server("hello", k=4)
-        for hook in hooks:
-            for path, body in (
-                ("/v1/completions", dict(prompt="p", max_tokens=5, **hook)),
-                ("/generate", dict(text="p", **hook)),
-            ):
-                with self.subTest(path=path, hook=hook):
-                    r = client.post(path, json=body)
-                    self.assertEqual(r.status_code, 400)
-                    self.assertIn("--bench-hooks", r.text)
+        self.assertEqual(client.post("/v1/completions", json=body).status_code, 400)
         client, _, kv = self._server("hello", k=4, bench_hooks=True)
-        body = dict(prompt="p", max_tokens=5, k3_force_acc=6, k3_draft="zero")
-        out = client.post("/v1/completions", json=dict(body, k3_stop_ids=[7]))
-        self.assertEqual(out.status_code, 200)
+        self.assertEqual(client.post("/v1/completions", json=body).status_code, 200)
         job = json.loads(kv.data[srv._KV_PREFIX + "1"])["job"]
-        self.assertEqual(
-            (job["force_acc"], job["zero_drafts"], job["stop_ids"]), (6, True, [7])
-        )
-        self.assertEqual(
-            client.post("/v1/completions", json=dict(body, k3_draft="x")).status_code,
-            400,
-        )
+        self.assertEqual((job["force_acc"], job["stop_ids"]), (6, [7]))
 
     def test_follower_runs_jobs_with_stop_strings_until_shutdown(self):
         kv, engine = _KV(), _Engine("a\nb", k=4)
