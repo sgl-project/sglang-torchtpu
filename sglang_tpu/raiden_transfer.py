@@ -108,17 +108,79 @@ class CombinedFutureEvent:
         self._events = list(events)
 
     def query(self) -> bool:
-        return all(event.query() for event in self._events)
+        # A failed DMA is reported only once every DMA has landed: the others
+        # may still be copying into pages the caller would release on failure.
+        done, error = True, None
+        for event in self._events:
+            try:
+                done = event.query() and done
+            except RuntimeError as e:
+                error = error or e
+        if not done:
+            return False
+        if error is not None:
+            raise error
+        return True
 
     def synchronize(self) -> None:
+        # Waits for every DMA before raising the first failure, as query() does.
+        error = None
         for event in self._events:
-            event.synchronize()
+            try:
+                event.synchronize()
+            except RuntimeError as e:
+                error = error or e
+        if error is not None:
+            raise error
 
     def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
         return None
 
     def wait(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
         return None
+
+
+class LoadBackEvent(CombinedFutureEvent):
+    """A HiCache load-back's DMAs, whose failure is cleaned up, not raised.
+
+    ``error`` keeps this rank's failure. ``failed`` stays None until every rank
+    agrees on the outcome (``TpuRaidenHybridCacheController.resolve_load_back``)
+    and then says whether the load failed on any rank. A failed load reports
+    done only once ``released`` lets its cleanup run, so ``loading_check``
+    cannot ack it earlier; an unsettled failure still raises from
+    ``synchronize()``.
+    """
+
+    def __init__(self, events):
+        super().__init__(events)
+        self.error = None
+        self.failed = None
+        self.released = False
+
+    def landed(self) -> bool:
+        """This rank's view: True once every DMA has landed, failed or not."""
+        if self.error is None:
+            try:
+                if not super().query():
+                    return False
+            except RuntimeError as e:
+                self.error = e
+        return True
+
+    def query(self) -> bool:
+        if not self.landed():
+            return False
+        return self.released if self.failed else self.error is None
+
+    def synchronize(self) -> None:
+        if self.failed:
+            return
+        try:
+            super().synchronize()
+        except RuntimeError as e:
+            self.error = e
+        if self.error is not None and self.failed is None:
+            raise self.error
 
 
 class RaidenKVTransfer:

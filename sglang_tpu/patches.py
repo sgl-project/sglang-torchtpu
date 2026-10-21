@@ -955,6 +955,17 @@ def _patch_scheduler_reject_prompt_logprob() -> None:
     Scheduler._add_request_to_queue = _add_request_to_queue
 
 
+def _patch_pd_decode_hicache_load_failure() -> None:
+    """Abort the requests of a failed PD decode HiCache load-back and roll
+    back its nodes instead of stopping the server.
+
+    See ``pd_decode_hicache_load_failure``.
+    """
+    from sglang_tpu import pd_decode_hicache_load_failure
+
+    pd_decode_hicache_load_failure.install()
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -977,6 +988,7 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _patch_hicache_write_back_copy_ahead()
     _patch_pd_decode_async_prefill_info()
+    _patch_pd_decode_hicache_load_failure()
     _patch_host_heap_trim()
     _patch_profile_auto()
     _patch_scheduler_reject_prompt_logprob()

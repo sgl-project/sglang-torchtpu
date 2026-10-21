@@ -38,10 +38,12 @@ from sglang_tpu.kv_free_fence import (
 from sglang_tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
+    LoadBackEvent,
     RaidenFutureEvent,
 )
 
 logger = logging.getLogger(__name__)
+
 
 # Pools indexed by KV allocator pages, which the KV free fence keeps from loads
 # while a forward may still write them; any other pool's slots are unfenced.
@@ -63,6 +65,10 @@ class TpuRaidenHybridCacheController(HybridCacheController):
 
     # Set by the scheduler for the tree's controller; see fence_hicache_backups.
     kv_free_fence: Optional[KVFreeFence] = None
+
+    # A PD decode server cleans up a failed load-back (requests aborted, nodes
+    # rolled back); elsewhere a failed load still stops the server.
+    handles_load_back_failures = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -236,7 +242,12 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         # The consuming forward's CompiledForwardShim wait() polls the combined
         # event through the whole-batch gate (poll-only; never Await), so the
         # DMAs overlap whatever the scheduler runs before that forward.
-        finish_event = CombinedFutureEvent(self._issue_pool_dmas(op, load=True))
+        events = self._issue_pool_dmas(op, load=True)
+        finish_event = (
+            LoadBackEvent(events)
+            if self.handles_load_back_failures
+            else CombinedFutureEvent(events)
+        )
         self.layer_done_counter.set_event(producer_id, finish_event)
         self.ack_load_queue.append(
             HiCacheAck(
@@ -268,9 +279,44 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         """
         if consumer_index < 0:
             return True
-        event = self.layer_done_counter.events[consumer_index]
-        done = torch.tensor(
-            int(event is None or event.query()), dtype=torch.int, device="cpu"
+        return self.resolve_load_back(
+            self.layer_done_counter.events[consumer_index], all_reduce
         )
-        all_reduce(done, torch.distributed.ReduceOp.MIN)
-        return bool(done.item())
+
+    def resolve_load_back(
+        self, event, all_reduce: Callable[[torch.Tensor, Any], None]
+    ) -> bool:
+        """True once ``event``'s DMAs landed on every rank; settles whether it failed.
+
+        A collective: every rank calls it for the same events in the same
+        order. A load failed if its DMA failed on any rank, and every rank then
+        sees ``event.failed`` set, so the cleanup is the same everywhere.
+        """
+        if not isinstance(event, LoadBackEvent):
+            # An unused slot (None) or another backend's event: completion only.
+            done = torch.tensor(
+                int(event is None or event.query()), dtype=torch.int, device="cpu"
+            )
+            all_reduce(done, torch.distributed.ReduceOp.MIN)
+            return bool(done.item())
+        if event.failed is not None:
+            # Settled by a collective every rank took part in.
+            return True
+        # [landed, -failed] MIN-reduces to [landed everywhere, -(failed anywhere)].
+        status = torch.tensor(
+            [int(event.landed()), -int(event.error is not None)],
+            dtype=torch.int,
+            device="cpu",
+        )
+        all_reduce(status, torch.distributed.ReduceOp.MIN)
+        if not status[0].item():
+            return False
+        event.failed = bool(status[1].item())
+        if event.failed:
+            logger.warning(
+                "raiden HiCache load-back failed on at least one rank "
+                "(this rank: %s); its requests are aborted and its nodes "
+                "rolled back to host-only",
+                event.error or "ok",
+            )
+        return True
