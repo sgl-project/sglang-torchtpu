@@ -800,11 +800,12 @@ class TpuSRTPlatform(SRTPlatform):
         # weights have loaded (its binder runs post-load).
         parts = static_fp8_parts()
         cfg = resolving_view(server_args)
-        check_static_fp8_spec_batch(
-            parts,
-            speculative_algorithm=cfg.speculative_algorithm,
-            max_running_requests=cfg.max_running_requests,
-        )
+        if "latent_up" in parts:
+            check_static_fp8_spec_batch(
+                parts,
+                speculative_algorithm=cfg.speculative_algorithm,
+                max_running_requests=cfg.max_running_requests,
+            )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
