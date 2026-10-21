@@ -417,6 +417,7 @@ class StackKernel:
         moe_region_m: bool = True,
         moe_up_fill: str = "reduce",
         moe_distinct_balance: bool = False,
+        moe_single_rows: bool = True,
         moe_down_dequant: bool = True,
         oproj_full_gather: bool = True,
         far_first: bool = True,
@@ -487,8 +488,8 @@ class StackKernel:
         gives the attention o_proj its own ring ("attn_out"), filled from the previous layer's MoE
         together with the input projections instead of at layer start. ``mla_kv_window``: see
         ``MlaStage`` (masks one page instead of the whole KV block; bit-identical).
-        ``moe_up_tree``: ``MoeStage`` ``up_tree``. ``moe_down_dequant``: ``MoeStage``
-        ``down_dequant`` (verify rows; f32 reorder). ``oproj_full_gather`` (verify rows,
+        ``moe_up_tree``: ``MoeStage`` ``up_tree``. ``moe_single_rows`` / ``moe_down_dequant``: ``MoeStage``
+        ``single_rows`` / ``down_dequant`` (verify rows; f32 reorder). ``oproj_full_gather`` (verify rows,
         pair o_proj): the row-scattered o_proj reduce gathers both halves in one host round (same bits).
         ``far_first``: every collective level issues its copies to other hosts first (same bits). ``fused_head``: the kernel also does the greedy
         LM head (``stages.head``; inputs ``embed`` [V, H] and ``lm_head`` [V / world, H] replace
@@ -621,6 +622,7 @@ class StackKernel:
             row_gathers=row_gathers or self.rows_mode,
             up_tree=moe_up_tree,
             fast_topk=moe_fast_topk,
+            single_rows=moe_single_rows,
             down_dequant=moe_down_dequant,
             debug=frozenset(x for x in moe_debug.split(",") if x)
             | frozenset(k for k in debug_skip if k.startswith("moe_")),
