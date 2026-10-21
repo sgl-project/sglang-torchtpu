@@ -143,6 +143,71 @@ class TestK3MegakernelHooks(CustomTestCase):
             with self.subTest(size=size, mode=mode), self.assertRaises(ValueError):
                 prefill_rows(size, mode)
 
+    def test_kda_rows_follow_the_gdn_pool_layout(self):
+        """The kernel reads and writes the KDA rows the TPU GDN backend uses: slot rows for
+        extend and decode, the request's verify window for a verify."""
+        from sglang.srt.configs.mamba_utils import (
+            Mamba2CacheParams,
+            Mamba2StateDType,
+            Mamba2StateShape,
+        )
+        from sglang_tpu.k3_megakernel.ops import kda_state_rows
+        from sglang_tpu.mamba_pool import TpuMambaPool
+
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=8 * 128,
+            n_groups=2,
+            num_heads=8,
+            head_dim=128,
+            state_size=128,
+            conv_kernel=4,
+        )
+        params = Mamba2CacheParams(
+            dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
+            layers=[1],
+            shape=shape,
+        )
+
+        def pool(width):
+            return TpuMambaPool(
+                size=3,
+                spec_state_size=3,
+                cache_params=params,
+                mamba_layer_ids=[1],
+                device="cpu",
+                speculative_num_draft_tokens=width,
+                speculative_eagle_topk=1,
+            )
+
+        def rows(p, mode, slot, req):
+            read, base = kda_state_rows(
+                p, mode, torch.tensor(slot, dtype=torch.int32), torch.tensor([req])
+            )
+            return int(read), int(base)
+
+        spec = pool(4)  # slot rows 0..3, then request windows from row 4
+        slot, req = 2, 3
+        window = spec.window_start + req * spec.checkpoint_width
+        self.assertEqual(window, 16)
+        for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
+            with self.subTest(mode=mode):
+                self.assertEqual(rows(spec, mode, slot, req), (slot, slot))
+        # A fresh verify resumes from the slot row (AT_SLOT) and writes the window.
+        self.assertEqual(
+            rows(spec, ForwardMode.TARGET_VERIFY, slot, req), (slot, window)
+        )
+        # After a commit it resumes from the selected window row.
+        spec.select_checkpoints(torch.tensor([slot]), torch.tensor([2]))
+        self.assertEqual(
+            rows(spec, ForwardMode.TARGET_VERIFY, slot, req), (window + 2, window)
+        )
+        # Without speculation every step reads and writes the slot row.
+        plain = pool(1)
+        self.assertEqual(
+            rows(plain, ForwardMode.TARGET_VERIFY, slot, req), (slot, slot)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

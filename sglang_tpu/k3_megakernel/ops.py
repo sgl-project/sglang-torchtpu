@@ -521,20 +521,12 @@ class K3MegakernelRuntime:
         slot = (
             lin._state_indices[0].to(torch.int32).clamp(min=0)
         )  # padded / warmup rows carry -1
-        # With speculation every slot owns ``width`` consecutive KDA rows (one checkpoint per verify
-        # row) and reads the one its last commit selected (sglang_tpu.mamba_pool).
-        width = backend.req_to_token_pool.mamba_pool.checkpoint_width
-        base = slot * width
-        offsets = backend.req_to_token_pool.mamba_pool.checkpoint_read_offsets
-        if (
-            offsets is not None
-        ):  # index_select: a 0-d tensor index is data-dependent under dynamo
-            read = (
-                base
-                + offsets.index_select(0, slot.long().reshape(1)).to(torch.int32)[0]
-            )
-        else:
-            read = base
+        read, base = kda_state_rows(
+            backend.req_to_token_pool.mamba_pool,
+            mode,
+            slot,
+            forward_batch.req_pool_indices[:1].to(slot.device),
+        )
         x0 = (
             model.embed_tokens(input_ids)
             if inputs_embeds is None
@@ -604,6 +596,28 @@ class K3MegakernelRuntime:
             buf.copy_(aux)
             aux = buf
         return out, aux
+
+
+def kda_state_rows(mamba_pool, mode, slot, req_pool_indices):
+    """(read row, write base) of one request's KDA state, as the TPU GDN backend uses them
+    (``sglang_tpu.mamba_pool``, ``TpuGDNAttnBackend._state_rows``).
+
+    Slots own one state row each; with speculation every request pool row also owns a
+    ``checkpoint_width`` verify window after the slots. A verify resumes from the committed
+    row (the slot row, or the window row its last commit selected) and writes the state after
+    row t to window row t. Extend and decode read and write the slot row (extend's metadata
+    has already reset the slot's read offset to ``AT_SLOT``).
+
+    ``slot`` is a 0-d int32 tensor, ``req_pool_indices`` the request's ``[1]`` pool row.
+    """
+    import torch
+
+    if mode.is_target_verify() and mamba_pool.checkpoint_read_offsets is not None:
+        # index_select over a [1] index: a 0-d tensor index is data-dependent under dynamo
+        read = mamba_pool.committed_state_rows(slot.reshape(1), req_pool_indices)
+        base = mamba_pool.window_bases(req_pool_indices)
+        return read.to(torch.int32)[0], base.to(torch.int32)[0]
+    return slot, slot
 
 
 def _check_pools(kernel, shapes: dict) -> None:
