@@ -2984,6 +2984,18 @@ for _entry_class in (
     )
 
 
+def _tied_head_shares_embedding_layout() -> bool:
+    """Whether embed_tokens can double as the LM head under the current layout.
+
+    Under DP attention the embedding is replicated while a DP LM head shards
+    over the attention-TP group; they agree only when that group is one rank.
+    """
+    if not is_dp_attention_enabled():
+        return True
+    parallel = get_parallel()
+    return parallel.enable_dp_lm_head and parallel.attn_tp_size == 1
+
+
 # TODO: Remove this class entrypoint
 # This class is temporary text-only qwen3_5 class which is for
 # splitting the qwen3_5 on TPU into text-only and text + vision
@@ -2998,10 +3010,9 @@ class Qwen3_5TextForCausalLM(nn.Module):
     (model_type "qwen3_5_text") and MoE ("qwen3_5_moe_text") text configs.
     """
 
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
+    # Includes the fused GDN in-projections; without them the quant skip list
+    # can never match in_proj_ba and it is quantized.
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
 
     def __init__(
         self,
@@ -3018,16 +3029,23 @@ class Qwen3_5TextForCausalLM(nn.Module):
         # rather than a substring of model_type.
         is_moe = isinstance(config, Qwen3_5MoeTextConfig)
         backbone_cls = Qwen3_5MoeForCausalLM if is_moe else Qwen3_5ForCausalLM
+        # Quant configs name modules as the VL checkpoint does; the same module
+        # prefix makes the skip list match without renaming.
         self.model = backbone_cls(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config, quant_config, prefix=add_prefix("model.language_model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            org_num_embeddings=config.vocab_size,
-            prefix=add_prefix("lm_head", prefix),
-        )
+        if config.tie_word_embeddings and _tied_head_shares_embedding_layout():
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                org_num_embeddings=config.vocab_size,
+                # Shard over the group the LogitsProcessor gathers over.
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                prefix=add_prefix("lm_head", prefix),
+            )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -3061,6 +3079,15 @@ class Qwen3_5TextForCausalLM(nn.Module):
         # namespace and delegate (the backbone loader fuses q/k/v and the GDN
         # in-projections via its stacked_params_mapping).
         lm_prefix = "model.language_model."
+        tied = self.config.tie_word_embeddings
+        # A tied head that could not alias the embedding (see __init__) is fed
+        # the embedding tensor through its own loader, which slices its shard.
+        head_from_embedding = tied and self.lm_head is not self.model.embed_tokens
+
+        def _load_head(w: torch.Tensor) -> None:
+            param = self.lm_head.weight
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, w)
 
         # Remap lazily. Buffering into a list would drain the incoming stream
         # before a single parameter is copied, which defeats the platform's
@@ -3076,23 +3103,20 @@ class Qwen3_5TextForCausalLM(nn.Module):
                     or name.startswith("mtp.")
                 ):
                     continue
-                if name.startswith("lm_head."):
-                    param = self.lm_head.weight
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, w)
-                elif name.startswith(lm_prefix):
-                    yield name[len(lm_prefix) :], w
+                if name == "lm_head.weight":
+                    # For a tied model the embedding is authoritative.
+                    if not tied:
+                        _load_head(w)
+                    continue
+                if name.startswith(lm_prefix):
+                    name = name[len(lm_prefix) :]
                 elif name.startswith("model."):
-                    yield name[len("model.") :], w
-                else:
-                    yield name, w
+                    name = name[len("model.") :]
+                if head_from_embedding and name == "embed_tokens.weight":
+                    _load_head(w)
+                yield name, w
 
         self.model.load_weights(_remapped())
-        # Tied embeddings: no lm_head weight in the checkpoint.
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight.data.copy_(self.model.embed_tokens.weight.data)
 
 
 # The text-only entry answers the shared-expert fusion question like the others.
