@@ -64,6 +64,15 @@ def _draft_runner_of(worker):
     )
 
 
+def _flatten_accept_index(accept_index, num_accept_tokens_list, topk):
+    """Flatten accepted indices without a dynamic mask for linear drafts."""
+    if topk != 1:
+        return accept_index[accept_index != -1]
+    return torch.cat(
+        [row[:length] for row, length in zip(accept_index, num_accept_tokens_list)]
+    )
+
+
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
@@ -444,8 +453,12 @@ class EagleVerifyInput(SpecInput):
 
         unfinished_index = []
         unfinished_accept_index = []
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
+        accept_token_per_slot = torch.where(
+            accept_index >= 0,
+            predict[accept_index.clamp(min=0)],
+            predict.new_full((), -1),
+        )
+        accept_token_per_slot_cpu = accept_token_per_slot.tolist()
         has_finished = False
         think_end_id = batch.model_config.think_end_id
         # Track per-request correct drafts from the CPU loop to avoid a
@@ -454,20 +467,22 @@ class EagleVerifyInput(SpecInput):
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+        for i, (req, accept_token_row) in enumerate(
+            zip(batch.reqs, accept_token_per_slot_cpu)
+        ):
             num_accept_tokens = 0
-            for j, idx in enumerate(accept_index_row):
-                if idx == -1:
+            accept_token = -1
+            for j, accept_token in enumerate(accept_token_row):
+                if accept_token == -1:
                     break
                 num_accept_tokens += 1
-                id = predict_cpu[idx]
-                req.output_ids.append(id)
+                req.output_ids.append(accept_token)
                 if req.require_reasoning and think_end_id is not None:
-                    req.update_reasoning_tokens(id, think_end_id)
+                    req.update_reasoning_tokens(accept_token, think_end_id)
                 req.update_finish_state()
                 if not req.finished() and req.grammar is not None:
                     try:
-                        req.grammar.accept_token(id)
+                        req.grammar.accept_token(accept_token)
                     except ValueError as e:
                         logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                         raise e
@@ -482,7 +497,7 @@ class EagleVerifyInput(SpecInput):
             req.kv_allocated_len = req.kv_committed_len
             if not req.finished():
                 unfinished_index.append(i)
-                if idx == -1:
+                if accept_token == -1:
                     unfinished_accept_index.append(accept_index[i, :j])
                 else:
                     unfinished_accept_index.append(accept_index[i])
@@ -495,17 +510,22 @@ class EagleVerifyInput(SpecInput):
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
 
-        # Free the KV cache for unaccepted tokens
-        # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
-        accept_tokens = predict[accept_index]
-        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-        evict_mask[accept_index] = False
         # Derive CPU values from the loop above instead of device transfer.
         num_accept_tokens_list = [n + 1 for n in num_correct_drafts_list]
         num_accept_tokens_cpu = torch.tensor(
             num_accept_tokens_list, dtype=batch.seq_lens_cpu.dtype
         )
+
+        # Avoid dynamic masking for the common linear-draft path.
+        accept_index = _flatten_accept_index(
+            accept_index, num_accept_tokens_list, self.topk
+        )
+
+        # Free the KV cache for unaccepted tokens
+        # TODO: fuse them
+        accept_tokens = predict[accept_index]
+        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
+        evict_mask[accept_index] = False
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
