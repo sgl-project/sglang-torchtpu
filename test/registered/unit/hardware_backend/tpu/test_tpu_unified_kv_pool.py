@@ -35,8 +35,12 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    SpecAuxHiddenStateConfig,
+)
 from sglang.srt.model_executor.pool_configurator import (
     HybridSWAPoolConfigurator,
+    MemoryPoolConfig,
     create_memory_pool_configurator,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -150,6 +154,7 @@ def _hybrid_kvc(
         model_config=model_config,
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        spec_aux_config=SpecAuxHiddenStateConfig(),
         layer_info=SimpleNamespace(
             start_layer=0,
             full_attention_layer_ids=list(full_layer_ids),
@@ -536,6 +541,35 @@ class TestUnifiedAllocator(CustomTestCase):
         alloc.free_full(filler)
         self.assertIsNotNone(_decode(alloc, req[-1:], PAGE_SIZE + 1))
         self.assertEqual(_held_and_free_pages(alloc), (2, 2, 4))
+
+    def test_extend_short_of_one_side_takes_no_page(self):
+        """Speculative decoding reserves a request's next tokens through
+        alloc_extend; when only one side has a page for them it takes none."""
+        alloc = self._make_allocator()
+        req = _extend(alloc, PAGE_SIZE)
+        filler = _extend_swa_tail(alloc, seq_len=5 * PAGE_SIZE, swa_tail_len=0)
+        self.assertIsNotNone(filler)
+        self.assertEqual(_held_and_free_pages(alloc), (6, 1, 1))
+        prefix_lens = torch.tensor([PAGE_SIZE], dtype=torch.int64)
+        seq_lens = prefix_lens + 1
+        self.assertIsNone(
+            alloc.alloc_extend(
+                prefix_lens, prefix_lens, seq_lens, seq_lens, req[-1:], 1
+            )
+        )
+        self.assertEqual(_held_and_free_pages(alloc), (6, 1, 1))
+
+    def test_draft_pool_covers_every_page_id(self):
+        """A draft pool is indexed by the full side's page ids, which reach the
+        last page of the shared pool; one sized by the full-attention token
+        count takes draft writes past its end."""
+        alloc = self._make_allocator()
+        full_only = _extend_swa_tail(alloc, seq_len=POOL_TOKENS, swa_tail_len=0)
+        self.assertIsNotNone(full_only)
+        draft_tokens = alloc.draft_pool_num_tokens()
+        self.assertEqual(draft_tokens, POOL_TOKENS)
+        # A pool of N tokens holds N // PAGE_SIZE + 1 pages; page 0 pads.
+        self.assertLess(int(full_only.max()), draft_tokens + PAGE_SIZE)
 
     def test_every_release_path_returns_pages_to_the_shared_list(self):
         alloc = self._make_allocator()
@@ -1406,6 +1440,45 @@ class TestUnifiedPoolEnabled(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "nor fit as one full-attention"):
                 unified_kv_pool_enabled(fp8)
 
+    @staticmethod
+    def _enabled_with(spec_algorithm, **kvc_fields):
+        kvc = _hybrid_kvc()
+        kvc.spec_algorithm = spec_algorithm
+        for name, value in kvc_fields.items():
+            setattr(kvc, name, value)
+        with (
+            _fused_rpa_platform(),
+            get_context().override_server_args(tpu_unified_kv_pool=True),
+            get_parallel().override(attn_tp_size=1),
+        ):
+            return unified_kv_pool_enabled(kvc)
+
+    def test_accepts_eagle3_and_dflash_targets(self):
+        # Their draft pools are plain pools over the target's shared page ids.
+        for algorithm in (SpeculativeAlgorithm.EAGLE3, SpeculativeAlgorithm.DFLASH):
+            with self.subTest(algorithm=algorithm.name):
+                self.assertTrue(self._enabled_with(algorithm))
+
+    def test_rejects_other_drafts_by_name(self):
+        # The near relatives of the accepted algorithms.
+        for algorithm in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.DSPARK):
+            with (
+                self.subTest(algorithm=algorithm.name),
+                self.assertRaisesRegex(
+                    ValueError, f"speculative decoding with {algorithm.name}"
+                ),
+            ):
+                self._enabled_with(algorithm)
+        with self.assertRaisesRegex(ValueError, "the draft worker's KV pool"):
+            self._enabled_with(SpeculativeAlgorithm.EAGLE3, is_draft_worker=True)
+        with self.assertRaisesRegex(ValueError, "a sliding-window draft model"):
+            self._enabled_with(
+                SpeculativeAlgorithm.EAGLE3,
+                spec_aux_config=SpecAuxHiddenStateConfig(
+                    eagle_draft_num_layers=1, eagle_draft_swa_num_layers=1
+                ),
+            )
+
 
 class TestUnifiedHostPool(CustomTestCase):
     HICACHE_RATIO = 2.0
@@ -1608,6 +1681,25 @@ class TestUnifiedPoolSizing(CustomTestCase):
         config = configurator.calculate_pool_sizes(1280 * 1000, PAGE_SIZE)
         self.assertEqual(self._sizes(config), (1000, 2496, 2496))
 
+    def test_draft_pool_over_the_shared_page_ids_shares_the_budget(self):
+        # A one-layer draft adds 512 bytes per full token: 2048 bytes size 1000
+        # full + 500 SWA tokens and a 1000-token draft pool. A draft pool over
+        # the shared pool covers it plus a page, so the shared pool gets
+        # (2048000 - 4 * 512) // (1024 + 512) = 1332 tokens, floored to 1312.
+        kvc = _hybrid_kvc()
+        kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+        kvc.spec_aux_config = SpecAuxHiddenStateConfig(eagle_draft_num_layers=1)
+        budget = 2048 * 1000
+        config = self._configurator(kvc).calculate_pool_sizes(budget, PAGE_SIZE)
+        self.assertEqual(self._sizes(config), (1000, 1312, 1312))
+
+        def used_bytes(shared_tokens):
+            return shared_tokens * 1024 + (shared_tokens + PAGE_SIZE) * 512
+
+        # The largest whole number of 8-page units that fits.
+        self.assertLessEqual(used_bytes(1312), budget)
+        self.assertGreater(used_bytes(1312 + 8 * PAGE_SIZE), budget)
+
     def test_token_cap_keeps_counting_full_attention_tokens(self):
         # gpt-oss at page 64 and ratio 0.8: --max-total-tokens 16400 caps the
         # static pools at 16384 full + 13056 SWA tokens, 29440 shared, floored
@@ -1753,6 +1845,74 @@ class TestUnifiedPoolDispatch(CustomTestCase):
         self.assertIsInstance(allocator, TpuUnifiedSWATokenToKVPoolAllocator)
         # Either side alone can take every page of the shared pool.
         self.assertEqual(allocator.full_available_size(), pool.size)
+
+    def test_draft_pool_spans_the_target_allocator_page_ids(self):
+        """The draft worker sizes its pool from the target's config, whose token
+        count is the full-attention one, but indexes it with the target's page
+        ids; a pool smaller than their range takes draft writes past its end."""
+        _tpu_swa_allocator_branches(self)
+        allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+            POOL_TOKENS,
+            page_size=PAGE_SIZE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=_make_pool(),
+            need_sort=False,
+        )
+        # A plain one-layer EAGLE3 draft model.
+        draft = SimpleNamespace(
+            is_draft_worker=True,
+            is_hybrid_swa=False,
+            is_hybrid_swa_mtp_draft=False,
+            use_mla_backend=False,
+            mambaish_config=None,
+            device="cpu",
+            loc_space_scale=1,
+            pool_page_size=PAGE_SIZE,
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype_str="auto",
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["LlamaForCausalLMEagle3"]),
+                head_dim=128,
+                get_num_kv_heads=lambda tp_size, dcp_size=1: 1,
+            ),
+            layer_info=SimpleNamespace(
+                num_effective_layers=1, start_layer=0, end_layer=1
+            ),
+            _validate_prefill_only_disable_kv_cache_pool_family=lambda *args: None,
+            _tpu_mha_pool_class=lambda: TpuFusedMHATokenToKVPool,
+            _mxint8_pool_kwargs=lambda: {},
+        )
+        draft._build_token_to_kv_pool = lambda **kwargs: (
+            KVCacheConfigurator._build_token_to_kv_pool(draft, **kwargs)
+        )
+        draft._build_oot_mha_kv_pool = lambda **kwargs: (
+            KVCacheConfigurator._build_oot_mha_kv_pool(draft, **kwargs)
+        )
+        draft._build_token_to_kv_pool_allocator = lambda **kwargs: (
+            KVCacheConfigurator._build_token_to_kv_pool_allocator(draft, **kwargs)
+        )
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                TpuSRTPlatform(),
+            ),
+            get_context().override_server_args(
+                tpu_unified_kv_pool=True, page_size=PAGE_SIZE
+            ),
+            get_parallel().override(attn_tp_size=1, attn_dcp_size=1),
+        ):
+            sizes = KVCacheConfigurator._derive_pool_sizes(
+                draft, config=MemoryPoolConfig(max_total_num_tokens=POOL_TOKENS // 2)
+            )
+            pools = KVCacheConfigurator._init_pools(
+                draft,
+                sizes=sizes,
+                req_to_token_pool=object(),
+                token_to_kv_pool_allocator=allocator,
+            )
+        self.assertIs(pools.token_to_kv_pool_allocator, allocator)
+        self.assertEqual(pools.token_to_kv_pool.size, POOL_TOKENS)
 
 
 if __name__ == "__main__":

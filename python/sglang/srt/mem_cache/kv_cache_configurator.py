@@ -693,6 +693,14 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
+            else:
+                draft_virtual_id_space = (
+                    token_to_kv_pool_allocator.draft_pool_num_tokens()
+                )
+                if draft_virtual_id_space is not None:
+                    sizes = msgspec.structs.replace(
+                        sizes, max_total_num_tokens=draft_virtual_id_space
+                    )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:

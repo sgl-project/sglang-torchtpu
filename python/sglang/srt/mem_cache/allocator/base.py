@@ -249,6 +249,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         virtual-id pools must override."""
         return kv_indices
 
+    def draft_pool_num_tokens(self) -> int | None:
+        """Tokens a draft pool indexed by this allocator's page ids must cover;
+        None means the configured token capacity covers them."""
+        return None
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError()
 

@@ -192,8 +192,18 @@ def _unsupported_reason(kvc: KVCacheConfigurator) -> Optional[str]:
         or not layer_info.swa_attention_layer_ids
     ):
         return "a rank without both full-attention and sliding-window layers"
-    if not kvc.spec_algorithm.is_none() or kvc.is_draft_worker:
-        return "speculative decoding"
+    # A draft model keeps its own pool, indexed by the target's shared page ids.
+    if kvc.is_draft_worker:
+        return "the draft worker's KV pool"
+    spec_algorithm = kvc.spec_algorithm
+    if not (
+        spec_algorithm.is_none()
+        or spec_algorithm.is_eagle3()
+        or spec_algorithm.is_dflash()
+    ):
+        return f"speculative decoding with {spec_algorithm.name}"
+    if kvc.spec_aux_config.eagle_draft_swa_num_layers is not None:
+        return "a sliding-window draft model"
     if get_parallel().pp_size > 1:
         return "pipeline parallelism"
     if get_parallel().attn_cp_size > 1 or get_parallel().dcp_enabled:
@@ -758,6 +768,10 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def _page_ids_needed(self, num_full_pages: int, num_swa_pages: int) -> int:
         return num_full_pages + self._swa_groups * num_swa_pages
 
+    def draft_pool_num_tokens(self) -> int:
+        # The full side hands out page ids across the whole shared pool.
+        return self.size_full
+
     def available_size(self):
         return self._free_page_count() // (1 + self._swa_groups) * self.page_size
 
@@ -1044,11 +1058,33 @@ class _SharedPagesRatioSplit(HybridSWAPoolConfigurator):
         return None
 
 
+def _shared_pool_tokens(
+    *,
+    full_tokens: int,
+    swa_tokens: int,
+    full_layers: int,
+    swa_layers: int,
+    num_buffers: int,
+    layer_token_bytes: int,
+    draft_token_bytes: int,
+    page_size: int,
+) -> int:
+    """Largest token count of a shared pool that, with a draft pool over its page
+    ids, fits in the bytes of the static pools and their draft pool."""
+    static_bytes = (
+        full_tokens * full_layers + swa_tokens * swa_layers
+    ) * layer_token_bytes + full_tokens * draft_token_bytes
+    # A draft pool takes one padding page more.
+    return (static_bytes - page_size * draft_token_bytes) // (
+        num_buffers * layer_token_bytes + draft_token_bytes
+    )
+
+
 class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
     """Sizes the unified pool from the static full and sliding-window pools.
 
-    The shared pool gets the bytes the two static pools would get for the same
-    flags, and max_total_num_tokens stays their full-attention token count.
+    The shared pool and its draft pool get the bytes the static pools and theirs
+    would get for the same flags; max_total_num_tokens stays the full-attention count.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -1066,6 +1102,10 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
             num_full_layers=self._full_layers_num,
             num_swa_layers=self._swa_layers_num,
         )
+        # Both kinds of layer have rows of the same bytes.
+        self._layer_token_bytes = self._static._full_per_token
+        # 0 without a draft model.
+        self._draft_token_bytes = self._static._draft_pool_bytes_per_token()
         self._sliding_window_size = kvc.sliding_window_size
 
     def calculate_pool_sizes(
@@ -1098,9 +1138,16 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
         num_buffers = max(
             self._full_layers_num, _cdiv(self._swa_layers_num, self._swa_groups)
         )
-        shared_tokens = (
-            full_tokens * self._full_layers_num + swa_tokens * self._swa_layers_num
-        ) // num_buffers
+        shared_tokens = _shared_pool_tokens(
+            full_tokens=full_tokens,
+            swa_tokens=swa_tokens,
+            full_layers=self._full_layers_num,
+            swa_layers=self._swa_layers_num,
+            num_buffers=num_buffers,
+            layer_token_bytes=self._layer_token_bytes,
+            draft_token_bytes=self._draft_token_bytes,
+            page_size=page_size,
+        )
         align_tokens = page_size * _TPU_SWA_PAGE_ALIGNMENT
         shared_tokens = shared_tokens // align_tokens * align_tokens
         self._validate_shared_pool_size(shared_tokens, page_size)
