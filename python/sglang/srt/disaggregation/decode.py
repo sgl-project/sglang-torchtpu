@@ -1191,6 +1191,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 except Exception as e:
                     error_message += f" with exception {e}"
                     is_propagated = getattr(e, "is_from_another_rank", False)
+                if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                    # Aborting a request also fails its receiver. The request
+                    # keeps the abort's reason and status.
+                    logger.debug(error_message)
+                    continue
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
