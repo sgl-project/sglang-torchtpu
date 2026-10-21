@@ -47,6 +47,7 @@ from sglang_tpu.k3_megakernel.kernel.stages.common import (
 )
 from sglang_tpu.k3_megakernel.kernel.stages.expert import (
     down_dot,
+    down_dot_dequant,
     down_dot_pair,
     gate_up_dot,
     situ_and_mul,
@@ -227,6 +228,7 @@ class MoeStage:
         late_latent_up: bool | str = False,
         row_gathers: bool = False,
         up_tree: bool = False,
+        down_dequant: bool = True,
         debug: frozenset = frozenset(),
     ):
         """``gather_bf16``: the router-score, latent and output gathers travel as bf16 (their
@@ -276,6 +278,8 @@ class MoeStage:
         self.late_latent_up = {True: "latent"}.get(late_latent_up, late_latent_up)
         assert self.late_latent_up in (False, "latent", "reduce"), late_latent_up
         self.up_tree = up_tree
+        # Grouped rows, several picking rows: the down dot as one M=R pass on scale-applied bf16 weights.
+        self.down_dequant = down_dequant
         self.debug = debug
         assert ring % 2 == 0 or not pair_down, ring
         self.relax = relax
@@ -727,14 +731,17 @@ class MoeStage:
                 col = jnp.where(row_id == r, wmat[j * rows + r], col)
             return col
 
+        def down_rows(a, slot):
+            dot = down_dot_dequant if self.down_dequant else down_dot
+            return dot(a, ring[2].at[slot], ring[3].at[slot])
+
         def single(j):
             slot = j % self.ring
             self._wait(w, ring, sems, j, lid, 0)
             a = self._act(ring, slot, x)
             self._refill(w, ring, sems, j, lid, n, 0)
             self._wait(w, ring, sems, j, lid, 1)
-            part = down_dot(a, ring[2].at[slot], ring[3].at[slot])
-            acc_vmem[...] += part * weights(j)
+            acc_vmem[...] += down_rows(a, slot) * weights(j)
             self._refill(w, ring, sems, j, lid, n, 1)
 
         # Paired distinct experts are off: at R = 8 they gave a wrong row 0 in --verify-check

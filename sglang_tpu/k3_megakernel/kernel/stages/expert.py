@@ -97,3 +97,16 @@ def down_dot(a: jax.Array, packed_ref, exp_ref) -> jax.Array:
     part = jax.lax.dot_general(left, w, _DN, preferred_element_type=jnp.float32)
     part = part[: rows * groups].reshape(rows, groups, -1)
     return jnp.sum(part * _e8m0_to_f32(exp_ref[...])[None], axis=1)
+
+
+def down_dot_dequant(a: jax.Array, packed_ref, exp_ref) -> jax.Array:
+    """``down_dot`` with the e8m0 group scales applied to the weights (bf16, exact: FP4 values times
+    powers of two) and one M=R dot; the f32 sum over K runs in the MXU's order instead of per group."""
+    rows, c = a.shape
+    groups = c // 32
+    w = pltpu.bitcast(packed_ref.bitcast(jnp.uint32)[...], jnp.float4_e2m1fn)
+    w = w.astype(jnp.float8_e4m3fn).astype(jnp.bfloat16)
+    scale = _e8m0_to_f32(exp_ref[...]).astype(jnp.bfloat16)  # [groups, N]
+    n = scale.shape[-1]
+    scale = jnp.broadcast_to(scale[:, None, :], (groups, 32, n)).reshape(c, n)
+    return jax.lax.dot_general(a, w * scale, _DN, preferred_element_type=jnp.float32)
