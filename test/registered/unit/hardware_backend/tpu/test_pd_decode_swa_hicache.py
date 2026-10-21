@@ -493,6 +493,27 @@ class TestFullOnlyStrategy(CustomTestCase):
         self.assertIsNone(cache.components[ComponentType.SWA]._swa_kv_pool_host)
 
 
+class TestFullOnlyStrategyPoolMatch(CustomTestCase):
+    def test_pool_subclassing_the_original_swa_class_still_matches(self):
+        """A pool subclassing the original SWAKVPool gets the full-only stack
+        after a plugin rebinds swa_memory_pool.SWAKVPool to its own subclass."""
+        from sglang.srt.mem_cache import swa_memory_pool
+
+        class PlatformPool(swa_memory_pool.SWAKVPool):
+            pass
+
+        class PluginPool(swa_memory_pool.SWAKVPool):
+            pass
+
+        kvcache = MagicMock(spec=PlatformPool)
+        components = {ComponentType.FULL, ComponentType.SWA}
+        with (
+            patch.object(swa_memory_pool, "SWAKVPool", PluginPool),
+            patch.object(tpu, "_is_building_full_only_host_cache", True),
+        ):
+            self.assertTrue(tpu._FULL_ONLY_SWA_STRATEGY.matches(kvcache, components))
+
+
 class TestAdmissionAndAllocation(CustomTestCase):
     def queue(self, cache):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)

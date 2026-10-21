@@ -81,6 +81,22 @@ per-side SWA page ids both schedulers already derive for `StateType.SWA`
 (`_swa_payload` in prefill.py/decode.py). The extra block list and endpoint
 ride in the existing `BLOCKS` reply.
 
+With `--enable-unified-memory` both kinds share one pool's buffers
+(`sglang_tpu/unified_kv_pool.py`): full-attention layer i uses buffer i, and
+sliding-window layers beyond the full count form G groups whose k-th layers
+share buffer k, so a sliding-window page is one page id per group. The SWA
+engine registers each buffer the sliding-window layers use once and moves a
+window page as its G page ids, page by page
+(`TpuUnifiedSWAKVPool.swa_transfer_pages`), so one block-id list fills every
+layer and a tail of the list is a tail of the window. Its max blocks and
+staging are G per window page. Both peers must run the unified pool with the
+same layer split: a unified decode names its layout (`swa_layout`: buffers,
+blocks per page) in `PULL_REQ` and `RESHARD_REQ`, and other decodes leave the
+field out, so their messages are unchanged. A prefill with another layout fails
+the room and answers `ROOM_FAILED`; a prefill that predates the field rejects
+the message. A unified decode on the pipeline transfer
+(`SGLANG_RAIDEN_PIPELINE_TRANSFER`) is refused at startup.
+
 Push-resharding runs the same two-engine split. `RESHARD_REQ` carries the
 decode's SWA pages and its SWA transfer address alongside the full ones, and
 `RESHARD_BLOCKS` carries the prefill's; each side then builds a second plan
@@ -123,7 +139,7 @@ KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 | `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 6*node_worker_rank` over every PP/CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`, GDN state engine control/data = `+4`/`+5`) |
 | `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; each rank's pool is sized for at most one max-length transfer per running request and seats in-flight transfers page by page. Startup fails with the required and available sizes when not even one max-length transfer fits |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
-| `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
+| `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start. A unified pool with G sliding-window groups stages G blocks per page |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
 | `SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S` | `60` | raiden deadline of each KV chunk transfer (the closing read counts as a chunk; not the whole request; `SGLANG_RAIDEN_TIMEOUT_S` is a deprecated alias), set the same on prefill and decode: the prefill keeps a read registered for this long after announcing it and then releases its pages; a decode read that waited longer than this for a staging slot is failed instead of pulled |
 | `SGLANG_RAIDEN_LISTENER_START_READ` | `1` | decode only: the listener thread starts a request's next read as soon as the prefill announces it, instead of waiting for the next scheduler poll; `0` starts reads only on the poll. Admission is unchanged and completion is still detected by the poll. Pipeline and resharded transfers are unaffected |

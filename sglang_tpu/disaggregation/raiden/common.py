@@ -67,6 +67,12 @@ class RaidenKVCacheGroups:
     state: List[torch.Tensor] = field(default_factory=list)
     # Maps a request's mamba slot to the state row a transfer moves.
     committed_state_row: Optional[Callable[[int], int]] = None
+    # Set for the TPU unified pool, whose sliding-window layers share buffers:
+    # the SWA engine registers each of them once (swa_buffers) and moves a
+    # sliding-window page as swa_block_ids(pages), swa_groups page ids each.
+    swa_buffers: Optional[List[Any]] = None
+    swa_block_ids: Optional[Callable[[List[int]], List[int]]] = None
+    swa_groups: int = 1
 
 
 def get_raiden_kv_caches(
@@ -155,6 +161,18 @@ def get_raiden_kv_caches(
                 f"Raiden requires uniform {name} block counts; got "
                 f"{sorted(block_counts)}"
             )
+    # Deferred: the unified pool module pulls in the KV cache stack.
+    from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+    shared_swa = {}
+    if isinstance(pool, TpuUnifiedSWAKVPool):
+        # Its block ids would also index a draft's sliding-window pool.
+        assert not num_draft_swa
+        shared_swa = dict(
+            swa_buffers=pool.swa_transfer_buffers(),
+            swa_block_ids=pool.swa_transfer_pages,
+            swa_groups=pool.num_swa_groups,
+        )
     return RaidenKVCacheGroups(
         full=full,
         swa=swa,
@@ -164,4 +182,5 @@ def get_raiden_kv_caches(
         num_draft_swa=num_draft_swa,
         state=state,
         committed_state_row=committed_state_row,
+        **shared_swa,
     )

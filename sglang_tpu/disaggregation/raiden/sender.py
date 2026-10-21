@@ -16,6 +16,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, List, Optional, Set
 
+import msgspec
 import numpy as np
 import numpy.typing as npt
 import zmq
@@ -73,6 +74,13 @@ def _first_repeated_block(
     return None
 
 
+def _describe_swa_layout(layout) -> str:
+    if layout is msgspec.UNSET:
+        return "a page id per page of per-layer buffers"
+    buffers, groups = layout
+    return f"{groups} page ids per page of {buffers} buffers (unified KV pool)"
+
+
 class RaidenSenderMixin:
     """Prefill-side methods of ``RaidenKVManager``."""
 
@@ -85,6 +93,8 @@ class RaidenSenderMixin:
         decode_swa_pages = req.decode_swa_pages
         with self._state_lock:
             failed_reason = self._tombstone_reason_locked(room)
+            if failed_reason is None:
+                failed_reason = self._refuse_swa_layout_locked(room, req.swa_layout)
             if failed_reason is None:
                 self._prefill.decode_addr[room] = (decode_ip, decode_port)
                 self._prefill.decode_pages[room] = decode_pages
@@ -139,6 +149,24 @@ class RaidenSenderMixin:
             )
             self.update_status(room, KVPoll.Failed)
         self._drop_room_state(room)
+
+    def _refuse_swa_layout_locked(self, room: int, decode_layout) -> Optional[str]:
+        """Fail ``room`` if its decode moves sliding-window KV in another layout,
+        and return why. Raiden pairs the two block lists position by position,
+        and a unified pool's list holds a page id per sliding-window group."""
+        if decode_layout == self._swa_layout:
+            return None
+        reason = (
+            f"Raiden sliding-window KV layouts differ: prefill rank "
+            f"{self.attn_tp_rank} moves {_describe_swa_layout(self._swa_layout)}, "
+            f"the decode {_describe_swa_layout(decode_layout)}. Run both with the "
+            "same --enable-unified-memory setting"
+        )
+        logger.error("RaidenKVManager room %s: %s", room, reason)
+        self._mark_aborted_locked(room)
+        self._fail_room_locked(room, reason)
+        self.update_status(room, KVPoll.Failed)
+        return reason
 
     def _tombstone_reason_locked(self, room: int) -> Optional[str]:
         """Why a decode asking for ``room`` cannot be served, or None if the
@@ -716,6 +744,8 @@ class RaidenSenderMixin:
         swa_push_endpoint = req.swa_push_endpoint
         with self._state_lock:
             failed_reason = self._tombstone_reason_locked(room)
+            if failed_reason is None:
+                failed_reason = self._refuse_swa_layout_locked(room, req.swa_layout)
             if failed_reason is None:
                 self._prefill.reshard_req[room] = dict(
                     reply_addr=(decode_ip, decode_port),

@@ -9,14 +9,16 @@ torch_tpu installed.
 import contextlib
 import subprocess
 import sys
+import threading
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import hicache_auto_size
 from sglang.srt.mem_cache.allocator import swa as swa_allocator_module
@@ -26,6 +28,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -46,6 +49,11 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
+from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+from sglang_tpu.disaggregation.raiden.serde import Blocks, MessageTag, RoomFailed
+from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.disaggregation.tpu.wire import WireMessage
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
 from sglang_tpu.kv_pool_host import TpuRaidenHostKVCache
@@ -100,10 +108,11 @@ def _make_pool(
     swa_head_num=1,
     swa_head_dim=128,
     pool_cls=TpuFusedMHATokenToKVPool,
+    size=POOL_TOKENS,
 ):
     """A bf16 unified pool whose full-attention layers have one KV head."""
     return TpuUnifiedSWAKVPool(
-        size=POOL_TOKENS,
+        size=size,
         page_size=PAGE_SIZE,
         dtype=torch.bfloat16,
         head_num=1,
@@ -248,13 +257,20 @@ class _StubTreeCache:
     """Prefix-cache stand-in: records eviction requests (``evict`` walks
     apart), then runs ``on_evict``."""
 
-    def __init__(self, on_evict=None):
+    def __init__(self, on_evict=None, *, swa_evictable=0):
         self.requests = []
         self.walks = []
         self._on_evict = on_evict
+        self._swa_evictable = swa_evictable
 
     def supports_prefix_sharing(self):
         return True
+
+    def full_evictable_size(self):
+        return 0
+
+    def swa_evictable_size(self):
+        return self._swa_evictable
 
     def evict_for_alloc(self, params):
         self.requests.append((params.num_tokens, params.swa_num_tokens))
@@ -651,6 +667,70 @@ class TestUnifiedAllocator(CustomTestCase):
         self.assertEqual(out_indices_cpu.tolist(), loc.tolist())
         self.assertGreater(int(alloc.full_to_swa_index_mapping[loc.long()]), 0)
         self.assertEqual(_held_and_free_pages(alloc), (2, 2, 4))
+
+    def test_prealloc_fits_counts_both_sides_against_one_list(self):
+        """A PD decode admits a preallocation only if its full and SWA pages fit
+        the one free list together; each side's budget counts every free page,
+        so checking the sides apart admits requests the allocation then fails."""
+        alloc = self._make_allocator()
+        _extend(alloc, 2 * PAGE_SIZE)
+
+        def fits(full_pages, swa_pages, tree):
+            # The budgets a decode passes with no headroom held back.
+            return alloc.prealloc_fits(
+                tree,
+                full_pages * PAGE_SIZE,
+                swa_pages * PAGE_SIZE,
+                full_budget_tokens=alloc.full_available_size()
+                + tree.full_evictable_size(),
+                swa_budget_tokens=alloc.swa_available_size()
+                + tree.swa_evictable_size(),
+            )
+
+        # Four pages are free: three full and two SWA pages each fit alone.
+        self.assertFalse(fits(3, 2, _StubTreeCache()))
+        self.assertTrue(fits(2, 2, _StubTreeCache()))
+        # A page the tree can evict counts, and the decode reclaims it jointly.
+        self.assertTrue(fits(3, 2, _StubTreeCache(swa_evictable=PAGE_SIZE)))
+        self.assertTrue(alloc.prealloc_fits_assumes_reclaim())
+
+    def test_prealloc_ceiling_counts_both_sides_against_the_whole_pool(self):
+        alloc = self._make_allocator()
+        _extend(alloc, 2 * PAGE_SIZE)
+        # Pages in use do not lower the ceiling; both sides share all eight.
+        self.assertTrue(alloc.prealloc_ceiling_fits(5 * PAGE_SIZE, 3 * PAGE_SIZE))
+        self.assertFalse(alloc.prealloc_ceiling_fits(5 * PAGE_SIZE, 3 * PAGE_SIZE + 1))
+
+    def test_grouped_prealloc_charges_a_page_id_per_group(self):
+        """A PD decode on a pool with three SWA groups prices each SWA page of a
+        preallocation at three page ids in admission, ceiling and reclaim."""
+        alloc, _ = _grouped_allocator(self)
+        # One full page and one SWA page of three ids are held; four are free.
+        cached = _extend(alloc, PAGE_SIZE)
+
+        def fits(full_pages, swa_pages, tree):
+            return alloc.prealloc_fits(
+                tree,
+                full_pages * PAGE_SIZE,
+                swa_pages * PAGE_SIZE,
+                full_budget_tokens=alloc.full_available_size()
+                + tree.full_evictable_size(),
+                swa_budget_tokens=alloc.swa_available_size()
+                + tree.swa_evictable_size(),
+            )
+
+        self.assertTrue(fits(1, 1, _StubTreeCache()))
+        # One page more on either side needs five or seven ids.
+        self.assertFalse(fits(2, 1, _StubTreeCache()))
+        self.assertFalse(fits(1, 2, _StubTreeCache()))
+        self.assertTrue(fits(1, 2, _StubTreeCache(swa_evictable=PAGE_SIZE)))
+        # The whole pool holds two full and two SWA pages, not a token more.
+        self.assertTrue(alloc.prealloc_ceiling_fits(2 * PAGE_SIZE, 2 * PAGE_SIZE))
+        self.assertFalse(alloc.prealloc_ceiling_fits(2 * PAGE_SIZE, 2 * PAGE_SIZE + 1))
+        # Reclaim asks the tree for the three missing ids, or one SWA page.
+        tree = _StubTreeCache(on_evict=lambda: alloc.free(cached))
+        self.assertIsNone(alloc.reclaim_for_prealloc(tree, PAGE_SIZE, 2 * PAGE_SIZE))
+        self.assertEqual(tree.requests, [(3 * PAGE_SIZE, PAGE_SIZE)])
 
 
 def _radix_tree(alloc, window):
@@ -1378,6 +1458,57 @@ class TestUnifiedPoolEnabled(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "TpuSeqAlongLaneKVPool"):
                     unified_kv_pool_enabled(_hybrid_kvc())
 
+    def test_pd_disaggregation_is_refused_with_pp_or_merged_heads(self):
+        # Raiden's pipeline transfer would register each shared buffer twice;
+        # merged sliding-window heads have not been through a transfer.
+        def enabled_with(mode, pp_size, kvc=None):
+            with (
+                _fused_rpa_platform(),
+                get_context().override_server_args(
+                    tpu_unified_kv_pool=True, disaggregation_mode=mode
+                ),
+                get_parallel().override(attn_tp_size=1, pp_size=pp_size),
+            ):
+                return unified_kv_pool_enabled(kvc or _hybrid_kvc())
+
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                self.assertTrue(enabled_with(mode, 1))
+                with self.assertRaisesRegex(
+                    ValueError, "PD disaggregation with pipeline parallelism"
+                ):
+                    enabled_with(mode, 2)
+                self.assertTrue(
+                    enabled_with(
+                        mode, 1, _hybrid_kvc(full_layer_ids=(0,), swa_layer_ids=(1, 2))
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "merged sliding-window heads"):
+                    enabled_with(
+                        mode,
+                        1,
+                        _hybrid_kvc(head_dim=256, swa_kv_heads=2, swa_head_dim=128),
+                    )
+
+    def test_a_decode_on_the_pipeline_transfer_is_refused(self):
+        # A decode fed by a pipeline prefill takes raiden's pipeline transfer,
+        # whose per-layer pools ignore the sliding-window groups.
+        def enabled_with(mode):
+            with (
+                _fused_rpa_platform(),
+                get_context().override_server_args(
+                    tpu_unified_kv_pool=True, disaggregation_mode=mode
+                ),
+                get_parallel().override(attn_tp_size=1),
+            ):
+                return unified_kv_pool_enabled(_hybrid_kvc())
+
+        # The override restores the variable only on a normal exit.
+        with envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.override(True):
+            self.assertTrue(enabled_with("prefill"))
+            with self.assertRaisesRegex(ValueError, "SGLANG_RAIDEN_PIPELINE_TRANSFER"):
+                enabled_with("decode")
+
     def test_sliding_window_pages_must_match_or_merge_into_full_ones(self):
         # Sliding-window layers beyond the full count form groups, and two
         # sliding-window heads of 128 merge into one full head of 256; one full
@@ -1545,6 +1676,354 @@ class TestUnifiedHostPool(CustomTestCase):
 
         swa_host.free(host_indices)
         self.assertEqual(full_host.available_size(), swa_host.size)
+
+
+# Two full-attention and five sliding-window layers: SWA groups of two, two and
+# one layers over two shared buffers, as Muse Spark's 16 + 46 layers form
+# groups of 16, 15 and 15.
+PD_FULL_LAYERS = (0, 3)
+PD_SWA_LAYERS = (1, 2, 4, 5, 6)
+PD_GROUPS = 3
+PD_POOL_PAGES = 64
+PD_WINDOW = 2 * PAGE_SIZE
+# Five pages and a token: the window starts mid-request.
+PD_SEQ_LEN = 5 * PAGE_SIZE + 1
+PD_ROOM = 7
+PD_DECODE_PORT = 40000
+PD_PREFILL_RANK = {"rank_ip": "127.0.0.1", "rank_port": 40001}
+
+
+def _pd_side(
+    testcase,
+    *,
+    pool_cls,
+    full_layer_ids=PD_FULL_LAYERS,
+    swa_layer_ids=PD_SWA_LAYERS,
+):
+    _tpu_swa_allocator_branches(testcase)
+    size = PD_POOL_PAGES * PAGE_SIZE
+    pool = _make_pool(
+        full_layer_ids=full_layer_ids,
+        swa_layer_ids=swa_layer_ids,
+        pool_cls=pool_cls,
+        size=size,
+    )
+    alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+        size,
+        page_size=PAGE_SIZE,
+        dtype=torch.bfloat16,
+        device="cpu",
+        kvcache=pool,
+        need_sort=False,
+    )
+    return pool, alloc
+
+
+def _window_swa_pages(alloc, full_loc, window_start):
+    """The SWA payload prefill.py and decode.py build: the window's SWA pages."""
+    swa_loc = alloc.translate_swa_indices_for_transfer(full_loc[window_start:])
+    return [int(p) for p in kv_to_page_indices(swa_loc, PAGE_SIZE)]
+
+
+def _pages(full_loc):
+    return [int(p) for p in kv_to_page_indices(full_loc, PAGE_SIZE)]
+
+
+def _raiden_manager(pool, *, prefill):
+    """A raiden manager over ``pool`` whose two engines are mocks recording how
+    they were built; no sockets."""
+    mgr = object.__new__(RaidenKVManager)
+    mgr.kv_args = SimpleNamespace(
+        page_size=PAGE_SIZE,
+        sliding_window_size=PD_WINDOW,
+        state_types=[StateType.SWA],
+        engine_rank=0,
+    )
+    mgr.server_args = SimpleNamespace(context_length=PD_POOL_PAGES * PAGE_SIZE)
+    mgr.attn_tp_rank = 0
+    mgr.attn_tp_size = 1
+    mgr.local_ip = "127.0.0.1"
+    mgr.rank_port = PD_DECODE_PORT
+    mgr._local_rank = 0
+    mgr._control_port = 31000
+    mgr._timeout_s = 60.0
+    mgr._dynamic_host_staging = True
+    mgr._transfer_parallelism = 4
+    mgr._engine = None
+    mgr._swa_engine = None
+    mgr._num_slots = lambda kv_caches, max_blocks, engines=1: 4
+    mgr._state_lock = threading.Lock()
+    mgr._status_lock = threading.Lock()
+    mgr._announce_lock = threading.Lock()
+    mgr.request_status = {}
+    mgr.failure_records = {}
+    mgr.failure_lock = threading.Lock()
+    mgr.record_failure = Mock()
+    mgr._aborted = {}
+    mgr._completed_send = set()
+    mgr._completed_recv = set()
+    mgr._failed = set()
+    mgr._native_failed = set()
+    mgr._pulling_cleared = set()
+    mgr._prefill = PrefillState(announce_pages=1) if prefill else None
+    mgr._decode = None if prefill else DecodeState()
+    engines = []
+
+    def build_engine(**kwargs):
+        engines.append(Mock(kwargs=kwargs, transfer_address="127.0.0.1:31001"))
+        return engines[-1]
+
+    native = SimpleNamespace(KVCacheManager=build_engine)
+    with patch.dict(sys.modules, {"tpu_sync.api.torch.kv_cache_manager": native}):
+        mgr.set_kv_caches(get_raiden_kv_caches(pool))
+    return mgr, engines
+
+
+def _static_swa_pool(pool_cls):
+    """The same model's sliding-window layers in static pools: one tensor each."""
+    return SWAKVPool(
+        size=PD_POOL_PAGES * PAGE_SIZE,
+        size_swa=PD_POOL_PAGES * PAGE_SIZE,
+        page_size=PAGE_SIZE,
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=128,
+        swa_attention_layer_ids=list(PD_SWA_LAYERS),
+        full_attention_layer_ids=list(PD_FULL_LAYERS),
+        device="cpu",
+        token_to_kv_pool_class=pool_cls,
+    )
+
+
+def _send_metadata(d_mgr, *, pages, swa_pages):
+    """The decode's send_metadata: records the room's pages and returns the
+    pull request it sends to the prefill."""
+    d_mgr._send_multipart_locked = Mock()
+    d_mgr.register_decode_request(
+        PD_ROOM,
+        pages,
+        d_mgr._swa_blocks_from_state_indices([swa_pages]),
+        None,
+        [PD_PREFILL_RANK],
+    )
+    return d_mgr._send_multipart_locked.call_args.args[1]
+
+
+class _PullReqBeforeSwaLayout(WireMessage):
+    """PULL_REQ as a prefill without the SWA layout field decodes it."""
+
+    TAG = MessageTag.PULL_REQ
+    room: int
+    decode_ip: str
+    decode_port: int
+    decode_pages: int
+    decode_swa_pages: int = 0
+
+
+class TestUnifiedPoolPDTransfer(CustomTestCase):
+    """Raiden PD with a pool whose sliding-window layers form several groups: a
+    sliding-window page is a page id per group, and every group's page has to
+    land in the decode's page of the same group."""
+
+    POOL_CLS = TpuFusedMHATokenToKVPool
+
+    def setUp(self):
+        self.p_pool, self.p_alloc = _pd_side(self, pool_cls=self.POOL_CLS)
+        self.d_pool, self.d_alloc = _pd_side(self, pool_cls=self.POOL_CLS)
+        # The decode holds another request, so its page ids differ.
+        _extend(self.d_alloc, 3 * PAGE_SIZE)
+        self.p_full = _extend(self.p_alloc, PD_SEQ_LEN)
+        self.window_start = (PD_SEQ_LEN - PD_WINDOW) // PAGE_SIZE * PAGE_SIZE
+        # A PD decode preallocates SWA KV for the window only.
+        self.d_full = _extend_swa_tail(
+            self.d_alloc,
+            seq_len=PD_SEQ_LEN,
+            swa_tail_len=PD_SEQ_LEN - self.window_start,
+        )
+
+    def test_engines_register_each_shared_buffer_once(self):
+        # Raiden copies a block's row of every tensor an engine wraps: a buffer
+        # listed once per sliding-window layer would copy group 0's row thrice.
+        mgr, (full_engine, swa_engine) = _raiden_manager(self.p_pool, prefill=True)
+        buffers = self.p_pool.full_kv_pool.backing.kv_buffer
+        for engine in (full_engine, swa_engine):
+            registered = engine.kwargs["kv_caches"]
+            self.assertEqual(len(registered), len(buffers))
+            for tensor, buffer in zip(registered, buffers):
+                self.assertIs(tensor, buffer)
+        # A two-page window spans three pages from a mid-page start, and each
+        # page moves as one block per group.
+        self.assertEqual(swa_engine.kwargs["max_blocks"], 3 * PD_GROUPS)
+        self.assertEqual(mgr._pulling.swa_capacity, 4 * 3 * PD_GROUPS)
+
+    def test_one_group_moves_the_per_layer_buffers(self):
+        # One group keeps the per-layer tensors and page ids, so the SWA engine
+        # still pairs with a static pool's.
+        pool, _ = _pd_side(
+            self, pool_cls=self.POOL_CLS, full_layer_ids=(0, 2), swa_layer_ids=(1, 3)
+        )
+        groups = get_raiden_kv_caches(pool)
+        self.assertEqual(groups.swa_groups, 1)
+        self.assertEqual(len(groups.swa_buffers), len(groups.swa))
+        for tensor, layer_tensor in zip(groups.swa_buffers, groups.swa):
+            self.assertIs(tensor, layer_tensor)
+        self.assertEqual(groups.swa_block_ids([5, 2]), [5, 2])
+
+    def _closing_swa_read(self, *, decode_window_start):
+        """One request's closing transfer; returns the SWA read's (prefill,
+        decode) block pairs and the SWA blocks on the wire."""
+        p_mgr, (_, p_swa_engine) = _raiden_manager(self.p_pool, prefill=True)
+        d_mgr, (d_full_engine, d_swa_engine) = _raiden_manager(
+            self.d_pool, prefill=False
+        )
+        p_mgr._register_sender_read = Mock()
+        p_mgr._send_multipart_locked = Mock()
+
+        # Prefill: the last chunk's send.
+        p_swa_blocks = p_mgr._swa_blocks_from_state_indices(
+            [_window_swa_pages(self.p_alloc, self.p_full, self.window_start)]
+        )
+        p_mgr.append_send_blocks(PD_ROOM, _pages(self.p_full), p_swa_blocks)
+        p_mgr._prefill.send_aux[PD_ROOM] = b""
+        p_mgr._prefill.reshard_finalized.add(PD_ROOM)
+        # The decode's pull request; the prefill replies with BLOCKS.
+        p_mgr._on_pull_req(
+            _send_metadata(
+                d_mgr,
+                pages=_pages(self.d_full),
+                swa_pages=_window_swa_pages(
+                    self.d_alloc, self.d_full, decode_window_start
+                ),
+            )
+        )
+        (registered_swa,) = [
+            c.args[4]
+            for c in p_mgr._register_sender_read.call_args_list
+            if c.args[1] is p_swa_engine
+        ]
+        frames = p_mgr._send_multipart_locked.call_args.args[1]
+
+        d_mgr._on_blocks(frames)
+        self.assertTrue(d_mgr.maybe_start_pull(PD_ROOM))
+        d_full_engine.start_read.assert_called_once()
+        req_id, uuid, _, remote, local = d_swa_engine.start_read.call_args.args
+        self.assertEqual((req_id, uuid), (f"swa:{PD_ROOM}", PD_ROOM))
+        # The prefill registers exactly the blocks the decode reads.
+        self.assertEqual(remote, registered_swa)
+        return list(zip(remote, local)), Blocks.from_frames(frames).swa_blocks
+
+    def _group_pairs(self, first_token):
+        """(prefill, decode) page of every group of each window page from
+        ``first_token`` on."""
+
+        def group_pages(pool, alloc, full_loc):
+            return [
+                [page] + pool.swa_group_pages[:, page].tolist()
+                for page in _window_swa_pages(alloc, full_loc, first_token)
+            ]
+
+        pairs = []
+        for p_groups, d_groups in zip(
+            group_pages(self.p_pool, self.p_alloc, self.p_full),
+            group_pages(self.d_pool, self.d_alloc, self.d_full),
+        ):
+            pairs += zip(p_groups, d_groups)
+        return pairs
+
+    def test_every_group_page_lands_in_the_decode_page_of_its_group(self):
+        pairs, wire_blocks = self._closing_swa_read(
+            decode_window_start=self.window_start
+        )
+        self.assertEqual(len(pairs), 3 * PD_GROUPS)
+        self.assertEqual(pairs, self._group_pairs(self.window_start))
+        self.assertEqual(wire_blocks, [p for p, _ in pairs])
+
+    def test_a_decode_holding_the_window_head_pulls_whole_tail_pages(self):
+        # A decode whose prefix covers the window's first page allocates the
+        # last two pages only; the tail it pairs must be whole pages.
+        start = self.window_start + PAGE_SIZE
+        pairs, _ = self._closing_swa_read(decode_window_start=start)
+        self.assertEqual(len(pairs), 2 * PD_GROUPS)
+        self.assertEqual(pairs, self._group_pairs(start))
+
+    def _assert_refused(self, p_mgr):
+        """The prefill failed the room and told the decode why."""
+        endpoint, frames = p_mgr._send_multipart_locked.call_args.args
+        note = RoomFailed.from_frames(frames)
+        self.assertEqual(
+            (endpoint, note.room), (f"tcp://127.0.0.1:{PD_DECODE_PORT}", PD_ROOM)
+        )
+        self.assertIn("sliding-window KV layouts differ", note.reason)
+        self.assertIn(str(PD_ROOM), p_mgr._failed)
+        self.assertNotIn(PD_ROOM, p_mgr._prefill.decode_addr)
+        self.assertNotIn(PD_ROOM, p_mgr._prefill.reshard_req)
+
+    def test_a_static_prefill_refuses_a_unified_decode(self):
+        # It would read 5 of the decode's 15 blocks: groups 1-2 of most window
+        # pages would keep stale rows.
+        p_mgr, _ = _raiden_manager(_static_swa_pool(self.POOL_CLS), prefill=True)
+        d_mgr, _ = _raiden_manager(self.d_pool, prefill=False)
+        p_mgr._send_multipart_locked = Mock()
+        p_mgr._on_pull_req(
+            _send_metadata(
+                d_mgr,
+                pages=_pages(self.d_full),
+                swa_pages=_window_swa_pages(
+                    self.d_alloc, self.d_full, self.window_start
+                ),
+            )
+        )
+        self._assert_refused(p_mgr)
+
+    def test_a_unified_prefill_refuses_a_static_decode(self):
+        p_mgr, _ = _raiden_manager(self.p_pool, prefill=True)
+        d_mgr, _ = _raiden_manager(_static_swa_pool(self.POOL_CLS), prefill=False)
+        p_mgr._send_multipart_locked = Mock()
+        p_mgr._on_pull_req(_send_metadata(d_mgr, pages=[1, 2], swa_pages=[3]))
+        self._assert_refused(p_mgr)
+
+    def test_a_static_prefill_refuses_a_resharding_unified_decode(self):
+        p_mgr, _ = _raiden_manager(_static_swa_pool(self.POOL_CLS), prefill=True)
+        d_mgr, _ = _raiden_manager(self.d_pool, prefill=False)
+        d_mgr._send_multipart_locked = Mock()
+        d_mgr._register_reshard_request(
+            PD_ROOM,
+            _pages(self.d_full),
+            d_mgr._swa_blocks_from_state_indices(
+                [_window_swa_pages(self.d_alloc, self.d_full, self.window_start)]
+            ),
+            None,
+            [PD_PREFILL_RANK, PD_PREFILL_RANK],
+        )
+        p_mgr._send_multipart_locked = Mock()
+        p_mgr._on_reshard_req(d_mgr._send_multipart_locked.call_args.args[1])
+        self._assert_refused(p_mgr)
+
+    def test_only_a_unified_decode_extends_the_pull_request(self):
+        # Static peers keep the old message byte for byte; a prefill that
+        # predates the field rejects a unified decode's request.
+        d_static, _ = _raiden_manager(_static_swa_pool(self.POOL_CLS), prefill=False)
+        static_pull = _send_metadata(d_static, pages=[1, 2], swa_pages=[3])
+        old = _PullReqBeforeSwaLayout.from_frames(static_pull)
+        self.assertEqual(old.to_frames(), static_pull)
+        d_mgr, _ = _raiden_manager(self.d_pool, prefill=False)
+        unified_pull = _send_metadata(d_mgr, pages=[1, 2], swa_pages=[3])
+        with self.assertRaisesRegex(ValueError, "swa_layout"):
+            _PullReqBeforeSwaLayout.from_frames(unified_pull)
+
+    def test_the_pipeline_transfer_refuses_the_unified_pool(self):
+        # Its per-layer pools would receive every group at group 0's pages.
+        mgr = object.__new__(RaidenKVManager)
+        mgr._pipeline_enabled = True
+        with self.assertRaisesRegex(RuntimeError, "pipeline transfer"):
+            mgr.set_kv_caches(get_raiden_kv_caches(self.d_pool))
+
+
+class TestUnifiedPoolPDTransferRankFour(TestUnifiedPoolPDTransfer):
+    """The same transfers over a platform pool class with its own rank-4 layout,
+    as an out-of-tree plugin may register: raiden copies each tensor's dim-0 rows."""
+
+    POOL_CLS = _RankFourPool
 
 
 class TestUnifiedPoolSizing(CustomTestCase):

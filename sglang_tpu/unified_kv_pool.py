@@ -194,12 +194,25 @@ def _unsupported_reason(kvc: KVCacheConfigurator) -> Optional[str]:
         return "a rank without both full-attention and sliding-window layers"
     if not kvc.spec_algorithm.is_none() or kvc.is_draft_worker:
         return "speculative decoding"
+    # Pipeline-parallel PD uses raiden's pipeline transfer, which registers each
+    # buffer the two views share once per view.
+    if get_disagg().disaggregation_mode != "null" and get_parallel().pp_size > 1:
+        return "PD disaggregation with pipeline parallelism"
+    # A decode fed by a pipeline prefill takes that transfer as well, and its
+    # per-layer pools would receive every sliding-window group at group 0's pages.
+    if (
+        get_disagg().disaggregation_mode == "decode"
+        and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+    ):
+        return "PD disaggregation with SGLANG_RAIDEN_PIPELINE_TRANSFER"
+    # A sliding-window page moves as its page id in every group
+    # (swa_transfer_pages); merged sliding-window heads are not validated.
+    if get_disagg().disaggregation_mode != "null" and full_page != swa_page:
+        return "PD disaggregation with merged sliding-window heads"
     if get_parallel().pp_size > 1:
         return "pipeline parallelism"
     if get_parallel().attn_cp_size > 1 or get_parallel().dcp_enabled:
         return "context parallelism"
-    if get_disagg().disaggregation_mode != "null":
-        return "PD disaggregation"
     # Only raiden's host pool can be shared by both views; torch_tpu's mirrors
     # one sub-pool's buffers.
     if (
@@ -435,6 +448,9 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             allocation_label="Unified",
         )
         view = functools.partial(view_cls, backing=self._backing)
+        # Group g holds sliding-window layers g, g + groups, ...
+        swa_buffer_ids = [j // groups for j in range(num_swa)]
+        self._swa_buffer_ids = sorted(set(swa_buffer_ids))
         super().__init__(
             size=size,
             size_swa=size,
@@ -449,10 +465,9 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             full_attention_layer_ids=full_attention_layer_ids,
             device=device,
             full_kv_pool_class=functools.partial(view, buffer_ids=range(num_full)),
-            # Group g holds sliding-window layers g, g + groups, ...
             swa_kv_pool_class=functools.partial(
                 view,
-                buffer_ids=[j // groups for j in range(num_swa)],
+                buffer_ids=swa_buffer_ids,
                 group_pages=self.swa_group_pages if groups > 1 else None,
             ),
             start_layer=start_layer,
@@ -468,6 +483,22 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
         index, is_swa = self.layers_mapping[layer_id]
         assert is_swa
         return index % self.num_swa_groups
+
+    def swa_transfer_buffers(self) -> List[torch.Tensor]:
+        """The buffers the sliding-window layers use, each once, in buffer
+        order. Copying a page id's row of each moves that page id's KV for
+        every sliding-window layer that reads it."""
+        buffers = self._backing.kv_buffer
+        return [buffers[i] for i in self._swa_buffer_ids]
+
+    def swa_transfer_pages(self, page_ids: Sequence[int]) -> List[int]:
+        """The page ids that hold the sliding-window pages ``page_ids`` (their
+        group-0 ids), page by page: [p0 in group 0, ..., p0 in the last group,
+        p1 in group 0, ...], so a tail of the list is a tail of the pages."""
+        ids = torch.as_tensor(page_ids, dtype=torch.int64).reshape(1, -1)
+        if self.num_swa_groups > 1:
+            ids = torch.cat([ids, self.swa_group_pages[:, ids[0]].to(torch.int64)])
+        return ids.t().reshape(-1).tolist()
 
     def get_state(self) -> list[torch.Tensor]:
         return self._backing.get_state()
@@ -993,6 +1024,39 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 evict(0, shortfall())
             else:
                 evict(shortfall(), 0)
+
+    def prealloc_fits_assumes_reclaim(self) -> bool:
+        return True
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool:
+        return self.can_reserve(full_tokens, swa_tokens, empty_pool=True)
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        # Each budget is this side's free plus evictable tokens less the decode's
+        # headroom; add that headroom to the demand and price both sides at once.
+        full_evictable_tokens = tree_cache.full_evictable_size()
+        swa_evictable_tokens = tree_cache.swa_evictable_size()
+        full_tokens += (
+            self.full_available_size() + full_evictable_tokens - full_budget_tokens
+        )
+        if swa_budget_tokens is not None:
+            swa_tokens += (
+                self.swa_available_size() + swa_evictable_tokens - swa_budget_tokens
+            )
+        return self.can_reserve(
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
+        )
 
     def reclaim_for_prealloc(
         self, tree_cache, full_tokens: int, swa_tokens: int
