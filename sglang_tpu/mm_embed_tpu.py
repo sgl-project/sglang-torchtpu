@@ -58,9 +58,10 @@ def scatter_mm_on_device(
 
     # Keep indices at the padded token count; only their values depend on
     # image lengths. The elementwise fallback scans tokens * hidden instead.
-    indices = (torch.cumsum(mask.reshape(-1), dim=0, dtype=torch.int32) - 1).clamp_(
-        min=0
-    )
+    flat = mask.reshape(-1)
+    indices = torch.cumsum(flat, dim=0, dtype=torch.int32) - 1
+    # Rows outside the mask read their own row; repeated indices slow the gather.
+    indices = torch.where(flat, indices, torch.arange(flat.numel(), dtype=torch.int32))
     _scatter_mm_rows(dest, src, indices, mask, merge_rows=merge_rows)
 
 
@@ -101,7 +102,8 @@ def _scatter_padded_embedding(
         if key not in placements:
             placements[key] = (
                 span.buffer,
-                torch.zeros(dest.shape[0], dtype=torch.int32),
+                # Inactive rows read their own row; repeated indices slow the gather.
+                torch.arange(dest.shape[0], dtype=torch.int32),
                 torch.zeros(dest.shape[0], 1, dtype=torch.bool),
             )
         _buffer, indices, active = placements[key]
