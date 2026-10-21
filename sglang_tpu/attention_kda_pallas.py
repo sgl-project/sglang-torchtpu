@@ -39,6 +39,7 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
         # the model hands them over with leading batch / per-head axes. Fused
         # projections pass split views, and the op reads raw buffers, so make
         # every input dense.
+        state_rows, read_offsets = self._state_rows()
         out = self._op(
             mixed_qkv.contiguous(),
             b.reshape(num_tokens, n_v).contiguous(),
@@ -51,7 +52,7 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             # Per-channel under KDA; Mosaic rejects the flat [n_v * d_k] form.
             layer.dt_bias.reshape(n_v, d_k),
             self._query_start_loc,
-            self._state_indices,
+            state_rows,
             self._distribution,
             self._seq_lens,
             layer.num_k_heads,
@@ -67,9 +68,8 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             fused_qkvg=getattr(layer, "fused_qkvg", False),
             # Kimi-K3 packs conv / dt_bias / A_log into one f32 operand post-load.
             packed_weights=getattr(layer, "packed_kernel_weights", None),
-            read_offsets=self._read_offsets,
+            read_offsets=read_offsets,
             num_spec_tokens=self._num_spec_tokens,
-            spec_window=self._spec_window,
         )
         # Keep the batch axis: the model squeezes dim 0 after o_norm, which would
         # eat the token axis of a one-token decode.
