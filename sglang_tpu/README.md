@@ -74,10 +74,10 @@ loads what they reject, and fails the launch naming the rollback variables:
   not apply, and `SGLANG_TPU_ENABLE_BSEARCH_SAMPLING=0`, since the plugin workers
   filter sampled rows only with the sort-free sampler;
 - EAGLE3 and native MTP: non-static ragged verify, a draft window, top-k other
-  than 1, draft-token counts other than steps + 1, adaptive speculation, and a
-  hidden-state return mode (the chain worker drops the target's hidden states);
-  EAGLE3 also multi-layer drafting, drafts other than `LlamaForCausalLMEagle3`
-  and M-RoPE drafts; native MTP also drafts the MTP drafter does not load;
+  than 1, adaptive speculation, and a hidden-state return mode (the chain
+  worker drops the target's hidden states); EAGLE3 also multi-layer drafting,
+  drafts other than `LlamaForCausalLMEagle3` and M-RoPE drafts; native MTP also
+  drafts the MTP drafter does not load;
 - DFlash and DSpark: non-static ragged verify; DFlash also
   LiLiCorr or Domino drafts, a `mask_embedding.pt` beside the draft, and a
   missing or out-of-vocabulary `dflash_config.mask_token_id`; DSpark a draft its

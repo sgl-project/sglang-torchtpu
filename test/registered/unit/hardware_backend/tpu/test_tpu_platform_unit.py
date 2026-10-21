@@ -371,6 +371,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             speculative_draft_model_revision=None,
             speculative_draft_window_size=None,
             speculative_num_draft_tokens=None,
+            speculative_dspark_block_size=None,
             disaggregation_mode="null",
             disaggregation_transfer_backend="mooncake",
             optimistic_prefill_attempts=0,
@@ -544,13 +545,6 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 {},
                 {},
                 "draft-window-size",
-            ),
-            (
-                "EAGLE3",
-                dict(speculative_num_steps=3, speculative_num_draft_tokens=3),
-                {},
-                {},
-                "num-draft-tokens = --speculative-num-steps",
             ),
             (
                 "EAGLE3",
@@ -730,16 +724,23 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         from sglang_tpu.envs import envs as tpu_envs
 
         flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
-        for algo in ("EAGLE3", "DFLASH", "DSPARK"):
+        for algo, overrides in (
+            ("EAGLE3", {}),
+            # The speculative arguments normalize a chain to steps + 1 tokens later.
+            ("EAGLE3", dict(speculative_num_steps=3, speculative_num_draft_tokens=8)),
+            ("DFLASH", {}),
+            ("DSPARK", {}),
+        ):
             with (
-                self.subTest(algorithm=algo),
+                self.subTest(algorithm=algo, **overrides),
                 flag.override(True),
                 tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
             ):
                 flag.clear()
-                args = self._args(speculative_algorithm=algo)
+                args = self._args(speculative_algorithm=algo, **overrides)
                 self._apply(args)
                 self.assertFalse(flag.is_set())
+                self.assertFalse(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
                 self.assertTrue(self._resolved(args, "enable_torch_compile"))
 
     def test_plugin_keeps_what_no_other_worker_serves_differently(self):
@@ -776,11 +777,6 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             ),
             ({}, {"SGLANG_RAGGED_VERIFY_MODE": "compact"}, "RAGGED_VERIFY_MODE"),
             (dict(speculative_draft_window_size=64), {}, "draft-window-size"),
-            (
-                dict(speculative_num_steps=3, speculative_num_draft_tokens=5),
-                {},
-                "num-draft-tokens",
-            ),
             (dict(speculative_adaptive=True), {}, "adaptive speculation"),
             (
                 dict(speculative_accept_threshold_single=0.5),
@@ -1083,6 +1079,115 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             self.assertRegex(
                 self._dflash_reason(path=path, mask_token_id=7), "mask_embedding.pt"
             )
+
+    def _model_config_args(self, **overrides):
+        """Launch arguments with the fields the ModelConfig factory reads."""
+        return self._args(
+            model_path="org/target",
+            revision="target-only-sha",
+            trust_remote_code=False,
+            context_length=None,
+            is_embedding=False,
+            enable_multimodal=None,
+            quantization=None,
+            speculative_draft_model_quantization=None,
+            _speculative_draft_quantization_explicitly_set=False,
+            model_impl="auto",
+            sampling_defaults="model",
+            quantize_and_serve=False,
+            decrypted_config_file=None,
+            decrypted_draft_config_file=None,
+            language_only=False,
+            language_model_only=False,
+            encoder_only=False,
+            disable_hybrid_swa_memory=False,
+            model_config_parser=None,
+            **overrides,
+        )
+
+    def test_draft_checkpoint_is_read_at_the_revision_its_worker_loads(self):
+        """A draft given by path is read at "main" unless its revision is given
+        too, as the speculative arguments settle it; only a draft inferred from
+        the target checkpoint takes a pinned target's revision."""
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang_tpu import spec_execution
+        from sglang_tpu.envs import envs as tpu_envs
+
+        requested = []
+
+        def read_config(config, *, model_path, revision, **kwargs):
+            requested.append((model_path, revision))
+            architecture = (
+                "Qwen3_5ForCausalLMMTP"
+                if model_path == "org/target"
+                else "LlamaForCausalLMEagle3"
+            )
+            config.hf_config = SimpleNamespace(architectures=[architecture])
+            config.model_is_mrope = False
+
+        with (
+            patch.object(ModelConfig, "__init__", read_config),
+            patch("sglang_tpu.patches._prepare_tpu_env"),
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+            tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
+            for draft_revision, expected in ((None, "main"), ("v2", "v2")):
+                with self.subTest(draft_revision=draft_revision):
+                    requested.clear()
+                    args = self._model_config_args(
+                        speculative_algorithm="EAGLE3",
+                        speculative_draft_model_path="org/draft",
+                        speculative_draft_model_revision=draft_revision,
+                    )
+                    TpuSRTPlatform().apply_server_args_defaults(args)
+                    self.assertEqual(requested, [("org/draft", expected)])
+                    self.assertTrue(self._resolved(args, "enable_torch_compile"))
+
+            requested.clear()
+            spec_execution._mtp_draft_architecture(
+                self._model_config_args(speculative_algorithm="NEXTN")
+            )
+            self.assertEqual(requested, [("org/target", "target-only-sha")])
+
+    def _dspark_reason(self, **overrides):
+        from sglang_tpu import spec_execution
+
+        # A dense DSpark draft whose checkpoint names no block size.
+        hf_config = SimpleNamespace(
+            architectures=["DSparkDraftModel"],
+            dspark_config=dict(
+                markov_rank=1, markov_head_type="vanilla", mask_token_id=7
+            ),
+        )
+        with (
+            patch.object(
+                spec_execution,
+                "_draft_model_config",
+                return_value=SimpleNamespace(hf_config=hf_config),
+            ),
+            patch.object(
+                spec_execution,
+                "_target_model_config",
+                return_value=SimpleNamespace(vocab_size=1000),
+            ),
+        ):
+            return spec_execution._dspark_draft_unsupported_reason(
+                self._args(
+                    speculative_algorithm="DSPARK",
+                    speculative_draft_model_path="/draft",
+                    **overrides,
+                )
+            )
+
+    def test_dspark_draft_check_reads_the_verify_window_the_launch_settles(self):
+        """The block size, else the checkpoint's, else the default sets gamma
+        before the draft is checked, as the speculative arguments resolve it."""
+        self.assertIsNone(self._dspark_reason(speculative_dspark_block_size=16))
+        self.assertIsNone(self._dspark_reason())
+        self.assertIsNone(self._dspark_reason(speculative_num_draft_tokens=5))
+        self.assertRegex(
+            self._dspark_reason(speculative_dspark_block_size=0), "positive"
+        )
 
     def test_compatibility_route_keeps_eager_configuration(self):
         from sglang_tpu.envs import envs as tpu_envs

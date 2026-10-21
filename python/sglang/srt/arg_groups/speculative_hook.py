@@ -139,16 +139,26 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
-def handle_speculative_decoding(server_args: ServerArgs) -> None:
-    cfg = resolving_view(server_args)
+def explicit_draft_model_revision(cfg) -> Optional[str]:
+    """The revision a draft checkpoint given by path is read at: its own, else
+    "main". A draft the algorithm handlers infer from the target checkpoint
+    takes the target's revision instead."""
     if (
         cfg.speculative_draft_model_path is not None
         and cfg.speculative_draft_model_revision is None
     ):
+        return "main"
+    return cfg.speculative_draft_model_revision
+
+
+def handle_speculative_decoding(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    revision = explicit_draft_model_revision(cfg)
+    if revision != cfg.speculative_draft_model_revision:
         declare_resolution(
             server_args,
             "handle_speculative_decoding",
-            speculative_draft_model_revision="main",
+            speculative_draft_model_revision=revision,
         )
 
     # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -739,8 +749,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
     from sglang.srt.speculative.dspark_components.dspark_config import (
-        DEFAULT_DSPARK_GAMMA,
         read_draft_checkpoint_config,
+        resolve_launch_gamma,
     )
 
     draft_config = None
@@ -753,23 +763,23 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             e,
         )
 
-    gamma: Optional[int] = None
-    if cfg.speculative_dspark_block_size is not None:
-        if int(cfg.speculative_dspark_block_size) <= 0:
-            raise ValueError(
-                "DSpark requires --speculative-dspark-block-size to be positive, "
-                f"got {cfg.speculative_dspark_block_size}."
-            )
-        gamma = int(cfg.speculative_dspark_block_size)
-    else:
-        if draft_config is not None:
-            gamma = draft_config.resolve_gamma(default=None)
-        if gamma is None and cfg.speculative_num_draft_tokens is None:
-            gamma = DEFAULT_DSPARK_GAMMA
-            logger.warning(
-                "DSpark gamma is not set; defaulting to %d.",
-                gamma,
-            )
+    checkpoint_gamma = (
+        draft_config.resolve_gamma(default=None) if draft_config is not None else None
+    )
+    gamma = resolve_launch_gamma(
+        block_size=cfg.speculative_dspark_block_size,
+        checkpoint_gamma=checkpoint_gamma,
+        num_draft_tokens=cfg.speculative_num_draft_tokens,
+    )
+    if (
+        gamma is not None
+        and cfg.speculative_dspark_block_size is None
+        and checkpoint_gamma is None
+    ):
+        logger.warning(
+            "DSpark gamma is not set; defaulting to %d.",
+            gamma,
+        )
 
     if gamma is not None:
         verify_window = int(gamma) + 1

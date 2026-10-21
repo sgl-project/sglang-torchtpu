@@ -286,14 +286,9 @@ def _chain_unsupported_reason(
         return "only supports SGLANG_RAGGED_VERIFY_MODE=static"
     if cfg.speculative_draft_window_size is not None:
         return "does not support --speculative-draft-window-size"
+    # A chain's draft-token count is normalized to steps + 1 after this runs.
     if cfg.speculative_eagle_topk not in (None, 1):
         return "drafts chains only (--speculative-eagle-topk 1)"
-    if (
-        cfg.speculative_num_steps is not None
-        and cfg.speculative_num_draft_tokens is not None
-        and cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
-    ):
-        return "needs --speculative-num-draft-tokens = --speculative-num-steps + 1"
     # The chain worker drives no adaptive controller, so it would ignore the flag.
     if cfg.speculative_adaptive:
         return "does not support adaptive speculation"
@@ -368,13 +363,16 @@ def _mtp_draft_architecture(server_args: ServerArgs) -> str:
 
 def _draft_model_config(server_args: ServerArgs, *, path: str):
     from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.speculative_hook import explicit_draft_model_revision
     from sglang.srt.configs.model_config import ModelConfig
 
-    # Built aside rather than memoized on the record: resolution is still running.
+    # Built aside rather than memoized on the record: resolution is still running,
+    # so read the revision the speculative arguments will settle on. Without a
+    # draft path it stays unset, and the factory reads the target's.
     return ModelConfig.from_server_args(
         server_args,
         model_path=path,
-        model_revision=resolving_view(server_args).speculative_draft_model_revision,
+        model_revision=explicit_draft_model_revision(resolving_view(server_args)),
         is_draft_model=True,
     )
 
@@ -414,6 +412,8 @@ def _dspark_draft_unsupported_reason(server_args: ServerArgs) -> str | None:
     """What ``TpuDsparkDraftWorker`` rejects in the draft checkpoint."""
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.speculative.dspark_components.dspark_config import (
+        parse_dspark_draft_config,
+        resolve_launch_gamma,
         resolve_runtime_config,
     )
 
@@ -425,9 +425,19 @@ def _dspark_draft_unsupported_reason(server_args: ServerArgs) -> str | None:
         server_args, path=cfg.speculative_draft_model_path
     ).hf_config
     try:
+        # The verify window the speculative arguments will settle on.
+        gamma = resolve_launch_gamma(
+            block_size=cfg.speculative_dspark_block_size,
+            checkpoint_gamma=parse_dspark_draft_config(
+                draft_hf_config=hf_config
+            ).resolve_gamma(default=None),
+            num_draft_tokens=cfg.speculative_num_draft_tokens,
+        )
         resolve_runtime_config(
             draft_hf_config=hf_config,
-            speculative_num_draft_tokens=cfg.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=(
+                cfg.speculative_num_draft_tokens if gamma is None else gamma + 1
+            ),
             target_vocab_size=_target_model_config(server_args).vocab_size,
         )
     except ValueError as e:
