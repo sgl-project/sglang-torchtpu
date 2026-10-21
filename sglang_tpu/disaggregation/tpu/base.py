@@ -66,7 +66,6 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import ServerArgs
-from sglang_tpu.disaggregation.pp_consensus import poll_with_pp_consensus
 from sglang_tpu.disaggregation.tpu import transfer as tpu_transfer
 from sglang_tpu.disaggregation.tpu.host_staging import StageBuf
 from sglang_tpu.disaggregation.tpu.serde import Transfer
@@ -543,10 +542,19 @@ class TpuKVSenderBase(CommonKVSender):
         marks Success from its background push thread."""
 
     def poll(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status)
+
+    def poll_pp_consensus(self) -> KVPoll:
+        # PP stage 0 alone polls a bootstrapping room on a pipeline-parallel
+        # prefill, and every stage starts it from _handle_transfer. Reading the
+        # least advanced stage keeps the bootstrap deadline on the whole room.
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         self._pre_poll()
-        status = self.kv_mgr.check_status(self.bootstrap_room)
+        status = check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             if (
                 status == KVPoll.Success
@@ -569,11 +577,6 @@ class TpuKVSenderBase(CommonKVSender):
                 self.conclude_state = KVPoll.Failed
                 return KVPoll.Failed
         return status
-
-    def poll_pp_consensus(self) -> KVPoll:
-        # Every stage starts a room when the decode's transfer info arrives
-        # (_handle_transfer), so stage 0 can wait on all of them.
-        return poll_with_pp_consensus(self)
 
     def failure_exception(self):
         if self.conclude_state is None:

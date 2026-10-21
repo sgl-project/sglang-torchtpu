@@ -2815,6 +2815,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr.attn_tp_rank = 0
+        mgr.pp_size = 1
         mgr._state_lock = threading.Lock()
         mgr._drain_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()

@@ -22,7 +22,6 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
-from sglang_tpu.disaggregation.pp_consensus import poll_with_pp_consensus
 from sglang_tpu.disaggregation.raiden import dram_offload_channel as raiden_offload
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
@@ -525,7 +524,7 @@ class RaidenSenderMixin:
     def _finish_pp_bootstrap_locked(self, room: int) -> None:
         """On a pipeline-parallel prefill, end a requested room's Bootstrapping
         as soon as the request lands: only stage 0 polls bootstrapping rooms, and
-        it waits on every stage's status (poll_with_pp_consensus)."""
+        it waits on every stage's status (RaidenKVSender.poll_pp_consensus)."""
         if (
             self.pp_size > 1
             and room not in self._aborted
@@ -575,6 +574,24 @@ class RaidenSenderMixin:
                 room,
                 f"Request {room} timed out after {time.time() - since:.1f}s "
                 "waiting for the decode to ask for its KV",
+            )
+            self.update_status(room, KVPoll.Failed)
+        return True
+
+    def fail_pp_bootstrap_timeout(
+        self, room: int, since: float, timeout: float
+    ) -> bool:
+        """Fails ``room`` when a pipeline stage has not had the decode's request
+        within ``timeout``. Stage 0 alone polls a bootstrapping room, so its
+        deadline covers every stage; the failure is fail_decode_silence's."""
+        with self._state_lock:
+            if time.time() - since < timeout:
+                return False
+            self._mark_aborted_locked(room)
+            self._fail_room_locked(
+                room,
+                f"Request {room} timed out after {time.time() - since:.1f}s "
+                "waiting for every pipeline stage to receive the decode's request",
             )
             self.update_status(room, KVPoll.Failed)
         return True
@@ -1581,7 +1598,23 @@ class RaidenKVSender(CommonKVSender):
         return status
 
     def poll_pp_consensus(self) -> KVPoll:
-        return poll_with_pp_consensus(self)
+        """PP stage 0's poll of a bootstrapping room on a pipeline-parallel prefill.
+
+        This stage's own poll keeps its failure, drain and terminal states. A room
+        it is ready for waits on the least advanced stage, held to the bootstrap
+        deadline here: no other stage polls a bootstrapping room, and each starts
+        it only when the decode's request lands (_finish_pp_bootstrap_locked).
+        """
+        status = self.poll()
+        if status != KVPoll.WaitingForInput:
+            return status
+        consensus = self.kv_mgr.check_status_pp_consensus(self.bootstrap_room)
+        if consensus == KVPoll.Bootstrapping and self.kv_mgr.fail_pp_bootstrap_timeout(
+            self.bootstrap_room, self.init_time, self.kv_mgr.bootstrap_timeout
+        ):
+            self.conclude_state = KVPoll.Failed
+            return KVPoll.Failed
+        return min(status, consensus)
 
     def drained(self) -> bool:
         """No transfer of this room still runs on this rank."""
