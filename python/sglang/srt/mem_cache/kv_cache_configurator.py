@@ -2400,16 +2400,23 @@ class KVCacheConfigurator:
             elif (
                 get_memory().tpu_unified_kv_pool and self._tpu_unified_kv_pool_enabled()
             ):
+                # Widened by attn_dcp_size like the hybrid SWA allocator below;
+                # the pool keeps the physical size and page.
+                widening = (
+                    get_parallel().attn_dcp_size
+                    if current_platform.dcp_shards_every_kv_pool()
+                    else 1
+                )
                 AllocatorCls = current_platform.get_unified_kv_pool_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(
-                    sizes.full_max_total_num_tokens,
-                    page_size=get_schedule().page_size,
+                    sizes.full_max_total_num_tokens * widening,
+                    page_size=get_schedule().page_size * widening,
                     dtype=self.kv_cache_dtype,
                     device=self.device,
                     kvcache=token_to_kv_pool,
                     need_sort=need_sort,
                     req_to_token_pool=req_to_token_pool,
-                    static_full_tokens=sizes.max_total_num_tokens,
+                    static_full_tokens=sizes.max_total_num_tokens * widening,
                 )
             elif _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"

@@ -140,6 +140,8 @@ def _hybrid_kvc(
         get_num_kv_heads=lambda tp_size, dcp_size=1: 1,
         get_swa_num_kv_heads=lambda tp_size, dcp_size=1: swa_kv_heads,
         hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+        full_attention_layer_ids=list(full_layer_ids),
+        swa_attention_layer_ids=list(swa_layer_ids),
     )
     return SimpleNamespace(
         is_hybrid_swa=True,
@@ -1313,6 +1315,93 @@ class TestUnifiedPoolImportOrder(CustomTestCase):
         self.assertEqual(out.stdout.strip().splitlines()[-1], "[]")
 
 
+class TestUnifiedAllocatorDcp(CustomTestCase):
+    """Under decode context parallelism the allocator hands out locations in a
+    space widened by dcp over the physical pool: the attention backend reads a
+    location's page as loc // (page_size * dcp) and writes it at physical slot
+    loc // dcp on the DCP rank that owns its position."""
+
+    DCP = 2
+    WIDE_PAGE = PAGE_SIZE * DCP
+
+    def test_widened_locations_address_the_physical_pages(self):
+        _tpu_swa_allocator_branches(self)
+        pool = _make_pool()
+        alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+            pool.size * self.DCP,
+            page_size=self.WIDE_PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+        self.assertEqual(alloc._total_pages(), pool.size // pool.page_size)
+
+        # Two widened pages and one token take three pages on each side.
+        seq_len = 2 * self.WIDE_PAGE + 1
+        full_loc = _extend(alloc, seq_len)
+        swa_loc = alloc.translate_loc_from_full_to_swa(full_loc)
+        for loc in (full_loc, swa_loc):
+            # Pages 1..NUM_PAGES of the pool's rows; page 0 takes padding writes.
+            pages = loc // self.WIDE_PAGE
+            self.assertGreaterEqual(int(pages.min()), 1)
+            self.assertLessEqual(int(pages.max()), NUM_PAGES)
+            self.assertLess(int((loc // self.DCP).max()), (NUM_PAGES + 1) * PAGE_SIZE)
+            # Position p belongs to DCP rank p % dcp.
+            self.assertEqual(
+                (loc % self.DCP).tolist(), [p % self.DCP for p in range(seq_len)]
+            )
+        full_pages = set((full_loc // self.WIDE_PAGE).tolist())
+        swa_pages = set((swa_loc // self.WIDE_PAGE).tolist())
+        self.assertEqual((len(full_pages), len(swa_pages)), (3, 3))
+        self.assertFalse(full_pages & swa_pages)
+        self.assertEqual(alloc.full_available_size(), (NUM_PAGES - 6) * self.WIDE_PAGE)
+
+    def test_configurator_widens_the_allocator_and_not_the_pool(self):
+        _tpu_swa_allocator_branches(self)
+        kvc = _hybrid_kvc()
+        kvc.device = "cpu"
+        kvc.pool_page_size = PAGE_SIZE
+        kvc._tpu_unified_kv_pool_enabled = lambda: (
+            KVCacheConfigurator._tpu_unified_kv_pool_enabled(kvc)
+        )
+        kvc._tpu_mha_pool_class = lambda: TpuFusedMHATokenToKVPool
+        with (
+            _fused_rpa_platform(),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                TpuSRTPlatform(),
+            ),
+            get_context().override_server_args(
+                tpu_unified_kv_pool=True,
+                page_size=PAGE_SIZE,
+                tp_size=self.DCP,
+                dcp_size=self.DCP,
+            ),
+        ):
+            pool = KVCacheConfigurator._build_tpu_swa_kv_pool(
+                kvc,
+                full_max_total_num_tokens=POOL_TOKENS,
+                swa_max_total_num_tokens=POOL_TOKENS,
+            )
+            allocator = KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                kvc,
+                sizes=SimpleNamespace(
+                    full_max_total_num_tokens=POOL_TOKENS,
+                    max_total_num_tokens=POOL_TOKENS // 2,
+                ),
+                token_to_kv_pool=pool,
+                is_dsv4_model=False,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+            )
+        self.assertEqual((pool.size, pool.page_size), (POOL_TOKENS, PAGE_SIZE))
+        self.assertEqual(allocator.page_size, self.WIDE_PAGE)
+        self.assertEqual(allocator.full_available_size(), POOL_TOKENS * self.DCP)
+        # The static full pool's share, in the widened pages.
+        self.assertEqual(allocator._full_share, POOL_TOKENS // 2 // PAGE_SIZE)
+
+
 class TestUnifiedPoolEnabled(CustomTestCase):
     def test_field_gates_and_rejects_unsupported_configs(self):
         mla_model = SimpleNamespace(
@@ -1405,6 +1494,42 @@ class TestUnifiedPoolEnabled(CustomTestCase):
             fp8.kv_cache_dtype = torch.float8_e4m3fn
             with self.assertRaisesRegex(ValueError, "nor fit as one full-attention"):
                 unified_kv_pool_enabled(fp8)
+
+    def test_accepts_decode_and_refuses_prefill_context_parallelism(self):
+        # Decode context parallelism widens only the allocator's locations.
+        def enabled_with(kvc=None, **parallel_args):
+            with (
+                _fused_rpa_platform(),
+                get_context().override_server_args(
+                    tpu_unified_kv_pool=True, tp_size=2, **parallel_args
+                ),
+            ):
+                return unified_kv_pool_enabled(kvc or _hybrid_kvc())
+
+        self.assertTrue(enabled_with(dcp_size=2))
+        with self.assertRaisesRegex(ValueError, "prefill context parallelism"):
+            enabled_with(attn_cp_size=2)
+        # The DCP write spans cover the first sliding-window group only.
+        with self.assertRaisesRegex(ValueError, "decode context parallelism"):
+            enabled_with(
+                dcp_size=2, kvc=_hybrid_kvc(full_layer_ids=(0,), swa_layer_ids=(1, 2))
+            )
+
+    def test_decode_context_parallelism_counts_the_whole_models_groups(self):
+        """A rank's own layers can form one sliding-window group while the pool
+        groups by the whole model's layers (a pipeline stage); the refusal
+        counts the whole model's."""
+        stage = _hybrid_kvc(full_layer_ids=(4,), swa_layer_ids=(5,))
+        stage.model_config.full_attention_layer_ids = [0, 4]
+        stage.model_config.swa_attention_layer_ids = [1, 2, 3, 5, 6, 7]
+        with (
+            _fused_rpa_platform(),
+            get_context().override_server_args(
+                tpu_unified_kv_pool=True, tp_size=2, dcp_size=2
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "decode context parallelism"):
+                unified_kv_pool_enabled(stage)
 
 
 class TestUnifiedHostPool(CustomTestCase):

@@ -163,23 +163,24 @@ def _unsupported_reason(kvc: KVCacheConfigurator) -> Optional[str]:
             "sliding-window KV heads other than the full-attention ones in the "
             f"{pool_cls.__name__} KV pool"
         )
+    dcp_size = get_parallel().attn_dcp_size
     itemsize = kvc.kv_cache_dtype.itemsize
     full_page = _fused_page_shape(
         page_size=kvc.page_size,
-        num_kv_heads=model_config.get_num_kv_heads(tp_size),
+        num_kv_heads=model_config.get_num_kv_heads(tp_size, dcp_size),
         head_dim=model_config.head_dim,
         itemsize=itemsize,
     )
     swa_page = _fused_page_shape(
         page_size=kvc.page_size,
-        num_kv_heads=model_config.get_swa_num_kv_heads(tp_size),
+        num_kv_heads=model_config.get_swa_num_kv_heads(tp_size, dcp_size),
         head_dim=model_config.swa_head_dim,
         itemsize=itemsize,
     )
     if full_page != swa_page and not _merged_swa_heads_fit(
         full_page=full_page,
         swa_page=swa_page,
-        swa_kv_heads=model_config.get_swa_num_kv_heads(tp_size),
+        swa_kv_heads=model_config.get_swa_num_kv_heads(tp_size, dcp_size),
     ):
         return (
             "sliding-window KV pages that neither match the full-attention ones "
@@ -196,8 +197,23 @@ def _unsupported_reason(kvc: KVCacheConfigurator) -> Optional[str]:
         return "speculative decoding"
     if get_parallel().pp_size > 1:
         return "pipeline parallelism"
-    if get_parallel().attn_cp_size > 1 or get_parallel().dcp_enabled:
-        return "context parallelism"
+    if get_parallel().attn_cp_size > 1:
+        return "prefill context parallelism"
+    # The DCP write spans translate slots for the first sliding-window group only.
+    # Count the groups over the whole model's layers, as the pool does on every
+    # pipeline stage, not over this rank's.
+    if get_parallel().dcp_enabled and (
+        full_page != swa_page
+        or num_swa_groups(
+            num_full_layers=len(model_config.full_attention_layer_ids),
+            num_swa_layers=len(model_config.swa_attention_layer_ids),
+        )
+        > 1
+    ):
+        return (
+            "decode context parallelism with sliding-window layer groups or "
+            "merged sliding-window heads"
+        )
     if get_disagg().disaggregation_mode != "null":
         return "PD disaggregation"
     # Only raiden's host pool can be shared by both views; torch_tpu's mirrors
@@ -659,7 +675,10 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     ):
         assert page_size > 1, "the unified allocator pages its shared free list"
         assert isinstance(kvcache, TpuUnifiedSWAKVPool)
-        assert size == kvcache.size, "the allocator hands out the whole shared pool"
+        # Compared in pages: DCP widens the allocator's size and page, not the pool's.
+        assert size // page_size == kvcache.size // kvcache.page_size, (
+            "the allocator hands out the whole shared pool"
+        )
         super().__init__(
             size=size,
             size_swa=size,
