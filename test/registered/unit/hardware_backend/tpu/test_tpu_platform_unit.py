@@ -353,6 +353,10 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             speculative_num_steps=None,
             enable_multi_layer_eagle=False,
             speculative_adaptive=False,
+            speculative_accept_threshold_single=1.0,
+            speculative_accept_threshold_acc=1.0,
+            enable_return_hidden_states=False,
+            return_hidden_states_mode=None,
             speculative_use_rejection_sampling=False,
             speculative_skip_dp_mlp_sync=False,
             speculative_draft_model_path=None,
@@ -556,6 +560,34 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             ),
             (
                 "EAGLE3",
+                dict(speculative_accept_threshold_single=0.5),
+                {},
+                {},
+                "accept-threshold-single and --speculative-accept-threshold-acc of 1.0",
+            ),
+            (
+                "DFLASH",
+                dict(speculative_accept_threshold_acc=0.5),
+                {},
+                {},
+                "accept-threshold-single and --speculative-accept-threshold-acc of 1.0",
+            ),
+            (
+                "EAGLE3",
+                dict(return_hidden_states_mode="last"),
+                {},
+                {},
+                "does not return hidden states",
+            ),
+            (
+                "EAGLE3",
+                dict(enable_return_hidden_states=True),
+                {},
+                {},
+                "does not return hidden states",
+            ),
+            (
+                "EAGLE3",
                 dict(speculative_draft_model_path="eagle3-draft"),
                 {},
                 dict(eagle3_draft=self._eagle3_draft("Eagle3DeepseekV2ForCausalLM")),
@@ -663,6 +695,27 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 self.assertFalse(flag.is_set())
                 self.assertTrue(self._resolved(args, "enable_torch_compile"))
 
+    def test_plugin_keeps_what_no_other_worker_serves_differently(self):
+        """DFlash drops hidden states on the compatibility worker too, and no
+        other worker serves DSPARK, so neither leaves the plugin worker for them."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER
+        for algo, overrides in (
+            ("DFLASH", dict(return_hidden_states_mode="full")),
+            ("DSPARK", dict(speculative_accept_threshold_single=0.5)),
+        ):
+            with (
+                self.subTest(algorithm=algo, **overrides),
+                flag.override(True),
+                tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            ):
+                flag.clear()
+                args = self._args(speculative_algorithm=algo, **overrides)
+                self._apply(args)
+                self.assertFalse(tpu_envs.SGLANG_TPU_SPEC_WORKER_FALLBACK.get())
+                self.assertTrue(self._resolved(args, "enable_torch_compile"))
+
     def _mtp_rejections(self):
         """(args overrides, env, reason) TpuChainSpecWorker rejects at construction."""
         return [
@@ -680,6 +733,16 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
                 "num-draft-tokens",
             ),
             (dict(speculative_adaptive=True), {}, "adaptive speculation"),
+            (
+                dict(speculative_accept_threshold_single=0.5),
+                {},
+                "accept-threshold-single",
+            ),
+            (
+                dict(return_hidden_states_mode="full"),
+                {},
+                "does not return hidden states",
+            ),
         ]
 
     def test_nextn_uses_the_chain_worker_only_where_it_is_supported(self):

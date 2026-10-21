@@ -248,6 +248,16 @@ def _plugin_unsupported_reason(
         # but its verify forward pads tokens to an attention-TP-aligned bucket that
         # the DP-synced token counts do not cover, so verify fails on its first step.
         return "does not support DP attention"
+    # Sampled drafts are accepted on the target and draft probabilities alone,
+    # which the thresholds do not relax. DSPARK has no other worker to honor them.
+    if not algorithm.is_dspark() and (
+        cfg.speculative_accept_threshold_single != 1.0
+        or cfg.speculative_accept_threshold_acc != 1.0
+    ):
+        return (
+            "supports only --speculative-accept-threshold-single and "
+            "--speculative-accept-threshold-acc of 1.0"
+        )
     if algorithm.is_dflash_family():
         if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
             return "only supports SGLANG_RAGGED_VERIFY_MODE=static"
@@ -283,6 +293,9 @@ def _chain_unsupported_reason(
     # The chain worker drives no adaptive controller, so it would ignore the flag.
     if cfg.speculative_adaptive:
         return "does not support adaptive speculation"
+    # It drafts from the target's hidden states and drops them before publishing.
+    if cfg.enable_return_hidden_states or cfg.return_hidden_states_mode is not None:
+        return "does not return hidden states (--return-hidden-states-mode)"
     if algorithm.is_eagle3():
         if cfg.enable_multi_layer_eagle:
             return "does not support multi-layer EAGLE3"

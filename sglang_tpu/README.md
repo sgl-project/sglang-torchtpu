@@ -67,8 +67,12 @@ reject:
 - every route: disabled overlap, a non-fixed simulated-acceptance token mode,
   and attention DP, which no plugin worker serves yet (the chain worker's
   bucket-aligned verify rows exceed the DP-synced token counts);
+- EAGLE3, native MTP and DFlash: `--speculative-accept-threshold-single` or
+  `--speculative-accept-threshold-acc` other than 1.0, which sampled drafts do
+  not apply;
 - EAGLE3 and native MTP: non-static ragged verify, a draft window, top-k other
-  than 1, draft-token counts other than steps + 1, and adaptive speculation;
+  than 1, draft-token counts other than steps + 1, adaptive speculation, and a
+  hidden-state return mode (the chain worker drops the target's hidden states);
   EAGLE3 also multi-layer drafting, drafts other than `LlamaForCausalLMEagle3`
   and M-RoPE drafts; native MTP also drafts the MTP drafter does not load;
 - DFlash and DSpark: non-static ragged verify; DFlash also
