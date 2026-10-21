@@ -177,6 +177,10 @@ class _EagleDraftWorkerHarness:
         self.hot_token_id = None
         self.model_runner.forward = model_forward
         self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
+        # draft_forward routes each step's cache locations through this hook.
+        self._prepare_step_cache_loc = MethodType(
+            EagleDraftWorker._prepare_step_cache_loc, self
+        )
         # draft_forward's topk=1 fast path reads these prealloc buffers (built
         # in EagleDraftWorker.__init__, which the harness skips), so build them
         # here. _rebuild_topk1_chain_buffers asserts num_draft_tokens ==
