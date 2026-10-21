@@ -1340,7 +1340,8 @@ class Scheduler(
         self.enable_continuous_input_polling = False
         self.forward_ct = 0
         self.recompile_stance_set = False
-        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        # (rid, http_worker_ipc) of health probes deferred while the engine was busy.
+        self.return_health_check_ipcs: Deque[Tuple[str, Optional[str]]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -2320,7 +2321,7 @@ class Scheduler(
                 for_health_check=True
             ):
                 self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
+                    (recv_req.rid, getattr(recv_req, "http_worker_ipc", None))
                 )
                 continue
 
@@ -5237,13 +5238,13 @@ class Scheduler(
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
-            # Return some signal for the health check.
-            # This is used to prevent the health check signal being blocked by long context prefill.
-            # However, one minor issue is that this code path does not check the status of detokenizer manager.
+            # Answer the deferred probe by its own rid, so the tokenizer manager can
+            # resolve exactly that probe instead of treating any message as health.
+            # This also keeps a long-context prefill from blocking the signal.
+            # Note: this path bypasses the detokenizer, so it says nothing about it.
+            rid, http_worker_ipc = self.return_health_check_ipcs.popleft()
             self.ipc_channels.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
-                )
+                HealthCheckOutput(rid=rid, http_worker_ipc=http_worker_ipc)
             )
 
     def maybe_signal_queued_health_checks(self, batch: ScheduleBatch) -> None:
