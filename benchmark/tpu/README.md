@@ -246,8 +246,8 @@ above the profiled full-step time.
 ## Unified KV pool for hybrid sliding-window models
 
 `--enable-unified-memory` lets the full-attention and sliding-window layers of a hybrid
-model (gpt-oss, Gemma 4) share one KV page pool instead of two fixed-size ones, at the same KV
-memory.
+model (gpt-oss, Gemma 4, Muse Spark, Muse Glimmer) share one KV page pool instead of two
+fixed-size ones, at the same KV memory.
 
 ```bash
 EXTRA_ARGS="--enable-unified-memory" ./recipe/gpt_oss_120b/server.sh

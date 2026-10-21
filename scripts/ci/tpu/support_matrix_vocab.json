@@ -49,6 +49,9 @@
     "mimo-v2.5-pro": {
       "name": "MiMo-V2.5-Pro"
     },
+    "muse-glimmer": {
+      "name": "Muse Glimmer 30B"
+    },
     "deepseek-r1-0528": {
       "name": "DeepSeek-R1-0528",
       "aliases": [
@@ -110,6 +113,7 @@
     "tpu-oot": "Out-of-tree plugin (mode B)",
     "rpa-v3": "RPA v3 attention backend",
     "seq-along-lane": "Batched RPA seq-along-lane layout",
-    "normalization": "Multi-host node normalization"
+    "normalization": "Multi-host node normalization",
+    "unified-memory": "Unified KV pool (--enable-unified-memory)"
   }
 }

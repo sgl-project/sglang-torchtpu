@@ -19,11 +19,6 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.vision_utils import (
-    get_vision_cu_seqlens,
-    get_vision_position_ids,
-    get_vision_window_index,
-)
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import (
@@ -708,6 +703,14 @@ class MuseGlimmerVisionModel(nn.Module):
     def forward(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> torch.Tensor:
+        # Imported here: the TPU stack's transformers pin has no vision_utils,
+        # and text-only serving never runs the vision tower.
+        from transformers.vision_utils import (
+            get_vision_cu_seqlens,
+            get_vision_position_ids,
+            get_vision_window_index,
+        )
+
         pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
         hidden_states = self.patch_embedder(pixel_values, grid_thw)
         hidden_states = self.ln_pre(hidden_states)
