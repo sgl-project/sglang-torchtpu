@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+import socket
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -252,6 +253,55 @@ class TestRegisterToBootstrap(CustomTestCase):
 
         url_used = mock_put.call_args[0][0]
         self.assertIn("10.0.0.1", url_used)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_dist_init_addr_lookup_retries_dns_failures(self, mock_put, mock_time):
+        mock_put.return_value.status_code = 200
+        not_found = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 0))]
+
+        mgr = self._make_manager(dist_init_addr="prefill-leader:5000")
+        with patch(
+            "socket.getaddrinfo", side_effect=[not_found, not_found, answer]
+        ) as mock_getaddrinfo:
+            mgr.register_to_bootstrap()
+
+        self.assertEqual(mock_getaddrinfo.call_count, 3)
+        self.assertEqual(mock_time.sleep.call_args_list, [call(1.0), call(2.0)])
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args[0][0], "http://10.0.0.1:8765/route")
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_dist_init_addr_lookup_gives_up_after_retries(self, mock_put, mock_time):
+        not_found = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+        mgr = self._make_manager(dist_init_addr="prefill-leader:5000")
+        with patch("socket.getaddrinfo", side_effect=not_found) as mock_getaddrinfo:
+            with self.assertRaisesRegex(ValueError, "Cannot resolve host"):
+                mgr.register_to_bootstrap()
+
+        self.assertEqual(mock_getaddrinfo.call_count, 8)
+        self.assertEqual(
+            [c.args[0] for c in mock_time.sleep.call_args_list],
+            [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0],
+        )
+        mock_put.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_dist_init_addr_lookup_does_not_retry_other_errors(
+        self, mock_put, mock_time
+    ):
+        mgr = self._make_manager(dist_init_addr="prefill-leader:5000")
+        # An invalid name raises UnicodeError, which is also a ValueError.
+        with patch("socket.getaddrinfo", side_effect=UnicodeError("label too long")):
+            with self.assertRaises(UnicodeError):
+                mgr.register_to_bootstrap()
+
+        mock_time.sleep.assert_not_called()
+        mock_put.assert_not_called()
 
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
