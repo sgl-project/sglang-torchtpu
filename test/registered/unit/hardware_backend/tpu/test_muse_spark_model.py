@@ -1,4 +1,5 @@
-"""CPU tests for the Muse Spark TPU model's checkpoint mapping, config, and PP."""
+"""CPU tests for the Muse Spark TPU model's checkpoint mapping, config,
+attention partitions, and PP."""
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -6,12 +7,16 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.configs.model_config import get_hybrid_layer_ids
-from sglang.srt.configs.muse_spark import MuseSparkConfig
+from sglang.srt.configs.muse_spark import MuseSparkConfig, MuseSparkTextConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptQuantConfig
+from sglang.srt.runtime_context import SpawnRanks, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.models.muse_spark import (
+    MuseSparkAttention,
     MuseSparkInterleavedRope,
     MuseSparkMoE,
     MuseSparkRMSNorm,
@@ -156,6 +161,70 @@ class TestMuseSparkConfig(CustomTestCase):
         swa, full = get_hybrid_layer_ids(config.architectures, text)
         self.assertEqual(swa, [0, 2])
         self.assertEqual(full, [1, 3])
+
+
+class TestMuseSparkAttentionParallelGroups(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        # Rank 3 of TP 4 with two attention-DP groups is attention-TP rank 1 of 2,
+        # so the attention-TP and TP partitions differ.
+        publish(
+            ServerArgs(model_path="dummy", device="cpu", tp_size=4, attn_dp_size=2),
+            role="test",
+            ranks=SpawnRanks(world_rank=3),
+        )
+
+    def test_projections_shard_over_attention_tp(self):
+        heads, kv_heads, head_dim, hidden = 4, 2, 8, 32
+        config = MuseSparkTextConfig(
+            hidden_size=hidden,
+            head_dim=head_dim,
+            num_attention_heads=heads,
+            num_key_value_heads=kv_heads,
+            num_hidden_layers=2,
+            layer_types=["sliding_attention", "full_attention"],
+            layer_rope_theta=[500000.0, 0.0],
+            mlp_layer_types=["sparse"] * 2,
+        )
+        rope = MuseSparkInterleavedRope(head_dim, 64, 500000.0)
+        attn = MuseSparkAttention(config, 0, rope, prefix="model.layers.0.self_attn")
+
+        local_heads, local_kv_heads = heads // 2, kv_heads // 2
+        self.assertEqual(
+            (attn.num_heads, attn.num_kv_heads), (local_heads, local_kv_heads)
+        )
+        self.assertEqual(
+            tuple(attn.qkv_proj.weight.shape),
+            ((local_heads + 2 * local_kv_heads) * head_dim, hidden),
+        )
+        self.assertEqual(
+            tuple(attn.gate_proj.weight.shape), (local_heads * head_dim, hidden)
+        )
+        self.assertEqual(
+            tuple(attn.o_proj.weight.shape), (hidden, local_heads * head_dim)
+        )
+        for proj in (attn.qkv_proj, attn.gate_proj, attn.o_proj):
+            self.assertEqual(rank_size(proj), (1, 2))
+        self.assertEqual(rank_size(attn.qkv_proj, kv=True), (1, 2))
+
+        # Checkpoint loading keeps this rank's attention-TP slice.
+        gate = torch.randn(heads * head_dim, hidden)
+        attn.gate_proj.weight_loader(attn.gate_proj.weight, gate)
+        torch.testing.assert_close(attn.gate_proj.weight, gate.chunk(2, dim=0)[1])
+        out = torch.randn(hidden, heads * head_dim)
+        attn.o_proj.weight_loader(attn.o_proj.weight, out)
+        torch.testing.assert_close(attn.o_proj.weight, out.chunk(2, dim=1)[1])
+
+        # The output projection completes its partial sum with the TP all-reduce.
+        x = torch.randn(3, local_heads * head_dim)
+        with patch(
+            "sglang.srt.layers.linear.tensor_model_parallel_all_reduce",
+            side_effect=lambda t: 2 * t,
+        ) as all_reduce:
+            output, _ = attn.o_proj(x)
+        all_reduce.assert_called_once()
+        torch.testing.assert_close(output, 2 * x @ attn.o_proj.weight.t())
 
 
 class _StubAttn(torch.nn.Module):
