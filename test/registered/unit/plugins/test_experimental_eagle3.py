@@ -548,6 +548,32 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertIs(seen[0], bucket.temperatures)
         self.assertIsNone(seen[1])
 
+    def test_fused_draft_waits_for_the_hicache_reload_first(self):
+        """The fused draft program inlines the forward shim, whose HiCache reload gate
+        only runs eagerly; without the eager wait a PD decode drafts on draft KV
+        a host reload has not landed yet."""
+        drafter = object.__new__(TpuEagle3DraftWorker)
+        calls = []
+        shim = SimpleNamespace(wait_for_hicache_reload=lambda: calls.append("wait"))
+        drafter._compile_policy = lambda: SimpleNamespace(compiled_forward_shim=shim)
+        drafter.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda batch: None)
+        )
+        drafter._carry_table = torch.zeros((1, 1))
+        drafter._fused_draft = lambda *args: calls.append("draft") or ("d", None)
+        forward_batch = SimpleNamespace(mark_forward_metadata_ready=lambda: None)
+        drafter.run_fused_draft(
+            forward_batch,
+            req_pool_indices=None,
+            positions=None,
+            cache_locs=None,
+            seq_lens=None,
+            temperatures=None,
+            top_ks=None,
+            uniforms=None,
+        )
+        self.assertEqual(calls, ["wait", "draft"])
+
 
 if __name__ == "__main__":
     unittest.main()

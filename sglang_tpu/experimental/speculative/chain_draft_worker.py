@@ -168,6 +168,11 @@ class TpuChainDraftWorker(TpuDraftWorker):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Drafts [pbs, N] (and dense q logits when sampling) from one compiled program."""
         assert self._fused_draft is not None, "precompile_draft has not run"
+        shim = self._compile_policy().compiled_forward_shim
+        assert shim is not None
+        # The fused program inlines the forward shim, whose HiCache reload gate runs
+        # only eagerly; a PD decode drafts before any target forward waits on it.
+        shim.wait_for_hicache_reload()
         backend = self.model_runner.attn_backend
         backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
