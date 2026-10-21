@@ -12,6 +12,9 @@ Single host:
   python -m sglang_tpu.k3_megakernel.server.app --port 30000 --decode-steps 64 -- \\
       --layers 13 --expert-load stream --relax dense_fp8,pair_oproj --kernel-opt wire_relax=bf16_transport
 Multi-host: ``server/run4h.sh`` on every host (adds --coordinator/--num-processes/--process-id).
+Speculative decoding: ``--spec-draft dspark --draft-path <DSpark draft checkpoint>`` (greedy DSpark
+draft + 8-row verify on device, ``--spec-rounds`` rounds per device call; see engine.generate_spec).
+Manual checks and benchmarks: test/manual/k3_megakernel/README.md.
 
 Limits: one request at a time, greedy decoding (sampling parameters such as temperature are
 ignored; n > 1, logprobs, echo, tools and several prompts per request are rejected with 400).
@@ -38,6 +41,8 @@ _KV_PREFIX = "k3srv/job/"
 # (every job that reaches the device is a collective all processes take part in).
 _KV_KEEP = 64
 _MAX_STOPS, _MAX_STOP_LEN = 16, 256
+# Per-request benchmark / test hooks: rejected with 400 unless the server runs with --bench-hooks.
+_BENCH_HOOKS = ("k3_force_acc", "k3_draft", "k3_stop_ids")
 # OpenAI / sglang request fields this server does not implement: a request using them gets a 400.
 _UNSUPPORTED = (
     "logprobs",
@@ -72,6 +77,33 @@ def _parse(argv):
     p.add_argument(
         "--capacity", type=int, default=16384, help="max prompt + generated tokens"
     )
+    p.add_argument(
+        "--spec-draft",
+        choices=("none", "dspark"),
+        default="none",
+        help="speculative decoding: 'dspark' = server.draft.DraftModel from --draft-path",
+    )
+    p.add_argument(
+        "--draft-path", default="", help="DSpark draft checkpoint (--spec-draft dspark)"
+    )
+    p.add_argument(
+        "--draft-tp",
+        type=int,
+        default=0,
+        help="DSpark draft tensor-parallel group (0 = the whole mesh; 8 = one host: every host runs its own copy, "
+        "so no draft collective crosses hosts; at 4 hosts the whole mesh measured ~40 us/round faster)",
+    )
+    p.add_argument(
+        "--spec-rounds", type=int, default=8, help="speculative rounds per device call"
+    )
+    p.add_argument(
+        "--bench-hooks",
+        action="store_true",
+        help="accept the per-request benchmark / test hooks (output meaningless): k3_force_acc=N "
+        "(spec: every round emits N tokens whatever the target says), k3_draft=zero (spec: drafts "
+        "token 0 without running the draft), k3_stop_ids=[ids] (extra ids treated like EOS). Off: "
+        "a request using them gets a 400",
+    )
     p.add_argument("--served-model-name", default="")
     p.add_argument("--no-warmup", action="store_true")
     p.add_argument(
@@ -88,6 +120,8 @@ def _parse(argv):
         else (argv, [])
     )
     ns, unknown = p.parse_known_args(ours)
+    if ns.spec_draft == "dspark" and not ns.draft_path:
+        p.error("--spec-draft dspark needs --draft-path")
     return ns, unknown + rest
 
 
@@ -144,17 +178,31 @@ def run_job(engine, tok, job: Job):
         job.push(("tokens", new, finished, reason))
 
     try:
-        stop_ids = () if spec.get("ignore_eos") else STOP_IDS
-        stop_check = _stop_fn(tok, spec.get("stop") or [])
-        ids, reason, timing = engine.generate(
-            spec["prompt"],
-            spec["max_tokens"],
-            stop_ids,
-            on_tokens=on_tokens,
-            stop_check=stop_check,
-            prefill_mode=spec.get("prefill_mode", "rows"),
-            steps=int(spec.get("steps", 0)),
+        stop_ids = (() if spec.get("ignore_eos") else STOP_IDS) + tuple(
+            spec.get("stop_ids") or ()
         )
+        stop_check = _stop_fn(tok, spec.get("stop") or [])
+        spec_engine = getattr(engine, "draft", None) is not None
+        if spec_engine and spec.get("prefill_mode", "rows") == "rows":
+            ids, reason, timing = engine.generate_spec(
+                spec["prompt"],
+                spec["max_tokens"],
+                stop_ids,
+                on_tokens=on_tokens,
+                stop_check=stop_check,
+                force=spec.get("force_acc", 0),
+                zero_drafts=spec.get("zero_drafts", False),
+            )
+        else:
+            ids, reason, timing = engine.generate(
+                spec["prompt"],
+                spec["max_tokens"],
+                stop_ids,
+                on_tokens=on_tokens,
+                stop_check=stop_check,
+                prefill_mode=spec.get("prefill_mode", "rows"),
+                steps=int(spec.get("steps", 0)),
+            )
         _log(f"job {spec['n']}: {json.dumps(timing)} reason {reason}")
         job.push(("done", ids, reason, timing))
     except Exception as e:  # a bad request must not take the server down
@@ -193,6 +241,7 @@ def job_spec(
     max_prompt: int,
     vocab: int,
     steps_allowed,
+    bench_hooks: bool = False,
 ) -> dict:
     """Validated job spec (no job number yet: the leader numbers jobs as it publishes them, so a
     rejected request never leaves a gap the followers would wait on). Raises ValueError -> 400."""
@@ -225,13 +274,39 @@ def job_spec(
     prefill = body.get("k3_prefill") or "rows"
     if prefill not in ("rows", "loop"):
         raise ValueError("k3_prefill must be rows or loop")
-    return dict(
+    spec = dict(
         prompt=list(prompt_ids),
         max_tokens=max_tokens,
         ignore_eos=bool(body.get("ignore_eos", False)),
         stop=_stops(body.get("stop")),
         prefill_mode=prefill,
         steps=steps,
+    )
+    used = [k for k in _BENCH_HOOKS if body.get(k) is not None]
+    if used and not bench_hooks:
+        raise ValueError(
+            f"{used}: benchmark / test hooks, off in serving (server flag --bench-hooks)"
+        )
+    if used:
+        spec.update(_bench_hooks(body))
+    return spec
+
+
+def _bench_hooks(body: dict) -> dict:
+    """Job fields of the --bench-hooks request fields (see ``_parse``)."""
+    stop_ids = body.get("k3_stop_ids") or []
+    if not isinstance(stop_ids, list):
+        raise ValueError("k3_stop_ids must be a list of token ids")
+    force = _int(body.get("k3_force_acc") or 0, "k3_force_acc")
+    if not 0 <= force <= 8:
+        raise ValueError("k3_force_acc must be in [0, 8]")
+    draft = body.get("k3_draft") or "dspark"
+    if draft not in ("dspark", "zero"):
+        raise ValueError("k3_draft must be dspark or zero")
+    return dict(
+        stop_ids=[_int(t, "k3_stop_ids") for t in stop_ids],
+        force_acc=force,
+        zero_drafts=draft == "zero",
     )
 
 
@@ -254,6 +329,7 @@ def make_app(
     max_prompt: int,
     vocab: int,
     steps_allowed=(),
+    bench_hooks: bool = False,
 ):
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, StreamingResponse
@@ -268,6 +344,7 @@ def make_app(
             max_prompt=max_prompt,
             vocab=vocab,
             steps_allowed=set(steps_allowed),
+            bench_hooks=bench_hooks,
         )
         job = Job(spec, asyncio.get_running_loop())
         jobs.put(job)
@@ -519,6 +596,7 @@ def make_app(
                     stop=sp.get("stop"),
                     k3_prefill=body.get("k3_prefill"),
                     k3_steps=body.get("k3_steps"),
+                    **{k: body.get(k) for k in _BENCH_HOOKS},
                 ),
                 128,
             )
@@ -710,12 +788,21 @@ def main(argv=None):
         f"processes {jax.process_count()} devices {jax.device_count()}; server {vars(ns)}; model args {model_argv}"
     )
     tok = AutoTokenizer.from_pretrained(args.ckpt, trust_remote_code=True)
+    mesh = mesh_mod.make_mesh()
+    draft = None
+    if ns.spec_draft == "dspark":
+        from sglang_tpu.k3_megakernel.server.draft import DraftModel
+
+        tp = min(ns.draft_tp, mesh.devices.size) if ns.draft_tp else None
+        draft = DraftModel.load(ns.draft_path, mesh, embed_mode=args.embed, tp=tp)
     engine = Engine(
         args,
-        mesh_mod.make_mesh(),
+        mesh,
         decode_steps=ns.decode_steps,
         capacity=ns.capacity,
         lookahead=ns.lookahead,
+        draft=draft,
+        spec_rounds=ns.spec_rounds,
     )
     _log(f"weights loaded in {engine.load_s:.0f}s")
     if not ns.no_warmup:
@@ -733,6 +820,7 @@ def main(argv=None):
         max_prompt=engine.max_prompt,
         vocab=engine.vocab,
         steps_allowed=engine.compiled_steps(),
+        bench_hooks=ns.bench_hooks,
     )
     _serve_http(app, ns.host, ns.port)
     import socket
