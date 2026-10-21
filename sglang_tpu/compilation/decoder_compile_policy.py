@@ -1919,10 +1919,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """
         if (
             self.model_runner.is_draft_worker
-            or not get_exec().mamba.enable_mamba_extra_buffer
             or not isinstance(self.model_runner.req_to_token_pool, HybridReqToTokenPool)
             or not (mode.is_extend() or mode.is_decode())
             or mode.is_target_verify()
+            or not get_exec().mamba.enable_mamba_extra_buffer
         ):
             return
         # The scheduler builds these on the host, as int64 / bool.
