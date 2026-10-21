@@ -100,6 +100,31 @@ of the migration. The TPU Plugin Scoreboard workflow publishes both daily.
 `sglang-tpu`, so mode A needs its own entry point. `register()` runs once per
 process and only on TPU, since every host installs the plugin.
 
+## P/D generation health
+
+Point the router or Kubernetes health check at `/health_generate`.
+
+- `SGLANG_TPU_PD_HEALTH_WINDOW_S` sets the progress window **T** (default
+  **200 seconds**). Choose T above the longest expected chunk, remote prefill,
+  or KV-transfer wait, and below both `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`
+  and `SGLANG_DISAGGREGATION_WAITING_TIMEOUT` (default **300 seconds** each).
+  `0` disables the progress window and uses only the core probe and worker crashes.
+- `SGLANG_HEALTH_CHECK_TIMEOUT` sets the core probe wait (default **20 seconds**).
+  Set the external health-check timeout above this, for example
+  `--health-check-endpoint /health_generate --health-check-timeout-secs 30`
+  on sgl-model-gateway.
+
+**Healthy (200):** no confirmed worker crash, and pending work completes chunks
+or produces tokens within T, including buffered tokens. A new request gets T
+from dispatch before its first progress. Active work within this window stays
+healthy even if the shorter core probe times out. An idle server must pass the
+core probe.
+
+**Unhealthy (503):** a confirmed worker crash (immediately), pending work with
+no completed chunk or token for longer than T, or a failed core probe while idle.
+Synthetic probe replies and aborts do not count as progress. A single healthy
+step exceeding T also returns 503, so size T for supported workloads.
+
 ## Tests
 
 `test/registered/tpu/**` and `test/registered/unit/hardware_backend/tpu/**`

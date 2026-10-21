@@ -9,6 +9,7 @@ All patches are idempotent.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import os
 from collections.abc import Sequence
@@ -956,6 +957,104 @@ def _patch_scheduler_reject_prompt_logprob() -> None:
     Scheduler._add_request_to_queue = _add_request_to_queue
 
 
+_tokenizer_manager_pd_health_patched = False
+
+
+def apply_tpu_http_patches(*, disaggregation_mode: str) -> None:
+    """Patches for the process that resolves server args and hosts the tokenizer manager."""
+    if disaggregation_mode == "null":
+        return
+    from sglang_tpu.disaggregation import health_generate
+
+    health_generate.configure_window()
+    _patch_tokenizer_manager_pd_health_generate()
+
+
+def _patch_tokenizer_manager_pd_health_generate() -> None:
+    """P/D /health_generate from completed work, the probe and worker crashes."""
+    global _tokenizer_manager_pd_health_patched
+    if _tokenizer_manager_pd_health_patched:
+        return
+    _tokenizer_manager_pd_health_patched = True
+    from sglang.srt.managers.io_struct import HealthCheckOutput
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.utils import TypeBasedDispatcher
+    from sglang_tpu.disaggregation import health_generate
+
+    orig_handle_batch_output = TokenizerManager._handle_batch_output
+    orig_init_request_dispatcher = TokenizerManager.init_request_dispatcher
+
+    @functools.wraps(orig_handle_batch_output)
+    async def _handle_batch_output(self, recv_obj):
+        # Core can delete finished requests and yield while notifying clients.
+        # Publish health progress first, independently of its metrics updates.
+        health_generate.mark_progress(self, recv_obj)
+        return await orig_handle_batch_output(self, recv_obj)
+
+    @functools.wraps(orig_init_request_dispatcher)
+    def init_request_dispatcher(self):
+        orig_init_request_dispatcher(self)
+        original = self._result_dispatcher
+
+        def dispatch(recv_obj):
+            health_generate.mark_progress(self, recv_obj)
+            return original(recv_obj)
+
+        self._result_dispatcher = TypeBasedDispatcher([(HealthCheckOutput, dispatch)])
+        self._result_dispatcher += original
+        self._result_dispatcher.add_fallback_fn(original)
+        health_generate.install_health_generate_route()
+
+    TokenizerManager._handle_batch_output = _handle_batch_output
+    TokenizerManager.init_request_dispatcher = init_request_dispatcher
+
+
+_scheduler_pd_health_patched = False
+
+
+def _patch_scheduler_pd_health_progress() -> None:
+    """Completed work reaches the tokenizer before a probe is acknowledged."""
+    global _scheduler_pd_health_patched
+    if _scheduler_pd_health_patched:
+        return
+    _scheduler_pd_health_patched = True
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang_tpu.disaggregation import health_generate
+
+    orig_process = Scheduler.process_batch_result
+    orig_send = Scheduler.maybe_send_health_check_signal
+    orig_queued = Scheduler.maybe_signal_queued_health_checks
+
+    @functools.wraps(orig_process)
+    def process_batch_result(self, batch, result, *args, **kwargs):
+        # Core acknowledges probes before it publishes the batch's completed
+        # work; hold the ack until the work is out, so a verdict never pairs a
+        # fresh ack with stale progress. Instances made by core lack the flags.
+        self._tpu_pd_hold_ack = True
+        try:
+            return orig_process(self, batch, result, *args, **kwargs)
+        finally:
+            self._tpu_pd_hold_ack = False
+            if vars(self).pop("_tpu_pd_ack_held", False):
+                orig_send(self)
+
+    @functools.wraps(orig_send)
+    def maybe_send_health_check_signal(self):
+        if vars(self).get("_tpu_pd_hold_ack", False):
+            self._tpu_pd_ack_held = True
+            return None
+        return orig_send(self)
+
+    @functools.wraps(orig_queued)
+    def maybe_signal_queued_health_checks(self, batch):
+        health_generate.report_completed_work(self, batch)
+        return orig_queued(self, batch)
+
+    Scheduler.process_batch_result = process_batch_result
+    Scheduler.maybe_send_health_check_signal = maybe_send_health_check_signal
+    Scheduler.maybe_signal_queued_health_checks = maybe_signal_queued_health_checks
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -981,3 +1080,4 @@ def apply_tpu_patches() -> None:
     _patch_host_heap_trim()
     _patch_profile_auto()
     _patch_scheduler_reject_prompt_logprob()
+    _patch_scheduler_pd_health_progress()

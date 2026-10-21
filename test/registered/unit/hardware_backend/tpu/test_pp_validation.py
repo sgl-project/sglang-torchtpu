@@ -63,6 +63,7 @@ def _args(**overrides):
         pp_async_batch_depth=0,
         disaggregation_mode="null",
         disaggregation_transfer_backend="mooncake",
+        tokenizer_worker_num=1,
         optimistic_prefill_attempts=0,
         max_queued_requests=None,
         enable_priority_scheduling=False,

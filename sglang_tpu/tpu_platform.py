@@ -794,12 +794,13 @@ class TpuSRTPlatform(SRTPlatform):
             with_phase,
         )
         from sglang_tpu.kimi_k3 import static_fp8_parts
-        from sglang_tpu.patches import _prepare_tpu_env
+        from sglang_tpu.patches import _prepare_tpu_env, apply_tpu_http_patches
 
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
         static_fp8_parts()
         cfg = resolving_view(server_args)
+        apply_tpu_http_patches(disaggregation_mode=cfg.disaggregation_mode)
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
