@@ -776,13 +776,29 @@ async def health_generate(request: Request) -> Response:
     # awaiting it would add that to the probe's latency.
     task.add_done_callback(_retrieve_health_probe_outcome)
 
+    def release_probe() -> None:
+        # The probe is a real scheduler request, and under P/D it carries a fake
+        # bootstrap peer, so an unfinished one holds a decode prealloc queue slot
+        # until it is aborted. Cancelling the task only abandons the client half.
+        # abort_request resolves the rid through rid_to_state, so it has to run
+        # BEFORE the pop -- afterwards the scheduler-side entry is unreachable by
+        # rid and nothing will ever reap it.
+        # Both exit paths land here, including the success one: it returns as soon
+        # as last_receive_tstamp advances, which only says the manager saw *some*
+        # response, not this probe's. Aborting only the unfinished ones keeps a
+        # completed probe out of the aborted-request metric.
+        state = _global_state.tokenizer_manager.rid_to_state.get(rid)
+        if state is not None and not state.finished:
+            _global_state.tokenizer_manager.abort_request(rid=rid)
+        _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
     tic = time.time()
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            release_probe()
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
             return Response(status_code=200)
 
@@ -796,7 +812,7 @@ async def health_generate(request: Request) -> Response:
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+    release_probe()
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
