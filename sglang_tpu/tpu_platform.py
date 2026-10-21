@@ -793,13 +793,18 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
-        from sglang_tpu.kimi_k3 import static_fp8_parts
+        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch, static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
-        static_fp8_parts()
+        parts = static_fp8_parts()
         cfg = resolving_view(server_args)
+        check_static_fp8_spec_batch(
+            parts,
+            speculative_algorithm=cfg.speculative_algorithm,
+            max_running_requests=cfg.max_running_requests,
+        )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
