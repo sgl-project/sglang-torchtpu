@@ -77,7 +77,8 @@ QUANTIZATION = ""
 KV_CACHE_DTYPE = "fp8_e4m3"
 MAX_TOTAL_TOKENS = 786432
 DISAGG_TRANSFER_BACKEND = "raiden"
-# Use Raiden for P/D transfer and decode retraction backup.
+# Decode's --hicache-io-backend. TPU decode retraction resolves to cpu_tensor
+# and never reads it; it only feeds startup validation in handle_hicache.
 HICACHE_IO_BACKEND = "raiden"
 EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 EXTRA_LAUNCH_ENV: Dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
@@ -246,7 +247,8 @@ def build_decode_env(
         *EXTRA_SERVER_ARGS,
         "--disaggregation-transfer-backend",
         DISAGG_TRANSFER_BACKEND,
-        # TPU decode retraction requires a fused host pool.
+        # Retraction resolves to cpu_tensor on TPU and never reads these; they
+        # only feed startup validation, where raiden requires page_first_fused.
         "--hicache-mem-layout",
         "page_first_fused",
         "--hicache-io-backend",
@@ -471,11 +473,12 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             env = env_fn(2, env={})
             self.assertNotIn("hierarchical-cache", env["EXTRA_ARGS"])
             self.assertNotIn("speculative", env["EXTRA_ARGS"])
-        # Prefill never retracts, so only decode carries the host-pool flags.
+        # Only decode carries the hicache flags.
         self.assertNotIn("hicache", build_prefill_env(2, env={})["EXTRA_ARGS"])
 
     def test_decode_retraction_host_pool_stays_on_raiden(self) -> None:
-        # GPT-OSS's hybrid KV layout requires Raiden.
+        # Pins decode's hicache flags, which only feed startup validation; TPU
+        # decode retraction resolves to cpu_tensor.
         decode_args = build_decode_env(2, env={})["EXTRA_ARGS"]
         self.assertIn("--hicache-mem-layout page_first_fused", decode_args)
         self.assertIn("--hicache-io-backend raiden", decode_args)

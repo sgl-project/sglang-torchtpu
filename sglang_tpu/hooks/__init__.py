@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HookRegistry entries (``sglang.srt.plugins`` entry point). TPU worker initialization hooks.
+"""HookRegistry entries and server-args resolution hooks (``sglang.srt.plugins`` entry point).
 
 Every hook is tracked debt and carries a header: Why / How (hook type and
 target) / Upstream PR or issue / Remove when. A REPLACE on a method longer than
@@ -19,6 +19,7 @@ from sglang_tpu.hooks.attn_residual import (
 )
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.cpu_pinning import pin_scheduler_main_thread
+from sglang_tpu.hooks.decode_retraction import reject_host_pool_retraction
 from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
@@ -253,6 +254,12 @@ HOOKS.extend(host_padding_hooks())
 
 HOOKS.extend(hook_specs())
 
+# (resolution step, wrapper) pairs for register_resolution_hook; they run while
+# server args are resolved, before any worker starts.
+RESOLUTION_HOOKS: list[tuple] = [
+    ("handle_cache_compatibility", reject_host_pool_retraction),
+]
+
 _registered = False
 
 
@@ -264,18 +271,21 @@ def register() -> None:
         return
     _registered = True
 
-    if not HOOKS:
-        logger.debug("sglang_tpu: no hooks registered.")
-        return
-
     from sglang.srt.platforms import current_platform
 
     # Every host installs the plugin, so the entry points also run off TPU.
     if not current_platform.is_tpu():
         return
 
+    from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
     from sglang.srt.plugins.hook_registry import HookRegistry
 
+    for name, hook in RESOLUTION_HOOKS:
+        register_resolution_hook(name)(hook)
     for target, hook, hook_type in HOOKS:
         HookRegistry.register(target, hook, hook_type)
-    logger.info("sglang_tpu: registered %d hook(s).", len(HOOKS))
+    logger.info(
+        "sglang_tpu: registered %d hook(s) and %d resolution hook(s).",
+        len(HOOKS),
+        len(RESOLUTION_HOOKS),
+    )

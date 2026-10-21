@@ -372,22 +372,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disaggregation-decode-retraction-backup=host_pool requires "
             "--disable-priority-preemption when priority scheduling is enabled."
         )
-    if (
-        cfg.disaggregation_decode_retraction_backup == "host_pool"
-        and cfg.device == "tpu"
-        and (
-            cfg.hicache_io_backend not in ("torch_tpu", "raiden")
-            or cfg.hicache_mem_layout != "page_first_fused"
-        )
-    ):
-        raise ValueError(
-            "--disaggregation-decode-retraction-backup=host_pool on TPU "
-            "builds the TPU host pool, which requires --hicache-mem-layout "
-            "page_first_fused and --hicache-io-backend torch_tpu or raiden; "
-            f"got layout {cfg.hicache_mem_layout!r} and io backend "
-            f"{cfg.hicache_io_backend!r}."
-        )
-
     if cfg.radix_eviction_policy == "tlru":
         tlru_config = cfg.radix_eviction_policy_config or {}
         threshold = tlru_config.get("threshold", 0)

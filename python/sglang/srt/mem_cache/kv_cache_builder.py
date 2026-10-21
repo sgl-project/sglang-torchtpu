@@ -200,11 +200,9 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
             )
         )
-        # The TPU host pools need the page_first_fused layout and a TPU io
-        # backend, neither of which a decode server carries by default, and
-        # host-pool retraction books a device-pool-sized slab of host memory
-        # per rank. Default a TPU decode server to per-request CPU tensors;
-        # host_pool stays available as an explicit choice.
+        # The TPU host pools cannot restore through the host-pool retraction
+        # path, and the TPU plugin rejects an explicit host_pool at startup, so
+        # a TPU decode server uses per-request CPU tensors.
         from sglang.srt.platforms import current_platform
 
         if current_platform.is_tpu():

@@ -256,7 +256,11 @@ class ServerArgs:
                 "from the corrected arguments."
             )
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
+        from sglang.srt.plugins import load_plugins
 
+        # Plugins register resolution hooks. Load them here so a launcher that
+        # resolves before calling load_plugins() still applies them.
+        load_plugins()
         self._input_frozen = True
 
         try:

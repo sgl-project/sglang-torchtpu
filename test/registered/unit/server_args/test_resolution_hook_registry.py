@@ -263,5 +263,25 @@ class TestEndToEnd(_IsolatedRegistry):
         )
 
 
+class TestResolveLoadsPlugins(CustomTestCase):
+    def test_resolve_once_loads_plugins_before_the_pipeline(self):
+        # A launcher may resolve before calling load_plugins(); plugin
+        # resolution hooks must still be registered when the pipeline runs.
+        order = []
+        with (
+            patch(
+                "sglang.srt.plugins.load_plugins",
+                side_effect=lambda: order.append("load_plugins"),
+            ),
+            patch.object(
+                pipeline_module,
+                "run_resolution_pipeline",
+                side_effect=lambda *a, **k: order.append("pipeline"),
+            ),
+        ):
+            ServerArgs(model_path="dummy").resolve_once()
+        self.assertEqual(order[:2], ["load_plugins", "pipeline"])
+
+
 if __name__ == "__main__":
     unittest.main()
