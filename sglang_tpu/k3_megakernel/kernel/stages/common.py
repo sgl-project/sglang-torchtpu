@@ -378,6 +378,9 @@ class OutProjSpec(msgspec.Struct, frozen=True):
     hidden: int
     relax: Relax = Relax()
     rows: int = 1  # decode rows (speculative verify: 8)
+    # pair, rows > 1: the row-scattered reduce gathers both parities' rows (RowScatterSpec.full_host),
+    # so the halves swap goes away (same bits).
+    rows_full_gather: bool = False
 
     @property
     def pair(self) -> bool:
@@ -413,7 +416,9 @@ class OutProjSpec(msgspec.Struct, frozen=True):
         if (
             r > 1
         ):  # verify rows: the half partials reduced scattered by row over the parity's lanes
-            ar = RowScatterSpec(half_topo, r, half, t, th, stride=2)
+            ar = RowScatterSpec(
+                half_topo, r, half, t, th, stride=2, full_host=self.rows_full_gather
+            )
         else:
             ar = AllReduceSpec(
                 half_topo, flat_rows(1, half), t, stride=2, host_transport=th, flat=flat
@@ -504,6 +509,8 @@ class PairProjection:
         self.ar.start(flat(part))
         _call(self.before_reduce)
         rows = x.shape[0]
+        if rows > 1 and self.spec.rows_full_gather:
+            return unflat(self.ar.finish(), rows, 2 * half)  # bf16-valued, both halves
         mine = bf16(unflat(self.ar.finish(), rows, half))
         self.halves.start(flat(mine))
         theirs = unflat(self.halves.finish(), rows, half)

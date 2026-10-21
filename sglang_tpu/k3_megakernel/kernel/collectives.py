@@ -119,7 +119,14 @@ class AllReduceSpec(msgspec.Struct, frozen=True):
         ]
 
 
+# Issue order of a level's remote copies: farthest peers (largest XOR offset: other hosts) first.
+# Set by ``StackKernel(far_first=...)``; issue order only.
+FAR_FIRST = [False]
+
+
 def _remote_copies(me, src, dst, send, recv, offsets):
+    if FAR_FIRST[0]:
+        offsets = sorted(offsets, reverse=True)
     return [
         pltpu.make_async_remote_copy(
             src, dst, send, recv, device_id=(me ^ off,), device_id_type=_MESH
@@ -767,8 +774,13 @@ class RowScatterSpec(msgspec.Struct, frozen=True):
     transport: object = jnp.float32
     host_transport: object = None
     stride: int = 1  # over one chip-pair parity (pair_oproj): 2
+    # stride 2: the bf16 rows are gathered from all lanes of the host (both parities), so every
+    # rank ends with the full [R, 2 * hidden] block and the chip pair's halves swap goes away.
+    full_host: bool = False
 
     def __post_init__(self):
+        if self.full_host and self.stride != 2:
+            raise ValueError("full_host gathers both parities: stride must be 2")
         if self.rows % self.topo.lanes or self.hidden % 128:
             raise ValueError(
                 f"rows={self.rows} must split over {self.topo.lanes} lanes"
@@ -794,6 +806,14 @@ class RowScatterSpec(msgspec.Struct, frozen=True):
 
     @property
     def gather(self) -> "AllGatherSpec":
+        if self.full_host:
+            return AllGatherSpec(
+                Topology(1, 2 * self.topo.lanes),
+                1,
+                jnp.bfloat16,
+                flat=True,
+                cols=self.per_lane * self.hidden,
+            )
         return AllGatherSpec(
             Topology(1, self.topo.lanes),
             1,
@@ -840,8 +860,20 @@ class RowScatterAllReduce:
             .astype(jnp.bfloat16)
             .astype(jnp.float32)
         )
-        every = self.gat(row)  # [1, R * H]
-        return every.reshape(sp.rows * sp.hidden // LANE, LANE)
+        # [1, R * H]; full_host: [1, 2 * R * H] in host-lane order
+        every = self.gat(row)
+        if not sp.full_host:
+            return every.reshape(sp.rows * sp.hidden // LANE, LANE)
+        # Host lane 2j + p holds parity p's half of rows [j * per_lane, (j + 1) * per_lane).
+        blocks = every.reshape(2 * sp.rows, sp.hidden)
+        out = []
+        for r in range(sp.rows):
+            j, i = divmod(r, sp.per_lane)
+            b = [(2 * j + p) * sp.per_lane + i for p in range(2)]
+            out.append(jnp.concatenate([blocks[k : k + 1] for k in b], axis=1))
+        return jnp.concatenate(out, axis=0).reshape(
+            2 * sp.rows * sp.hidden // LANE, LANE
+        )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         self.start(x)

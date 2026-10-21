@@ -190,6 +190,7 @@ SERVING_KERNEL_OPTIONS = frozenset(
         "attn_ring_mib",
         "attn_chunk_mib",
         "oproj_early",
+        "oproj_full_gather",
         "stream_budget",
         "stream_slots",
         "stream_budgets",
