@@ -1821,6 +1821,9 @@ class KVCacheConfigurator:
                 device=self.device,
                 start_layer=self.layer_info.start_layer,
                 token_to_kv_pool_class=self._tpu_mha_pool_class(),
+                # The whole model's split, the same on every pipeline stage.
+                model_num_full_layers=len(self.model_config.full_attention_layer_ids),
+                model_num_swa_layers=len(self.model_config.swa_attention_layer_ids),
             )
         PoolCls = self._tpu_mha_pool_class()
         # This stage's own layers, not the model's: under PP the global lists

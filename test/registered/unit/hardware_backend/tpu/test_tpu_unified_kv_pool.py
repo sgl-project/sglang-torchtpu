@@ -7,6 +7,7 @@ torch_tpu installed.
 """
 
 import contextlib
+import os
 import subprocess
 import sys
 import unittest
@@ -17,6 +18,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import hicache_auto_size
 from sglang.srt.mem_cache.allocator import swa as swa_allocator_module
@@ -140,6 +142,8 @@ def _hybrid_kvc(
         get_num_kv_heads=lambda tp_size, dcp_size=1: 1,
         get_swa_num_kv_heads=lambda tp_size, dcp_size=1: swa_kv_heads,
         hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+        full_attention_layer_ids=list(full_layer_ids),
+        swa_attention_layer_ids=list(swa_layer_ids),
     )
     return SimpleNamespace(
         is_hybrid_swa=True,
@@ -159,6 +163,28 @@ def _hybrid_kvc(
         page_size=page_size,
         attn_dp_size=1,
     )
+
+
+GPT_OSS_NUM_LAYERS = 36
+
+
+def _gpt_oss_stage_kvc(pp_rank, pp_size, **kwargs):
+    """KV-cache config of one pipeline stage of a gpt-oss-like model: 36 layers,
+    sliding-window on even ids and full attention on odd ids, split into stages
+    as the model runner splits them."""
+    full_ids = list(range(1, GPT_OSS_NUM_LAYERS, 2))
+    swa_ids = list(range(0, GPT_OSS_NUM_LAYERS, 2))
+    start, end = get_pp_indices(GPT_OSS_NUM_LAYERS, pp_rank, pp_size)
+    kvc = _hybrid_kvc(
+        full_layer_ids=[i for i in full_ids if start <= i < end],
+        swa_layer_ids=[i for i in swa_ids if start <= i < end],
+        **kwargs,
+    )
+    kvc.layer_info.start_layer = start
+    kvc.model_config.num_hidden_layers = GPT_OSS_NUM_LAYERS
+    kvc.model_config.full_attention_layer_ids = full_ids
+    kvc.model_config.swa_attention_layer_ids = swa_ids
+    return kvc
 
 
 def _fused_rpa_platform(pool_cls=TpuFusedMHATokenToKVPool):
@@ -1406,6 +1432,45 @@ class TestUnifiedPoolEnabled(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "nor fit as one full-attention"):
                 unified_kv_pool_enabled(fp8)
 
+    @staticmethod
+    def _enabled_on_stage(pp_rank, pp_size, **server_args):
+        """unified_kv_pool_enabled on one pipeline stage of a gpt-oss-like model."""
+        with (
+            _fused_rpa_platform(),
+            get_context().override_server_args(
+                tpu_unified_kv_pool=True, pp_size=pp_size, **server_args
+            ),
+            get_parallel().override(attn_tp_size=1, pp_rank=pp_rank),
+        ):
+            return unified_kv_pool_enabled(_gpt_oss_stage_kvc(pp_rank, pp_size))
+
+    def test_pipeline_stages_with_unequal_layer_mixes_are_accepted(self):
+        # At PP8, stages 4 and 6 hold two full-attention and three
+        # sliding-window layers, stages 5 and 7 three and two.
+        for rank in range(8):
+            with self.subTest(rank=rank):
+                self.assertTrue(self._enabled_on_stage(rank, 8))
+
+    def test_a_stage_without_both_layer_kinds_is_refused_on_every_rank(self):
+        # Stage 0 holds layer 0 alone. Every rank refuses, including those
+        # holding both kinds, so none waits for the others in pool sizing.
+        with patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": "1,5,5,5,5,5,5,5"}):
+            for rank in range(8):
+                with (
+                    self.subTest(rank=rank),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "a rank without both full-attention and sliding-window layers",
+                    ),
+                ):
+                    self._enabled_on_stage(rank, 8)
+
+    def test_rejects_pd_disaggregation_with_pipeline_parallelism(self):
+        with self.assertRaisesRegex(
+            ValueError, "PD disaggregation with pipeline parallelism"
+        ):
+            self._enabled_on_stage(0, 8, disaggregation_mode="prefill")
+
 
 class TestUnifiedHostPool(CustomTestCase):
     HICACHE_RATIO = 2.0
@@ -1554,8 +1619,9 @@ class TestUnifiedPoolSizing(CustomTestCase):
     buffer, max(#full, ceil(#SWA / groups)) * 512, and the shared size is whole
     8-page units."""
 
-    def _configurator(self, kvc, **server_args):
-        """The unified configurator over ``kvc``'s static policy at ratio 0.5."""
+    def _configurator(self, kvc, *, parallel=None, **server_args):
+        """The unified configurator over ``kvc``'s static policy at ratio 0.5;
+        ``parallel`` sets this process's ranks."""
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(
@@ -1569,7 +1635,7 @@ class TestUnifiedPoolSizing(CustomTestCase):
                 }
             )
         )
-        stack.enter_context(get_parallel().override(attn_tp_size=1))
+        stack.enter_context(get_parallel().override(attn_tp_size=1, **(parallel or {})))
         stack.enter_context(_fused_rpa_platform())
         return TpuUnifiedSWAPoolConfigurator(kvc)
 
@@ -1607,6 +1673,122 @@ class TestUnifiedPoolSizing(CustomTestCase):
         )
         config = configurator.calculate_pool_sizes(1280 * 1000, PAGE_SIZE)
         self.assertEqual(self._sizes(config), (1000, 2496, 2496))
+
+    def test_pipeline_stages_share_the_smallest_stage_size(self):
+        # Every stage sizes 1000 full + 500 SWA tokens and takes the smallest
+        # stage's share, so the stages' schedulers see the same pages. PP8
+        # stages hold (2, 2), (2, 3) or (3, 2) full and SWA layers:
+        # min(3000 // 2, 3500 // 3, 4000 // 3) = 1166, floored to 1152. PP16
+        # stages hold (1, 1), (1, 2) or (2, 1): min(1500, 2000 // 2, 2500 // 2)
+        # = 1000, floored to 992, which also caps the full-attention count.
+        cases = (
+            (8, [(2, 2)] * 4 + [(2, 3), (3, 2)] * 2, (1000, 1152, 1152)),
+            (16, [(1, 1)] * 12 + [(1, 2), (2, 1)] * 2, (992, 992, 992)),
+        )
+        for pp_size, stage_mixes, sizes in cases:
+            for rank in range(pp_size):
+                with self.subTest(pp_size=pp_size, rank=rank):
+                    kvc = _gpt_oss_stage_kvc(rank, pp_size)
+                    layer_info = kvc.layer_info
+                    self.assertEqual(
+                        (
+                            len(layer_info.full_attention_layer_ids),
+                            len(layer_info.swa_attention_layer_ids),
+                        ),
+                        stage_mixes[rank],
+                    )
+                    configurator = self._configurator(
+                        kvc, parallel=dict(pp_rank=rank), pp_size=pp_size
+                    )
+                    config = configurator.calculate_pool_sizes_from_max_tokens(
+                        1000, PAGE_SIZE
+                    )
+                    config = configurator.finalize_with_max_running_requests(config)
+                    self.assertEqual(self._sizes(config), sizes)
+
+    def test_pipeline_stages_agree_after_the_token_count_min(self):
+        # Pool sizing sizes the byte budget on every stage, MIN-reduces the
+        # full-attention count over the stages and re-derives the stages above
+        # it. Radix cache off, 2 requests and 32-token chunks cap SWA at
+        # 2 * (16 + 4 + 8) + 9 pipeline slots * 32 + 4 = 348 tokens; a 10000-token
+        # budget leaves 4652, 4476 and 3100 full tokens to the (2, 2), (2, 3)
+        # and (3, 2) stages. At 3100 the (2, 3) stage shares
+        # (2 * 3100 + 3 * 348) // 3 = 2414, floored to 2400, on every stage.
+        with envs.SGLANG_SWA_EVICTION_INTERVAL.override(4):
+            configurators = [
+                self._configurator(
+                    _gpt_oss_stage_kvc(rank, 8, sliding_window_size=16),
+                    parallel=dict(pp_rank=rank),
+                    pp_size=8,
+                    pp_async_batch_depth=1,
+                    max_running_requests=2,
+                    disable_radix_cache=True,
+                    chunked_prefill_size=32,
+                    disable_overlap_schedule=True,
+                )
+                for rank in range(8)
+            ]
+        configs = [
+            configurator.calculate_pool_sizes(512 * 10000, PAGE_SIZE)
+            for configurator in configurators
+        ]
+        min_tokens = min(config.max_total_num_tokens for config in configs)
+        self.assertEqual(min_tokens, 3100)
+        finals = {
+            self._sizes(
+                configurator.finalize_with_max_running_requests(
+                    config
+                    if config.max_total_num_tokens == min_tokens
+                    else configurator.calculate_pool_sizes_from_max_tokens(
+                        min_tokens, PAGE_SIZE
+                    )
+                )
+            )
+            for configurator, config in zip(configurators, configs)
+        }
+        self.assertEqual(finals, {(2400, 2400, 2400)})
+
+    def test_pipeline_stages_group_by_the_whole_model(self):
+        # Eight layers, full attention on 0, 4 and 5: PP2 stages hold (1, 3) and
+        # (2, 2) layers and group by the model's ceil(5 / 3) = 2, not their own
+        # 3 and 1, so both stages' allocators charge two page ids per SWA page.
+        # Two buffers per stage share min(2500 // 2, 3000 // 2) = 1250 tokens,
+        # floored to 1248.
+        full_ids, swa_ids = [0, 4, 5], [1, 2, 3, 6, 7]
+        for rank, stage_full, stage_swa in ((0, [0], [1, 2, 3]), (1, [4, 5], [6, 7])):
+            with self.subTest(rank=rank):
+                start, _ = get_pp_indices(8, rank, 2)
+                kvc = _hybrid_kvc(full_layer_ids=stage_full, swa_layer_ids=stage_swa)
+                kvc.layer_info.start_layer = start
+                kvc.model_config.num_hidden_layers = 8
+                kvc.model_config.full_attention_layer_ids = full_ids
+                kvc.model_config.swa_attention_layer_ids = swa_ids
+                configurator = self._configurator(
+                    kvc, parallel=dict(pp_rank=rank), pp_size=2
+                )
+                config = configurator.calculate_pool_sizes_from_max_tokens(
+                    1000, PAGE_SIZE
+                )
+                config = configurator.finalize_with_max_running_requests(config)
+                self.assertEqual(self._sizes(config), (1000, 1248, 1248))
+                pool = TpuUnifiedSWAKVPool(
+                    size=POOL_TOKENS,
+                    page_size=PAGE_SIZE,
+                    dtype=torch.bfloat16,
+                    head_num=1,
+                    head_dim=128,
+                    swa_head_num=1,
+                    swa_head_dim=128,
+                    swa_v_head_dim=128,
+                    swa_attention_layer_ids=stage_swa,
+                    full_attention_layer_ids=stage_full,
+                    device="cpu",
+                    start_layer=start,
+                    model_num_full_layers=len(full_ids),
+                    model_num_swa_layers=len(swa_ids),
+                )
+                self.assertEqual(pool.num_swa_groups, 2)
+                self.assertEqual(len(pool.get_state()), 2)
 
     def test_token_cap_keeps_counting_full_attention_tokens(self):
         # gpt-oss at page 64 and ratio 0.8: --max-total-tokens 16400 caps the

@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -186,16 +187,13 @@ def _unsupported_reason(kvc: KVCacheConfigurator) -> Optional[str]:
             "nor fit as one full-attention KV head "
             f"(KV page shapes {full_page} and {swa_page} per rank)"
         )
-    layer_info = kvc.layer_info
-    if (
-        not layer_info.full_attention_layer_ids
-        or not layer_info.swa_attention_layer_ids
-    ):
+    # Checked for every pipeline stage, so all ranks refuse together.
+    if not all(num_full and num_swa for num_full, num_swa in _stage_layer_mixes(kvc)):
         return "a rank without both full-attention and sliding-window layers"
     if not kvc.spec_algorithm.is_none() or kvc.is_draft_worker:
         return "speculative decoding"
-    if get_parallel().pp_size > 1:
-        return "pipeline parallelism"
+    if get_disagg().disaggregation_mode != "null" and get_parallel().pp_size > 1:
+        return "PD disaggregation with pipeline parallelism"
     if get_parallel().attn_cp_size > 1 or get_parallel().dcp_enabled:
         return "context parallelism"
     if get_disagg().disaggregation_mode != "null":
@@ -229,6 +227,34 @@ def _unified_pool_classes(pool_cls: type) -> Tuple[type, type]:
             f"_SharedBufferView{pool_cls.__name__}", (_SharedBufferView, pool_cls), {}
         ),
     )
+
+
+def _stage_layer_mixes(kvc: KVCacheConfigurator) -> list[tuple[int, int]]:
+    """(#full-attention, #sliding-window) layers of every pipeline stage.
+
+    Under pipeline parallelism every rank derives the list from the whole
+    model's layer kinds, so all stages compute the same one.
+    """
+    pp_size = get_parallel().pp_size
+    if pp_size == 1:
+        layer_info = kvc.layer_info
+        return [
+            (
+                len(layer_info.full_attention_layer_ids),
+                len(layer_info.swa_attention_layer_ids),
+            )
+        ]
+    model_config = kvc.model_config
+    mixes = []
+    for rank in range(pp_size):
+        start, end = get_pp_indices(model_config.num_hidden_layers, rank, pp_size)
+        mixes.append(
+            (
+                sum(start <= i < end for i in model_config.full_attention_layer_ids),
+                sum(start <= i < end for i in model_config.swa_attention_layer_ids),
+            )
+        )
+    return mixes
 
 
 class _UnifiedBackingPool(TpuFusedMHATokenToKVPool):
@@ -372,6 +398,8 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
     sliding-window layers; the allocator records in ``swa_group_pages`` which
     page each further group uses alongside each group-0 sliding-window page.
     The buffers and views take the layout of ``token_to_kv_pool_class``.
+    Under pipeline parallelism the groups follow the whole model's layer counts,
+    so every stage's allocator charges alike for a sliding-window page.
     """
 
     def __init__(
@@ -390,11 +418,14 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
         device: str,
         start_layer: int,
         token_to_kv_pool_class: type = TpuFusedMHATokenToKVPool,
+        model_num_full_layers: Optional[int] = None,
+        model_num_swa_layers: Optional[int] = None,
     ):
         num_full = len(full_attention_layer_ids)
         num_swa = len(swa_attention_layer_ids)
         self.num_swa_groups = num_swa_groups(
-            num_full_layers=num_full, num_swa_layers=num_swa
+            num_full_layers=model_num_full_layers or num_full,
+            num_swa_layers=model_num_swa_layers or num_swa,
         )
         groups = self.num_swa_groups
         # i32[num_swa_groups - 1, pages + 1]: [g - 1, p] is group g's page of the
@@ -1047,8 +1078,10 @@ class _SharedPagesRatioSplit(HybridSWAPoolConfigurator):
 class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
     """Sizes the unified pool from the static full and sliding-window pools.
 
-    The shared pool gets the bytes the two static pools would get for the same
-    flags, and max_total_num_tokens stays their full-attention token count.
+    The shared pool gets at most the bytes the two static pools would get for
+    the same flags: every pipeline stage takes the page count of the stage where
+    those bytes buy the fewest pages. max_total_num_tokens stays their
+    full-attention token count, capped at the shared size.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -1060,11 +1093,12 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
             if SWAChunkCapPoolConfigurator.is_applicable(kvc)
             else _SharedPagesRatioSplit(kvc)
         )
-        self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
-        self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
+        self._stage_layer_mixes = _stage_layer_mixes(kvc)
+        # Every pipeline stage groups by the whole model's layers, so the stages'
+        # allocators charge alike for a sliding-window page.
         self._swa_groups = num_swa_groups(
-            num_full_layers=self._full_layers_num,
-            num_swa_layers=self._swa_layers_num,
+            num_full_layers=sum(num_full for num_full, _ in self._stage_layer_mixes),
+            num_swa_layers=sum(num_swa for _, num_swa in self._stage_layer_mixes),
         )
         self._sliding_window_size = kvc.sliding_window_size
 
@@ -1088,19 +1122,28 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
     def finalize_with_max_running_requests(
         self, config: MemoryPoolConfig
     ) -> MemoryPoolConfig:
-        return self._static.finalize_with_max_running_requests(config)
+        config = self._static.finalize_with_max_running_requests(config)
+        # The token capacity stops at the shared size. Until here it stays the
+        # full-attention count, which config_from_budget MIN-reduces over the
+        # pipeline stages and re-derives their pools from.
+        return dataclasses.replace(
+            config,
+            max_total_num_tokens=min(
+                config.max_total_num_tokens, config.full_max_total_num_tokens
+            ),
+        )
 
     def _share(self, config: MemoryPoolConfig, page_size: int) -> MemoryPoolConfig:
         full_tokens = config.full_max_total_num_tokens
         swa_tokens = config.swa_max_total_num_tokens
-        # A shared page holds a row in each of the pool's buffers, whichever
-        # side owns it.
-        num_buffers = max(
-            self._full_layers_num, _cdiv(self._swa_layers_num, self._swa_groups)
+        # A shared page holds a row in each of a stage's buffers, whichever side
+        # owns it. Every pipeline stage takes the smallest stage's size, so the
+        # stages' schedulers see the same pages.
+        shared_tokens = min(
+            (full_tokens * num_full + swa_tokens * num_swa)
+            // max(num_full, _cdiv(num_swa, self._swa_groups))
+            for num_full, num_swa in self._stage_layer_mixes
         )
-        shared_tokens = (
-            full_tokens * self._full_layers_num + swa_tokens * self._swa_layers_num
-        ) // num_buffers
         align_tokens = page_size * _TPU_SWA_PAGE_ALIGNMENT
         shared_tokens = shared_tokens // align_tokens * align_tokens
         self._validate_shared_pool_size(shared_tokens, page_size)
