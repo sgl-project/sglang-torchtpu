@@ -406,7 +406,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             supports_kv_free_fence,
             supports_tpu_direct_compile,
         )
-        from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        def select_experimental_spec_worker(_default, algorithm, _server_args):
+            return TpuSRTPlatform().get_spec_worker_cls(algorithm, None, default=None)
 
         mtp = SpeculativeAlgorithm.from_string("NEXTN")
         spec_args = SimpleNamespace(speculative_algorithm="NEXTN")
@@ -487,6 +490,36 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, "core refused"):
                         kimi_spec_defaults(original, args)
+
+    def test_platform_selects_the_experimental_workers(self):
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+            TpuChainSpecWorker,
+        )
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        platform = TpuSRTPlatform()
+
+        class _CoreWorker:
+            pass
+
+        def select(algo):
+            return platform.get_spec_worker_cls(algo, None, default=_CoreWorker)
+
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            self.assertIs(select(SpeculativeAlgorithm.DFLASH), TpuBlockSpecWorker)
+            self.assertIs(select(SpeculativeAlgorithm.DSPARK), TpuBlockSpecWorker)
+            self.assertIs(select(SpeculativeAlgorithm.EAGLE3), TpuChainSpecWorker)
+            self.assertIs(select(SpeculativeAlgorithm.EAGLE), TpuChainSpecWorker)
+            self.assertIs(select(SpeculativeAlgorithm.NGRAM), _CoreWorker)
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
+            self.assertIs(select(SpeculativeAlgorithm.DFLASH), _CoreWorker)
+            self.assertIs(select(SpeculativeAlgorithm.EAGLE3), _CoreWorker)
 
     def test_draft_merge_preserves_right_hand_length_metadata(self):
         left, right = _state([1]), _state([2, 3])

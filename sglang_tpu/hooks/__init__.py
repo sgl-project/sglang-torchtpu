@@ -58,7 +58,6 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
-from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
@@ -84,11 +83,6 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
         skip_spec_op_precompile_without_draft,
         HookType.AROUND,
-    ),
-    (
-        "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_worker",
-        select_experimental_spec_worker,
-        HookType.AFTER,
     ),
     (
         "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",

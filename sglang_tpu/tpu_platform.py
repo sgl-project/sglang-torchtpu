@@ -1040,6 +1040,27 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuGraphRunner
 
+    def get_spec_worker_cls(self, algorithm, server_args, *, default: type) -> type:
+        # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+        from sglang_tpu.experimental import (
+            is_experimental_chain,
+            is_experimental_spec_worker,
+        )
+
+        if is_experimental_chain(algorithm):
+            from sglang_tpu.experimental.speculative.chain_spec_worker import (
+                TpuChainSpecWorker,
+            )
+
+            return TpuChainSpecWorker
+        if is_experimental_spec_worker(algorithm):
+            from sglang_tpu.experimental.speculative.block_spec_worker import (
+                TpuBlockSpecWorker,
+            )
+
+            return TpuBlockSpecWorker
+        return default
+
     def get_quantization_config(
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:

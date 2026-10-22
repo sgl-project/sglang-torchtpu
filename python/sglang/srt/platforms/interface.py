@@ -244,6 +244,15 @@ class SRTPlatform(DeviceMixin):
         """Return a platform implementation for speculative KV-cache locations."""
         return None
 
+    def get_spec_worker_cls(self, algorithm, server_args, *, default: type) -> type:
+        """Return the worker class for a builtin speculative algorithm.
+
+        ``default`` is the class core selects for ``algorithm``. A platform may
+        return a different class satisfying ``SpecWorkerContract``
+        (``speculative/spec_worker_contract.py``) that serves the same algorithm.
+        """
+        return default
+
     def get_quantization_config(
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:

@@ -79,9 +79,10 @@ Inheritance kept for reuse, not because it is-a (do not extend the pattern):
   slowdown. torch_tpu fuses the eager ops
   that feed a compiled call into one program, so fuse new eager ops into one
   warmed `compiled_op`.
-- **Plugin only.** Core reaches this code through hooks (`../../hooks/spec_worker.py`
-  selects the worker, `../../hooks/experimental_spec.py` adapts host-padded
-  batches), and every hook delegates unchanged for non-experimental batches.
+- **Plugin only.** Core reaches this code through the platform and hooks
+  (`TpuSRTPlatform.get_spec_worker_cls` selects the worker,
+  `../../hooks/experimental_spec.py` adapts host-padded batches), and every hook
+  delegates unchanged for non-experimental batches.
 
 ## Adding a drafter
 

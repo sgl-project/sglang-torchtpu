@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.spec_common import adjust_verify_logits, verify_coins
 from sglang.srt.speculative.spec_utils import fill_bonus_tokens_func
 from sglang.srt.utils import (
     is_cpu,
@@ -847,76 +848,6 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
-def _seeded_verify_coins(
-    *,
-    sampling_seed: torch.Tensor,
-    seq_lens: torch.Tensor,
-    draft_token_num: int,
-    device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Derive deterministic verify-side coins from per-request sampling seeds.
-
-    Mirrors the main seeded-sampling path: murmur_hash32(seed, seq_lens,
-    column) mapped to [0, 1). Columns [0, draft_token_num) drive the
-    per-draft rejection coins; column draft_token_num drives the final
-    fallback-sampling coin.
-
-    Scope: this seeds only the verify-side RNG. With rejection sampling the
-    draft workers still pick candidates via unseeded multinomial
-    (fast_sample in eagle_worker_v2), so that mode stays non-deterministic
-    until the draft RNG is seeded in a follow-up; top-k/greedy draft
-    selection is already deterministic.
-    """
-    from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
-
-    cols = torch.arange(draft_token_num + 1, device=device, dtype=torch.int64)
-    hashed = murmur_hash32(
-        sampling_seed.to(torch.uint64), seq_lens.to(torch.uint64), cols
-    )
-    uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
-    # The float32 cast rounds the top 129 uint32 hashes to exactly 1.0, but
-    # the sampling kernels expect half-open [0, 1) coins: a 1.0 coin walks
-    # past the last CDF bucket and can return a zero-probability token.
-    # Clamp to the largest float32 below one; every other coin value is
-    # untouched, so previously verified bitwise baselines stay intact.
-    max_coin = 1.0 - 2**-24
-    coins = (
-        uniforms[:, :draft_token_num].to(torch.float32).clamp_(max=max_coin)
-    ).contiguous()
-    coins_for_final_sampling = (
-        uniforms[:, draft_token_num].to(torch.float32).clamp_(max=max_coin)
-    ).contiguous()
-    return coins, coins_for_final_sampling
-
-
-def _verify_coins(
-    *,
-    sampling_info: SamplingBatchInfo,
-    seq_lens: torch.Tensor,
-    draft_token_num: int,
-    candidates: torch.Tensor,
-    device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Rejection and final-sampling coins for verify: deterministic seeded
-    coins when sampling_seed is set (see _seeded_verify_coins), torch.rand
-    otherwise.
-    """
-    if sampling_info.sampling_seed is not None:
-        return _seeded_verify_coins(
-            sampling_seed=sampling_info.sampling_seed,
-            seq_lens=seq_lens,
-            draft_token_num=draft_token_num,
-            device=device,
-        )
-    # coins for rejection sampling
-    coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-    # coins for final sampling
-    coins_for_final_sampling = torch.rand(
-        (candidates.shape[0],), dtype=torch.float32, device=device
-    )
-    return coins, coins_for_final_sampling
-
-
 def _verify_uses_greedy(
     *,
     is_all_greedy: bool,
@@ -968,9 +899,6 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -991,30 +919,11 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        additive_penalties = torch.repeat_interleave(
-            sampling_info.acc_additive_penalties,
-            verify_input.draft_token_num,
-            dim=0,
-        )
-        next_token_logits[: additive_penalties.shape[0]].add_(additive_penalties)
-    if sampling_info.acc_scaling_penalties is not None:
-        scaling_penalties = torch.repeat_interleave(
-            sampling_info.acc_scaling_penalties,
-            verify_input.draft_token_num,
-            dim=0,
-        )
-        apply_scaling_penalties(
-            next_token_logits[: scaling_penalties.shape[0]],
-            scaling_penalties,
-        )
-    if sampling_info.logit_bias is not None:
-        logit_bias = torch.repeat_interleave(
-            sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-        )
-        next_token_logits[: logit_bias.shape[0]].add_(logit_bias)
+    adjust_verify_logits(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=verify_input.draft_token_num,
+    )
 
     # Apply grammar mask if provided
     if grammar_mask is not None:
@@ -1196,7 +1105,7 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
-        coins, coins_for_final_sampling = _verify_coins(
+        coins, coins_for_final_sampling = verify_coins(
             sampling_info=sampling_info,
             seq_lens=batch.seq_lens,
             draft_token_num=verify_input.draft_token_num,
@@ -1325,9 +1234,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # page>1 topk>1 row-width assert has nothing to guard: nothing is written.
     # Eviction, penalties, per-request iteration counters and the device-accept
     # routing prepared at the end of this function all still run.
-    skip_allocation = (
-        num_needed_tokens == 0 and _is_tpu and batch.req_to_token_pool.host_resident
-    )
+    skip_allocation = num_needed_tokens == 0 and batch.req_to_token_pool.host_resident
 
     if not skip_allocation:
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
@@ -1347,7 +1254,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
                 f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
             )
 
-        if _is_tpu and batch.req_to_token_pool.host_resident:
+        if batch.req_to_token_pool.host_resident:
             # TPU: req_to_token lives on the host, so allocate and write the page
             # table through the host mirrors instead of the device alloc path.
             allocate_and_assign_decode_cache(

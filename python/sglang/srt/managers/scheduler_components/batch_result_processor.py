@@ -49,7 +49,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.spec_worker_contract import is_spec_worker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -1398,9 +1398,9 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
-            # isinstance narrowing: create_worker may also return plain
+            # Narrowing: create_worker may also return plain
             # TpModelWorker-based drafts, which carry no spec-worker hooks.
-            if isinstance(self.draft_worker, BaseSpecWorker):
+            if is_spec_worker(self.draft_worker):
                 self.draft_worker.note_request_finished(
                     rid=req.rid,
                     natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),

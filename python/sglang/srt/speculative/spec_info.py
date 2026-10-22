@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+    from sglang.srt.speculative.spec_worker_contract import SpecWorkerContract
 
 
 class SpeculativeAlgorithm(Enum):
@@ -323,12 +324,20 @@ class SpeculativeAlgorithm(Enum):
 
     def create_worker(
         self, server_args: ServerArgs
-    ) -> type[BaseSpecWorker | TpModelWorker | NGRAMWorker] | None:
+    ) -> type[SpecWorkerContract | TpModelWorker] | None:
+        from sglang.srt.platforms import current_platform
 
-        cfg = resolving_view(server_args)
         assert not self.is_none(), (
             "Cannot create worker for NONE speculative algorithm."
         )
+        return current_platform.get_spec_worker_cls(
+            self, server_args, default=self._default_worker_cls(server_args)
+        )
+
+    def _default_worker_cls(
+        self, server_args: ServerArgs
+    ) -> type[BaseSpecWorker | TpModelWorker | NGRAMWorker]:
+        cfg = resolving_view(server_args)
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it

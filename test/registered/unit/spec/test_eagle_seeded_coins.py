@@ -1,4 +1,4 @@
-"""Unit tests for the EAGLE verify coins (_verify_coins / _seeded_verify_coins).
+"""Unit tests for the EAGLE verify coins (verify_coins / seeded_verify_coins).
 
 Locks the deterministic-coin contract behind seeded speculative sampling:
 identical (seed, seq_lens) inputs produce bitwise-identical coins, distinct
@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.eagle_utils import _seeded_verify_coins, _verify_coins
+from sglang.srt.speculative.spec_common import seeded_verify_coins, verify_coins
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,7 +28,7 @@ DRAFT_TOKEN_NUM = 4
 
 def _coins(seeds, seq_lens):
     device = "cuda"
-    return _seeded_verify_coins(
+    return seeded_verify_coins(
         sampling_seed=torch.tensor(seeds, device=device, dtype=torch.int64),
         seq_lens=torch.tensor(seq_lens, device=device, dtype=torch.int64),
         draft_token_num=DRAFT_TOKEN_NUM,
@@ -101,8 +101,8 @@ class TestSeededVerifyCoins(CustomTestCase):
         with patch(
             "sglang.kernels.ops.sampling.murmur_hash.murmur_hash32"
         ) as mock_hash:
-            coins_a, final_a = _verify_coins(**kwargs)
-            coins_b, final_b = _verify_coins(**kwargs)
+            coins_a, final_a = verify_coins(**kwargs)
+            coins_b, final_b = verify_coins(**kwargs)
 
         mock_hash.assert_not_called()
         self.assertEqual(coins_a.shape, (3, DRAFT_TOKEN_NUM))
@@ -116,7 +116,7 @@ class TestSeededVerifyCoins(CustomTestCase):
         device = "cuda"
         seeds = torch.tensor([12345, 67890], device=device, dtype=torch.int64)
         seq_lens = torch.tensor([7, 9], device=device, dtype=torch.int64)
-        coins, final = _verify_coins(
+        coins, final = verify_coins(
             sampling_info=SimpleNamespace(sampling_seed=seeds),
             seq_lens=seq_lens,
             draft_token_num=DRAFT_TOKEN_NUM,
@@ -125,7 +125,7 @@ class TestSeededVerifyCoins(CustomTestCase):
             ),
             device=device,
         )
-        expected_coins, expected_final = _seeded_verify_coins(
+        expected_coins, expected_final = seeded_verify_coins(
             sampling_seed=seeds,
             seq_lens=seq_lens,
             draft_token_num=DRAFT_TOKEN_NUM,

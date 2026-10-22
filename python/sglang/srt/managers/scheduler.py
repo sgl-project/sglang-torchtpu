@@ -328,7 +328,6 @@ from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec,
@@ -338,6 +337,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
 )
+from sglang.srt.speculative.spec_worker_contract import is_spec_worker
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
@@ -2544,7 +2544,7 @@ class Scheduler(
         # runner that votes belongs to the target model.
         target_worker = (
             self.tp_worker.target_worker
-            if isinstance(self.tp_worker, BaseSpecWorker)
+            if is_spec_worker(self.tp_worker)
             else self.tp_worker
         )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(

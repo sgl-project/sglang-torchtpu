@@ -45,7 +45,7 @@ from sglang_tpu.experimental.speculative.spec_utils import pad_rows
 from sglang_tpu.hooks.experimental_spec import (
     keep_host_padded_extend_outputs,
 )
-from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -79,24 +79,25 @@ def _unfiltered(rows: int) -> dict[str, torch.Tensor]:
     )
 
 
+def _select_worker(algorithm):
+    """The TPU platform's worker for algorithm, or None for core's own."""
+    return TpuSRTPlatform().get_spec_worker_cls(algorithm, None, default=None)
+
+
 class TestExperimentalEagle3(CustomTestCase):
     def test_flag_routes_eagle3_and_leaves_other_algorithms_alone(self):
         with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
             self.assertIs(
-                select_experimental_spec_worker(
-                    None, SpeculativeAlgorithm.EAGLE3, None
-                ),
+                _select_worker(SpeculativeAlgorithm.EAGLE3),
                 TpuChainSpecWorker,
             )
             # EAGLE is MTP (core resolves NEXTN to it), served by the chain worker.
             self.assertIs(
-                select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE, None),
+                _select_worker(SpeculativeAlgorithm.EAGLE),
                 TpuChainSpecWorker,
             )
         with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
-            self.assertIsNone(
-                select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE3, None)
-            )
+            self.assertIsNone(_select_worker(SpeculativeAlgorithm.EAGLE3))
 
     def test_dp_ranks_agree_on_a_bucket_the_draft_padding_keeps(self):
         """Every DP rank derives the same decode bucket from the synced sizes, equal

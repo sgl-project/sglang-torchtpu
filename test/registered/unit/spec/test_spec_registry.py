@@ -2,10 +2,11 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -196,6 +197,38 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         server_args.disable_overlap_schedule = False
         with self.assertRaisesRegex(ValueError, "does not support overlap"):
             self.algo.create_worker(server_args)
+
+
+class TestPlatformWorkerFactory(CustomTestCase):
+    """Builtin algorithms pick their worker class through the current platform."""
+
+    def test_platform_receives_core_default_and_its_answer_wins(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        class _PlatformWorker:
+            pass
+
+        calls = []
+
+        class _FakePlatform(SRTPlatform):
+            def get_spec_worker_cls(self, algorithm, server_args, *, default):
+                calls.append((algorithm, server_args, default))
+                return _PlatformWorker
+
+        server_args = MagicMock()
+        with patch("sglang.srt.platforms.current_platform", _FakePlatform()):
+            worker_cls = SpeculativeAlgorithm.DFLASH.create_worker(server_args)
+        self.assertIs(worker_cls, _PlatformWorker)
+        self.assertEqual(
+            calls, [(SpeculativeAlgorithm.DFLASH, server_args, DFlashWorkerV2)]
+        )
+
+    def test_base_platform_keeps_the_core_default(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        with patch("sglang.srt.platforms.current_platform", SRTPlatform()):
+            worker_cls = SpeculativeAlgorithm.DFLASH.create_worker(MagicMock())
+        self.assertIs(worker_cls, DFlashWorkerV2)
 
 
 class TestServerArgsHook(_RegistryIsolated):

@@ -162,6 +162,11 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    """Optional base for spec workers: implements ``SpecWorkerContract`` with defaults.
+
+    Core depends on the contract (``spec_worker_contract.py``), not on this class.
+    """
+
     _hicache_draft_plan = HiCacheDraftPlan()
 
     def __init__(self) -> None:

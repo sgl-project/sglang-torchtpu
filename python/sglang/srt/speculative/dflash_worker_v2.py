@@ -45,7 +45,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
-    mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
@@ -81,6 +80,9 @@ from sglang.srt.speculative.lilicorr_utils import (
     publish_anchor,
     resolve_sampling_enabled,
     target_input_embeddings,
+)
+from sglang.srt.speculative.spec_common import (
+    update_target_recurrent_state_after_verify,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
@@ -1070,9 +1072,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
 
+    @property
+    def _pads_to_batch_buckets(self) -> bool:
+        """Whether the target's compile policy pads batches to compile buckets."""
+        return self.model_runner.compile_policy.b_bucketer is not None
+
     def _maybe_pad_draft_bs(self, bs: int) -> int:
-        """Round bs up to the TPU compile bucket; identity on other backends."""
-        if _is_tpu:
+        """Round bs up to the compile bucket; identity without batch buckets."""
+        if self._pads_to_batch_buckets:
             b_bucketer = self.model_runner.compile_policy.b_bucketer
             return int(b_bucketer.next_bucket(int(bs)))
         return int(bs)
@@ -1132,12 +1139,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         if cap >= int(bs):
             return
 
-        # On TPU the capacity must itself be a bucket, so _maybe_pad_draft_bs(bs)
-        # stays <= cap for every later bs <= cap and buf[:pad_bs] never overruns;
-        # the ladder bounds regrowth. Elsewhere double to amortize it.
+        # With batch buckets the capacity must itself be a bucket, so
+        # _maybe_pad_draft_bs(bs) stays <= cap for every later bs <= cap and
+        # buf[:pad_bs] never overruns; the ladder bounds regrowth. Elsewhere
+        # double to amortize it.
         new_cap = (
             self._maybe_pad_draft_bs(int(bs))
-            if _is_tpu
+            if self._pads_to_batch_buckets
             else max(int(bs), cap * 2 if cap > 0 else int(bs))
         )
         device = self.device
@@ -2336,39 +2344,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if not self._need_mamba_verify_commit:
             return
-        attn_backend = self.target_worker.model_runner.attn_backend
-
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
-        mamba_steps_to_track = None
-
-        if batch.mamba_track_indices is not None:
-            mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != seq_lens_post_verify // mamba_track_interval
-            )
-            tracking_point = (
-                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
-            )
-            mamba_steps_to_track = torch.where(
-                can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
-
         model_runner = self.target_worker.model_runner
-        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
-            attn_backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-                model=model_runner.model,
-                req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
-            )
+        update_target_recurrent_state_after_verify(
+            attn_backend=model_runner.attn_backend,
+            model=model_runner.model,
+            mamba_track_indices=batch.mamba_track_indices,
+            tree_page_size=batch.tree_cache.page_size,
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens_pre_verify=seq_lens_pre_verify,
+            seq_lens_post_verify=seq_lens_post_verify,
+            commit_lens=commit_lens,
+        )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
@@ -2783,7 +2769,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
-        if not _is_tpu:
+        if current_platform.supports_overlap_streams():
             batch.seq_lens.record_stream(
                 torch.get_device_module(self.device).current_stream()
             )
@@ -2889,7 +2875,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         if fused_block is None:
-            if _is_tpu:
+            if self._pads_to_batch_buckets:
                 # Feed the bucket-padded buffer so the compiled artifact stays on a
                 # static shape, then trim the ghost rows back off.
                 input_embeds = self.embed_draft_block_ids(
@@ -3007,9 +2993,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     bs=bs, sampling_info=batch.sampling_info
                 )
 
-        grad_context = torch.no_grad if _is_tpu else torch.inference_mode
         with (
-            grad_context(),
+            current_platform.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
@@ -3227,10 +3212,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Penalties, logit bias and grammar stay logical: both apply in place, so a
         # prefix view writes through to the real rows. Must run before
         # prepare_spec_verify, which widens sampling_info and so len(sampling_info).
-        # Only TPU pads the verify outputs; elsewhere the rows are already logical.
+        # Only a batch-bucketing policy pads the verify outputs; elsewhere the
+        # rows are already logical.
         logical_logits = (
             logits_output.next_token_logits[: bs * block_size]
-            if _is_tpu
+            if self._pads_to_batch_buckets
             else logits_output.next_token_logits
         )
         if sampling_info is not None:

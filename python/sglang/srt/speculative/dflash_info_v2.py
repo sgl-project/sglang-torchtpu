@@ -191,7 +191,7 @@ class DFlashDraftInputV2(SpecInput):
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
-        if _is_tpu and batch.req_to_token_pool.host_resident:
+        if batch.req_to_token_pool.host_resident:
             # A step where no request needs a new slot would only pre-evict; the next
             # allocating step pre-evicts with the same per-request headroom.
             if num_needed_tokens > 0:
