@@ -162,9 +162,12 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any
 
 
 def engine_configuration_failures(
-    *, prefill_info: Mapping[str, Any], decode_info: Mapping[str, Any]
+    *,
+    prefill_info: Mapping[str, Any],
+    decode_info: Mapping[str, Any],
+    speculative_algorithm: str = "EAGLE3",
 ) -> list[str]:
-    """Reject a run that is not an EAGLE3 Raiden P/D pair offloading on both."""
+    """Reject a run that is not a speculative Raiden P/D pair offloading on both."""
     failures = []
     for label, info, expected_mode in (
         (PREFILL_ROLE, prefill_info, PREFILL_ROLE),
@@ -183,10 +186,10 @@ def engine_configuration_failures(
                 failures.append(
                     f"{label} reports {key}={info.get(key)!r}, expected {value!r}"
                 )
-        if str(info.get("speculative_algorithm", "")).upper() != "EAGLE3":
+        if str(info.get("speculative_algorithm", "")).upper() != speculative_algorithm:
             failures.append(
                 f"{label} reports speculative_algorithm="
-                f"{info.get('speculative_algorithm')!r}, expected 'EAGLE3'"
+                f"{info.get('speculative_algorithm')!r}, expected {speculative_algorithm!r}"
             )
     # Without decode radix cache the decode engine never offloads, and the
     # probe would only measure prefill.
@@ -527,9 +530,10 @@ def render_jobset_yaml(
     lane: str = "nightly",
     weights_pvc: str = "model-weights",
     run_name: str = RUN_NAME,
+    test_path: str = __file__,
 ) -> str:
     """Render one full prefill host plus one full decode host."""
-    rel_path = os.path.relpath(__file__, REPO)
+    rel_path = os.path.relpath(test_path, REPO)
     cmd = [
         PYTHON,
         RENDER_JOBSET,

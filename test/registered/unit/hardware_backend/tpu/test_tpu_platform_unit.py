@@ -295,6 +295,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             optimistic_prefill_attempts=0,
             max_queued_requests=None,
             enable_priority_scheduling=False,
+            disaggregation_enable_kv_checksum=False,
             dcp_size=1,
             attn_cp_size=1,
             enable_prefill_cp=False,
@@ -368,6 +369,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         ):
             with self.subTest(**overrides):
                 self._apply(self._args(**overrides))
+
+    def test_rejects_kv_checksum(self):
+        """The KV checksum is CUDA-only. On TPU the prefill passed its health
+        checks and then every rank died on the first real request (#1177)."""
+        for mode in ("prefill", "decode", "null"):
+            with self.subTest(mode=mode):
+                args = self._args(
+                    disaggregation_mode=mode,
+                    disaggregation_transfer_backend="raiden",
+                    disaggregation_enable_kv_checksum=True,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "--disaggregation-enable-kv-checksum is not supported on TPU",
+                ):
+                    self._apply(args)
+
+    def test_kv_checksum_off_allowed(self):
+        self._apply(
+            self._args(
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="raiden",
+                disaggregation_enable_kv_checksum=False,
+            )
+        )
 
     def test_defaults_applied(self):
         args = self._args(enable_torch_compile=False)
@@ -490,6 +516,33 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_dp_lm_head=False,
         )
         self._apply(args)
+
+    def test_shared_head_experimental_drafts_need_dp_lm_head_at_attn_tp_1(self):
+        """At attention TP 1 the target head shards over the full TP group, but these
+        drafts share it inside the attention-TP group: they would draft from one shard."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        for algorithm, enabled, error in (
+            ("DFLASH", True, True),
+            ("NEXTN", True, True),
+            ("EAGLE3", True, False),
+            ("DFLASH", False, False),
+        ):
+            args = self._args(
+                tp_size=8,
+                attn_dp_size=8,
+                enable_dp_lm_head=False,
+                speculative_algorithm=algorithm,
+            )
+            with (
+                self.subTest(algorithm=algorithm, enabled=enabled),
+                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+            ):
+                if error:
+                    with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+                        self._apply(args)
+                else:
+                    self._apply(args)
 
     def test_configures_export_mesh_from_tp_size(self):
         args = self._args(tp_size=16)
@@ -727,6 +780,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             optimistic_prefill_attempts=0,
             max_queued_requests=None,
             enable_priority_scheduling=False,
+            disaggregation_enable_kv_checksum=False,
             enable_hierarchical_cache=False,
             dcp_comm_backend="ag_rs",
             dcp_replicate_q_proj=False,

@@ -1002,7 +1002,7 @@ class UnifiedRadixCache(BasePrefixCache):
         node_id: NodeId,
         params: DecLockRefParams,
     ) -> None:
-        if self.disable:
+        if self.disable or self.session.try_dec_swa_lock_only(node_id):
             return
         result = self.tree_core.dec_swa_lock_only(node_id, params)
         self._free_values(result.device_frees, result.host_frees)

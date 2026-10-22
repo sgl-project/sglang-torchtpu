@@ -356,7 +356,7 @@ class TestExperimentalEagle3(CustomTestCase):
                 return_value=SimpleNamespace(buckets=[4]),
             ),
             patch(
-                "sglang_tpu.experimental.speculative.chain_spec_worker."
+                "sglang_tpu.experimental.speculative.base_spec_worker."
                 "warmup_compiled_op",
                 lambda op, *args: calls.append(args),
             ),
@@ -389,6 +389,7 @@ class TestExperimentalEagle3(CustomTestCase):
             return values
 
         worker._tp_sync = SimpleNamespace(sync=sync)
+        worker._dp_attention = False
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
                 sampler=sampler, model_config=SimpleNamespace(vocab_size=8)
@@ -500,35 +501,6 @@ class TestExperimentalEagle3(CustomTestCase):
             [[2.0, 3.0], [-1.0, -1.0], [6.0, 7.0], [8.0, 9.0], [-2.0, -2.0]],
         )
 
-    def test_idle_dp_rank_mirrors_the_whole_chain_step(self):
-        """An idle DP rank runs the active step's forwards in order (draft chain,
-        verify, commit's draft rows) with the greedy draft its peers sync."""
-        worker = _chain_worker()
-        worker.num_drafts = 2
-        calls = []
-        drafts = torch.zeros((4, 2), dtype=torch.int64)
-
-        def draft_chain(**kwargs):
-            calls.append(("draft", kwargs["temperatures"], kwargs["top_ks"]))
-            return SimpleNamespace(draft_tokens=drafts)
-
-        worker._draft_chain = draft_chain
-        worker._forward_idle_verify = lambda **kwargs: (
-            calls.append(("verify",)) or "out"
-        )
-        worker.commit = lambda *args: calls.append(("commit", args[4]))
-        worker._device_zeros = lambda rows: torch.zeros((rows,), dtype=torch.int64)
-        zeros = torch.zeros((4,), dtype=torch.int64)
-        verify_input = SimpleNamespace(
-            req_pool_indices_cpu=zeros,
-            padded_kv_lens_after_rows=lambda rows: (zeros, 0),
-        )
-        state = SpecState(bonus_tokens=zeros, seq_lens=zeros, req_pool_indices=zeros)
-        worker._forward_idle_step(
-            batch=None, state=state, rows=None, verify_input=verify_input
-        )
-        self.assertEqual(calls, [("draft", None, None), ("verify",), ("commit", "out")])
-
     def test_dp_attention_drafts_greedy(self):
         """Under DP attention the draft never samples: peers and idle ranks must
         issue the same draft sync, and sampled requests take target-only accept."""
@@ -547,6 +519,57 @@ class TestExperimentalEagle3(CustomTestCase):
             worker.draft(None, bucket, None, verify_input)
         self.assertIs(seen[0], bucket.temperatures)
         self.assertIsNone(seen[1])
+
+    def _fused_drafter(self, fused_draft):
+        drafter = object.__new__(TpuEagle3DraftWorker)
+        calls = []
+        shim = SimpleNamespace(wait_for_hicache_reload=lambda: calls.append("wait"))
+        drafter._compile_policy = lambda: SimpleNamespace(compiled_forward_shim=shim)
+        drafter.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda batch: None)
+        )
+        drafter._carry_table = torch.zeros((1, 1))
+        drafter._fused_draft = lambda *args: fused_draft(calls)
+        return drafter, calls
+
+    @staticmethod
+    def _run_fused(drafter):
+        drafter.run_fused_draft(
+            SimpleNamespace(mark_forward_metadata_ready=lambda: None),
+            req_pool_indices=None,
+            positions=None,
+            cache_locs=None,
+            seq_lens=None,
+            temperatures=None,
+            top_ks=None,
+            uniforms=None,
+        )
+
+    def test_fused_draft_runs_as_a_decode_program(self):
+        """The fused draft guards on is_extend_in_batch; a stale True from the last
+        extend under DP attention would recompile it under fail_on_recompile."""
+        from sglang.srt.layers.dp_attention import (
+            get_is_extend_in_batch,
+            set_is_extend_in_batch,
+        )
+
+        seen = []
+        drafter, _ = self._fused_drafter(
+            lambda calls: seen.append(get_is_extend_in_batch()) or ("d", None)
+        )
+        set_is_extend_in_batch(True)
+        self._run_fused(drafter)
+        self.assertEqual(seen, [False])
+
+    def test_fused_draft_waits_for_the_hicache_reload_first(self):
+        """The fused draft program inlines the forward shim, whose HiCache reload gate
+        only runs eagerly; without the eager wait a PD decode drafts on draft KV
+        a host reload has not landed yet."""
+        drafter, calls = self._fused_drafter(
+            lambda calls: calls.append("draft") or ("d", None)
+        )
+        self._run_fused(drafter)
+        self.assertEqual(calls, ["wait", "draft"])
 
 
 if __name__ == "__main__":

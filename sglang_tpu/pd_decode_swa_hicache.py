@@ -8,13 +8,16 @@ to host RAM:
   and prefill sends each request's SWA window fresh.
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
-- A request that reuses pages of an unfinished RAM restore waits for it.
-- With EAGLE3, or DFlash/DSpark on the experimental worker, the draft KV goes
-  to RAM together with the full-attention KV.
+- With a draft (EAGLE3, DFlash, or DSpark on the experimental worker), the draft
+  KV goes to RAM together with the full-attention KV.
+
+For every raiden PD decode prefix cache, sliding-window or not, a request that
+reuses pages of an unfinished RAM restore waits for it. Restores that load only
+auxiliary state (no KV pages) are not tracked.
 
 ``install()`` wraps a few upstream functions and registers a host stack
-strategy. Each behaves exactly like upstream unless the decode cache is one of
-these full-only caches.
+strategy. Except for the restore hold, each behaves exactly like upstream unless
+the decode cache is one of these full-only caches.
 """
 
 from __future__ import annotations
@@ -54,8 +57,6 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang_tpu.experimental import is_experimental_spec_worker
 from sglang_tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
@@ -66,13 +67,16 @@ logger = logging.getLogger(__name__)
 _is_installed = False
 # Decode caches with a full-only host pool, added by the host stack builder.
 _full_only_host_caches: weakref.WeakSet[UnifiedRadixCache] = weakref.WeakSet()
+# Raiden PD decode prefix caches whose requests wait for unfinished restores.
+_restore_gated_caches: weakref.WeakSet[UnifiedRadixCache] = weakref.WeakSet()
 # Owned by _build_kv_cache for the duration of one cache build. While set, the
 # tree cache factory enables HiCache and _FullOnlySwaStrategy matches.
 _is_building_full_only_host_cache = False
 # The draft HiCache plan of that build, None without speculative decoding.
 _building_draft_plan: Optional[HiCacheDraftPlan] = None
-# Device pages of each full KV load a full-only controller issued, by anchor
-# node id. An entry is in flight while the anchor is in ongoing_load_back.
+# Device pages of each full KV load a restore-gated cache's controller issued,
+# by anchor node id. An entry is in flight while the anchor is in
+# ongoing_load_back.
 _load_device_pages: weakref.WeakKeyDictionary[Any, dict[int, torch.Tensor]] = (
     weakref.WeakKeyDictionary()
 )
@@ -126,7 +130,7 @@ def _should_use_full_only_host_cache(
 def _validate_full_only_host_cache_config(
     *,
     page_size: int,
-    spec_algorithm: SpeculativeAlgorithm,
+    spec_algorithm: Any,
     hicache_draft_plan: Optional[HiCacheDraftPlan],
 ) -> None:
     """Raise for settings the full-only cache does not support."""
@@ -145,25 +149,25 @@ def _validate_full_only_host_cache_config(
             "--hicache-storage-backend (L3) restores are not supported",
         ),
         (page_size > 1, "--page-size must be > 1 for the page-aligned SWA tail"),
-        # Block-draft KV at i reads only tokens up to i and is written for every
-        # committed token, so unigram keys fit; core's DFlash worker is untested.
         (
-            spec_algorithm.is_none()
-            or spec_algorithm.is_eagle3()
-            or is_experimental_spec_worker(spec_algorithm),
-            "speculative decoding supports only EAGLE3, or DFLASH/DSPARK with "
-            "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1",
+            spec_algorithm.supports_pd_decode_swa_hicache(),
+            f"speculative algorithm {spec_algorithm.name} is not supported in this mode",
         ),
-        # Draft KV reaches RAM only through upstream's draft sidecar pool. A
-        # packed draft lives inside the full KV pool, which this build does
-        # not lay out for.
+        # EAGLE3 and DFlash-family draft KV reaches RAM through upstream's draft sidecar pool.
         (
-            spec_algorithm.is_none()
+            not (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash_family())
             or (
                 hicache_draft_plan is not None
                 and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
             ),
-            "draft KV must use the HiCache draft sidecar",
+            "EAGLE3, DFlash and DSpark draft KV must use the HiCache draft sidecar",
+        ),
+        # A packed draft lives inside the full KV pool, which this build does
+        # not lay out for.
+        (
+            hicache_draft_plan is None
+            or hicache_draft_plan.mode != HiCacheDraftMode.PACKED,
+            "A packed draft KV pool is not supported",
         ),
         # Upstream auto-sizes the host pool for it, and so would this build.
         (
@@ -185,7 +189,7 @@ def _build_kv_cache(
     enable_hierarchical_cache: bool,
     tp_worker: Any,
     page_size: int,
-    spec_algorithm: SpeculativeAlgorithm,
+    spec_algorithm: Any,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     **other_kwargs,
 ):
@@ -224,9 +228,12 @@ def _build_kv_cache(
 
 
 def _create_tree_cache(upstream: Callable, ctx: TreeCacheBuildContext):
-    """Wraps ``create_tree_cache``: turn HiCache back on, draft KV included."""
+    """Wraps ``create_tree_cache``: turn HiCache back on for a full-only build,
+    draft KV included, and register raiden PD decode caches for the restore hold."""
     if not _is_building_full_only_host_cache:
-        return upstream(ctx)
+        cache = upstream(ctx)
+        _gate_decode_restores(cache)
+        return cache
     draft_plan = _building_draft_plan
     # The match policy below is implemented for the Python tree core only.
     # Upstream defaults to the Rust core, which the registry resolves back to
@@ -326,6 +333,7 @@ def _build_full_only_host_stack(
         host_memory_mode=memory.hicache_host_memory_mode,
     )
     _full_only_host_caches.add(cache)
+    _restore_gated_caches.add(cache)
     _load_device_pages[cache_controller] = {}
     return hybrid_pool_assembler.StackBuildResult(
         host_pool_group=host_pool_group,
@@ -536,6 +544,19 @@ def _commit_hicache_local_restore_to_req(
     req.swa_prefix_lock_released = True
 
 
+def _gate_decode_restores(cache: Any) -> None:
+    """Register a raiden PD decode prefix cache for the restore hold."""
+    disagg = get_disagg()
+    if (
+        disagg.disaggregation_mode == "decode"
+        and disagg.disaggregation_decode_enable_radix_cache
+        and isinstance(cache, UnifiedRadixCache)
+        and isinstance(cache.cache_controller, TpuRaidenHybridCacheController)
+    ):
+        _restore_gated_caches.add(cache)
+        _load_device_pages[cache.cache_controller] = {}
+
+
 def _controller_load(
     upstream: Callable,
     controller: TpuRaidenHybridCacheController,
@@ -553,7 +574,8 @@ def _controller_load(
         extra_pools=extra_pools,
     )
     loads = _load_device_pages.get(controller)
-    if loads is not None and device_indices is not None:
+    # An auxiliary-only restore (e.g. Mamba state) fills no KV pages.
+    if loads is not None and device_indices is not None and device_indices.numel():
         loads[node_id] = _page_ids(device_indices, controller.page_size)
     return device_indices
 
@@ -604,7 +626,7 @@ def _process_hicache_local_restores(
     reuses them looks ready to upstream, so it is held until the restore is acked.
     """
     upstream(queue, decode_reqs)
-    if not uses_full_only_host_cache(queue.tree_cache):
+    if queue.tree_cache not in _restore_gated_caches:
         return
     inflight_mask = _inflight_page_mask(queue.tree_cache)
     if inflight_mask is None:

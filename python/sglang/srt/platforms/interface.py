@@ -162,6 +162,14 @@ class SRTPlatform(DeviceMixin):
         """
         return "inductor"
 
+    def get_batch_input_device(self, batch) -> Optional[str]:
+        """Placement of host-created forward inputs before backend preparation.
+
+        None preserves each caller's normal device. Scheduler state and
+        device-produced tokens keep their own devices.
+        """
+        return None
+
     def supports_torch_compile(self) -> bool:
         """Whether this platform consumes annotation-driven compile policies."""
         return False
@@ -213,6 +221,13 @@ class SRTPlatform(DeviceMixin):
         self, algorithm: str, backend: str
     ) -> bool:
         """Whether this platform supports a draft backend for an algorithm."""
+        return False
+
+    def supports_speculative_dp_attention(self, algorithm: str) -> bool:
+        """Whether this platform serves the named speculative algorithm under DP attention.
+
+        Consulted only where core rejects an algorithm with DP attention by default.
+        """
         return False
 
     def support_cuda_graph(self) -> bool:

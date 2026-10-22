@@ -903,7 +903,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
             self._seed_dummy_req_to_token(forward_batch)
             if is_dp_attention_enabled():
-                self._set_dp_attention_metadata(
+                self.set_dp_attention_metadata(
                     forward_batch,
                     bs * self.speculative_eagle_topk,
                     bs,

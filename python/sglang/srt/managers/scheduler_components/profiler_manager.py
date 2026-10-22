@@ -414,6 +414,8 @@ class SchedulerProfilerManager:
         if self.tpu_profiler is not None:
             from sglang_tpu.profiler import stop_tpu_profile
 
+            if stage is not None:
+                current_platform.synchronize()
             stop_tpu_profile(self.tpu_profiler)
             self.tpu_profiler = None
 

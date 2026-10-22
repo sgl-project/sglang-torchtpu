@@ -21,6 +21,7 @@ from torch._dynamo.utils import dynamo_timed
 from torch.nn.utils.stateless import _reparametrize_module
 from torch_tpu._internal import execution_mode, sync
 from torch_tpu._internal.compile import tpu_torch_compile
+from torch_tpu._internal.sync.sync import synchronize
 
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -341,7 +342,28 @@ class CompiledFunction:
     def precompile(
         self, *args: Any, async_compile: bool = False, **kwargs: Any
     ) -> PendingCall:
-        """Compile without executing the helper or retaining example inputs."""
+        """Compile without executing; shared input binding completes at queue join."""
+        queue = current_warmup_queue() if self._spmd_safe else None
+        shared = queue is not None and queue.spmd_compiler is not None
+        # Shared compilation validates real input layouts on every rank.
+        if async_compile and not shared:
+            tensors = [
+                value
+                for value in tree_util.tree_leaves((args, kwargs))
+                if _is_tpu_tensor(value)
+            ]
+            if tensors:
+                # Submit eager input preparation without waiting for buffers.
+                # Symbolic arguments keep layout queries from blocking compilation.
+                synchronize(tensors, wait=False)
+                args, kwargs = tree_util.tree_map(
+                    lambda value: (
+                        tpu_torch_compile.placeholder_like(value)
+                        if _is_tpu_tensor(value)
+                        else value
+                    ),
+                    (args, kwargs),
+                )
         artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
         return PendingCall(artifact.wait_for_compile)
 

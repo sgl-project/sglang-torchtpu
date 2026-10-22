@@ -27,6 +27,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import sampler as tpu_sampler_module
 from sglang_tpu import top_k as tpu_top_k_module
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.row_pad import pad_rows, row_bucket
 from sglang_tpu.sampler import (
     TpuSampler,
@@ -537,7 +538,7 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                     return weights.argmax(-1).to(torch.int32)
 
                 with (
-                    envs.SGLANG_TPU_HOST_PADDING.override(True),
+                    tpu_envs.SGLANG_TPU_HOST_PADDING.override(True),
                     patch("sglang_tpu.top_k.tpu_top_k", side_effect=torch.topk),
                     patch.object(
                         tpu_sampler_module, "sampling_from_probs_torch", sample
@@ -1310,7 +1311,7 @@ class TestHostSamplingWarmupCoverage(CustomTestCase):
 
         sampler = object.__new__(TpuSampler)
         with (
-            envs.SGLANG_TPU_HOST_PADDING.override(True),
+            tpu_envs.SGLANG_TPU_HOST_PADDING.override(True),
             patch.object(tpu_sampler_module, "_use_bsearch_filtering", lambda _: True),
             patch.object(tpu_top_k_module, "tpu_top_k", fake_top_k),
             patch.object(sampling_mask_module, "tpu_filter_probs", fake_filter),

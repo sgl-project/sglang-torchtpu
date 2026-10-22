@@ -264,9 +264,18 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         }
 
     def _run_and_compare(
-        self, inputs, *, distribution, tolerance=None, **kernel_kwargs
+        self,
+        inputs,
+        *,
+        distribution,
+        tolerance=None,
+        check_live_cache=False,
+        **kernel_kwargs,
     ):
-        """Run kernel + reference with matching kwargs and assert close."""
+        """Run kernel + reference with matching kwargs and assert close.
+
+        ``check_live_cache`` also asserts every live K/V slot after the call.
+        """
         import jax.numpy as jnp
 
         from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
@@ -320,7 +329,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             **kernel_kwargs,
             **scale_kwargs,
         )
-        if "decode_query_size" in kernel_kwargs:
+        if check_live_cache or "decode_query_size" in kernel_kwargs:
             self._assert_live_cache_matches_reference(inputs, updated_cache)
         kernel_out = kernel_out[: inputs["total_q_tokens"]]
 
@@ -644,6 +653,44 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         self.TOTAL_NUM_PAGES = self.PAGES_PER_SEQ
         inputs = self._build_inputs([(kv_len, 8)])
         self._run_and_compare(inputs, distribution=(0, 0, 1), sliding_window=32)
+
+    # Each query block's KV loop starts at its window, so the last query block
+    # of a long sliding-window prefill never visits the first KV blocks. Their
+    # new tokens must still reach the cache: a later prefix-cache hit inside
+    # this prompt reads the window before the hit from there.
+
+    def test_extend_sliding_window_writes_all_new_kv(self):
+        """The last query block's window starts one 128-key block in."""
+        self.PAGES_PER_SEQ = 17
+        self.TOTAL_NUM_PAGES = 17
+        inputs = self._build_inputs(
+            [(256, 256)], num_q_heads=8, num_kv_heads=2, noncontiguous_pages=True
+        )
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            sliding_window=40,
+            m_block_sizes=(32, 128, 32, 32),
+            check_live_cache=True,
+        )
+
+    def test_extend_sliding_window_writes_all_new_kv_prefix_multi_seq(self):
+        """A cached prefix and a second sequence, several blocks per window."""
+        self.PAGES_PER_SEQ = 21
+        self.TOTAL_NUM_PAGES = 42
+        inputs = self._build_inputs(
+            [(320, 192), (200, 200)],
+            num_q_heads=8,
+            num_kv_heads=2,
+            noncontiguous_pages=True,
+        )
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 2),
+            sliding_window=48,
+            m_block_sizes=(32, 64, 32, 32),
+            check_live_cache=True,
+        )
 
     def test_decode_soft_cap(self):
         """soft_cap rescales logits with tanh before softmax. Verifies the

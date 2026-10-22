@@ -4,7 +4,8 @@ Decode backs up and restores full-attention KV through host RAM, and the SWA
 window always comes from the prefill transfer. Each wrapper is called with the
 real upstream function (or a fake where upstream needs a full server), so the
 tests pin both the full-only behavior and the pass-through to upstream for
-every other cache. Two tests drive a real unified tree: its host stack attach
+every other cache, except the restore hold, which every raiden PD decode cache
+gets. Two tests drive a real unified tree: its host stack attach
 and its locks.
 """
 
@@ -57,9 +58,10 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_swa_hicache as tpu
-from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.raiden_hybrid_cache_controller import TpuRaidenHybridCacheController
 
 ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
 BUILDER = "sglang.srt.mem_cache.kv_cache_builder"
@@ -83,7 +85,9 @@ def installed_patches():
 
 
 def mark_full_only(cache):
+    # As the full-only host stack builder does.
     tpu._full_only_host_caches.add(cache)
+    tpu._restore_gated_caches.add(cache)
 
 
 def swa_receipt(*, node_id, swa_uuid):
@@ -188,6 +192,26 @@ def make_ctx():
     )
 
 
+def spec(*, eagle3=False, dflash=False, none=False):
+    if none:
+        return SpeculativeAlgorithm.NONE
+    if eagle3:
+        return SpeculativeAlgorithm.EAGLE3
+    if dflash:
+        return SpeculativeAlgorithm.DFLASH
+    return SpeculativeAlgorithm.EAGLE
+
+
+class _OptedInSpec(CustomSpecAlgo):
+    def supports_pd_decode_swa_hicache(self) -> bool:
+        return True
+
+
+def plugin_spec(*, opted_in):
+    cls = _OptedInSpec if opted_in else CustomSpecAlgo
+    return cls("PLUGIN", factory=MagicMock())
+
+
 def real_swa_cache(*, is_eagle=False):
     """A real FULL + SWA unified tree over mocked pools, without HiCache."""
     allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
@@ -217,7 +241,7 @@ def build_kwargs(**overrides):
         enable_hierarchical_cache=True,
         tp_worker=SimpleNamespace(is_hybrid_swa=True),
         page_size=64,
-        spec_algorithm=SpeculativeAlgorithm.NONE,
+        spec_algorithm=spec(none=True),
         hicache_draft_plan=None,
     )
     kwargs.update(overrides)
@@ -292,9 +316,14 @@ class TestCacheConstruction(CustomTestCase):
             upstream.assert_called_once_with(ctx)
             auto_size.assert_called_once()
 
-    def test_eagle3_draft_plan_is_sized_and_registered_as_a_sidecar(self):
+    def test_draft_plan_is_sized_and_registered_as_a_sidecar(self):
         # Upstream registers the draft sidecar only with the flag on, which
         # this build turns off to pass the SWA guard.
+        for algorithm in (spec(eagle3=True), spec(dflash=True)):
+            with self.subTest(algorithm=algorithm):
+                self._check_draft_sidecar(algorithm)
+
+    def _check_draft_sidecar(self, algorithm):
         ctx = make_ctx()
         cache = MagicMock()
         draft_plan = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
@@ -312,50 +341,11 @@ class TestCacheConstruction(CustomTestCase):
         ):
             tpu._build_kv_cache(
                 upstream_build,
-                **build_kwargs(
-                    spec_algorithm=SpeculativeAlgorithm.EAGLE3,
-                    hicache_draft_plan=draft_plan,
-                ),
+                **build_kwargs(spec_algorithm=algorithm, hicache_draft_plan=draft_plan),
             )
         auto_size.assert_called_once_with(ctx.params, draft_plan, enabled=True)
         register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
         self.assertIsNone(tpu._building_draft_plan)
-
-    def test_block_drafts_need_the_experimental_worker_and_a_sidecar(self):
-        # The experimental block worker keeps draft KV for every cached token;
-        # core's DFlash worker is not validated with this cache.
-        sidecar = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
-        packed = SimpleNamespace(mode=HiCacheDraftMode.PACKED)
-        for algorithm, experimental, draft_plan, error in (
-            (SpeculativeAlgorithm.DFLASH, True, sidecar, None),
-            (SpeculativeAlgorithm.DSPARK, True, sidecar, None),
-            (SpeculativeAlgorithm.DFLASH, False, sidecar, "EXPERIMENTAL_SPEC_WORKER"),
-            (SpeculativeAlgorithm.DSPARK, False, sidecar, "EXPERIMENTAL_SPEC_WORKER"),
-            (SpeculativeAlgorithm.DFLASH, True, None, "sidecar"),
-            (SpeculativeAlgorithm.DSPARK, True, packed, "sidecar"),
-        ):
-            with (
-                self.subTest(f"{algorithm.name} {experimental=} {draft_plan=}"),
-                patch(TPU + ".get_disagg", return_value=disagg()),
-                patch(TPU + ".get_memory", return_value=memory()),
-                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(
-                    experimental
-                ),
-                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
-            ):
-                upstream = MagicMock()
-                kwargs = build_kwargs(
-                    spec_algorithm=algorithm, hicache_draft_plan=draft_plan
-                )
-                if error is not None:
-                    with self.assertRaisesRegex(ValueError, error):
-                        tpu._build_kv_cache(upstream, **kwargs)
-                    upstream.assert_not_called()
-                    continue
-                tpu._build_kv_cache(upstream, **kwargs)
-                call = upstream.call_args.kwargs
-                self.assertFalse(call["enable_hierarchical_cache"])
-                self.assertIs(call["hicache_draft_plan"], sidecar)
 
     def test_full_only_build_requires_the_full_only_stack(self):
         # E.g. a cache type the SWA host strategy does not build.
@@ -386,28 +376,73 @@ class TestCacheConstruction(CustomTestCase):
             tpu._build_kv_cache(upstream_build, **build_kwargs())
         self.assertFalse(tpu._is_building_full_only_host_cache)
 
+    def test_builtin_algorithms_accepted(self):
+        accepted = {
+            algo
+            for algo in SpeculativeAlgorithm
+            if algo.supports_pd_decode_swa_hicache()
+        }
+        self.assertEqual(
+            accepted,
+            {
+                SpeculativeAlgorithm.NONE,
+                SpeculativeAlgorithm.EAGLE3,
+                SpeculativeAlgorithm.DFLASH,
+            },
+        )
+
+    def test_opted_in_plugin_algorithm_builds(self):
+        cache = MagicMock()
+
+        def upstream_build(**kwargs):
+            mark_full_only(cache)
+            return tpu._create_tree_cache(lambda ctx: cache, make_ctx())
+
+        with (
+            patch(TPU + ".get_disagg", return_value=disagg()),
+            patch(TPU + ".get_memory", return_value=memory()),
+            patch(TPU + ".auto_size_hicache"),
+        ):
+            built = tpu._build_kv_cache(
+                upstream_build,
+                **build_kwargs(spec_algorithm=plugin_spec(opted_in=True)),
+            )
+        self.assertIs(built, cache)
+
     def test_unsupported_configs_are_rejected(self):
         for overrides, mem, dis, tree_core, reason in (
             ({"page_size": 1}, {}, {}, "python", "page-size"),
-            # NGRAM and the other drafts are not validated in this mode.
+            # MTP and the other drafts are not validated in this mode.
             (
-                {"spec_algorithm": SpeculativeAlgorithm.NGRAM},
+                {"spec_algorithm": spec()},
                 {},
                 {},
                 "python",
-                "supports only EAGLE3",
+                "speculative algorithm .* is not supported",
             ),
-            # EAGLE3 draft KV reaches RAM only as upstream's draft sidecar.
             (
-                {"spec_algorithm": SpeculativeAlgorithm.EAGLE3},
+                {"spec_algorithm": plugin_spec(opted_in=False)},
                 {},
                 {},
                 "python",
-                "sidecar",
+                "speculative algorithm .* is not supported",
             ),
             (
                 {
-                    "spec_algorithm": SpeculativeAlgorithm.EAGLE3,
+                    "spec_algorithm": plugin_spec(opted_in=True),
+                    "hicache_draft_plan": SimpleNamespace(mode=HiCacheDraftMode.PACKED),
+                },
+                {},
+                {},
+                "python",
+                "packed",
+            ),
+            # Draft KV reaches RAM only as upstream's draft sidecar.
+            ({"spec_algorithm": spec(eagle3=True)}, {}, {}, "python", "sidecar"),
+            ({"spec_algorithm": spec(dflash=True)}, {}, {}, "python", "sidecar"),
+            (
+                {
+                    "spec_algorithm": spec(eagle3=True),
                     "hicache_draft_plan": SimpleNamespace(mode=HiCacheDraftMode.PACKED),
                 },
                 {},
@@ -767,6 +802,76 @@ class TestInflightLoadGate(CustomTestCase):
             upstream, other_controller, host_indices=torch.arange(64), node_id=4
         )
         self.assertNotIn(other_controller, tpu._load_device_pages)
+
+
+class TestDenseRestoreGate(CustomTestCase):
+    """Non-SWA models share the hazard: a restore publishes pages before they land."""
+
+    def dense_cache(self, controller_spec=TpuRaidenHybridCacheController):
+        cache = MagicMock(spec=UnifiedRadixCache)
+        cache.cache_controller = MagicMock(spec=controller_spec)
+        cache.cache_controller.page_size = 64
+        cache.page_size = 64
+        cache.ongoing_load_back = {}
+        return cache
+
+    def build(self, cache, **disagg_overrides):
+        with patch(TPU + ".get_disagg", return_value=disagg(**disagg_overrides)):
+            self.assertIs(
+                tpu._create_tree_cache(MagicMock(return_value=cache), make_ctx()),
+                cache,
+            )
+
+    def test_reuser_of_a_dense_restore_waits_for_the_ack(self):
+        cache = self.dense_cache()
+        self.build(cache)
+        queue = DecodeHiCacheTransferMixin()
+        queue.tree_cache = cache
+        tpu._controller_load(
+            MagicMock(return_value=torch.arange(64, 320)),
+            cache.cache_controller,
+            host_indices=torch.arange(256),
+            node_id=3,
+        )
+        cache.ongoing_load_back[3] = object()
+        reuser = TestInflightLoadGate.request(torch.arange(320))
+
+        def process():
+            tpu._process_hicache_local_restores(
+                DecodeHiCacheTransferMixin._process_hicache_local_restores,
+                queue,
+                [reuser],
+            )
+            return reuser.hicache_restore_status
+
+        self.assertEqual(process(), HiCacheRestoreResult.PENDING)
+        del cache.ongoing_load_back[3]
+        self.assertEqual(process(), HiCacheRestoreResult.READY)
+
+    def test_auxiliary_only_restore_is_not_tracked(self):
+        # A Mamba-state restore returns no KV pages; tracking it must not
+        # break the in-flight page mask for other requests.
+        cache = self.dense_cache()
+        self.build(cache)
+        tpu._controller_load(
+            MagicMock(return_value=torch.empty(0, dtype=torch.int64)),
+            cache.cache_controller,
+            host_indices=torch.empty(0, dtype=torch.int64),
+            node_id=4,
+        )
+        cache.ongoing_load_back[4] = object()
+        self.assertIsNone(tpu._inflight_page_mask(cache))
+
+    def test_only_raiden_decode_prefix_caches_are_gated(self):
+        for name, cache, overrides in (
+            ("prefill", self.dense_cache(), dict(mode="prefill")),
+            ("decode radix off", self.dense_cache(), dict(decode_radix=False)),
+            ("other controller", self.dense_cache(HybridCacheController), {}),
+        ):
+            with self.subTest(name):
+                self.build(cache, **overrides)
+                self.assertNotIn(cache, tpu._restore_gated_caches)
+                self.assertNotIn(cache.cache_controller, tpu._load_device_pages)
 
 
 class TestSwaMatchValidator(CustomTestCase):

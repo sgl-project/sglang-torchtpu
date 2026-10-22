@@ -752,14 +752,16 @@ class RaidenKVManager(
     def _log_settled_transfers(
         self, *, sent: Iterable[str], received: Iterable[str]
     ) -> None:
+        # Per-transfer, per-rank lines are DEBUG: at INFO they dominate server
+        # logs (several lines per request on every rank). Failures stay ERROR.
         for rid in sent:
-            logger.info(
+            logger.debug(
                 "RaidenKVManager rank%d prefill read served | req_id=%s",
                 self.attn_tp_rank,
                 rid,
             )
         for rid in received:
-            logger.info(
+            logger.debug(
                 "RaidenKVManager rank%d decode pull done | req_id=%s",
                 self.attn_tp_rank,
                 rid,
