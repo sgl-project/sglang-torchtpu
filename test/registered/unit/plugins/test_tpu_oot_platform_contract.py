@@ -211,9 +211,13 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             f"unknown algorithms claimed: {sorted(_SUPPORTED_SPEC_ALGORITHMS - known)}",
         )
 
-    def test_dspark_is_deliberately_not_claimed(self):
-        """DSPARK is in flight; delete this test when it is tested on TPU."""
-        self.assertFalse(self.platform.supports_speculative_algorithm("DSPARK"))
+    def test_dspark_is_claimed_only_with_experimental_spec_worker(self):
+        """DSPARK is served by TpuBlockSpecWorker when the experimental spec worker is enabled."""
+        from sglang_tpu.envs import envs
+
+        self.assertTrue(self.platform.supports_speculative_algorithm("DSPARK"))
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            self.assertFalse(self.platform.supports_speculative_algorithm("DSPARK"))
 
     def test_claimed_draft_backends_are_registered(self):
         from sglang_tpu.platform import _SUPPORTED_DRAFT_ATTENTION_BACKENDS

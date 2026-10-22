@@ -1,7 +1,8 @@
 # Experimental TPU spec worker
 
 Every algorithm is written as draft -> verify -> commit over static, bucketed
-shapes. Enable it with `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`. It requires
+shapes. It is enabled by default (set `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0`
+to fall back to core's spec workers). It requires
 overlap scheduling (except on a P/D prefill). For an example launch config, see
 `benchmark/tpu/recipe/configs/qwen3_8_27b/mtp_gate.py`.
 
