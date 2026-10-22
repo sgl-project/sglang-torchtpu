@@ -137,6 +137,11 @@ Both raiden roles serve every algorithm with the same spec flags.
   stages relay the EAGLE3 / DFlash aux captures to the last one (`../../pp_wave.py`),
   and PP runs without overlap, which a prefill-only server allows.
   `test_tpu_gpt_oss_120b_pd_singlehost_pp_spec_perf.py` runs PP8 EAGLE3 and DFlash.
+- Decode radix + HiCache on a sliding-window target (`../../pd_decode_swa_hicache.py`):
+  EAGLE3, DFlash and DSpark keep their draft KV in the HiCache draft sidecar.
+  Block drafts use unigram radix keys, since their context KV at a position reads
+  only tokens up to it. `test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_dflash.py`
+  is the DFlash gate.
 - KV free fence: commit writes draft KV after the accept outputs the result
   copies, so commit and extend return an output of their last KV write as
   `kv_fence_tail` (MTP's draft hidden, EAGLE3's seed token, the block KV
