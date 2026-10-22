@@ -48,6 +48,8 @@ from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -346,6 +348,32 @@ class TpuSpecWorker(BaseSpecWorker):
             zeros(padded_bs),
             torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
         )
+
+    @property
+    def retraction_draft_kv_pools(self) -> tuple[KVCache, ...]:
+        # Core backs up only EAGLE draft pools; without these, a request resumed
+        # on a PD decode server drafts over whatever KV its new slots hold.
+        pools = tuple(
+            runner.token_to_kv_pool for runner in self._draft_worker.draft_runners
+        )
+        disagg = get_disagg()
+        if (
+            disagg.disaggregation_mode == "decode"
+            and disagg.disaggregation_decode_retraction_backup == "cpu_tensor"
+        ):
+            unsupported = [
+                type(pool).__name__
+                for pool in pools
+                if not isinstance(pool, (MHATokenToKVPool, SWAKVPool))
+            ]
+            if unsupported:
+                raise NotImplementedError(
+                    f"TpuSpecWorker cannot back up draft KV pools {unsupported} "
+                    "to CPU on decode retraction; pass "
+                    "--disaggregation-decode-retraction-backup none to abort "
+                    "retracted requests instead."
+                )
+        return pools
 
     @abstractmethod
     def draft(

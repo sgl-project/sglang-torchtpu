@@ -147,6 +147,10 @@ Both raiden roles serve every algorithm with the same spec flags.
   it on host; core's builders stack it on device at the live bs, one compile per
   bs. MTP ships its carry as the EAGLE hidden seed, and decode writes it back
   into the carry table.
+- Decode retraction: a cpu_tensor backup carries the draft KV with the target
+  KV (`TpuSpecWorker.retraction_draft_kv_pools`); a draft pool without a CPU
+  copy raises at startup. On resume the MTP/EAGLE3 carry is reseeded from the
+  PD seed, as core EAGLE reseeds its hidden.
 - Hybrid GDN targets: raiden moves each request's committed GDN state row on a
   third engine next to the KV, and the decode seed resets the slot's
   checkpoint read offset.

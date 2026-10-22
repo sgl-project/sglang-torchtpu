@@ -1022,6 +1022,86 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(carry[3].tolist(), [1.0, 1.0])
         self.assertEqual(carry[0].tolist(), [0.0, 0.0])
 
+    def _retraction_worker(self, draft_pool, *, mode="decode", backup="cpu_tensor"):
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._draft_worker = SimpleNamespace(
+            draft_runners=(SimpleNamespace(token_to_kv_pool=draft_pool),)
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode=mode, disaggregation_decode_retraction_backup=backup
+        )
+        get_disagg = patch(
+            "sglang_tpu.experimental.speculative.base_spec_worker.get_disagg",
+            return_value=disagg,
+        )
+        return worker, get_disagg
+
+    def test_cpu_retraction_restores_draft_kv_at_resumed_slots(self):
+        """A PD decode request retracted with a CPU backup must resume with its
+        own draft KV, not whatever its newly allocated slots hold."""
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        draft_pool = MHATokenToKVPool(
+            size=16,
+            page_size=1,
+            dtype=torch.float32,
+            head_num=1,
+            head_dim=2,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+        )
+        old_slots, new_slots = torch.tensor([3, 4, 5]), torch.tensor([9, 10, 11])
+        draft_pool.k_buffer[0][old_slots] = 7.0
+        draft_pool.v_buffer[0][old_slots] = 8.0
+        req_to_token = torch.zeros((4, 8), dtype=torch.int64)
+        req_to_token[1, :3] = old_slots
+        req_to_token[2, :3] = new_slots
+        req = object.__new__(Req)
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = [4]
+        req.kv = SimpleNamespace(req_pool_idx=1, mamba_pool_idx=None, holds_mamba=False)
+        target_allocator = MagicMock()
+        target_allocator.get_kvcache.return_value.cpu_copy_carries_mamba = True
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+
+        worker, get_disagg = self._retraction_worker(draft_pool)
+        with get_disagg:
+            draft_kv_pools = worker.retraction_draft_kv_pools
+        req.offload_kv_cache(
+            req_to_token_pool, target_allocator, draft_kv_pools=draft_kv_pools
+        )
+        # Resume lands on another req pool row whose slots held other KV.
+        req.kv.req_pool_idx = 2
+        draft_pool.k_buffer[0][new_slots] = -1.0
+        draft_pool.v_buffer[0][new_slots] = -1.0
+        req.load_kv_cache(req_to_token_pool, target_allocator)
+        self.assertTrue(bool((draft_pool.k_buffer[0][new_slots] == 7.0).all()))
+        self.assertTrue(bool((draft_pool.v_buffer[0][new_slots] == 8.0).all()))
+
+    def test_unbackable_draft_pool_refuses_cpu_retraction_at_startup(self):
+        """A draft pool without a CPU copy must fail when the scheduler reads the
+        pools at startup, not resume requests over stale draft KV."""
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        mla_pool = object.__new__(MLATokenToKVPool)
+        worker, get_disagg = self._retraction_worker(mla_pool)
+        with get_disagg, self.assertRaisesRegex(NotImplementedError, "draft KV"):
+            worker.retraction_draft_kv_pools
+        # No CPU backup is taken off a decode server or with another backend.
+        for mode, backup in (("prefill", "cpu_tensor"), ("decode", "none")):
+            worker, get_disagg = self._retraction_worker(
+                mla_pool, mode=mode, backup=backup
+            )
+            with get_disagg:
+                self.assertEqual(worker.retraction_draft_kv_pools, (mla_pool,))
+
     def test_per_batch_checks_refuse_only_unsupported_requests(self):
         """Filtered sampling needs the sort-free filter (the sort-based target
         keeps different boundary ties), but greedy rows (top_k = 1) do not; custom

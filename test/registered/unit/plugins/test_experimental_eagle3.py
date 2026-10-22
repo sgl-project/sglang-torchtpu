@@ -520,28 +520,20 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertIs(seen[0], bucket.temperatures)
         self.assertIsNone(seen[1])
 
-    def test_fused_draft_runs_as_a_decode_program(self):
-        """The fused draft guards on is_extend_in_batch; a stale True from the last
-        extend under DP attention would recompile it under fail_on_recompile."""
-        from sglang.srt.layers.dp_attention import (
-            get_is_extend_in_batch,
-            set_is_extend_in_batch,
-        )
-
+    def _fused_drafter(self, fused_draft):
         drafter = object.__new__(TpuEagle3DraftWorker)
-        seen = []
+        calls = []
+        shim = SimpleNamespace(wait_for_hicache_reload=lambda: calls.append("wait"))
+        drafter._compile_policy = lambda: SimpleNamespace(compiled_forward_shim=shim)
         drafter.model_runner = SimpleNamespace(
             attn_backend=SimpleNamespace(init_forward_metadata=lambda batch: None)
         )
         drafter._carry_table = torch.zeros((1, 1))
-        drafter._fused_draft = lambda *args: (
-            seen.append(get_is_extend_in_batch())
-            or (
-                "d",
-                None,
-            )
-        )
-        set_is_extend_in_batch(True)
+        drafter._fused_draft = lambda *args: fused_draft(calls)
+        return drafter, calls
+
+    @staticmethod
+    def _run_fused(drafter):
         drafter.run_fused_draft(
             SimpleNamespace(mark_forward_metadata_ready=lambda: None),
             req_pool_indices=None,
@@ -552,7 +544,32 @@ class TestExperimentalEagle3(CustomTestCase):
             top_ks=None,
             uniforms=None,
         )
+
+    def test_fused_draft_runs_as_a_decode_program(self):
+        """The fused draft guards on is_extend_in_batch; a stale True from the last
+        extend under DP attention would recompile it under fail_on_recompile."""
+        from sglang.srt.layers.dp_attention import (
+            get_is_extend_in_batch,
+            set_is_extend_in_batch,
+        )
+
+        seen = []
+        drafter, _ = self._fused_drafter(
+            lambda calls: seen.append(get_is_extend_in_batch()) or ("d", None)
+        )
+        set_is_extend_in_batch(True)
+        self._run_fused(drafter)
         self.assertEqual(seen, [False])
+
+    def test_fused_draft_waits_for_the_hicache_reload_first(self):
+        """The fused draft program inlines the forward shim, whose HiCache reload gate
+        only runs eagerly; without the eager wait a PD decode drafts on draft KV
+        a host reload has not landed yet."""
+        drafter, calls = self._fused_drafter(
+            lambda calls: calls.append("draft") or ("d", None)
+        )
+        self._run_fused(drafter)
+        self.assertEqual(calls, ["wait", "draft"])
 
 
 if __name__ == "__main__":
