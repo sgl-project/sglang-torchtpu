@@ -771,8 +771,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             if current_platform.dcp_shards_every_kv_pool()
             else 1
         )
-        # An unsplit SWA sub-pool keeps plain-TP heads and counts rows, paged at
-        # page_size * dcp (see _build_tpu_swa_kv_pool).
+        # An unsplit SWA sub-pool keeps plain-TP heads and counts rows; its rows
+        # are paged at the physical page (see _build_tpu_swa_kv_pool) but the
+        # request cap and the admission floor run on the allocator's grid
+        # (page_size * dcp), which the eviction frontier, the decode
+        # allocation and a decode-node preallocation round to.
         self._swa_replicated = dcp_size > 1 and current_platform.dcp_replicates_swa_kv()
         swa_dcp_size = 1 if self._swa_replicated else dcp_size
 

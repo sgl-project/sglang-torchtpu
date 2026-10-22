@@ -4,13 +4,18 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.memory.allocator import get_and_clear_swa_pages
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_reserve_per_decode,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_npu, is_tpu
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import ceil_div, get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 
 logger = logging.getLogger(__name__)
@@ -55,13 +60,24 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: BaseSWAKVPool,
         need_sort: bool,
         req_to_token_pool=None,
+        swa_page_size: Optional[int] = None,
     ):
+        """``swa_page_size``: the SWA side's page when it differs from the full
+        side's (an unsplit SWA sub-pool under decode context parallelism keeps
+        the physical page while full locations are widened); defaults to
+        ``page_size``. ``page_size`` stays the full side's and the composite's."""
         assert isinstance(kvcache, BaseSWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
         self.dtype = dtype
         self.device = device
         self.page_size = page_size
+        self.swa_page_size = page_size if swa_page_size is None else swa_page_size
+        assert self.swa_page_size == page_size or (
+            page_size > 1
+            and self.swa_page_size > 1
+            and page_size % self.swa_page_size == 0
+        ), (page_size, self.swa_page_size)
 
         full_kv_pool = getattr(kvcache, "full_kv_pool", None)
         swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
@@ -98,7 +114,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
                 size_swa,
-                page_size,
+                self.swa_page_size,
                 dtype,
                 device,
                 swa_kv_pool,
@@ -213,16 +229,66 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        self._evict_to_free_tokens(tree_cache, num_tokens, num_tokens)
+
+    def _evict_to_free_tokens(self, tree_cache, full_tokens: int, swa_tokens: int):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
-        full_shortfall = max(0, num_tokens - self.full_available_size())
-        swa_shortfall = max(0, num_tokens - self.swa_available_size())
+        full_shortfall = max(0, full_tokens - self.full_available_size())
+        swa_shortfall = max(0, swa_tokens - self.swa_available_size())
         if full_shortfall or swa_shortfall:
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
             )
+
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
+        """Both sides at their own page. ``num_tokens`` is the batch's count of
+        new full-side pages; with one page for both sides it is the SWA side's
+        count too. With a finer SWA page the SWA side is recounted from the
+        requests' allocation lengths (the lengths the decode allocation uses),
+        since a step can open an SWA page without opening a full page."""
+        swa_tokens = self._swa_tokens_next_decode(num_tokens, requests, spec_algorithm)
+        self._evict_to_free_tokens(tree_cache, num_tokens, swa_tokens)
+        if self.full_available_size() < num_tokens:
+            return False
+        return self._swa_req_ring or self.swa_available_size() >= swa_tokens
+
+    def _swa_tokens_next_decode(self, num_tokens: int, requests, spec_algorithm) -> int:
+        if (
+            requests is None
+            or self._swa_req_ring
+            or self.swa_page_size == self.page_size
+        ):
+            return num_tokens
+        if spec_algorithm is not None and spec_algorithm.is_some():
+            # ScheduleBatch._new_tokens_required_next_decode_spec_v2's reserve.
+            reserve = get_alloc_reserve_per_decode() + int(
+                self._req_to_token_pool is not None
+                and self._req_to_token_pool.host_resident
+                and not get_schedule().disable_overlap_schedule
+                and not spec_algorithm.is_dflash_family()
+            )
+            cur_lens, nxt_lens, _ = page_aligned_decode_alloc_lens(
+                requests, reserve=reserve, page_size=self.page_size
+            )
+        else:
+            cur_lens = [req.kv.kv_committed_len for req in requests]
+            nxt_lens = [cur + 1 for cur in cur_lens]
+        ps = self.swa_page_size
+        new_pages = sum(
+            ceil_div(nxt, ps) - ceil_div(cur, ps)
+            for cur, nxt in zip(cur_lens, nxt_lens)
+        )
+        return new_pages * ps
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
@@ -299,7 +365,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # SWA ring rows are pre-allocated per slot; no per-token SWA paging.
             return full_ok
         return full_ok and (
-            num_swa_pages <= self.swa_attn_allocator.available_size() // self.page_size
+            num_swa_pages
+            <= self.swa_attn_allocator.available_size() // self.swa_page_size
         )
 
     def alloc_extend(
@@ -320,7 +387,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
-        if not self.new_pages_available(num_new_pages, num_new_pages):
+        num_swa_pages = self._num_new_swa_pages(
+            seq_lens_cpu, prefix_lens_cpu, num_new_pages
+        )
+        if not self.new_pages_available(num_new_pages, num_swa_pages):
             return None
 
         if self._swa_req_ring:
@@ -362,7 +432,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             swa_last_loc,
             extend_num_tokens,
-            num_new_pages=num_new_pages,
+            num_new_pages=num_swa_pages,
             **host_kwargs,
         )
         assert alloc_full_indices is not None
@@ -371,6 +441,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
 
         return alloc_full_indices
+
+    def _num_new_swa_pages(self, seq_lens_cpu, prefix_lens_cpu, num_full_pages: int):
+        """New SWA pages of an extend: the full count when both sides share a
+        page, else counted at the SWA page."""
+        if self.swa_page_size == self.page_size:
+            return num_full_pages
+        return get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.swa_page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
 
     def alloc_extend_swa_tail(
         self,
@@ -391,7 +472,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_full_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
-        num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
+        num_swa_pages = (swa_tail_len + self.swa_page_size - 1) // self.swa_page_size
         if not self.new_pages_available(num_full_pages, num_swa_pages):
             return None
 
@@ -614,7 +695,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._free_swa_pages(free_index, start_pos=start_pos)
 
     def _free_swa_pages(self, free_index: torch.Tensor, start_pos: int):
-        ps = self.page_size
+        # One representative per SWA page: the SWA side may page finer than the
+        # full side (swa_page_size), never coarser.
+        ps = self.swa_page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
         if current_platform.keeps_swa_index_mapping_on_host():
             # The mapping is host-resident (see __init__), and so are the kv rows
@@ -646,7 +729,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _free_swa_pages_none_cuda(
         self, full_page_representatives: torch.Tensor
     ) -> torch.Tensor:
-        ps = self.page_size
+        ps = self.swa_page_size
         swa_tokens = self.full_to_swa_index_mapping[full_page_representatives]
         expect(_SWA_PEER_MAPPED, swa_tokens > 0, msg="caller wants free_full")
 
@@ -671,7 +754,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _free_swa_pages_cuda(
         self, full_page_representatives: torch.Tensor
     ) -> torch.Tensor:
-        ps = self.page_size
+        ps = self.swa_page_size
         check_page_mappings = ps > 1 and self.swa_attn_allocator.debug_mode
         swa_pages, peers_mapped, page_mappings_valid = get_and_clear_swa_pages(
             full_page_representatives,
@@ -781,13 +864,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if not self._swa_req_ring:
             # Ring capacity follows the req slot count, not the token config.
             self._size_swa = size_swa
-        for alloc, sz in (
-            (self.full_attn_allocator, size_full),
-            (self.swa_attn_allocator, size_swa),
+        for alloc, sz, page in (
+            (self.full_attn_allocator, size_full, self.page_size),
+            (self.swa_attn_allocator, size_swa, self.swa_page_size),
         ):
             alloc.size = int(sz)
-            if self.page_size > 1:
-                alloc.num_pages = int(sz) // self.page_size
+            if page > 1:
+                alloc.num_pages = int(sz) // page
         self.clear()
 
     def clear(self):
@@ -833,6 +916,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         assert isinstance(kvcache, BaseSWAKVPool)
 
         self.page_size = page_size
+        self.swa_page_size = page_size  # one side, one page
         self.dtype = dtype
         self.device = device
         self.need_sort = need_sort

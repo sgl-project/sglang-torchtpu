@@ -1822,7 +1822,8 @@ class KVCacheConfigurator:
         # it shards over the whole attn TP group.
         dcp_size = get_parallel().attn_dcp_size
         # An unsplit SWA sub-pool keeps plain-TP heads and every token on every
-        # DCP rank, paged like its allocator (page_size * attn_dcp_size).
+        # DCP rank at the physical page: its allocator pages its own rows at
+        # that page while the full side's locations are widened.
         swa_replicated = (
             dcp_size > 1
             and not self.model_config.is_draft_model
@@ -1849,7 +1850,7 @@ class KVCacheConfigurator:
                 )
             subpool_kwargs = {
                 "swa_kv_pool_kwargs": {
-                    "page_size": self.pool_page_size * dcp_size,
+                    "page_size": self.pool_page_size,
                     "device": self.device,
                     "enable_memory_saver": False,
                     "head_num": swa_head_num,
@@ -2475,8 +2476,9 @@ class KVCacheConfigurator:
                         if current_platform.dcp_shards_every_kv_pool()
                         else 1
                     )
-                    # An unsplit SWA sub-pool hands out its own rows (see
-                    # _build_tpu_swa_kv_pool), not widened locations.
+                    # An unsplit SWA sub-pool hands out its own rows at the
+                    # physical page (see _build_tpu_swa_kv_pool), not widened
+                    # locations.
                     swa_widening = (
                         1
                         if widening > 1 and current_platform.dcp_replicates_swa_kv()
@@ -2491,6 +2493,7 @@ class KVCacheConfigurator:
                         kvcache=token_to_kv_pool,
                         need_sort=need_sort,
                         req_to_token_pool=req_to_token_pool,
+                        swa_page_size=get_schedule().page_size * swa_widening,
                     )
                 else:
                     if get_memory().enable_hisparse:
