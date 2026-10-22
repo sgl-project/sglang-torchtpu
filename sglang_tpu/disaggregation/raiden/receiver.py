@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import secrets
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -111,6 +111,7 @@ class RaidenReceiverMixin:
         aux_blob = req.aux_blob
 
         aux_index = None
+        aux_error = None
         with self._state_lock:
             if room in self._aborted or room in self._decode.final_seen:
                 return
@@ -125,13 +126,16 @@ class RaidenReceiverMixin:
             # Written under the lock: a room failing concurrently frees its
             # metadata slot, and the write must never land in a reused one.
             if aux_index is not None and aux_blob and room not in self._aborted:
-                write_aux_blob(
-                    self.kv_args.aux_data_ptrs,
-                    self.kv_args.aux_item_lens,
-                    aux_index,
-                    aux_blob,
-                )
-            if self.chunked_transfer:
+                try:
+                    write_aux_blob(
+                        self.kv_args.aux_data_ptrs,
+                        self.kv_args.aux_item_lens,
+                        aux_index,
+                        aux_blob,
+                    )
+                except Exception as error:
+                    aux_error = error
+            if aux_error is None and self.chunked_transfer:
                 holds_nothing = (
                     room in self._decode.local_blocks
                     and not self._decode.local_blocks[room]
@@ -165,6 +169,15 @@ class RaidenReceiverMixin:
                         )
                     )
                 self._decode.final_seen.add(room)
+        if aux_error is not None:
+            # Failed outside the block: _fail_room_on_error takes _state_lock.
+            self._fail_room_on_error(
+                room,
+                f"Raiden receive failed: cannot write aux data: {aux_error}",
+                aux_error,
+                live=lambda: room in self._decode.local_blocks,
+            )
+            return
         if self._listener_start_read and self.chunked_transfer:
             self._start_chunked_pull(room)
 
@@ -1044,13 +1057,29 @@ class RaidenReceiverMixin:
             self._fail_reshard_room(room, error)
 
     def _fail_reshard_room(self, room: int, error: BaseException) -> None:
-        """Fail a resharded room whose decode-side handler raised.
+        """Fail a resharded room whose decode-side handler raised."""
+        self._fail_room_on_error(
+            room,
+            f"Raiden reshard receive failed: {error}",
+            error,
+            live=lambda: room in self._decode.reshard_meta,
+        )
+
+    def _fail_room_on_error(
+        self,
+        room: int,
+        reason: str,
+        error: BaseException,
+        live: Callable[[], bool],
+    ) -> None:
+        """Fail a room whose decode-side handler raised.
 
         The exception is consumed here: the listener has nothing to do with
-        it beyond logging, and its log would not carry the room. A room
-        already cleared or aborted is left as it is.
+        it beyond logging, and its log would not carry the room. ``live`` is
+        checked under ``_state_lock``; a room it rejects (cleared) or one
+        already aborted is left as it is. Must not be called with
+        ``_state_lock`` held.
         """
-        reason = f"Raiden reshard receive failed: {error}"
         logger.error(
             "RaidenKVManager rank%d room %s: %s",
             self.attn_tp_rank,
@@ -1059,7 +1088,7 @@ class RaidenReceiverMixin:
             exc_info=error,
         )
         with self._state_lock:
-            if room not in self._decode.reshard_meta or room in self._aborted:
+            if not live() or room in self._aborted:
                 return
             self._mark_aborted_locked(room)
             self._fail_room_locked(room, reason, preserve_reason=True)
