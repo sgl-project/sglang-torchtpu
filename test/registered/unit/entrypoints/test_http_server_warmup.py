@@ -11,6 +11,9 @@ from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.http_server import (
     _send_disaggregation_warmup_requests,
 )
+from sglang.srt.managers.communicator import FanOutCommunicator
+from sglang.srt.managers.io_struct import FreezeGCReq, FreezeGCReqOutput
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -156,13 +159,33 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
         self.assertEqual(len(self.calls), 4)
         self.assertEqual(ready, [4])
 
+    def test_cleanup_failure_does_not_publish_readiness(self):
+        ready = []
+        with self._post([_FreezeServerError()]):
+            with self.assertRaises(requests.exceptions.HTTPError):
+                http_server._wait_and_warmup(
+                    self.server_args, launch_callback=lambda: ready.append(True)
+                )
+        self.assertEqual(ready, [])
+        self.assertIsNone(http_server._global_state.tokenizer_manager.server_status)
+
+    def test_rust_server_does_not_call_the_python_freeze_endpoint(self):
+        ready = []
+        with http_server.envs.SGLANG_RUST_SERVER.override(True), self._post([]):
+            http_server._wait_and_warmup(
+                self.server_args, launch_callback=lambda: ready.append(True)
+            )
+        self.assertEqual(self.calls, [])
+        self.assertEqual(ready, [True])
+
     def test_retry_is_bounded(self):
         refused = requests.exceptions.ConnectionError("Connection refused")
         with (
             patch.object(http_server, "_FREEZE_GC_RETRY_SECS", 1.5),
             self._post([refused] * 3),
         ):
-            http_server._freeze_gc_after_server_warmup(self.server_args)
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                http_server._freeze_gc_after_server_warmup(self.server_args)
         self.assertEqual(len(self.calls), 2)
 
     def test_http_and_ssl_errors_are_not_retried(self):
@@ -173,8 +196,40 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 self.calls.clear()
                 with self._post([error, _FreezeOk()]):
-                    http_server._freeze_gc_after_server_warmup(self.server_args)
+                    with self.assertRaises(requests.exceptions.RequestException):
+                        http_server._freeze_gc_after_server_warmup(self.server_args)
                 self.assertEqual(len(self.calls), 1)
+
+
+class TestPipelineFreeze(unittest.TestCase):
+    def test_deferred_dispatch_only_handles_freeze(self):
+        processed = []
+        scheduler = SimpleNamespace(process_input_requests=processed.extend)
+        request = FreezeGCReq()
+        SchedulerPPMixin._pp_process_freeze_gc(scheduler, [object(), request])
+        self.assertEqual(processed, [request])
+
+
+class TestFreezeCompletion(unittest.IsolatedAsyncioTestCase):
+    async def test_waits_for_every_scheduler_reply_before_local_freeze(self):
+        events = []
+        communicator = FanOutCommunicator(lambda _: events.append("sent"), 2)
+        manager = SimpleNamespace(
+            auto_create_handle_loop=lambda: None,
+            freeze_gc_communicator=communicator,
+        )
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.freeze_gc", side_effect=events.append
+        ):
+            task = asyncio.create_task(http_server.TokenizerManager.freeze_gc(manager))
+            await asyncio.sleep(0)
+            communicator.handle_recv(FreezeGCReqOutput())
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            self.assertEqual(events, ["sent"])
+            communicator.handle_recv(FreezeGCReqOutput())
+            await task
+        self.assertEqual(events, ["sent", "Tokenizer Manager"])
 
 
 if __name__ == "__main__":

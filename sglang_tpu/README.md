@@ -127,3 +127,25 @@ prepares patches. Live check:
 [`test_tpu_muse_spark_mm_pd_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_mm_pd_multihost.py)
 (images and video over P/D), with `SGLANG_TPU_USE_LIVE_SERVER=1` and
 `BASE_URL` pointing at the router.
+
+## Startup cleanup
+
+The existing `/freeze_gc` request joins pending compilation saves and releases
+startup file-cache pages before collecting garbage, freezing GC and trimming
+freed host heap pages. Each host scans its files once; all worker ranks finish
+cleanup before the scheduler acknowledgement and startup readiness message.
+
+`SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE=0` keeps target and draft checkpoint
+shards cached. `SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE=0` keeps the native compiler
+cache pages. Both releases default on. The compiler cache namespace comes from
+`TORCH_TPU_TIER2_COMPILATION_CACHE` (legacy:
+`TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE`); empty or unset selects `default`,
+and `disabled` skips it. Other namespaces are untouched. Disk-backed files are
+advised with `POSIX_FADV_DONTNEED` and remain on disk; tmpfs/ramfs are skipped.
+Advice is not a measurement of resident memory freed.
+
+Checkpoint pages remain eligible for kernel reclaim during startup, but explicit
+eviction happens at final cleanup. This can increase peak host memory relative
+to evicting immediately after weight loading. Reusing these files after cleanup
+can require storage reads. One rank per host logs cgroup headroom and NUMA large
+free blocks after cleanup; these diagnostics do not gate readiness.

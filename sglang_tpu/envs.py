@@ -17,6 +17,8 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE = EnvBool(True)
+    SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE = EnvBool(True)
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.

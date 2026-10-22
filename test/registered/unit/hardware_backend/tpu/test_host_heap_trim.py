@@ -9,6 +9,7 @@ import os
 import threading
 import unittest
 import weakref
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.test.test_utils import CustomTestCase
@@ -60,6 +61,19 @@ class TestTrimHostHeap(CustomTestCase):
 
 class TestInstall(CustomTestCase):
     def setUp(self):
+        for name, value in {
+            "release_startup_page_cache": lambda: None,
+            "log_startup_memory": lambda: None,
+            "get_parallel": lambda: SimpleNamespace(
+                world_group=SimpleNamespace(barrier=lambda: None)
+            ),
+        }.items():
+            mocked = patch.object(tpu, name, value)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        local_rank = patch.dict(os.environ, {"LOCAL_RANK": "0"})
+        local_rank.start()
+        self.addCleanup(local_rank.stop)
         self.cls = _scheduler_cls()
         tpu.install(scheduler_cls=self.cls)
 
@@ -107,6 +121,38 @@ class TestInstall(CustomTestCase):
         wrapped = self.cls.handle_freeze_gc
         tpu.install(scheduler_cls=self.cls)
         self.assertIs(self.cls.handle_freeze_gc, wrapped)
+
+    def test_cleanup_finishes_before_the_scheduler_reply(self):
+        scheduler = self.cls()
+        group = SimpleNamespace(barrier=lambda: scheduler.calls.append("barrier"))
+        with (
+            patch.object(
+                tpu,
+                "release_startup_page_cache",
+                side_effect=lambda: scheduler.calls.append("files"),
+            ),
+            patch.object(
+                tpu,
+                "_before_freeze",
+                side_effect=lambda: scheduler.calls.append("collect"),
+            ),
+            patch.object(
+                tpu, "_after_freeze", side_effect=lambda: scheduler.calls.append("trim")
+            ),
+            patch.object(
+                tpu, "get_parallel", return_value=SimpleNamespace(world_group=group)
+            ),
+            patch.object(
+                tpu,
+                "log_startup_memory",
+                side_effect=lambda: scheduler.calls.append("memory"),
+            ),
+        ):
+            result = scheduler.handle_freeze_gc("freeze")
+        self.assertEqual(result, "forwarded")
+        self.assertEqual(
+            scheduler.calls, ["files", "collect", "freeze", "trim", "barrier", "memory"]
+        )
 
     def test_periodic_trim_runs_on_the_configured_interval(self):
         trimmed = threading.Event()

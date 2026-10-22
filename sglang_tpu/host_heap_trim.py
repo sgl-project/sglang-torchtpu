@@ -28,8 +28,11 @@ from typing import Callable, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.runtime_context import get_parallel
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.page_cache import release_startup_page_cache
+from sglang_tpu.startup_memory import log_startup_memory
 
 logger = get_logger(__name__)
 
@@ -169,9 +172,14 @@ def install(scheduler_cls: Optional[type] = None) -> None:
         return
 
     def handle_freeze_gc(self, *args, **kwargs):
+        release_startup_page_cache()
         _before_freeze()
         result = orig(self, *args, **kwargs)
         _after_freeze()
+        # A scheduler reply must cover cleanup on every rank, including PP stages.
+        get_parallel().world_group.barrier()
+        if int(os.environ["LOCAL_RANK"]) == 0:
+            log_startup_memory()
         return result
 
     handle_freeze_gc._tpu_host_heap_trim = True

@@ -2414,9 +2414,6 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            # Skip server_status update for Rust server
-            if not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2443,12 +2440,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                 )
             # In rust-server mode there is no TokenizerManager (readiness is
             # the Rust server's own /health), so skip the status update.
-            if not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = (
-                    ServerStatus.Up
-                    if not failed_status_codes
-                    else ServerStatus.UnHealthy
-                )
+            if failed_status_codes and not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -2460,7 +2453,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 
 
 # Arbitrary margin: the server listens within a second of the warmup thread starting.
-# A retry window for new attempts; each attempt keeps its own 10 s request timeout.
+# A retry window for connecting; scheduler cleanup uses the warmup timeout.
 _FREEZE_GC_RETRY_SECS = 30.0
 
 
@@ -2472,6 +2465,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
     start = time.monotonic()
+    timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     attempt = 0
     while True:
         attempt += 1
@@ -2479,7 +2473,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
             res = requests.post(
                 server_args.url() + "/freeze_gc",
                 headers=freeze_headers,
-                timeout=10,
+                timeout=timeout if timeout > 0 else 600,
                 verify=ssl_verify_of(server_args),
             )
             res.raise_for_status()
@@ -2492,13 +2486,12 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
             if retry and time.monotonic() - start < _FREEZE_GC_RETRY_SECS:
                 time.sleep(0.5)
                 continue
-            logger.warning("post-warmup freeze_gc failed", exc_info=True)
-            return
+            logger.exception("post-warmup freeze_gc failed")
+            raise
         if attempt > 1:
-            # The endpoint freezes the tokenizer and queues the request for the schedulers,
-            # which forward it to the detokenizer.
+            # Scheduler cleanup has completed before this response is sent.
             logger.info(
-                "post-warmup freeze_gc accepted on attempt %d (%.1f s)",
+                "post-warmup freeze_gc completed on attempt %d (%.1f s)",
                 attempt,
                 time.monotonic() - start,
             )
@@ -2524,10 +2517,11 @@ def _wait_and_warmup(
     if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
-    _freeze_gc_after_server_warmup(server_args)
+    if not envs.SGLANG_RUST_SERVER.get():
+        # Rust owns its readiness lifecycle and has no /freeze_gc endpoint.
+        _freeze_gc_after_server_warmup(server_args)
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
