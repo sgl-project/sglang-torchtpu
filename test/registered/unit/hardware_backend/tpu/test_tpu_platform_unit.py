@@ -7,6 +7,7 @@ import builtins
 import os
 import sys
 import unittest
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
 )
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang.srt.plugins.oot_classes import clear_oot_replacements
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,6 +32,26 @@ from sglang_tpu.tpu_platform import (
 
 # CPU suite: mocks torch_tpu, so it runs on the CPU runners -- never a TPU node.
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@contextmanager
+def _module_entry(name, module):
+    """Bind one sys.modules entry for the block.
+
+    Unlike patch.dict(sys.modules, ...), modules first imported inside the block
+    stay loaded: re-importing a native extension aborts the process, and a fresh
+    plugin import would redefine registered classes.
+    """
+    missing = object()
+    previous = sys.modules.get(name, missing)
+    sys.modules[name] = module
+    try:
+        yield
+    finally:
+        if previous is missing:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
 
 
 class TestTpuPlatformIdentity(CustomTestCase):
@@ -82,6 +104,10 @@ class TestTpuPlatformIdentity(CustomTestCase):
 class TestTpuPlatformInitialization(CustomTestCase):
     def setUp(self):
         self.platform = TpuSRTPlatform()
+        # init_backend registers class replacements process-wide; each test
+        # starts and ends with none so the order of tests cannot matter.
+        clear_oot_replacements()
+        self.addCleanup(clear_oot_replacements)
 
     def test_rejects_backend_initialization_without_worker_world_size(self):
         with (
@@ -110,7 +136,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 {"WORLD_SIZE": "16", "LIBTPU_INIT_ARGS": "--xla_user=1"},
                 clear=False,
             ),
-            patch.dict(sys.modules, {"torch_tpu": fake_torch_tpu}),
+            _module_entry("torch_tpu", fake_torch_tpu),
             compiler_config.patch(cache_key_tag=""),
             patch(
                 "sglang_tpu.patches._prepare_tpu_env",
@@ -196,7 +222,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
 
         with (
             patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
-            patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
+            _module_entry("torch_tpu", ModuleType("torch_tpu")),
             patch("sglang_tpu.patches._prepare_tpu_env"),
             patch(
                 "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key"

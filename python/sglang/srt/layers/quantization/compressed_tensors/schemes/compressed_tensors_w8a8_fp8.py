@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import logging
 from typing import Callable, Optional
 
 import torch
@@ -22,7 +21,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
-    block_quant_dequant,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -30,14 +28,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_bool_env_var, is_hip, is_tpu
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
-logger = logging.getLogger(__name__)
 _is_hip = is_hip()
-_is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -48,35 +43,6 @@ strategy_to_parameter_type = {
     QuantizationStrategy.CHANNEL: ChannelQuantScaleParameter,
     QuantizationStrategy.TENSOR: PerTensorScaleParameter,
 }
-
-
-def _get_tpu_fp8_runtime() -> str:
-    return get_exec().kernel.tpu_fp8_runtime
-
-
-def _requantize_tpu_block_fp8_to_channelwise(layer: torch.nn.Module) -> None:
-    assert layer.weight_block_size is not None
-    weight = layer.weight.data
-    weight_dequant = block_quant_dequant(
-        weight,
-        layer.weight_scale.data,
-        layer.weight_block_size,
-        torch.float32,
-    )
-    dtype_max = torch.finfo(weight.dtype).max
-    weight_scale = torch.clamp(
-        weight_dequant.abs().amax(dim=1, keepdim=True) / dtype_max,
-        min=1e-12,
-    )
-    weight = torch.clamp(
-        weight_dequant / weight_scale,
-        min=-dtype_max,
-        max=dtype_max,
-    ).to(weight.dtype)
-
-    layer.weight = Parameter(weight.t().contiguous(), requires_grad=False)
-    layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-    layer.weight_block_size = None
 
 
 class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
@@ -250,16 +216,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_shape=layer.weight.shape,
             )
 
-            if _is_tpu and _get_tpu_fp8_runtime() == "channelwise":
-                logger.warning_once(
-                    "TPU dense FP8 linear is converting block-FP8 checkpoint "
-                    "weights to channelwise runtime scales by default for "
-                    "performance. Use --tpu-fp8-runtime=channelwise to make "
-                    "this explicit, or --tpu-fp8-runtime=blockwise to preserve "
-                    "blockwise runtime scales."
-                )
-                _requantize_tpu_block_fp8_to_channelwise(layer)
-
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
 
@@ -311,17 +267,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 bias=bias,
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,
-            )
-        elif _is_tpu:
-            from sglang_tpu.fp8_linear import (
-                apply_tpu_fp8_linear,
-            )
-
-            return apply_tpu_fp8_linear(
-                x=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                bias=bias,
             )
         else:
             return apply_fp8_linear(

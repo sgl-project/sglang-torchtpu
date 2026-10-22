@@ -611,8 +611,9 @@ class Fp8LinearMethod(LinearMethodBase):
                             f"weight quantization block_n = {block_n}."
                         )
 
-    @staticmethod
+    @classmethod
     def create_fp8_weight_(
+        cls,
         layer: torch.nn.Module,
         block_quant: bool,
         quant_config,
@@ -646,7 +647,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 output_size,
                 output_size_per_partition,
                 output_partition_sizes,
-                skip_block_quant_check or (_is_tpu and not use_mxfp8),
+                skip_block_quant_check,
             )
         else:
             block_n, block_k = None, None
@@ -674,24 +675,17 @@ class Fp8LinearMethod(LinearMethodBase):
 
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
-                if _is_tpu and not use_mxfp8:
-                    from sglang_tpu.fp8_linear import (
-                        compute_tpu_fp8_linear_scale_shape,
-                    )
-
-                    scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
-                        layer,
-                        input_size=input_size,
-                        input_size_per_partition=input_size_per_partition,
-                        output_size=output_size,
-                        output_size_per_partition=output_size_per_partition,
-                        output_partition_sizes=output_partition_sizes,
-                        block_n=block_n,
-                        block_k=block_k,
-                    )
-                else:
-                    scale_rows = (output_size_per_partition + block_n - 1) // block_n
-                    scale_cols = (input_size_per_partition + block_k - 1) // block_k
+                scale_rows, scale_cols = cls._block_scale_shape(
+                    layer,
+                    input_size=input_size,
+                    input_size_per_partition=input_size_per_partition,
+                    output_size=output_size,
+                    output_size_per_partition=output_size_per_partition,
+                    output_partition_sizes=output_partition_sizes,
+                    block_n=block_n,
+                    block_k=block_k,
+                    use_mxfp8=use_mxfp8,
+                )
                 scale = BlockQuantScaleParameter(
                     data=scale_init(
                         scale_rows,
@@ -732,6 +726,24 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 layer.register_parameter("input_scale", None)
 
+    @staticmethod
+    def _block_scale_shape(
+        layer,
+        *,
+        input_size,
+        input_size_per_partition,
+        output_size,
+        output_size_per_partition,
+        output_partition_sizes,
+        block_n,
+        block_k,
+        use_mxfp8,
+    ):
+        return (
+            (output_size_per_partition + block_n - 1) // block_n,
+            (input_size_per_partition + block_k - 1) // block_k,
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -743,7 +755,7 @@ class Fp8LinearMethod(LinearMethodBase):
         skip_block_quant_check: bool = False,
         **extra_weight_attrs,
     ):
-        Fp8LinearMethod.create_fp8_weight_(
+        self.create_fp8_weight_(
             layer,
             block_quant=self.block_quant,
             quant_config=self.quant_config,
@@ -1093,15 +1105,6 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
-            if _is_tpu and not self.use_mxfp8:
-                from sglang_tpu.fp8_linear import (
-                    prepare_tpu_fp8_linear_weights,
-                )
-
-                prepare_tpu_fp8_linear_weights(
-                    layer,
-                    weight_block_size=self.quant_config.weight_block_size,
-                )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -1312,20 +1315,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 **extra_kwargs,
             )
             return out
-
-        if (
-            _is_tpu
-            and not self.use_mxfp8
-            and (not self.block_quant or layer.weight_block_size is None)
-        ):
-            from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
-
-            return apply_tpu_fp8_linear(
-                x=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                bias=bias,
-            )
 
         if self.block_quant:
             if use_intel_amx_backend(layer):

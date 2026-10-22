@@ -8,7 +8,6 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
@@ -25,6 +24,7 @@ from sglang_tpu.fp8_linear import (
 from sglang_tpu.fp8_moe import (
     _requantize_tpu_fp8_moe_block_to_channelwise,
 )
+from sglang_tpu.quantization.dense_fp8 import TpuFp8LinearMethod
 
 _SMALL_M_KERNEL = tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL
 
@@ -184,7 +184,7 @@ class TestTpuFp8Linear(CustomTestCase):
         )
         layer.input_scale = None
 
-        method = Fp8LinearMethod(_FakeBlockFp8Config())
+        method = TpuFp8LinearMethod(_FakeBlockFp8Config())
         method.process_weights_after_loading(layer)
 
         self.assertEqual(layer.weight.shape, (out_size, in_size))

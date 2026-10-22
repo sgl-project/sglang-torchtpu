@@ -1374,6 +1374,9 @@ class TpuSRTPlatform(SRTPlatform):
         rank_slice._load()
         traced_rank._load()
         _register_attention_backends()
+        from sglang_tpu.quantization.dense_fp8 import register_dense_fp8_methods
+
+        register_dense_fp8_methods()
         from sglang_tpu.envs import envs as tpu_envs
 
         if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
