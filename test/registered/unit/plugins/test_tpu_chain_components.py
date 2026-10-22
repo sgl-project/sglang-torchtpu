@@ -8,10 +8,12 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.speculative.spec_common import VerifyLogitModifiers
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
 from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
-from sglang_tpu.experimental.speculative.spec_ops import apply_verify_logit_bias
+from sglang_tpu.experimental.speculative.spec_ops import apply_verify_logit_modifiers
 from sglang_tpu.experimental.speculative.spec_types import (
     BucketState,
     DraftResult,
@@ -19,6 +21,25 @@ from sglang_tpu.experimental.speculative.spec_types import (
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _sampling_info(**kwargs):
+    values = dict(
+        temperatures=torch.ones(1, 1),
+        top_ps=torch.ones(1),
+        top_ks=torch.ones(1, dtype=torch.int32),
+        min_ps=torch.zeros(1),
+        is_all_greedy=True,
+        is_any_greedy=True,
+        need_top_p_sampling=False,
+        need_top_k_sampling=False,
+        need_min_p_sampling=False,
+        vocab_size=5,
+        device="cpu",
+        real_batch_size=1,
+    )
+    values.update(kwargs)
+    return HostPaddedSamplingInfo(**values)
 
 
 class TestChainComponents(CustomTestCase):
@@ -44,7 +65,13 @@ class TestChainComponents(CustomTestCase):
             None,
             torch.tensor([2, 2], dtype=torch.int32),
         )
-        out, accept = worker.verify(None, bucket, None, draft, None)
+        out, accept = worker.verify(
+            SimpleNamespace(has_grammar=False, sampling_info=_sampling_info()),
+            bucket,
+            None,
+            draft,
+            None,
+        )
         self.assertIs(out.next_token_logits, logits)
         self.assertEqual(accept.accept_tokens.tolist(), [[1, 2, 3], [3, 2, 1]])
         self.assertEqual(accept.accept_lens.tolist(), [3, 0])
@@ -56,7 +83,9 @@ class TestChainComponents(CustomTestCase):
         bias = torch.zeros((4, 3))
         bias[0, 1] = 5.0
         bias[1, 2] = 6.0
-        adjusted = apply_verify_logit_bias(logits, bias, 3)
+        adjusted = apply_verify_logit_modifiers(
+            logits, VerifyLogitModifiers(logit_bias=bias), 3
+        )
         self.assertEqual(adjusted.argmax(-1).tolist(), [1] * 3 + [2] * 3 + [0] * 6)
         torch.testing.assert_close(adjusted[6:], logits[6:])
         self.assertTrue(torch.all(logits[:, 0] == 3.0))

@@ -391,11 +391,37 @@ def compute_spec_logprobs(
     accept_index: Optional[torch.Tensor] = None,
     chain_stride: Optional[int] = None,
 ):
+    return compute_spec_logprobs_from_tensors(
+        logits_output,
+        predict,
+        batch_size=len(batch.seq_lens),
+        temperatures=batch.sampling_info.temperatures,
+        is_all_greedy=batch.sampling_info.is_all_greedy,
+        top_logprobs_nums=batch.top_logprobs_nums,
+        token_ids_logprobs=batch.token_ids_logprobs,
+        accept_index=accept_index,
+        chain_stride=chain_stride,
+    )
+
+
+def compute_spec_logprobs_from_tensors(
+    logits_output: LogitsProcessorOutput,
+    predict: torch.Tensor,
+    *,
+    batch_size: int,
+    temperatures: torch.Tensor,
+    is_all_greedy: bool,
+    top_logprobs_nums,
+    token_ids_logprobs,
+    accept_index: Optional[torch.Tensor] = None,
+    chain_stride: Optional[int] = None,
+):
+    """Compute speculative output logprobs from logical request metadata."""
     assert (accept_index is None) != (chain_stride is None), (
         "pass exactly one of accept_index / chain_stride"
     )
 
-    bs = len(batch.seq_lens)
+    bs = batch_size
     next_token_logits = logits_output.next_token_logits
 
     if accept_index is not None:
@@ -414,11 +440,11 @@ def compute_spec_logprobs(
         gathered_logits = next_token_logits
         accepted_token_ids = predict
 
-    if batch.sampling_info.is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+    if is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
         gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
     else:
         temperatures = torch.repeat_interleave(
-            batch.sampling_info.temperatures,
+            temperatures,
             max_accept,
             dim=0,
         )
@@ -431,9 +457,9 @@ def compute_spec_logprobs(
         1, accepted_token_ids.long().view(-1, 1)
     ).view(bs, max_accept)
 
-    if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
+    if top_logprobs_nums and any(x > 0 for x in top_logprobs_nums):
         top_logprobs_nums_expanded = [
-            num for num in batch.top_logprobs_nums for _ in range(max_accept)
+            num for num in top_logprobs_nums for _ in range(max_accept)
         ]
         (
             logits_output.next_token_top_logprobs_val,
@@ -442,11 +468,9 @@ def compute_spec_logprobs(
             gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
         )
 
-    if batch.token_ids_logprobs and any(
-        x is not None for x in batch.token_ids_logprobs
-    ):
+    if token_ids_logprobs and any(x is not None for x in token_ids_logprobs):
         token_ids_logprobs_expanded = [
-            ids for ids in batch.token_ids_logprobs for _ in range(max_accept)
+            ids for ids in token_ids_logprobs for _ in range(max_accept)
         ]
         (
             logits_output.next_token_token_ids_logprobs_val,

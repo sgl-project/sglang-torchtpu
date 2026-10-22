@@ -1053,19 +1053,22 @@ class TpuSRTPlatform(SRTPlatform):
         return TpuGraphRunner
 
     def get_spec_worker_cls(self, algorithm, server_args, *, default: type) -> type:
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+
         # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
         from sglang_tpu.experimental import (
             is_experimental_chain,
             is_experimental_spec_worker,
         )
 
-        if is_experimental_chain(algorithm):
+        pp_size = resolving_view(server_args).pp_size
+        if is_experimental_chain(algorithm, pp_size=pp_size):
             from sglang_tpu.experimental.speculative.chain_spec_worker import (
                 TpuChainSpecWorker,
             )
 
             return TpuChainSpecWorker
-        if is_experimental_spec_worker(algorithm):
+        if is_experimental_spec_worker(algorithm, pp_size=pp_size):
             from sglang_tpu.experimental.speculative.block_spec_worker import (
                 TpuBlockSpecWorker,
             )

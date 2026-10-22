@@ -8,6 +8,10 @@ from typing import Callable
 import torch
 
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.spec_common import (
+    VerifyLogitModifiers,
+    adjust_verify_logits,
+)
 from sglang.srt.utils.common import is_pin_memory_available
 
 _PARAM_FILLS = {
@@ -109,8 +113,20 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             if (value := getattr(self, name)) is not None
         }
 
+    def _device_modifier(self, value, rows, fill):
+        if value is None:
+            return None
+        value = value[: len(self)]
+        if value.device.type == "cpu":
+            return _pad_host_rows(
+                value, rows, fill, is_pin_memory_available(self.device)
+            ).to(self.device, non_blocking=True)
+        return torch.nn.functional.pad(
+            value, (0, 0, 0, rows - value.shape[0]), value=fill
+        )
+
     def device_logit_bias(self, rows: int) -> torch.Tensor | None:
-        """Upload live bias rows at the forward's physical bucket, with neutral padding."""
+        """Bias padded neutrally at the forward's physical extent, uploaded once per bucket."""
         if self.logit_bias is None:
             return None
         cache = self.device_bias
@@ -118,11 +134,28 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             cache.source, cache.by_rows = self.logit_bias, {}
         bias = cache.by_rows.get(rows)
         if bias is None:
-            bias = _pad_host_rows(
-                self.logit_bias, rows, 0.0, is_pin_memory_available(self.device)
-            ).to(self.device, non_blocking=True)
+            bias = self._device_modifier(self.logit_bias, rows, 0.0)
             cache.by_rows[rows] = bias
         return bias
+
+    def device_modifiers(self, rows: int) -> VerifyLogitModifiers:
+        return VerifyLogitModifiers(
+            self._device_modifier(self.acc_additive_penalties, rows, 0.0),
+            self._device_modifier(self.acc_scaling_penalties, rows, 1.0),
+            self.device_logit_bias(rows),
+        )
+
+    def _apply_pre_grammar_logits_transforms(self, logits):
+        rows = logits.shape[0]
+        modifiers = VerifyLogitModifiers(
+            self._device_modifier(self.acc_additive_penalties, rows, 0.0),
+            self._device_modifier(self.acc_scaling_penalties, rows, 1.0),
+        )
+        adjust_verify_logits(
+            next_token_logits=logits, sampling_info=modifiers, draft_token_num=1
+        )
+        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+            self.penalizer_orchestrator.apply(logits[: len(self)])
 
     def _apply_post_grammar_logits_transforms(self, logits):
         # Prefill only, outside compiled forwards: not warmed. Like the other

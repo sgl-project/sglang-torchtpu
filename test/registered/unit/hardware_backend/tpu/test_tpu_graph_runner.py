@@ -180,6 +180,7 @@ class TestTpuGraphRunner(CustomTestCase):
     ) -> SimpleNamespace:
         # Only what production still reads off the handed instance.
         server_args = SimpleNamespace(
+            pp_size=1,
             enable_torch_compile=enable_torch_compile,
             tpu_compile_tracer=tpu_compile_tracer,
             unsafe_save_torch_compile_bundle=None,
@@ -425,11 +426,28 @@ class TestTpuGraphRunner(CustomTestCase):
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
 
+    def test_pp_draft_scope_keeps_target_compatibility_policy(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        runner = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            server_args=SimpleNamespace(pp_size=2),
+        )
+        with (
+            get_context().override_server_args(pp_size=2),
+            # draft_pp_context overrides the live group width to one.
+            get_context().parallel.override(pp_size=1),
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+        ):
+            policy = _augment_spec_policy(DecoderTpuCompilePolicy, runner)
+        self.assertTrue(issubclass(policy, Eagle3SpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(policy, TpuChainSpecDecodeCompilePolicyMixin))
+
     def test_experimental_worker_takes_native_mtp_to_the_chain_policy(self):
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.EAGLE,
             server_args=SimpleNamespace(
-                speculative_num_steps=3, speculative_algorithm="EAGLE"
+                pp_size=1, speculative_num_steps=3, speculative_algorithm="EAGLE"
             ),
         )
         with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
@@ -437,12 +455,28 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertTrue(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
         self.assertFalse(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
 
+    def test_pipelined_native_mtp_keeps_the_compatibility_policy(self):
+        # The chain worker serves one pipeline stage; PP targets stay on core's EAGLE.
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            server_args=SimpleNamespace(
+                pp_size=2, speculative_num_steps=3, speculative_algorithm="EAGLE"
+            ),
+        )
+        with (
+            get_context().override_server_args(pp_size=2),
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+        ):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
+
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
         # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy.
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
             server_args=SimpleNamespace(
-                speculative_num_steps=3, speculative_algorithm="EAGLE3"
+                pp_size=1, speculative_num_steps=3, speculative_algorithm="EAGLE3"
             ),
         )
         cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
@@ -457,7 +491,7 @@ class TestTpuGraphRunner(CustomTestCase):
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.EAGLE,
             server_args=SimpleNamespace(
-                speculative_num_steps=3, speculative_algorithm="EAGLE"
+                pp_size=1, speculative_num_steps=3, speculative_algorithm="EAGLE"
             ),
         )
         with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
@@ -473,7 +507,7 @@ class TestTpuGraphRunner(CustomTestCase):
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             server_args=SimpleNamespace(
-                speculative_num_steps=3, speculative_algorithm="DFLASH"
+                pp_size=1, speculative_num_steps=3, speculative_algorithm="DFLASH"
             ),
         )
         cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
@@ -502,7 +536,7 @@ class TestTpuGraphRunner(CustomTestCase):
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
             server_args=SimpleNamespace(
-                speculative_num_steps=3, speculative_algorithm="EAGLE3"
+                pp_size=1, speculative_num_steps=3, speculative_algorithm="EAGLE3"
             ),
         )
         self.assertIs(
@@ -513,7 +547,7 @@ class TestTpuGraphRunner(CustomTestCase):
         ngram = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.NGRAM,
             server_args=SimpleNamespace(
-                speculative_num_steps=3, speculative_algorithm="NGRAM"
+                pp_size=1, speculative_num_steps=3, speculative_algorithm="NGRAM"
             ),
         )
         self.assertIs(

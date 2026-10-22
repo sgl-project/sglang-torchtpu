@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     DecoderCompilePolicy,
@@ -80,18 +81,23 @@ def _spec_enabled(model_runner: ModelRunner) -> bool:
     return (
         (algo.is_eagle() and not algo.is_frozen_kv_mtp())
         or algo.is_dflash()
-        or is_experimental_spec_worker(algo)
+        or (
+            algo.is_dspark()
+            and is_experimental_spec_worker(
+                algo, pp_size=resolving_view(model_runner.server_args).pp_size
+            )
+        )
     )
 
 
 def _resolve_spec_compile_policy_mixin(
-    spec_algorithm: SpeculativeAlgorithm,
+    spec_algorithm: SpeculativeAlgorithm, *, pp_size: int
 ) -> type[BaseSpecDecodeCompilePolicyMixin]:
     """Resolve speculative compile policy mixin class based on algorithm."""
     # Checked first: the experimental workers also serve DFLASH, MTP and EAGLE3.
-    if is_experimental_chain(spec_algorithm):
+    if is_experimental_chain(spec_algorithm, pp_size=pp_size):
         return TpuChainSpecDecodeCompilePolicyMixin
-    if is_experimental_spec_worker(spec_algorithm):
+    if is_experimental_spec_worker(spec_algorithm, pp_size=pp_size):
         return TpuBlockSpecDecodeCompilePolicyMixin
     if spec_algorithm.is_dflash():
         return DFlashSpecDecodeCompilePolicyMixin
@@ -108,7 +114,11 @@ def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
         return policy_cls
     if not issubclass(policy_cls, DecoderTpuCompilePolicy):
         return policy_cls
-    spec_mixin_cls = _resolve_spec_compile_policy_mixin(model_runner.spec_algorithm)
+    # Draft construction temporarily hides PP; selection follows the target configuration.
+    spec_mixin_cls = _resolve_spec_compile_policy_mixin(
+        model_runner.spec_algorithm,
+        pp_size=resolving_view(model_runner.server_args).pp_size,
+    )
     return type(f"Spec{policy_cls.__name__}", (spec_mixin_cls, policy_cls), {})
 
 

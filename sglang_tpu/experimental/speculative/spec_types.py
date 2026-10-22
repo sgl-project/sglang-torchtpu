@@ -220,7 +220,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         if candidates is None or committed_lens is None or req_pool_indices is None:
             raise NotImplementedError(
                 "TpuSpecWorker needs the verify window (overlap schedule, "
-                "host-resident req_to_token, no grammar/logprob/LoRA)."
+                "host-resident req_to_token, no draft window size, no LoRA)."
             )
         req_pool_indices_cpu = batch.req_pool_indices_cpu
         seq_lens_cpu = batch.seq_lens_cpu

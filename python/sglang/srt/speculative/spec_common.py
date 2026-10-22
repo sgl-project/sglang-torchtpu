@@ -43,38 +43,33 @@ def adjust_verify_logits(
 ) -> None:
     """Apply accumulated penalties and logit_bias to verify logits in place.
 
-    Traceable. Each request's per-request row is repeated over its
+    Traceable. Each request's per-request row is broadcast over its
     ``draft_token_num`` verify rows, a relaxed form of penalties for
-    speculative decoding. Rows past ``len(sampling_info) * draft_token_num``
-    (bucket padding) are left untouched.
+    speculative decoding, without materializing a repeated vocabulary-sized
+    tensor. Rows past ``len(sampling_info) * draft_token_num`` (bucket padding)
+    are left untouched.
     """
     # Looked up at call time: a platform may rebind this module attribute at startup.
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
 
+    def per_request_rows(modifier: torch.Tensor) -> torch.Tensor:
+        # [requests, draft_token_num, vocab] view of the live verify rows.
+        rows = modifier.shape[0] * draft_token_num
+        return next_token_logits[:rows].view(modifier.shape[0], draft_token_num, -1)
+
     if sampling_info.acc_additive_penalties is not None:
-        additive_penalties = torch.repeat_interleave(
-            sampling_info.acc_additive_penalties,
-            draft_token_num,
-            dim=0,
-        )
-        next_token_logits[: additive_penalties.shape[0]].add_(additive_penalties)
+        additive_penalties = sampling_info.acc_additive_penalties
+        per_request_rows(additive_penalties).add_(additive_penalties.unsqueeze(1))
     if sampling_info.acc_scaling_penalties is not None:
-        scaling_penalties = torch.repeat_interleave(
-            sampling_info.acc_scaling_penalties,
-            draft_token_num,
-            dim=0,
-        )
+        scaling_penalties = sampling_info.acc_scaling_penalties
         apply_scaling_penalties(
-            next_token_logits[: scaling_penalties.shape[0]],
-            scaling_penalties,
+            per_request_rows(scaling_penalties), scaling_penalties.unsqueeze(1)
         )
     if sampling_info.logit_bias is not None:
-        logit_bias = torch.repeat_interleave(
-            sampling_info.logit_bias, draft_token_num, dim=0
-        )
-        next_token_logits[: logit_bias.shape[0]].add_(logit_bias)
+        logit_bias = sampling_info.logit_bias
+        per_request_rows(logit_bias).add_(logit_bias.unsqueeze(1))
 
 
 def seeded_verify_coins(
@@ -83,10 +78,12 @@ def seeded_verify_coins(
     seq_lens: torch.Tensor,
     draft_token_num: int,
     device,
+    uniform_fn=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Derive deterministic verify-side coins from per-request sampling seeds.
 
-    Traceable.
+    Traceable. ``uniform_fn`` lets a backend provide the same hash-to-coin
+    contract without requiring the default kernel or float64 arithmetic.
     Mirrors the main seeded-sampling path: murmur_hash32(seed, seq_lens,
     column) mapped to [0, 1). Columns [0, draft_token_num) drive the
     per-draft rejection coins; column draft_token_num drives the final
@@ -98,13 +95,16 @@ def seeded_verify_coins(
     until the draft RNG is seeded in a follow-up; top-k/greedy draft
     selection is already deterministic.
     """
-    from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
-
     cols = torch.arange(draft_token_num + 1, device=device, dtype=torch.int64)
-    hashed = murmur_hash32(
-        sampling_seed.to(torch.uint64), seq_lens.to(torch.uint64), cols
-    )
-    uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    if uniform_fn is None:
+        from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+
+        hashed = murmur_hash32(
+            sampling_seed.to(torch.uint64), seq_lens.to(torch.uint64), cols
+        )
+        uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    else:
+        uniforms = uniform_fn(sampling_seed, seq_lens, cols)
     # The float32 cast rounds the top 129 uint32 hashes to exactly 1.0, but
     # the sampling kernels expect half-open [0, 1) coins: a 1.0 coin walks
     # past the last CDF bucket and can return a zero-probability token.
@@ -146,6 +146,16 @@ def verify_coins(
         (candidates.shape[0],), dtype=torch.float32, device=device
     )
     return coins, coins_for_final_sampling
+
+
+def accumulate_spec_penalty_tokens(batch: ScheduleBatch) -> None:
+    """Host: add each request's last output token to its penalties before the snapshot.
+
+    The relaxed form the EAGLE decode path also uses: one token per step, not
+    every token the preceding step accepted.
+    """
+    if batch.sampling_info.penalizer_orchestrator.is_required:
+        batch.cumulate_penalty_output_tokens()
 
 
 def build_dp_idle_draft_batch(batch: ScheduleBatch) -> ScheduleBatch:

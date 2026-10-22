@@ -24,8 +24,21 @@ class ChainVerifier(msgspec.Struct, frozen=True):
     ops: SpecOps = SpecOps()
 
     def accept(
-        self, *, target_logits, draft_result, bucket, threshold_single, threshold_acc
+        self,
+        *,
+        target_logits,
+        draft_result,
+        bucket,
+        threshold_single,
+        threshold_acc,
+        coins=None,
+        final_sampling_coins=None,
     ):
+        randoms = (
+            {}
+            if coins is None
+            else {"coins": coins, "final_sampling_coins": final_sampling_coins}
+        )
         if bucket.temperatures is None or bucket.top_ks is None:
             num_correct_drafts, bonus_tokens = self.ops.accept_drafts_greedy(
                 target_logits, draft_result.draft_tokens, draft_result.num_verify_drafts
@@ -43,6 +56,7 @@ class ChainVerifier(msgspec.Struct, frozen=True):
                 bucket.min_ps,
                 threshold_single,
                 threshold_acc,
+                **randoms,
             )
             site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
         elif bucket.need_filters:
@@ -55,6 +69,7 @@ class ChainVerifier(msgspec.Struct, frozen=True):
                 bucket.top_ks,
                 bucket.top_ps,
                 bucket.min_ps,
+                **randoms,
             )
             site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
         else:
@@ -65,6 +80,7 @@ class ChainVerifier(msgspec.Struct, frozen=True):
                 draft_result.draft_logits.float(),
                 bucket.temperatures,
                 bucket.top_ks,
+                **randoms,
             )
             site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
         return num_correct_drafts, bonus_tokens, site

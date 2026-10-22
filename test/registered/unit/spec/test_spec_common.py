@@ -51,6 +51,33 @@ class TestAdjustVerifyLogits(CustomTestCase):
             logits[bs * draft_token_num :], original[bs * draft_token_num :]
         )
 
+    def test_per_request_terms_broadcast_without_repeating_rows(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        bs, draft_token_num, vocab = 2, 3, 4
+        logits = torch.zeros(bs * draft_token_num, vocab)
+        ops = []
+
+        class RecordOps(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                ops.append(func.overloadpacket.__name__)
+                return func(*args, **(kwargs or {}))
+
+        with RecordOps():
+            adjust_verify_logits(
+                next_token_logits=logits,
+                sampling_info=SimpleNamespace(
+                    acc_additive_penalties=torch.ones(bs, vocab),
+                    acc_scaling_penalties=torch.full((bs, vocab), 2.0),
+                    logit_bias=torch.ones(bs, vocab),
+                ),
+                draft_token_num=draft_token_num,
+            )
+        # A repeated [bs * draft_token_num, vocab] copy costs a vocab-sized
+        # allocation per verify step.
+        self.assertNotIn("repeat_interleave", ops)
+        torch.testing.assert_close(logits, torch.full_like(logits, 1.5))
+
 
 def _decode_batch(*, seq_lens, seq_lens_sum=None, seq_lens_cpu=None):
     return SimpleNamespace(

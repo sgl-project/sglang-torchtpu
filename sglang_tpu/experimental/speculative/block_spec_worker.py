@@ -122,7 +122,6 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
     ) -> DraftResult:
-        del batch
         state = bucket.state
         bs = state.seq_lens.shape[0]
         block_hidden, graph_draft_tokens = self._forward_draft_block(
@@ -141,7 +140,16 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 num_verify_drafts=num_verify_drafts,
             )
         draft_tokens, draft_logits = self._sample_draft_block(
-            block_hidden, state.bonus_tokens, temperatures, top_ks
+            block_hidden,
+            state.bonus_tokens,
+            temperatures,
+            top_ks,
+            sampling_seed=(
+                batch.sampling_info.host_params_at(bs)["sampling_seed"].to(self.device)
+                if batch.sampling_info.sampling_seed is not None
+                else None
+            ),
+            seq_lens=state.seq_lens,
         )
         return DraftResult(
             draft_tokens=draft_tokens,
@@ -155,15 +163,20 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
         temperatures: torch.Tensor,
         top_ks: torch.Tensor,
+        sampling_seed=None,
+        seq_lens=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sampled [pbs, gamma] drafts and their logits from the [pbs, width, H] block."""
         # FIXME(junyanxu): sampled drafting runs eager until the sampling params can
         # enter the draft graph (sampling_info is an ignored direct-compile input).
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            del step_idx
             tokens = sample_tokens(
-                logits=step_logits, temperatures=temperatures, top_ks=top_ks
+                logits=step_logits,
+                temperatures=temperatures,
+                top_ks=top_ks,
+                sampling_seed=sampling_seed,
+                positions=None if sampling_seed is None else seq_lens + step_idx + 1,
             )
             return self._tp_sync.sync(SpecTpSyncSite.SPEC_DRAFT_SAMPLE, tokens)
 
@@ -373,6 +386,21 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     torch.ones((padded_bs,), dtype=torch.float32).to(self.device),
                     torch.ones((padded_bs,), dtype=torch.int32).to(self.device),
                 )
+                if self._seeds_requests():
+                    self._sample_draft_block(
+                        block_hidden,
+                        bonus_tokens,
+                        torch.ones(padded_bs, device=self.device),
+                        torch.full(
+                            (padded_bs,), 2, dtype=torch.int32, device=self.device
+                        ),
+                        sampling_seed=torch.zeros(
+                            padded_bs, dtype=torch.int64, device=self.device
+                        ),
+                        seq_lens=torch.zeros(
+                            padded_bs, dtype=torch.int64, device=self.device
+                        ),
+                    )[0].cpu()
                 draft_logits.float().cpu()
                 torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
                 self._warmup_sampled_accept(padded_bs, draft_tokens, draft_logits)

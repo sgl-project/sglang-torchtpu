@@ -1203,10 +1203,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     bs = batch.batch_size()
 
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
+    from sglang.srt.speculative.spec_common import accumulate_spec_penalty_tokens
+
+    accumulate_spec_penalty_tokens(batch)
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()

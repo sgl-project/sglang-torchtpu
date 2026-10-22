@@ -10,6 +10,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.spec_common import accumulate_spec_penalty_tokens
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import allocate_and_assign_decode_cache
 from sglang_tpu.dflash_utils_tpu import gather_dflash_candidate_window
@@ -53,6 +54,7 @@ class HostPaddedDraftInput(SpecInput):
         if not batch.req_to_token_pool.host_resident:
             raise RuntimeError("TpuSpecWorker needs a host-resident req_to_token pool.")
         batch.maybe_evict_swa()
+        accumulate_spec_penalty_tokens(batch)
 
         num_verify_rows = int(get_spec().speculative_num_draft_tokens)
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
@@ -173,13 +175,11 @@ class HostPaddedDraftInput(SpecInput):
 
 def _verify_window_eligible(batch: ScheduleBatch) -> bool:
     # A verify commits at most one window, the single offset the plan enumerates.
-    # grammar_retained_tokens can commit less, and the compact draft cache maps
-    # its own window from host lengths.
+    # A grammar-terminated request may retain a shorter prefix. The scheduler
+    # removes it before reusing state; remaining rows still advance by one window.
     return (
         batch.enable_overlap
         and isinstance(batch.req_pool_indices_cpu, torch.Tensor)
         and get_spec().speculative_draft_window_size is None
-        and not batch.return_logprob
-        and not batch.has_grammar
         and all(req.lora_id is None for req in batch.reqs)
     )

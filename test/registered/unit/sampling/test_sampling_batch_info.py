@@ -1218,6 +1218,29 @@ class TestHostSamplingMode(CustomTestCase):
         hash_patch = patch.object(sampler_module, "murmur_hash32", cpu_hash)
         hash_patch.start()
         self.addCleanup(hash_patch.stop)
+
+        def cpu_filter(probs, top_ks, top_ps, min_ps, **need):
+            # Replace only the TPU filter kernel; preserve its tie-inclusive mask.
+            descending = probs.sort(dim=-1, descending=True).values
+            cutoff = torch.zeros(probs.shape[0])
+            rows = torch.arange(probs.shape[0])
+            if need["need_top_k"]:
+                k = top_ks.clamp(1, probs.shape[1]).long() - 1
+                cutoff = torch.maximum(cutoff, descending[rows, k])
+            if need["need_top_p"]:
+                nucleus = (
+                    (descending.cumsum(-1) < top_ps[:, None])
+                    .sum(-1)
+                    .clamp_max(probs.shape[1] - 1)
+                )
+                cutoff = torch.maximum(cutoff, descending[rows, nucleus])
+            if need["need_min_p"]:
+                cutoff = torch.maximum(cutoff, descending[:, 0] * min_ps)
+            return torch.where(probs >= cutoff[:, None], probs, 0.0)
+
+        filter_patch = patch("sglang_tpu.sampling_mask.tpu_filter_probs", cpu_filter)
+        filter_patch.start()
+        self.addCleanup(filter_patch.stop)
         sampler = self._sampler()
         info = self._host_info(3)
         info.sampling_seed = torch.tensor([42, 7, 123])

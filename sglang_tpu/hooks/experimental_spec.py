@@ -21,7 +21,7 @@ import torch
 
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_context, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu.experimental import (
     experimental_spec_enabled,
@@ -31,6 +31,20 @@ from sglang_tpu.experimental import (
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+
+
+def _target_pp_size() -> int:
+    """The configured target PP, not draft_pp_context's one-stage group."""
+    # Argument resolution runs before the parallel bag is published and sees one stage.
+    context = get_context()
+    if context.is_config_namespace_published("parallel"):
+        return context.config_bag("parallel").pp_size
+    return 1
+
+
+def _serves_chain(spec_algorithm) -> bool:
+    """Whether TpuChainSpecWorker serves spec_algorithm at the configured target PP."""
+    return is_experimental_chain(spec_algorithm, pp_size=_target_pp_size())
 
 
 def initialize_host_batch(result, *args, **kwargs):
@@ -325,7 +339,7 @@ def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
 
 
 def supports_kv_free_fence(original, spec_algorithm, *, copies_draft_tail):
-    if is_experimental_spec(spec_algorithm):
+    if is_experimental_spec(spec_algorithm, pp_size=_target_pp_size()):
         # commit writes draft KV after the accept tensors the result copies;
         # the copied draft tail (kv_fence_tail) is an output of that write.
         return copies_draft_tail
@@ -335,14 +349,14 @@ def supports_kv_free_fence(original, spec_algorithm, *, copies_draft_tail):
 def need_topk(original, spec_algorithm):
     # HostPaddedDraftInput carries an empty topk placeholder; an EAGLE topk relay
     # would route it through the EAGLE device-accept resolve.
-    if is_experimental_chain(spec_algorithm):
+    if _serves_chain(spec_algorithm):
         return False
     return original(spec_algorithm)
 
 
 def supports_tpu_direct_compile(original, spec_algorithm):
     # The chain worker's fused draft and draft rows are direct-compiled.
-    if is_experimental_chain(spec_algorithm):
+    if _serves_chain(spec_algorithm):
         return True
     return original(spec_algorithm)
 
@@ -350,7 +364,7 @@ def supports_tpu_direct_compile(original, spec_algorithm):
 def spec_need_hidden_states(original):
     # The chain carry lives in a req-pool-indexed device table, never in FutureMap.
     algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    if is_experimental_chain(algorithm):
+    if _serves_chain(algorithm):
         return False
     return original()
 

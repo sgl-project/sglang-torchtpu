@@ -51,29 +51,41 @@ def experimental_spec_enabled() -> bool:
     )
 
 
-def is_experimental_spec_worker(spec_algorithm: SpeculativeAlgorithm) -> bool:
+def is_experimental_spec_worker(
+    spec_algorithm: SpeculativeAlgorithm, *, pp_size=1
+) -> bool:
     """Whether DFLASH/DSPARK is served by sglang_tpu.experimental.TpuBlockSpecWorker."""
-    return spec_algorithm.is_dflash_family() and experimental_spec_enabled()
+    return (
+        pp_size == 1
+        and spec_algorithm.is_dflash_family()
+        and experimental_spec_enabled()
+    )
 
 
-def is_experimental_mtp(spec_algorithm: SpeculativeAlgorithm) -> bool:
+def is_experimental_mtp(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
     """Whether MTP is served by sglang_tpu.experimental.TpuChainSpecWorker."""
     # Core resolves NEXTN (MTP) to EAGLE; exact, since is_eagle() also matches EAGLE3.
-    return spec_algorithm == SpeculativeAlgorithm.EAGLE and experimental_spec_enabled()
-
-
-def is_experimental_eagle3(spec_algorithm: SpeculativeAlgorithm) -> bool:
-    """Whether EAGLE3 is served by sglang_tpu.experimental.TpuChainSpecWorker."""
-    return spec_algorithm.is_eagle3() and experimental_spec_enabled()
-
-
-def is_experimental_chain(spec_algorithm: SpeculativeAlgorithm) -> bool:
-    """Whether TpuChainSpecWorker serves this algorithm (MTP or EAGLE3)."""
-    return is_experimental_mtp(spec_algorithm) or is_experimental_eagle3(spec_algorithm)
-
-
-def is_experimental_spec(spec_algorithm: SpeculativeAlgorithm) -> bool:
-    """Whether a TpuSpecWorker serves this algorithm (host-padded batches)."""
-    return is_experimental_spec_worker(spec_algorithm) or is_experimental_chain(
-        spec_algorithm
+    return (
+        pp_size == 1
+        and spec_algorithm == SpeculativeAlgorithm.EAGLE
+        and experimental_spec_enabled()
     )
+
+
+def is_experimental_eagle3(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
+    """Whether EAGLE3 is served by sglang_tpu.experimental.TpuChainSpecWorker."""
+    return pp_size == 1 and spec_algorithm.is_eagle3() and experimental_spec_enabled()
+
+
+def is_experimental_chain(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
+    """Whether TpuChainSpecWorker serves this algorithm (MTP or EAGLE3)."""
+    return is_experimental_mtp(
+        spec_algorithm, pp_size=pp_size
+    ) or is_experimental_eagle3(spec_algorithm, pp_size=pp_size)
+
+
+def is_experimental_spec(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
+    """Whether a TpuSpecWorker serves this algorithm (host-padded batches)."""
+    return is_experimental_spec_worker(
+        spec_algorithm, pp_size=pp_size
+    ) or is_experimental_chain(spec_algorithm, pp_size=pp_size)

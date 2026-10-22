@@ -41,6 +41,8 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs_from_tensors
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -63,12 +65,15 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.spec_common import VerifyLogitModifiers
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
+    GrammarTree,
+    build_grammar_vocab_mask,
     gather_spec_extras_func,
     prepare_mamba_track_for_verify,
     sample_simulated_acc_len,
@@ -88,7 +93,8 @@ from sglang_tpu.experimental.speculative.chain_verifier import ChainVerifier
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import (
-    apply_verify_logit_bias,
+    apply_token_bitmask,
+    apply_verify_logit_modifiers,
     build_verify_tokens,
     live_result_rows,
     pad_state_rows,
@@ -114,8 +120,10 @@ from sglang_tpu.mamba_pool import (
 )
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
+from sglang_tpu.sampling.seeded import verify_coins
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 # apply_dflash_simulated_acceptance's fixed_token_id, so both paths emit the same tokens.
@@ -127,6 +135,8 @@ _SAMPLING_WARMUP_VARIANTS = [{"greedy": True}] + [
     {"greedy": False, "top_k": top_k, "top_p": top_p, "min_p": min_p}
     for top_k, top_p, min_p in itertools.product((False, True), repeat=3)
 ]
+# Greedy and sampled rows in one batch: seeded sampling keeps the greedy rows on argmax.
+_MIXED_GREEDY = {"greedy": False, "top_k": True, "mixed_greedy": True}
 
 
 class TpuSpecWorker(BaseSpecWorker):
@@ -215,7 +225,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
-        self._warmup_verify_logit_bias()
+        self._warmup_verify_logit_modifiers()
         # A PD prefill server never verifies, so its mamba pool has no checkpoints.
         if (
             self._target_has_linear_attn
@@ -254,6 +264,9 @@ class TpuSpecWorker(BaseSpecWorker):
 
     def _warmup_logical_bs_ops(self) -> None:
         # torch_tpu compiles one program per shape even for a plain H2D copy.
+        # Not warmed: penalizer state (and its padding to the bucket) and decode
+        # logprobs stay at the live extent in shared code, so those eager programs
+        # compile once per new live size, the first time a request needs them.
         max_bs = min(
             self.target_worker.model_runner.max_running_requests,
             self._b_bucketer().max_val,
@@ -272,6 +285,8 @@ class TpuSpecWorker(BaseSpecWorker):
             ]
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
             + [((pbs, 2 * self.num_verify_rows), torch.int64) for pbs in bucket_sizes]
+            # Live (bs, 1): decode logprobs upload the live temperatures.
+            + [((bs, 1), torch.float32) for bs in live_sizes]
         )
         with torch.no_grad():
             for bs in live_sizes:
@@ -284,6 +299,14 @@ class TpuSpecWorker(BaseSpecWorker):
                         self.make_dummy_carry(bs),
                         padded_bs,
                     )
+                    # Grammar verify copies the live rows of the padded verify tokens.
+                    GrammarTree.from_linear_chain(
+                        torch.zeros(
+                            (padded_bs * self.num_verify_rows,),
+                            dtype=torch.int64,
+                            device=self.device,
+                        ).reshape(padded_bs, self.num_verify_rows)[:bs]
+                    ).resolve()
             for shape, dtype in h2d_shapes:
                 torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True).cpu()
             for pbs in bucket_sizes:
@@ -397,6 +420,7 @@ class TpuSpecWorker(BaseSpecWorker):
         rows: VerifyRows,
         draft_result: DraftResult,
         verify_input: TpuSpecVerifyInput,
+        grammar_barrier=None,
     ) -> tuple[LogitsProcessorOutput, AcceptResult]:
         """Score [r, d] with the target in one forward and accept losslessly.
 
@@ -408,6 +432,16 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens = build_verify_tokens(
                 bucket.state.bonus_tokens, draft_result.draft_tokens
             )
+        sampling_info = batch.sampling_info
+        live_bs = len(sampling_info)
+        physical_bs = bucket.state.seq_lens.shape[0]
+        grammar_tree = (
+            GrammarTree.from_linear_chain(
+                verify_tokens.reshape(physical_bs, self.num_verify_rows)[:live_bs]
+            )
+            if batch.has_grammar
+            else None
+        )
         logits_output = self._forward_target_verify(
             batch=batch,
             bucket_state=bucket.state,
@@ -419,12 +453,49 @@ class TpuSpecWorker(BaseSpecWorker):
         assert target_logits.shape[0] == draft_result.draft_tokens.shape[0] * (
             self.num_verify_rows
         ), "verify logits must keep the batch bucket rows"
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                target_logits[: live_bs * self.num_verify_rows],
+                sampling_info,
+                self.num_verify_rows,
+            )
+        modifiers = sampling_info.device_modifiers(physical_bs)
+        if any(value is not None for value in modifiers):
+            target_logits = apply_verify_logit_modifiers(
+                target_logits, modifiers, self.num_verify_rows
+            )
+            logits_output.next_token_logits = target_logits
+        if grammar_tree is not None:
+            grammar_mask = build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                tree=grammar_tree,
+                sampling_info=sampling_info,
+                device=target_logits.device,
+                barrier=grammar_barrier,
+                mask_rows=physical_bs * self.num_verify_rows,
+            )
+            if grammar_mask is not None:
+                target_logits = _apply_grammar_mask(target_logits, grammar_mask)
+                logits_output.next_token_logits = target_logits
+        randoms = {}
+        if sampling_info.sampling_seed is not None:
+            seeds = sampling_info.host_params_at(physical_bs)["sampling_seed"].to(
+                target_logits.device, non_blocking=True
+            )
+            # Keyed as GPU EAGLE keys a chain of N drafts (draft_token_num is
+            # N + 1): draft j's rejection coin in column j, the final coin in
+            # column N + 1.
+            coins, final_coins = verify_coins(
+                seeds, bucket.state.seq_lens, self.num_verify_rows
+            )
+            randoms = dict(coins=coins, final_sampling_coins=final_coins)
         num_correct_drafts, bonus_tokens, site = self.verifier.accept(
             target_logits=target_logits,
             draft_result=draft_result,
             bucket=bucket,
             threshold_single=self._accept_threshold_single,
             threshold_acc=self._accept_threshold_acc,
+            **randoms,
         )
         draft_tokens = draft_result.draft_tokens
         if self._simulate_acc_len > 0:
@@ -463,10 +534,16 @@ class TpuSpecWorker(BaseSpecWorker):
         bucket: BucketState,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        grammar_barrier=None,
     ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
-            batch, bucket, rows, draft_result, verify_input
+            batch,
+            bucket,
+            rows,
+            draft_result,
+            verify_input,
+            grammar_barrier=grammar_barrier,
         )
         if self._target_has_linear_attn:
             self._commit_linear_attn_states(
@@ -522,7 +599,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 self._forward_idle_decode(batch)
             result = self._idle_result()
         else:
-            result = self._forward_decode(batch)
+            result = self._forward_decode(batch, grammar_barrier=grammar_barrier)
         next_draft_input = result.next_draft_input
         assert isinstance(next_draft_input, HostPaddedDraftInput)
         # Rows with requests write KV; idle rows write only the reserved slot 0.
@@ -531,7 +608,9 @@ class TpuSpecWorker(BaseSpecWorker):
             on_publish(result.new_seq_lens)
         return result
 
-    def _forward_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def _forward_decode(
+        self, batch: ScheduleBatch, grammar_barrier=None
+    ) -> GenerationBatchResult:
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
@@ -545,7 +624,9 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.committed_lens,
             bucket.state.seq_lens,
         )
-        committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
+        committed, logits_output, accept = self.step(
+            batch, bucket, rows, verify_input, grammar_barrier=grammar_barrier
+        )
         next_state = committed.state
         # The scheduler stores this key as the next spec_info.future_indices.
         self._bucket = bucket._replace(key=batch.req_pool_indices, state=next_state)
@@ -557,7 +638,31 @@ class TpuSpecWorker(BaseSpecWorker):
         next_draft_input = result.next_draft_input
         assert isinstance(next_draft_input, HostPaddedDraftInput)
         next_draft_input.kv_fence_tail = committed.kv_fence_tail
+        if batch.return_logprob:
+            self._attach_logprobs(batch, logits_output, result.next_token_ids, bs)
         return result
+
+    def _attach_logprobs(
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        next_token_ids: torch.Tensor,
+        bs: int,
+    ) -> None:
+        # Rejected draft slots hold -1 for the scheduler, which drops their
+        # logprobs; gather them at token 0 so every index is in the vocabulary.
+        compute_spec_logprobs_from_tensors(
+            logits_output,
+            next_token_ids.clamp(min=0),
+            batch_size=bs,
+            temperatures=batch.sampling_info.temperatures[:bs].to(
+                logits_output.next_token_logits.device
+            ),
+            is_all_greedy=batch.sampling_info.is_all_greedy,
+            top_logprobs_nums=batch.top_logprobs_nums,
+            token_ids_logprobs=batch.token_ids_logprobs,
+            chain_stride=self.num_verify_rows,
+        )
 
     def _decode_buckets_for(self, bs: int) -> list[int]:
         """Decode buckets a rank with bs live requests can run (_decode_bucket)."""
@@ -742,9 +847,17 @@ class TpuSpecWorker(BaseSpecWorker):
         # A multimodal wrapper's eager outer logits processor emits live rows,
         # which TpuSampler pads to the batch bucket (whatever the input modality).
         eager_logits = not self._compile_policy()._compiles_logits_processor()
+        seeded_variants = (
+            [
+                dict(variant, seeded=True)
+                for variant in _SAMPLING_WARMUP_VARIANTS[1:] + [_MIXED_GREEDY]
+            ]
+            if self._seeds_requests()
+            else []
+        )
         with torch.no_grad():
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
-                for variant in _SAMPLING_WARMUP_VARIANTS:
+                for variant in _SAMPLING_WARMUP_VARIANTS + seeded_variants:
                     # A target that keeps extend outputs padded samples all cap rows,
                     # materializing the pbs-row params to them.
                     variants = {(pbs, False), (cap, True)}
@@ -780,6 +893,12 @@ class TpuSpecWorker(BaseSpecWorker):
                 # ModelRunner.sample positions, then the block-draft extend trim; a
                 # target that keeps extend outputs padded samples at the cap rows.
                 (torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1).cpu()
+                if self._pad_bs(bs) > bs:
+                    # Seeded sampling pads the live positions to the sampled rows.
+                    torch.nn.functional.pad(
+                        torch.zeros((bs,), dtype=torch.int64, device=self.device),
+                        (0, self._pad_bs(bs) - bs),
+                    ).cpu()
                 for rows in {self._pad_bs(bs), cap}:
                     torch.zeros((rows,), dtype=torch.int64, device=self.device)[
                         :bs
@@ -801,17 +920,93 @@ class TpuSpecWorker(BaseSpecWorker):
         logits = torch.zeros((cap, vocab_size), dtype=torch.float32).to(self.device)
         return logits if rows == cap else logits[:rows]
 
-    def _warmup_verify_logit_bias(self) -> None:
+    def _warmup_verify_logit_modifiers(self) -> None:
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         for pbs in self._b_bucketer().buckets:
+            for additive, scaling, bias in itertools.product((False, True), repeat=3):
+                modifiers = VerifyLogitModifiers(
+                    *[
+                        torch.full((pbs, vocab_size), fill, device=self.device)
+                        if enabled
+                        else None
+                        for enabled, fill in (
+                            (additive, 0.0),
+                            (scaling, 1.0),
+                            (bias, 0.0),
+                        )
+                    ]
+                )
+                if any(value is not None for value in modifiers):
+                    warmup_compiled_op(
+                        apply_verify_logit_modifiers,
+                        torch.zeros(
+                            (pbs * self.num_verify_rows, vocab_size), device=self.device
+                        ),
+                        modifiers,
+                        self.num_verify_rows,
+                    )
+            rows = pbs * self.num_verify_rows
+            bitmask = torch.zeros((rows, (vocab_size + 31) // 32), dtype=torch.int32)
             warmup_compiled_op(
-                apply_verify_logit_bias,
-                torch.zeros(
-                    (pbs * self.num_verify_rows, vocab_size), device=self.device
-                ),
-                torch.zeros((pbs, vocab_size), device=self.device),
-                self.num_verify_rows,
+                apply_token_bitmask,
+                torch.zeros((rows, vocab_size), device=self.device),
+                bitmask.to(self.device, non_blocking=True),
             )
+            if self._seeds_requests():
+                self._warmup_seeded_accept(pbs, vocab_size)
+                warmup_compiled_op(
+                    verify_coins,
+                    torch.zeros(pbs, dtype=torch.int64, device=self.device),
+                    torch.zeros(pbs, dtype=torch.int64, device=self.device),
+                    self.num_verify_rows,
+                )
+
+    def _warmup_seeded_accept(self, pbs, vocab_size):
+        logits = torch.zeros(
+            (pbs * self.num_verify_rows, vocab_size), device=self.device
+        )
+        drafts = torch.zeros(
+            (pbs, self.num_drafts), dtype=torch.int64, device=self.device
+        )
+        draft_logits = torch.zeros(
+            (pbs, self.num_drafts, vocab_size), device=self.device
+        )
+        params = self._sampling_param_warmup_args(pbs)
+        coins, final = verify_coins(
+            torch.zeros(pbs, dtype=torch.int64, device=self.device),
+            torch.zeros(pbs, dtype=torch.int64, device=self.device),
+            self.num_verify_rows,
+        )
+        randoms = dict(coins=coins, final_sampling_coins=final)
+        ops = self.verifier.ops
+        warmup_compiled_op(
+            ops.accept_drafts_target_only,
+            logits,
+            drafts,
+            self._all_drafts[pbs],
+            *params,
+            self._accept_threshold_single,
+            self._accept_threshold_acc,
+            **randoms,
+        )
+        warmup_compiled_op(
+            ops.accept_drafts_sampled,
+            logits,
+            drafts,
+            self._all_drafts[pbs],
+            draft_logits,
+            *params[:2],
+            **randoms,
+        )
+        warmup_compiled_op(
+            ops.accept_drafts_sampled_filtered,
+            logits,
+            drafts,
+            self._all_drafts[pbs],
+            draft_logits,
+            *params,
+            **randoms,
+        )
 
     def _sampling_param_warmup_args(
         self, padded_bs: int
@@ -979,21 +1174,24 @@ class TpuSpecWorker(BaseSpecWorker):
         top_k: bool = False,
         top_p: bool = False,
         min_p: bool = False,
+        seeded: bool = False,
         params_on_cpu: bool = False,
+        mixed_greedy: bool = False,
     ) -> SamplingBatchInfo:
         top_k_value = 1 if greedy else 2 if top_k else TOP_K_ALL
+        top_ks = torch.full((padded_bs,), top_k_value, dtype=torch.int32)
+        if mixed_greedy:
+            top_ks[::2] = 1
         # Pinned like HostPaddedSamplingInfo's rows: a pageable H2D is its own
         # program and would fuse into the sampler's first op.
         pin = is_pin_memory_available(self.device)
         return HostPaddedSamplingInfo(
             temperatures=torch.ones((padded_bs, 1), pin_memory=pin),
             top_ps=torch.full((padded_bs,), 0.9 if top_p else 1.0, pin_memory=pin),
-            top_ks=torch.full(
-                (padded_bs,), top_k_value, dtype=torch.int32, pin_memory=pin
-            ),
+            top_ks=top_ks.pin_memory() if pin else top_ks,
             min_ps=torch.full((padded_bs,), 0.1 if min_p else 0.0, pin_memory=pin),
             is_all_greedy=greedy,
-            is_any_greedy=greedy,
+            is_any_greedy=greedy or mixed_greedy,
             need_top_p_sampling=top_p,
             need_top_k_sampling=top_k_value != TOP_K_ALL,
             need_min_p_sampling=min_p,
@@ -1001,9 +1199,16 @@ class TpuSpecWorker(BaseSpecWorker):
             device=self.device,
             host_pad_bs=self._pad_bs,
             real_batch_size=padded_bs,
+            sampling_seed=torch.zeros(padded_bs, dtype=torch.int64) if seeded else None,
             # Serving's flag survives on_device(), so the sampler pads the params to the logits rows.
             sampling_params_on_cpu=params_on_cpu,
         )
+
+    def _seeds_requests(self) -> bool:
+        """Requests carry their seeds into sampling only under deterministic
+        inference (SamplingBatchInfo.from_schedule_batch); the seed-only programs
+        are warmed only then."""
+        return get_exec().deterministic.enable_deterministic_inference
 
     def _compile_policy(self) -> DecoderTpuCompilePolicy:
         compile_policy = self.target_worker.model_runner.compile_policy
@@ -1095,11 +1300,6 @@ class TpuSpecWorker(BaseSpecWorker):
             skip_attn_backend_init=False,
         )
         logits_output = target_out.logits_output
-        bias = batch.sampling_info.device_logit_bias(bucket_state.seq_lens.shape[0])
-        if bias is not None:
-            logits_output.next_token_logits = apply_verify_logit_bias(
-                logits_output.next_token_logits, bias, self.num_verify_rows
-            )
         return logits_output
 
     @staticmethod
@@ -1167,24 +1367,8 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> None:
         if pp_proxy_tensors is not None:
             raise NotImplementedError("TpuSpecWorker does not support PP.")
-        if batch.has_grammar:
-            raise NotImplementedError("TpuSpecWorker does not support grammar.")
-        if batch.return_logprob:
-            raise NotImplementedError("TpuSpecWorker does not support logprobs.")
         sampling_info = batch.sampling_info
-        if sampling_info is None:
-            return
-        # Their per-request device state is not bucket-padded, so filter/merge
-        # would compile per batch-size pair.
-        if (
-            sampling_info.acc_additive_penalties is not None
-            or sampling_info.acc_scaling_penalties is not None
-            or (
-                sampling_info.penalizer_orchestrator is not None
-                and sampling_info.penalizer_orchestrator.is_required
-            )
-        ):
-            raise NotImplementedError("TpuSpecWorker does not support penalties.")
+        assert is_host_padded(sampling_info)
         # The sort-based target filter keeps different boundary ties than the
         # verify filter, so filtered sampling needs the sort-free path on both.
         if not self._bsearch_filtering and any(
@@ -1193,16 +1377,6 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "TpuSpecWorker needs SGLANG_TPU_ENABLE_BSEARCH_SAMPLING for "
                 "top-k/top-p/min-p sampling."
-            )
-        # Processors expect len(sampling_info) live rows, not bucket rows.
-        if sampling_info.has_custom_logit_processor:
-            raise NotImplementedError(
-                "TpuSpecWorker does not support custom logit processors."
-            )
-        # Seeded sampling reads live-bs positions against bucket-padded seeds.
-        if sampling_info.sampling_seed is not None:
-            raise NotImplementedError(
-                "TpuSpecWorker does not support deterministic sampling."
             )
 
 
@@ -1223,3 +1397,14 @@ def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:
         "need_top_p": bool((sampled & (top_ps < 1.0)).any()),
         "need_min_p": bool((sampled & (min_ps > 0.0)).any()),
     }
+
+
+def _apply_grammar_mask(
+    logits: torch.Tensor, grammar_mask: GrammarMask
+) -> torch.Tensor:
+    # Packed int32 bitmasks (xgrammar, llguidance) take the warmed plain-op apply;
+    # another mask type keeps its backend's own (eager) apply.
+    if grammar_mask.vocab_mask.dtype == torch.int32:
+        return apply_token_bitmask(logits, grammar_mask.vocab_mask)
+    grammar_mask.apply(logits)
+    return logits

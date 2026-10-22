@@ -86,7 +86,9 @@ def _unfiltered(rows: int) -> dict[str, torch.Tensor]:
 
 def _select_worker(algorithm):
     """The TPU platform's worker for algorithm, or None for core's own."""
-    return TpuSRTPlatform().get_spec_worker_cls(algorithm, None, default=None)
+    return TpuSRTPlatform().get_spec_worker_cls(
+        algorithm, SimpleNamespace(pp_size=1), default=None
+    )
 
 
 class TestExperimentalEagle3(CustomTestCase):
@@ -435,6 +437,7 @@ class TestExperimentalEagle3(CustomTestCase):
         with (
             patch.object(TpuChainSpecWorker, "_compile_policy", return_value=policy),
             patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
+            patch.object(TpuChainSpecWorker, "_seeds_requests", return_value=True),
         ):
             worker._warmup_extend_sampling()
         self.assertEqual({shape for shape, _ in sampled}, {(1,), (2,), (4,)})
@@ -442,6 +445,41 @@ class TestExperimentalEagle3(CustomTestCase):
             broadcast,
             {(SpecTpSyncSite.SPEC_TARGET, *shape_dtype) for shape_dtype in sampled},
         )
+
+    def test_seed_only_extend_warmups_follow_deterministic_inference(self):
+        """Request seeds reach sampling only under deterministic inference, so
+        the seeded sampler variants are warmed only then."""
+        policy = SimpleNamespace(
+            _extend_compile_cap=lambda: 4, _compiles_logits_processor=lambda: True
+        )
+        buckets = SimpleNamespace(next_bucket=lambda bs: 1 << (bs - 1).bit_length())
+        calls = {}
+        for seeds in (False, True):
+            worker = _chain_worker()
+            seeded = calls[seeds] = []
+
+            def sampler(logits_output, sampling_info, *_args, seeded=seeded):
+                seeded.append(sampling_info.sampling_seed is not None)
+                rows = logits_output.next_token_logits.shape[0]
+                return torch.zeros((rows,), dtype=torch.int32)
+
+            worker._tp_sync = SimpleNamespace(sync=lambda site, values: values)
+            worker._target_worker = SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    sampler=sampler, model_config=SimpleNamespace(vocab_size=8)
+                )
+            )
+            with (
+                patch.object(
+                    TpuChainSpecWorker, "_compile_policy", return_value=policy
+                ),
+                patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
+                patch.object(TpuChainSpecWorker, "_seeds_requests", return_value=seeds),
+            ):
+                worker._warmup_extend_sampling()
+        self.assertNotIn(True, calls[False])
+        self.assertGreater(calls[True].count(True), 0)
+        self.assertEqual(calls[True].count(False), len(calls[False]))
 
     def test_draft_prompt_shift_keeps_chunks_consistent(self):
         """Each request's last row takes its own sampled token, except a non-final
@@ -576,11 +614,38 @@ class TestExperimentalEagle3(CustomTestCase):
         verify_input = SimpleNamespace(
             req_pool_indices_cpu=None, padded_kv_lens_after_rows=lambda rows: (None, 0)
         )
+        batch = SimpleNamespace(sampling_info=SimpleNamespace(sampling_seed=None))
         for sampled in (True, False):
             worker._sampled_drafts = sampled
-            worker.draft(None, bucket, None, verify_input)
+            worker.draft(batch, bucket, None, verify_input)
         self.assertIs(seen[0], bucket.temperatures)
         self.assertIsNone(seen[1])
+
+    def test_seeded_sampled_drafts_take_the_bucket_padded_seeds(self):
+        worker = _chain_worker()
+        worker.num_drafts = 2
+        worker._sampled_drafts = True
+        seen = []
+        worker._draft_chain = lambda **kwargs: seen.append(kwargs["sampling_seed"])
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.zeros(4, dtype=torch.int64)),
+            temperatures=torch.ones(4),
+            top_ks=torch.ones(4),
+        )
+        verify_input = SimpleNamespace(
+            req_pool_indices_cpu=None, padded_kv_lens_after_rows=lambda rows: (None, 0)
+        )
+        seeds = torch.tensor([3, 5, 0, 0])
+        rows = []
+        sampling_info = SimpleNamespace(
+            sampling_seed=seeds[:2],
+            host_params_at=lambda n: rows.append(n) or {"sampling_seed": seeds},
+        )
+        worker.draft(
+            SimpleNamespace(sampling_info=sampling_info), bucket, None, verify_input
+        )
+        self.assertEqual(rows, [4])
+        torch.testing.assert_close(seen[0], seeds)
 
 
 if __name__ == "__main__":

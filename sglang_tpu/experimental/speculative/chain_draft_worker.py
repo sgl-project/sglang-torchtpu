@@ -27,6 +27,7 @@ from sglang_tpu.experimental.speculative.chain_draft_input import (
     chain_draft_forward_input,
 )
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
+from sglang_tpu.sampling.seeded import sample_categorical
 
 # (forward_batch, carry, req_pool_indices, positions, cache_locs, seq_lens,
 #  temperatures, top_ks, uniforms) -> (drafts [pbs, N], dense logits [pbs, N, V] | None).
@@ -251,8 +252,9 @@ class TpuChainDraftWorker(TpuDraftWorker):
             dense.float() / temperatures.clamp_min(1e-5)[:, None], dim=-1
         )
         # Inverse CDF with one uniform per row; ranks share the uniforms, so no sync.
-        drawn = (probs.cumsum(dim=-1) < uniforms[:, None]).sum(dim=-1)
-        drawn = drawn.clamp_max(dense.shape[-1] - 1)
+        # Its half-open coins never land on a zero-probability token, such as a
+        # target token outside the draft vocabulary, even at a zero uniform.
+        drawn = sample_categorical(probs, uniforms)
         token = torch.where(top_ks <= 1, torch.argmax(dense, dim=-1), drawn)
         return token, dense
 

@@ -97,6 +97,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 "sglang.srt.sampling.sampling_batch_info.get_exec", return_value=context
             )
         )
+        from sglang.srt.runtime_context import get_context
+
+        stack.enter_context(get_context().override_server_args(pp_size=1))
         stack.enter_context(
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True)
         )
@@ -254,6 +257,28 @@ class TestExperimentalSpecHooks(CustomTestCase):
             served = self.batch([1], spec_algorithm=algorithm)
             self.assertIs(served.host_pad_bs, _pad)
             self.assertIsInstance(served.sampling_info, HostPaddedSamplingInfo)
+
+    def test_draft_pp_scope_keeps_the_configured_batch_route(self):
+        from sglang.srt.runtime_context import get_context, get_parallel
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        # A PP=2 target keeps DSpark on the compatibility worker, which registers
+        # no host-batch padder, so the draft's one-stage PP group must not switch
+        # its batches to host padding.
+        self.assertIs(
+            TpuSRTPlatform().get_spec_worker_cls(
+                SpeculativeAlgorithm.DSPARK, SimpleNamespace(pp_size=2), default=object
+            ),
+            object,
+        )
+        with (
+            patch("sglang_tpu.experimental._host_batch_padder", None),
+            get_context().override_server_args(pp_size=2),
+            get_parallel().override(pp_size=1),
+        ):
+            batch = self.batch([1])
+        self.assertFalse(hasattr(batch, "host_pad_bs"))
+        self.assertIs(type(batch.sampling_info), SamplingBatchInfo)
 
     def test_prefill_staging_and_allocation_remain_on_host(self):
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
@@ -510,7 +535,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         def select_experimental_spec_worker(_default, algorithm, _server_args):
-            return TpuSRTPlatform().get_spec_worker_cls(algorithm, None, default=None)
+            return TpuSRTPlatform().get_spec_worker_cls(
+                algorithm, SimpleNamespace(pp_size=1), default=None
+            )
 
         mtp = SpeculativeAlgorithm.from_string("NEXTN")
         spec_args = SimpleNamespace(speculative_algorithm="NEXTN")
@@ -607,7 +634,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
             pass
 
         def select(algo):
-            return platform.get_spec_worker_cls(algo, None, default=_CoreWorker)
+            return platform.get_spec_worker_cls(
+                algo, SimpleNamespace(pp_size=1), default=_CoreWorker
+            )
 
         with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
             self.assertIs(select(SpeculativeAlgorithm.DFLASH), TpuBlockSpecWorker)
@@ -706,9 +735,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         # Enabling the server feature alone must not stop startup.
         self.assertIsInstance(init(True).sampler, TpuSampler)
 
-    def test_worker_rejects_mixed_phase_dp_steps(self):
-        """Under DP attention, prefill coordination or a skipped MLP sync lets one
-        rank prefill while another decodes; the worker must refuse, not desync."""
+    def test_worker_rejects_unsupported_mixed_phase_dp_at_startup(self):
+        """TPU collective graphs retain their existing same-phase restriction."""
         from sglang.srt.environ import envs as srt_envs
         from sglang_tpu.experimental.speculative import base_spec_worker
         from sglang_tpu.experimental.speculative.block_spec_worker import (
@@ -926,7 +954,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
     def test_per_batch_checks_refuse_only_unsupported_requests(self):
         """Filtered sampling needs the sort-free filter (the sort-based target
         keeps different boundary ties), but greedy rows (top_k = 1) do not; custom
-        logit processors are refused per batch, not at startup."""
+        logit processors are supported at the live request extent."""
         from sglang_tpu.experimental.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
@@ -935,12 +963,15 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._bsearch_filtering = False
 
         def batch(top_k=1, top_p=1.0, custom=False):
-            sampling_info = SimpleNamespace(
-                logit_bias=None,
-                acc_additive_penalties=None,
-                acc_scaling_penalties=None,
-                penalizer_orchestrator=None,
-                sampling_seed=None,
+            sampling_info = HostPaddedSamplingInfo(
+                temperatures=torch.ones(2, 1),
+                is_all_greedy=top_k == 1,
+                is_any_greedy=True,
+                need_top_k_sampling=True,
+                need_top_p_sampling=top_p < 1,
+                need_min_p_sampling=False,
+                device="cpu",
+                real_batch_size=2,
                 has_custom_logit_processor=custom,
                 vocab_size=32,
                 top_ks=torch.tensor([1, top_k], dtype=torch.int32),
@@ -957,8 +988,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         check(batch=batch(top_k=1 << 30), pp_proxy_tensors=None)
         with self.assertRaisesRegex(NotImplementedError, "BSEARCH"):
             check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
-        with self.assertRaisesRegex(NotImplementedError, "custom logit processors"):
-            check(batch=batch(custom=True), pp_proxy_tensors=None)
+        check(batch=batch(custom=True), pp_proxy_tensors=None)
         worker._bsearch_filtering = True
         check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
 
@@ -989,6 +1019,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         ]
         batch = SimpleNamespace(
             reqs=reqs,
+            sampling_info=SimpleNamespace(
+                penalizer_orchestrator=SimpleNamespace(is_required=False)
+            ),
             batch_size=lambda: len(reqs),
             maybe_evict_swa=lambda: None,
             req_to_token_pool=SimpleNamespace(
@@ -1038,11 +1071,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertEqual(draft.tpu_committed_lens.tolist(), [5, 10])
             self.assertEqual(draft.tpu_req_pool_indices.tolist(), [1, 2])
 
-            # Logprobs can commit past the window's bound: stay on the sync path.
+            # Logprobs retain the same bounded chain/KV window.
             batch.return_logprob = True
             draft.prepare_for_decode(batch)
-            self.assertFalse(draft.tpu_host_seq_lens_is_committed)
-            self.assertIsNone(draft.tpu_verify_cache_candidates)
+            self.assertTrue(draft.tpu_host_seq_lens_is_committed)
+            self.assertIsNotNone(draft.tpu_verify_cache_candidates)
 
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):

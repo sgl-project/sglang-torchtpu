@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dspark_components import dspark_verify
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -49,6 +50,38 @@ class TestGreedyDraftAccept(CustomTestCase):
         self.assertEqual(probs.shape, (BS, GAMMA, VOCAB))
         expected = torch.nn.functional.one_hot(draft_tokens, VOCAB).float()
         self.assertTrue(torch.equal(probs, expected))
+
+
+def _forward_sampling_info(**fields):
+    # copy_for_forward's result: penalties survive only as their accumulations.
+    return SamplingBatchInfo(
+        temperatures=torch.ones(BS, 1),
+        top_ps=torch.ones(BS),
+        top_ks=torch.ones(BS, dtype=torch.int32),
+        min_ps=torch.zeros(BS),
+        is_all_greedy=True,
+        is_any_greedy=True,
+        need_top_p_sampling=False,
+        need_top_k_sampling=False,
+        need_min_p_sampling=False,
+        vocab_size=VOCAB,
+        device="cpu",
+        **fields,
+    )
+
+
+class TestVerifyLogitsAdjustments(CustomTestCase):
+    def test_accumulated_penalties_keep_verify_off_the_unadjusted_paths(self):
+        self.assertTrue(
+            dspark_verify.verify_logits_adjustments_are_noop(_forward_sampling_info())
+        )
+        for field, fill in (
+            ("acc_additive_penalties", 0.0),
+            ("acc_scaling_penalties", 1.0),
+        ):
+            info = _forward_sampling_info(**{field: torch.full((BS, VOCAB), fill)})
+            self.assertIsNone(info.penalizer_orchestrator)
+            self.assertFalse(dspark_verify.verify_logits_adjustments_are_noop(info))
 
 
 if __name__ == "__main__":

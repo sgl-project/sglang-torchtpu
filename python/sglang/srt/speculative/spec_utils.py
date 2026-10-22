@@ -1400,6 +1400,8 @@ def generate_token_bitmask(
     retrieve_next_sibling_cpu: torch.Tensor,
     draft_tokens_cpu: torch.Tensor,
     vocab_size: int,
+    *,
+    mask_rows: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
     """
     Generate the logit mask for structured output.
@@ -1410,6 +1412,8 @@ def generate_token_bitmask(
     """
 
     num_draft_tokens = draft_tokens_cpu.shape[-1]
+    mask_rows = draft_tokens_cpu.numel() if mask_rows is None else mask_rows
+    assert mask_rows >= draft_tokens_cpu.numel()
 
     allocate_token_bitmask = None
     assert len(reqs) == retrieve_next_token_cpu.shape[0]
@@ -1419,7 +1423,7 @@ def generate_token_bitmask(
             if allocate_token_bitmask is None:
                 allocate_token_bitmask = req.grammar.allocate_vocab_mask(
                     vocab_size=vocab_size,
-                    batch_size=draft_tokens_cpu.numel(),
+                    batch_size=mask_rows,
                     device="cpu",
                 )
             grammar = req.grammar
@@ -1513,6 +1517,7 @@ def build_grammar_vocab_mask(
     sampling_info: SamplingBatchInfo,
     device,
     barrier: Optional[Callable[[], None]],
+    mask_rows: Optional[int] = None,
 ) -> Optional[GrammarMask]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
@@ -1526,6 +1531,7 @@ def build_grammar_vocab_mask(
         reqs,
         *tree.resolve(),
         sampling_info.vocab_size,
+        mask_rows=mask_rows,
     )
     if vocab_mask is None:
         return None

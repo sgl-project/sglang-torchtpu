@@ -75,6 +75,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
 )
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows, padded_h2d
+from sglang_tpu.sampling.seeded import draft_uniforms
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuChainDraftWorker]] = {
     # MTP: core resolves NEXTN to EAGLE.
@@ -151,10 +152,14 @@ class TpuChainSpecWorker(TpuSpecWorker):
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
     ) -> DraftResult:
-        del batch
         # Host KV bound past the last draft row; RPA reads the exact length per step.
         seq_lens_cpu, _ = verify_input.padded_kv_lens_after_rows(self.num_drafts)
         sampled = self._sampled_drafts
+        sampling_seed = None
+        if sampled and batch.sampling_info.sampling_seed is not None:
+            sampling_seed = batch.sampling_info.host_params_at(
+                bucket.state.seq_lens.shape[0]
+            )["sampling_seed"].to(self.device, non_blocking=True)
         return self._draft_chain(
             state=bucket.state,
             rows=rows,
@@ -162,6 +167,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
             seq_lens_cpu=seq_lens_cpu,
             temperatures=bucket.temperatures if sampled else None,
             top_ks=bucket.top_ks if sampled else None,
+            sampling_seed=sampling_seed,
         )
 
     def _draft_chain(
@@ -173,6 +179,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         seq_lens_cpu: torch.Tensor,
         temperatures: torch.Tensor | None,
         top_ks: torch.Tensor | None,
+        sampling_seed: torch.Tensor | None = None,
     ) -> DraftResult:
         """The fused draft and its eager prelude; warmup runs it as serving does."""
         padded_bs = state.seq_lens.shape[0]
@@ -185,6 +192,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 seq_lens_cpu=seq_lens_cpu,
                 temperatures=temperatures,
                 top_ks=top_ks,
+                sampling_seed=sampling_seed,
             )
         return DraftResult(
             draft_tokens=draft_tokens,
@@ -201,6 +209,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         seq_lens_cpu: torch.Tensor,
         temperatures: torch.Tensor | None,
         top_ks: torch.Tensor | None,
+        sampling_seed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         padded_bs = state.seq_lens.shape[0]
         drafter = self._chain_draft_worker
@@ -214,15 +223,17 @@ class TpuChainSpecWorker(TpuSpecWorker):
             out_cache_loc=rows.cache_locs[:, 0].contiguous(),
         )
         sampled = temperatures is not None and top_ks is not None
-        uniforms = (
+        uniforms = None
+        if sampled and sampling_seed is not None:
+            # A seeded request's drafts depend only on its seed and their positions,
+            # as its verify coins do, so other traffic cannot change its output.
+            uniforms = draft_uniforms(sampling_seed, state.seq_lens, self.num_drafts)
+        elif sampled:
             # Ranks draw alike from rank 0's uniforms, so the fused chain needs no sync.
-            self._tp_sync.sync(
+            uniforms = self._tp_sync.sync(
                 SpecTpSyncSite.SPEC_DRAFT_SAMPLE,
                 torch.rand((padded_bs, self.num_drafts), device=self.device),
             )
-            if sampled
-            else None
-        )
         draft_tokens, draft_logits = drafter.run_fused_draft(
             forward_batch,
             req_pool_indices=state.req_pool_indices,
@@ -545,6 +556,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
         with torch.no_grad():
             for pbs in self._b_bucketer().buckets:
                 self._warmup_draft_chain(pbs)
+                if self._sampled_drafts and self._seeds_requests():
+                    zeros = torch.zeros((pbs,), dtype=torch.int64, device=self.device)
+                    warmup_compiled_op(draft_uniforms, zeros, zeros, self.num_drafts)
                 rows = _dummy_verify_rows(pbs, width, self.device)
                 accept_tokens = torch.zeros(
                     (pbs, width), dtype=torch.int64, device=self.device
