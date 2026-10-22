@@ -718,7 +718,12 @@ class TestLogitsOutputMode(_PolicyTestCase):
             metadata = LogitsMetadata.from_forward_batch(batch)
             return value + int(metadata.forward_mode)
 
-        with patch("sglang.srt.layers.logits_processor._is_tpu", True):
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        with patch(
+            "sglang.srt.layers.logits_processor.platforms.current_platform",
+            TpuSRTPlatform(),
+        ):
             torch._dynamo.reset()
             self.addCleanup(torch._dynamo.reset)
             compiled = torch.compile(consume_mode, backend="eager", fullgraph=True)

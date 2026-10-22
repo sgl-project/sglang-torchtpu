@@ -74,7 +74,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_shm_available,
-    is_tpu,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -83,7 +82,6 @@ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
-_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 
@@ -716,7 +714,7 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
-        if _is_tpu:
+        if not platforms.current_platform.capabilities.traces_raw_collectives:
             # Raw torch.distributed.all_reduce lowers to
             # _c10d_functional.all_reduce, which Dynamo cannot trace under
             # torch.compile at tp>1; the registered custom op is traceable.
@@ -1843,7 +1841,7 @@ class GroupCoordinator:
                 # Skip sending empty tensors.
                 continue
 
-            if _is_tpu:
+            if not platforms.current_platform.capabilities.device_p2p:
                 # TPU has no device send/recv: ship a host copy on the gloo
                 # cpu_group (the copy also waits for the producing program).
                 tensor = tensor.contiguous().cpu()
@@ -1890,7 +1888,10 @@ class GroupCoordinator:
                 # On TPU a device tensor arrives as a host copy on the gloo
                 # cpu_group and is uploaded to the sender's device type after
                 # the receive, unless the caller keeps it on the host.
-                via_host = _is_tpu and value.device != "cpu"
+                via_host = (
+                    not platforms.current_platform.capabilities.device_p2p
+                    and value.device != "cpu"
+                )
                 upload = via_host and not keep_on_host
                 tensor = torch.empty(
                     value.size,

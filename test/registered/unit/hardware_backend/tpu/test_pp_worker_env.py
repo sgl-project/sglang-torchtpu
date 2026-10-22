@@ -19,6 +19,7 @@ from sglang.srt.utils.patch_torch import (
     monkey_patch_torch_tpu_env,
 )
 from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 _ENV_VARS = (
     "RANK",
@@ -160,7 +161,9 @@ class TestPipelineGroupCommunicators(CustomTestCase):
         with (
             # initialize_model_parallel reads the widths from the published config.
             published_topology(tp_size=1, pp_size=8),
-            patch.object(parallel_state, "_is_tpu", True),
+            patch.object(
+                parallel_state.platforms, "current_platform", TpuSRTPlatform()
+            ),
             patch.object(parallel_state, "_WORLD", None),
             patch.object(parallel_state, "_TP", None),
             patch.object(parallel_state, "_ATTN_CP", None),

@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt import platforms
 from sglang.srt.arg_groups.model_override_base import (
     ep_scale_joiner_of,
     resolving_view,
@@ -32,7 +33,7 @@ from sglang.srt.runtime_context import (
     get_resources,
     get_stream,
 )
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_tpu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -128,7 +129,6 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
 
 
 _is_hip = is_hip()
-_is_tpu = is_tpu()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 _is_cpu = is_cpu()
 
@@ -149,9 +149,8 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        # TPU requires static shapes and equal-length per-rank blocks. Only
-        # MAX_LEN is compatible with that.
-        if _is_tpu:
+        # Uniform per-rank blocks require MAX_LEN padding.
+        if platforms.current_platform.capabilities.uniform_dp_padding:
             return DpPaddingMode.MAX_LEN
 
         gather_width = dp_gather_width()
@@ -676,7 +675,7 @@ def _dp_gather_via_all_reduce(
             global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
-def _dp_gather_tpu_all_reduce(
+def _dp_gather_rank_uniform_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     is_partial: bool,
@@ -738,12 +737,12 @@ def _dp_gather_via_all_gather(
             get_parallel().tp_group.all_gather_into_tensor(global_tokens, local_tokens)
         return
 
-    if _is_tpu:
-        # TODO: remove this branch and _dp_gather_tpu_all_reduce once torch_tpu
+    if platforms.current_platform.capabilities.rank_uniform_graphs:
+        # TODO: remove this branch and _dp_gather_rank_uniform_all_reduce once torch_tpu
         # keeps rank-divergent in-graph collectives (today it drops the
         # collective on ranks whose traced graph lacks the consumer). The
         # standard reduce-scatter + all-gather path below works once it does.
-        _dp_gather_tpu_all_reduce(global_tokens, local_tokens, is_partial)
+        _dp_gather_rank_uniform_all_reduce(global_tokens, local_tokens, is_partial)
         return
     if not is_partial:
         if get_parallel().attn_tp_rank != 0:
@@ -1100,10 +1099,10 @@ def dp_scatter(
     ``cp_shard_counts`` (as in dp_gather_partial) the rank takes back only its
     own CP shard, and the rest of ``local_tokens`` is zero."""
     _note_dp_gather_in_prefill_graph()
-    if _is_tpu:
-        # TPU supports MAX_LEN only (SUM_LEN is ragged and not supported by TPU)
+    if platforms.current_platform.capabilities.rank_uniform_graphs:
+        # Rank-uniform scatter uses equal-sized slots.
         assert forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN, (
-            "TPU DP scatter requires DpPaddingMode.MAX_LEN, got "
+            "Rank-uniform DP scatter requires DpPaddingMode.MAX_LEN, got "
             f"{forward_batch.dp_padding_mode}"
         )
         n = local_tokens.shape[0]

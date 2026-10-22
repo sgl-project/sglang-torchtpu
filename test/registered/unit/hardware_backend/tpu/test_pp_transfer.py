@@ -27,7 +27,9 @@ import torch.multiprocessing
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator, TensorMetadata
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
 def _fake_device_tensor(host_copy: torch.Tensor, device_type: str = "tpu"):
@@ -61,7 +63,9 @@ class TestSendTensorDictOnTpu(CustomTestCase):
         device = _fake_device_tensor(host)
         work = object()
         with (
-            patch.object(parallel_state, "_is_tpu", True),
+            patch.object(
+                parallel_state.platforms, "current_platform", TpuSRTPlatform()
+            ),
             patch.object(
                 parallel_state.torch.distributed, "isend", return_value=work
             ) as isend,
@@ -88,7 +92,9 @@ class TestSendTensorDictOnTpu(CustomTestCase):
         coordinator = _coordinator()
         tokens = torch.arange(3)
         with (
-            patch.object(parallel_state, "_is_tpu", True),
+            patch.object(
+                parallel_state.platforms, "current_platform", TpuSRTPlatform()
+            ),
             patch.object(parallel_state.torch.distributed, "send") as send,
         ):
             coordinator.send_tensor_dict({"next_token_ids": tokens})
@@ -100,7 +106,7 @@ class TestSendTensorDictOnTpu(CustomTestCase):
         coordinator = _coordinator()
         device = _fake_device_tensor(torch.ones(2), device_type="cuda")
         with (
-            patch.object(parallel_state, "_is_tpu", False),
+            patch.object(parallel_state.platforms, "current_platform", SRTPlatform()),
             patch.object(parallel_state.torch.distributed, "send") as send,
         ):
             coordinator.send_tensor_dict({"hidden_states": device})
@@ -126,7 +132,11 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
 
         with (
             patch("torch.distributed.is_initialized", return_value=True),
-            patch.object(parallel_state, "_is_tpu", is_tpu),
+            patch.object(
+                parallel_state.platforms,
+                "current_platform",
+                TpuSRTPlatform() if is_tpu else SRTPlatform(),
+            ),
             patch.object(
                 parallel_state.torch.distributed, "irecv", side_effect=fake_irecv
             ),
@@ -189,7 +199,7 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
         ]
         with (
             patch("torch.distributed.is_initialized", return_value=True),
-            patch.object(parallel_state, "_is_tpu", False),
+            patch.object(parallel_state.platforms, "current_platform", SRTPlatform()),
             patch.object(
                 parallel_state.torch.distributed, "irecv", return_value=MagicMock()
             ) as irecv,
@@ -230,7 +240,9 @@ def _run_wave_column_hand_off(rank: int, init_file: str) -> None:
         scheduler._pp_tensor_dict_inbox = defaultdict(deque)
         hidden = torch.arange(32, dtype=torch.float32).reshape(4, 8)
         tokens = torch.arange(4)
-        with patch.object(parallel_state, "_is_tpu", True):
+        with patch.object(
+            parallel_state.platforms, "current_platform", TpuSRTPlatform()
+        ):
             if rank == 0:
                 for tensors, kind in (
                     ({"hidden_states": hidden}, "proxy"),

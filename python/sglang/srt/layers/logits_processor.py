@@ -26,6 +26,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt import platforms
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -410,7 +411,10 @@ class LogitsMetadata:
         # the logical mode after the compiled forward; reading the optional
         # original mode here would also create a serving-only Dynamo variant.
         forward_mode = forward_batch.forward_mode
-        if not _is_tpu and forward_batch._original_forward_mode == ForwardMode.IDLE:
+        if (
+            not platforms.current_platform.capabilities.rank_uniform_graphs
+            and forward_batch._original_forward_mode == ForwardMode.IDLE
+        ):
             forward_mode = ForwardMode.IDLE
         if (
             compute_input_logprobs
@@ -486,7 +490,9 @@ class LogitsMetadata:
             # TPU requires equal-sized blocks and does not support variable
             # length, so use MAX_LEN. GPU defaults to SUM_LEN.
             dp_padding_mode=(
-                DpPaddingMode.MAX_LEN if _is_tpu else DpPaddingMode.SUM_LEN
+                DpPaddingMode.MAX_LEN
+                if platforms.current_platform.capabilities.uniform_dp_padding
+                else DpPaddingMode.SUM_LEN
             ),
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,

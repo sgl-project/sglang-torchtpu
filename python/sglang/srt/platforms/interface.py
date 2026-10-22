@@ -54,11 +54,16 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     # DP gather/scatter supports only equal per-rank blocks (DpPaddingMode.MAX_LEN).
     uniform_dp_padding: bool = False
     # Compiled programs must be identical on every rank; no rank-dependent branches.
+    # Requires uniform_dp_padding: rank-uniform gather/scatter use equal slots.
     rank_uniform_graphs: bool = False
     # Device tensors can be sent point-to-point without a host copy.
     device_p2p: bool = True
     # Dynamo can trace raw torch.distributed (c10d functional) collectives.
     traces_raw_collectives: bool = True
+
+    def __post_init__(self):
+        if self.rank_uniform_graphs and not self.uniform_dp_padding:
+            raise ValueError("rank_uniform_graphs requires uniform_dp_padding")
 
 
 class SRTPlatform(DeviceMixin):
