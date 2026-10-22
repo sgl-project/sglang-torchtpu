@@ -146,6 +146,9 @@ class PallasForwardMetadata:
     cp_last_rows: torch.Tensor | None = None
     # i32[max_num_seqs]  1 where this rank owns the request's last token
     cp_last_owner_mask: torch.Tensor | None = None
+    # i64[cp_size * local_tokens]  all-gathered row of each global token; set
+    # only under FULL hidden capture (cp_layout.global_rows)
+    cp_global_rows: torch.Tensor | None = None
     # Owned scalar i32: -1=native fallback, 0=static base, 1024/2048=promotion.
     # Backends without runtime tile selection leave this unset.
     prefill_kv_tile_hint: torch.Tensor | None = None
@@ -1380,6 +1383,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             cp_last_owner_mask=torch.from_numpy(host.last_owner_mask)
             .to(torch.int32)
             .to(device, non_blocking=True),
+            cp_global_rows=(
+                torch.from_numpy(host.global_rows).to(device, non_blocking=True)
+                if forward_batch.capture_hidden_mode is not None
+                and forward_batch.capture_hidden_mode.is_full()
+                else None
+            ),
         )
 
     def _cp_write_runs(

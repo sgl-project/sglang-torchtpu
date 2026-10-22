@@ -505,8 +505,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     @property
     def _cp_strategy(self) -> Any:
-        """Prefill context-parallel strategy, or None when not configured; not
-        cached, since the strategy may initialize after this policy is built."""
+        """Prefill context-parallel strategy, or None when not configured or on
+        a draft runner; not cached, since the strategy may initialize after this
+        policy is built."""
+        if self.model_runner.is_draft_worker:
+            return None
         return get_cp_strategy()
 
     def _record_compile_step(
@@ -1034,6 +1037,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 cp_rank=self._cp_strategy.cp_rank,
                 device=self.model_runner.device,
             )
+            # A spec target extend stages its token inputs on host (HOST_PADDED).
+            self._upload_host_padded_inputs(forward_batch)
         else:
             real_q, real_b = _pad_forward_batch_inputs(
                 forward_batch,
@@ -1593,7 +1598,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Build generic text decoder warmup inputs."""
         if variant == "cp":
             forward_batch = self._make_cp_dummy_forward_batch(
-                local_tokens=num_tokens, bs=bs, capture_hidden_mode=capture_hidden_mode
+                local_tokens=num_tokens,
+                bs=bs,
+                capture_hidden_mode=capture_hidden_mode,
+                spec_info=spec_info,
             )
         else:
             forward_batch = self._make_dummy_forward_batch(
@@ -1609,7 +1617,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
     def _make_cp_dummy_forward_batch(
-        self, *, local_tokens: int, bs: int, capture_hidden_mode: CaptureHiddenMode
+        self,
+        *,
+        local_tokens: int,
+        bs: int,
+        capture_hidden_mode: CaptureHiddenMode,
+        spec_info: SpecInput | None = None,
     ) -> ForwardBatch:
         """EXTEND dummy whose zigzag layout fills exactly ``local_tokens``
         rows on every context-parallel rank, with the CP-v2 metadata built
@@ -1629,7 +1642,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             bs=len(request_lens),
             mode=ForwardMode.EXTEND,
             capture_hidden_mode=capture_hidden_mode,
-            spec_info=None,
+            spec_info=spec_info,
         )
         if not is_cp_active(forward_batch):
             raise RuntimeError(

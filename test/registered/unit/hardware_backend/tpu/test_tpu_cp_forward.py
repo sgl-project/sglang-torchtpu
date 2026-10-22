@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.layers.cp.base import get_cp_strategy, init_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_rpa_batched import (
@@ -19,6 +19,7 @@ from sglang_tpu.attention_pallas_rpa_batched import (
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.cp_forward import (
     TpuCpBatchLayout,
+    cp_global_token_rows,
     cp_last_token_rows,
     get_tpu_cp_layout,
     install_cp_logits_forward,
@@ -31,6 +32,7 @@ from sglang_tpu.cp_layout import (
     local_row_count,
     warmup_request_lengths,
 )
+from sglang_tpu.cp_strategy import draft_cp_context
 from sglang_tpu.kv_row_write import kv_write_segments
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
@@ -118,6 +120,16 @@ class TestZigzagLayout(CustomTestCase):
         for host in layouts:
             got = list(zip(host.gathered_req.tolist(), host.gathered_pos.tolist()))
             self.assertEqual(got, expected)
+
+    def test_global_rows_restore_the_batch_token_order(self):
+        """A spec draft reads every prompt row in the batch's own order from the
+        rank-major all-gather of the local rows."""
+        layouts = _layouts()
+        gathered = np.concatenate([host.local_rows for host in layouts])
+        total = sum(EXTEND)
+        for host in layouts:
+            restored = gathered[host.global_rows]
+            self.assertEqual(restored[:total].tolist(), list(range(total)))
 
     def test_rejects_batches_whose_rows_would_be_lost(self):
         with self.assertRaisesRegex(ValueError, "no token to prefill"):
@@ -210,6 +222,16 @@ class TestTpuZigzagStrategy(CustomTestCase):
         stay on the plain program, since warmup compiles CP for extends only."""
         self.assertFalse(is_cp_active(self._batch([40, 1, 1], mode=ForwardMode.MIXED)))
 
+    def test_draft_context_keeps_the_draft_off_cp(self):
+        """A spec draft extend reads the target's gathered rows as plain TP."""
+        batch = self._batch([40, 3])
+        with draft_cp_context():
+            self.assertFalse(is_cp_active(batch))
+            with draft_cp_context():
+                pass
+            self.assertFalse(is_cp_active(batch))
+        self.assertTrue(is_cp_active(batch))
+
     def test_plain_program_stand_in_stays_off(self):
         """Inside the graph the pinned lengths alone pick the program."""
         cp = pinned_extend_seq_lens_cpu(2, cp_size=CP, cp_active=True)
@@ -226,7 +248,7 @@ class TestCpMetadata(CustomTestCase):
     EXTEND_LENS, PREFIX_LENS, POOL_ROWS = [3, 40], [5, 100], [2, 1]
     PAGE = 16
 
-    def _metadata(self, req_to_token, full_to_swa=None):
+    def _metadata(self, req_to_token, full_to_swa=None, capture=CaptureHiddenMode.NULL):
         backend = object.__new__(TpuPallasRpaBatchedAttnBackend)
         backend.page_size = self.PAGE
         backend.max_context_len = 256
@@ -248,6 +270,7 @@ class TestCpMetadata(CustomTestCase):
         batch = SimpleNamespace(
             seq_lens=torch.zeros(4, dtype=torch.int32),
             req_pool_indices_cpu=torch.tensor(self.POOL_ROWS + [0, 0]),
+            capture_hidden_mode=capture,
         )
         layout = TpuCpBatchLayout(host=host, local_rows=torch.zeros(16).long())
         return host, backend._build_cp_metadata(batch, layout)
@@ -259,6 +282,16 @@ class TestCpMetadata(CustomTestCase):
         table = pool_rows + torch.arange(256, dtype=torch.int32)
         table[0] = 0
         return table
+
+    def test_global_rows_are_uploaded_only_under_full_capture(self):
+        """Only a FULL-capture extend reads every prompt row; the plain CP
+        program keeps its inputs."""
+        _, plain = self._metadata(self._req_to_token())
+        self.assertIsNone(plain.cp_global_rows)
+        host, full = self._metadata(
+            self._req_to_token(), capture=CaptureHiddenMode.FULL
+        )
+        self.assertEqual(full.cp_global_rows.tolist(), host.global_rows.tolist())
 
     def test_rows_read_their_own_request(self):
         """A short request leaves fewer than two rows on a rank, so every later row
@@ -371,7 +404,9 @@ class TestCpEmbeddingAndLogits(CustomTestCase):
         group = SimpleNamespace(all_reduce=lambda t: t)
         parallel = SimpleNamespace(attn_cp_group=group)
         metadata = SimpleNamespace(
-            from_forward_batch=lambda batch, **kwargs: SimpleNamespace()
+            from_forward_batch=lambda batch, **kwargs: SimpleNamespace(
+                capture_hidden_mode=CaptureHiddenMode.NULL
+            )
         )
         hidden = torch.arange(3, dtype=torch.float32)[:, None]
         batch = SimpleNamespace()
@@ -388,6 +423,63 @@ class TestCpEmbeddingAndLogits(CustomTestCase):
             attn.cp_last_rows = None
             wrapper("ids", hidden, "head", batch)
             original.assert_called_with("ids", hidden, "head", batch, None, None)
+
+    def test_full_capture_returns_every_row_in_global_order(self):
+        """FULL capture (a spec target extend) stores the packed aux rows of the
+        whole batch in global order, not the processor's reduced rows."""
+        original = MagicMock(return_value=SimpleNamespace(hidden_states=None))
+        processor = SimpleNamespace(forward=original, compute_input_logprobs=False)
+        wrapper = install_cp_logits_forward(processor)
+        attn = SimpleNamespace(
+            cp_last_rows=torch.tensor([1]),
+            cp_last_owner_mask=torch.tensor([1]),
+            cp_global_rows=torch.tensor([2, 0, 3, 1]),
+        )
+        context = SimpleNamespace(attn_backend=SimpleNamespace(forward_metadata=attn))
+        peer = torch.tensor([[10.0, 10.0], [11.0, 11.0]])
+
+        def all_gather_into_tensor(out, local):
+            out.copy_(torch.cat([local, peer]))
+
+        group = SimpleNamespace(
+            world_size=2,
+            all_reduce=lambda t: t,
+            all_gather_into_tensor=all_gather_into_tensor,
+        )
+        metadata = SimpleNamespace(
+            from_forward_batch=lambda batch, **kwargs: SimpleNamespace(
+                capture_hidden_mode=CaptureHiddenMode.FULL
+            )
+        )
+        hidden = torch.tensor([[0.0], [1.0]])
+        aux = [torch.tensor([[5.0], [6.0]]), torch.tensor([[7.0], [8.0]])]
+        with (
+            patch(f"{_CP_FORWARD}.get_forward_context", return_value=context),
+            patch(
+                f"{_CP_FORWARD}.get_parallel",
+                return_value=SimpleNamespace(attn_cp_group=group),
+            ),
+            patch(f"{_CP_FORWARD}.ForwardBatch", SimpleNamespace),
+            patch(f"{_CP_FORWARD}.LogitsMetadata", metadata),
+        ):
+            out = wrapper("ids", hidden, "head", SimpleNamespace(), aux)
+        args = original.call_args.args
+        self.assertEqual(args[4:], (None, None))
+        packed_rows = [[5.0, 7.0], [6.0, 8.0], [10.0, 10.0], [11.0, 11.0]]
+        expected = [packed_rows[i] for i in (2, 0, 3, 1)]
+        self.assertEqual(out.hidden_states.tolist(), expected)
+
+    def test_global_token_rows_index_the_rank_major_gather(self):
+        group = SimpleNamespace(
+            world_size=2,
+            all_gather_into_tensor=lambda out, local: out.copy_(
+                torch.cat([local, local + 2])
+            ),
+        )
+        rows = cp_global_token_rows(
+            torch.tensor([0.0, 1.0]), global_rows=torch.tensor([3, 0]), group=group
+        )
+        self.assertEqual(rows.tolist(), [3.0, 0.0])
 
 
 if __name__ == "__main__":

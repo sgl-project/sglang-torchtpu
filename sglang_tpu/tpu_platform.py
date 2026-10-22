@@ -170,8 +170,13 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
             f"{feature} writes K/V in the token-major fused layout; unset "
             "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV."
         )
-    if cfg.speculative_algorithm is not None:
-        raise NotImplementedError(f"{feature} does not support speculative decoding.")
+    if cfg.speculative_algorithm is not None and not _serves_experimental_spec(
+        cfg.speculative_algorithm
+    ):
+        raise NotImplementedError(
+            f"{feature} supports speculative decoding only on the experimental "
+            "spec worker (SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1)."
+        )
     if cfg.attn_dp_size > 1:
         raise NotImplementedError(f"{feature} does not support DP attention.")
     if cfg.moe_dp_size != attn_cp_size:
@@ -750,6 +755,14 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
 
 
+def _serves_experimental_spec(algorithm: str) -> bool:
+    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang_tpu.experimental import is_experimental_spec
+
+    return is_experimental_spec(SpeculativeAlgorithm.from_string(algorithm))
+
+
 def _experimental_spec_enabled() -> bool:
     # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
     from sglang_tpu.experimental import experimental_spec_enabled
@@ -1190,11 +1203,7 @@ class TpuSRTPlatform(SRTPlatform):
 
     def supports_speculative_dp_attention(self, algorithm: str) -> bool:
         # Every experimental TpuSpecWorker serves DP attention; core's DFlash worker does not.
-        # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.experimental import is_experimental_spec
-
-        return is_experimental_spec(SpeculativeAlgorithm.from_string(algorithm))
+        return _serves_experimental_spec(algorithm)
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False

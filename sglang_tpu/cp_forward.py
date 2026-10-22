@@ -22,6 +22,7 @@ from typing import Any, Callable, NamedTuple
 import numpy as np
 import torch
 
+from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_forward_context
@@ -330,6 +331,16 @@ def cp_last_token_rows(
     return group.all_reduce(rows)
 
 
+def cp_global_token_rows(
+    local: torch.Tensor, *, global_rows: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """``[cp_size * local_tokens, ...]`` rows of ``local`` in the batch's global
+    token order, identical on every rank."""
+    gathered = local.new_empty((group.world_size * local.shape[0], *local.shape[1:]))
+    group.all_gather_into_tensor(gathered, local.contiguous())
+    return gathered.index_select(0, global_rows)
+
+
 class TpuCpLogitsForward:
     """``LogitsProcessor.forward`` replacement for context-parallel prefill.
 
@@ -363,11 +374,12 @@ class TpuCpLogitsForward:
                 aux_hidden_states,
                 hidden_states_before_norm,
             )
+        group = get_parallel().attn_cp_group
         rows = cp_last_token_rows(
             hidden_states,
             last_rows=last_rows,
             last_owner_mask=attn_metadata.cp_last_owner_mask,
-            group=get_parallel().attn_cp_group,
+            group=group,
         )
         metadata = LogitsMetadata.from_forward_batch(
             logits_metadata,
@@ -376,14 +388,28 @@ class TpuCpLogitsForward:
         # One query row per request, so the extend last-index gather is the
         # identity over the reduced rows.
         metadata.extend_seq_lens = torch.ones_like(last_rows, dtype=torch.int32)
-        return self._forward(
-            input_ids,
-            rows,
-            lm_head,
-            metadata,
-            aux_hidden_states,
-            hidden_states_before_norm,
+        if not metadata.capture_hidden_mode.is_full():
+            return self._forward(
+                input_ids,
+                rows,
+                lm_head,
+                metadata,
+                aux_hidden_states,
+                hidden_states_before_norm,
+            )
+        # FULL capture (a spec draft reads every prompt row): gather the rows the
+        # processor would store, in global token order, over its reduced-row capture.
+        if hidden_states_before_norm is not None:
+            captured = hidden_states_before_norm
+        elif aux_hidden_states is not None:
+            captured = pack_aux_hidden_states(aux_hidden_states)
+        else:
+            captured = hidden_states
+        output = self._forward(input_ids, rows, lm_head, metadata, None, None)
+        output.hidden_states = cp_global_token_rows(
+            captured, global_rows=attn_metadata.cp_global_rows, group=group
         )
+        return output
 
 
 def install_cp_logits_forward(logits_processor: Any) -> TpuCpLogitsForward:

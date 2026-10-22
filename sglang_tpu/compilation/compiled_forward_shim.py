@@ -916,7 +916,7 @@ class CompiledForwardShim:
         # Prefill context parallelism: above 1, extend batches present their
         # local zigzag rows to the graph and a batch-independent
         # extend_seq_lens_cpu (see __call__).
-        cp_strategy = get_cp_strategy()
+        cp_strategy = None if self._draft_worker else get_cp_strategy()
         self._attn_cp_size = cp_strategy.cp_size if cp_strategy is not None else 1
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:

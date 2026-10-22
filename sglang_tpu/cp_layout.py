@@ -48,6 +48,9 @@ class TpuCpHostLayout(NamedTuple):
     # -1 for padding rows.
     gathered_req: np.ndarray
     gathered_pos: np.ndarray
+    # [cp_size * local_rows_padded]: row of the rank-major all-gathered tensor
+    # holding each global token; 0 past the batch's real tokens.
+    global_rows: np.ndarray
     # Radix-cache prefix length per request, zero for padded requests.
     prefix_lens: np.ndarray
     # Attention rows ([2 * pad_b], one per non-empty owned block, request-major,
@@ -169,6 +172,8 @@ def build_tpu_cp_layout(
     gathered_pos = np.where(
         valid, gathered_rows - cu_extend[np.clip(gathered_req, 0, None)], -1
     ).astype(np.int64)
+    global_rows = np.zeros(gathered_rows.shape[0], dtype=np.int64)
+    global_rows[gathered_rows[valid]] = np.flatnonzero(valid)
 
     local_rows_real, req_starts = _rank_rows(extend_lens, cp_size, cp_rank)
     local_rows = gathered[cp_rank]
@@ -208,6 +213,7 @@ def build_tpu_cp_layout(
         local_rows=local_rows,
         gathered_req=gathered_req,
         gathered_pos=gathered_pos,
+        global_rows=global_rows,
         prefix_lens=padded_prefix,
         pseudo_kv_lens=pseudo_kv_lens,
         pseudo_q_lens=pseudo_q_lens,

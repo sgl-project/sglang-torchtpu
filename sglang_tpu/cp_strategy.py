@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
 from typing import Any
 
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -19,8 +22,13 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
     an attention row.
     """
 
+    def __init__(self, cp_size: int) -> None:
+        super().__init__(cp_size=cp_size)
+        # Set by draft_cp_context while a speculative draft runs.
+        self.suspended = False
+
     def can_apply(self, num_tokens: int, forward_batch: Any) -> bool:
-        if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
+        if self.suspended or self.cp_size <= 1 or num_tokens < self.cp_size * 2:
             return False
         forward_mode = forward_batch.forward_mode
         # A mixed batch carries its running requests as one-token extends and
@@ -35,3 +43,18 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
             return True
         lengths = [int(length) for length in extend_lens]
         return min(lengths) > 0 and max(lengths) >= self.cp_size
+
+
+@contextlib.contextmanager
+def draft_cp_context() -> Iterator[None]:
+    """Run speculative draft forwards as plain TP: the draft extend reads the
+    target's prompt hidden states already gathered in global token order."""
+    strategy = get_cp_strategy()
+    if not isinstance(strategy, TpuZigzagCPStrategy) or strategy.suspended:
+        yield
+        return
+    strategy.suspended = True
+    try:
+        yield
+    finally:
+        strategy.suspended = False

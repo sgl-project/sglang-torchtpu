@@ -17,6 +17,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_utils import draft_pp_context, draft_tp_context
+from sglang_tpu.cp_strategy import draft_cp_context
 
 
 class TpuDraftWorker(ABC):
@@ -32,6 +33,12 @@ class TpuDraftWorker(ABC):
         # Under DP attention the draft runs inside its rank's attention-TP group, as
         # an EAGLE3 draft does in core, so it gathers nothing across DP ranks.
         self._owns_attention = get_parallel().attn_dp_enabled
+        # Prefill CP leaves attention TP below TP; the draft's layers are built on
+        # attention TP so their heads match its pool, while its forwards keep the
+        # target TP group the shared head and embedding are sharded over.
+        self._builds_on_attention_tp = (
+            self._owns_attention or get_parallel().attn_cp_size > 1
+        )
         model_config = ModelConfig.from_server_args(
             target_runner.server_args,
             model_path=get_spec().speculative_draft_model_path,
@@ -42,7 +49,7 @@ class TpuDraftWorker(ABC):
         )
         # FIXME(junyanxu): ModelRunner requires gpu_id / nccl_port, which TPU never reads;
         # drop the placeholders once core makes them optional.
-        with self.draft_context():
+        with self.draft_context(owns_attention=self._builds_on_attention_tp):
             self.model_runner = ModelRunner(
                 model_config=model_config,
                 mem_fraction_static=get_schedule().mem_fraction_static,
@@ -53,12 +60,15 @@ class TpuDraftWorker(ABC):
             )
 
     @contextlib.contextmanager
-    def draft_context(self) -> Iterator[None]:
+    def draft_context(self, *, owns_attention: bool | None = None) -> Iterator[None]:
         """The scopes every draft-model phase runs under, as EAGLEWorkerV2 enters them."""
+        if owns_attention is None:
+            owns_attention = self._owns_attention
         # Under PP the one-layer draft lives on the last stage only, as if PP were off.
         with (
             draft_pp_context(),
-            draft_tp_context(self._owns_attention),
+            draft_tp_context(owns_attention),
+            draft_cp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
