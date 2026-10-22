@@ -115,7 +115,7 @@ class TpuEnvs:
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
-    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
     # Same effect as SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER. Non-speculative
     # batches ignore it.
     SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
