@@ -295,6 +295,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             optimistic_prefill_attempts=0,
             max_queued_requests=None,
             enable_priority_scheduling=False,
+            disaggregation_enable_kv_checksum=False,
             dcp_size=1,
             attn_cp_size=1,
             enable_prefill_cp=False,
@@ -368,6 +369,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         ):
             with self.subTest(**overrides):
                 self._apply(self._args(**overrides))
+
+    def test_rejects_kv_checksum(self):
+        """The KV checksum is CUDA-only. On TPU the prefill passed its health
+        checks and then every rank died on the first real request (#1177)."""
+        for mode in ("prefill", "decode", "null"):
+            with self.subTest(mode=mode):
+                args = self._args(
+                    disaggregation_mode=mode,
+                    disaggregation_transfer_backend="raiden",
+                    disaggregation_enable_kv_checksum=True,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "--disaggregation-enable-kv-checksum is not supported on TPU",
+                ):
+                    self._apply(args)
+
+    def test_kv_checksum_off_allowed(self):
+        self._apply(
+            self._args(
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="raiden",
+                disaggregation_enable_kv_checksum=False,
+            )
+        )
 
     def test_defaults_applied(self):
         args = self._args(enable_torch_compile=False)
@@ -754,6 +780,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             optimistic_prefill_attempts=0,
             max_queued_requests=None,
             enable_priority_scheduling=False,
+            disaggregation_enable_kv_checksum=False,
             enable_hierarchical_cache=False,
             dcp_comm_backend="ag_rs",
             dcp_replicate_q_proj=False,

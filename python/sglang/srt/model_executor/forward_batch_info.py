@@ -1175,7 +1175,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions = clamp_position(batch.seq_lens)
         else:
             if isinstance(extend_seq_lens, list):
-                # Main path: H2D from host lists; populate *_cpu mirrors.
+                # Build from host lists; the backend may defer H2D until padding.
                 assert isinstance(extend_prefix_lens, list)
                 pin_memory = is_pin_memory_available(device)
                 input_device = _extend_metadata_device(batch, device)
@@ -1652,10 +1652,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     )
             mrope_positions_list[batch_idx] = mrope_positions
 
+        # Derived positions follow the extend metadata placement, so a backend
+        # that keeps extend lengths on the host pads these there too.
         self.mrope_positions = torch.cat(
             mrope_positions_list,
             dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        ).to(
+            dtype=torch.int64,
+            device=_extend_metadata_device(batch, model_runner.device),
+            non_blocking=True,
+        )
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:
@@ -2320,7 +2326,7 @@ def _stable_hash_str_to_i64(rid: str) -> int:
 
 def _extend_metadata_device(batch, device):
     """Initial placement of host-built extend lengths and derived positions."""
-    return device
+    return batch.input_tensor_device or device
 
 
 def _mrope_decode_device(batch, device):

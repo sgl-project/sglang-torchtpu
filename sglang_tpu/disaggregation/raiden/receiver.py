@@ -390,7 +390,7 @@ class RaidenReceiverMixin:
                 self._fail_room_locked(room, reason)
                 self._release_pull_slots_locked()
             return False
-        logger.info(
+        logger.debug(
             "RaidenKVManager rank%d decode pull started | room=%s req_id=%s "
             "uuid=%d pages=%d from=%s",
             self.attn_tp_rank,

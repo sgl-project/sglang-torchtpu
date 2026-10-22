@@ -872,7 +872,8 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
 def _patch_pd_decode_swa_hicache() -> None:
     """Allow PD decode prefix cache + RAM offload on sliding-window models.
 
-    Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
+    Only full-attention KV goes to RAM. Also hold PD decode requests that reuse
+    an unfinished raiden restore, on any model. See ``pd_decode_swa_hicache``.
     """
     from sglang_tpu import pd_decode_swa_hicache
 

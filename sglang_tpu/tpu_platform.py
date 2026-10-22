@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
 # Platform discovery runs before worker bootstrap configures torch_tpu.
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
@@ -402,6 +403,17 @@ def _validate_raiden_optimistic_prefill(
         "Optimistic prefill computes it earlier and parks its KV, which under "
         "load fills the prefill pool with requests the decodes have no pages "
         "for and deadlocks prefill and decode."
+    )
+
+
+def _validate_kv_checksum(enable_kv_checksum: bool) -> None:
+    if not enable_kv_checksum:
+        return
+    raise ValueError(
+        "--disaggregation-enable-kv-checksum is not supported on TPU: the KV "
+        "checksum has only a CUDA implementation. On TPU the server would pass "
+        "its health checks and then fail every rank on the first real request. "
+        "Remove the flag from both the prefill and the decode engines."
     )
 
 
@@ -792,13 +804,19 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
-        from sglang_tpu.kimi_k3 import static_fp8_parts
+        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch, static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
-        static_fp8_parts()
+        parts = static_fp8_parts()
         cfg = resolving_view(server_args)
+        if "latent_up" in parts:
+            check_static_fp8_spec_batch(
+                parts,
+                speculative_algorithm=cfg.speculative_algorithm,
+                max_running_requests=cfg.max_running_requests,
+            )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
@@ -810,6 +828,7 @@ class TpuSRTPlatform(SRTPlatform):
             disaggregation_mode=cfg.disaggregation_mode,
             max_queued_requests=cfg.max_queued_requests,
         )
+        _validate_kv_checksum(cfg.disaggregation_enable_kv_checksum)
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray
@@ -1174,6 +1193,39 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
+
+    def get_batch_input_device(self, batch) -> str | None:
+        """Keep eligible prefill inputs on CPU until backend padding."""
+        from sglang.srt.layers.cp.base import get_cp_strategy
+        from sglang.srt.utils.common import print_warning_once
+        from sglang_tpu.allocator_tpu import host_return_allocators
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.host_padding import _can_stage_forward_metadata
+
+        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get():
+            return None
+        # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
+        allocator = batch.token_to_kv_pool_allocator
+        checks = (
+            ("forward metadata is not staged", _can_stage_forward_metadata(batch)),
+            ("context parallelism is on", get_cp_strategy() is None),
+            ("the allocator returns device indices", host_return_allocators(allocator)),
+            # Page size 1 uses alloc(), which has no host-return contract.
+            ("page size is 1", allocator.page_size > 1),
+            (
+                "req_to_token is on the device",
+                batch.req_to_token_pool.req_to_token.device.type == "cpu",
+            ),
+        )
+        for reason, ok in checks:
+            if not ok:
+                print_warning_once(
+                    "SGLANG_TPU_HOST_PADDING is set, but prefill inputs upload at "
+                    f"the live length because {reason}. This may compile a program "
+                    "per prompt length."
+                )
+                return None
+        return "cpu"
 
     def supports_torch_compile(self) -> bool:
         return True

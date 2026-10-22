@@ -90,6 +90,32 @@ def _make_vit(block):
     )
 
 
+class _Qwen3VLTowerStub(nn.Module):
+    """Qwen3-VL vision tower surface the compile policy touches."""
+
+    def __init__(self, hidden):
+        super().__init__()
+        self.hidden = hidden
+        self.spatial_merge_size = 2
+        self.dtype = torch.float32
+        # 3 channels * 2 temporal * 1x1 patch == 6 features per patch.
+        self.patch_embed = SimpleNamespace(
+            in_channels=3, temporal_patch_size=2, patch_size=1
+        )
+        self.forward_with_tpu_graph = MagicMock()
+        self.prologue_inputs = []
+
+    def prepare_tpu_graph_inputs(self, x, grid_thw):
+        self.prologue_inputs.append(x)
+        bucket = x.shape[0]
+        return (
+            torch.zeros(bucket, self.hidden),
+            torch.tensor([0, bucket], dtype=torch.int32),
+            torch.zeros(bucket, 2),
+            torch.zeros(bucket, 2),
+        )
+
+
 class _FakeVisionPolicy(VisionTpuCompilePolicy):
     """Smallest subclass that exercises the base ``run`` seam."""
 
@@ -356,6 +382,92 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         self.assertEqual(grid_thw.device.type, "cpu")
         # 324 == 18^2, so a square grid lands exactly on the bucket.
         self.assertEqual(grid_thw.tolist(), [[1, 18, 18]])
+
+    def test_qwen3_vl_supplies_the_vision_tower_for_direct_compile(self):
+        tower = nn.Linear(2, 2)
+        self.assertIs(Qwen3VLVisionTpuCompilePolicy(tower).get_compile_model(), tower)
+        # A non-module stand-in keeps the Dynamo path rather than tracing
+        # something direct_compile cannot enumerate state for.
+        self.assertIsNone(
+            Qwen3VLVisionTpuCompilePolicy(
+                SimpleNamespace(spatial_merge_size=2)
+            ).get_compile_model()
+        )
+
+    def test_qwen3_vl_direct_warmup_queues_the_serve_time_boundary(self):
+        """Under direct compile, buckets are submitted, not compiled inline.
+
+        The warmup must hand warmup_async the same argument tuple run() passes
+        at serve time; otherwise the first real image of each bucket misses the
+        specialization cache and compiles synchronously.
+        """
+        hidden = 4
+        vit = _Qwen3VLTowerStub(hidden)
+        runner = SimpleNamespace(
+            _supports_segment_ids=True, forward=lambda x, cu, cos, sin, seg: x
+        )
+        vit.graph_runners = runner
+        policy = Qwen3VLVisionTpuCompilePolicy(
+            vit,
+            owner=vit,
+            model_runner=SimpleNamespace(
+                server_args=SimpleNamespace(
+                    tpu_compile_tracer="direct",
+                    unsafe_save_torch_compile_bundle=None,
+                    unsafe_load_torch_compile_bundle=None,
+                )
+            ),
+        )
+        events = []
+
+        def compile_artifact(args, kwargs, **options):
+            events.append(("compile", args[0].shape[0], options["async_compile"]))
+
+            def execute(call):
+                args, kwargs = call
+                events.append(("execute", args[0].shape[0]))
+                return policy.compiled_fn.fn(*args, **kwargs)
+
+            return execute
+
+        with (
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(False),
+            patch.object(vit_runner, "_precompiled_max_patch_count", None),
+            patch.object(vit_runner, "tpu_sync") as sync,
+            patch.object(
+                direct_compile.CompiledFunction,
+                "_compile",
+                side_effect=compile_artifact,
+            ),
+        ):
+            self.assertTrue(policy.install())
+            self.assertIsInstance(policy.compiled_fn, direct_compile.CompiledFunction)
+            pending = policy.precompile([4, 16])
+
+            self.assertEqual(events, [("compile", 4, True), ("compile", 16, True)])
+            self.assertEqual(
+                [tuple(x.shape) for x in vit.prologue_inputs], [(4, 6), (16, 6)]
+            )
+            vit.forward_with_tpu_graph.assert_not_called()
+            sync.assert_not_called()
+
+            for call in pending:
+                call.wait()
+            self.assertEqual(events[-2:], [("execute", 4), ("execute", 16)])
+            self.assertEqual(sync.call_count, 2)
+
+            # A real 3x4 image padded into the 16 bucket reuses the warmed graph.
+            out = runner.run(
+                torch.zeros(16, hidden),
+                torch.tensor([0, 12], dtype=torch.int32),
+                rotary_pos_emb_cos=torch.zeros(16, 2),
+                rotary_pos_emb_sin=torch.zeros(16, 2),
+            )
+            self.assertEqual(len(policy.compiled_fn.cache), 2)
+            self.assertEqual(events[-1], ("execute", 16))
+            # 12 real patches with a 2x2 merge leave 3 merged rows.
+            self.assertEqual(out.shape[0], 3)
 
     def test_precompile_publishes_nothing_when_warming_is_disabled(self):
         policy = _FakeVisionPolicy()

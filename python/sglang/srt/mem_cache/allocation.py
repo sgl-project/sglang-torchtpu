@@ -323,7 +323,7 @@ def alloc_paged_token_slots_extend(
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
-    if return_host:
+    if return_host or (batch is not None and batch.input_tensor_device == "cpu"):
         # Opt-in allocators may defer the upload until forward-input padding.
         extra_alloc_kwargs["return_host"] = True
     if out_cache_loc_host is not None:

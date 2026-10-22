@@ -716,20 +716,20 @@ def _mamba_state_indices(slot: int) -> list:
 
 
 class RaidenStateTestCase(RaidenRendezvousTestCase):
-    """Managers with a GDN state engine, each side with its own checkpoint width."""
+    """Managers with a GDN state engine; a slot's committed state is its own row."""
 
-    def _with_state(self, m, *, checkpoint_width: int):
+    def _with_state(self, m):
         m._state_engine = _FakeRaidenEngine()
         m._state_engine_max_blocks = 1
-        m._committed_state_row = lambda slot: slot * checkpoint_width
+        m._committed_state_row = lambda slot: slot
         m.state_raiden_endpoint = f"raiden-state://127.0.0.1:{m.rank_port}"
         m.kv_args.state_types = [StateType.MAMBA]
         m._pulling = StagingAdmission(256, None, 8)
         return m
 
     def _state_pair(self, *, chunked: bool = False):
-        prefill = self._with_state(self._prefill(), checkpoint_width=1)
-        decode = self._with_state(self._decode(), checkpoint_width=4)
+        prefill = self._with_state(self._prefill())
+        decode = self._with_state(self._decode())
         prefill.chunked_transfer = decode.chunked_transfer = chunked
         # Reads are issued from the poll so tests see each step.
         decode._listener_start_read = False
@@ -761,7 +761,7 @@ class RaidenStateTestCase(RaidenRendezvousTestCase):
 
 class TestRaidenStateTransfer(RaidenStateTestCase):
     def test_state_read_moves_each_sides_committed_row(self):
-        """Prefill (width 1) slot 7 is row 7; decode (width 4) slot 5 is row 20."""
+        """Prefill slot 7 is row 7 and decode slot 5 is row 5, whatever the width."""
         for chunked in (False, True):
             with self.subTest(chunked=chunked):
                 prefill, decode = self._state_pair(chunked=chunked)
@@ -775,7 +775,7 @@ class TestRaidenStateTransfer(RaidenStateTestCase):
                 self.assertTrue(decode.maybe_start_pull(room))
                 self.assertEqual(
                     [args for args, _ in decode._state_engine.started],
-                    [(f"state:{room}", room, prefill.state_raiden_endpoint, [7], [20])],
+                    [(f"state:{room}", room, prefill.state_raiden_endpoint, [7], [5])],
                 )
                 self.assertEqual(
                     [args[0] for args, _ in decode._engine.started], [str(room)]
@@ -797,7 +797,7 @@ class TestRaidenStateTransfer(RaidenStateTestCase):
                 self.assertEqual(decode._engine.started, [])
                 self.assertEqual(
                     [args for args, _ in decode._state_engine.started],
-                    [(f"state:{room}", room, prefill.state_raiden_endpoint, [7], [20])],
+                    [(f"state:{room}", room, prefill.state_raiden_endpoint, [7], [5])],
                 )
                 # Polling again must not issue the read twice.
                 self.assertTrue(decode.maybe_start_pull(room))
@@ -983,7 +983,7 @@ class TestRaidenStateGroups(CustomTestCase):
         self.assertEqual(groups.full, [kv[3], kv[7]])
         self.assertEqual(groups.full_layer_ids, [3, 7])
         self.assertEqual(groups.state, state)
-        self.assertEqual(groups.committed_state_row(2), 6)
+        self.assertEqual(groups.committed_state_row(2), 2)
 
     def test_non_tpu_mamba_pool_contributes_no_state(self):
         pool, _ = self._hybrid_pool(mamba_pool=object())

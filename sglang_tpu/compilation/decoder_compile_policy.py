@@ -26,7 +26,7 @@ from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import dp_gather_width, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -79,6 +79,10 @@ from sglang_tpu.cp_forward import (
 from sglang_tpu.cp_layout import warmup_request_lengths
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.host_padding import (
+    check_host_padding_config,
+    ordinary_compiled_forward,
+)
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
@@ -1074,13 +1078,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         # EAGLE warmup and serving have different sampling_info values. Avoid
         # guarding that metadata in compiled paths which cannot use this mode.
-        if not envs.SGLANG_TPU_HOST_PADDING.get() or batch.spec_info is not None:
+        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get() or batch.spec_info is not None:
             return False
         info = getattr(batch, "sampling_info", None)
         if info is None or not supports_padded_sampling(info):
             return False
-        parallel = get_parallel()
-        config = self.model_runner.model_config
         observer = getattr(self.model_runner, "sampling_observer", None)
         return (
             # Beam-member tails are sliced by the worker before sampling.
@@ -1094,33 +1096,20 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             and batch.capture_hidden_mode == CaptureHiddenMode.NULL
             and not batch.return_pooled_hidden_states
             and not batch.return_hidden_states_before_norm
-            and parallel.pp_size == 1
-            and parallel.attn_cp_size == 1
-            and parallel.attn_dp_size == 1
-            and parallel.attn_dcp_size == 1
-            and not get_schedule().enable_mixed_chunk
-            and not config.use_ngram_embedding
-            and not config.use_engram
-            and not config.is_encoder_decoder
+            and ordinary_compiled_forward(self.model_runner.model_config)
             and (observer is None or not observer.is_active(info))
             and self._supports_padded_sampling_outputs()
         )
 
     def _upload_host_inputs(self, forward_batch: ForwardBatch) -> None:
         if (
-            not envs.SGLANG_TPU_HOST_PADDING.get()
+            not tpu_envs.SGLANG_TPU_HOST_PADDING.get()
             or forward_batch.spec_info is not None
         ):
             return
-        staged_metadata = forward_batch.seq_lens.device.type == "cpu"
-        staged_prefill = (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            and forward_batch.input_ids.device.type == "cpu"
-        )
-        mrope = getattr(forward_batch, "mrope_positions", None)
-        staged_mrope = isinstance(mrope, torch.Tensor) and mrope.device.type == "cpu"
-        if not (staged_metadata or staged_prefill or staged_mrope):
-            return
+        # Each field is checked on its own: tokens, lengths and extend metadata
+        # are placed by separate decisions, so one device-side field does not
+        # mean the others were uploaded.
         # Only staged forward inputs move here; CPU mirrors stay on the host.
         # Mamba tracking followed seq_lens.device during padding, so host-owned
         # lengths defer those uploads to this boundary as well.
@@ -1348,16 +1337,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if disagg_mode != "prefill":
             pending += self._precompile_decode()
         spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
-        if (
-            envs.SGLANG_TPU_HOST_PADDING.get()
+        host_padded_prefill = (
+            tpu_envs.SGLANG_TPU_HOST_PADDING.get()
             and spec_algorithm is not None
             and spec_algorithm.is_none()
+        )
+        if host_padded_prefill:
+            check_host_padding_config(self.model_runner)
+        if (
+            host_padded_prefill
             and get_exec().kernel.sampling_backend == "tpu"
-            and get_parallel().pp_size == 1
-            and get_parallel().attn_dp_size == 1
-            and get_parallel().attn_cp_size == 1
-            and get_parallel().attn_dcp_size == 1
-            and not get_schedule().enable_mixed_chunk
+            and ordinary_compiled_forward(self.model_runner.model_config)
         ):
             # Execute after queued model warmups, before the checker is armed.
             pending.append(PendingCall(self._warmup_host_padding))
@@ -1376,12 +1366,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         from sglang_tpu.sampling.warmup import warmup_host_sampling
 
         runner = self.model_runner
-        config = runner.model_config
         if (
-            not config.is_generation
-            or config.use_ngram_embedding
-            or config.use_engram
-            or config.is_encoder_decoder
+            not ordinary_compiled_forward(runner.model_config)
             or resolving_view(runner.server_args).dllm_algorithm is not None
             or runner.req_to_token_pool.req_to_token.device.type != "cpu"
         ):
@@ -1914,6 +1900,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
+        self._add_dummy_mamba_tracking(batch, bs=bs, mode=mode)
         if enable_num_token_non_padded():
             # Serving sets these in init_new and ModelRunner.forward; the MoE
             # path guards on the field being present, so warmup must carry it.
@@ -1933,6 +1920,28 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 ),
             )
         return batch
+
+    def _add_dummy_mamba_tracking(
+        self, batch: ForwardBatch, *, bs: int, mode: ForwardMode
+    ) -> None:
+        """Give warmup batches the radix tracking plan serving extend/decode carry.
+
+        Their upload and the GDN backend's tracking metadata are eager ops keyed on
+        the bucket; an all-False mask writes no snapshot.
+        """
+        if (
+            self.model_runner.is_draft_worker
+            or not isinstance(self.model_runner.req_to_token_pool, HybridReqToTokenPool)
+            or not (mode.is_extend() or mode.is_decode())
+            or mode.is_target_verify()
+            or not get_exec().mamba.enable_mamba_extra_buffer
+        ):
+            return
+        # The scheduler builds these on the host, as int64 / bool.
+        batch.mamba_track_indices = torch.zeros(bs, dtype=torch.int64)
+        batch.mamba_track_mask = torch.zeros(bs, dtype=torch.bool)
+        if mode.is_extend():
+            batch.mamba_track_seqlens = torch.zeros(bs, dtype=torch.int64)
 
     def _make_top_k_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
         """Mirror an eligible serving batch for the common static TopK width.

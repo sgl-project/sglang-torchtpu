@@ -70,6 +70,7 @@ def _args(**overrides):
         optimistic_prefill_attempts=0,
         max_queued_requests=None,
         enable_priority_scheduling=False,
+        disaggregation_enable_kv_checksum=False,
         attn_cp_size=1,
         enable_prefill_cp=False,
         cp_strategy=None,

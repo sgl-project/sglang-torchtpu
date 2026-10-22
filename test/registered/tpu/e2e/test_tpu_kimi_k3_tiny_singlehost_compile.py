@@ -118,16 +118,15 @@ def _prompt(length: int, seed: int) -> list[int]:
 TEXT_BATCHES = [[_prompt(100, 1)], [_prompt(37, 2), _prompt(300, 3)]]
 
 
-def _image_url() -> str:
+def _image_url(width: int = 224, height: int = 224) -> str:
     from PIL import Image
 
-    size = 224
-    image = Image.new("RGB", (size, size))
+    image = Image.new("RGB", (width, height))
     image.putdata(
         [
             ((x * 7) % 256, (y * 5) % 256, ((x + y) * 3) % 256)
-            for y in range(size)
-            for x in range(size)
+            for y in range(height)
+            for x in range(width)
         ]
     )
     buffer = io.BytesIO()
@@ -152,7 +151,9 @@ def _generate(prompts: list[list[int]]) -> list[list[int]]:
     return [output["output_ids"] for output in response.json()]
 
 
-def _chat_with_image(model: str) -> tuple[str, int]:
+def _chat_with_image(
+    model: str, width: int = 224, height: int = 224
+) -> tuple[str, int]:
     response = requests.post(
         f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
         json={
@@ -161,7 +162,10 @@ def _chat_with_image(model: str) -> tuple[str, int]:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": _image_url()}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _image_url(width, height)},
+                        },
                         {"type": "text", "text": "Describe the image."},
                     ],
                 }
@@ -190,7 +194,11 @@ def _serve(model: str, *, compile: bool) -> tuple[dict, str]:
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=SERVER_ARGS + (["--enable-torch-compile"] if compile else []),
-        env={"TORCH_LOGS": "recompiles"},
+        env={
+            "TORCH_LOGS": "recompiles",
+            # The vision buckets up to the startup warmup's 32x32 grid.
+            "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES": "1024",
+        },
         return_stdout_stderr=(log, log),
         device="tpu",
     )
@@ -205,6 +213,8 @@ def _serve(model: str, *, compile: bool) -> tuple[dict, str]:
         outputs = {
             "text": [_generate(batch) for batch in TEXT_BATCHES],
             "image": _chat_with_image(model),
+            # 32x16 patches: padded into the 24x24 vision bucket.
+            "wide_image": _chat_with_image(model, width=448, height=224),
             "text_after_image": _generate(TEXT_BATCHES[0]),
         }
         return outputs, _read(log)
@@ -231,6 +241,7 @@ class TestKimiK3TinyCompileBoundary(CustomTestCase):
         self.assertNotIn("Recompiling function", served_log)
         self.assertNotIn("Detected recompile", served_log)
         self.assertGreater(compiled["image"][1], 0)
+        self.assertGreater(compiled["wide_image"][1], compiled["image"][1])
         self.assertEqual(compiled, eager)
 
 

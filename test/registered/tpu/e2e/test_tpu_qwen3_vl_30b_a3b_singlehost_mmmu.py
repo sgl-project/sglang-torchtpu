@@ -17,13 +17,15 @@ register_tpu_ci(
     est_time=3000,
     suite="nightly-tpu-4-v7",
     nightly=True,
-    labels=["singlehost", "qwen3-vl-30b-a3b", "moe", "multimodal"],
+    labels=["singlehost", "qwen3-vl-30b-a3b", "multimodal", "compile-tracer"],
 )
 
 SERVED_MODEL_NAME = "qwen3-vl-30b-a3b"
 MODEL = "/weights/Qwen3-VL-30B-A3B-Instruct"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
-# Budget: the ViT and the VL decoder graph captures, ~21 min cold.
+# Budget: the ViT and VL decoder warmups compile concurrently under the
+# recipe's direct tracer, ~8 min cold (~39 min under dynamo); the 45 min
+# default also covers a dynamo comparison run.
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "2700"))
 
 # Deployment environment only: the serving settings are the recipe's, so this
