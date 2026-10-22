@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import prometheus_client
+import test_unified_radix_cache_unittest as radix_fixture
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -75,7 +76,9 @@ class TestDeviceEvictionAge(CustomTestCase):
             components=(ComponentType.FULL, ComponentType.SWA),
             sliding_window_size=4,
         )
-        cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
+        # The fixture asks for an accelerator; the CPU CI runner has none.
+        with mock.patch.object(radix_fixture, "get_device", return_value="cpu"):
+            cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
         cache.metrics_collector, sample = _collector()
         return cache, allocator, sample
 
