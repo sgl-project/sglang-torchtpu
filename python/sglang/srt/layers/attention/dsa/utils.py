@@ -226,17 +226,24 @@ def is_dsa_prefill_cp_interleave():
     return is_dsa_enable_prefill_cp() and get_parallel().cp_strategy == "interleave"
 
 
+# Fold at import: Dynamo inlines through the lru_cache wrapper of is_cuda()
+# and tracing into the CUDA probes raises on non-CUDA backends.
+_CUDA_ENABLED = is_cuda()
+
+
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
 # MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
 # inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
 # this surface (no feature flag); each adds its own extra carve-outs at its call
 # site (e.g. the indexer also excludes DSA prefill context parallelism).
 def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
+    # The two graph predicates below are CUDA-only surfaces, so the folded
+    # bool is the whole device gate.
+    if not _CUDA_ENABLED:
+        return False
     return (
-        is_cuda()
-        and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-        and forward_batch.forward_mode.is_extend_without_speculative()
-    )
+        is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
+    ) and forward_batch.forward_mode.is_extend_without_speculative()
 
 
 def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):

@@ -35,6 +35,14 @@ def _qwen3_vl_decoder_policy() -> type[CompilePolicy]:
     return Qwen3VLDecoderTpuCompilePolicy
 
 
+def _bailing_vl_decoder_policy() -> type[CompilePolicy]:
+    from sglang_tpu.compilation.decoder_compile_policy import (
+        BailingVLDecoderTpuCompilePolicy,
+    )
+
+    return BailingVLDecoderTpuCompilePolicy
+
+
 CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
     # The Qwen3-VL MoE decoder (Qwen3-VL-30B-A3B, 235B-A22B). qwen3_vl annotates
     # only the dense Qwen3LLMModel and the vision tower, and the vision tower's
@@ -48,6 +56,14 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         module="sglang.srt.models.qwen3_vl_moe",
         class_name="Qwen3MoeLLMModel",
         policy=_qwen3_vl_decoder_policy,
+    ),
+    # The Bailing/Ling-3 VL decoder. Same suppression by the vision tower's
+    # class-level annotation; the VL-specific BailingMoeV3VLModel subclass
+    # keeps the text-only BailingMoeV3ForCausalLM on the generic fallback.
+    _CoreCompileBoundary(
+        module="sglang.srt.models.bailing_mm_v3",
+        class_name="BailingMoeV3VLModel",
+        policy=_bailing_vl_decoder_policy,
     ),
 )
 

@@ -2501,3 +2501,33 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 # Kimi-K3's multimodal wrapper compiles its language model with the Qwen3-VL
 # policy unchanged.
 KimiK3VLDecoderTpuCompilePolicy = Qwen3VLDecoderTpuCompilePolicy
+
+
+class BailingVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
+    """Qwen3-VL policy with Bailing's unsupported-config fail-fasts.
+
+    The shared VL policy has no later-stage warmup and no input_ids-only
+    direct-tracer key; refuse those here so the compile never starts,
+    saving the ~19-minute cold compile on misconfigured hosts.
+    """
+
+    def install(self) -> bool:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        if parallel.pp_size > 1:
+            raise ValueError(
+                "Bailing/Ling-3's multimodal model does not support "
+                "pipeline parallelism with --enable-torch-compile on TPU "
+                "yet."
+            )
+        if (
+            getattr(self.model_runner.server_args, "tpu_compile_tracer", None)
+            == "direct"
+        ):
+            raise ValueError(
+                "Bailing/Ling-3's multimodal model does not support "
+                "--tpu-compile-tracer direct with --enable-torch-compile "
+                "on TPU yet."
+            )
+        return super().install()

@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers.mm_utils import (
@@ -41,9 +42,11 @@ from sglang.srt.models.bailing_moe_v3 import (
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_tpu
 
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
 
 _PUBLIC_VISION_PARAMETER_PREFIXES = (
     "visual.patch_embed.",
@@ -59,8 +62,21 @@ _NON_TEXT_PREFIX_MAPPING = (
 )
 
 
+class BailingMoeV3VLModel(BailingMoeV3ForCausalLM):
+    """VL-specific decoder, so the boundary-table policy on this class stays
+    off the text-only BailingMoeV3ForCausalLM (same split as
+    Qwen3MoeLLMModel vs Qwen3MoeModel)."""
+
+
 class BailingMoeV3VLForConditionalGeneration(nn.Module):
     """Bailing MoE V3 language model with Qwen3 vision encoding."""
+
+    # Decode / verify embed inside the compiled language model instead of
+    # an eager general_mm_embed_routine in front of it; prefill keeps the
+    # routine, routing both image and text extends onto the policy-warmed
+    # input_embeds face (the Qwen3-VL boundary -- the text_ids warmup bakes
+    # 1D positions, so a direct mrope-shaped call cannot reuse it).
+    decode_embeds_in_language_model: bool = _is_tpu
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
@@ -83,7 +99,7 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
         text_config = config.text_config
         self.multi_gate_enabled = is_bailing_multi_gate_enabled(text_config)
-        self.model = BailingMoeV3ForCausalLM(
+        self.model = BailingMoeV3VLModel(
             config=text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -142,19 +158,51 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
     def _get_vision_feature(
         self, items: List[MultimodalDataItem], grid_thw: torch.Tensor
     ) -> torch.Tensor:
-        pixel_values = self._materialize_items(items)
         if self.use_data_parallel:
+            if _is_tpu:
+                # The DP runner shards and all-gathers on device, which is
+                # incompatible with the host-staged TPU encoder path.
+                raise NotImplementedError(
+                    "TPU vision encoding does not support --mm-enable-dp-encoder"
+                )
             from sglang.srt.multimodal.mm_utils import (
                 run_dp_sharded_mrope_vision_model,
             )
 
+            pixel_values = self._materialize_items(items)
             vision_embeds = run_dp_sharded_mrope_vision_model(
                 self.visual,
                 pixel_values,
                 grid_thw.tolist(),
                 rope_type="rope_3d",
             )
+        elif _is_tpu:
+            # Assemble on the host at the bucketed patch length so the
+            # encoder prologue sees a static shape; forward_with_tpu_graph
+            # does the single host->device transfer.
+            # Pre-install buckets are empty, so this is an identity pad and
+            # the runner executes the blocks eagerly.
+            features = [item.feature for item in items]
+            assert features, "TPU vision staging ran with no image items"
+            # The gateway renders one batch on one device, so the first
+            # feature's device speaks for every item.
+            if features[0].device.type == "tpu":
+                # A plain-buffer slice copy_ races its own async TPU->host
+                # transfer and loads garbage; .cpu() forces the transfer to
+                # complete before the host copy is read.
+                features = [f.cpu() for f in features]
+            total_patches = int(grid_thw.prod(dim=1).sum())
+            pixel_values = materialize_multimodal_features(
+                features,
+                device=torch.device("cpu"),
+                dtype=self.visual.dtype,
+                pad_to=self.visual.graph_runners.bucket_for_patches(total_patches),
+            )
+            # forward_with_tpu_graph hard-asserts CPU inputs.
+            grid_thw = grid_thw.cpu()
+            vision_embeds = self.visual(pixel_values, grid_thw=grid_thw)
         else:
+            pixel_values = self._materialize_items(items)
             vision_embeds = self.visual(pixel_values, grid_thw=grid_thw)
 
         if self.deepstack_visual_indexes:
@@ -168,9 +216,18 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
                 )
             vision_embeds = vision_embeds[..., : self.vision_out_dim]
 
+        # The TPU ViT runner stages its output on the host; the bridge
+        # projection weights live on the device. Backends that keep the
+        # embeds and the weights on the same device skip the move.
+        if vision_embeds.device != self.linear_proj[0].weight.device:
+            vision_embeds = vision_embeds.to(self.linear_proj[0].weight.device)
         vision_embeds = self.linear_proj(vision_embeds)
         if self.norm_query_embeds:
             vision_embeds = F.normalize(vision_embeds, dim=-1)
+        # The TPU embed merge (mm_embed_tpu._place_mm_rows) index_puts these
+        # rows into a host matrix unless SGLANG_TPU_MM_EMBED_ON_DEVICE is set.
+        if _is_tpu and not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
+            return vision_embeds.to("cpu")
         return vision_embeds
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -198,6 +255,15 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
         del input_embeds, get_embedding
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
+        if self.decode_embeds_in_language_model and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Embed in-graph: the compile policy warms decode, verify and
+            # text-only extend as input_ids calls without input_embeds.
+            return self.model(
+                input_ids, positions, forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
