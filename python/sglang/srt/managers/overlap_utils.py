@@ -6,20 +6,13 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
+from sglang.srt.compilation.helper_compile import maybe_compile
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
-
-_is_tpu = is_tpu()
-
-if _is_tpu:
-    from sglang_tpu.overlap_utils_tpu import (
-        device_accept_resolved_tpu,
-        resolve_device_accept_seq_lens_tpu,
-    )
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -81,7 +74,7 @@ _is_npu = is_npu()
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
-@torch.compile(dynamic=True, disable=_is_npu or _is_tpu)
+@maybe_compile(dynamic=True, disable=_is_npu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
 ) -> None:
@@ -99,7 +92,9 @@ def _stage_prefill_tokens(batch):
     )
 
 
-def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+def resolve_forward_inputs(
+    batch: ScheduleBatch, future_map: Optional[FutureMap]
+) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
@@ -107,8 +102,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """
     batch.mm_input_ids_cpu = None
     if batch.prefill_input_ids_cpu is not None:
-        if _is_tpu and any(batch.multimodal_inputs or ()):
-            batch.mm_input_ids_cpu = batch.prefill_input_ids_cpu
+        # A prefill-only caller may pass no future map (it relays no decode tokens).
+        if future_map is not None:
+            future_map.prepare_prefill_inputs(batch)
         prefill_gpu = _stage_prefill_tokens(batch)
         if batch.mix_running_indices is not None:
             # Keep mix_running_indices (= the mixed-in running batch's req_pool_indices, freed
@@ -147,25 +143,6 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
     if batch.enable_overlap and not batch.spec_algorithm.is_none():
         future_map._resolve_spec_extras(batch)
-
-
-# Device types whose backend bakes a Python-int index as a compile-time constant
-# (e.g. torch_tpu / XLA), so indexing a buffer with a slice or int recompiles the
-# graph per distinct value. On these the FutureMap keeps its circular-buffer write
-# offset as a device tensor and writes with index_copy_; other backends index
-# eagerly, where the cheaper slice assignment is fine.
-_DYNAMIC_INDEX_DEVICE_TYPES = ("tpu",)
-
-
-def _device_use_dynamic_index(device: torch.device) -> bool:
-    """Whether ``device``'s backend bakes Python-int indices as graph constants.
-
-    True for the backends in ``_DYNAMIC_INDEX_DEVICE_TYPES`` (which would otherwise
-    recompile a slice/int-indexed write per value); those keep the future-map
-    offsets dynamic (device tensor + ``index_copy_``) instead.
-    """
-    dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
-    return any(dev_type == known for known in _DYNAMIC_INDEX_DEVICE_TYPES)
 
 
 CONFIDENCE_RELAY_RING_LAG: int = 2
@@ -318,14 +295,6 @@ class FutureMap:
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token
 
-        # On backends that bake a buffer WRITE offset as an HLO constant-shaped
-        # scatter (e.g. TPU/XLA), route future-buffer writes through `_store`
-        # (index_copy_) so the offset stays DATA and the compiled store graph
-        # shape is static across overlap steps (avoids per-step XLA recompiles).
-        # Other backends use the plain `buf[indices] = values`. Ported from fork
-        # PR #78; see `_store`.
-        self._use_dynamic_index = _device_use_dynamic_index(device)
-
         if _DEBUG_ASSERT:
             # Poisoned init: every row must be written before its first gather.
             self.output_tokens_buf = torch.full(
@@ -460,9 +429,6 @@ class FutureMap:
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
-        if _is_tpu and device_accept_resolved_tpu(self, batch):
-            # resolve_seq_lens_cpu already routed this batch on device.
-            return
         if self.spec_algo.is_ngram():
             draft_input = batch.spec_info
             if draft_input is None or draft_input.future_indices is None:
@@ -482,8 +448,7 @@ class FutureMap:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
-        if not _is_tpu:
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
+        self._record_indices_stream(indices)
         if self.need_topk:
             # Function-local: spec_utils imports schedule_batch, which imports
             # this module.
@@ -526,25 +491,22 @@ class FutureMap:
     def _store(
         self, buf: torch.Tensor, indices: torch.Tensor, values: torch.Tensor
     ) -> None:
-        """Write ``values`` into future buffer ``buf`` at rows ``indices``.
-
-        On backends flagged ``_use_dynamic_index`` (e.g. TPU/XLA) use a
-        tensor-indexed ``index_copy_`` so the write offset stays DATA: a
-        ``buf[indices] = values`` setitem lowers to a scatter whose position the
-        backend can bake as a compile-time constant, recompiling the future-map
-        store every overlap step. ``index_copy_`` keeps the store graph shape
-        static across steps (offset is a runtime tensor value, not a shape).
-        Ported from fork PR #78; elsewhere keep the cheaper setitem.
-        """
-        # Cast to the buffer dtype before storing (main #134: the sampler now
-        # returns int64 token ids that must land in the buffer's dtype).
-        # Host-owned scheduler lengths may arrive on CPU; same-device values are no-ops.
+        """Store relay rows, retaining the buffer's dtype and device."""
         values = values.to(device=buf.device, dtype=buf.dtype, non_blocking=True)
         indices = indices.to(buf.device, non_blocking=True)
-        if self._use_dynamic_index:
-            buf.index_copy_(0, indices, values)
-        else:
-            buf[indices] = values
+        buf[indices] = values
+
+    def prepare_prefill_inputs(self, batch):
+        pass
+
+    def _record_indices_stream(self, indices):
+        indices.record_stream(torch.get_device_module(self.device).current_stream())
+
+    def _resolve_device_seq_lens(self, batch) -> bool:
+        return False
+
+    def _keep_committed_seq_lens(self, batch) -> bool:
+        return False
 
     def stash_bonus_tokens(
         self, indices: torch.Tensor, bonus_tokens: torch.Tensor
@@ -619,18 +581,11 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        if _is_tpu and resolve_device_accept_seq_lens_tpu(self, batch):
+        if self._resolve_device_seq_lens(batch):
             return
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if (
-            _is_tpu
-            and self.spec_algo.is_dflash_family()
-            and draft_input.tpu_host_seq_lens_is_committed
-        ):
-            # DFLASH pre-gathered its verify window from the committed base, so
-            # the host mirror prepare_for_decode seeded must survive: reading the
-            # published length back would reintroduce the sync this avoids.
+        if self._keep_committed_seq_lens(batch):
             return
 
         if not self.needs_cpu_seq_lens:

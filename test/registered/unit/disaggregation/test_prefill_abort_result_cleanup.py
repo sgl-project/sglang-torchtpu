@@ -10,6 +10,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMa
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.backend_extension import (
+    SchedulerExtension,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -69,6 +72,7 @@ class _Req:
 
 class _Scheduler(Scheduler):
     def __init__(self):
+        self.scheduler_extension = SchedulerExtension()
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
             move_logprobs_to_cpu=Mock(),

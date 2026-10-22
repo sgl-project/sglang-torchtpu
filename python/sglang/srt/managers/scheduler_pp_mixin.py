@@ -35,17 +35,18 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import is_npu, is_tpu, is_xpu
+from sglang.srt.utils.common import is_npu, is_xpu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
-_is_tpu = is_tpu()
 _PP_PD_CONSENSUS_TAG = 0x5050
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang_tpu.pp_scheduler import PPDecodeTransferStatus
+    from sglang.srt.managers.scheduler_components.backend_extension import (
+        PipelineTransferStatus,
+    )
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -221,12 +222,14 @@ class SchedulerPPMixin:
     # Stage hand-off: over the TPU ICI wave when init_pp_loop_state built one,
     # otherwise over the host channel. Each helper dispatches once; the wait
     # on the output copy event is the same on both.
-    def _pp_init_wave(self: Scheduler):
-        from sglang_tpu.pp_scheduler import (
-            build_scheduler_pp_wave,
+    def _pp_init_wave(self):
+        return self.scheduler_extension.create_pipeline_transport(
+            model_runner=self.tp_worker.model_runner,
+            pp_group=self.pp_group,
+            stage_group=self.tp_group,
+            world_group=self.world_group,
+            depth=self.pp_loop_size,
         )
-
-        return build_scheduler_pp_wave(self)
 
     def _pp_begin_iteration(self: Scheduler, has_forward: bool) -> None:
         if self._pp_wave is not None:
@@ -449,7 +452,7 @@ class SchedulerPPMixin:
         tmbs = [None] * self.pp_loop_size
         consensus_retract_rids: Optional[List[str]] = None
         consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[List[str] | PPDecodeTransferStatus] = None
+        release_rids: Optional[List[str] | PipelineTransferStatus] = None
         send_retract_work = []
         send_prealloc_work = []
         send_transfer_work = []
@@ -700,10 +703,6 @@ class SchedulerPPMixin:
             and not self.spec_algorithm.is_none()
         )
 
-        self._pp_pd_control_work: List[List[P2PWork]] = [
-            [] for _ in range(self.pp_loop_size)
-        ]
-        self._pp_pd_control_slot = 0
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
@@ -733,7 +732,7 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
-        self._pp_wave = self._pp_init_wave() if _is_tpu else None
+        self._pp_wave = self._pp_init_wave()
 
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -796,8 +795,7 @@ class SchedulerPPMixin:
         reused; no-op over the host channel."""
         if self._pp_wave is None:
             return
-        self._pp_commit_comm_work(self._pp_pd_control_work[mb_id])
-        self._pp_pd_control_slot = mb_id
+        self._pp_wave.begin_control_step(mb_id, self._pp_commit_comm_work)
 
     def _pp_pd_send_control(
         self: Scheduler, payloads: List, *, before_forward: bool
@@ -832,8 +830,7 @@ class SchedulerPPMixin:
         # The ring owns the serialized buffers until their real sends complete.
         # One-step acknowledgments prevent trailing ranks from launching ICI
         # when a drained pipeline starts another wave.
-        self._pp_pd_control_work[self._pp_pd_control_slot].extend(work)
-        return []
+        return self._pp_wave.retain_control_work(work)
 
     def _pp_pd_send_control_to_next_stage(
         self: Scheduler, data, async_send: bool = False
@@ -892,10 +889,10 @@ class SchedulerPPMixin:
 
     def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
-        tmbs: List[List[str] | PPDecodeTransferStatus],
+        tmbs: List[List[str] | PipelineTransferStatus],
         next_first_rank_mb_id: int,
-        release_rids: List[str] | PPDecodeTransferStatus,
-        transferred_rids: List[str] | PPDecodeTransferStatus,
+        release_rids: List[str] | PipelineTransferStatus,
+        transferred_rids: List[str] | PipelineTransferStatus,
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
@@ -2053,11 +2050,7 @@ class SchedulerPPMixin:
         if self._pp_wave is not None:
             # Over the wave every stage polls its own receivers and the status
             # carries the failures seen by any stage.
-            from sglang_tpu.pp_scheduler import (
-                decode_transfer_status,
-            )
-
-            return decode_transfer_status(
+            return self._pp_wave.decode_transfer_status(
                 self.disagg_decode_transfer_queue,
                 (
                     None
@@ -2122,7 +2115,7 @@ class SchedulerPPMixin:
 
     def process_decode_transfer_queue(
         self: Scheduler,
-        release_rids: Optional[List[str] | PPDecodeTransferStatus],
+        release_rids,
     ):
         # Resolve held deferred releases every call, independent of release_rids,
         # so ack/timeout-driven releases still fire when no rids are being polled.
@@ -2130,14 +2123,9 @@ class SchedulerPPMixin:
         if release_rids is not None:
             terminal_rids = release_rids
             if self._pp_wave is not None:
-                from sglang_tpu.pp_scheduler import (
-                    abort_failed_receivers,
+                terminal_rids = self._pp_wave.release_terminal_rids(
+                    self.disagg_decode_transfer_queue, release_rids
                 )
-
-                abort_failed_receivers(
-                    self.disagg_decode_transfer_queue, release_rids.failed_rids
-                )
-                terminal_rids = release_rids.terminal_rids
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 terminal_rids
             )

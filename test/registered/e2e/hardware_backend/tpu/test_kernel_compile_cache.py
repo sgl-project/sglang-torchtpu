@@ -23,7 +23,7 @@ def worker():
     import torch
     from torch._functorch._aot_autograd import autograd_cache
 
-    from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
+    from sglang_tpu.worker_env import initialize_torch_tpu_worker
 
     server_args = SimpleNamespace(
         device="tpu",

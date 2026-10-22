@@ -181,11 +181,11 @@ class TestTpuOOTPlatformContract(CustomTestCase):
                 self.platform.init_backend()
             in_tree_init.assert_called_once()
 
-    def test_worker_bootstrap_marker_is_set_by_patch_torch(self):
-        """The marker is only meaningful while patch_torch sets it."""
+    def test_worker_bootstrap_marker_is_set_by_plugin(self):
+        """The worker marker must be set before deferred plugin initialization."""
         from sglang_tpu.platform import _WORKER_BOOTSTRAP_MARKER
 
-        source = self._read_core("utils/patch_torch.py")
+        source = open(os.path.join(_REPO_ROOT, "sglang_tpu", "worker_env.py")).read()
         self.assertIn(f'os.environ["{_WORKER_BOOTSTRAP_MARKER}"] = ', source)
 
     # -- DSA / sparse attention -------------------------------------------
@@ -345,7 +345,6 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
         from sglang_tpu.hooks.pipeline_parallel import (
             check_pipeline_parallel_compat,
-            skip_spec_op_precompile_without_draft,
         )
         from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
         from sglang_tpu.hooks.twolevel_allreduce import (
@@ -369,14 +368,6 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             (
                 "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",
                 check_pipeline_parallel_compat,
-                HookType.AROUND,
-            ),
-            HOOKS,
-        )
-        self.assertIn(
-            (
-                "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
-                skip_spec_op_precompile_without_draft,
                 HookType.AROUND,
             ),
             HOOKS,

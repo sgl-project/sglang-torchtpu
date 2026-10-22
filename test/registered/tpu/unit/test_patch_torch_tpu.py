@@ -13,8 +13,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.worker_env import initialize_torch_tpu_worker
 
 _TORCHRUN_ENV_VARS = (
     "RANK",

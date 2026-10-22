@@ -13,7 +13,6 @@ import torch
 
 import sglang.srt.managers.overlap_utils as overlap_utils
 import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
-from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.dflash_utils_tpu import (
@@ -22,9 +21,7 @@ from sglang_tpu.dflash_utils_tpu import (
     gather_dflash_candidate_window,
     select_dflash_verify_cache_locs_tpu,
 )
-from sglang_tpu.overlap_utils_tpu import (
-    resolve_device_accept_seq_lens_tpu,
-)
+from sglang_tpu.future_map import TpuFutureMap
 
 BLOCK_SIZE = 4
 MAX_CTX = 64
@@ -203,8 +200,9 @@ def test_padded_rows_do_not_disturb_live_rows():
     torch.testing.assert_close(padded[:2], live)
 
 
-def _resolve_stub(new_seq_lens_buf: torch.Tensor) -> SimpleNamespace:
-    return SimpleNamespace(
+def _resolve_stub(new_seq_lens_buf: torch.Tensor) -> TpuFutureMap:
+    future_map = object.__new__(TpuFutureMap)
+    future_map.__dict__.update(
         publish_ready=None,
         new_seq_lens_buf=new_seq_lens_buf,
         spec_algo=SpeculativeAlgorithm.DFLASH,
@@ -215,6 +213,8 @@ def _resolve_stub(new_seq_lens_buf: torch.Tensor) -> SimpleNamespace:
         need_topk=False,
         tpu_direct_handoff=None,
     )
+
+    return future_map
 
 
 def _resolve_batch(committed_base: torch.Tensor, committed: bool):
@@ -234,17 +234,10 @@ def _run_resolve(committed: bool, committed_base: torch.Tensor):
     published = _DeviceTensor(torch.tensor([31, 42], dtype=torch.int64))
     batch = _resolve_batch(committed_base, committed=committed)
     with (
-        patch.object(overlap_utils, "_is_tpu", True),
         patch.object(overlap_utils, "_DEBUG_ASSERT", False),
-        patch.object(
-            overlap_utils,
-            "resolve_device_accept_seq_lens_tpu",
-            resolve_device_accept_seq_lens_tpu,
-            create=True,
-        ),
         TransferRecorder() as log,
     ):
-        FutureMap.resolve_seq_lens_cpu(_resolve_stub(published), batch)
+        _resolve_stub(published).resolve_seq_lens_cpu(batch)
     return batch, log
 
 

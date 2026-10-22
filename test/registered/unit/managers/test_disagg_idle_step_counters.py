@@ -17,6 +17,9 @@ from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.backend_extension import (
+    SchedulerExtension,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -478,6 +481,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.tp_size = get_parallel().tp_size
         scheduler.gracefully_exit = False
+        scheduler.scheduler_extension = SchedulerExtension()
+        # The PP wave asks the extension for a transport from the target runner
+        # and the scheduler's groups; the shared extension builds none.
+        scheduler.tp_worker = SimpleNamespace(model_runner=None)
+        scheduler.tp_group = scheduler.world_group = None
         # Fork-only scheduler state read by the PP loops.
         scheduler.use_overlap_streams = True
         scheduler._pending_chunked_abort_req = None

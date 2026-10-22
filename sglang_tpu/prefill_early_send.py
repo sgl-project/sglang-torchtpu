@@ -63,14 +63,13 @@ def tpu_clip_cached_prefix_send_end(
 
 
 def tpu_hicache_load_page_ids(
-    scheduler: Scheduler, load_indices: Sequence[torch.Tensor]
+    *, page_size: int, load_indices: Sequence[torch.Tensor]
 ) -> torch.Tensor:
     """Convert a batch's load-back KV slot indices to unique page IDs on CPU.
 
     Divides by the allocator's page size, which DCP widens beyond the radix page
     size, the same unit the early-send clips use for prefix slots.
     """
-    page_size = scheduler.token_to_kv_pool_allocator.page_size
     # A page's slots are adjacent within a load, so collapse each run first;
     # the final sort then sees about one entry per page.
     page_ids = [

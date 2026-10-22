@@ -309,6 +309,9 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
     @staticmethod
     def _scheduler(req):
         scheduler = Scheduler.__new__(Scheduler)
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        scheduler.scheduler_extension = TpuSchedulerExtension()
         scheduler.chunked_req = req
         scheduler._pending_chunked_abort_req = req
         scheduler._deferred_chunked_sender_aborts = []
@@ -363,6 +366,11 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         sender.drained.return_value = False
         req = self._aborted_chunked_req(sender)
         scheduler = self._scheduler(req)
+        from sglang.srt.managers.scheduler_components.backend_extension import (
+            SchedulerExtension,
+        )
+
+        scheduler.scheduler_extension = SchedulerExtension()
         scheduler.attn_tp_cpu_group = object()
         scheduler.attn_cp_cpu_group = object()
 
@@ -414,6 +422,9 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         # is_fully_idle reads the pipeline width from the published config.
         enter_scope(self, published_topology())
         scheduler = Scheduler.__new__(Scheduler)
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        scheduler.scheduler_extension = TpuSchedulerExtension()
         scheduler.tree_cache = MagicMock()
         scheduler.running_batch = SimpleNamespace(
             reqs=[], is_empty=lambda: True, batch_is_full=False

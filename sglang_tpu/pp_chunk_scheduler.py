@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -31,13 +31,12 @@ from sglang_tpu.pp_chunks import (
     uses_dynamic_chunks,
 )
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
-
 logger = logging.getLogger(__name__)
 
 
-def pending_step_limit(scheduler: Scheduler) -> int:
+def pending_step_limit(
+    *, cost, cached_prefix, waiting_queue, chunked_req, mbs, last_mbs, tree_cache
+) -> int:
     """Spread outstanding prefill work over stages, rounded up to a bucket.
 
     Outstanding work is the unscheduled tokens of waiting and partial
@@ -46,12 +45,10 @@ def pending_step_limit(scheduler: Scheduler) -> int:
     load the chunks grow with the work already in flight, since every stage
     advances in lockstep at the pace of the largest chunk in the pipeline.
     """
-    cost = scheduler._tpu_pp_chunk_cost
-    requests = list(scheduler.waiting_queue)
-    if scheduler.chunked_req is not None:
-        requests.append(scheduler.chunked_req)
-    cached_prefix = scheduler._tpu_pp_cached_prefix
-    waiting = {req.rid for req in scheduler.waiting_queue}
+    requests = list(waiting_queue)
+    if chunked_req is not None:
+        requests.append(chunked_req)
+    waiting = {req.rid for req in waiting_queue}
     for rid in [rid for rid in cached_prefix if rid not in waiting]:
         del cached_prefix[rid]
     seen = set()
@@ -70,7 +67,7 @@ def pending_step_limit(scheduler: Scheduler) -> int:
             # Matched once per waiting request; its cached prefix is not pending work,
             # and the match refreshes that prefix's recency ahead of admission.
             matches_left -= 1
-            cached = matched_prefix_len(scheduler.tree_cache, req)
+            cached = matched_prefix_len(tree_cache, req)
             cached_prefix[req.rid] = cached
         pending += max(len(req.origin_input_ids) + len(req.output_ids) - cached, 0)
         if pending >= get_parallel().pp_size * cost.buckets[-1]:
@@ -78,7 +75,7 @@ def pending_step_limit(scheduler: Scheduler) -> int:
             break
     # A micro-batch slot holds its batch until the result is processed, when
     # the same batch is recorded as the slot's last batch.
-    for batch, done in zip(scheduler.mbs, scheduler.last_mbs):
+    for batch, done in zip(mbs, last_mbs):
         if batch is not None and batch is not done:
             pending += _prefill_tokens(batch)
     granule = cost.granularity
@@ -200,9 +197,10 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         return self.budget_state() if len(self.can_run_list) > before else result
 
 
-def profile_and_install_cost_model(scheduler: Scheduler) -> None:
+def profile_cost_model(
+    *, runner, page_size, chunked_prefill_size, world_group
+) -> Optional[StepCostModel]:
     """Profile every stage after compilation and share the slowest cost curve."""
-    runner = scheduler.tp_worker.model_runner
     if not uses_dynamic_chunks():
         return
     if not get_exec().graph.enable_torch_compile:
@@ -210,9 +208,7 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     if envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
         raise ValueError("SGLANG_TPU_PP_CHUNK_SLACK must be nonnegative.")
     policy = runner.compile_policy
-    granularity = chunk_granularity(
-        scheduler.page_size, scheduler.chunked_prefill_size, True
-    )
+    granularity = chunk_granularity(page_size, chunked_prefill_size, True)
     buckets = policy.t_bucketer.buckets
     if buckets[-1] > runner.model_config.context_len:
         raise ValueError(
@@ -243,9 +239,9 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     # multi-device stage admit the same chunks.
     # TODO(yinlin09): all schedulers of a stage must pick identical chunks each step;
     # let the stage leader decide and broadcast, or check agreement in the stage.
-    reports = [None] * scheduler.world_group.world_size
+    reports = [None] * world_group.world_size
     torch.distributed.all_gather_object(
-        reports, (samples, schedule), group=scheduler.world_group.cpu_group
+        reports, (samples, schedule), group=world_group.cpu_group
     )
     schedules = [report[1] for report in reports if report[1] is not None]
     cost = StepCostModel.fit(
@@ -265,7 +261,5 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
                 f"{granularity}-token chunk of prompts up to {longest} tokens; "
                 f"lower --context-length from {context_len} to {longest}."
             )
-    scheduler._tpu_pp_chunk_cost = cost
-    # Cached prefix tokens of each waiting request, matched once.
-    scheduler._tpu_pp_cached_prefix = {}
     logger.info("TPU pipeline chunks: %s; stage samples %s", cost.describe(), samples)
+    return cost

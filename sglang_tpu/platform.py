@@ -27,7 +27,7 @@ _SUPPORTED_DRAFT_ATTENTION_BACKENDS = frozenset(
 )
 _DEFAULT_DRAFT_ATTENTION_BACKEND = "pallas_tpu_rpa_v3"
 
-# Set by patch_torch.monkey_patch_torch_tpu_env in the scheduler worker;
+# Set by worker_env.monkey_patch_torch_tpu_env in the scheduler worker;
 # unlike WORLD_SIZE, no launcher exports it into the parent environment.
 _WORKER_BOOTSTRAP_MARKER = "SGLANG_TPU_CACHE_DP_SCOPE"
 

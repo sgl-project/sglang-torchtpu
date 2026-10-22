@@ -708,12 +708,13 @@ class TestHostPadFieldSelection(CustomTestCase):
         from sglang.srt.managers import overlap_utils
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.future_map import TpuFutureMap
 
         indices = torch.tensor([2, 7, 9])
         batch = ScheduleBatch(reqs=[], req_pool_indices=indices)
-        relay = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        relay = object.__new__(TpuFutureMap)
+        relay.tpu_direct_handoff = None
         relay.spec_algo = SpeculativeAlgorithm.NONE
-        relay._use_dynamic_index = True
         relay.output_tokens_buf = torch.empty(16, dtype=torch.int64, device="meta")
         operations = []
 

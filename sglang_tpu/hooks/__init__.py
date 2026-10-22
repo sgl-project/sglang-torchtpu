@@ -55,7 +55,6 @@ from sglang_tpu.hooks.moe_topk import (
 )
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
-    skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
@@ -77,11 +76,6 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",
         check_pipeline_parallel_compat,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
-        skip_spec_op_precompile_without_draft,
         HookType.AROUND,
     ),
     (

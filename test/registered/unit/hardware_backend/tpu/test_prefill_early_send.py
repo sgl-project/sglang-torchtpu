@@ -489,7 +489,7 @@ class TestHiCacheLoadPageIds(CustomTestCase):
             page_size=4, token_to_kv_pool_allocator=SimpleNamespace(page_size=8)
         )
         page_ids = tpu_hicache_load_page_ids(
-            scheduler=scheduler,
+            page_size=scheduler.token_to_kv_pool_allocator.page_size,
             load_indices=[torch.arange(0, 8), torch.arange(8, 16)],
         )
         self.assertEqual(sorted(page_ids.tolist()), [0, 1])
@@ -500,7 +500,7 @@ class TestHiCacheLoadPageIds(CustomTestCase):
             token_to_kv_pool_allocator=SimpleNamespace(page_size=64)
         )
         page_ids = tpu_hicache_load_page_ids(
-            scheduler=scheduler,
+            page_size=scheduler.token_to_kv_pool_allocator.page_size,
             load_indices=[torch.arange(64, 192), torch.arange(192, 256)],
         )
         # Every slot of a page maps to the same page ID, so each ID repeats 64 times;
@@ -508,7 +508,8 @@ class TestHiCacheLoadPageIds(CustomTestCase):
         self.assertEqual(sorted(page_ids.tolist()), [1, 2, 3])
         # The IDs stay unique even if a page's slots are not adjacent in a load.
         page_ids = tpu_hicache_load_page_ids(
-            scheduler=scheduler, load_indices=[torch.tensor([0, 130, 1])]
+            page_size=scheduler.token_to_kv_pool_allocator.page_size,
+            load_indices=[torch.tensor([0, 130, 1])],
         )
         self.assertEqual(sorted(page_ids.tolist()), [0, 2])
 

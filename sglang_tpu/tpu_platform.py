@@ -1035,6 +1035,18 @@ class TpuSRTPlatform(SRTPlatform):
         # Registered by _register_attention_backends().
         return "tpu"
 
+    def initialize_scheduler_worker(
+        self, server_args, tp_rank, pp_rank=0, dp_rank=None
+    ):
+        from sglang_tpu.worker_env import initialize_torch_tpu_worker
+
+        initialize_torch_tpu_worker(server_args, tp_rank, pp_rank, dp_rank=dp_rank)
+
+    def get_scheduler_extension_cls(self) -> type:
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        return TpuSchedulerExtension
+
     def get_graph_runner_cls(self) -> type:
         from sglang_tpu.graph_runner.tpu_graph_runner import TpuGraphRunner
 

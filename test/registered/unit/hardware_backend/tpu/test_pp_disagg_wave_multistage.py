@@ -181,7 +181,9 @@ def stage(fabric, rank, mode, schedule):
         device=torch.device("cpu"),
         launcher=lambda x: fabric.launch(rank, x),
     )
-    scheduler._pp_init_wave = lambda: wave
+    from sglang_tpu.pp_scheduler import TpuPipelineTransport
+
+    scheduler._pp_init_wave = lambda: TpuPipelineTransport(wave, fabric.size + 1)
     scheduler._pp_send_pyobj_to_next_stage = lambda data, async_send=False: fabric.send(
         rank, "raw", data
     )
@@ -349,7 +351,6 @@ class TestMultiStageDisaggregatedWave(unittest.TestCase):
 
                 stage_parallel = threading.local()
                 with (
-                    patch.object(scheduler_pp_mixin, "_is_tpu", True),
                     patch.object(
                         scheduler_pp_mixin,
                         "get_parallel",

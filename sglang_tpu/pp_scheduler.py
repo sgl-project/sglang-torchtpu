@@ -4,23 +4,16 @@ scheduler drives, and the decode transfer consensus over it."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
+from typing import Any, List, Optional
 
 import torch
 from torch import nn
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.managers.scheduler_components.backend_extension import (
+    PipelineTransferStatus as PPDecodeTransferStatus,
+)
 from sglang_tpu.pp_wave import PPWave, build_pp_wave, num_relayed_aux_slots
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
-
-
-class PPDecodeTransferStatus(NamedTuple):
-    """Transfer terminals shared by every stage and failures seen by any stage."""
-
-    terminal_rids: List[str]
-    failed_rids: List[str]
 
 
 def _check_aux_capture_relay(model: nn.Module) -> None:
@@ -45,23 +38,24 @@ def _check_aux_capture_relay(model: nn.Module) -> None:
         )
 
 
-def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
+def build_scheduler_pp_wave(
+    *, model_runner, pp_group, stage_group, world_group
+) -> PPWave:
     """The stage's hand-off wave, sized to the largest batch a compiled
     forward can hand on."""
     from sglang_tpu.compilation.decoder_compile_policy import (
         DecoderTpuCompilePolicy,
     )
 
-    model_runner = scheduler.tp_worker.model_runner
     policy = model_runner.compile_policy
     assert isinstance(policy, DecoderTpuCompilePolicy), type(policy)
     if model_runner.spec_aux_config.eagle_use_aux_hidden_state:
         _check_aux_capture_relay(model_runner.model)
     num_aux = num_relayed_aux_slots(model_runner.spec_aux_config, model_runner.model)
     return build_pp_wave(
-        pp_group=scheduler.pp_group,
-        stage_group=scheduler.tp_group,
-        world_group=scheduler.world_group,
+        pp_group=pp_group,
+        stage_group=stage_group,
+        world_group=world_group,
         rows=policy.max_padded_tokens(),
         hidden=int(model_runner.model_config.hidden_size),
         num_aux=num_aux,
@@ -106,3 +100,36 @@ def abort_failed_receivers(queue: Any, failed_rids: List[str]) -> None:
             receiver.quiesce_group_failure()
         else:
             receiver.abort()
+
+
+class TpuPipelineTransport:
+    """Wave plus host-control buffers retained until their slot is reused."""
+
+    def __init__(self, wave, depth):
+        self.wave = wave
+        self.control_work = [[] for _ in range(depth)]
+        self.control_slot = 0
+
+    def begin_iteration(self, has_forward):
+        return self.wave.begin_iteration(has_forward)
+
+    def receive(self):
+        return self.wave.receive()
+
+    def end_iteration(self, *args, **kwargs):
+        return self.wave.end_iteration(*args, **kwargs)
+
+    def begin_control_step(self, slot, commit_work):
+        commit_work(self.control_work[slot])
+        self.control_slot = slot
+
+    def retain_control_work(self, work):
+        self.control_work[self.control_slot].extend(work)
+        return []
+
+    def decode_transfer_status(self, queue, previous):
+        return decode_transfer_status(queue, previous)
+
+    def release_terminal_rids(self, queue, status):
+        abort_failed_receivers(queue, status.failed_rids)
+        return status.terminal_rids

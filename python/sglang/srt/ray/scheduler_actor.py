@@ -46,11 +46,11 @@ class SchedulerActor:
         dist_init_addr: Optional[str] = None,
     ):
         from sglang.srt.environ import envs
+        from sglang.srt.platforms import current_platform
         from sglang.srt.utils.numa_utils import (
             get_numa_node_if_available,
             numa_bind_to_node,
         )
-        from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
         # Declared, not copied: Ray deserializes the argument per call, so this
         # record is the actor's own and nothing else in the process holds it.
@@ -70,7 +70,7 @@ class SchedulerActor:
         # WORLD_SIZE/MASTER_* for torch_tpu's PJRT slicebuilder), then initialize
         # the backend before importing Scheduler. Ray actors skip the mp entry
         # point that normally performs this work. No-op for non-TPU.
-        initialize_torch_tpu_worker(server_args, tp_rank, pp_rank)
+        current_platform.initialize_scheduler_worker(server_args, tp_rank, pp_rank)
 
         from sglang.srt.managers.scheduler import (
             Scheduler,

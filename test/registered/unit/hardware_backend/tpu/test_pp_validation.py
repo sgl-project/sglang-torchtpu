@@ -13,6 +13,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.arg_groups.validation_hook import (
     check_pipeline_parallel_compat as core_check_pipeline_parallel_compat,
@@ -21,12 +23,10 @@ from sglang.srt.distributed import parallel_state
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pp_stage_chips, pp_stage_groups
-from sglang_tpu.hooks.pipeline_parallel import (
-    check_pipeline_parallel_compat,
-    skip_spec_op_precompile_without_draft,
-)
+from sglang_tpu.hooks.pipeline_parallel import check_pipeline_parallel_compat
 from sglang_tpu.pp_scheduler import _check_aux_capture_relay
 from sglang_tpu.pp_wave import num_relayed_aux_slots
+from sglang_tpu.scheduler_extension import TpuSchedulerExtension
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 
@@ -288,16 +288,43 @@ class TestEagle3PipelineParallelCompat(CustomTestCase):
             )
 
     def test_stage_without_draft_skips_spec_op_precompile(self):
-        original = Mock()
-        scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=None))
-        skip_spec_op_precompile_without_draft(original, scheduler)
-        original.assert_not_called()
+        target_runner = Mock()
+        with patch("sglang_tpu.spec_op_precompile.precompile_spec_v2_ops") as compile_:
+            TpuSchedulerExtension().precompile_spec_ops(
+                target_runner=target_runner,
+                draft_worker=SimpleNamespace(draft_worker=None),
+                vocab_size=32,
+            )
+        compile_.assert_not_called()
+        self.assertEqual(target_runner.mock_calls, [])
 
     def test_stage_with_draft_precompiles_spec_ops(self):
-        original = Mock()
-        scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=object()))
-        skip_spec_op_precompile_without_draft(original, scheduler)
-        original.assert_called_once_with(scheduler)
+        from sglang_tpu.compilation.spec_decode_compile_policy import (
+            BaseSpecDecodeCompilePolicyMixin,
+        )
+
+        policy = object.__new__(BaseSpecDecodeCompilePolicyMixin)
+        policy.b_bucketer = SimpleNamespace(buckets=[1, 2])
+        policy.draft_token_num = 4
+        draft_runner = SimpleNamespace(
+            model=SimpleNamespace(config=SimpleNamespace(vocab_size=32))
+        )
+        with (
+            patch(
+                "sglang_tpu.scheduler_extension.get_draft_recurrent_hidden_state_spec",
+                return_value=(16, torch.float32),
+            ),
+            patch("sglang_tpu.spec_op_precompile.precompile_spec_v2_ops") as compile_,
+        ):
+            TpuSchedulerExtension().precompile_spec_ops(
+                target_runner=SimpleNamespace(compile_policy=policy, device="cpu"),
+                draft_worker=SimpleNamespace(
+                    draft_worker=SimpleNamespace(draft_runner=draft_runner)
+                ),
+                vocab_size=32,
+            )
+        compile_.assert_called_once()
+        self.assertEqual(compile_.call_args.kwargs["physical_batch_buckets"], [1, 2])
 
     def test_model_without_relay_rejects_captures_before_the_last_stage(self):
         model = SimpleNamespace(

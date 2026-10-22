@@ -89,7 +89,7 @@ class TpuDraftWorker(ABC):
 
     @property
     def draft_runner(self) -> ModelRunner:
-        """Read by Scheduler.precompile_tpu_spec_ops."""
+        """Read by TpuSchedulerExtension.precompile_spec_ops."""
         return self.model_runner
 
     @property

@@ -751,7 +751,7 @@ def test_device_accept_cache_window_follows_verify_input(is_tpu):
 @pytest.mark.parametrize("with_hidden", (False, True))
 def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
     from sglang.srt.managers import overlap_utils
-    from sglang_tpu import overlap_utils_tpu
+    from sglang_tpu.future_map import TpuFutureMap
 
     bs = 3
     indices = torch.arange(1, bs + 1, dtype=torch.int64)
@@ -764,7 +764,8 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
         accept_lens_device=accept_lens,
         future_dsa_topk_indices_available=False,
     )
-    future_map = SimpleNamespace(
+    future_map = object.__new__(TpuFutureMap)
+    vars(future_map).update(
         publish_ready=None,
         tpu_direct_handoff=None,
         new_seq_lens_buf=torch.arange(8) + 20,
@@ -791,31 +792,18 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
         buf[rows] = -1
 
     with (
-        patch.object(overlap_utils, "_is_tpu", True),
-        patch.object(
-            overlap_utils,
-            "resolve_device_accept_seq_lens_tpu",
-            overlap_utils_tpu.resolve_device_accept_seq_lens_tpu,
-            create=True,
-        ),
-        patch.object(
-            overlap_utils,
-            "device_accept_resolved_tpu",
-            overlap_utils_tpu.device_accept_resolved_tpu,
-            create=True,
-        ),
         patch.object(kernels, "gather_spec_extras_func", side_effect=gather),
         patch.object(overlap_utils, "_DEBUG_ASSERT", True),
         patch.object(
             overlap_utils, "_assert_nonneg_and_invalidate", side_effect=invalidate
         ) as debug,
     ):
-        overlap_utils.FutureMap.resolve_seq_lens_cpu(future_map, batch)
+        future_map.resolve_seq_lens_cpu(batch)
         torch.testing.assert_close(batch.seq_lens, indices + 20)
         torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([99]))
         torch.testing.assert_close(debug.call_args.args[2], indices)
         # Reusing resolved state must neither gather nor invalidate again.
-        overlap_utils.FutureMap._resolve_spec_extras(future_map, batch)
+        future_map._resolve_spec_extras(batch)
         assert debug.call_count == 1
 
     torch.testing.assert_close(draft.topk_p, future_map.topk_p_buf[indices])

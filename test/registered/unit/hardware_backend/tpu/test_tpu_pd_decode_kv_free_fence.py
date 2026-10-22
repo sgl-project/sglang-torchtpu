@@ -109,7 +109,18 @@ def _scheduler(**overrides):
         tpu_async_copy_worker=SimpleNamespace(copy_draft_tail=True),
     )
     attrs.update(overrides)
+    from sglang.srt.managers.scheduler_components.backend_extension import (
+        SchedulerExtension,
+    )
+    from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+    attrs.setdefault("tree_cache", None)
     scheduler = SimpleNamespace(**attrs)
+    scheduler.scheduler_extension = (
+        TpuSchedulerExtension() if scheduler.device == "tpu" else SchedulerExtension()
+    )
+    if scheduler.device == "tpu":
+        scheduler.scheduler_extension.result_copier = scheduler.tpu_async_copy_worker
     for name in (
         "_uses_raiden_hicache",
         "_needs_kv_free_fence",

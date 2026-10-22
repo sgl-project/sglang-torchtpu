@@ -124,6 +124,19 @@ class SRTPlatform(DeviceMixin):
         """Return the default draft attention backend for an algorithm."""
         raise NotImplementedError
 
+    def initialize_scheduler_worker(
+        self, server_args, tp_rank, pp_rank=0, dp_rank=None
+    ):
+        """Initialize backend process state before worker plugin/model loading."""
+        pass
+
+    def get_scheduler_extension_cls(self) -> type:
+        from sglang.srt.managers.scheduler_components.backend_extension import (
+            SchedulerExtension,
+        )
+
+        return SchedulerExtension
+
     def get_graph_runner_cls(self) -> Optional[type]:
         """Return the graph runner class, or None for the in-tree default.
 

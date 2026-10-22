@@ -15,7 +15,7 @@ Deliberately absent, because only one algorithm or platform reaches them: the
 DSpark-only commands behind ``is_dspark()`` / ``decide_needs_confidence_relay``
 (``dump_info_records``, ``clear_info_records``, ``set_dspark_forced_budget_frac``,
 ``block_accept_estimate_log_suffix``, ``get_confidence_budget_prepare``), the TPU
-spec-op precompile (``Scheduler.precompile_tpu_spec_ops``), and the
+spec-op precompile (``TpuSchedulerExtension.precompile_spec_ops``), and the
 NGRAM relay fields read by ``RelayPayload.from_ngram``.
 
 Known gap: ``SchedulerWeightUpdaterManager.save_remote_model`` still reads

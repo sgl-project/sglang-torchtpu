@@ -92,6 +92,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_device,
@@ -114,7 +115,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 
@@ -327,7 +327,7 @@ class BenchArgs:
 
 
 def load_model(server_args, port_args, gpu_id, tp_rank):
-    initialize_torch_tpu_worker(server_args, tp_rank)
+    current_platform.initialize_scheduler_worker(server_args, tp_rank)
     cfg = resolving_view(server_args)
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None

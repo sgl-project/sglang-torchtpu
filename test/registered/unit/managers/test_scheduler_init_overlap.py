@@ -17,6 +17,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -32,6 +34,14 @@ _SCHED_MOD = "sglang.srt.managers.scheduler"
 def _make_scheduler(*, enable_overlap: bool) -> Scheduler:
     """A bare Scheduler with only the attributes init_overlap touches."""
     s = Scheduler.__new__(Scheduler)
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.managers.scheduler_components.backend_extension import (
+        SchedulerExtension,
+    )
+
+    s.scheduler_extension = SchedulerExtension()
+    s.enable_hierarchical_cache = False
+    s.disaggregation_mode = DisaggregationMode.NULL
     s.device = "cpu"
     s.forward_stream = object()  # sentinel; only used on the stream path
     s.enable_overlap = enable_overlap
@@ -225,6 +235,188 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         )
         self.assertIsNone(out)
         s._relay_forward_payload.assert_not_called()
+
+
+class TestSchedulerExtensionOwnership(CustomTestCase):
+    def test_platform_factory_selects_distinct_scheduler_instances(self):
+        from sglang.srt.managers.scheduler_components.backend_extension import (
+            SchedulerExtension,
+        )
+        from sglang.srt.platforms.interface import SRTPlatform
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        for platform in (SRTPlatform(), TpuSRTPlatform(), TpuOOTPlatform()):
+            with (
+                self.subTest(platform=type(platform).__name__),
+                patch(f"{_SCHED_MOD}.current_platform", platform),
+            ):
+                first = Scheduler.__new__(Scheduler)
+                second = Scheduler.__new__(Scheduler)
+                first.init_scheduler_extension()
+                second.init_scheduler_extension()
+                expected = (
+                    SchedulerExtension
+                    if type(platform) is SRTPlatform
+                    else TpuSchedulerExtension
+                )
+                self.assertIs(type(first.scheduler_extension), expected)
+                self.assertIsNot(first.scheduler_extension, second.scheduler_extension)
+
+    def test_direct_handoff_does_not_patch_shared_future_map(self):
+        from sglang.srt.managers.overlap_utils import FutureMap
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.future_map import TpuFutureMap
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        stash = FutureMap.stash
+        pool = SimpleNamespace(req_to_token=torch.zeros(8, 16))
+        extension = TpuSchedulerExtension()
+        relay = extension.create_future_map(SpeculativeAlgorithm.NONE, "cpu", pool)
+        self.assertIs(type(relay), TpuFutureMap)
+        self.assertIs(FutureMap.stash, stash)
+        self.assertNotIn("tpu_direct_handoff", FutureMap.__dict__)
+        other = extension.create_future_map(SpeculativeAlgorithm.NONE, "cpu", pool)
+        relay.tpu_direct_handoff = object()
+        self.assertIsNone(other.tpu_direct_handoff)
+
+    def test_plugin_spec_relay_is_materialized_by_the_extension(self):
+        """The extension builds the TPU relay itself, so it also starts the plugin
+        spec workers' relay buffers concrete, as their workers expect."""
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.hooks import experimental_spec
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        pool = SimpleNamespace(req_to_token=torch.zeros(8, 16))
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+                patch.object(
+                    experimental_spec,
+                    "materialize_future_map",
+                    side_effect=lambda relay, algorithm: relay,
+                ) as materialize,
+            ):
+                relay = TpuSchedulerExtension().create_future_map(
+                    SpeculativeAlgorithm.EAGLE3, "cpu", pool
+                )
+            if enabled:
+                materialize.assert_called_once_with(relay, SpeculativeAlgorithm.EAGLE3)
+            else:
+                materialize.assert_not_called()
+
+    def test_draftless_stage_skips_spec_precompile(self):
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        # No target runner is deliberately provided: a non-last PP stage must
+        # return before touching policy, draft-model fields or device state.
+        TpuSchedulerExtension().precompile_spec_ops(
+            target_runner=None,
+            draft_worker=SimpleNamespace(draft_worker=None),
+            vocab_size=32,
+        )
+
+    def test_pipeline_control_buffers_survive_until_slot_reuse(self):
+        from sglang_tpu.pp_scheduler import TpuPipelineTransport
+
+        transport = TpuPipelineTransport(None, 2)
+        retired = []
+
+        def commit(work):
+            retired.extend(work)
+            work.clear()
+
+        first, second = object(), object()
+        transport.begin_control_step(0, commit)
+        self.assertEqual(transport.retain_control_work([first]), [])
+        transport.begin_control_step(1, commit)
+        transport.retain_control_work([second])
+        self.assertEqual(retired, [])
+        transport.begin_control_step(0, commit)
+        self.assertEqual(retired, [first])
+        self.assertEqual(transport.control_work[1], [second])
+
+    def test_drain_polls_senders_and_takes_the_group_minimum(self):
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        polled = []
+
+        def sender(name, drained):
+            return SimpleNamespace(
+                poll=lambda: polled.append(name), drained=lambda: drained
+            )
+
+        senders = [sender("a", True), sender("b", True), sender("c", False)]
+        extension = TpuSchedulerExtension()
+        # No group, or a group of one rank, keeps each sender's own state.
+        with patch("torch.distributed.get_world_size", return_value=1):
+            self.assertEqual(
+                extension.poll_drained(senders, [None, object()]), [True, True, False]
+            )
+        self.assertEqual(polled, ["a", "b", "c"])
+
+        def peer_still_sending(bits, op, group):
+            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+            bits[1] = 0
+
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce", side_effect=peer_still_sending),
+        ):
+            self.assertEqual(
+                extension.group_drained(senders, [object()]), [True, False, False]
+            )
+
+    def test_hicache_load_pages_only_for_prefill_host_loads(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.environ import envs
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        loaded = SimpleNamespace(host_loaded_length=4, last_node="loaded")
+        device_only = SimpleNamespace(host_loaded_length=0, last_node="device")
+        tree_cache = SimpleNamespace(path_device_indices=lambda node: node)
+        extension = TpuSchedulerExtension()
+
+        def load_page_ids(**kwargs):
+            return extension.hicache_load_page_ids(
+                tree_cache=tree_cache, page_size=16, **kwargs
+            )
+
+        with patch(
+            "sglang_tpu.prefill_early_send.tpu_hicache_load_page_ids",
+            return_value="pages",
+        ) as convert:
+            with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
+                self.assertIsNone(
+                    load_page_ids(
+                        disaggregation_mode=DisaggregationMode.DECODE,
+                        requests=[loaded],
+                    )
+                )
+                self.assertIsNone(
+                    load_page_ids(
+                        disaggregation_mode=DisaggregationMode.PREFILL,
+                        requests=[device_only],
+                    )
+                )
+                self.assertEqual(
+                    load_page_ids(
+                        disaggregation_mode=DisaggregationMode.PREFILL,
+                        requests=[device_only, loaded],
+                    ),
+                    "pages",
+                )
+            with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(False):
+                self.assertIsNone(
+                    load_page_ids(
+                        disaggregation_mode=DisaggregationMode.PREFILL,
+                        requests=[loaded],
+                    )
+                )
+        convert.assert_called_once_with(page_size=16, load_indices=["loaded"])
 
 
 if __name__ == "__main__":

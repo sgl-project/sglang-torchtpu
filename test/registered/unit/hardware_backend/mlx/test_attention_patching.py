@@ -408,14 +408,21 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(pending.lazy_tokens.tolist(), [8])
 
     def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
         from sglang.srt.managers import scheduler as scheduler_module
         from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.backend_extension import (
+            SchedulerExtension,
+        )
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         scheduler = object.__new__(Scheduler)
         scheduler.device = "cpu"
+        scheduler.scheduler_extension = SchedulerExtension()
+        scheduler.enable_hierarchical_cache = False
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.draft_worker = None
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=None)

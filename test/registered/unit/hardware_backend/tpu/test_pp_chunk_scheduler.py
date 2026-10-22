@@ -24,13 +24,37 @@ from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import published_topology
-from sglang_tpu import pp_chunk_scheduler, pp_profile
+from sglang_tpu import pp_chunk_scheduler, pp_profile, scheduler_extension
 from sglang_tpu.pp_chunk_scheduler import (
     TpuPipelinePrefillAdder,
-    pending_step_limit,
-    profile_and_install_cost_model,
+)
+from sglang_tpu.pp_chunk_scheduler import pending_step_limit as _pending_step_limit
+from sglang_tpu.pp_chunk_scheduler import (
+    profile_cost_model,
 )
 from sglang_tpu.pp_chunks import StepCostModel
+from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+
+def pending_step_limit(scheduler):
+    return _pending_step_limit(
+        cost=scheduler._tpu_pp_chunk_cost,
+        cached_prefix=scheduler._tpu_pp_cached_prefix,
+        waiting_queue=scheduler.waiting_queue,
+        chunked_req=scheduler.chunked_req,
+        mbs=scheduler.mbs,
+        last_mbs=scheduler.last_mbs,
+        tree_cache=scheduler.tree_cache,
+    )
+
+
+def profile_and_install_cost_model(scheduler):
+    scheduler._tpu_pp_chunk_cost = profile_cost_model(
+        runner=scheduler.tp_worker.model_runner,
+        page_size=getattr(scheduler, "page_size", 256),
+        chunked_prefill_size=getattr(scheduler, "chunked_prefill_size", 4096),
+        world_group=getattr(scheduler, "world_group", None),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -205,6 +229,69 @@ def test_decode_rows_are_not_pending_prefill():
     mixed = batch(4096 + 64, mode=ForwardMode.MIXED, decoding_reqs=[None] * 64)
     sched = scheduler([request], mbs=[stale] * 7 + [mixed], last_mbs=[None] * 8)
     assert pending_step_limit(sched) == 4096
+
+
+def test_extension_profiles_chunk_cost_only_for_pipelines(monkeypatch):
+    calls = []
+
+    def profile(**kwargs):
+        calls.append(kwargs)
+        return cost()
+
+    monkeypatch.setattr(pp_chunk_scheduler, "profile_cost_model", profile)
+    args = dict(runner="runner", page_size=128, chunked_prefill_size=4096)
+    single = TpuSchedulerExtension()
+    monkeypatch.setattr(scheduler_extension, "get_parallel", lambda: NS(pp_size=1))
+    single.init_chunked_prefill(world_group="world", **args)
+    assert single.chunk_cost is None and calls == []
+    pipeline = TpuSchedulerExtension()
+    monkeypatch.setattr(scheduler_extension, "get_parallel", lambda: NS(pp_size=8))
+    pipeline.init_chunked_prefill(world_group="world", **args)
+    assert calls == [dict(world_group="world", **args)]
+    assert isinstance(pipeline.chunk_cost, StepCostModel)
+
+
+def test_extension_keeps_the_shared_adder_without_a_cost_model():
+    adder_cls, options = TpuSchedulerExtension().prefill_adder_options(
+        waiting_queue=[req(32768)],
+        chunked_req=None,
+        mbs=[],
+        last_mbs=[],
+        tree_cache=Cache(),
+    )
+    assert adder_cls is PrefillAdder and options == {}
+
+
+def test_extension_sizes_pipeline_chunks_from_its_own_state():
+    """The extension owns the cached-prefix matches across steps and sizes
+    each chunk from the scheduler's in-flight micro-batch slots."""
+    extension = TpuSchedulerExtension()
+    extension.chunk_cost = cost()
+    request = req(65536 + 256)
+    tree_cache = Cache(matched=65536)
+
+    def options(waiting, mbs=(), last_mbs=()):
+        return extension.prefill_adder_options(
+            waiting_queue=waiting,
+            chunked_req=None,
+            mbs=list(mbs),
+            last_mbs=list(last_mbs),
+            tree_cache=tree_cache,
+        )
+
+    adder_cls, kwargs = options([request])
+    assert adder_cls is TpuPipelinePrefillAdder
+    assert kwargs == {"cost": extension.chunk_cost, "step_limit": 2048}
+    assert options([request])[1]["step_limit"] == 2048
+    assert len(tree_cache.limits) == 1
+    assert set(extension.cached_prefix) == {request.rid}
+    flying = [batch(16384) for _ in range(7)]
+    in_flight = options([request], mbs=flying + [None], last_mbs=[None] * 8)
+    assert in_flight[1]["step_limit"] == 16384
+    processed = options([request], mbs=flying, last_mbs=flying)
+    assert processed[1]["step_limit"] == 2048
+    options([])
+    assert extension.cached_prefix == {}
 
 
 def test_finished_request_leaves_budget_for_next_request(monkeypatch):

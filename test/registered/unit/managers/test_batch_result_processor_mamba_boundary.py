@@ -11,6 +11,9 @@ from sglang.srt.managers.schedule_batch import (
     set_mamba_track_indices_from_reqs,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.backend_extension import (
+    SchedulerExtension,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -118,6 +121,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 result = _make_result()
 
                 scheduler = Scheduler.__new__(Scheduler)
+                scheduler.scheduler_extension = SchedulerExtension()
                 scheduler.gracefully_exit = False
                 scheduler.ingest_requests = MagicMock(
                     side_effect=[[], [], StopIteration]

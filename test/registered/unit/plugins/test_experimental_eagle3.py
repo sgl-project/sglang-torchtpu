@@ -10,17 +10,21 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental.compilation.chain_compile_policy import (
     _hidden_only_logits,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import spec_ops
+from sglang_tpu.experimental.speculative import base_spec_worker, spec_ops
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
 from sglang_tpu.experimental.speculative.chain_spec_worker import (
     TpuChainSpecWorker,
@@ -42,6 +46,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
 )
 from sglang_tpu.experimental.speculative.spec_types import SpecState
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows
+from sglang_tpu.future_map import TpuFutureMap
 from sglang_tpu.hooks.experimental_spec import (
     keep_host_padded_extend_outputs,
 )
@@ -330,6 +335,42 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         self.assertEqual(accept.window_tokens.tolist(), [5, 6, 0, 4, 0, 0])
         self.assertEqual(accept.window_seq_lens.tolist(), [13, 3])
+
+    def test_relay_warmup_flushes_the_serving_handoff(self):
+        """The relay warmup stores through the serving TpuFutureMap and drains its
+        direct handoff, for every plugin family on the shared base."""
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.device = "cpu"
+        worker.num_drafts = 2
+        worker.num_verify_rows = 3
+        worker._dp_attention = False
+        policy = object.__new__(DecoderTpuCompilePolicy)
+        policy.b_bucketer = policy.t_bucketer = Bucketer("rows", [2])
+        policy.extend_bs = None
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                max_running_requests=2,
+                compile_policy=policy,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((8, 4))),
+            )
+        )
+        with (
+            get_context().override_server_args(speculative_algorithm="DFLASH"),
+            patch("sglang.srt.speculative.spec_utils._use_torch_native", True),
+            patch.object(
+                base_spec_worker,
+                "flush_direct_handoff_tpu",
+                wraps=base_spec_worker.flush_direct_handoff_tpu,
+            ) as flush,
+        ):
+            worker._warmup_relay_and_results()
+        relay = flush.call_args.args[0]
+        self.assertIsInstance(relay, TpuFutureMap)
+        self.assertIsNone(relay.tpu_direct_handoff)
+        self.assertFalse(relay.need_topk)
+        self.assertEqual(relay.output_tokens_buf[0].item(), 0)
+        self.assertEqual(relay.new_seq_lens_buf[0].item(), 0)
 
     def test_filtered_accept_warmup_passes_unaliased_params(self):
         """Serving uploads each sampling param separately; a warmup passing one

@@ -161,6 +161,10 @@ class TestWaveRows(CustomTestCase):
                 device="cpu",
             )
         )
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        scheduler.scheduler_extension = TpuSchedulerExtension()
+        scheduler.pp_loop_size = 1
         with patch.object(pp_scheduler, "build_pp_wave") as build:
             scheduler._pp_init_wave()
         return build.call_args.kwargs["rows"]

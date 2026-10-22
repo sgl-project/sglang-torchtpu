@@ -85,7 +85,9 @@ def scheduler(rank, receivers, size=3):
     result = SchedulerPPMixin()
     # The per-stage poll and the failure union are the TPU wave's path; its
     # consensus travels on the pipeline group's tagged channel.
-    result._pp_wave = object()
+    from sglang_tpu.pp_scheduler import TpuPipelineTransport
+
+    result._pp_wave = TpuPipelineTransport(None, 1)
     result.pp_group = SimpleNamespace(
         rank_in_group=rank,
         world_size=size,
@@ -93,8 +95,6 @@ def scheduler(rank, receivers, size=3):
         is_last_rank=rank == size - 1,
         send_object=Mock(return_value=[]),
     )
-    result._pp_pd_control_work = [[]]
-    result._pp_pd_control_slot = 0
     result.attn_cp_cpu_group = object()
     result.attn_tp_cpu_group = object()
     result.disagg_decode_transfer_queue = TransferQueue(receivers)

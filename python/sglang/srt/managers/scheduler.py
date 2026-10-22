@@ -62,7 +62,6 @@ from torch.distributed import barrier
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
-    from sglang_tpu.kv_free_fence import KVFreeFence
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
@@ -223,7 +222,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
-    PrefillAdder,
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -333,7 +331,6 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
-    get_draft_recurrent_hidden_state_spec,
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -371,7 +368,6 @@ from sglang.srt.utils.hf_transformers_utils import (
     resolve_image_processor_backend,
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
@@ -462,7 +458,7 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
-    kv_free_fence: Optional["KVFreeFence"] = None
+    kv_free_fence = None
     # Draft KV pools cpu_tensor retraction backs up with the target KV.
     retraction_draft_kv_pools: tuple = ()
 
@@ -569,6 +565,7 @@ class Scheduler(
         maybe_revert_pr_fix()
 
         # Launch a model worker and draft model worker if using speculative decoding
+        self.init_scheduler_extension()
         self.init_model_worker()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
@@ -1122,19 +1119,16 @@ class Scheduler(
             if load_bundle_dir is not None:
                 torch_compile_bundle.load(bundle_path)
 
-        warmup_scope = nullcontext()
-        if current_platform.is_tpu() and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
-            from sglang_tpu.compilation.warmup_queue import (
-                collect_warmups,
-            )
-
-            warmup_scope = collect_warmups()
+        warmup_scope = self.scheduler_extension.graph_warmup_context()
         with warmup_scope:
             self.tp_worker.init_cuda_graphs()
             if self.draft_worker is not None:
                 self.draft_worker.init_cuda_graphs()
-                if current_platform.is_tpu():
-                    self.precompile_tpu_spec_ops()
+                self.scheduler_extension.precompile_spec_ops(
+                    target_runner=self.tp_worker.model_runner,
+                    draft_worker=self.draft_worker,
+                    vocab_size=self.model_config.vocab_size,
+                )
 
         # Independent DP groups repeat distributed ranks but run identical model
         # replicas. DP0 writes their shared bundles; DP-attention ranks are unique.
@@ -1142,6 +1136,9 @@ class Scheduler(
             self.attn_dp_enabled or get_parallel().dp_rank in (None, 0)
         ):
             torch_compile_bundle.save(bundle_path)
+
+    def init_scheduler_extension(self):
+        self.scheduler_extension = current_platform.get_scheduler_extension_cls()()
 
     def init_model_worker(self):
         # Load model weights.
@@ -1390,14 +1387,12 @@ class Scheduler(
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
 
-        self._tpu_pp_chunk_cost = None
-        self._tpu_pp_cached_prefix = {}
-        if current_platform.is_tpu() and get_parallel().pp_size > 1:
-            from sglang_tpu.pp_chunk_scheduler import (
-                profile_and_install_cost_model,
-            )
-
-            profile_and_install_cost_model(self)
+        self.scheduler_extension.init_chunked_prefill(
+            runner=self.tp_worker.model_runner,
+            page_size=self.page_size,
+            chunked_prefill_size=self.chunked_prefill_size,
+            world_group=self.world_group,
+        )
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -1682,21 +1677,10 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
-        self.tpu_async_copy_worker = None
-        if (
-            self.device == "tpu"
-            and self.enable_overlap
-            and envs.SGLANG_TPU_ASYNC_COPY_WORKER.get()
-        ):
-            from sglang_tpu.result_copy_worker import (
-                TPUAsyncCopyWorker,
-            )
-
-            self.tpu_async_copy_worker = TPUAsyncCopyWorker(
-                # The KV free fence releases pages once copy_done completes.
-                copy_draft_tail=self._needs_kv_free_fence()
-            )
-            logger.info("TPU async result-copy worker enabled")
+        self.scheduler_extension.init_result_copier(
+            enable_overlap=self.enable_overlap,
+            needs_kv_free_fence=self._needs_kv_free_fence(),
+        )
 
         # CUDA-style forward/copy/schedule streams only buy overlap on backends
         # with real multi-stream execution. Single-queue backends (see
@@ -1725,7 +1709,8 @@ class Scheduler(
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
         needs_confidence_relay = decide_needs_confidence_relay()
-        self.future_map = self.spec_algorithm.create_future_map(
+        self.future_map = self.scheduler_extension.create_future_map(
+            self.spec_algorithm,
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
@@ -1781,86 +1766,21 @@ class Scheduler(
         )
 
     def _needs_kv_free_fence(self) -> bool:
-        """Whether unordered DMAs can write pages an in-flight forward writes:
-        raiden HiCache loads, or KV arriving on a PD decode server."""
-        return (
-            self.device == "tpu"
-            and self.enable_overlap
-            and (
-                self._uses_raiden_hicache()
-                or self.disaggregation_mode == DisaggregationMode.DECODE
-            )
+        return self.scheduler_extension.needs_kv_free_fence(
+            enable_overlap=self.enable_overlap,
+            uses_raiden_hicache=self._uses_raiden_hicache(),
+            disaggregation_mode=self.disaggregation_mode,
         )
 
     def maybe_init_kv_free_fence(self):
-        """Hold KV pages freed under overlap back from DMA write targets.
-        Raises if the fence cannot cover every KV write of this server."""
-        if not self._needs_kv_free_fence():
-            return
-        from sglang_tpu.kv_free_fence import (
-            fence_hicache_backups,
-            install_kv_free_fence,
-            kv_free_fence_unsupported_reason,
-        )
-
-        fence_kwargs = dict(
+        self.kv_free_fence = self.scheduler_extension.create_kv_free_fence(
+            allocator=self.token_to_kv_pool_allocator,
+            device_module=self.device_module,
             spec_algorithm=self.spec_algorithm,
-            copies_draft_tail=self.tpu_async_copy_worker is not None
-            and self.tpu_async_copy_worker.copy_draft_tail,
-        )
-        reason = kv_free_fence_unsupported_reason(
-            self.token_to_kv_pool_allocator, **fence_kwargs
-        )
-        if reason is not None:
-            # Unfenced, a DMA into a freed page can land before an in-flight
-            # forward's write to it and be overwritten without any error.
-            needed_by = (
-                "The raiden HiCache backend"
-                if self._uses_raiden_hicache()
-                else "A PD decode server under overlap scheduling"
-            )
-            raise ValueError(
-                f"{needed_by} needs the KV free fence: {reason} "
-                "Pass --disable-overlap-schedule to run without it."
-            )
-        self.kv_free_fence = install_kv_free_fence(
-            self.token_to_kv_pool_allocator,
-            synchronize_device=self.device_module.synchronize,
-            **fence_kwargs,
-        )
-        if self._uses_raiden_hicache():
-            fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
-
-    def precompile_tpu_spec_ops(self) -> None:
-        from sglang_tpu.compilation.spec_decode_compile_policy import (
-            BaseSpecDecodeCompilePolicyMixin,
-        )
-        from sglang_tpu.spec_op_precompile import (
-            precompile_spec_v2_ops,
-        )
-
-        compile_policy = self.tp_worker.model_runner.compile_policy
-        if not isinstance(compile_policy, BaseSpecDecodeCompilePolicyMixin):
-            return
-        assert compile_policy.b_bucketer is not None
-
-        draft_runner = self.draft_worker.draft_worker.draft_runner
-        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(draft_runner)
-        if hidden_size is None or hidden_dtype is None:
-            return
-        draft_vocab_size = (
-            getattr(draft_runner.model.config, "draft_vocab_size", None)
-            or draft_runner.model.config.vocab_size
-        )
-
-        precompile_spec_v2_ops(
-            device=torch.device(self.tp_worker.model_runner.device),
-            physical_batch_buckets=compile_policy.b_bucketer.buckets,
-            num_verify_tokens=compile_policy.draft_token_num,
-            vocab_size=self.model_config.vocab_size,
-            draft_vocab_size=draft_vocab_size,
-            hidden_size=hidden_size,
-            hidden_dtype=hidden_dtype,
+            enable_overlap=self.enable_overlap,
+            uses_raiden_hicache=self._uses_raiden_hicache(),
+            disaggregation_mode=self.disaggregation_mode,
+            tree_cache=self.tree_cache,
         )
 
     def maybe_init_ngram_embedding(self):
@@ -2068,8 +1988,7 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
-        if self.tpu_async_copy_worker is not None:
-            self.tpu_async_copy_worker.close()
+        self.scheduler_extension.close()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -2199,10 +2118,9 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
-            if current_platform.is_tpu() and self.spec_algorithm.is_dflash():
-                # The verify window spans a single commit, so a second
-                # unprocessed forward would silently address the wrong KV slots.
-                assert len(self.result_queue) <= 1
+            self.scheduler_extension.validate_pending_results(
+                self.spec_algorithm, len(self.result_queue)
+            )
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -3950,21 +3868,13 @@ class Scheduler(
         if not pending or get_parallel().pp_size > 1:
             # Pipeline stages free them through _release_consensus_sender_aborts.
             return
-        drained = None
-        if current_platform.is_tpu():
-            for req in pending:
-                req.disagg_kv_sender.poll()
-            # TPU ranks must free in the same step to admit matching batches.
-            # Abort seals each sender before the group samples its drain state.
-            drained = self._group_drained([req.disagg_kv_sender for req in pending])
+        drained = self.scheduler_extension.poll_drained(
+            [req.disagg_kv_sender for req in pending],
+            (self.attn_tp_cpu_group, self.attn_cp_cpu_group),
+        )
         still_held = []
-        for i, req in enumerate(pending):
+        for req, req_drained in zip(pending, drained):
             sender = req.disagg_kv_sender
-            if drained is None:
-                sender.poll()
-                req_drained = sender.drained()
-            else:
-                req_drained = drained[i]
             if not req_drained:
                 still_held.append(req)
                 continue
@@ -3974,16 +3884,9 @@ class Scheduler(
 
     def _group_drained(self, senders) -> List[bool]:
         """Return drain state, coordinated across attention TP/CP on TPU."""
-        drained = [sender.drained() for sender in senders]
-        if not current_platform.is_tpu():
-            return drained
-        bits = torch.tensor(drained, dtype=torch.uint8, device="cpu")
-        for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
-            if group is not None and torch.distributed.get_world_size(group) > 1:
-                torch.distributed.all_reduce(
-                    bits, op=torch.distributed.ReduceOp.MIN, group=group
-                )
-        return [bool(bit) for bit in bits.tolist()]
+        return self.scheduler_extension.group_drained(
+            senders, (self.attn_tp_cpu_group, self.attn_cp_cpu_group)
+        )
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -4321,19 +4224,13 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
-        adder_cls = PrefillAdder
-        adder_kwargs = {}
-        if self._tpu_pp_chunk_cost is not None:
-            from sglang_tpu.pp_chunk_scheduler import (
-                TpuPipelinePrefillAdder,
-                pending_step_limit,
-            )
-
-            adder_cls = TpuPipelinePrefillAdder
-            adder_kwargs = {
-                "cost": self._tpu_pp_chunk_cost,
-                "step_limit": pending_step_limit(self),
-            }
+        adder_cls, adder_kwargs = self.scheduler_extension.prefill_adder_options(
+            waiting_queue=self.waiting_queue,
+            chunked_req=self.chunked_req,
+            mbs=self.mbs if get_parallel().pp_size > 1 else (),
+            last_mbs=self.last_mbs if get_parallel().pp_size > 1 else (),
+            tree_cache=self.tree_cache,
+        )
 
         adder = adder_cls(
             # TPU DCP cuts prefill chunks at whole widened pages.
@@ -4539,24 +4436,14 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
-            if (
-                self.disaggregation_mode == DisaggregationMode.PREFILL
-                and current_platform.is_tpu()
-                and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
-                and any(req.host_loaded_length > 0 for req in can_run_list)
-            ):
-                from sglang_tpu.prefill_early_send import (
-                    tpu_hicache_load_page_ids,
+            new_batch.hicache_load_page_ids = (
+                self.scheduler_extension.hicache_load_page_ids(
+                    disaggregation_mode=self.disaggregation_mode,
+                    requests=can_run_list,
+                    tree_cache=self.tree_cache,
+                    page_size=self.token_to_kv_pool_allocator.page_size,
                 )
-
-                new_batch.hicache_load_page_ids = tpu_hicache_load_page_ids(
-                    scheduler=self,
-                    load_indices=[
-                        self.tree_cache.path_device_indices(req.last_node)
-                        for req in can_run_list
-                        if req.host_loaded_length > 0
-                    ],
-                )
+            )
 
         new_batch.prepare_for_extend()
 
@@ -4936,26 +4823,18 @@ class Scheduler(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
-                            elif self.tpu_async_copy_worker is not None:
-                                self.tpu_async_copy_worker.submit(
+                            else:
+                                self.scheduler_extension.copy_result_to_cpu(
                                     batch_result,
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
+                                    use_overlap_streams=self.use_overlap_streams,
+                                    copy_stream=self.copy_stream
+                                    if self.use_overlap_streams
+                                    else None,
+                                    forward_stream=self.forward_stream,
+                                    copy_stream_ctx=self.copy_stream_ctx,
                                 )
-                            else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                # TPU single-queue: no copy_stream exists, so skip the
-                                # cross-stream wait; copy_stream_ctx is nullcontext there
-                                # and the D2H runs on the default stream.
-                                if self.use_overlap_streams:
-                                    self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
-                                    batch_result.copy_to_cpu(
-                                        return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
-                                    )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -6481,7 +6360,9 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
-    initialize_torch_tpu_worker(server_args, tp_rank, pp_rank, dp_rank=dp_rank)
+    current_platform.initialize_scheduler_worker(
+        server_args, tp_rank, pp_rank, dp_rank=dp_rank
+    )
 
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()

@@ -3,10 +3,10 @@
 import torch
 
 from sglang.srt.managers import overlap_utils
-from sglang.srt.managers.overlap_utils import FutureMap
+from sglang_tpu.future_map import TpuFutureMap
 
 
-class HostPaddingFutureMap(FutureMap):
+class HostPaddingFutureMap(TpuFutureMap):
     def __init__(self, device, spec_algo, req_to_token_pool, *args, **kwargs):
         super().__init__(device, spec_algo, req_to_token_pool, *args, **kwargs)
         self.bucketer = req_to_token_pool._tpu_relay_bucketer

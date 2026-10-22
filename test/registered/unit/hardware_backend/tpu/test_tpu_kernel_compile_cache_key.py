@@ -14,11 +14,11 @@ import torch.compiler.config as compiler_config
 
 import sglang
 from sglang.srt.environ import envs
-from sglang.srt.utils.patch_torch import monkey_patch_torch_tpu_env
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu import compile_cache
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.worker_env import monkey_patch_torch_tpu_env
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 

@@ -265,7 +265,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
             "meta"  # An accidental upload is observable without TPU hardware.
         )
         resolve_forward_inputs(
-            batch, SimpleNamespace(_resolve_spec_extras=lambda batch: None)
+            batch,
+            SimpleNamespace(
+                _resolve_spec_extras=lambda batch: None,
+                prepare_prefill_inputs=lambda batch: None,
+            ),
         )
         self.assertIs(batch.input_ids, prompt)
         self.assertIsNone(batch.prefill_input_ids_cpu)
@@ -291,7 +295,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         batch.mix_running_indices = torch.tensor([0])
         with self.assertRaisesRegex(AssertionError, "mixed chunks"):
             resolve_forward_inputs(
-                batch, SimpleNamespace(_resolve_spec_extras=lambda batch: None)
+                batch,
+                SimpleNamespace(
+                    _resolve_spec_extras=lambda batch: None,
+                    prepare_prefill_inputs=lambda batch: None,
+                ),
             )
 
     def test_worker_publishes_plugin_owned_draft_state(self):

@@ -14,12 +14,12 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.distributed import bootstrap, parallel_state
-from sglang.srt.utils.patch_torch import (
+from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.worker_env import (
     initialize_torch_tpu_worker,
     monkey_patch_torch_tpu_env,
 )
-from sglang.test.test_utils import CustomTestCase, published_topology
-from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 _ENV_VARS = (
     "RANK",

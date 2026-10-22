@@ -1,7 +1,7 @@
 """CPU coverage for the TPU FutureMap relay helpers in overlap_utils_tpu."""
 
 import unittest
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
-from sglang_tpu import patches
+from sglang_tpu.future_map import TpuFutureMap
 from sglang_tpu.overlap_utils_tpu import (
     flush_direct_handoff_tpu,
     resolve_direct_handoff_tpu,
@@ -22,35 +22,14 @@ from sglang_tpu.overlap_utils_tpu import (
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-@contextmanager
-def tpu_future_map():
-    """Install the TPU FutureMap patch on a CPU host, restoring it on exit."""
-    with ExitStack() as stack:
-        for name in (
-            "stash",
-            "publish",
-            "stash_bonus_tokens",
-            "resolve_mixed_spec_tails",
-        ):
-            stack.enter_context(patch.object(FutureMap, name, getattr(FutureMap, name)))
-        for name in ("tpu_direct_handoff", "tpu_published_seq_lens"):
-            stack.enter_context(patch.object(FutureMap, name, None, create=True))
-        stack.enter_context(
-            patch.object(patches, "_future_map_direct_handoff_patched", False)
-        )
-        patches._patch_future_map_direct_handoff()
-        yield
-
-
 def stash(fm, indices, payload, seq_lens, published=True) -> bool:
     """Publish then stash like the overlap forward; report whether deferred."""
-    with tpu_future_map():
-        if published is True:
-            published = indices
-        if published is not None:
-            fm.publish(published, seq_lens)
-        fm.stash(indices, payload)
-        return fm.tpu_direct_handoff is not None
+    if published is True:
+        published = indices
+    if published is not None:
+        fm.publish(published, seq_lens)
+    fm.stash(indices, payload)
+    return fm.tpu_direct_handoff is not None
 
 
 def make_case():
@@ -60,7 +39,7 @@ def make_case():
         is_ngram=lambda: False,
         need_topk=lambda: True,
     )
-    fm = FutureMap(
+    fm = TpuFutureMap(
         device="cpu",
         spec_algo=algo,
         req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(8, 16)),
@@ -161,8 +140,7 @@ class TestDirectHandoff(CustomTestCase):
         )
         stash(fm, torch.tensor([3, 4]), other, seq_lens)
         torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
-        with tpu_future_map():
-            flush_direct_handoff_tpu(fm)
+        flush_direct_handoff_tpu(fm)
         torch.testing.assert_close(
             fm.output_tokens_buf[torch.tensor([3, 4])], other.bonus_tokens
         )
@@ -243,18 +221,14 @@ class TestDirectHandoff(CustomTestCase):
             seen.append(self.output_tokens_buf[batch.mix_running_indices].clone())
 
         with patch.object(FutureMap, "resolve_mixed_spec_tails", read_tails):
-            with tpu_future_map():
-                fm.resolve_mixed_spec_tails(
-                    SimpleNamespace(mix_running_indices=indices)
-                )
+            fm.resolve_mixed_spec_tails(SimpleNamespace(mix_running_indices=indices))
         torch.testing.assert_close(seen[0], payload.bonus_tokens)
         self.assertIsNone(fm.tpu_direct_handoff)
 
     def test_bonus_token_stash_flushes_pending_rows_first(self):
         fm, batch, indices, payload, seq_lens = make_case()
         self.assertTrue(stash(fm, indices, payload, seq_lens))
-        with tpu_future_map():
-            fm.stash_bonus_tokens(indices[:1], torch.tensor([77]))
+        fm.stash_bonus_tokens(indices[:1], torch.tensor([77]))
         # The flush lands first, so the newer bonus-token write wins.
         torch.testing.assert_close(
             fm.output_tokens_buf[indices], torch.tensor([77, 12])

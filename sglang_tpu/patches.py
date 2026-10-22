@@ -668,56 +668,6 @@ def _patch_tpu_torch_pallas_register_positional() -> None:
     tpu_torch_pallas.call_custom_kernel = call_custom_kernel
 
 
-_future_map_direct_handoff_patched = False
-
-
-def _patch_future_map_direct_handoff() -> None:
-    """Route FutureMap.stash/publish through the TPU direct handoff, so an
-    unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
-    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu."""
-    global _future_map_direct_handoff_patched
-    if _future_map_direct_handoff_patched:
-        return
-    _future_map_direct_handoff_patched = True
-
-    from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang_tpu.overlap_utils_tpu import (
-        flush_direct_handoff_tpu,
-        publish_tpu,
-        stash_tpu,
-    )
-
-    orig_stash = FutureMap.stash
-    orig_publish = FutureMap.publish
-    orig_stash_bonus_tokens = FutureMap.stash_bonus_tokens
-    orig_resolve_mixed_spec_tails = FutureMap.resolve_mixed_spec_tails
-    FutureMap.tpu_direct_handoff = None
-    FutureMap.tpu_published_seq_lens = None
-
-    def stash(self, future_indices, payload):
-        if not stash_tpu(self, future_indices, payload):
-            orig_stash(self, future_indices, payload)
-
-    def publish(self, future_indices, new_seq_lens, confidence=None):
-        orig_publish(self, future_indices, new_seq_lens, confidence)
-        publish_tpu(self, future_indices, new_seq_lens)
-
-    # Every other buffer reader or writer must see the pending rows stored first.
-    def stash_bonus_tokens(self, indices, bonus_tokens):
-        flush_direct_handoff_tpu(self)
-        orig_stash_bonus_tokens(self, indices, bonus_tokens)
-
-    def resolve_mixed_spec_tails(self, batch):
-        # The mixed input resolve reads output_tokens_buf right after this.
-        flush_direct_handoff_tpu(self)
-        orig_resolve_mixed_spec_tails(self, batch)
-
-    FutureMap.stash = stash
-    FutureMap.publish = publish
-    FutureMap.stash_bonus_tokens = stash_bonus_tokens
-    FutureMap.resolve_mixed_spec_tails = resolve_mixed_spec_tails
-
-
 _raiden_is_load_back_event_done_patched = False
 
 
@@ -907,7 +857,6 @@ def apply_tpu_patches() -> None:
     _patch_torch_native_attn_backend()
     _register_aten_fallbacks()
     _patch_tpu_torch_pallas_register_positional()
-    _patch_future_map_direct_handoff()
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()

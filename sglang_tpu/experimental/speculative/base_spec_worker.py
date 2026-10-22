@@ -41,7 +41,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -106,6 +106,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
 )
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
 from sglang_tpu.experimental.speculative.state_layout import SpecStateLayout
+from sglang_tpu.future_map import TpuFutureMap
 from sglang_tpu.mamba_pool import (
     TpuMambaPool,
     committed_read_offsets,
@@ -858,7 +859,7 @@ class TpuSpecWorker(BaseSpecWorker):
         max_bs = min(runner.max_running_requests, self._b_bucketer().max_val)
         cap = self._compile_policy()._extend_compile_cap()
         # A scratch map runs the production publish/stash; live buffers stay untouched.
-        future_map = FutureMap(
+        future_map = TpuFutureMap(
             self.device, runner.spec_algorithm, runner.req_to_token_pool
         )
         with torch.no_grad():

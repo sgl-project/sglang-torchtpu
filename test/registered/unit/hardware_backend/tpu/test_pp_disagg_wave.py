@@ -71,7 +71,11 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     wave.begin_iteration = Mock(wraps=wave.begin_iteration)
     wave.receive = Mock(wraps=wave.receive)
     wave.end_iteration = Mock(wraps=wave.end_iteration)
-    scheduler._pp_init_wave = Mock(return_value=wave)
+    from sglang_tpu.pp_scheduler import TpuPipelineTransport
+
+    scheduler._pp_init_wave = Mock(
+        return_value=TpuPipelineTransport(wave, 4 + depth) if use_wave else None
+    )
 
     def recv_requests():
         step[0] += 1
@@ -150,7 +154,6 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
         enable_dsa_prefill_context_parallel=False,
     )
     with (
-        patch.object(scheduler_pp_mixin, "_is_tpu", use_wave),
         patch.object(scheduler_pp_mixin, "get_parallel", return_value=parallel),
         patch.object(
             scheduler_pp_mixin,
@@ -289,7 +292,7 @@ class TestDisaggregatedWave(unittest.TestCase):
                 scheduler, _, copied, events = run_loop(
                     mode, [batch(forward)] + [None] * 9, 1, use_wave=False
                 )
-                scheduler._pp_init_wave.assert_not_called()
+                scheduler._pp_init_wave.assert_called_once()
                 scheduler._pp_recv_proxy_tensors.assert_called_once()
                 scheduler._pp_send_dict_to_next_stage.assert_called_once()
                 copied.synchronize.assert_called_once()

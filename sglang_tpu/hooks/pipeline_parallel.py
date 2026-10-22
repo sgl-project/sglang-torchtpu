@@ -8,20 +8,11 @@ check_pipeline_parallel_compat
        EAGLE, every other configuration runs it unchanged.
   Upstream PR or issue: not filed.
   Remove when: core asks the platform which speculative algorithms PP supports.
-
-skip_spec_op_precompile_without_draft
-  Why: Under PP only the last stage hosts the draft; the other stages keep a
-       draftless spec worker and run no spec ops.
-  How: AROUND Scheduler.precompile_tpu_spec_ops; skip it on those stages.
-  Upstream PR or issue: not filed.
-  Remove when: precompile_tpu_spec_ops moves into sglang_tpu.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable
-
-from sglang.srt.managers.scheduler import Scheduler
 
 
 class _AsEagle:
@@ -44,11 +35,3 @@ def check_pipeline_parallel_compat(original: Callable[[Any], None], cfg: Any) ->
         # The rest of TPU's PP checks run in TpuSRTPlatform.apply_server_args_defaults.
         cfg = _AsEagle(cfg)
     original(cfg)
-
-
-def skip_spec_op_precompile_without_draft(
-    original: Callable[[Scheduler], None], scheduler: Scheduler
-) -> None:
-    if scheduler.draft_worker.draft_worker is None:
-        return
-    original(scheduler)
