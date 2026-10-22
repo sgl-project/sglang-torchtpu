@@ -15,6 +15,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-a-test-cpu-intel")
 
 
@@ -81,6 +82,40 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     assert output.topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(output.topk_weights[:, -1], torch.full((2,), 0.4))
     assert recorded["topk_ids"].tolist() == [[0, 65], [63, 127]]
+
+
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1])
+def test_hash_topk_torch_path_gathers_with_int64_indices(
+    monkeypatch, num_fused_shared_experts
+):
+    index_dtypes = []
+    gather = torch.Tensor.gather
+
+    def recording_gather(self, dim, index, **kwargs):
+        index_dtypes.append(index.dtype)
+        return gather(self, dim, index, **kwargs)
+
+    topk = HashTopK(
+        topk=3,
+        num_experts=8,
+        num_fused_shared_experts=num_fused_shared_experts,
+        vocab_size=2,
+        scoring_func="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+    )
+    routed = 3 - num_fused_shared_experts
+    with torch.no_grad():
+        topk.tid2eid.copy_(
+            torch.tensor([[0, 5, 7][:routed], [6, 1, 2][:routed]], dtype=torch.int32)
+        )
+    router_logits = torch.randn(2, 8)
+    monkeypatch.setattr(torch.Tensor, "gather", recording_gather)
+
+    topk_weights, topk_ids = topk._forward_torch(router_logits, torch.tensor([0, 1]))
+
+    assert index_dtypes == [torch.int64]
+    assert topk_ids[:, :routed].tolist() == [[0, 5, 7][:routed], [6, 1, 2][:routed]]
+    assert torch.isfinite(topk_weights).all()
 
 
 def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):

@@ -156,7 +156,8 @@ class HashTopK(nn.Module):
 
         if self.num_fused_shared_experts == 1:
             topk_ids[:, :-1] = self.tid2eid[input_ids]
-            topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1])
+            # int64 is torch.gather's documented index dtype; torch_tpu rejects int32.
+            topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1].to(torch.int64))
 
             if self.score_func != "softmax":
                 topk_weights[:, :-1] /= (
@@ -177,9 +178,8 @@ class HashTopK(nn.Module):
             )
         else:
             topk_ids[:, :] = self.tid2eid[input_ids]
-            topk_weights[:, :] = scores.gather(
-                1, topk_ids[:, :].to(torch.int64) if _is_tpu else topk_ids[:, :]
-            )
+            # int64 is torch.gather's documented index dtype; torch_tpu rejects int32.
+            topk_weights[:, :] = scores.gather(1, topk_ids[:, :].to(torch.int64))
             if self.score_func != "softmax":
                 topk_weights[:, :] /= (
                     topk_weights[:, :].sum(dim=-1, keepdim=True)

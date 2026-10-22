@@ -1,6 +1,7 @@
 import sys
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 
@@ -24,14 +25,24 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import (
     RegisteredMoeRunnerBackend,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    is_sbo_enabled,
+    is_tbo_enabled,
     register_moe_runner_backend_name,
     resolve_moe_runner_backend,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.lora.layers import FusedMoEWithLoRA
-from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_flags,
+    get_parallel,
+    reset_context,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=15, suite="stage-b-test-cpu-intel")
 
 
@@ -64,6 +75,45 @@ def isolated_runner_registries(monkeypatch):
     monkeypatch.setattr(runner_module, "_CUSTOM_RUNNER_CORE_FACTORIES", {})
     with get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE):
         yield
+
+
+@pytest.fixture
+def fresh_context():
+    reset_context()
+    yield
+    reset_context()
+
+
+def test_moe_flag_getters_do_not_write_defaults(fresh_context):
+    before = msgspec.structs.asdict(get_flags().moe)
+
+    assert get_moe_runner_backend().is_auto()
+    assert get_moe_a2a_backend().is_none()
+    assert is_tbo_enabled() is False
+    assert is_sbo_enabled() is False
+
+    assert msgspec.structs.asdict(get_flags().moe) == before
+
+
+def test_moe_flag_getters_trace_without_initialization(fresh_context):
+    """A dense model reads these inside a compiled forward without initialize_moe_config."""
+    torch._dynamo.reset()
+
+    def forward(x):
+        if (
+            get_moe_runner_backend().is_auto()
+            and get_moe_a2a_backend().is_none()
+            and not is_tbo_enabled()
+            and not is_sbo_enabled()
+        ):
+            return x + 1
+        return x - 1
+
+    try:
+        compiled = torch.compile(forward, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(torch.ones(2)), torch.full((2,), 2.0))
+    finally:
+        torch._dynamo.reset()
 
 
 def test_registered_runner_core_uses_standard_dispatch(

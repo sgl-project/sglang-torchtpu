@@ -55,7 +55,6 @@ import math
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
-from torch_tpu._internal.pallas import jax_op
 
 from sglang.srt.environ import envs
 
@@ -1013,6 +1012,7 @@ def _build_fused_moe_op():
         return _PALLAS_MOE_OP
 
     import jax  # noqa: F401  (force loud failure if JAX is missing)
+    from torch_tpu._internal.pallas import jax_op
 
     op_name = "sglang_tpu_pallas::fused_moe"
 

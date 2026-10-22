@@ -351,7 +351,7 @@ def _quantize_tpu_fp4_block512_kmajor(
 
 def _prepare_tpu_dsv4_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
     """Convert DeepSeek-V4 block-32 MXFP4 MoE weights into TPU block-512 packed-FP4 (W4A8) layout."""
-    from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+    from sglang_tpu.moe.mxfp4_tpu_util import (
         _pad_gate_up_halves_axis1,
         _pad_last_axis,
     )

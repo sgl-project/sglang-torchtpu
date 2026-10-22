@@ -57,7 +57,6 @@ from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
-from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
@@ -75,11 +74,6 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.run_event_loop",
         pin_scheduler_main_thread,
         HookType.BEFORE,
-    ),
-    (
-        "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
-        initialize_dense_moe_config,
-        HookType.AFTER,
     ),
     (
         "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",

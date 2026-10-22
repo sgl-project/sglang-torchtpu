@@ -14,13 +14,13 @@ from unittest import mock
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.quantization import mxfp4_tpu_util
-from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.moe import mxfp4_tpu_util
+from sglang_tpu.moe.mxfp4_tpu_util import (
     _EXPERTS_PER_CHUNK,
     prepare_tpu_mxfp4_moe_weights,
     process_mxfp4_moe_weights_bf16,
 )
-from sglang.test.test_utils import CustomTestCase
 
 HIDDEN, INTER = 64, 96
 # Wider than INTER's 128-lane width, as gpt-oss's 2880 pads to 3072 on tpu7x.

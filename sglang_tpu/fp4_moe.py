@@ -15,10 +15,6 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
-from sglang.srt.layers.quantization.mxfp4_tpu_util import (
-    _pad_gate_up_halves_axis1,
-    _pad_last_axis,
-)
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang_tpu.fp8_moe import _clear_replaced_param, _own_storage
 from sglang_tpu.fused_rs_sequence_parallel import (
@@ -26,6 +22,10 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     has_tpu_fused_rs_post_expert_norm,
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
+)
+from sglang_tpu.moe.mxfp4_tpu_util import (
+    _pad_gate_up_halves_axis1,
+    _pad_last_axis,
 )
 from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 

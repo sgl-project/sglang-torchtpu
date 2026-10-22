@@ -1011,13 +1011,13 @@ class TpuSRTPlatform(SRTPlatform):
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
         if quantization == "modelopt_fp4":
-            from sglang.srt.layers.quantization.modelopt_quant import (
+            from sglang_tpu.quantization.modelopt_fp4 import (
                 TpuModelOptCompatibleFp4Config,
             )
 
             return TpuModelOptCompatibleFp4Config
         if quantization == "modelopt_mixed":
-            from sglang.srt.layers.quantization.modelopt_quant import (
+            from sglang_tpu.quantization.modelopt_fp4 import (
                 TpuModelOptMixedPrecisionConfig,
             )
 

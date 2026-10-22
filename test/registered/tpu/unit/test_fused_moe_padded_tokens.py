@@ -116,7 +116,7 @@ def _make_weights(kind, num_experts, rng):
             kw["w1_scale"] = kw["w1_scale"] / kw["w1_channel_scale"][:, None]
             kw["w2_scale"] = kw["w2_scale"] / kw["w2_channel_scale"][:, None]
     elif kind == "mxfp4":
-        from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+        from sglang_tpu.moe.mxfp4_tpu_util import (
             process_mxfp4_moe_weights_bf16,
             process_mxfp4_moe_weights_native,
         )

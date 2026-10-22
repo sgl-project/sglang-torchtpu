@@ -827,16 +827,16 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
 
     def test_tpu_platform_factory_selects_tpu_config(self):
         from sglang.srt.layers import quantization
-        from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
         from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         platform = TpuSRTPlatform()
         self.assertIs(
             platform.get_quantization_config("modelopt_fp4"),
-            modelopt_quant.TpuModelOptCompatibleFp4Config,
+            modelopt_fp4.TpuModelOptCompatibleFp4Config,
         )
         mixed_config_cls = platform.get_quantization_config("modelopt_mixed")
-        self.assertIs(mixed_config_cls, modelopt_quant.TpuModelOptMixedPrecisionConfig)
+        self.assertIs(mixed_config_cls, modelopt_fp4.TpuModelOptMixedPrecisionConfig)
         with self.assertRaisesRegex(NotImplementedError, "not supported on TPU"):
             mixed_config_cls.from_config({})
         self.assertIsNone(platform.get_quantization_config("modelopt_fp8"))
@@ -847,11 +847,11 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         ):
             self.assertIs(
                 quantization.get_quantization_config("modelopt_fp4"),
-                modelopt_quant.TpuModelOptCompatibleFp4Config,
+                modelopt_fp4.TpuModelOptCompatibleFp4Config,
             )
             self.assertIs(
                 quantization.get_quantization_config("modelopt_mixed"),
-                modelopt_quant.TpuModelOptMixedPrecisionConfig,
+                modelopt_fp4.TpuModelOptMixedPrecisionConfig,
             )
         self.assertEqual(is_cpu.call_count, 2)
 
@@ -859,6 +859,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         from sglang.srt.layers.quantization import modelopt_quant
         from sglang.srt.layers.quantization.fp8 import Fp8Config
         from sglang.srt.model_loader import loader
+        from sglang_tpu.quantization import modelopt_fp4
 
         fp8_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
@@ -891,7 +892,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
             ),
             mock.patch(
                 "sglang.srt.layers.quantization.get_quantization_config",
-                return_value=modelopt_quant.TpuModelOptCompatibleFp4Config,
+                return_value=modelopt_fp4.TpuModelOptCompatibleFp4Config,
             ) as get_quantization_config,
         ):
             config = loader._get_quantization_config(
@@ -900,7 +901,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
 
         self.assertIsInstance(config, modelopt_quant.HybridFp8NvFp4Config)
         self.assertIsInstance(
-            config.nvfp4_config, modelopt_quant.TpuModelOptCompatibleFp4Config
+            config.nvfp4_config, modelopt_fp4.TpuModelOptCompatibleFp4Config
         )
         self.assertEqual(config.nvfp4_config.group_size, BLOCK_SIZE)
         self.assertIs(config.nvfp4_config.global_scale, False)
@@ -1043,17 +1044,17 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
     def test_tpu_config_selects_moe_adapter_and_rejects_dense_fp4(self):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization import modelopt_quant
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang_tpu.quantization import modelopt_fp4
 
-        config = modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
+        config = modelopt_fp4.TpuModelOptCompatibleFp4Config.from_config(
             self._checkpoint_config()
         )
         method = config.get_quant_method(
             mock.Mock(spec=FusedMoE), "model.layers.0.mlp.experts"
         )
 
-        self.assertIsInstance(method, modelopt_quant.TpuModelOptNvFp4FusedMoEMethod)
+        self.assertIsInstance(method, modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod)
         self.assertNotIn("handles_moe_reduction", method.__dict__)
         self.assertFalse(method.handles_moe_reduction)
         dense_layer = mock.Mock(spec=LinearBase)
@@ -1072,8 +1073,9 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
     def test_hybrid_nvfp4_dispatches_through_tpu_config(self):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
 
-        tpu_config = modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
+        tpu_config = modelopt_fp4.TpuModelOptCompatibleFp4Config.from_config(
             self._checkpoint_config()
         )
         hybrid_config = modelopt_quant.HybridFp8NvFp4Config(
@@ -1084,10 +1086,10 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         method = hybrid_config.get_quant_method(
             mock.Mock(spec=FusedMoE), "model.layers.0.mlp.experts"
         )
-        self.assertIsInstance(method, modelopt_quant.TpuModelOptNvFp4FusedMoEMethod)
+        self.assertIsInstance(method, modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod)
 
         unsupported_tpu_config = (
-            modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
+            modelopt_fp4.TpuModelOptCompatibleFp4Config.from_config(
                 self._checkpoint_config(group_size=8)
             )
         )
@@ -1101,9 +1103,9 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
             )
 
     def test_tpu_config_parses_flat_checkpoint_metadata(self):
-        from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
 
-        config = modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
+        config = modelopt_fp4.TpuModelOptCompatibleFp4Config.from_config(
             {
                 "quant_algo": "NVFP4",
                 "group_size": BLOCK_SIZE,
@@ -1116,12 +1118,12 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         self.assertIs(config.global_scale, False)
         self.assertEqual(config.scale_dtype, "BF16")
         self.assertEqual(config.exclude_modules, ["self_attn", "lm_head"])
-        method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+        method = modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod(config)
         self.assertEqual(method._weight_scale_dtype(), torch.bfloat16)
         self.assertEqual(method._prepared_scale_dtype, torch.bfloat16)
 
     def test_tpu_moe_accepts_and_honors_supported_scale_matrix(self):
-        from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
 
         dtype_aliases = {
             "float32": torch.float32,
@@ -1136,10 +1138,10 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                 overrides = {"global_scale": global_scale}
                 if scale_dtype is not None:
                     overrides["scale_dtype"] = scale_dtype
-                config = modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
+                config = modelopt_fp4.TpuModelOptCompatibleFp4Config.from_config(
                     self._checkpoint_config(**overrides)
                 )
-                method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+                method = modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod(config)
                 expected_checkpoint_dtype = (
                     dtype_aliases[scale_dtype]
                     if scale_dtype is not None
@@ -1162,7 +1164,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                     self.assertIs(method._uses_global_scale_parameters(), global_scale)
 
     def test_tpu_moe_rejects_malformed_extension_metadata(self):
-        from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
 
         cases = (
             ({"global_scale": "false"}, "global_scale to be a bool"),
@@ -1173,31 +1175,31 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
             ({"scale_dtype": "float16"}, "Unsupported.*scale_dtype"),
         )
         for overrides, error in cases:
-            config = modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
+            config = modelopt_fp4.TpuModelOptCompatibleFp4Config.from_config(
                 self._checkpoint_config(**overrides)
             )
             with self.subTest(overrides=overrides):
                 with self.assertRaisesRegex(ValueError, error):
-                    modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+                    modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod(config)
 
     def test_tpu_moe_accepts_supported_group_sizes(self):
-        from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
 
         for group_size in SUPPORTED_BLOCK_SIZES:
-            config = modelopt_quant.TpuModelOptCompatibleFp4Config(
+            config = modelopt_fp4.TpuModelOptCompatibleFp4Config(
                 is_checkpoint_nvfp4_serialized=True,
                 group_size=group_size,
                 exclude_modules=[],
             )
             with self.subTest(group_size=group_size):
-                method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+                method = modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod(config)
                 self.assertEqual(method.quant_config.group_size, group_size)
 
     def test_tpu_moe_rejects_unsupported_group_sizes(self):
-        from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
 
         for group_size in (8, 96, 1024, None):
-            config = modelopt_quant.TpuModelOptCompatibleFp4Config(
+            config = modelopt_fp4.TpuModelOptCompatibleFp4Config(
                 is_checkpoint_nvfp4_serialized=True,
                 group_size=group_size,
                 exclude_modules=[],
@@ -1206,12 +1208,12 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                 self.subTest(group_size=group_size),
                 self.assertRaisesRegex(NotImplementedError, "group_size in"),
             ):
-                modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+                modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod(config)
 
     def test_folded_scale_checkpoint_skips_unused_auxiliary_parameters(self):
-        from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
 
-        config = modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
+        config = modelopt_fp4.TpuModelOptCompatibleFp4Config.from_config(
             self._checkpoint_config(global_scale=False, scale_dtype="fp32")
         )
         self.assertIs(config.global_scale, False)
@@ -1221,7 +1223,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         layer.num_experts = EXPERTS
         layer.moe_runner_config = types.SimpleNamespace(is_gated=True)
 
-        method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+        method = modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod(config)
         method.create_weights(
             layer,
             num_experts=EXPERTS,
@@ -1266,9 +1268,9 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         group_size: int = BLOCK_SIZE,
     ):
         from sglang.srt.layers.moe import MoeRunnerBackend
-        from sglang.srt.layers.quantization import modelopt_quant
+        from sglang_tpu.quantization import modelopt_fp4
 
-        config = modelopt_quant.TpuModelOptCompatibleFp4Config.from_config(
+        config = modelopt_fp4.TpuModelOptCompatibleFp4Config.from_config(
             {
                 "quant_method": "modelopt",
                 "quantization": {
@@ -1301,7 +1303,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
 
         with (
             mock.patch.object(
-                modelopt_quant,
+                modelopt_fp4,
                 "get_moe_runner_backend",
                 return_value=MoeRunnerBackend(backend),
             ),
@@ -1330,7 +1332,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 _fake_prepare,
             ),
         ):
-            method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+            method = modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod(config)
             method.create_moe_runner(layer, moe_runner_config)
             constructed = method.handles_moe_reduction
             if not model_contract:

@@ -2773,8 +2773,9 @@ def select_experts(
         if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
-        # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
-        _can_use_jit_kernel = not (_is_cpu or _is_tpu)
+        # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports.
+        # TPU never gets here: TopK has no TPU forward, and forward_native sets torch_native.
+        _can_use_jit_kernel = not _is_cpu
 
         if _can_use_jit_kernel and (
             scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid"

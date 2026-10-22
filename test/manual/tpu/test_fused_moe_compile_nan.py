@@ -66,7 +66,7 @@ class TestFusedMoeCompileNaN(unittest.TestCase):
             pass
 
     def _weights(self):
-        from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+        from sglang_tpu.moe.mxfp4_tpu_util import (
             process_mxfp4_moe_weights_native,
         )
 

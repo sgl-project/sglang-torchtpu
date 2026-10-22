@@ -65,7 +65,7 @@ def _assert_close(test, out, ref, rtol):
 
 def _weights(kind, num_experts):
     """(w1, w2, w1_scale, w2_scale) for the kernel, f32 (w1, w2) for the ref."""
-    from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+    from sglang_tpu.moe.mxfp4_tpu_util import (
         process_mxfp4_moe_weights_bf16,
         process_mxfp4_moe_weights_native,
     )

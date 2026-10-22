@@ -209,7 +209,7 @@ class TestNativeMxfp4FusedMoE(unittest.TestCase):
 
     def _run_native(self, layer, hs, topk_ids, topk_w):
         """Run the native MXFP4 fused MoE call (uint8 packed + fp32 scales)."""
-        from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+        from sglang_tpu.moe.mxfp4_tpu_util import (
             process_mxfp4_moe_weights_native,
         )
         from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call

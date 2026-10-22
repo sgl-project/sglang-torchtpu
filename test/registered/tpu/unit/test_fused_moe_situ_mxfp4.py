@@ -101,7 +101,7 @@ class TestFusedMoEMxfp4Situ(CustomTestCase):
         )
 
     def test_packed_mxfp4_bf16_act_matches_dequantized_reference(self):
-        from sglang.srt.layers.quantization.mxfp4_tpu_util import (
+        from sglang_tpu.moe.mxfp4_tpu_util import (
             process_mxfp4_moe_weights_bf16,
             process_mxfp4_moe_weights_native,
         )
