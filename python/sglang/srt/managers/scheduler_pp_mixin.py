@@ -1417,9 +1417,10 @@ class SchedulerPPMixin:
             )
             if key in pp_outputs.tensors
         }
-        if self._pp_wave is not None:
+        if self._pp_wave is not None and get_disagg().disaggregation_mode != "prefill":
             # The relayed outputs stay on the host, and pp_outputs is relayed on
             # as is; decode reads its input IDs and the draft state from device.
+            # A PD prefill only ships them, so they stay on the host there.
             next_token_ids = next_token_ids.to(batch.device, non_blocking=True)
             draft_state = {
                 key: value.to(batch.device, non_blocking=True)

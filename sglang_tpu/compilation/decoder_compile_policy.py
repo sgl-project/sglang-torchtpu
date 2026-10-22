@@ -970,11 +970,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if pp_group is None or pp_group.is_first_rank:
             return {}
         hidden_size = self.model_runner.model_config.hidden_size
-        zeros = functools.partial(
-            torch.zeros,
-            dtype=self.model_runner.dtype,
-            device=self.model_runner.device,
-        )
+        # Serving trims the wave's max-bucket buffers to the batch's bucket
+        # (_fit_pp_proxy_rows), so the program takes row views of them; warm
+        # with the same views, or each bucket copies its view on first use.
+        rows = self.max_padded_tokens()
+
+        def zeros(shape: tuple[int, int]) -> torch.Tensor:
+            buffer = torch.zeros(
+                (rows, shape[1]),
+                dtype=self.model_runner.dtype,
+                device=self.model_runner.device,
+            )
+            return buffer[: shape[0]]
+
         proxy = {
             "hidden_states": zeros((num_tokens, hidden_size)),
             "residual": zeros((num_tokens, hidden_size)),

@@ -15,6 +15,7 @@ permute, so the wave without them is unchanged.
 
 import logging
 import os
+from collections.abc import Iterable
 from typing import Any, Callable
 
 import torch
@@ -224,6 +225,21 @@ class PPWave:
             )
         return torch.cat([t, zero[n:]])
 
+    def warmup_tensors(self, rows: int) -> dict[str, torch.Tensor]:
+        """Fresh hand-off tensors of one forward bucket, as a forward returns them."""
+        return {
+            key: torch.zeros(
+                (rows, self.hidden), dtype=self.dtype, device=self.zero.device
+            )
+            for key in self.KEYS
+        }
+
+    def warmup_merge(self, row_buckets: Iterable[int]) -> None:
+        """Compile merge's sum and pad for every bucket a forward hands on."""
+        for rows in row_buckets:
+            if rows <= self.rows:
+                self.merge(self.warmup_tensors(rows))
+
     def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
         """The padded sum of a forward's outgoing hidden states and residual."""
         if set(tensors) != set(self.KEYS):
@@ -400,6 +416,12 @@ class PPAuxWave(PPWave):
             (self.rows, self.aux_width), dtype=self.dtype, device=self.zero.device
         )
         self.zero_payload = (self.zero, self.aux_zero)
+
+    def warmup_tensors(self, rows: int) -> dict[str, torch.Tensor]:
+        aux = torch.zeros(
+            (rows, self.aux_width), dtype=self.dtype, device=self.zero.device
+        )
+        return super().warmup_tensors(rows) | {AUX_HIDDEN_STATES_PROXY_KEY: aux}
 
     def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
         if AUX_HIDDEN_STATES_PROXY_KEY not in tensors:

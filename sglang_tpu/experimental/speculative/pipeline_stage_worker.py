@@ -54,9 +54,24 @@ class TpuPipelineStageWorker(BaseSpecWorker):
         register_host_batch_padder(self._pad_bs)
 
     def init_cuda_graphs(self) -> None:
+        self._warmup_host_uploads()
         # torch_tpu compiles asynchronously; the checker must not count the warmups.
         torch.accelerator.synchronize()
         snapshot_recompilation_baseline()
+
+    def _warmup_host_uploads(self) -> None:
+        """HOST_PADDED inputs upload at their batch or token bucket, as on the last stage."""
+        runner = self._target_worker.model_runner
+        policy = runner.compile_policy
+        assert isinstance(policy, DecoderTpuCompilePolicy), type(policy)
+        assert policy.t_bucketer is not None and policy.b_bucketer is not None
+        # torch_tpu compiles one program per shape even for a plain H2D copy.
+        for rows in {*policy.b_bucketer.buckets, *policy.t_bucketer.buckets}:
+            for dtype in (torch.int64, torch.int32):
+                torch.zeros((rows,), dtype=dtype).to(runner.device, non_blocking=True)
+        # prepare_for_extend uploads the extend lengths at the live batch size.
+        for bs in range(1, policy._extend_compile_cap() + 1):
+            torch.zeros((bs,), dtype=torch.int64).to(runner.device, non_blocking=True)
 
     def forward_batch_generation(
         self,

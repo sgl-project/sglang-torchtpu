@@ -488,6 +488,36 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 self.assertTrue(spec_need_hidden_states(lambda: True))
         self.assertEqual(prepared, [batch, "core"])
 
+    def test_host_relayed_draft_state_filters_with_host_indices(self):
+        """A PP PD prefill keeps the relayed EAGLE draft state on host; filtering
+        it with device indices would compile per batch on the device."""
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+        from sglang_tpu.hooks.experimental_spec import filter_spec_input
+
+        spec_info = EagleDraftInput(
+            topk_p=torch.ones(3, 1),
+            topk_index=torch.zeros(3, 1, dtype=torch.int64),
+            hidden_states=torch.zeros(3, 4),
+            bonus_tokens=torch.arange(3),
+        )
+        batch = SimpleNamespace(spec_info=spec_info, enable_overlap=False)
+        seen = []
+        filter_spec_input(
+            lambda b, keep, keep_device: seen.append(keep_device),
+            batch,
+            [0, 2],
+            "device-indices",
+        )
+        self.assertEqual(seen[0].tolist(), [0, 2])
+        batch.spec_info = None
+        filter_spec_input(
+            lambda b, keep, keep_device: seen.append(keep_device),
+            batch,
+            [0],
+            "device-indices",
+        )
+        self.assertEqual(seen[1], "device-indices")
+
     def test_pp_stages_before_the_last_get_no_draft(self):
         """Under PP only the last stage hosts the draft; an earlier stage building one
         would bind the target embedding or lm_head its stage does not hold."""

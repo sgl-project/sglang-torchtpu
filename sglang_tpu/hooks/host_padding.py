@@ -56,13 +56,25 @@ def metadata_device(original, batch):
     # Independent of sampling parameter placement. Host allocation must also
     # understand these indices before the forward upload boundary.
     if (
-        _can_stage_forward_metadata(batch)
+        (_can_stage_forward_metadata(batch) or _stages_spec_metadata(batch))
         and batch.req_to_token_pool.req_to_token.device.type == "cpu"
         and batch.hisparse_coordinator is None
         and not any(req.beam_group is not None for req in batch.reqs)
     ):
         return "cpu"
     return original(batch)
+
+
+def _stages_spec_metadata(batch) -> bool:
+    """A non-overlap experimental-worker batch (a PD prefill, PP included) keeps
+    its lengths and request rows on host, so filtering and bucket padding never
+    compile per batch size on the device. The worker is on whenever
+    SGLANG_TPU_HOST_PADDING_NO_D2H or SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER is."""
+    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+    from sglang_tpu.experimental import uses_host_batch
+
+    # Overlap batches resolve seq_lens on the device through the FutureMap.
+    return uses_host_batch(batch) and not batch.enable_overlap
 
 
 def mrope_decode_device(original, batch, device):
