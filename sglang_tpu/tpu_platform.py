@@ -925,9 +925,22 @@ class TpuSRTPlatform(SRTPlatform):
             disable_cuda_graph=True,
             cuda_graph_config=graph_config,
         )
-        # ``enable_torch_compile`` is honored on TPU and wired up by
-        # ``TpuGraphRunner`` (see ``ModelRunner.init_device_graphs``). Off by
-        # default (the SGLang-wide default); opt in with ``--enable-torch-compile``.
+        # Plugin speculative workers require bucketed compiled forwards.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.spec_execution import settle_spec_execution
+
+        # NEXTN is renamed to EAGLE (MTP) only after the platform defaults run.
+        spec_name = cfg.speculative_algorithm
+        if settle_spec_execution(
+            server_args,
+            algorithm=SpeculativeAlgorithm.__members__.get(
+                "EAGLE" if spec_name == "NEXTN" else spec_name,
+                SpeculativeAlgorithm.NONE,
+            ),
+        ).host_padded:
+            declare_resolution(
+                server_args, "tpu.apply_server_args_defaults", enable_torch_compile=True
+            )
         # TPU runs SGLang's regular event-based overlap scheduling, minus the
         # CUDA-style forward/copy/schedule streams: torch_tpu serialises on a
         # single PJRT queue so cross-stream ordering is a no-op (see
@@ -986,7 +999,7 @@ class TpuSRTPlatform(SRTPlatform):
                 if spec_algo.upper() in SpeculativeAlgorithm.__members__:
                     raise NotImplementedError(
                         f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                        "yet (only EAGLE, EAGLE3, NEXTN and DFLASH among builtin algorithms)."
+                        "yet (only EAGLE, EAGLE3, NEXTN, DFLASH and plugin DSPARK among builtin algorithms)."
                     )
 
         # Platform defaults run after handle_deprecated_dp_attention, so the
@@ -1054,27 +1067,12 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_spec_worker_cls(self, algorithm, server_args, *, default: type) -> type:
         from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang_tpu.spec_execution import resolve_spec_execution
 
-        # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
-        from sglang_tpu.experimental import (
-            is_experimental_chain,
-            is_experimental_spec_worker,
+        binding = resolve_spec_execution(
+            algorithm, pp_size=resolving_view(server_args).pp_size
         )
-
-        pp_size = resolving_view(server_args).pp_size
-        if is_experimental_chain(algorithm, pp_size=pp_size):
-            from sglang_tpu.experimental.speculative.chain_spec_worker import (
-                TpuChainSpecWorker,
-            )
-
-            return TpuChainSpecWorker
-        if is_experimental_spec_worker(algorithm, pp_size=pp_size):
-            from sglang_tpu.experimental.speculative.block_spec_worker import (
-                TpuBlockSpecWorker,
-            )
-
-            return TpuBlockSpecWorker
-        return default
+        return binding.worker_cls(default=default)
 
     def get_quantization_config(
         self, quantization: str

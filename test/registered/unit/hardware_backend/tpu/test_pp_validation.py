@@ -221,6 +221,20 @@ class TestPipelineParallelValidation(CustomTestCase):
             )
         )
 
+    def test_direct_tracer_rejects_mtp_left_on_the_eager_driver(self):
+        """A configured pipeline keeps native MTP on core's EAGLE driver, which
+        the direct tracer does not compile."""
+        with self.assertRaisesRegex(ValueError, "--tpu-compile-tracer direct"):
+            _apply(
+                _args(
+                    pp_size=2,
+                    speculative_algorithm="NEXTN",
+                    disaggregation_mode="prefill",
+                    enable_torch_compile=True,
+                    tpu_compile_tracer="direct",
+                )
+            )
+
     def test_rejects_dynamic_chunking(self):
         with self.assertRaisesRegex(
             NotImplementedError, r"--enable-dynamic-chunking.*pipeline"

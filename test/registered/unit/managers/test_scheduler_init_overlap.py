@@ -20,7 +20,11 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -290,10 +294,12 @@ class TestSchedulerExtensionOwnership(CustomTestCase):
         from sglang_tpu.scheduler_extension import TpuSchedulerExtension
 
         pool = SimpleNamespace(req_to_token=torch.zeros(8, 16))
-        for enabled in (False, True):
+        # Only the plugin route: the flag on and a one-stage target pipeline.
+        for enabled, pp_size in ((False, 1), (True, 1), (True, 2)):
             with (
-                self.subTest(enabled=enabled),
+                self.subTest(enabled=enabled, pp_size=pp_size),
                 tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+                published_topology(tp_size=1, pp_size=pp_size),
                 patch.object(
                     experimental_spec,
                     "materialize_future_map",
@@ -303,7 +309,7 @@ class TestSchedulerExtensionOwnership(CustomTestCase):
                 relay = TpuSchedulerExtension().create_future_map(
                     SpeculativeAlgorithm.EAGLE3, "cpu", pool
                 )
-            if enabled:
+            if enabled and pp_size == 1:
                 materialize.assert_called_once_with(relay, SpeculativeAlgorithm.EAGLE3)
             else:
                 materialize.assert_not_called()

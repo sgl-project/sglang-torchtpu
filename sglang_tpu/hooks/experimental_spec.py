@@ -1,16 +1,16 @@
-"""Narrow hook adapters for the experimental host-padded spec path.
+"""Narrow hook adapters for the plugin host-padded spec path.
 
 Why: filter/merge and H2D staging must be intercepted before device operations,
-not repaired afterward. All non-experimental calls delegate unchanged.
+not repaired afterward. Compatibility batches delegate unchanged.
 kimi_spec_defaults: core refuses speculation for Kimi hybrid (KDA) targets on
-TPU and otherwise pins GPU verify/draft backends; the experimental worker
-serves DSPARK on the TPU KDA checkpoint verify, so it skips both.
+TPU and otherwise pins GPU verify/draft backends; the plugin worker serves
+DSPARK on the TPU KDA checkpoint verify, so it skips both.
 materialize_future_map (applied by TpuSchedulerExtension.create_future_map): the
 live FutureMap's lazy torch.empty buffers would fuse into their first store,
 compiling at whatever shape the first batch has.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
 replace these hooks with agreed factories/overrides for the extracted operations.
-Remove when: the experiment is removed or those upstream seams are available.
+Remove when: those upstream seams provide host-padded batch operations.
 """
 
 from __future__ import annotations
@@ -28,9 +28,11 @@ from sglang_tpu.experimental import (
     get_host_batch_padder,
     is_experimental_chain,
     is_experimental_spec,
+    plugin_block_draft_sampling,
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+from sglang_tpu.spec_execution import resolve_spec_execution
 
 
 def _target_pp_size() -> int:
@@ -43,12 +45,15 @@ def _target_pp_size() -> int:
 
 
 def _serves_chain(spec_algorithm) -> bool:
-    """Whether TpuChainSpecWorker serves spec_algorithm at the configured target PP."""
-    return is_experimental_chain(spec_algorithm, pp_size=_target_pp_size())
+    """Whether the binding sends spec_algorithm to TpuChainSpecWorker at the target PP."""
+    return resolve_spec_execution(
+        spec_algorithm, pp_size=_target_pp_size()
+    ).chain_worker
 
 
 def initialize_host_batch(result, *args, **kwargs):
-    # Every batch of a process a TpuSpecWorker serves is host padded, whatever the algorithm.
+    # Every batch of a process a TpuSpecWorker serves is host padded, whatever the
+    # algorithm. Only the worker the binding selects registers the padder.
     padder = get_host_batch_padder()
     if padder is not None:
         if not result.enable_overlap:
@@ -319,9 +324,8 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
 
 
 def sample_draft_tokens(original, model, hidden_states, input_ids):
-    from sglang_tpu.experimental import experimental_spec_enabled
-
-    if not experimental_spec_enabled():
+    # Traced inside the draft graph: read the plugin worker's construction-time choice.
+    if not plugin_block_draft_sampling():
         return original(model, hidden_states, input_ids)
     from sglang_tpu.experimental.models.dspark import sample_draft_tokens as sample
 
@@ -329,9 +333,7 @@ def sample_draft_tokens(original, model, hidden_states, input_ids):
 
 
 def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
-    from sglang_tpu.experimental import experimental_spec_enabled
-
-    if not experimental_spec_enabled():
+    if not plugin_block_draft_sampling():
         return original(model, hidden_states, input_ids)
     from sglang_tpu.experimental.models.dflash2 import sample_draft_tokens as sample
 
@@ -446,9 +448,11 @@ def hook_specs():
             HookType.AROUND,
         ),
     ]
+    # Hooks install before arguments are resolved, so the route is unknown here.
+    # Argument resolution marks launches the plugin worker cannot serve with a
+    # fallback that scheduler processes inherit before they install these.
     if experimental_spec_enabled():
-        # Hot paths every spec batch takes; registered only with the flag on so
-        # the default path runs no extra wrappers.
+        # Each adapter still checks the batch route: PP-prefill uses compatibility metadata.
         hooks += [
             (
                 "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",

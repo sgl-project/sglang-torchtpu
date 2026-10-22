@@ -23,7 +23,7 @@ from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
 from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 
 register_tpu_ci(
-    est_time=175,
+    est_time=235,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "qwen3-0.6b", "compile-tracer"],
 )
@@ -31,6 +31,21 @@ register_tpu_ci(
 MODEL = "Qwen/Qwen3-0.6B"
 EAGLE3_MODEL = "Qwen/Qwen3-1.7B"
 EAGLE3_DRAFT_MODEL = "AngelSlim/Qwen3-1.7B_eagle3"
+EAGLE3_SERVER_ARGS = {
+    "attention_backend": "pallas_tpu_rpa_v3",
+    "speculative_algorithm": "EAGLE3",
+    "speculative_draft_model_path": EAGLE3_DRAFT_MODEL,
+    "speculative_num_steps": 3,
+    "speculative_eagle_topk": 1,
+    "speculative_num_draft_tokens": 4,
+    "disable_overlap_schedule": False,
+    "disable_radix_cache": True,
+    "context_length": 512,
+    "max_total_tokens": 512,
+    "max_prefill_tokens": 64,
+    "chunked_prefill_size": 64,
+    "tpu_compile_tokens": [64],
+}
 
 
 class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
@@ -40,9 +55,11 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
         *,
         model=MODEL,
         overrides=None,
+        env=None,
         expect_speculative_decoding=False,
     ):
         config = deepcopy(CONFIG)
+        config["runtime_env"].update(env or {})
         if tracer == "direct":
             config["server_args"]["tpu_compile_tracer"] = "direct"
         config["server_args"].update(overrides or {})
@@ -99,26 +116,25 @@ class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
         self.assertEqual(state["torch_compile_dynamo_frames"], 0)
         self.assertEqual(state["torch_compile_aot_autograd_graphs"], 0)
 
-    def test_direct_with_eagle3(self):
-        state = self._run_server(
+    def _run_eagle3(self, **kwargs):
+        return self._run_server(
             "direct",
             model=EAGLE3_MODEL,
-            overrides={
-                "attention_backend": "pallas_tpu_rpa_v3",
-                "speculative_algorithm": "EAGLE3",
-                "speculative_draft_model_path": EAGLE3_DRAFT_MODEL,
-                "speculative_num_steps": 3,
-                "speculative_eagle_topk": 1,
-                "speculative_num_draft_tokens": 4,
-                "disable_overlap_schedule": True,
-                "disable_radix_cache": True,
-                "context_length": 512,
-                "max_total_tokens": 512,
-                "max_prefill_tokens": 64,
-                "chunked_prefill_size": 64,
-                "tpu_compile_tokens": [64],
-            },
             expect_speculative_decoding=True,
+            **kwargs,
+        )
+
+    def test_direct_with_eagle3(self):
+        """The default route: the compatibility worker without overlap scheduling."""
+        state = self._run_eagle3(
+            overrides={**EAGLE3_SERVER_ARGS, "disable_overlap_schedule": True}
+        )
+        self.assertEqual(state["torch_compile_dynamo_frames"], 0)
+
+    def test_direct_with_eagle3_plugin_worker(self):
+        state = self._run_eagle3(
+            overrides=EAGLE3_SERVER_ARGS,
+            env={"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1"},
         )
         self.assertEqual(state["torch_compile_dynamo_frames"], 0)
 

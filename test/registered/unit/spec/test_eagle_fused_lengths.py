@@ -13,16 +13,17 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.eagle_utils_tpu import (
     build_topk1_verify_chain_torch,
 )
+from sglang_tpu.experimental.speculative.eagle.draft_worker import TpuEagleDraftWorker
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class TestFusedDraftLengths(unittest.TestCase):
+class TestFusedDraftLengths(CustomTestCase):
     def test_step_state_matches_at_page_boundaries(self):
         for tracer in ("dynamo", "direct"):
             for dtype in (torch.int32, torch.int64):
@@ -51,7 +52,7 @@ class TestFusedDraftLengths(unittest.TestCase):
                 hidden_states=batch.spec_info.hidden_states + 1,
             )
 
-        worker = object.__new__(EagleDraftWorker)
+        worker = object.__new__(TpuEagleDraftWorker)
         worker.topk = 1
         worker.speculative_num_steps = steps
         worker.server_args = SimpleNamespace(tpu_compile_tracer=tracer)
@@ -70,10 +71,8 @@ class TestFusedDraftLengths(unittest.TestCase):
         )
         slots = torch.arange(steps * 2).reshape(steps, 2) + 101
 
-        # eagle_worker_v2 imports the verify-chain builder only on TPU, so bind
-        # it here to run the loop's final chain build off-device.
         with patch(
-            "sglang.srt.speculative.eagle_worker_v2.build_topk1_verify_chain_torch",
+            "sglang_tpu.experimental.speculative.eagle.draft_worker.build_topk1_verify_chain_torch",
             new=build_topk1_verify_chain_torch,
             create=True,
         ):

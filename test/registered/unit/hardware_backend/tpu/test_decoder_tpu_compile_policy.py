@@ -285,6 +285,13 @@ def _run_cases(policy, mode):
 
 
 class TestDirectCompileExtraModelState(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # These tests replace compilation, not distributed execution.
+        initialized = patch("torch.distributed.is_initialized", return_value=False)
+        initialized.start()
+        self.addCleanup(initialized.stop)
+
     def test_custom_policy_forwards_kv_pool_without_replacing_runner_pool(self):
         compile_kv_pool = object()
 
@@ -488,6 +495,13 @@ def _cpu_mamba_pool(num_layers: int) -> TpuMambaPool:
 
 
 class TestHybridLinearDirectCompile(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # The compiler is mocked; this fixture owns no distributed groups.
+        patcher = patch("torch.distributed.is_initialized", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_trace_binds_each_child_metadata_and_restores_it(self):
         """HybridLinearAttnBackend has no forward_metadata of its own.
 

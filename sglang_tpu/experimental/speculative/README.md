@@ -1,7 +1,8 @@
 # Experimental TPU spec worker
 
 Every algorithm is written as draft -> verify -> commit over static, bucketed
-shapes. Enable it with `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`. It requires
+shapes. Enable it with `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`; launches it
+cannot serve fail before load (see `sglang_tpu/README.md`). It requires
 overlap scheduling. For an example launch config, see
 `benchmark/tpu/recipe/configs/qwen3_8_27b/mtp_gate.py`.
 
@@ -118,7 +119,7 @@ policy mixin, and routes all three.
 ## Not supported
 
 Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP and mixed prefill/decode DP steps. Neither family supports DP
-attention, and the chain family (MTP) does not support a draft sliding window.
+attention, and the chain family (MTP and EAGLE3) does not support a draft sliding window.
 Each raises at startup.
 
 ## P/D disaggregation

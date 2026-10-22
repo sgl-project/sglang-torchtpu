@@ -58,6 +58,30 @@ def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
     return gamma
 
 
+def resolve_launch_gamma(
+    *,
+    block_size: Optional[int],
+    checkpoint_gamma: Optional[int],
+    num_draft_tokens: Optional[int],
+) -> Optional[int]:
+    """The gamma a launch settles on: --speculative-dspark-block-size, else the
+    draft checkpoint's, else DEFAULT_DSPARK_GAMMA when
+    --speculative-num-draft-tokens is unset too. None leaves the verify window
+    to --speculative-num-draft-tokens."""
+    if block_size is not None:
+        if int(block_size) <= 0:
+            raise ValueError(
+                "DSpark requires --speculative-dspark-block-size to be positive, "
+                f"got {block_size}."
+            )
+        return int(block_size)
+    if checkpoint_gamma is not None:
+        return int(checkpoint_gamma)
+    if num_draft_tokens is None:
+        return DEFAULT_DSPARK_GAMMA
+    return None
+
+
 class DSparkDraftConfig(msgspec.Struct, frozen=True):
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]

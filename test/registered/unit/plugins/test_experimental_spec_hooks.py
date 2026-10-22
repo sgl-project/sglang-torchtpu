@@ -342,6 +342,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         torch.testing.assert_close(draft.new_seq_lens, state.seq_lens)
 
     def test_model_hook_uses_anchor_width_without_changing_parent(self):
+        from sglang.srt.runtime_context import get_context
+
+        enter_scope(
+            self, get_context().override_server_args(speculative_algorithm="DSPARK")
+        )
         from sglang.srt.models.dflash import DFlashDraftModel
         from sglang.srt.models.dspark import DSparkDraftModel
         from sglang_tpu.hooks.experimental_spec import sample_draft_tokens
@@ -349,6 +354,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIsNot(
             DSparkDraftModel.sample_draft_tokens_tpu,
             DFlashDraftModel.sample_draft_tokens_tpu,
+        )
+        enter_scope(
+            self, patch("sglang_tpu.experimental._plugin_block_draft_sampling", True)
         )
         for anchor in (True, False):
             width = 2 if anchor else 3
@@ -383,7 +391,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
             # Each step reads the token drafted before it and the head's carried state.
             torch.testing.assert_close(seen["prev"][1], torch.tensor([3, 3]))
             self.assertEqual(seen["states"], [0, 1])
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        # A compatibility worker never chose plugin sampling for its draft model.
+        with patch("sglang_tpu.experimental._plugin_block_draft_sampling", False):
             sentinel = object()
             self.assertIs(
                 sample_draft_tokens(lambda *args: sentinel, None, None, None), sentinel

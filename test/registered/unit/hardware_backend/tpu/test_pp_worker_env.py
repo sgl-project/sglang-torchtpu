@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.distributed import bootstrap, parallel_state
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase, published_topology
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 from sglang_tpu.worker_env import (
@@ -169,6 +170,13 @@ class TestPipelineGroupCommunicators(CustomTestCase):
             patch.object(parallel_state, "_ATTN_CP", None),
             patch.object(parallel_state, "_ATTN_TP", None),
             patch.object(parallel_state, "_PP", None),
+            patch.object(parallel_state, "_DCP", None),
+            patch.object(parallel_state, "_SELF_PP", None),
+            patch.object(parallel_state, "_SHARED_EXPERTS_TP", None),
+            patch.object(parallel_state, "_MOE_DP", None),
+            patch.object(parallel_state, "_MOE_EP", None),
+            patch.object(parallel_state, "_MOE_TP", None),
+            patch.object(get_parallel(), "_stamp", {}),
             patch("torch.distributed.is_initialized", return_value=True),
             patch("torch.distributed.get_world_size", return_value=8),
             patch("torch.distributed.get_rank", return_value=0),

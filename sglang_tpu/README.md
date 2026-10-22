@@ -54,6 +54,49 @@ Unreachable today: MLA with hybrid SWA or an FP4 KV cache takes the plain OOT
 MLA builder in mode B and the generic builders in mode A; no TPU model uses
 either.
 
+## Speculative worker selection
+
+The plugin workers are opt-in: with `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`
+(or `SGLANG_TPU_HOST_PADDING_NO_D2H=1`), both platform identities serve, at PP=1,
+EAGLE3 top-k-1 chains and native MTP (NEXTN) on `TpuChainSpecWorker` and
+DFlash/DSpark on `TpuBlockSpecWorker`. These paths require overlap scheduling;
+argument resolution enables torch compilation for them. Unset, every algorithm
+keeps its compatibility worker, and DSpark, which only the plugin worker serves,
+is not admitted.
+
+With the plugin workers selected, argument resolution checks before any model
+loads what they reject, and fails the launch naming the rollback variables:
+- every route: disabled overlap, a non-fixed simulated-acceptance token mode,
+  and attention DP, which no plugin worker serves yet (the chain worker's
+  bucket-aligned verify rows exceed the DP-synced token counts);
+- EAGLE3, native MTP and DFlash: `--speculative-accept-threshold-single` or
+  `--speculative-accept-threshold-acc` other than 1.0, which sampled drafts do
+  not apply, and `SGLANG_TPU_ENABLE_BSEARCH_SAMPLING=0`, since the plugin workers
+  filter sampled rows only with the sort-free sampler;
+- EAGLE3 and native MTP: non-static ragged verify, a draft window, top-k other
+  than 1, adaptive speculation, and a hidden-state return mode (the chain
+  worker drops the target's hidden states); EAGLE3 also multi-layer drafting,
+  drafts other than `LlamaForCausalLMEagle3` and M-RoPE drafts; native MTP also
+  drafts the MTP drafter does not load;
+- DFlash and DSpark: non-static ragged verify; DFlash also
+  LiLiCorr or Domino drafts, a `mask_embedding.pt` beside the draft, and a
+  missing or out-of-vocabulary `dflash_config.mask_token_id`; DSpark a draft its
+  runtime config rejects, and a gamma other than the one its draft model builds
+  (the checkpoint's block size, else 16).
+
+`--tpu-compile-tracer direct` fails when the selected compatibility driver is not
+direct-compiled. Tree top-k stays rejected. PP-prefill retains the compatibility
+driver. TPU PP decode remains unsupported.
+
+The same settlement serves a route that selects the plugin workers by default:
+there a launch they cannot serve falls back to the compatibility worker for that
+launch and logs why, as does native MTP on a draft not yet exercised, while a P/D
+server fails, since its peer may settle differently. The default stays off until
+the plugin workers serve what the compatibility workers do: they do not yet
+return DFlash sampling masks, apply `/set_internal_state` updates of the accept
+thresholds, or serve attention DP, and their accuracy, throughput and memory
+against the compatibility workers are not measured.
+
 ## Layout
 
 ```

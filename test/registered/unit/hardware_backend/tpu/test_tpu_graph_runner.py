@@ -89,6 +89,8 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        # Mocked compilation owns no process groups, even after another module built them.
+        enter_scope(self, patch("torch.distributed.is_initialized", return_value=False))
         # Flush init's lazy imports before the torch.compile patch: their
         # import-time @torch.compile decorators must not hit the recorder.
         import sglang.kernels.ops.lora.moe.virtual_experts  # noqa: F401
@@ -426,6 +428,19 @@ class TestTpuGraphRunner(CustomTestCase):
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
 
+    def test_compile_enablement_uses_resolution_without_mutating_raw_args(self):
+        """A platform-enabled compile default must reach graph-runner startup."""
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        model = _model_with(forward=lambda *a, **k: None)
+        runner = self._runner_for(model, enable_torch_compile=False)
+        declare_resolution(
+            runner.server_args, "test.platform_default", enable_torch_compile=True
+        )
+        TpuGraphRunner(runner)
+        self.assertFalse(runner.server_args.enable_torch_compile)
+        self.assertIsNotNone(runner.compile_policy)
+
     def test_pp_draft_scope_keeps_target_compatibility_policy(self):
         from sglang_tpu.envs import envs as tpu_envs
 
@@ -479,6 +494,15 @@ class TestTpuGraphRunner(CustomTestCase):
                 pp_size=1, speculative_num_steps=3, speculative_algorithm="EAGLE3"
             ),
         )
+        # Opted in, EAGLE3 runs on the chain worker and its policy.
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            self.assertTrue(
+                issubclass(
+                    _augment_spec_policy(DecoderTpuCompilePolicy, mr),
+                    TpuChainSpecDecodeCompilePolicyMixin,
+                )
+            )
+        # By default it keeps the compatibility worker's policy.
         cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
@@ -520,7 +544,7 @@ class TestTpuGraphRunner(CustomTestCase):
         # No speculative decoding -> plain (unmixed) policy.
         no_spec = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            server_args=SimpleNamespace(),
+            server_args=SimpleNamespace(pp_size=1),
         )
         self.assertIs(
             _augment_spec_policy(DecoderTpuCompilePolicy, no_spec),
@@ -908,10 +932,12 @@ class TestDraftPrecompileOrdering(CustomTestCase):
     def test_precompile_runs_after_draft_init_cuda_graphs(self):
         import contextlib
 
-        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+        from sglang_tpu.experimental.speculative.eagle.draft_worker import (
+            TpuEagleDraftWorker,
+        )
 
         events = []
-        worker = object.__new__(EagleDraftWorker)
+        worker = object.__new__(TpuEagleDraftWorker)
         worker.speculative_num_steps = 3
         from sglang.srt.runtime_context import get_flags
 
@@ -957,10 +983,6 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
                 return_value=False,
-            ),
-            patch(
-                "sglang.srt.speculative.eagle_worker_v2._is_tpu",
-                True,
             ),
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.draft_pp_context",

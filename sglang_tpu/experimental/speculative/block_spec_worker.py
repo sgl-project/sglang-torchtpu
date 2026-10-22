@@ -37,6 +37,7 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.experimental import use_plugin_block_draft_sampling
 from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
 )
@@ -91,6 +92,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 "TpuBlockSpecWorker does not support DP attention."
             )
         self._spec_algorithm = target_runner.spec_algorithm
+        # Before the draft model exists, so every trace of its graph samples here.
+        use_plugin_block_draft_sampling()
         draft_worker = _DRAFT_WORKER_CLS[self._spec_algorithm](target_runner)
         super().__init__(target_worker, draft_worker, draft_worker.num_drafts)
         # prepare_for_decode gathers the verify window and KV reserve at this width.

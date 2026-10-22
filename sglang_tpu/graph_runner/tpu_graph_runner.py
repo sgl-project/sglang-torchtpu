@@ -49,25 +49,10 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
-from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
-    DFlashSpecDecodeCompilePolicyMixin,
-)
-from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
-    Eagle3SpecDecodeCompilePolicyMixin,
-)
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
-from sglang_tpu.experimental import (
-    is_experimental_chain,
-    is_experimental_spec_worker,
-)
-from sglang_tpu.experimental.compilation.block_compile_policy import (
-    TpuBlockSpecDecodeCompilePolicyMixin,
-)
-from sglang_tpu.experimental.compilation.chain_compile_policy import (
-    TpuChainSpecDecodeCompilePolicyMixin,
-)
+from sglang_tpu.spec_execution import resolve_spec_execution
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -76,39 +61,26 @@ if TYPE_CHECKING:
 
 
 def _spec_enabled(model_runner: ModelRunner) -> bool:
-    """Whether this runner uses speculative decoding on TPU."""
-    algo = model_runner.spec_algorithm
     return (
-        (algo.is_eagle() and not algo.is_frozen_kv_mtp())
-        or algo.is_dflash()
-        or (
-            algo.is_dspark()
-            and is_experimental_spec_worker(
-                algo, pp_size=resolving_view(model_runner.server_args).pp_size
-            )
-        )
+        resolve_spec_execution(
+            model_runner.spec_algorithm,
+            pp_size=resolving_view(model_runner.server_args).pp_size,
+        ).policy_path
+        is not None
     )
 
 
 def _resolve_spec_compile_policy_mixin(
     spec_algorithm: SpeculativeAlgorithm, *, pp_size: int
-) -> type[BaseSpecDecodeCompilePolicyMixin]:
-    """Resolve speculative compile policy mixin class based on algorithm."""
-    # Checked first: the experimental workers also serve DFLASH, MTP and EAGLE3.
-    if is_experimental_chain(spec_algorithm, pp_size=pp_size):
-        return TpuChainSpecDecodeCompilePolicyMixin
-    if is_experimental_spec_worker(spec_algorithm, pp_size=pp_size):
-        return TpuBlockSpecDecodeCompilePolicyMixin
-    if spec_algorithm.is_dflash():
-        return DFlashSpecDecodeCompilePolicyMixin
-    return Eagle3SpecDecodeCompilePolicyMixin
+) -> type[BaseSpecDecodeCompilePolicyMixin] | None:
+    return resolve_spec_execution(
+        spec_algorithm, pp_size=pp_size
+    ).compile_policy_mixin()
 
 
 def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
     """Compose speculative decoding compile behavior over a decoder policy."""
-    if not _spec_enabled(model_runner) or not issubclass(
-        policy_cls, DecoderCompilePolicy
-    ):
+    if not issubclass(policy_cls, DecoderCompilePolicy):
         return policy_cls
     if issubclass(policy_cls, BaseSpecDecodeCompilePolicyMixin):
         return policy_cls
@@ -119,6 +91,8 @@ def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
         model_runner.spec_algorithm,
         pp_size=resolving_view(model_runner.server_args).pp_size,
     )
+    if spec_mixin_cls is None:
+        return policy_cls
     return type(f"Spec{policy_cls.__name__}", (spec_mixin_cls, policy_cls), {})
 
 
@@ -171,7 +145,7 @@ class TpuGraphRunner:
     capture_bs: tuple[int, ...] = ()
 
     def __init__(self, model_runner: ModelRunner) -> None:
-        assert model_runner.server_args.enable_torch_compile, (
+        assert resolving_view(model_runner.server_args).enable_torch_compile, (
             "TpuGraphRunner should only be initialized when enable_torch_compile=True."
         )
 

@@ -4,14 +4,35 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.spec_execution import (  # noqa: F401 - retained public predicates
+    experimental_spec_enabled,
+    is_experimental_chain,
+    is_experimental_eagle3,
+    is_experimental_mtp,
+    is_experimental_spec,
+    is_experimental_spec_worker,
+)
 
 # (host req_pool_indices [bs], host draft hidden [bs, H]) -> None.
 PdCarrySeeder = Callable[[torch.Tensor, torch.Tensor], None]
 
 _host_batch_padder: Callable[[int], int] | None = None
 _pd_carry_seeder: PdCarrySeeder | None = None
+_plugin_block_draft_sampling = False
+
+
+def use_plugin_block_draft_sampling() -> None:
+    """Route the DFlash-family draft graph's sampling to the plugin sampler.
+
+    TpuBlockSpecWorker calls this before it builds its draft model, so every
+    trace of that graph reads a decision already made rather than resolving one.
+    """
+    global _plugin_block_draft_sampling
+    _plugin_block_draft_sampling = True
+
+
+def plugin_block_draft_sampling() -> bool:
+    return _plugin_block_draft_sampling
 
 
 def register_host_batch_padder(padder: Callable[[int], int]) -> None:
@@ -41,51 +62,3 @@ def uses_host_batch(batch) -> bool:
 def get_host_batch_padder() -> Callable[[int], int] | None:
     """The TpuSpecWorker's batch bucketing, or None when no TpuSpecWorker serves this process."""
     return _host_batch_padder
-
-
-def experimental_spec_enabled() -> bool:
-    """Either flag opts in: host-staged metadata without a D2H copy is what this worker serves."""
-    return (
-        tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.get()
-        or tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get()
-    )
-
-
-def is_experimental_spec_worker(
-    spec_algorithm: SpeculativeAlgorithm, *, pp_size=1
-) -> bool:
-    """Whether DFLASH/DSPARK is served by sglang_tpu.experimental.TpuBlockSpecWorker."""
-    return (
-        pp_size == 1
-        and spec_algorithm.is_dflash_family()
-        and experimental_spec_enabled()
-    )
-
-
-def is_experimental_mtp(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
-    """Whether MTP is served by sglang_tpu.experimental.TpuChainSpecWorker."""
-    # Core resolves NEXTN (MTP) to EAGLE; exact, since is_eagle() also matches EAGLE3.
-    return (
-        pp_size == 1
-        and spec_algorithm == SpeculativeAlgorithm.EAGLE
-        and experimental_spec_enabled()
-    )
-
-
-def is_experimental_eagle3(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
-    """Whether EAGLE3 is served by sglang_tpu.experimental.TpuChainSpecWorker."""
-    return pp_size == 1 and spec_algorithm.is_eagle3() and experimental_spec_enabled()
-
-
-def is_experimental_chain(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
-    """Whether TpuChainSpecWorker serves this algorithm (MTP or EAGLE3)."""
-    return is_experimental_mtp(
-        spec_algorithm, pp_size=pp_size
-    ) or is_experimental_eagle3(spec_algorithm, pp_size=pp_size)
-
-
-def is_experimental_spec(spec_algorithm: SpeculativeAlgorithm, *, pp_size=1) -> bool:
-    """Whether a TpuSpecWorker serves this algorithm (host-padded batches)."""
-    return is_experimental_spec_worker(
-        spec_algorithm, pp_size=pp_size
-    ) or is_experimental_chain(spec_algorithm, pp_size=pp_size)
