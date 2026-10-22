@@ -83,9 +83,9 @@ def kv_layout_mismatch_reason(
         return None
     return (
         f"KV layout mismatch: prefill uses {remote}, decode uses {local}; set "
-        "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV and the attention backend identically "
-        "on both (a prefill without kv_layout in its bootstrap info is "
-        f"{TOKEN_MAJOR_KV_LAYOUT})"
+        "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV, SGLANG_TPU_KV_PACK_HEADS and the "
+        "attention backend identically on both (a prefill without kv_layout in "
+        f"its bootstrap info is {TOKEN_MAJOR_KV_LAYOUT})"
     )
 
 
@@ -115,6 +115,8 @@ class RaidenKVCacheGroups:
     swa_head_nums: List[int] = field(default_factory=list)
     # Pools are TpuSeqAlongLaneKVPool (head-major, tokens on lanes).
     seq_along_lane: bool = False
+    # Most heads any pool stores side by side in one row (kv_pack_heads).
+    kv_pack_heads: int = 1
 
 
 def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
@@ -255,6 +257,15 @@ def get_raiden_kv_caches(
         full_heads.extend(draft_groups.full_head_nums)
         swa_heads.extend(draft_groups.swa_head_nums)
         seq_along_lane = seq_along_lane or draft_groups.seq_along_lane
+    packs = [
+        getattr(p, "kv_pack_heads", 1)
+        for top in (pool, draft_pool)
+        for p in (
+            top,
+            *(getattr(top, a, None) for a in ("full_kv_pool", "swa_kv_pool")),
+        )
+    ]
+    kv_pack_heads = max([1, *(p for p in packs if isinstance(p, int))])
 
     state: List[torch.Tensor] = []
     state_type = StateType.MAMBA
@@ -302,4 +313,5 @@ def get_raiden_kv_caches(
         full_head_nums=full_heads,
         swa_head_nums=swa_heads,
         seq_along_lane=seq_along_lane,
+        kv_pack_heads=kv_pack_heads,
     )

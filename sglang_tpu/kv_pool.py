@@ -253,6 +253,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                 raise NotImplementedError("packed KV heads need v_head_dim == head_dim")
             self.head_num, self.head_dim = 1, self.head_num * self.head_dim
             self.v_head_dim = self.head_dim
+            # A P/D layout of its own (see TpuSeqAlongLaneKVPool): a page holds
+            # other bytes than an unpacked pool's, even where the shapes match.
+            self.disagg_kv_layout = f"token_major_pack{self.kv_pack_heads}"
         if self.v_head_dim > self.head_dim:
             raise NotImplementedError(
                 "TpuFusedMHATokenToKVPool supports v_head_dim <= head_dim "

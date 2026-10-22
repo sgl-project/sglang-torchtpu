@@ -3188,6 +3188,42 @@ class TestKVLayoutCompatibility(unittest.TestCase):
                     recv.send_metadata(np.asarray([1], dtype=np.int32))
                     mgr.register_decode_request.assert_not_called()
 
+    def _pool_layout(self, dtype, pack):
+        from sglang.srt.disaggregation.utils import get_kv_layout
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        with tpu_envs.SGLANG_TPU_KV_PACK_HEADS.override(pack):
+            pool = TpuFusedMHATokenToKVPool(
+                size=128, page_size=16, dtype=dtype, head_num=2, head_dim=64,
+                layer_num=1, device="cpu", enable_memory_saver=False,
+            )  # fmt: skip
+        return pool.get_fused_kv_buffer(0).shape, get_kv_layout(pool)
+
+    def test_kv_pack_heads_on_one_side_is_refused(self):
+        """SGLANG_TPU_KV_PACK_HEADS on one side only, equal attention TP: a
+        page copy would mix head layouts (fp8 shapes even match)."""
+        import torch
+
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            packed_shape, packed = self._pool_layout(dtype, True)
+            plain_shape, plain = self._pool_layout(dtype, False)
+            self.assertEqual(packed, "token_major_pack2")
+            self.assertIsNone(plain)
+            if dtype is torch.float8_e4m3fn:
+                self.assertEqual(packed_shape, plain_shape)
+            for local, remote in ((packed, plain), (plain, packed)):
+                mgr, recv, abort = self._init(local, remote)
+                self.assertEqual(recv.poll(), KVPoll.Failed)
+                abort.assert_called_once()
+                with self.assertRaises(Exception) as cm:
+                    recv.failure_exception()
+                self.assertIn("SGLANG_TPU_KV_PACK_HEADS", str(cm.exception))
+            # Both sides packed: identical pages, the pull stays allowed.
+            mgr, recv, abort = self._init(packed, packed)
+            self.assertIsNone(recv.conclude_state)
+            abort.assert_not_called()
+
     def test_failed_common_init_is_left_alone(self):
         mgr = _decode_manager_stub(kv_args=SimpleNamespace(kv_layout=SEQ))
         recv = _receiver(mgr)
@@ -3202,6 +3238,25 @@ class TestKVLayoutCompatibility(unittest.TestCase):
         ):
             recv.init(0)
         self.assertEqual(mgr.failure_records[ROOM], "prefill down")
+
+
+class TestPipelinePackedHeads(unittest.TestCase):
+    """The pipeline's head slicing models a packed row as one head."""
+
+    def _register(self, pack, dst_attn_tp):
+        transfer = object.__new__(PipelineTransfer)
+        transfer.manager = SimpleNamespace(_kv_pack_heads=pack, attn_tp_size=1)
+        transfer.replies = {ROOM: {0: {"attn_tp_size": dst_attn_tp}}}
+        transfer._fail_room = Mock()
+        ok = transfer._register_blocks(
+            ROOM, req_id="r", uuid=1, full=[0], swa=[], with_swa=False
+        )
+        return ok, transfer._fail_room
+
+    def test_packed_heads_with_other_decode_tp_fail_the_room(self):
+        ok, fail_room = self._register(pack=2, dst_attn_tp=2)
+        self.assertFalse(ok)
+        self.assertIn("SGLANG_TPU_KV_PACK_HEADS", fail_room.call_args[0][1])
 
 
 if __name__ == "__main__":
