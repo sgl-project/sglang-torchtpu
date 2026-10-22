@@ -177,6 +177,67 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIsNone(forwarded.penalizer_orchestrator)
         self.assertEqual(forwarded.on_device().temperatures.shape, (8, 1))
 
+    def test_logit_bias_follows_live_rows_through_filter_merge_and_larger_bucket(self):
+        batch = self.batch([2, 5, 8])
+        batch.reqs[0].sampling_params.logit_bias = {"1": 2.0}
+        batch.reqs[2].sampling_params.logit_bias = {"3": -4.0}
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 32)
+        # Host placement must follow parameter_device, even with a device-side batch.
+        device_batch = self.batch([1])
+        device_batch.reqs[0].sampling_params.logit_bias = {"1": 3.0}
+        device_batch.device = "meta"
+        host_info = SamplingBatchInfo.from_schedule_batch(device_batch, 32)
+        self.assertEqual(host_info.logit_bias.device.type, "cpu")
+        self.assertEqual(host_info.logit_bias[0, 1].item(), 3.0)
+
+        batch.filter_batch(keep_indices=[2, 0])
+        other = self.batch([3, 4, 6])
+        batch.merge_batch(other)
+        info = batch.sampling_info
+        expected = torch.zeros((8, 32))
+        expected[0, 3] = -4.0
+        expected[1, 1] = 2.0
+        self.assertEqual(info.logit_bias.shape, (5, 32))
+        torch.testing.assert_close(info.on_device().logit_bias, expected)
+        # A peer DP rank can enlarge the physical bucket independently of live bs.
+        torch.testing.assert_close(
+            info.device_logit_bias(16), torch.nn.functional.pad(expected, (0, 0, 0, 8))
+        )
+
+    def test_static_logit_bias_uploads_once_per_bucket_until_the_batch_changes(self):
+        batch = self.batch([2, 5, 8])
+        batch.reqs[0].sampling_params.logit_bias = {"1": 2.0}
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 32)
+        info = batch.sampling_info
+        first = info.device_logit_bias(4)
+        # Every forward runs on a copy of the scheduler's info.
+        self.assertIs(info.copy_for_forward().device_logit_bias(4), first)
+        self.assertIsNot(info.device_logit_bias(8), first)
+        self.assertIs(info.device_logit_bias(4), first)
+        batch.filter_batch(keep_indices=[1, 2])
+        refreshed = info.device_logit_bias(4)
+        self.assertIsNot(refreshed, first)
+        torch.testing.assert_close(refreshed, torch.zeros((4, 32)))
+
+    def test_prefill_preprocessing_adds_bias_at_the_bucket_rows(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        batch = self.batch([2, 5, 8])
+        batch.reqs[0].sampling_params.logit_bias = {"1": 2.0}
+        batch.reqs[2].sampling_params.logit_bias = {"3": -4.0}
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 32)
+        # Extend logits keep the batch bucket's rows; the bias holds live host rows.
+        logits = torch.zeros((4, 32))
+        ModelRunner._preprocess_logits(
+            None,
+            LogitsProcessorOutput(next_token_logits=logits),
+            batch.sampling_info.copy_for_forward(),
+        )
+        expected = torch.zeros((4, 32))
+        expected[0, 1] = 2.0
+        expected[2, 3] = -4.0
+        torch.testing.assert_close(logits, expected)
+
     def test_host_padding_follows_the_worker_not_the_algorithm(self):
         """Without a TpuSpecWorker (no registered padder) batches keep core's rows;
         with one, every algorithm's batches are host padded."""

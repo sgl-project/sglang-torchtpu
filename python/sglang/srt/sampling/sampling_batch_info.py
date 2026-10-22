@@ -177,9 +177,10 @@ class SamplingBatchInfo:
             else None
         )
 
+        bias_device = cls.parameter_device(batch)
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
-            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            logit_bias = torch.zeros(len(reqs), vocab_size, device=bias_device)
             rows, cols, vals = [], [], []
             for i, r in enumerate(reqs):
                 if r.sampling_params.logit_bias is not None:
@@ -195,10 +196,10 @@ class SamplingBatchInfo:
                         vals.append(value)
             if rows:
                 logit_bias[
-                    _rows_to_device_indices(rows, device, _pin),
-                    _rows_to_device_indices(cols, device, _pin),
+                    _rows_to_device_indices(rows, bias_device, _pin),
+                    _rows_to_device_indices(cols, bias_device, _pin),
                 ] = torch.tensor(vals, dtype=logit_bias.dtype, pin_memory=_pin).to(
-                    device, non_blocking=True
+                    bias_device, non_blocking=True
                 )
 
         # Check if any request has custom logit processor
@@ -482,7 +483,12 @@ class SamplingBatchInfo:
         self._filter_params(keep_indices, keep_indices_device)
 
         if self.logit_bias is not None:
-            self.logit_bias = self.logit_bias[keep_indices_device]
+            indices = (
+                keep_indices
+                if self.logit_bias.device.type == "cpu"
+                else keep_indices_device
+            )
+            self.logit_bias = self.logit_bias[indices]
         if self.return_sampling_masks is not None:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
@@ -563,8 +569,14 @@ class SamplingBatchInfo:
 
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).
+        bias = self.logit_bias if self.logit_bias is not None else other.logit_bias
         self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
+            self.logit_bias,
+            other.logit_bias,
+            self_len,
+            other_len,
+            bias.device if bias is not None else self.device,
+            0.0,
         )
         if (
             self.return_sampling_masks is not None

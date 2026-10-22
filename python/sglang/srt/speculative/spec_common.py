@@ -11,7 +11,7 @@ calling it. Each docstring names its trace class:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -27,10 +27,18 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
+class VerifyLogitModifiers(NamedTuple):
+    """Per-request logit transforms, independent of scheduler sampling state."""
+
+    acc_additive_penalties: torch.Tensor | None = None
+    acc_scaling_penalties: torch.Tensor | None = None
+    logit_bias: torch.Tensor | None = None
+
+
 def adjust_verify_logits(
     *,
     next_token_logits: torch.Tensor,
-    sampling_info: SamplingBatchInfo,
+    sampling_info: SamplingBatchInfo | VerifyLogitModifiers,
     draft_token_num: int,
 ) -> None:
     """Apply accumulated penalties and logit_bias to verify logits in place.
