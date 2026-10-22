@@ -3,15 +3,16 @@
 Kimi-K3's tower is MoonViT-shaped (interpolated position embedding, complex
 2-D RoPE, a 2x2 temporal-pool merger, then the projector), but run eagerly
 every stage takes a per-image-grid shape: a new grid compiled the patch
-embedding, the bicubic interpolation, the RoPE lookup, every encoder layer,
-the merger and the projector while serving.
+embedding, the position-embedding interpolation, the RoPE lookup, every
+encoder layer, the merger and the projector while serving.
 
 Like Qwen3-VL's ``ViTTpuCompileRunner``, everything grid-dependent is staged on
 the host, one image at a time, at a fixed patch bucket:
 
 * pixels, reordered so every 2x2 merge window is 4 consecutive rows;
-* the 16 bicubic taps and weights of each patch's position embedding
-  (``kimi_k25._bicubic_interp_axis``, which matches ``F.interpolate``);
+* 16 taps and weights of each patch's position embedding, matching the
+  tower's ``F.interpolate`` mode: bilinear (the checkpoint's) uses 4 of them,
+  bicubic (``kimi_k25._bicubic_interp_axis``) all 16;
 * the RoPE cos / sin of each patch's (row, column);
 * segment ids, padding in a trailing segment of its own.
 
@@ -21,8 +22,8 @@ gather, the encoder layers (segment-id Pallas attention, real-arithmetic RoPE),
 the merge (a reshape, thanks to the window order) and the projector. Its
 output is unpadded on the host, where the TPU embed merge wants it anyway.
 
-Video grids (t > 1) and images past the largest bucket keep the tower's own
-eager path.
+Video grids (t > 1), images past the largest bucket and towers with another
+interpolation mode keep the tower's own eager path.
 """
 
 from __future__ import annotations
@@ -30,12 +31,14 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import multimodal_encoder_runs_here
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     VisionTpuCompilePolicy,
     _compute_patch_counts,
@@ -81,6 +84,39 @@ def rotate_interleaved(
     return rotated.flatten(-2).type_as(x)
 
 
+def _bilinear_interp_axis(in_size: int, out_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """1D taps + weights of ``F.interpolate(mode="bilinear", align_corners=False)``.
+
+    Each output row blends the two source rows around its half-pixel source
+    coordinate, which aten clamps at 0 for linear modes; at the far edge both
+    taps are the last row. Two zero-weight slots give
+    ``kimi_k25._bicubic_interp_axis``'s ``[out_size, 4]`` layout, so both modes
+    stage the same 16 (h, w) taps.
+    """
+    scale = in_size / out_size
+    src = np.maximum((np.arange(out_size, dtype=np.float64) + 0.5) * scale - 0.5, 0)
+    lo = np.floor(src).astype(np.int64)
+    hi = np.minimum(lo + 1, in_size - 1)
+    frac = src - lo
+    taps = np.pad(np.stack([lo, hi], axis=1), ((0, 0), (0, 2)))
+    coeffs = np.pad(np.stack([1.0 - frac, frac], axis=1), ((0, 0), (0, 2)))
+    return taps, coeffs
+
+
+def _axis_taps_for(
+    mode: str,
+) -> Optional[Callable[[int, int], tuple[np.ndarray, np.ndarray]]]:
+    """The per-axis taps of the tower's position-embedding interpolation mode,
+    or None for a mode the runner does not reproduce."""
+    if mode == "bilinear":
+        return _bilinear_interp_axis
+    if mode == "bicubic":
+        from sglang.srt.models.kimi_k25 import _bicubic_interp_axis
+
+        return _bicubic_interp_axis
+    return None
+
+
 def merge_window_order(h: int, w: int) -> torch.Tensor:
     """Row-major patch indices of an ``h x w`` grid, regrouped so each 2x2
     merge window is 4 consecutive entries, windows in row-major order --
@@ -97,7 +133,7 @@ class StagedImage:
 
     pixels: torch.Tensor  # [B, 3 * p * p]
     pos_idx: torch.Tensor  # [B, 16] int32 into the flattened pos-embed grid
-    pos_weight: torch.Tensor  # [B, 16] float32 bicubic weights (0 on padding)
+    pos_weight: torch.Tensor  # [B, 16] float32 interpolation weights (0 on padding)
     cos: torch.Tensor  # [B, head_dim/2]
     sin: torch.Tensor  # [B, head_dim/2]
     segment_ids: torch.Tensor  # [1, B] int32
@@ -156,6 +192,9 @@ class KimiK3VitTpuCompileRunner:
             self.tower is not None
             and self.projector is not None
             and tuple(self.tower.merge_kernel_size) == (_MERGE_SIZE, _MERGE_SIZE)
+            # Any other mode keeps the tower's own eager interpolation.
+            and _axis_taps_for(self.tower.patch_embed.pos_emb.interpolation_mode)
+            is not None
             and all(
                 getattr(attention, "supports_segment_ids", False)
                 for attention in self.attention
@@ -219,8 +258,6 @@ class KimiK3VitTpuCompileRunner:
 
     def stage(self, pixels: torch.Tensor, h: int, w: int, bucket: int) -> StagedImage:
         """Host inputs of one single-frame ``h x w`` image padded to ``bucket``."""
-        from sglang.srt.models.kimi_k25 import _bicubic_interp_axis
-
         real = h * w
         if real > bucket or h % _MERGE_SIZE or w % _MERGE_SIZE:
             raise ValueError(f"cannot stage a {h}x{w} grid into a {bucket} bucket")
@@ -233,8 +270,9 @@ class KimiK3VitTpuCompileRunner:
 
         pos_emb = self.tower.patch_embed.pos_emb
         src_h, src_w = pos_emb.weight.shape[:2]
-        taps_h, coeffs_h = _bicubic_interp_axis(src_h, h)
-        taps_w, coeffs_w = _bicubic_interp_axis(src_w, w)
+        axis_taps = _axis_taps_for(pos_emb.interpolation_mode)
+        taps_h, coeffs_h = axis_taps(src_h, h)
+        taps_w, coeffs_w = axis_taps(src_w, w)
         taps_h = torch.from_numpy(taps_h)[rows]  # [real, 4]
         taps_w = torch.from_numpy(taps_w)[cols]
         coeffs_h = torch.from_numpy(coeffs_h)[rows]
@@ -305,7 +343,13 @@ class KimiK3VisionTpuCompilePolicy(VisionTpuCompilePolicy):
         self._warned_oversize: set[int] = set()
 
     def _runner_ready_for_compile(self, runner: Any) -> bool:
-        return bool(getattr(runner, "ready", False))
+        # PD decode, language-only and LM-only servers never forward the tower,
+        # nor does one with multimodal input off; they skip the bucket ladder.
+        return (
+            self.model_runner.model_config.is_multimodal
+            and multimodal_encoder_runs_here()
+            and bool(getattr(runner, "ready", False))
+        )
 
     def compute_patch_buckets(self) -> list[int]:
         return patch_buckets()
