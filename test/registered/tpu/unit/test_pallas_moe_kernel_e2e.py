@@ -243,8 +243,8 @@ class TestPallasFusedMoEEager(unittest.TestCase):
 
         The other tests in this file hand kernel-layout ``(g, k, n)``
         weights straight to ``fused_moe_call`` and so bypass the
-        ``UnquantizedFusedMoEMethod.process_weights_after_loading`` TPU
-        branch entirely. That leaves two silent regression classes
+        ``TpuUnquantizedFusedMoEMethod.process_weights_after_loading``
+        weight preparation entirely. That leaves two silent regression classes
         uncovered:
 
           * A broken transpose in ``process_weights_after_loading``
@@ -261,10 +261,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         and compare to the same CPU reference the other tests use. A single
         numeric mismatch catches either drift.
         """
-        from sglang.srt.layers.quantization import unquant
-        from sglang.srt.layers.quantization.unquant import (
-            UnquantizedFusedMoEMethod,
-        )
+        from sglang_tpu.quantization.moe import TpuUnquantizedFusedMoEMethod
 
         m, k, n, g, topk = 32, 128, 128, 4, 2
 
@@ -282,19 +279,10 @@ class TestPallasFusedMoEEager(unittest.TestCase):
             torch.randn(m, topk, device=self.device).float(), dim=-1
         ).to(self.dtype)
 
-        # _is_tpu is True under the TPU runtime that gates this whole
-        # class. Assert the precondition so a host where it drifts to
-        # False fails loudly instead of silently exercising a non-TPU
-        # branch.
-        self.assertTrue(
-            unquant._is_tpu,
-            "unquant._is_tpu must be True under the TPU runtime",
-        )
-
         layer = torch.nn.Module()
         layer.w13_weight = torch.nn.Parameter(w13_sglang, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_sglang, requires_grad=False)
-        UnquantizedFusedMoEMethod().process_weights_after_loading(layer)
+        TpuUnquantizedFusedMoEMethod().process_weights_after_loading(layer)
 
         # Cheap CPU pin: the hook must recover gmm_v2 layout exactly.
         torch.testing.assert_close(layer.w13_weight.data, w1_gmm)

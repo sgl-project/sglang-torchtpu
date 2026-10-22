@@ -232,6 +232,9 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
+
+        _build_fused_moe_op()
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if not (

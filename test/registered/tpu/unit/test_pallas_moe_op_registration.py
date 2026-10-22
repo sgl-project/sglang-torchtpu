@@ -2,7 +2,7 @@
 
 Parallel to :mod:`test.manual.tpu.test_pallas_rpa_v3_dispatch` for the
 attention backend -- this file pins the TPU-specific dispatch glue
-that turns ``UnquantizedFusedMoEMethod.forward_tpu`` into a usable
+that turns ``TpuUnquantizedFusedMoEMethod.forward_tpu`` into a usable
 torch op.
 
 The behaviour being guarded here:
@@ -52,7 +52,7 @@ _SKIP_REASON = "Requires torch_tpu + JAX with a TPU backend visible to jax.devic
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestPallasMoeOpRegistration(CustomTestCase):
     """The fused-MoE custom op must be registered under the expected
-    qualified name so ``UnquantizedFusedMoEMethod.forward_tpu``'s call to
+    qualified name so ``TpuUnquantizedFusedMoEMethod.forward_tpu``'s call to
     ``fused_moe_call`` reaches the right kernel. A typo or namespace
     drift here would silently produce a separate, unregistered op."""
 

@@ -73,6 +73,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.plugins.oot_classes import oot_base_class
 from sglang.srt.runtime_context import (
     get_exec,
     get_global_dwdp_manager,
@@ -86,7 +87,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
-    is_tpu,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -95,7 +95,6 @@ _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 # Log the deferred-finalize config at most once per process (rank). Different MoE
@@ -530,15 +529,6 @@ class FusedMoE(torch.nn.Module):
                 f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
                 f"quant_method={type(self.quant_method).__name__})."
             )
-
-        # The fused-MoE Pallas op is a MoE-layer concern (every quant method's
-        # TPU path calls it), so register it once here at construction -- before
-        # torch.compile traces the model -- rather than in each quant method.
-        # Mirrors the RPA v3 attention backend.
-        if _is_tpu:
-            from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
-
-            _build_fused_moe_op()
 
         self.quant_method.create_weights(
             layer=self,
@@ -1219,12 +1209,11 @@ class FusedMoE(torch.nn.Module):
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
-                method.__class__.__name__
+                oot_base_class(type(method)).__name__
                 in [
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
-                    "TpuCompressedTensorsWNA16MoE",
                 ]
             )
             and "zero" not in weight_name
@@ -1471,11 +1460,10 @@ class FusedMoE(torch.nn.Module):
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
-                method.__class__.__name__
+                oot_base_class(type(method)).__name__
                 in [
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
-                    "TpuCompressedTensorsWNA16MoE",
                 ]
             )
             and "zero" not in weight_name

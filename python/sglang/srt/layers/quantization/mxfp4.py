@@ -54,7 +54,6 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
-    is_tpu,
     is_triton_kernels_available,
     is_xpu,
     round_up,
@@ -442,6 +441,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "or SM120."
                 )
 
+    def _get_intermediate_size_after_pad(self, size: int) -> int:
+        return size
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -550,9 +552,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, triton_kernels_padding_alignment
             )
-        elif is_tpu():
-            intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, mxfp4_block
+        else:
+            intermediate_size_per_partition_after_pad = (
+                self._get_intermediate_size_after_pad(intermediate_size_per_partition)
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
@@ -736,13 +738,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
         if self._fi_kernel == "cutlass_sm120":
             self._process_weights_for_sm120_cutlass(layer)
-            return
-        if is_tpu():
-            from sglang.srt.layers.quantization.mxfp4_tpu_util import (
-                prepare_tpu_mxfp4_moe_weights,
-            )
-
-            prepare_tpu_mxfp4_moe_weights(layer, with_bias=self.with_bias)
             return
         if self.use_flashinfer:
             # Per-expert buffers are local (create_weights uses num_local_experts);
@@ -1451,10 +1446,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # MegaMoE uses this method for weight preparation only and calls
             # DeepGEMM directly instead of dispatching through a MoeRunner.
             return
-        if moe_runner_backend.is_pallas_tpu():
-            # TPU dispatches directly through UnquantizedFusedMoEMethod.forward_tpu
-            # in apply(), so there is no generic MoeRunner to construct here.
-            return
 
         if moe_runner_backend.is_auto():
             # Must match apply() priority: _use_aiter before use_triton_kernels.
@@ -1614,22 +1605,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             StandardCombineInput,
         )
         from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-        # TODO(qinghan): once the packed-FP4 fast path lands, gate this on a
-        # config flag instead of unconditionally taking the BF16 triage path.
-        if is_tpu():
-            from sglang.srt.layers.quantization.unquant import (
-                UnquantizedFusedMoEMethod,
-            )
-
-            # Scales are None on the BF16 path, packed-FP4 block scales otherwise.
-            return UnquantizedFusedMoEMethod.forward_tpu(
-                self,
-                layer,
-                dispatch_output,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-            )
 
         if self.use_deep_gemm:
             # Handles standard AND deepep_ll/deepep_normal dispatch formats via

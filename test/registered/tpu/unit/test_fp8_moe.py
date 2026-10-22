@@ -7,16 +7,15 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-import sglang.srt.layers.quantization.fp8 as fp8_mod
 import sglang_tpu.fp8_moe as tpu_fp8_moe
 import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op_module
-from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.moe.pallas.fused_moe_op import (
     _build_fused_moe_op,
     fused_moe_call,
 )
+from sglang_tpu.quantization.moe import TpuFp8MoEMethod
 
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -147,7 +146,7 @@ class TestTpuFp8MoE(CustomTestCase):
         self.assertEqual(tuple(layer.w2_weight_scale.shape), (2, 1, 1, 4))
 
     def test_fp8_moe_method_routes_to_tpu_fused_moe_call(self):
-        method = object.__new__(Fp8MoEMethod)
+        method = object.__new__(TpuFp8MoEMethod)
         method.moe_runner_config = SimpleNamespace(
             activation="silu",
             apply_router_weight_on_input=False,
@@ -170,7 +169,6 @@ class TestTpuFp8MoE(CustomTestCase):
             topk_output=(topk_weights, topk_ids, None),
         )
         with (
-            patch.object(fp8_mod, "_is_tpu", True),
             # Single-rank EP: no distributed process group in a unit test.
             patch.object(
                 tpu_fp8_moe,
@@ -210,7 +208,7 @@ class TestTpuFp8MoE(CustomTestCase):
         """EP enabled (world size 4, rank 2): the FP8 caller must compute
         global_num_experts / expert_group_offset from the layer's local
         expert count and forward them."""
-        method = object.__new__(Fp8MoEMethod)
+        method = object.__new__(TpuFp8MoEMethod)
         method.moe_runner_config = SimpleNamespace(
             activation="silu",
             apply_router_weight_on_input=False,
@@ -236,7 +234,6 @@ class TestTpuFp8MoE(CustomTestCase):
         )
 
         with (
-            patch.object(fp8_mod, "_is_tpu", True),
             patch.object(
                 tpu_fp8_moe,
                 "get_parallel",
@@ -266,7 +263,7 @@ class TestTpuFp8MoE(CustomTestCase):
     def test_fp8_moe_forwards_swiglu_limit_as_clamped_activation(self):
         """A checkpoint's swiglu_limit must reach the kernel as a clamped
         activation; dropping it runs the experts unclamped with no error."""
-        method = object.__new__(Fp8MoEMethod)
+        method = object.__new__(TpuFp8MoEMethod)
         method.moe_runner_config = SimpleNamespace(
             activation="silu",
             apply_router_weight_on_input=False,
@@ -291,7 +288,6 @@ class TestTpuFp8MoE(CustomTestCase):
             ),
         )
         with (
-            patch.object(fp8_mod, "_is_tpu", True),
             patch.object(
                 tpu_fp8_moe,
                 "get_parallel",

@@ -9,9 +9,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.quantization.moe import TpuUnquantizedFusedMoEMethod
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -181,14 +181,14 @@ class TestUnquantGlobalRouting(CustomTestCase):
                         call = bridge.fused_moe_call = Mock(side_effect=kernel)
                         with (
                             patch(
-                                "sglang.srt.layers.quantization.unquant.get_parallel",
+                                "sglang_tpu.quantization.moe.get_parallel",
                                 return_value=SimpleNamespace(
                                     moe_ep_size=ep_size, moe_ep_rank=rank
                                 ),
                             ),
                             patch.dict(sys.modules, {module_name: bridge}),
                         ):
-                            output = UnquantizedFusedMoEMethod.forward_tpu(
+                            output = TpuUnquantizedFusedMoEMethod.forward_tpu(
                                 method, layer, dispatch
                             ).hidden_states
                         self.assertEqual(

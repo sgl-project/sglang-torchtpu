@@ -1064,6 +1064,10 @@ class TpuSRTPlatform(SRTPlatform):
     def get_quantization_config(
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
+        if quantization == "compressed-tensors":
+            from sglang_tpu.quantization.moe import TpuCompressedTensorsConfig
+
+            return TpuCompressedTensorsConfig
         if quantization == "modelopt_fp4":
             from sglang_tpu.quantization.modelopt_fp4 import (
                 TpuModelOptCompatibleFp4Config,
@@ -1379,6 +1383,9 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.quantization.dense_fp8 import register_dense_fp8_methods
 
         register_dense_fp8_methods()
+        from sglang_tpu.quantization.moe import register_moe_quantization_methods
+
+        register_moe_quantization_methods()
         from sglang_tpu.envs import envs as tpu_envs
 
         if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():

@@ -80,8 +80,8 @@ _PALLAS_MOE_OP = None
 #
 # JAX is imported inside each function body, not at module scope, so importing
 # ``fused_moe_op`` on a non-TPU host stays cheap (the only inbound paths to
-# this module are TPU-only: ``UnquantizedFusedMoEMethod.forward_tpu`` and the
-# op registration in ``FusedMoE.__init__``, which is gated on ``_is_tpu``).
+# this module are TPU-only: ``TpuUnquantizedFusedMoEMethod.forward_tpu`` and the
+# op registration in the plugin MoE methods' ``create_moe_runner``).
 
 
 def _padded_token_count(m: int, topk: int, sublane: int) -> int:
@@ -1002,8 +1002,8 @@ def _build_fused_moe_op():
 
     Mirrors ``_build_pallas_kernel_op`` in attention_pallas_rpa_v3.py — registration
     is heavy (``inspect.signature`` on a JAX function + JAX export) and
-    cannot run inside a dynamo trace, so ``FusedMoE.__init__``
-    (fused_moe_triton/layer.py) calls this eagerly at layer construction,
+    cannot run inside a dynamo trace, so plugin MoE methods call this from
+    ``create_moe_runner`` during layer construction,
     before torch.compile traces the model. The model code path just looks
     up the op cached in ``_PALLAS_MOE_OP``.
     """

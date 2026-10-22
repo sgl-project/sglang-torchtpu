@@ -1331,6 +1331,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 "sglang_tpu.fp4_moe.prepare_tpu_nvfp4_moe_weights",
                 _fake_prepare,
             ),
+            mock.patch("sglang_tpu.moe.pallas.fused_moe_op._build_fused_moe_op"),
         ):
             method = modelopt_fp4.TpuModelOptNvFp4FusedMoEMethod(config)
             method.create_moe_runner(layer, moe_runner_config)

@@ -105,7 +105,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
-    is_tpu,
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
@@ -127,7 +126,6 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_is_tpu = is_tpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 
@@ -149,21 +147,6 @@ _is_gfx1250_supported = is_gfx1250_supported()
 # gfx1250 grouped MoE runs the a8w4 (fp8 activation) FlyDSL kernel when
 # AITER_FORCE_A8W4 is set; that kernel consumes (16,16)-preshuffled weights.
 _use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
-
-
-def _scaled_fp8_quant_tpu_weight(
-    weight: torch.Tensor, scale: Optional[torch.Tensor] = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-tensor FP8 quantization fallback for TPU weight post-processing."""
-    fp8_max = torch.finfo(fp8_dtype).max
-    device = weight.device
-    weight = weight.detach().cpu()
-    if scale is None:
-        scale = weight.abs().max().to(torch.float32).clamp(min=1e-12) / fp8_max
-    else:
-        scale = scale.detach().cpu().to(torch.float32)
-    qweight = (weight / scale).clamp(min=-fp8_max, max=fp8_max).to(fp8_dtype)
-    return qweight.to(device), scale.to(device)
 
 
 def _require_fp4_dtype():
@@ -2148,7 +2131,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
-                if _is_tpu:
+                if self.keep_fp4_weights_packed:
                     return
                 if _is_npu:
                     self._process_npu_fp4_expert_weights(layer)
@@ -2542,8 +2525,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
+    keep_fp4_weights_packed = False
+
+    def _quantize_weight(self, weight, scale=None):
+        return scaled_fp8_quant(weight, scale)
+
+    def _prepare_weights_for_backend(self, layer: Module) -> None:
+        pass
+
     def process_weights_after_loading(self, layer: Module) -> None:
-        quant_fn = _scaled_fp8_quant_tpu_weight if _is_tpu else scaled_fp8_quant
+        quant_fn = self._quantize_weight
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
@@ -2676,43 +2667,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
-        if _is_tpu:
-            from sglang_tpu.fp8_moe import (
-                prepare_tpu_fp8_moe_weights,
-            )
-
-            prepare_tpu_fp8_moe_weights(
-                layer,
-                block_quant=self.block_quant,
-                weight_block_size=self.quant_config.weight_block_size,
-                use_mxfp8=self.use_mxfp8,
-                is_fp4_expert=self.is_fp4_expert,
-            )
-            moe_runner_backend = get_moe_runner_backend()
-            if (
-                moe_runner_backend.is_auto()
-                or moe_runner_backend.is_pallas_tpu_fused_rs()
-            ):
-                from sglang_tpu.fp8_moe_fused_rs import (
-                    prepare_fp8_fused_rs,
-                )
-
-                self.handles_moe_reduction = prepare_fp8_fused_rs(layer)
-                if self.handles_moe_reduction and get_parallel().tp_rank == 0:
-                    logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
-                if (
-                    moe_runner_backend.is_pallas_tpu_fused_rs()
-                    and not self.handles_moe_reduction
-                ):
-                    reason = getattr(
-                        layer,
-                        "_tpu_fused_rs_unsupported_reason",
-                        "unknown incompatibility",
-                    )
-                    raise ValueError(
-                        "--moe-runner-backend pallas_tpu_fused_rs is not supported by "
-                        f"this model or parallel layout: {reason}"
-                    )
+        self._prepare_weights_for_backend(layer)
 
         # The runner backend is global, so it is also true for a borrowed delegate,
         # which has no moe_runner_config and whose kernel ignores these params.
@@ -2938,7 +2893,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif (
             moe_runner_backend.is_pallas_tpu()
             or moe_runner_backend.is_pallas_tpu_fused_rs()
-        ) and not _is_tpu:
+        ):
             raise ValueError(f"{moe_runner_backend.value} is only available on TPU")
 
         if (
@@ -3048,29 +3003,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
 
-        if _is_tpu:
-            if self.handles_moe_reduction:
-                from sglang_tpu.fp8_moe_fused_rs import (
-                    apply_fp8_fused_rs,
-                )
-
-                return apply_fp8_fused_rs(
-                    layer=layer,
-                    dispatch_output=dispatch_output,
-                    activation=moe_runner_config.activation,
-                    swiglu_limit=moe_runner_config.swiglu_limit,
-                )
-            from sglang_tpu.fp8_moe import apply_tpu_fp8_moe
-
-            return apply_tpu_fp8_moe(
-                layer=layer,
-                dispatch_output=dispatch_output,
-                activation=moe_runner_config.activation,
-                block_quant=self.block_quant,
-                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
-                no_combine=moe_runner_config.no_combine,
-                swiglu_limit=moe_runner_config.swiglu_limit,
-            )
         if _is_npu and self.is_fp4_expert:
             from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 

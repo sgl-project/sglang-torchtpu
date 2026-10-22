@@ -31,9 +31,10 @@ import torch
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.quantization.moe import TpuUnquantizedFusedMoEMethod
 
 
-class _MethodWithFakeRunnerConfig(UnquantizedFusedMoEMethod):
+class _MethodWithFakeRunnerConfig(TpuUnquantizedFusedMoEMethod):
     """``UnquantizedFusedMoEMethod`` with an injected ``moe_runner_config``.
 
     The real method gets its config via ``create_moe_runner`` during full
@@ -59,7 +60,7 @@ class _MethodWithFakeRunnerConfig(UnquantizedFusedMoEMethod):
 
 
 class _MoeMockRunner:
-    """Test harness ("mock runner") for ``UnquantizedFusedMoEMethod.forward_tpu``.
+    """Test harness ("mock runner") for ``TpuUnquantizedFusedMoEMethod.forward_tpu``.
 
     Encapsulates the setup that every forward_tpu test shares:
 
@@ -244,7 +245,7 @@ class _MoeMockRunner:
         """Direct ``method.forward_tpu(layer, d_out)`` call."""
         # Single-rank EP: no distributed process group in a unit test.
         with patch(
-            "sglang.srt.layers.quantization.unquant.get_parallel",
+            "sglang_tpu.quantization.moe.get_parallel",
             lambda: SimpleNamespace(moe_ep_rank=0, moe_ep_size=1),
         ):
             return self.method.forward_tpu(layer, d_out)
@@ -256,7 +257,7 @@ class _MoeMockRunner:
         the dispatch -> forward_tpu chain.
         """
         with patch(
-            "sglang.srt.layers.quantization.unquant.get_parallel",
+            "sglang_tpu.quantization.moe.get_parallel",
             lambda: SimpleNamespace(moe_ep_rank=0, moe_ep_size=1),
         ):
             return self.method.forward(layer, d_out)
@@ -292,8 +293,6 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
     """
 
     def test_tpu_branch_swaps_to_gmm_v2_layout(self):
-        from sglang.srt.layers.quantization import unquant
-
         torch.manual_seed(0)
         # SGLang layout, w13 (g, 2*inter, hidden) and w2 (g, hidden, inter);
         # inter = 128 is already lane-aligned, so no padding.
@@ -304,10 +303,7 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
         layer.w13_weight = torch.nn.Parameter(sglang_w13.clone(), requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(sglang_w2.clone(), requires_grad=False)
 
-        # The TPU branch is gated on the module-level ``_is_tpu`` flag;
-        # patch it so the test runs on any host.
-        with patch.object(unquant, "_is_tpu", True):
-            UnquantizedFusedMoEMethod().process_weights_after_loading(layer)
+        TpuUnquantizedFusedMoEMethod().process_weights_after_loading(layer)
 
         # gmm_v2 layout: (g, k, n) for both w1 and w2.
         # w13: (g, hidden, 2*intermediate);  w2: (g, intermediate, hidden).
@@ -335,8 +331,6 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
         its intermediate axis. Zero rows contribute act(0) * 0 = 0, so the
         result is exact; a pad applied to the wrong axis or half is not.
         """
-        from sglang.srt.layers.quantization import unquant
-
         torch.manual_seed(0)
         inter, hidden, g = 64, 32, 4
         sglang_w13 = torch.randn(g, 2 * inter, hidden, dtype=torch.bfloat16)
@@ -346,8 +340,7 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
         layer.w13_weight = torch.nn.Parameter(sglang_w13.clone(), requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(sglang_w2.clone(), requires_grad=False)
 
-        with patch.object(unquant, "_is_tpu", True):
-            UnquantizedFusedMoEMethod().process_weights_after_loading(layer)
+        TpuUnquantizedFusedMoEMethod().process_weights_after_loading(layer)
 
         padded = 128
         w13, w2 = layer.w13_weight.data, layer.w2_weight.data
@@ -364,11 +357,9 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
         self.assertTrue(w13.is_contiguous() and w2.is_contiguous())
 
     def test_no_swap_when_not_on_tpu(self):
-        """The layout swap is platform-specific. With ``_is_tpu=False``
+        """The layout swap belongs to the plugin subclass. The shared method
         the hook must not modify the weights -- a regression that
         always swapped would silently break the CUDA / CPU paths."""
-        from sglang.srt.layers.quantization import unquant
-
         torch.manual_seed(1)
         sglang_w13 = torch.randn(4, 128, 32, dtype=torch.bfloat16)
         sglang_w2 = torch.randn(4, 32, 64, dtype=torch.bfloat16)
@@ -377,8 +368,7 @@ class TestProcessWeightsAfterLoading(CustomTestCase):
         layer.w13_weight = torch.nn.Parameter(sglang_w13.clone(), requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(sglang_w2.clone(), requires_grad=False)
 
-        with patch.object(unquant, "_is_tpu", False):
-            UnquantizedFusedMoEMethod().process_weights_after_loading(layer)
+        UnquantizedFusedMoEMethod().process_weights_after_loading(layer)
 
         # On a vanilla CPU host none of the non-TPU branches (aiter,
         # deep_gemm, flashinfer, npu) light up, so the hook returns

@@ -1,4 +1,4 @@
-"""Unit tests for ``UnquantizedFusedMoEMethod.process_weights_after_loading`` (TPU).
+"""Unit tests for ``TpuUnquantizedFusedMoEMethod.process_weights_after_loading``.
 
 Regression coverage for the square-weight storage bug: the TPU branch transposes
 each expert weight to gmm_v2's ``(num_experts, k, n)`` layout and then frees the
@@ -10,28 +10,19 @@ leaves the param pointing at ``old``'s storage; the ``resize_(0)`` then used to
 zero out the live weight, giving a valid shape but a 0-byte storage that later
 crashed the pallas MoE kernel.
 
-The TPU branch is device-agnostic (transpose / contiguous / copy_ / resize_ /
-data_ptr), so these run on CPU by forcing ``_is_tpu``.
+The TPU method's weight preparation is device-agnostic (transpose / contiguous /
+copy_ / resize_ / data_ptr), so these run on CPU.
 """
 
 import unittest
 
 import torch
 
-from sglang.srt.layers.quantization import unquant
-from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.quantization.moe import TpuUnquantizedFusedMoEMethod
 
 
 class TestUnquantizedMoEWeightPrepTPU(CustomTestCase):
-    def setUp(self):
-        # Exercise the `if _is_tpu:` branch on a CPU host.
-        self._orig_is_tpu = unquant._is_tpu
-        unquant._is_tpu = True
-
-    def tearDown(self):
-        unquant._is_tpu = self._orig_is_tpu
-
     def _make_layer(self, num_experts, intermediate, hidden, dtype=torch.bfloat16):
         # SGLang stores experts as (num_experts, n, k): w13 is gate||up
         # (n = 2*intermediate), w2 is down-proj (n = intermediate, k = hidden).
@@ -47,9 +38,9 @@ class TestUnquantizedMoEWeightPrepTPU(CustomTestCase):
         return layer, {"w13_weight": w13.clone(), "w2_weight": w2.clone()}
 
     def _run_prep(self, layer):
-        # self is unused in the TPU branch, so skip __init__ (which pulls in the
-        # MoE runner backend / global server args).
-        method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+        # Weight preparation does not read instance state, so skip __init__
+        # (which pulls in the MoE runner backend / global server args).
+        method = TpuUnquantizedFusedMoEMethod.__new__(TpuUnquantizedFusedMoEMethod)
         method.process_weights_after_loading(layer)
 
     def _assert_materialized_and_transposed(self, layer, ref):
