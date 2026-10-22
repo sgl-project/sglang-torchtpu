@@ -50,6 +50,9 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
     from sglang_tpu.compilation.decoder_compile_policy import (
         DecoderTpuCompilePolicy,
     )
+    from sglang_tpu.compilation.recompilation_checker import (
+        snapshot_recompilation_baseline,
+    )
 
     model_runner = scheduler.tp_worker.model_runner
     policy = model_runner.compile_policy
@@ -58,7 +61,7 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
     if aux_config.eagle_use_aux_hidden_state or aux_config.dflash_use_aux_hidden_state:
         _check_aux_capture_relay(model_runner.model)
     num_aux = num_relayed_aux_slots(aux_config, model_runner.model)
-    return build_pp_wave(
+    wave = build_pp_wave(
         pp_group=scheduler.pp_group,
         stage_group=scheduler.tp_group,
         world_group=scheduler.world_group,
@@ -68,6 +71,14 @@ def build_scheduler_pp_wave(scheduler: Scheduler) -> PPWave:
         dtype=model_runner.dtype,
         device=torch.device(model_runner.device),
     )
+    # A forward hands on its token bucket, or its batch bucket when decoding.
+    assert policy.t_bucketer is not None and policy.b_bucketer is not None
+    wave.warmup_merge({*policy.t_bucketer.buckets, *policy.b_bucketer.buckets})
+    if torch.device(model_runner.device).type != "cpu":
+        # torch_tpu compiles asynchronously; the checker must not count the warmups.
+        torch.accelerator.synchronize()
+    snapshot_recompilation_baseline()
+    return wave
 
 
 def decode_transfer_status(

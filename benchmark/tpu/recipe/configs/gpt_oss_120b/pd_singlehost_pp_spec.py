@@ -18,8 +18,12 @@ def pp_spec_role_configs(
     spec_args: dict[str, Any],
     spec_envs: dict[str, str],
     decode_args: dict[str, Any],
+    decode_dp: int = 1,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """(GROUP, PREFILL_CONFIG, DECODE_CONFIG) serving spec_args on both engines."""
+    """(GROUP, PREFILL_CONFIG, DECODE_CONFIG) serving spec_args on both engines.
+
+    decode_dp > 1 runs the decode with DP attention over that many DP ranks.
+    """
     group = deepcopy(pd_singlehost.GROUP)
     prefill = deepcopy(pd_singlehost.PREFILL_CONFIG)
     decode = deepcopy(pd_singlehost.DECODE_CONFIG)
@@ -71,4 +75,16 @@ def pp_spec_role_configs(
     decode["server_args"].pop("hicache_mem_layout")
     decode["server_args"].pop("hicache_io_backend")
     decode["server_args"]["disaggregation_decode_retraction_backup"] = "cpu_tensor"
+    if decode_dp > 1:
+        decode["server_args"].update(
+            dp_size=decode_dp,
+            enable_dp_attention=True,
+            # The drafts share the target lm_head inside the attention-TP group.
+            enable_dp_lm_head=True,
+        )
+        # Per-rank KV bytes per token change with DP; the profiler sizes the pool.
+        decode["server_args"].pop("max_total_tokens")
+        if decode["runtime_envs"].get("SGLANG_SPEC_TP_SYNC") == "rng":
+            # Under DP attention both spec-accept sites sync, or neither.
+            decode["runtime_envs"]["SGLANG_SPEC_TP_SYNC"] = "rng,spec-accept-greedy"
     return group, prefill, decode

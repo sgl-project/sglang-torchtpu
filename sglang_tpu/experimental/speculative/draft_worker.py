@@ -17,6 +17,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_utils import draft_pp_context, draft_tp_context
+from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 
 
 class TpuDraftWorker(ABC):
@@ -29,6 +30,7 @@ class TpuDraftWorker(ABC):
     num_drafts: int
 
     def __init__(self, target_runner: ModelRunner) -> None:
+        self._target_runner = target_runner
         # Under DP attention the draft runs inside its rank's attention-TP group, as
         # an EAGLE3 draft does in core, so it gathers nothing across DP ranks.
         self._owns_attention = get_parallel().attn_dp_enabled
@@ -83,7 +85,18 @@ class TpuDraftWorker(ABC):
     def init_cuda_graphs(self) -> None:
         with self.draft_context():
             self.model_runner.init_cuda_graphs(capture_decode_cuda_graph=False)
+            self._adopt_target_token_buckets()
             self.precompile_draft()
+
+    def _adopt_target_token_buckets(self) -> None:
+        """Pad draft prompt passes to the target's token buckets: under PP the target
+        adds dynamic-chunk buckets the draft's single-stage view never builds."""
+        target_policy = self._target_runner.compile_policy
+        draft_policy = self.model_runner.compile_policy
+        assert isinstance(target_policy, DecoderTpuCompilePolicy), type(target_policy)
+        assert isinstance(draft_policy, DecoderTpuCompilePolicy), type(draft_policy)
+        assert target_policy.t_bucketer is not None
+        draft_policy.t_bucketer = target_policy.t_bucketer
 
     @abstractmethod
     def precompile_draft(self) -> None:

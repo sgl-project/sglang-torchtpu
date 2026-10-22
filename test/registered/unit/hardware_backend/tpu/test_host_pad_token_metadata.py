@@ -483,6 +483,34 @@ class TestHostPadFieldSelection(CustomTestCase):
         for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
             self.assertEqual(getattr(batch, name).device.type, "meta", name)
 
+    def test_experimental_spec_keeps_non_overlap_metadata_on_host(self):
+        """An experimental-worker PD-prefill batch filters and pads its lengths on
+        host; an overlap batch, or one off the worker, keeps them on the device."""
+        from sglang_tpu.hooks import host_padding
+
+        def batch(*, overlap):
+            return SimpleNamespace(
+                host_pad_bs=8,
+                enable_overlap=overlap,
+                spec_algorithm=SimpleNamespace(is_none=lambda: False),
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.zeros(1, device="cpu")
+                ),
+                hisparse_coordinator=None,
+                reqs=[],
+            )
+
+        original = lambda b: "tpu"  # noqa: E731
+        self.assertEqual(
+            host_padding.metadata_device(original, batch(overlap=False)), "cpu"
+        )
+        self.assertEqual(
+            host_padding.metadata_device(original, batch(overlap=True)), "tpu"
+        )
+        off_worker = batch(overlap=False)
+        off_worker.host_pad_bs = None
+        self.assertEqual(host_padding.metadata_device(original, off_worker), "tpu")
+
     def test_decode_mrope_builds_on_host_and_uploads_only_bucket_shape(self):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang_tpu.hooks import host_padding

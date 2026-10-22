@@ -158,7 +158,11 @@ Both raiden roles serve every algorithm with the same spec flags.
   stages run `TpuPipelineStageWorker`, which only forwards the target. The
   stages relay the EAGLE3 / DFlash aux captures to the last one (`../../pp_wave.py`),
   and PP runs without overlap, which a prefill-only server allows.
-  `test_tpu_gpt_oss_120b_pd_singlehost_pp_spec_perf.py` runs PP8 EAGLE3 and DFlash.
+- DP attention on the decode: the decode ranks pull their own requests' KV, which
+  relieves the PP transfer that bounds a non-DP decode (`pd_singlehost_pp_spec.py`
+  `decode_dp`; it adds `--enable-dp-lm-head`).
+  `test_tpu_gpt_oss_120b_pd_singlehost_pp_{eagle3,dflash}_perf.py` run PP8 EAGLE3
+  and DFlash; the `_dpa_perf.py` variants run the decode at DP8.
 - Decode radix + HiCache on a sliding-window target (`../../pd_decode_swa_hicache.py`):
   EAGLE3 and DFlash are core's opt-ins; DSpark opts in on this worker (hook on
   `supports_pd_decode_swa_hicache`), since its draft KV at position i is projected

@@ -98,8 +98,21 @@ def merge_model_inputs(original, batch, other):
     _rebuild_relay_rows(batch)
 
 
+def _draft_state_on_host(spec_info: SpecInput | None) -> bool:
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    return (
+        isinstance(spec_info, EagleDraftInput)
+        and spec_info.bonus_tokens is not None
+        and spec_info.bonus_tokens.device.type == "cpu"
+    )
+
+
 def filter_spec_input(original, batch, keep_indices, keep_indices_device):
     if not _relays_rows(batch):
+        if _draft_state_on_host(batch.spec_info):
+            # A PP PD prefill keeps the relayed draft state on host; index it there.
+            keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64)
         return original(batch, keep_indices, keep_indices_device)
     from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 

@@ -204,6 +204,8 @@ class PDPipelineSpecConfigurationTestCase(unittest.TestCase):
     config_module: ClassVar[str] = ""
     algorithm: ClassVar[str] = ""
     perf_case: ClassVar[type[PDPipelineSpecPerfTestCase]]
+    # DP attention size of the decode; 1 runs it without DP attention.
+    decode_dp: ClassVar[int] = 1
     # Role -> the launcher's dry-run plan.
     plans: ClassVar[dict[str, dict[str, Any]]]
 
@@ -232,6 +234,16 @@ class PDPipelineSpecConfigurationTestCase(unittest.TestCase):
             )
             for role in (PREFILL_ROLE, DECODE_ROLE)
         }
+
+    def test_decode_dp_attention_matches_the_config(self) -> None:
+        args = self.plans[DECODE_ROLE]["server_args"]
+        if self.decode_dp == 1:
+            self.assertFalse(args.get("enable_dp_attention", False))
+            return
+        self.assertEqual(args["dp_size"], self.decode_dp)
+        self.assertTrue(args["enable_dp_attention"])
+        # The drafts share the target lm_head inside the attention-TP group.
+        self.assertTrue(args["enable_dp_lm_head"])
 
     def test_prefill_is_eight_single_device_stages(self) -> None:
         args = self.plans[PREFILL_ROLE]["server_args"]
