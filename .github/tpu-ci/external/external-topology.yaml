@@ -67,6 +67,12 @@ suites:
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
         pd: {prefill_hosts: 2, decode_hosts: 2}
+      - files: test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
+        cmd: env MODEL_PROFILE=qwen3_coder_480b python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
+        pd: {prefill_hosts: 2, decode_hosts: 2}
+      - files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py integration
+        pd: {prefill_hosts: 2, decode_hosts: 2}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
@@ -78,6 +84,9 @@ suites:
         pd: {prefill_hosts: 1, decode_hosts: 1}
       - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py
         cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_spec.py integration
+        pd: {prefill_hosts: 1, decode_hosts: 1}
+      - files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_dflash.py
+        cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_kv_offload_dflash.py integration
         pd: {prefill_hosts: 1, decode_hosts: 1}
       # Issue #1066. bf16 KV until the TPU image ships the MXINT8 backend
       # extension (with the test's default mxint8 both engines refuse to start);

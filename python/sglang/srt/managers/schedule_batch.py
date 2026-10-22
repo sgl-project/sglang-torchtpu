@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -2417,6 +2418,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Device
     device: str = "cuda"
+    # Placement of host-created inputs for the prepared prefill batch.
+    # None, the default, uploads them to batch.device during batch preparation.
+    # Some backends (e.g. TPU) set it to "cpu" to defer the H2D copy to a later
+    # stage, where inputs are padded and the model program runs.
+    input_tensor_device: Optional[str] = None
 
     # HiSparse (engine-level coordinator ref, same across batches)
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -2817,6 +2823,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
+
+        # Allocation and forward construction must use the same placement.
+        self.input_tensor_device = current_platform.get_batch_input_device(self)
 
         # Init tensors
         reqs = self.reqs
@@ -4048,17 +4057,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             ),
                         )
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
+                    # The next query, at seqlen - 1, reads down to seqlen - 1 - W;
+                    # past cache_protected_len the prefix SWA lock is unused, so it
+                    # can become evictable. Skip decode_batch_idx 0, while the
+                    # overlapped prefill may still read it.
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
                         and req.lock_receipt.component_lock_uuids.get(ComponentType.SWA)
                         is not None
                         and req.last_node is not None
-                        and req.decode_batch_idx >= sliding_window_size
+                        and req.decode_batch_idx >= 1
+                        and req.seqlen - 1 - req.kv.cache_protected_len
+                        >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
                             req.last_node, req.lock_receipt

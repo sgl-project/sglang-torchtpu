@@ -13,6 +13,9 @@
     "multihost": "Multi-host"
   },
   "models": {
+    "muse-spark-open-816b-a42b": {
+      "name": "Muse Spark Open 816B-A42B NVFP4"
+    },
     "gpt-oss-120b": {
       "name": "gpt-oss-120b"
     },
@@ -39,6 +42,9 @@
     },
     "qwen3-vl-8b": {
       "name": "Qwen3-VL-8B"
+    },
+    "qwen3-vl-30b-a3b": {
+      "name": "Qwen3-VL-30B-A3B"
     },
     "qwen3-8b": {
       "name": "Qwen3-8B"
@@ -105,6 +111,7 @@
     "compile-tracer": "Direct compile tracer",
     "agentic": "Agentic tool-call workload",
     "multimodal": "Multimodal",
+    "video": "Video input",
     "diffusion": "Diffusion",
     "collectives": "Multi-host collectives",
     "tpu-oot": "Out-of-tree plugin (mode B)",

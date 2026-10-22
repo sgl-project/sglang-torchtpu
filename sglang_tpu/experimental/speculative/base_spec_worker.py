@@ -54,7 +54,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    mamba_track_grid,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -104,7 +112,11 @@ from sglang_tpu.experimental.speculative.spec_types import (
     map_carry,
 )
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
-from sglang_tpu.mamba_pool import TpuMambaPool, committed_read_offsets
+from sglang_tpu.mamba_pool import (
+    TpuMambaPool,
+    committed_read_offsets,
+    verify_track_steps,
+)
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
 
@@ -534,25 +546,39 @@ class TpuSpecWorker(BaseSpecWorker):
             batch, bucket, rows, draft_result, verify_input
         )
         if self._target_has_linear_attn:
-            self._commit_linear_attn_states(batch=batch, accept=accept)
+            self._commit_linear_attn_states(
+                batch=batch, accept=accept, verify_input=verify_input
+            )
         committed = self.commit(
             batch, bucket.state, rows, verify_input, logits_output, accept
         )
         return committed, logits_output, accept
 
     def _commit_linear_attn_states(
-        self, *, batch: ScheduleBatch, accept: AcceptResult
+        self,
+        *,
+        batch: ScheduleBatch,
+        accept: AcceptResult,
+        verify_input: TpuSpecVerifyInput,
     ) -> None:
-        """Select each slot's verify checkpoint at its last accepted token."""
+        """Select each slot's verify checkpoint at its last accepted token, and
+        the checkpoints radix tracking snapshots."""
         runner = self.target_worker.model_runner
         attn_backend = runner.attn_backend
         assert isinstance(attn_backend, HybridLinearAttnBackend), type(attn_backend)
+        steps_to_track = None
+        if batch.mamba_track_indices is not None:
+            steps_to_track = verify_track_steps(
+                verify_input.committed_lens,
+                accept.last_steps,
+                mamba_track_grid(batch.tree_cache.page_size),
+            )
         # Slots come from the verify forward's bucket metadata; padded rows accept 0,
         # so their -1 step leaves the slot untouched.
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=accept.last_steps,
             mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=None,
+            mamba_steps_to_track=steps_to_track,
             model=runner.model,
         )
 
@@ -1038,6 +1064,13 @@ class TpuSpecWorker(BaseSpecWorker):
         """_commit_linear_attn_states' eager ops at every batch bucket."""
         mamba_pool = self.target_worker.model_runner.req_to_token_pool.mamba_pool
         assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
+        # Radix tracking snapshots boundary checkpoints after each verify.
+        track_grid = (
+            mamba_track_grid(get_schedule().page_size)
+            if get_exec().mamba.enable_mamba_extra_buffer
+            and not get_memory().disable_radix_cache
+            else None
+        )
         with torch.no_grad():
             for pbs in self._b_bucketer().buckets:
                 # int32 like the GDN metadata slots; the null slot 0 is never written.
@@ -1051,6 +1084,8 @@ class TpuSpecWorker(BaseSpecWorker):
                     steps,
                 )
                 mamba_pool.select_checkpoints(slots, steps)
+                if track_grid is not None:
+                    mamba_pool.warmup_snapshot_checkpoints(pbs, track_grid)
 
     def _warmup_sampling_info(
         self,

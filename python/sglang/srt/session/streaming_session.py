@@ -105,6 +105,10 @@ class StreamingSession:
             return DecLockRefResult()
         return None
 
+    def try_dec_swa_lock_only(self, node: Any) -> bool:
+        """True if ``node`` is a session-internal sentinel, whose lock is a no-op."""
+        return isinstance(node, _VirtualNode)
+
     def find_active_slot(self, req: Req) -> Optional[SessionSlot]:
         """A pre-aborted req (to_finish set) is detached from the session and
         gets None; the slot stays for the next request."""

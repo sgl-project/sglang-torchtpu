@@ -110,3 +110,20 @@ CI picks the mode per lane (`render_jobset.py --platform`, the `platform`
 input of `_tpu-test.yml`), so each test runs in one mode only: the PR gate
 (stage-a, stage-b) and the single-host nightly (`nightly-tpu-4-v7`) run mode B;
 the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
+
+## Muse Spark multimodal
+
+`models/muse_spark.py` is the text decoder; `models/muse_spark_omni.py` adds the
+NaViT vision tower (adapted from upstream SGLang PR
+[#44666](https://github.com/sgl-project/sglang/pull/44666), commit
+`26305be7f410`) and is the registered `MuseSparkForConditionalGeneration`.
+Image and video serving needs `--enable-multimodal`,
+`SGLANG_EXTERNAL_MM_MODEL_ARCH=MuseSparkForConditionalGeneration` and
+`SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=sglang_tpu.multimodal`.
+
+The vision encoder is replicated and complete images are distributed across
+attention-TP ranks; CPU features stay on the host until their encoder rank
+prepares patches. Live check:
+[`test_tpu_muse_spark_mm_pd_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_mm_pd_multihost.py)
+(images and video over P/D), with `SGLANG_TPU_USE_LIVE_SERVER=1` and
+`BASE_URL` pointing at the router.

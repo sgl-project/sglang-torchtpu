@@ -20,7 +20,7 @@ on:
   schedule:
     - cron: "0 10 * * *"  # day-10am: Kimi MMMU on the 2-host slices, single-host accuracy on the 1-host ones
       timezone: "America/Los_Angeles"
-    - cron: "0 17 * * *"  # day-5pm: Gemma4/Qwen3.5/Qwen3.8 MMMU on 1-host, DeepSeek accuracy + the 480B P/D gate on 2-host
+    - cron: "0 17 * * *"  # day-5pm: Gemma4/Qwen3.5/Qwen3.8 MMMU on 1-host, DeepSeek accuracy on 2-host
       timezone: "America/Los_Angeles"
   workflow_dispatch:
     inputs:
@@ -392,26 +392,6 @@ jobs:
       # push the pod name past 63 chars for deepseek-r1-0528. The test stays
       # legible in the job name and in the job's own "== test files: ==" line.
       run_name: ${{ matrix.group.run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # The 5 PM slot also takes the Qwen3-Coder-480B kv-offload-resharding P/D gate: it
-  # holds both 2-host slices for over an hour, more than the nightly's lane can spare.
-  pd-kvoff-reshard:
-    needs: [build, plan]
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","day-5pm"]'), needs.plan.outputs.model) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        only: [pd-mh-qwen3-480b-kvoff-reshard]
-    uses: ./.github/workflows/feature-validation-tpu.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      only: ${{ matrix.only }}
     permissions:
       contents: read
       id-token: write
