@@ -35,3 +35,25 @@ def static_fp8_parts() -> frozenset[str]:
             f"to include {sorted(missing)}"
         )
     return frozenset(parts)
+
+
+def check_static_fp8_spec_batch(
+    parts: frozenset[str], *, speculative_algorithm, max_running_requests
+) -> None:
+    """Refuse latent_up static fp8 under speculative decoding with more than one request.
+
+    A verify batch of several requests gives wrong tokens with latent_up on (DSpark, TP32,
+    4 requests x 8 rows), with the Pallas GEMV and with the XLA fp8 dot alike, while one
+    request (8 rows) is right and moe_front alone is right at 4 requests. The cause is not
+    found yet, so fail at startup instead of serving garbage.
+    """
+    if "latent_up" not in parts or speculative_algorithm in (None, "", "NONE"):
+        return
+    if max_running_requests == 1:
+        return
+    raise ValueError(
+        "SGLANG_TPU_K3_STATIC_FP8=latent_up gives wrong tokens when a speculative verify "
+        f"batch holds more than one request (--max-running-requests {max_running_requests}). "
+        "Set --max-running-requests 1, or drop latent_up from SGLANG_TPU_K3_STATIC_FP8 "
+        "(SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV needs it, so turn that off too)."
+    )

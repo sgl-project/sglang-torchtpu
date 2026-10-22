@@ -21,6 +21,7 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
@@ -605,13 +606,13 @@ class TpuSampler(Sampler):
 
             candidate_width = (
                 min(MAX_DISTRIBUTED_TOP_K, probs.shape[-1])
-                if envs.SGLANG_TPU_HOST_PADDING.get()
+                if tpu_envs.SGLANG_TPU_HOST_PADDING.get()
                 else top_k
             )
             global_top_k_probs, global_top_k_token_ids = tpu_top_k(
                 probs, candidate_width
             )
-            if envs.SGLANG_TPU_HOST_PADDING.get():
+            if tpu_envs.SGLANG_TPU_HOST_PADDING.get():
                 # Keep the candidate shape independent of the requested k.
                 # Rank masking retains exactly the requested number of candidates.
                 ranks = torch.arange(candidate_width, device=probs.device)

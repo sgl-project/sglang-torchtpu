@@ -22,11 +22,12 @@ from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.utils.common import ceil_align, next_power_of_2
+from sglang.srt.utils.common import ceil_align, next_power_of_2, print_warning_once
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.bucketer import (
     Bucketer,
@@ -42,6 +43,7 @@ from sglang_tpu.cp_forward import (
     get_tpu_cp_layout,
     pinned_extend_seq_lens_cpu,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
@@ -65,28 +67,6 @@ _TOKEN_FIELDS = (
 # Token dim of each field above. MROPE positions are (3, num_tokens). Every
 # other field has tokens on dim 0.
 _TOKEN_FIELD_DIM = {"mrope_positions": -1}
-
-# Token fields that prefill pads on the host instead of on the TPU.
-#
-# Padding on the TPU compiles a new XLA program for each distinct input
-# length. Prefill lengths are arbitrary, so that would trigger one
-# compilation for each unique input length seen while serving. These fields
-# are small integer tensors, so it is cheap to copy them to the host, pad
-# there, and copy the bucket-sized result back.
-# Embeddings and hidden states are too large for that and stay on the TPU.
-#
-# Guideline for adding a field here:
-#   1. Preferred: keep the tensor on host until reaching the padding here,
-#      pad it, and copy it to the TPU once. No copy back to the host is
-#      needed.
-#   2. Fallback: when that would require changing shared sglang code, let
-#      the tensor reach the TPU as usual and add the extra TPU-to-host copy
-#      here for padding. Do this only for tensors that are not too large.
-# Every field below uses the fallback today, because shared code copies them
-# to the TPU before this step.
-_HOST_PAD_TOKEN_FIELDS = frozenset(
-    ("input_ids", "positions", "out_cache_loc", "mrope_positions")
-)
 
 _MAMBA_TRACK_FIELDS = (
     "mamba_track_indices",
@@ -549,27 +529,10 @@ def _attach_input_logprobs(
     logits_output.input_logprobs_copy_done = eager.input_logprobs_copy_done
 
 
-def _pad_tensor_on_host(
-    t: torch.Tensor, target_size: int, *, dim: int = 0
-) -> torch.Tensor:
-    """Pad a small tensor along dim to target_size on the host."""
-    if t.shape[dim] >= target_size:
-        return t
-    padded_shape = list(t.shape)
-    padded_shape[dim] = target_size
-    padded = torch.zeros(padded_shape, dtype=t.dtype, device="cpu")
-    padded.narrow(dim, 0, t.shape[dim]).copy_(t.to("cpu"))
-    return padded.to(t.device)
-
-
-def _pad_tensor(
-    t: torch.Tensor, target_size: int, *, dim: int = 0, on_host: bool = False
-) -> torch.Tensor:
+def _pad_tensor(t: torch.Tensor, target_size: int, *, dim: int = 0) -> torch.Tensor:
     """Pad a tensor along dim to target_size."""
     if t.shape[dim] >= target_size:
         return t
-    if on_host and t.device.type == "tpu":
-        return _pad_tensor_on_host(t, target_size, dim=dim)
     dim = dim % t.ndim
     padding = (0,) * (2 * (t.ndim - dim - 1)) + (0, target_size - t.shape[dim])
     return F.pad(t, padding)
@@ -610,7 +573,7 @@ def _pad_forward_batch_inputs(
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
     if (
-        envs.SGLANG_TPU_HOST_PADDING.get()
+        tpu_envs.SGLANG_TPU_HOST_PADDING.get()
         and is_decode
         and forward_batch.spec_info is None
     ):
@@ -740,22 +703,22 @@ def _pad_batch_fields(
 
 
 def _pad_token_fields(forward_batch: Any, pad_t: int, is_draft_extend_v2: bool) -> None:
-    # Opt-in host padding applies only to prefill with arbitrary token counts.
-    # Decode and target verify have a small, fixed set of token counts. The
-    # TPU pad compiles each of those once, and avoids a blocking copy on
-    # every generation step.
-    mode = forward_batch.forward_mode
-    host_pad = (
-        envs.SGLANG_TPU_HOST_PADDING.get()
-        and mode.is_extend()
-        and not mode.is_target_verify()
-    )
+    # Host-staged inputs stay on CPU through padding and upload at bucket shape.
+    # Device-produced inputs retain their device; padding never reads them back.
+    if (
+        tpu_envs.SGLANG_TPU_HOST_PADDING.get()
+        and forward_batch.forward_mode == ForwardMode.EXTEND
+        and forward_batch.input_ids.device.type != "cpu"
+    ):
+        print_warning_once(
+            "Host padding is on, but prefill tokens reached padding on the device, "
+            "which may compile a program per prompt length."
+        )
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         dim = _TOKEN_FIELD_DIM.get(field, 0)
         if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
-            on_host = host_pad and field in _HOST_PAD_TOKEN_FIELDS
-            val = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
+            val = _pad_tensor(val, pad_t, dim=dim)
             setattr(forward_batch, field, val)
 
     if is_draft_extend_v2:
@@ -785,7 +748,7 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
     for field in _TOKEN_FIELDS:
         value = getattr(forward_batch, field, None)
         if (
-            envs.SGLANG_TPU_HOST_PADDING.get()
+            tpu_envs.SGLANG_TPU_HOST_PADDING.get()
             and field == "mrope_positions"
             and isinstance(value, torch.Tensor)
             and forward_batch.forward_mode.is_decode()

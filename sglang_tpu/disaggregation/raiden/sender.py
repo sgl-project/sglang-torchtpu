@@ -538,7 +538,7 @@ class RaidenSenderMixin:
             with self._state_lock:
                 self._discard_sender_read_locked(room, req_id)
             return
-        logger.info(
+        logger.debug(
             "RaidenKVManager rank%d prefill registered read | room=%s "
             "req_id=%s uuid=%d pages=%d",
             self.attn_tp_rank,

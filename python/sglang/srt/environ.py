@@ -1934,12 +1934,6 @@ class Envs:
     # Restore device MM scatter instead of host placement.
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
-    # Opt in to host padding for small prefill metadata tensors to avoid
-    # per-length XLA compilations.
-    SGLANG_TPU_HOST_PADDING = EnvBool(False)
-    # Opt in to host-staged batch metadata: eligible batches keep it on CPU,
-    # pad it to the compile bucket, and upload it once, with no D2H copy.
-    SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
     SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
