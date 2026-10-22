@@ -8,8 +8,8 @@ silently regress:
     paged_attention (GQA, page_size variants, q pre-scale, length mask);
   * _bucket_kv_len boundaries (bounds JAX recompiles);
   * _maybe_expand_kv_heads GQA expansion;
-  * _patch_support_triton_for_tpu (else the Triton path crashes on TPU
-    with "0 active drivers");
+  * the TPU platform reports no Triton for its Pallas backends (else the
+    Triton path crashes on TPU with "0 active drivers");
   * paged-decode slot padding stays local to pallas_tpu_flash and uses the
     allocator's reserved physical KV slot 0;
   * Both Pallas backend names appear in the attention registry (else
@@ -29,6 +29,7 @@ register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 import importlib.util
 import math
 import unittest
+from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -82,32 +83,17 @@ class TestPallasHelpers(CustomTestCase):
             self.assertTrue(torch.equal(out[h], kv[h // group]))
 
 
-class TestSupportTritonPatch(CustomTestCase):
-    """_patch_support_triton_for_tpu must treat both Pallas TPU backend names
-    like non-Triton backends (no Triton driver exists on TPU)."""
+class TestSupportTritonOnTpu(CustomTestCase):
+    """support_triton follows the platform capability, and TPU has no Triton
+    driver, so the Pallas TPU backends never take a Triton path."""
 
-    def test_pallas_tpu_is_non_triton_after_patch(self):
+    def test_pallas_tpu_backends_are_non_triton(self):
         import sglang.srt.utils.common as uc
-        from sglang_tpu.patches import (
-            _patch_support_triton_for_tpu,
-        )
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
-        # Before: stock allowlist treats an unknown name as Triton-capable.
-        self.assertTrue(uc.support_triton("pallas_tpu_flash"))
-        self.assertTrue(uc.support_triton("pallas_tpu_rpa_v3"))
-
-        _patch_support_triton_for_tpu()
-
-        # After: both Pallas backend names are non-Triton; others unchanged.
-        self.assertFalse(uc.support_triton("pallas_tpu_flash"))
-        self.assertFalse(uc.support_triton("pallas_tpu_rpa_v3"))
-        self.assertFalse(uc.support_triton("torch_native"))
-        self.assertTrue(uc.support_triton("flashinfer"))
-
-        # Idempotent.
-        _patch_support_triton_for_tpu()
-        self.assertFalse(uc.support_triton("pallas_tpu_flash"))
-        self.assertFalse(uc.support_triton("pallas_tpu_rpa_v3"))
+        with patch.object(uc, "current_platform", TpuSRTPlatform()):
+            for backend in ("pallas_tpu_flash", "pallas_tpu_rpa_v3", "torch_native"):
+                self.assertFalse(uc.support_triton(backend), backend)
 
 
 class TestPallasFlashTokenSlotPadding(CustomTestCase):

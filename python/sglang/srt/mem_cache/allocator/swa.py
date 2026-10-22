@@ -82,7 +82,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         else:
-            if _is_npu:
+            platform_allocator_cls = current_platform.get_paged_allocator_cls()
+            if platform_allocator_cls is not None:
+                PagedTokenToKVPoolAllocatorClass = platform_allocator_cls
+            elif _is_npu:
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
             elif _is_tpu:
                 PagedTokenToKVPoolAllocatorClass = TpuPagedTokenToKVPoolAllocator

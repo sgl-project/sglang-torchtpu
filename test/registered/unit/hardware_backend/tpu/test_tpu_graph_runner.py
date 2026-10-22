@@ -710,6 +710,50 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertIs(getattr(modules[repetition_path], target), eager)
         self.assertIs(getattr(modules[sampling_path], target), eager)
 
+    def test_shared_graph_setup_accepts_compile_only_runner(self):
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            CudaGraphConfig,
+            PhaseConfig,
+        )
+        from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
+
+        for can_compile in (True, False):
+            with self.subTest(can_compile=can_compile):
+                model = self._annotate(
+                    _model_with(forward=MagicMock(), _can_torch_compile=can_compile)
+                )
+                model_runner = self._runner_for(model)
+                model_runner.device = "tpu"
+                model_runner.gpu_id = 0
+                model_runner.is_generation = True
+                with (
+                    get_context().override_server_args(
+                        enable_torch_compile=True,
+                        cuda_graph_config=CudaGraphConfig(
+                            decode=PhaseConfig(backend=Backend.DISABLED)
+                        ),
+                    ),
+                    patch.object(
+                        cuda_graph_setup,
+                        "current_platform",
+                        SimpleNamespace(
+                            device_name="TPU",
+                            get_graph_runner_cls=lambda: TpuGraphRunner,
+                        ),
+                    ),
+                    patch.object(
+                        cuda_graph_setup, "get_available_gpu_memory", return_value=1.0
+                    ),
+                ):
+                    capture = cuda_graph_setup.capture_decode_graph(
+                        model_runner=model_runner
+                    )
+
+                self.assertIsInstance(capture.runner, TpuGraphRunner)
+                self.assertEqual(capture.runner.capture_bs, ())
+                self.assertFalse(capture.runner.can_run_graph(None))
+
     def test_can_run_is_always_false(self):
         # ModelRunner.forward branches on `graph_runner.can_run_graph(...)`
         # to decide whether to replay a captured graph. TPU has no
@@ -787,6 +831,7 @@ class TestDraftTorchCompileInstall(CustomTestCase):
             capture_cuda_graphs,
         )
         from sglang.srt.runtime_context import get_flags
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         runner = self._runner("tpu")
         events = []
@@ -807,6 +852,8 @@ class TestDraftTorchCompileInstall(CustomTestCase):
                 f"{self._SETUP_MOD}.capture_decode_graph",
                 side_effect=lambda **_: events.append("decode") or MagicMock(),
             ),
+            # The TPU platform installs torch.compile through decode capture.
+            patch(f"{self._SETUP_MOD}.current_platform", TpuSRTPlatform()),
             get_context().override_server_args(forward_hooks=[{"name": "capture"}]),
             get_flags().capture.override(enable_torch_compile=True),
         ):

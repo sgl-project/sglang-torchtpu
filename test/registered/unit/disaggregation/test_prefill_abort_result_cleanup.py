@@ -28,6 +28,9 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _Req:
     def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
         self.rid = "aborted-prefill"
+        self.release_mm_inputs_on_abort = Mock()
+        self.session = None
+        self.lock = None
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
         self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
@@ -46,7 +49,7 @@ class _Req:
         self.grammar = None
         self.output_ids = []
         self.origin_input_ids = list(range(100))
-        self.extend_range = None
+        self.extend_end = None
         self.time_stats = SimpleNamespace(
             set_prefill_finished_time=Mock(),
             set_last_chunked_prefill_finish_time=Mock(),
@@ -125,8 +128,8 @@ def _result():
     return GenerationBatchResult(next_token_ids=torch.tensor([11]))
 
 
-def _free_req(req, _tree_cache, *, is_insert):
-    assert is_insert is False
+def _free_req(req, _tree_cache, *, checkpoint):
+    assert checkpoint is False
     req.kv.req_pool_idx = None
     req.kv.mark_kv_released()
     req.kv.mamba_pool_idx = None
@@ -142,7 +145,9 @@ def test_aborted_final_result_releases_hybrid_cache(
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
     checkpoint_kv_cache.assert_not_called()
     req.disagg_kv_sender.abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
@@ -161,12 +166,14 @@ def test_aborted_final_result_releases_hybrid_cache(
 def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
-    req.extend_range = SimpleNamespace(end=50)
+    req.extend_end = 50
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
     assert req.inflight_middle_chunks == 0
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
@@ -174,7 +181,7 @@ def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
 def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=1)
-    req.extend_range = SimpleNamespace(end=len(req.origin_input_ids))
+    req.extend_end = len(req.origin_input_ids)
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
@@ -183,7 +190,9 @@ def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
@@ -207,7 +216,9 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
 
     scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
 
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     assert req.finished()
@@ -229,7 +240,9 @@ def test_grammar_rejection_retires_prefill_before_transfer(
     req.grammar.accept_token.assert_called_once_with(11)
     assert req.grammar.finished
     assert req.finished()
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
     checkpoint_kv_cache.assert_not_called()
     scheduler.send_kv_chunk.assert_not_called()
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
@@ -316,7 +329,7 @@ def test_aborted_final_result_keeps_pages_until_its_sender_drains(
             scheduler.process_disagg_prefill_inflight_queue([req.rid])
     release_at_result.assert_not_called()
     release_after_drain.assert_called_once_with(
-        req, scheduler.tree_cache, is_insert=False
+        req, scheduler.tree_cache, checkpoint=False
     )
     sender.clear.assert_called_once_with()
     assert scheduler._deferred_chunked_sender_aborts == []
@@ -380,7 +393,9 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     assert req.metadata_buffer_index == -1
     assert not req.pending_bootstrap
     assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
-    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    release_kv_cache.assert_called_once_with(
+        req, scheduler.tree_cache, checkpoint=False
+    )
     req.disagg_kv_sender.abort.assert_called_once_with()
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.tree_cache.finish.assert_called_once_with(

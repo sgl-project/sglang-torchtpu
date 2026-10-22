@@ -121,7 +121,6 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
     def test_moe_pad_count_goes_to_topk_not_experts(self):
         """TopK masks padded rows on TPU; experts keep DeepEPMoE's signature."""
         import inspect
-        from types import SimpleNamespace
 
         from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
         from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -147,21 +146,19 @@ class TestKimiK3ConstructOnTpu(CustomTestCase):
         moe.experts = ExpertsCallSpy(moe.moe_hidden_size)
         hidden = torch.zeros(4, 512, dtype=moe.gate.weight.dtype)
         count = torch.tensor(3, dtype=torch.int32)
-        forward_batch = SimpleNamespace(moe_num_token_non_padded=lambda: count)
         topk_output = StandardTopKOutput(
             torch.zeros(4, 2), torch.zeros(4, 2, dtype=torch.int32), torch.zeros(4, 4)
         )
-        for on_tpu in (True, False):
+        for token_count in (count, None):
             moe.experts.calls.clear()
             with (
-                self.subTest(on_tpu=on_tpu),
-                patch.object(kimi_k3, "_is_tpu", on_tpu),
+                self.subTest(token_count=token_count),
                 patch.object(moe.topk, "forward", return_value=topk_output) as topk,
             ):
-                moe(hidden, forward_batch=forward_batch)
+                moe(hidden, num_token_non_padded=token_count)
                 self.assertIs(
                     topk.call_args.kwargs["num_token_non_padded"],
-                    count if on_tpu else None,
+                    token_count,
                 )
                 ((args, kwargs),) = moe.experts.calls
                 self.assertIs(args[1], topk_output)

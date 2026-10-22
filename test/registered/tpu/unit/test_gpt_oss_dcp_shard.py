@@ -3,12 +3,12 @@
 Under DCP the ranks of a group replicate K/V and split only the queries, so the
 KV projections shard across ``attn_tp // dcp`` groups instead of ``attn_tp``.
 ``GptOssAttention`` must build its ``QKVParallelLinear`` with that narrower
-``kv_tp_size`` / ``kv_tp_rank`` pair, keep Q at full attention-TP sharding, and
+KV partition group, keep Q at full attention-TP sharding, and
 end up with the KV head count the KV pool is sized for
 (``ModelConfig.get_num_kv_heads(attn_tp, dcp_size)``).
 
 Pure CPU construction: the parallel topology is published on the parallel bag
-and every linear layer receives its rank/size explicitly, so no process group
+and every linear layer retains its partition group, so no process group
 is created.
 """
 
@@ -19,6 +19,7 @@ import torch
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -83,17 +84,30 @@ class TestGptOssDcpShard(CustomTestCase):
         for attn_tp_rank in range(ATTN_TP_SIZE):
             with self.subTest(attn_tp_rank=attn_tp_rank):
                 attn = _build_attention(attn_tp_rank, self.DCP)
-                self.assertEqual(attn.qkv_proj.kv_tp_size, ATTN_TP_SIZE // self.DCP)
-                self.assertEqual(attn.qkv_proj.kv_tp_rank, attn_tp_rank // self.DCP)
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.kv_tp_group)[1],
+                    ATTN_TP_SIZE // self.DCP,
+                )
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.kv_tp_group)[0],
+                    attn_tp_rank // self.DCP,
+                )
                 # Q keeps the full attention-TP split.
-                self.assertEqual(attn.qkv_proj.tp_size, ATTN_TP_SIZE)
-                self.assertEqual(attn.qkv_proj.tp_rank, attn_tp_rank)
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.tp_group)[1], ATTN_TP_SIZE
+                )
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.tp_group)[0], attn_tp_rank
+                )
 
     def test_ranks_of_one_dcp_group_hold_the_same_kv_shard(self):
         for group_start in range(0, ATTN_TP_SIZE, self.DCP):
             ranks = range(group_start, group_start + self.DCP)
             kv_ranks = {
-                _build_attention(r, self.DCP).qkv_proj.kv_tp_rank for r in ranks
+                get_group_rank_size(_build_attention(r, self.DCP).qkv_proj.kv_tp_group)[
+                    0
+                ]
+                for r in ranks
             }
             self.assertEqual(len(kv_ranks), 1, f"group at {group_start}: {kv_ranks}")
 
@@ -135,14 +149,20 @@ class TestGptOssDcpShard(CustomTestCase):
         for attn_tp_rank in (0, 7):
             with self.subTest(attn_tp_rank=attn_tp_rank):
                 attn = _build_attention(attn_tp_rank, 1)
-                self.assertEqual(attn.qkv_proj.kv_tp_size, ATTN_TP_SIZE)
-                self.assertEqual(attn.qkv_proj.kv_tp_rank, attn_tp_rank)
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.kv_tp_group)[1], ATTN_TP_SIZE
+                )
+                self.assertEqual(
+                    get_group_rank_size(attn.qkv_proj.kv_tp_group)[0], attn_tp_rank
+                )
                 self.assertEqual(attn.num_kv_heads, TOTAL_NUM_KV_HEADS // ATTN_TP_SIZE)
 
     def test_sliding_window_layers_shard_the_same_way(self):
         attn = _build_attention(2, self.DCP, layer_type="sliding_attention")
-        self.assertEqual(attn.qkv_proj.kv_tp_size, ATTN_TP_SIZE // self.DCP)
-        self.assertEqual(attn.qkv_proj.kv_tp_rank, 1)
+        self.assertEqual(
+            get_group_rank_size(attn.qkv_proj.kv_tp_group)[1], ATTN_TP_SIZE // self.DCP
+        )
+        self.assertEqual(get_group_rank_size(attn.qkv_proj.kv_tp_group)[0], 1)
 
 
 if __name__ == "__main__":

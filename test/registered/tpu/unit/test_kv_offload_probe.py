@@ -133,7 +133,8 @@ class TestDecodeTails(unittest.TestCase):
 
     def test_every_shape_ends_on_a_page_boundary_at_its_own_step(self) -> None:
         shapes = tail_shapes(page_size=64)
-        self.assertTrue(all((p + n) % 64 == 0 for p, n in shapes))
+        # The last output token has no KV, so the committed tokens end a page.
+        self.assertTrue(all((p + n - 1) % 64 == 0 for p, n in shapes))
         self.assertEqual(len({n for _, n in shapes}), len(shapes))
 
     def test_replays_must_not_complete_a_page(self) -> None:
@@ -258,7 +259,7 @@ class TestDecodeTailSequence(unittest.TestCase):
         return response
 
     def test_device_replays_precede_fillers_and_host_replays_follow(self) -> None:
-        sizes = [(96, 32), (95, 33)]
+        sizes = [(97, 32), (96, 33)]
         plan = plan_eviction(
             device_pool_tokens=8192, probe_tokens=1024, hicache_ratio=3.0
         )
@@ -277,7 +278,7 @@ class TestDecodeTailSequence(unittest.TestCase):
         replays = [c for c in self.calls if c[0] is not None and c[1] == 4]
         self.assertEqual([after for _, _, after in replays], [False] * 2 + [True] * 2)
         for (ids, _, _), (prompt_tokens, max_new) in zip(replays, sizes * 2):
-            committed = prompt_tokens + max_new
+            committed = prompt_tokens + max_new - 1
             self.assertEqual(len(ids), committed + 2)
             self.assertEqual(ids[committed:], ids[:2])
         self.assertEqual([t.committed_tokens for t in probe.tails], [128, 128])

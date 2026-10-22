@@ -68,8 +68,9 @@ class TestHttpServerNodeRank(unittest.TestCase):
             callback.assert_not_called()
             scheduler.block_until_scheduler_exits.assert_not_called()
         elif rust:
+            # Each Rust listener runs its own startup warmup.
             serve.assert_not_called()
-            warmup.assert_called_once_with(server_args)
+            warmup.assert_not_called()
             callback.assert_called_once_with()
             scheduler.block_until_scheduler_exits.assert_called_once_with()
         else:

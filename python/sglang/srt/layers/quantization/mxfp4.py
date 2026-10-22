@@ -638,6 +638,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if get_moe_a2a_backend().is_mori() and hasattr(layer, "dispatcher"):
+            # Resolve MORI dtype overrides and build the EPv2 op before KV cache
+            # sizing. No weight_dtype keeps bf16 dispatch, the validated default here.
+            layer.dispatcher.set_quant_config({})
+
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
@@ -705,7 +710,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     check_mega_moe_shapes,
                 )
 
-                mma_type = _mega_moe_mma_type()
+                mma_type = _mega_moe_mma_type(layer)
                 check_mega_moe_shapes(
                     hidden=layer.w13_weight.shape[2] * 2,
                     intermediate=layer.w13_weight.shape[1] // 2,
@@ -1911,6 +1916,11 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         return w, mx_scales
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if get_moe_a2a_backend().is_mori() and hasattr(layer, "dispatcher"):
+            # Resolve MORI dtype overrides and build the EPv2 op before KV cache
+            # sizing. No weight_dtype keeps bf16 dispatch, the validated default here.
+            layer.dispatcher.set_quant_config({})
+
         w13, w13_mx_scales = self.mxfp4_quantize(layer.w13_weight.data)
         w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
 

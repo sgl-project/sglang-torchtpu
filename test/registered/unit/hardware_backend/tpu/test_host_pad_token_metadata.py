@@ -747,7 +747,8 @@ class TestHostPadFieldSelection(CustomTestCase):
         req = SimpleNamespace(
             kv=SimpleNamespace(req_pool_idx=1),
             prefix_indices=[0, 1],
-            extend_range=SimpleNamespace(length=3),
+            extend_len=3,
+            prefix_len=2,
             origin_input_ids=[10, 11, 12, 13, 14],
             output_ids=[],
             retracted_stain=True,
@@ -928,6 +929,8 @@ class TestHostPadFieldSelection(CustomTestCase):
                     grammar=None,
                     finished=lambda: False,
                     skip_radix_cache_insert=True,
+                    prefix_len=0,
+                    extend_end=0,
                 )
                 for token in (11, 22, 33)
             ],

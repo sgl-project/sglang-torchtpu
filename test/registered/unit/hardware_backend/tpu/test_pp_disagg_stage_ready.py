@@ -35,7 +35,7 @@ def _req(sender, n_input, extend_end, pool_idx=0, **fields):
     return SimpleNamespace(
         disagg_kv_sender=sender,
         origin_input_ids=list(range(n_input)),
-        extend_range=SimpleNamespace(end=extend_end),
+        extend_end=extend_end,
         kv=SimpleNamespace(req_pool_idx=pool_idx),
         **fields,
     )

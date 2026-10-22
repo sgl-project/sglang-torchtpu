@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.mem_cache.page_interleave import (
+    compute_page_shard_scratch_bytes,
+    make_page_shard_spec,
+)
 from sglang.srt.runtime_context import (
+    get_context,
     get_memory,
     get_parallel,
     get_schedule,
@@ -192,6 +197,9 @@ def _make_model_runner(
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
     )
+    # Fused draft KV is off unless a test opts in (a bare MagicMock return
+    # would read as a truthy entry size and take the fused pricing branch).
+    mr.fused_entry_bytes.return_value = None
 
     return mr
 
@@ -258,6 +266,75 @@ class TestDefaultConfigurator(CustomTestCase):
         available = 10_000_000
         _, _, config = self._run(available, page_size=128)
         self.assertEqual(config.max_total_num_tokens % 128, 0)
+
+    def test_eight_context_scratch_is_reserved_before_kv_pool_sizing(self):
+        page_size = 16
+        mr = _make_model_runner(
+            self,
+            use_mla_backend=True,
+            num_layers=3,
+            page_size=page_size,
+            chunked_prefill_size=1024,
+            max_running_requests=1,
+        )
+        mr.model_config.context_len = 8193
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.mem_cache.page_interleave.get_kv_shard_group_info",
+                return_value=(0, 4),
+            ),
+            get_context().override_server_args(
+                prefill_max_requests=1,
+                chunked_prefill_size=1024,
+                max_running_requests=1,
+            ),
+        ):
+            spec = make_page_shard_spec(mr)
+            # Each context rounds to 8256 tokens, a 64-token gather multiple,
+            # even with request limits of one. Only the prefix is multiplied.
+            self.assertEqual(spec.max_prefix_tokens, 8 * 8256)
+            self.assertEqual(spec.chunk_tokens, 1024)
+            row_bytes = (512 + 64) * KV_SIZE
+            scratch_bytes = 2 * (8 * 8256 + 1024 + page_size) * row_bytes
+            self.assertEqual(compute_page_shard_scratch_bytes(mr), scratch_bytes)
+
+            # Scratch has two one-layer slots; persistent KV spans all three
+            # layers. Charge the former before dividing by the latter's cost.
+            cell_bytes = row_bytes * mr.num_effective_layers
+            page_bytes = page_size * cell_bytes
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            configurator = create_memory_pool_configurator(mr)
+            for desired_tokens in (page_size, 128):
+                for slack_bytes in (0, page_bytes - 1):
+                    with self.subTest(
+                        desired_tokens=desired_tokens, slack_bytes=slack_bytes
+                    ):
+                        budget = (
+                            scratch_bytes + desired_tokens * cell_bytes + slack_bytes
+                        )
+                        config = configurator.calculate_pool_sizes(budget, page_size)
+                        self.assertEqual(config.max_total_num_tokens, desired_tokens)
+                        self.assertEqual(
+                            budget
+                            - scratch_bytes
+                            - config.max_total_num_tokens * cell_bytes,
+                            slack_bytes,
+                        )
+
+            # The fixed eight-context scratch is never silently reduced to
+            # leave room for persistent KV, including a sub-page remainder.
+            for budget in (
+                scratch_bytes - 1,
+                scratch_bytes,
+                scratch_bytes + page_bytes - 1,
+            ):
+                with self.subTest(insufficient_budget=budget):
+                    with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
+                        configurator.calculate_pool_sizes(budget, page_size)
 
     def test_constraint_respected(self):
         """calculate_pool_sizes_from_max_tokens respects the limit."""
@@ -342,6 +419,24 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(raw_configurator._cell_size, (576 + 132) * num_layers)
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
+
+    def test_fused_draft_entry_overrides_the_layer_ratio(self):
+        """A fused draft prices the exact fused entry (host + draft + pad);
+        the per-draft-layer ratio under-reserves the pad."""
+        mr = _make_model_runner(self, speculative_algorithm="EAGLE")
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.fused_entry_bytes.side_effect = lambda name: (
+            77777 if name == "full" else None
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            fused = create_memory_pool_configurator(mr)
+        self.assertEqual(fused._cell_size, 77777)
 
 
 class TestHybridSWAConfigurator(CustomTestCase):
@@ -694,7 +789,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 104)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
+    def test_swa_request_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
         # Overlap on -> spec-v2: decode_alloc = 2 * get_alloc_len_per_decode =
         # 2 * max(steps*topk, max_draft) = 2 * max(6, 5) = 12 (page=1, since the
         # v2 allocator does not support page>1 & topk>1). trailing = 8 + 20 +
@@ -730,7 +825,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 91)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_accounts_for_draft_swa_layers(self):
+    def test_swa_request_cap_accounts_for_draft_swa_layers(self):
         """Draft SWA tensors consume the same fixed-capacity pool as target SWA."""
         available = 1_000_000
         mr = _make_model_runner(
@@ -764,7 +859,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
-    def test_chunk_cache_cap_drops_prefill_for_disagg_decode(self):
+    def test_swa_request_cap_drops_prefill_for_disagg_decode(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -792,7 +887,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 100)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_prefill_holds_window_plus_chunk(self):
+    def test_swa_request_cap_prefill_holds_window_plus_chunk(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -1180,8 +1275,8 @@ class TestFactory(CustomTestCase):
         self.assertIsInstance(cfg, HybridSWAPoolConfigurator)
 
     def test_chunk_cap_configurator_selection(self):
-        # SWAChunkCapPoolConfigurator is selected only when max_running_requests is set.
-        def _cfg(max_running_requests):
+        # SWARequestCapPoolConfigurator is selected only when max_running_requests is set.
+        def _cfg(max_running_requests, chunked_prefill_size=4):
             mr = _make_model_runner(
                 self,
                 is_hybrid_swa=True,
@@ -1189,7 +1284,7 @@ class TestFactory(CustomTestCase):
                 swa_attention_layer_ids=[1],
                 swa_num_kv_heads=4,
                 disable_radix_cache=True,
-                chunked_prefill_size=4,
+                chunked_prefill_size=chunked_prefill_size,
                 sliding_window_size=8,
                 max_running_requests=max_running_requests,
             )
@@ -1201,11 +1296,15 @@ class TestFactory(CustomTestCase):
                 return create_memory_pool_configurator(mr)
 
         from sglang.srt.model_executor.pool_configurator import (
-            SWAChunkCapPoolConfigurator,
+            SWARequestCapPoolConfigurator,
         )
 
-        self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
-        self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+        self.assertIsInstance(_cfg(2), SWARequestCapPoolConfigurator)
+        self.assertNotIsInstance(_cfg(None), SWARequestCapPoolConfigurator)
+        # Chunked prefill off: a whole prompt can exceed the cap.
+        self.assertNotIsInstance(
+            _cfg(2, chunked_prefill_size=-1), SWARequestCapPoolConfigurator
+        )
 
 
 class TestDflashDraftKvBudget(CustomTestCase):
@@ -2052,6 +2151,8 @@ class TestOutOfTreeHybridSwaRouting(CustomTestCase):
             use_mla_backend=False,
             mambaish_config=None,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            _page_major_enabled=lambda: False,
+            _resolve_kv_pool_class=lambda **kwargs: kwargs["default"],
             _build_tpu_swa_kv_pool=MagicMock(name="swa_builder"),
             _build_oot_mha_kv_pool=MagicMock(name="flat_builder"),
         )
@@ -2150,6 +2251,227 @@ class TestTpuDsaRouting(CustomTestCase):
         fake._build_dsa_kv_pool.assert_not_called()
 
 
+class TestOutOfTreePlatformKvApi(CustomTestCase):
+    """An out-of-tree platform that implements only get_kv_pool_cls and
+    get_paged_allocator_cls, with None meaning the in-tree class."""
+
+    _sizes = TestOutOfTreeHybridSwaRouting._sizes
+
+    class _Platform:
+        def __init__(self, mha_pool_cls):
+            self.mha_pool_cls = mha_pool_cls
+
+        def is_out_of_tree(self):
+            return True
+
+        def is_tpu(self):
+            return False
+
+        def get_kv_pool_cls(self, *, kind):
+            return self.mha_pool_cls if kind == "mha" else None
+
+        def get_paged_allocator_cls(self):
+            return None
+
+    def _fake_configurator(self):
+        from functools import partial
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        _publish_config(self, page_size=64, disaggregation_mode="null")
+        fake = SimpleNamespace(
+            device="cpu",
+            pool_page_size=64,
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype_str="auto",
+            is_draft_worker=False,
+            is_hybrid_swa=False,
+            use_mla_backend=False,
+            mambaish_config=None,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(),
+                head_dim=64,
+                v_head_dim=64,
+                get_num_kv_heads=lambda *_: 2,
+            ),
+            layer_info=SimpleNamespace(
+                num_effective_layers=2, start_layer=0, end_layer=2
+            ),
+            _page_major_enabled=lambda: False,
+            _mxint8_pool_kwargs=lambda: {},
+        )
+        for name in (
+            "_resolve_kv_pool_class",
+            "_tpu_mha_pool_class",
+            "_build_oot_mha_kv_pool",
+        ):
+            setattr(fake, name, partial(getattr(KVCacheConfigurator, name), fake))
+        return fake
+
+    def test_pool_comes_from_get_kv_pool_cls_or_the_in_tree_default(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        class _CustomPool(MHATokenToKVPool):
+            pass
+
+        for supplied, expected in (
+            (_CustomPool, _CustomPool),
+            (None, MHATokenToKVPool),
+        ):
+            fake = self._fake_configurator()
+            with (
+                self.subTest(supplied=supplied),
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                    self._Platform(supplied),
+                ),
+                # autospec raises TypeError on a keyword the real __init__ lacks.
+                patch.object(expected, "__init__", autospec=True, return_value=None),
+            ):
+                pool = KVCacheConfigurator._build_token_to_kv_pool(
+                    fake,
+                    sizes=self._sizes(),
+                    is_dsa_model=False,
+                    is_dsv4_model=False,
+                    req_to_token_pool=MagicMock(),
+                )
+                self.assertIs(type(pool), expected)
+
+    def test_in_tree_fallback_stores_v_at_the_model_width(self):
+        """A K width of 192 with a V width of 128 (MiMo-style): the in-tree pool
+        the fallback builds sizes V as the ordinary MHA builder does, and takes
+        a V write at the model's width."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        fake.model_config.head_dim = 192
+        fake.model_config.v_head_dim = 128
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+            self._Platform(None),
+        ):
+            pool = KVCacheConfigurator._build_oot_mha_kv_pool(
+                fake, max_total_num_tokens=128
+            )
+        self.assertEqual(pool.get_key_buffer(0).shape[1:], (2, 192))
+        self.assertEqual(pool.get_value_buffer(0).shape[1:], (2, 128))
+        layer = SimpleNamespace(layer_id=0, k_scale=None, v_scale=None)
+        loc = torch.tensor([3])
+        k = torch.randn(1, 2, 192, dtype=torch.bfloat16)
+        v = torch.randn(1, 2, 128, dtype=torch.bfloat16)
+        pool.set_kv_buffer(layer, loc, k, v)
+        torch.testing.assert_close(pool.get_value_buffer(0)[3], v[0])
+
+    def test_hybrid_linear_mla_pool_is_the_selected_class(self):
+        """A hybrid linear-attention MLA model on a non-TPU out-of-tree
+        platform builds its full-attention layers in the MLA pool the
+        configurator selected through get_kv_pool_cls(kind="mla")."""
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MLATokenToKVPool,
+        )
+
+        class _PluginMLAPool(MLATokenToKVPool):
+            pass
+
+        _publish_config(self, page_size=1, disaggregation_mode="null")
+        for selected, expected in (
+            (_PluginMLAPool, _PluginMLAPool),
+            (None, MLATokenToKVPool),
+        ):
+            with (
+                self.subTest(selected=selected),
+                patch(
+                    "sglang.srt.mem_cache.memory_pool.current_platform",
+                    self._Platform(None),
+                ),
+            ):
+                pool = HybridLinearKVPool(
+                    size=16,
+                    dtype=torch.bfloat16,
+                    page_size=1,
+                    head_num=1,
+                    head_dim=24,
+                    full_attention_layer_ids=[1, 3],
+                    device="cpu",
+                    mamba_pool=None,
+                    use_mla=True,
+                    kv_lora_rank=16,
+                    qk_rope_head_dim=8,
+                    full_kv_pool_class=selected,
+                )
+                self.assertIs(type(pool.full_kv_pool), expected)
+
+    def test_dsa_uses_the_platform_hook_or_the_in_tree_build(self):
+        from functools import partial
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+        from sglang_tpu.platform import TpuOOTPlatform
+
+        fake = self._fake_configurator()
+        fake.use_mla_backend = True
+        fake._build_dsa_kv_pool = MagicMock(name="in_tree_dsa_builder")
+        fake._build_oot_dsa_kv_pool = partial(
+            KVCacheConfigurator._build_oot_dsa_kv_pool, fake
+        )
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+            self._Platform(None),
+        ):
+            pool = KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=True,
+                is_dsv4_model=False,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(4, 8)),
+            )
+        self.assertIs(pool, fake._build_dsa_kv_pool.return_value)
+        fake._build_dsa_kv_pool.assert_called_once_with(
+            max_total_num_tokens=256,
+            max_running_requests=4,
+            dsa_pool_class=DSATokenToKVPool,
+        )
+        # The TPU out-of-tree identity keeps its hook, which refuses DSA.
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                TpuOOTPlatform(),
+            ),
+            self.assertRaisesRegex(NotImplementedError, "SGLANG_PLATFORM=tpu"),
+        ):
+            fake._build_oot_dsa_kv_pool(
+                max_total_num_tokens=256,
+                max_running_requests=4,
+                dsa_pool_class=DSATokenToKVPool,
+            )
+
+    def test_allocator_defaults_to_the_in_tree_paged_allocator(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                self._Platform(None),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.PagedTokenToKVPoolAllocator"
+            ) as paged_allocator,
+        ):
+            allocator = KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                fake,
+                sizes=self._sizes(),
+                token_to_kv_pool=MagicMock(),
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=None,
+            )
+        paged_allocator.assert_called_once()
+        self.assertIs(allocator, paged_allocator.return_value)
+
+
 class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
     """The core OOT MLA builder passes index_head_dim, which no TPU MLA pool took,
     so every MLA model failed to build its KV pool under SGLANG_PLATFORM=tpu_oot."""
@@ -2190,6 +2512,94 @@ class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
                     fake, max_total_num_tokens=256, is_dsa_model=False
                 )
                 self.assertIsInstance(pool, pool_cls)
+
+
+class TestFusedDraftPricing(unittest.TestCase):
+    """A fused full-side entry (host + draft + pad) replaces both the
+    per-token full term and the per-draft-layer approximation in every solve:
+    charging both over-reserves, charging only the approximation under-reserves."""
+
+    def _make(self, fused_entry, draft_layers, **runner_kwargs):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(4)),
+            swa_attention_layer_ids=list(range(4, 12)),
+            swa_num_kv_heads=4,
+            page_size=1,
+            swa_full_tokens_ratio=0.5,
+            **runner_kwargs,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_layers
+        mr.fused_entry_bytes.side_effect = lambda name: (
+            fused_entry if name == "full" else None
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            return mr, create_memory_pool_configurator(mr)
+
+    def _expected_cell(self, cfg, full_term):
+        return (
+            full_term
+            + cfg._swa_per_token * cfg._draft_swa_full_layers_num
+            + cfg._swa_full_tokens_ratio * cfg._swa_per_token * cfg._swa_layers_num
+            + cfg._draft_cell_size
+        )
+
+    def test_fused_entry_replaces_full_and_draft_terms(self):
+        fused_entry = 54_321
+        _, cfg = self._make(fused_entry=fused_entry, draft_layers=2)
+        self.assertEqual(cfg._draft_full_layers_num, 0)
+        self.assertEqual(cfg._cell_size, self._expected_cell(cfg, fused_entry))
+
+    def _assert_unified_bytes_price_the_fused_entry(self, cfg, config, available):
+        """The unified pool's bytes buy every full token at the fused entry
+        (the factory divides by it) without leaving a full token unspent."""
+        fused_entry = cfg._fused_full_entry
+        swa_bytes = (
+            config.swa_max_total_num_tokens * cfg._swa_per_token * cfg._swa_layers_num
+        )
+        self.assertEqual(
+            config.unified_memory_pool_bytes,
+            config.full_max_total_num_tokens * fused_entry + swa_bytes,
+        )
+        self.assertLessEqual(config.unified_memory_pool_bytes, available)
+        self.assertGreater(
+            config.unified_memory_pool_bytes + 2 * fused_entry, available
+        )
+
+    def test_unified_solve_prices_the_fused_entry(self):
+        available = 50_000_000
+        _, cfg = self._make(
+            fused_entry=54_321, draft_layers=2, enable_unified_memory=True
+        )
+        config = cfg.calculate_pool_sizes(available, 1)
+        self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
+
+    def test_chunk_cap_solve_prices_the_fused_entry(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            SWARequestCapPoolConfigurator,
+        )
+
+        available = 50_000_000
+        _, cfg = self._make(
+            fused_entry=54_321,
+            draft_layers=2,
+            enable_unified_memory=True,
+            disable_radix_cache=True,
+            chunked_prefill_size=4,
+            sliding_window_size=8,
+            max_running_requests=2,
+        )
+        self.assertIsInstance(cfg, SWARequestCapPoolConfigurator)
+        config = cfg.calculate_pool_sizes(available, 1)
+        self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
 
 
 if __name__ == "__main__":

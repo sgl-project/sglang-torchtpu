@@ -10,6 +10,11 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    PageMajorMHATokenToKVPool,
+)
+from sglang.srt.mem_cache.page_interleave import make_page_shard_spec
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -57,6 +62,13 @@ def _load_configurator(**dependencies):
         "mambaish_config": lambda _: None,
         "hybrid_gdn_config": lambda _: None,
         "hybrid_kda_config": lambda _: None,
+        # Logical-page KV sharding stays off unless the parallel bag enables it.
+        "make_page_shard_spec": make_page_shard_spec,
+        # The hybrid full-attention pool choice branches on NPU first.
+        "_is_npu": False,
+        # The out-of-tree MHA build tells the in-tree pools from a platform's.
+        "MHATokenToKVPool": MHATokenToKVPool,
+        "PageMajorMHATokenToKVPool": PageMajorMHATokenToKVPool,
         **dependencies,
     }
     module = ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[]))
@@ -74,7 +86,7 @@ class TestMXINT8Configurator(CustomTestCase):
         self.addCleanup(override.restore)
         self.platform_pool = Mock(name="platform_pool")
         self.platform = SimpleNamespace(
-            get_mha_kv_pool_cls=Mock(return_value=self.platform_pool),
+            get_kv_pool_cls=Mock(return_value=self.platform_pool),
             is_cpu=lambda: False,
         )
         self.swa_pool = Mock(name="swa_pool")
@@ -200,14 +212,14 @@ class TestMXINT8Configurator(CustomTestCase):
                 self.assertIsNone(kvc.kv_group_size)
                 self.assertEqual(kvc._mxint8_pool_kwargs(), {})
                 self.assertIs(kvc._tpu_mha_pool_class(), self.platform_pool)
-        self.assertEqual(self.platform.get_mha_kv_pool_cls.call_count, 4)
+        self.assertEqual(self.platform.get_kv_pool_cls.call_count, 4)
 
     def test_validation_override_retains_default_group_and_platform_factory(self):
         with patch.object(self.configurator, "_validate_mxint8", return_value=None):
             kvc = self._make(kv_group_size=None)
         self.assertEqual(kvc.kv_group_size, 32)
         self.assertIs(kvc._tpu_mha_pool_class(), self.platform_pool)
-        self.platform.get_mha_kv_pool_cls.assert_called_once_with()
+        self.platform.get_kv_pool_cls.assert_called_once_with(kind="mha")
 
     def test_bare_int8_rejected_before_profiling(self):
         for name in (None, "auto", "bf16"):
@@ -254,17 +266,22 @@ class TestMXINT8Configurator(CustomTestCase):
                     (subpool["head_num"], subpool["head_dim"]), (heads, dim)
                 )
             kvc.mambaish_config = SimpleNamespace(full_attention_layer_ids=[0])
+            mla_pool, dsa_pool = Mock(name="mla_pool"), Mock(name="dsa_pool")
             kvc._build_hybrid_linear_kv_pool(
                 max_total_num_tokens=512,
                 req_to_token_pool=SimpleNamespace(mamba_pool=object()),
                 mha_pool_class=self.platform_pool,
+                mla_pool_class=mla_pool,
+                dsa_pool_class=dsa_pool,
             )
+            mla_pool.assert_not_called()
+            dsa_pool.assert_not_called()
             self.assertIs(
                 self.hybrid_pool.call_args.kwargs["full_kv_pool"],
                 backend_pool.return_value,
             )
             self.assertEqual(backend_pool.call_args.kwargs["layer_num"], 1)
-            self.platform.get_mha_kv_pool_cls.assert_not_called()
+            self.platform.get_kv_pool_cls.assert_not_called()
         self._assert_preflight_error()
 
 

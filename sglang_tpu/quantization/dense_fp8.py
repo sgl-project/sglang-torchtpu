@@ -6,6 +6,7 @@ import logging
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
 )
@@ -74,7 +75,8 @@ class TpuFp8LinearMethod(Fp8LinearMethod):
     def _block_scale_shape(layer, *, use_mxfp8, **shape):
         if use_mxfp8:
             return Fp8LinearMethod._block_scale_shape(layer, use_mxfp8=True, **shape)
-        return compute_tpu_fp8_linear_scale_shape(layer, **shape)
+        tp_rank, _ = get_group_rank_size(layer.tp_group)
+        return compute_tpu_fp8_linear_scale_shape(layer, tp_rank=tp_rank, **shape)
 
     def process_weights_after_loading(self, layer):
         super().process_weights_after_loading(layer)

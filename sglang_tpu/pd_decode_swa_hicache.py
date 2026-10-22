@@ -38,8 +38,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -432,16 +432,13 @@ def _match_prefix_and_lock(
     # Device and host hits stop at the window start. Prefill sends the window,
     # so decode reserves and restores only the prefix before it.
     match_end = swa_window_start + _bigram_boundary(queue.tree_cache)
-    result = match_prefix_for_req(
-        queue.tree_cache,
+    result = match_kv_cache(
         req,
+        queue.tree_cache,
         req.origin_input_ids[:match_end],
         cow_mamba=False,
-        include_req=True,
     )
-    req.lock_receipt = queue.tree_cache.inc_lock_ref(
-        result.last_device_node
-    ).to_dec_params()
+    req.lock = queue.tree_cache.lock(result.last_device_node)
     return queue._build_decode_prefix_match(req, result)
 
 
@@ -501,12 +498,12 @@ def _alloc_for_decode_prealloc(
 
 def _restore_rematch(
     upstream: Callable,
-    tree_cache: Any,
     req: Any,
+    tree_cache: Any,
     token_ids: Optional[Any] = None,
     **kwargs,
 ):
-    """Wraps ``match_prefix_for_req`` in the restore: keep the last page under EAGLE.
+    """Wraps ``match_kv_cache`` in the restore: keep the last page under EAGLE.
 
     Without the extra token the restore's re-match comes up one page short and
     the restore fails.
@@ -519,7 +516,7 @@ def _restore_rematch(
         # Upstream also caps the key at the decode prefix; widen it the same way.
         if kwargs.get("max_prefix_len") is not None:
             kwargs["max_prefix_len"] += boundary
-    return upstream(tree_cache, req, token_ids, **kwargs)
+    return upstream(req, tree_cache, token_ids, **kwargs)
 
 
 def _commit_hicache_local_restore_to_req(
@@ -536,8 +533,7 @@ def _commit_hicache_local_restore_to_req(
     if not (uses_full_only_host_cache(queue.tree_cache) and needs_restore):
         return
     req = decode_req.req
-    queue.tree_cache.dec_swa_lock_only(req.last_node, req.lock_receipt)
-    req.swa_prefix_lock_released = True
+    queue.tree_cache.release_swa(req.lock)
 
 
 def _gate_decode_restores(cache: Any) -> None:
@@ -666,7 +662,7 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
         (decode, "alloc_for_decode_prealloc", _alloc_for_decode_prealloc),
         # Under EAGLE the restore's re-match comes up one page short and the
         # restore fails, so add the token that covers the last page.
-        (decode_hicache_mixin, "match_prefix_for_req", _restore_rematch),
+        (decode_hicache_mixin, "match_kv_cache", _restore_rematch),
         # When the restore commits, also drop the SWA part of the request's
         # lock, since the SWA window comes from prefill.
         (

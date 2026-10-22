@@ -508,6 +508,7 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
             gate_up_layer.logical_widths = [192, 192]
             scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
                 gate_up_layer,
+                tp_rank=tp_rank,
                 input_size=256,
                 input_size_per_partition=256,
                 output_size=768,
@@ -538,6 +539,7 @@ class TestDsv4Mxfp4MoeWeights(CustomTestCase):
             down_layer.logical_widths = [256]
             scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
                 down_layer,
+                tp_rank=tp_rank,
                 input_size=384,
                 input_size_per_partition=192,
                 output_size=256,

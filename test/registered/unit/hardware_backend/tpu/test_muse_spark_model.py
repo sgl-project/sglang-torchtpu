@@ -1,4 +1,5 @@
-"""CPU tests for the Muse Spark TPU model's checkpoint mapping and config."""
+"""CPU tests for the Muse Spark TPU model's checkpoint mapping, config and
+attention construction."""
 
 import unittest
 
@@ -6,9 +7,12 @@ import torch
 
 from sglang.srt.configs.model_config import get_hybrid_layer_ids
 from sglang.srt.configs.muse_spark import MuseSparkConfig
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.models.muse_spark import (
+    MuseSparkAttention,
     MuseSparkInterleavedRope,
     _param_name,
     _to_interleaved_rope,
@@ -103,6 +107,41 @@ class TestMuseSparkConfig(CustomTestCase):
         swa, full = get_hybrid_layer_ids(config.architectures, text)
         self.assertEqual(swa, [0, 2])
         self.assertEqual(full, [1, 3])
+
+
+class TestMuseSparkAttentionConstruction(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        init_single_process_dist()
+        override = get_context().override_server_args(tp_size=1, device="cpu")
+        override.install()
+        cls.addClassCleanup(override.restore)
+
+    def test_projections_shard_over_attention_tp(self):
+        heads, kv_heads, head_dim, hidden = 4, 2, 32, 128
+        text = MuseSparkConfig(
+            text_config={
+                "hidden_size": hidden,
+                "head_dim": head_dim,
+                "num_attention_heads": heads,
+                "num_key_value_heads": kv_heads,
+                "num_hidden_layers": 2,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "layer_rope_theta": [500000.0, 0],
+                "mlp_layer_types": ["sparse"] * 2,
+            }
+        ).text_config
+        rope = MuseSparkInterleavedRope(head_dim, 64, 500000.0)
+        attn = MuseSparkAttention(text, 0, rope, prefix="model.layers.0.self_attn")
+        self.assertEqual(
+            tuple(attn.qkv_proj.weight.shape),
+            ((heads + 2 * kv_heads) * head_dim, hidden),
+        )
+        self.assertEqual(tuple(attn.gate_proj.weight.shape), (heads * head_dim, hidden))
+        self.assertEqual(tuple(attn.o_proj.weight.shape), (hidden, heads * head_dim))
+        # The local head counts come from attention TP, so the weights split there.
+        for proj in (attn.qkv_proj, attn.gate_proj, attn.o_proj):
+            self.assertEqual(proj.parallel_group, "attn_tp")
 
 
 if __name__ == "__main__":

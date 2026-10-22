@@ -46,12 +46,13 @@ _MAX_NEW_TOKENS = 16
 # Generous: the first probe is a cold prefill on a freshly compiled server.
 _REQUEST_TIMEOUT = 900
 
-# Under overlap scheduling, a request that finishes is still in the next forward's
-# batch, which writes the KV of its last token. When prompt plus output is a page
-# multiple, that slot completes a page that release inserts into the radix tree and
-# write-through backs up to host while the forward may still be writing it. Every
-# tail request is sized that way; whether a given backup reads the page early is
-# timing, so several requests each get a chance.
+# A request's last output token has KV only if a later forward takes it as input,
+# and the scheduler skips the decode step that would only do that for a request
+# finishing by length. Its committed KV is every token before that one. When those
+# fill whole pages, release inserts the last of them into the radix tree and
+# write-through backs it up to host, possibly while a forward is still writing it.
+# Every tail request is sized that way; whether a given backup reads the page early
+# is timing, so several requests each get a chance.
 _TAIL_REQUESTS = 8
 # A prefix match is capped one token short of the input and floored to a page, so
 # a replay of only the committed tokens would recompute the tail page instead of
@@ -258,8 +259,9 @@ def spec_failures(*, probe: KvOffloadProbe) -> List[str]:
 def tail_shapes(*, page_size: int) -> List[Tuple[int, int]]:
     """``(prompt_tokens, max_new_tokens)`` for each decode-tail request.
 
-    Each pair sums to a page multiple. The output lengths differ, so the requests
-    finish on different decode steps and their backups are separate exposures.
+    Each pair, less the last output token, sums to a page multiple. The output
+    lengths differ, so the requests finish on different decode steps and their
+    backups are separate exposures.
     """
     # Keeps a replay from completing a page of its own, which would add tree and
     # host state the eviction plan does not count.
@@ -270,7 +272,8 @@ def tail_shapes(*, page_size: int) -> List[Tuple[int, int]]:
     shapes = []
     for i in range(_TAIL_REQUESTS):
         max_new_tokens = page_size // 2 + i
-        shapes.append(((2 + i % 2) * page_size - max_new_tokens, max_new_tokens))
+        prompt_tokens = (2 + i % 2) * page_size - max_new_tokens + 1
+        shapes.append((prompt_tokens, max_new_tokens))
     return shapes
 
 
@@ -290,7 +293,7 @@ def tail_failures(*, tails: Sequence[TailReplay]) -> List[str]:
                 f"decode tail {i}: the device replay matched {device.device_tokens} "
                 f"device and {device.host_tokens} host tokens, expected all "
                 f"{committed} committed tokens on device, so the tail page was not "
-                "in the tree and nothing was checked (is overlap scheduling on?)"
+                "in the tree and nothing was checked"
             )
         elif host.device_tokens or host.host_tokens != committed:
             failures.append(
@@ -469,7 +472,8 @@ def run_probe(
                 f"decode tail {i} generated {len(out.output_ids)} tokens, expected "
                 f"{max_new_tokens}"
             )
-        return ids + list(out.output_ids)
+        # The last output token never had KV written (see _TAIL_REQUESTS).
+        return ids + list(out.output_ids)[:-1]
 
     def replay(committed: List[int]) -> CacheObservation:
         return generate(
@@ -553,7 +557,7 @@ def kv_offload_runner(
     ``hicache_ratio`` must leave enough host capacity for the probe and fillers.
     ``spec_decoding`` additionally enables the speculative-decoding checks.
     ``decode_tails`` additionally checks that host copies of page-aligned decode
-    KV match the device; it needs overlap scheduling.
+    KV match the device.
     """
     if decode_tails and (spec_decoding or dp_size != 1):
         raise ValueError(
@@ -566,7 +570,7 @@ def kv_offload_runner(
         device_pool_tokens=device_pool_tokens,
         probe_tokens=probe_tokens,
         hicache_ratio=hicache_ratio,
-        tail_tokens=sum(map(sum, shapes)),
+        tail_tokens=sum(prompt + new - 1 for prompt, new in shapes),
     )
 
     if dp_size < 1:

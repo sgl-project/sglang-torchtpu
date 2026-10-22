@@ -157,7 +157,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
             pending_bootstrap=False,
             host_hit_length=0,
             early_send_prefix_end=None,
-            extend_range=None,
+            extend_end=None,
             start_send_idx=0,
             kv=kv,
             owned_kv_len=lambda: kv.kv_committed_len,
@@ -165,21 +165,21 @@ class TestChunkSendsStayOwned(CustomTestCase):
             refresh_fill_ids=lambda: None,
             disagg_kv_sender=_Sender(self.blocks),
         )
-        req.get_fill_ids = lambda: req.full_untruncated_fill_ids[: req.extend_range.end]
+        req.get_fill_ids = lambda: req.full_untruncated_fill_ids[: req.extend_end]
         return req
 
     def _match_and_lock(self, req):
         result = self.cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", req.origin_input_ids)))
         )
-        req.prefix_indices = result.device_indices
+        req.prefix_len = result.device_prefix_len
         req.last_node = result.last_device_node
         req.swa_branching_seqlen = result.swa_branching_seqlen
-        req.kv.cache_protected_len = len(result.device_indices)
-        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        req.swa_prefix_lock_released = False
-        self.pool.req_to_token[req.kv.req_pool_idx, : len(req.prefix_indices)] = (
-            req.prefix_indices
+        req.kv.cache_protected_len = result.device_prefix_len
+        req.lock = self.cache.lock(req.last_node)
+        prefix_indices = self.cache.prefix_device_indices(req)
+        self.pool.req_to_token[req.kv.req_pool_idx, : len(prefix_indices)] = (
+            prefix_indices
         )
         return result
 
@@ -194,7 +194,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
         )
         self.assertIsNotNone(slots)
         row[start:end] = slots
-        req.extend_range = SimpleNamespace(start=start, end=end)
+        req.extend_end = end
         req.kv.kv_committed_len = req.kv.kv_allocated_len = end
         return slots.long()
 
@@ -231,7 +231,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
         # Full hit reaches 16, so the branch cap sits inside chunk 2.
         x = self._req("x", 1, TOKENS)
         match = self._match_and_lock(x)
-        self.assertEqual(len(match.device_indices), 0)
+        self.assertEqual(match.device_prefix_len, 0)
         self.assertEqual(x.swa_branching_seqlen, 16)
 
         # Overlap loop, chunks of 12: form batch k+1 (checkpoint chunk k, then
@@ -254,7 +254,7 @@ class TestChunkSendsStayOwned(CustomTestCase):
         self.assertEqual(y.kv.cache_protected_len, 16)
         self._alloc_chunk(y, 16, 24)
         y.finished = lambda: True
-        release_kv_cache(y, self.cache)
+        release_kv_cache(y, self.cache, checkpoint=True)
 
         # X's next checkpoint dedups [16, 24) against the sibling's leaf.
         self._checkpoint(x, 36)

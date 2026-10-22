@@ -6,7 +6,6 @@ from typing import Callable, List, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -17,6 +16,8 @@ from sglang.srt.mem_cache.allocation import (
     get_last_loc,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import get_global_server_args
@@ -86,6 +87,9 @@ class EagleVerifyInput(SpecInput):
     draft_probs: torch.Tensor = None
     prepared_out_cache_loc: Optional[torch.Tensor] = None
     prepared_mrope_positions: Optional[torch.Tensor] = None
+    # The iteration's plan when the draft planned the verify window
+    # (`prepared_out_cache_loc`); verify and draft extend take it.
+    kv_loc_plan: Optional[KVLocPlan] = None
 
     # TPU-selected KV locations for this verification.
     device_accept_cache_locs: Optional[torch.Tensor] = None
@@ -140,13 +144,19 @@ class EagleVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        translator: KVIndexTranslator,
+        plan: KVLocPlan,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the translator packs the read ids straight into
+        ``kv_indices``."""
         device = req_pool_indices.device
-        batch_size = len(req_pool_indices)
+        batch_size = req_pool_indices.numel()
         qo_indptr = torch.arange(
             0,
             (1 + batch_size) * self.draft_token_num,
@@ -161,19 +171,15 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
-            dtype=torch.int32,
-            device=device,
-        )
-        create_flashinfer_kv_indices_triton[(batch_size,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+        total_tokens = paged_kernel_lens_sum + self.draft_token_num * batch_size
+        kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        translator.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            out=kv_indices,
+            kind=kind,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -1064,11 +1070,16 @@ class EagleDraftExtendInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: Optional[int],
-        req_to_token: torch.Tensor,
+        translator: KVIndexTranslator,
+        plan: KVLocPlan,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
+        """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
+        draft-extend window."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
@@ -1089,14 +1100,13 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+        translator.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            out=kv_indices,
+            kind=kind,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 

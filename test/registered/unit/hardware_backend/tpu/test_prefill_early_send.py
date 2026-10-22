@@ -131,7 +131,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((8, num_slots), dtype=torch.int32)
         )
-        self.tree_cache = SimpleNamespace(supports_prefix_sharing=lambda: True)
+        self.tree_cache = SimpleNamespace(
+            supports_prefix_sharing=lambda: True,
+        )
         self.tpu_inflight_kv_write_page_ids: Optional[torch.Tensor] = None
 
 
@@ -146,12 +148,13 @@ def _req(rid: str, pool_idx: int, sender, input_len: int, prefix_indices=None):
         ),
         origin_input_ids=list(range(input_len)),
         prefix_indices=prefix_indices,
+        prefix_len=len(prefix_indices),
         host_hit_length=0,
         start_send_idx=0,
         pending_bootstrap=False,
         skip_radix_cache_insert=False,
         early_send_prefix_end=None,
-        extend_range=None,
+        extend_end=None,
         disagg_kv_sender=sender,
     )
 
@@ -182,7 +185,7 @@ class _Harness:
 
     def write_chunk(self, req, start: int, end: int, pages: List[int]) -> None:
         """prepare_for_extend: allocate ``pages`` for positions [start, end)."""
-        req.extend_range = _Range(start, end)
+        req.prefix_len, req.extend_end = start, end
         # A trailing partial page holds only the range's tokens.
         self.s.req_to_token_pool.req_to_token[req.kv.req_pool_idx, start:end] = _slots(
             pages
@@ -192,7 +195,12 @@ class _Harness:
         batch = (
             None
             if batch_reqs is None
-            else SimpleNamespace(reqs=batch_reqs, hicache_load_page_ids=None)
+            else SimpleNamespace(
+                reqs=batch_reqs,
+                prefix_lens=[r.prefix_len for r in batch_reqs],
+                extend_lens=[r.extend_end - r.prefix_len for r in batch_reqs],
+                hicache_load_page_ids=None,
+            )
         )
         if batch is not None:
             # run_batch: early send while the previous forward is still
@@ -205,7 +213,7 @@ class _Harness:
                 for p in (
                     self.s.req_to_token_pool.req_to_token[
                         req.kv.req_pool_idx,
-                        req.extend_range.start : req.extend_range.end,
+                        req.prefix_len : req.extend_end,
                     ]
                     // PAGE_SIZE
                 ).tolist()
@@ -218,9 +226,7 @@ class _Harness:
         # modelled the same way, up to its last full page.
         for req, chunk_end in self.pending:
             self.s.send_kv_chunk(req, last_chunk=False, end_idx=chunk_end)
-        self.pending = (
-            [] if batch is None else [(r, r.extend_range.end) for r in batch.reqs]
-        )
+        self.pending = [] if batch is None else [(r, r.extend_end) for r in batch.reqs]
         if (
             prefill._is_tpu
             and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
@@ -234,6 +240,7 @@ class _Harness:
             req.kv.req_pool_idx, :upto
         ].to(torch.int64)
         req.kv.cache_protected_len = upto
+        req.prefix_len = upto
 
     def sends_of(self, rid: str) -> List[List[int]]:
         return [pages for r, pages, _ in self.log if r == rid]
@@ -438,6 +445,8 @@ class TestCollectPrefillWritePageIds(CustomTestCase):
     def _write_page_ids(self, scheduler, reqs):
         return _collect_prefill_write_page_ids(
             reqs=reqs,
+            prefix_lens=[r.prefix_len for r in reqs],
+            extend_lens=[(r.extend_end or r.prefix_len) - r.prefix_len for r in reqs],
             req_to_token_table=scheduler.req_to_token_pool.req_to_token,
             page_size=PAGE_SIZE,
         )
@@ -445,12 +454,14 @@ class TestCollectPrefillWritePageIds(CustomTestCase):
     def test_covers_every_extend_range(self):
         s = _Scheduler(enable_overlap=True)
         r1 = SimpleNamespace(
-            kv=SimpleNamespace(req_pool_idx=1), extend_range=_Range(0, 8)
+            kv=SimpleNamespace(req_pool_idx=1), prefix_len=0, extend_end=8
         )
         r2 = SimpleNamespace(
-            kv=SimpleNamespace(req_pool_idx=2), extend_range=_Range(4, 6)
+            kv=SimpleNamespace(req_pool_idx=2), prefix_len=4, extend_end=6
         )
-        r3 = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=3), extend_range=None)
+        r3 = SimpleNamespace(
+            kv=SimpleNamespace(req_pool_idx=3), prefix_len=0, extend_end=None
+        )
         s.req_to_token_pool.req_to_token[1, :8] = _slots([5, 7]).to(torch.int32)
         s.req_to_token_pool.req_to_token[2, 4:6] = torch.tensor(
             [9, 10], dtype=torch.int32
@@ -463,7 +474,7 @@ class TestCollectPrefillWritePageIds(CustomTestCase):
         # A chunk starting mid-page still writes that page.
         s = _Scheduler(enable_overlap=True)
         req = SimpleNamespace(
-            kv=SimpleNamespace(req_pool_idx=1), extend_range=_Range(2, 9)
+            kv=SimpleNamespace(req_pool_idx=1), prefix_len=2, extend_end=9
         )
         s.req_to_token_pool.req_to_token[1, :12] = _slots([3, 6, 8]).to(torch.int32)
         self.assertEqual(self._write_page_ids(s, [req]).tolist(), [3, 6, 8])
@@ -505,16 +516,24 @@ class TestHiCacheLoadPageIds(CustomTestCase):
 class TestUpdateInflightKvWritePages(CustomTestCase):
     def _batch(self, s, hicache_load_page_ids=None):
         req = SimpleNamespace(
-            kv=SimpleNamespace(req_pool_idx=1), extend_range=_Range(0, 8)
+            kv=SimpleNamespace(req_pool_idx=1), prefix_len=0, extend_end=8
         )
         s.req_to_token_pool.req_to_token[1, :8] = _slots([5, 7]).to(torch.int32)
-        return SimpleNamespace(reqs=[req], hicache_load_page_ids=hicache_load_page_ids)
+        return SimpleNamespace(
+            reqs=[req],
+            prefix_lens=[0],
+            extend_lens=[8],
+            hicache_load_page_ids=hicache_load_page_ids,
+        )
 
     def test_tracks_the_launched_batch(self):
         s = _Scheduler(enable_overlap=True)
         s.tpu_inflight_kv_write_page_ids = torch.tensor([1])
         with _platform(is_tpu=True):
-            tpu_update_inflight_kv_write_pages(s, self._batch(s))
+            prepared = self._batch(s)
+            # Progress can advance after launch; the prepared write range stays fixed.
+            prepared.reqs[0].prefix_len, prepared.reqs[0].extend_end = 8, 12
+            tpu_update_inflight_kv_write_pages(s, prepared)
         self.assertEqual(s.tpu_inflight_kv_write_page_ids.tolist(), [5, 7])
 
     def test_tracks_the_launched_batch_hicache_load_pages(self):
@@ -554,6 +573,9 @@ class TestMaybeSendCachedPrefixChunk(CustomTestCase):
             pending_bootstrap=False,
             early_send_prefix_end=None,
         )
+        req.prefix_len = 8
+        req.kv = SimpleNamespace(req_pool_idx=1)
+        scheduler.req_to_token_pool.req_to_token[1, :8] = _slots([1, 2]).to(torch.int32)
         with _platform(is_tpu=is_tpu):
             scheduler.maybe_send_cached_prefix_chunk(
                 req, hicache_load_page_ids=hicache_load_page_ids
@@ -712,6 +734,8 @@ class TestEarlySendSkipsHiCacheLoadPages(CustomTestCase):
         a.host_hit_length = 2 * PAGE_SIZE
         batch = SimpleNamespace(
             reqs=[a, b],
+            prefix_lens=[16, 16],
+            extend_lens=[4, 4],
             hicache_load_page_ids=hicache_load_page_ids,
             extend_num_tokens=0,
             forward_mode=Mock(

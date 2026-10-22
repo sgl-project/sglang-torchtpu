@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
-    MAX_PREFIX_MATCHED_WAITING_REQS,
+    WAITING_QUEUE_PREFIX_MATCH_MAX,
     AddReqResult,
     PrefillAdder,
 )
@@ -55,7 +55,7 @@ def req(tokens, prefix=0, rid="r"):
         rid=rid,
         origin_input_ids=[0] * tokens,
         output_ids=[],
-        prefix_indices=[0] * prefix,
+        prefix_len=prefix,
         num_matched_prefix_tokens=0,
         full_untruncated_fill_ids=[0] * tokens,
         needs_host_load_back=lambda: False,
@@ -78,7 +78,7 @@ class Cache:
 
     def match_prefix(self, params):
         self.limits.append(params.key.limit)
-        return NS(device_indices=[0] * self.matched, host_hit_length=self.host)
+        return NS(device_prefix_len=self.matched, host_hit_length=self.host)
 
 
 def adder(model=None):
@@ -141,7 +141,7 @@ def test_waiting_request_matches_are_capped_per_step():
     waiting = [req(65536 + 256, rid=str(i)) for i in range(600)]
     sched = scheduler(waiting, matched=65536)
     assert pending_step_limit(sched) == 16384
-    assert len(sched.tree_cache.limits) == MAX_PREFIX_MATCHED_WAITING_REQS
+    assert len(sched.tree_cache.limits) == WAITING_QUEUE_PREFIX_MATCH_MAX
 
 
 def test_a_waiting_request_is_matched_once():
@@ -211,7 +211,7 @@ def test_finished_request_leaves_budget_for_next_request(monkeypatch):
     def admit(self, *, req, **_):
         tokens = len(req.full_untruncated_fill_ids)
         assert tokens <= self.rem_chunk_tokens
-        req.extend_range = NS(length=tokens)
+        req.extend_len = tokens
         self.can_run_list.append(req)
         self.rem_chunk_tokens -= tokens
         return self.budget_state()
@@ -257,7 +257,7 @@ def test_host_prefix_is_included_before_chunk_is_sized():
 
 def test_new_partial_request_stops_admission(monkeypatch):
     def admit(self, *, req, **_):
-        req.extend_range = NS(length=self.rem_chunk_tokens)
+        req.extend_len = self.rem_chunk_tokens
         self.can_run_list.append(req)
         self.new_chunked_req = req
         self.rem_chunk_tokens = 0
@@ -320,7 +320,7 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     request.cache_request_handle = CacheRequestHandle(request.rid, 0)
     request.origin_input_ids = [0] * tokens
     request.output_ids = []
-    request.prefix_indices = []
+    request.prefix_len = 0
     request.full_untruncated_fill_ids = [0] * tokens
     request.sampling_params = NS(ignore_eos=False, max_new_tokens=16)
     request.retracted_stain = False
@@ -330,9 +330,8 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     request.fulfilled_storage_hit_len.return_value = 0
     request.needs_host_load_back.return_value = False
     request.last_node = None
-    request.set_extend_range.side_effect = lambda start, end: setattr(
-        request, "extend_range", NS(length=end - start)
-    )
+    request.extend_end = None
+    type(request).extend_len = Req.extend_len
     # Called the way the scheduler calls every prefill adder.
     assert (
         obj.add_one_req(
@@ -345,7 +344,7 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     )
     assert obj.can_run_list == [request]
     assert obj.new_chunked_req is None
-    assert request.extend_range.length == tokens
+    assert request.extend_len == tokens
     assert obj.step_tokens == tokens
     assert obj.rem_chunk_tokens == 16384 - obj.ceil_paged_tokens(tokens)
 

@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
 )
+from sglang.srt.mem_cache.common import match_kv_cache
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -64,12 +64,12 @@ class DecodeHiCachePreallocMixin:
     def _build_decode_prefix_match(
         self, req: Req, result: Any, *, max_prefix_len: Optional[int] = None
     ) -> DecodePrefixMatch:
-        """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
+        """Convert a ``match_kv_cache`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
         HiCache is enabled and the last host node is backed up.
         """
-        prefix_indices = result.device_indices
+        prefix_indices = self.tree_cache.prefix_device_indices(req)
         l1_prefix_len = len(prefix_indices)
         l2_host_hit_length = result.host_hit_length
 
@@ -159,14 +159,12 @@ class DecodeHiCachePreallocMixin:
         return sum(
             dr.prefix_match.restore_token_count
             for dr in self.transfer_queue.queue
-            if dr.prefix_match is not None
-            and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
-            and dr.hicache_restored_node is None
+            if dr.prefix_match is not None and dr.hicache_restore_lock is None
         )
 
 
 class HiCacheRestoreGatedKVReceiver:
-    """Wraps a kv_receiver so KVPoll.Success is gated on HiCache restore READY."""
+    """Wraps a kv_receiver so the HiCache restore outcome enters the KV poll."""
 
     def __init__(self, decode_req: DecodeRequest):
         self.decode_req = decode_req
@@ -198,11 +196,12 @@ class HiCacheRestoreGatedKVReceiver:
 
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
-        if (
-            poll == KVPoll.Success
-            and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
-        ):
-            return KVPoll.Transferring
+        if poll == KVPoll.Success:
+            restore_status = self.decode_req.hicache_restore_status
+            if restore_status == HiCacheRestoreResult.PENDING:
+                return KVPoll.Transferring
+            if restore_status == HiCacheRestoreResult.FAILED:
+                return KVPoll.Failed
         return poll
 
 
@@ -217,19 +216,14 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.finish(
                 decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
             )
-        if decode_req.hicache_restored_node is not None:
-            self.tree_cache.dec_lock_ref(
-                decode_req.hicache_restored_node,
-                decode_req.hicache_restore_lock_receipt,
-            )
-            decode_req.hicache_restored_node = None
-            decode_req.hicache_restore_lock_receipt = None
+        self.tree_cache.unlock(decode_req.hicache_restore_lock)
+        decode_req.hicache_restore_lock = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
 
-        On success, ``dr.hicache_restored_node`` and ``hicache_restored_kv_indices``
-        are populated, and an inc_lock_ref is held until commit/abort.
+        On success, ``dr.hicache_restore_lock`` and ``hicache_restored_kv_indices``
+        are populated; the lock is held until commit/abort.
         Trivial cases (all-on-device / no needed coverage) auto-flip to READY.
         Failback paths flip to FAILED.
         """
@@ -241,19 +235,15 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
-        # Re-match: req.last_node / prefix_indices updated to current device state.
-        # Look up only the first decode_prefix_len tokens, the ones decode told
-        # prefill it already holds. Prefill sends the rest, and admission reserved
-        # device slots only for these tokens.
-        rematch = match_prefix_for_req(
-            self.tree_cache,
+        # Restore only the prefix decode advertised and reserved device slots for.
+        rematch = match_kv_cache(
             dr.req,
+            self.tree_cache,
             dr.req.origin_input_ids[: pm.decode_prefix_len],
             cow_mamba=False,
-            include_req=True,
             max_prefix_len=pm.decode_prefix_len,
         )
-        new_indices, restored_node = self.tree_cache.init_load_back(
+        loaded_len, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
@@ -261,19 +251,16 @@ class DecodeHiCacheTransferMixin:
             )
         )
         # The rematch repointed req.last_node to feed init_load_back's device
-        # boundary, but the prealloc lock and the receipt on the req still
-        # belong to pm.last_device_node; restore the pairing so any release
-        # before the commit hands over the restored lock hits the right node
-        # (the receipt's anchor makes a mispaired release assert).
+        # boundary; point it back at the prefix the prealloc matched and locked.
         dr.req.last_node = pm.last_device_node
         # Failback: total coverage < required prefix means device alloc likely failed.
-        if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+        if rematch.device_prefix_len + loaded_len < pm.decode_prefix_len:
             logger.warning(
                 "HiCache load_back failed for rid=%s: device_indices=%d, "
                 "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
                 dr.req.rid,
-                len(rematch.device_indices),
-                len(new_indices),
+                rematch.device_prefix_len,
+                loaded_len,
                 pm.decode_prefix_len,
                 pm.l1_prefix_len,
                 pm.l2_host_hit_length,
@@ -282,15 +269,13 @@ class DecodeHiCacheTransferMixin:
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
 
-        dr.hicache_restored_kv_indices = torch.cat(
-            [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )[: pm.restore_token_count]
-        dr.hicache_restored_node = restored_node
-        dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
+        # The load published its span: the restored path holds the whole prefix.
+        dr.hicache_restored_kv_indices = self.tree_cache.path_device_indices(
             restored_node
-        ).to_dec_params()
+        )[pm.l1_prefix_len : pm.decode_prefix_len]
+        dr.hicache_restore_lock = self.tree_cache.lock(restored_node)
 
-        if len(new_indices) == 0:
+        if loaded_len == 0:
             # Whole prefix already on device; no DMA needed.
             dr.hicache_restore_status = HiCacheRestoreResult.READY
             return False
@@ -312,7 +297,7 @@ class DecodeHiCacheTransferMixin:
         # Phase A: advance in-flight DMAs to READY.
         for dr in active:
             if (
-                dr.hicache_restored_node is not None
+                dr.hicache_restore_lock is not None
                 and self.tree_cache.is_load_back_event_done(
                     dr.hicache_load_consumer_index
                 )
@@ -325,8 +310,7 @@ class DecodeHiCacheTransferMixin:
         queued = [
             dr
             for dr in active
-            if dr.hicache_restored_node is None
-            and self._try_hicache_queue_load_back(dr)
+            if dr.hicache_restore_lock is None and self._try_hicache_queue_load_back(dr)
         ]
         if not queued:
             return
@@ -346,16 +330,9 @@ class DecodeHiCacheTransferMixin:
             return
 
         req = decode_req.req
-        restored_node = decode_req.hicache_restored_node
-        restored_lock_receipt = decode_req.hicache_restore_lock_receipt
-        assert restored_node is not None
-        assert restored_lock_receipt is not None
-        # Release preallocation before installing the restored lock receipt.
-        self.tree_cache.dec_lock_ref(
-            prefix_match.last_device_node,
-            req.lock_receipt,
-            skip_swa=req.swa_prefix_lock_released,
-        )
+        restore_lock = decode_req.hicache_restore_lock
+        assert restore_lock is not None
+        self.tree_cache.unlock(req.lock)
 
         self.tree_cache.req_to_token_pool.write(
             (
@@ -364,12 +341,8 @@ class DecodeHiCacheTransferMixin:
             ),
             decode_req.hicache_restored_kv_indices,
         )
-        req.prefix_indices = torch.cat(
-            [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
-        )
-        req.last_node = restored_node
-        req.lock_receipt = restored_lock_receipt
-        req.swa_prefix_lock_released = False
+        req.prefix_len = prefix_match.decode_prefix_len
+        req.last_node = restore_lock.node
+        req.lock = restore_lock
         # Prevent abort cleanup from releasing the transferred lock.
-        decode_req.hicache_restored_node = None
-        decode_req.hicache_restore_lock_receipt = None
+        decode_req.hicache_restore_lock = None

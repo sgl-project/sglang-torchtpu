@@ -13,7 +13,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
@@ -77,11 +76,9 @@ def insert(cache, token_ids):
 
 
 def match_len(cache, token_ids) -> int:
-    return len(
-        cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-        ).device_indices
-    )
+    return cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+    ).device_prefix_len
 
 
 def register(cache, token_ids, session_id, generation=None):
@@ -123,10 +120,12 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         cache.sanity_check()
 
     def test_swa_lock_release_on_streaming_session_node_is_a_noop(self):
-        """A later streaming-session turn locks the slot's virtual node; releasing
-        its SWA lock must be a no-op like its other locks, not a tree lookup."""
-        node = SessionSlot().virtual_node
-        self.cache.dec_swa_lock_only(node, DecLockRefParams())
+        """A later streaming-session turn locks the slot's virtual node, which
+        takes no tree lock; releasing its SWA part is then a no-op, not a tree
+        lookup."""
+        lock = self.cache.lock(SessionSlot().virtual_node)
+        self.assertIsNone(lock)
+        self.cache.release_swa(lock)
         self.cache.sanity_check()
 
     def test_register_and_release_update_full_component_reference(self):

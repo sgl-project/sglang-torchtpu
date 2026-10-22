@@ -285,6 +285,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         hidden_states=object(), mm_input_embeds=None
                     ),
                     next_token_ids=object(),
+                    kv_loc_plan=None,
                 )
                 verify_input = object()
 
@@ -310,7 +311,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         self.assertEqual(kwargs["grammar_barrier"], "grammar")
                     return result
 
-                def extend(current, *args):
+                def extend(current, *args, **kwargs):
                     record("draft_extend", current)
                     return object()
 

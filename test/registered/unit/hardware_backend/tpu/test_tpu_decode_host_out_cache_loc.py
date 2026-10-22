@@ -100,6 +100,7 @@ def _page_allocators(allocator):
 
 def _batch(allocator, pool, seq_lens, rows, device):
     return SimpleNamespace(
+        device=device,
         maybe_evict_swa=lambda: None,
         seq_lens_cpu=seq_lens,
         seq_lens=seq_lens.to(device),

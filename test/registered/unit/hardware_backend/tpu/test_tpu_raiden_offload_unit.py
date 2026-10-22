@@ -1148,6 +1148,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
+        mgr.pp_size = 1
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr._timeout_s = 120.0
@@ -1965,6 +1966,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.kv_args = Mock(page_size=128)
         mgr.attn_tp_rank = 1
         mgr.attn_tp_size = 8
+        mgr.pp_size = 1
         mgr._local_rank = 1
         mgr._timeout_s = 5
         mgr._transfer_parallelism = 4
@@ -2791,6 +2793,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._prefill = PrefillState(announce_pages=1)
         mgr._decode = None
         mgr.attn_tp_rank = 0
+        mgr.pp_size = 1
         mgr._state_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._aborted = {}

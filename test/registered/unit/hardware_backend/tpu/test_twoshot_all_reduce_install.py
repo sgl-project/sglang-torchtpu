@@ -6,6 +6,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,7 +27,8 @@ class _Row(RowParallelLinear):
         output_size=8192,
     ):
         torch.nn.Module.__init__(self)
-        self.tp_size = tp_size
+        # Layers keep their TP group; rank and size are read from it.
+        self.tp_group = SimpleNamespace(rank_in_group=0, world_size=tp_size)
         self.bias = bias
         self.reduce_results = reduce_results
         self.use_dp_attention_reduce = dp_attention

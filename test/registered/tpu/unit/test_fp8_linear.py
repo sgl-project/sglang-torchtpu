@@ -320,6 +320,7 @@ class TestTpuFp8Linear(CustomTestCase):
             layer.logical_widths = [192, 192]
             scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
                 layer,
+                tp_rank=tp_rank,
                 input_size=256,
                 input_size_per_partition=256,
                 output_size=768,
@@ -357,6 +358,7 @@ class TestTpuFp8Linear(CustomTestCase):
             layer.logical_widths = [256]
             scale_rows, scale_cols = compute_tpu_fp8_linear_scale_shape(
                 layer,
+                tp_rank=tp_rank,
                 input_size=384,
                 input_size_per_partition=192,
                 output_size=256,

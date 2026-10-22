@@ -61,6 +61,8 @@ if _is_cpu:
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -127,7 +129,10 @@ def prepare_for_draft_extend(
     return_hidden_states_before_norm: bool,
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
+    kv_loc_plan: Optional[KVLocPlan] = None,
 ):
+    """``kv_loc_plan``: the iteration's plan, whose window the draft extend
+    writes again (the verify window); a widened window plans its own."""
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
     # rows below the boundary. Locs/positions arrive precomputed; token/hidden
@@ -215,6 +220,7 @@ def prepare_for_draft_extend(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
         extend_position_info=extend_position_info,
+        kv_loc_plan=None if widen else kv_loc_plan,
     )
     if device_lens_only and not forward_batch.forward_mode.is_idle():
         # The query width is known without reading seq_lens back from the device.
@@ -258,15 +264,32 @@ def prepare_for_draft(
     draft_model_runner: ModelRunner,
     topk: int,
     num_steps: int,
-):
-
+    *,
+    target_translator: Optional[KVIndexTranslator] = None,
+    num_draft_tokens: Optional[int] = None,
+) -> tuple[ForwardBatch, bool, Optional[KVLocPlan]]:
+    """The draft-decode batch. With ``target_translator``, a chain draft plans
+    the iteration's whole write window (the ``num_draft_tokens`` slots past
+    ``seq_lens`` that verify and draft extend also write) and writes its first
+    ``num_steps`` columns; that plan is returned, else None."""
     prepared_positions = None
     prepared_mrope_positions = None
+    kv_loc_plan = None
     if not batch.forward_mode.is_idle():
         bs = len(batch.seq_lens)
 
         # Assign cache locations (draft-write targets).
         page_size = batch.token_to_kv_pool_allocator.page_size
+        plans_window = (
+            target_translator is not None
+            and topk == 1
+            and num_draft_tokens is not None
+            and num_draft_tokens > num_steps
+            and not _is_cpu
+        )
+        # A chain draft's slots lead the iteration's window: gather the whole
+        # window in the same launch.
+        window_cols = num_draft_tokens if plans_window else num_steps
         if _is_tpu and prepare_draft_cache_locs_tpu(
             batch,
             draft_input,
@@ -276,10 +299,10 @@ def prepare_for_draft(
             num_verify_tokens=get_spec().speculative_num_draft_tokens,
             host_resident=req_to_token_pool.host_resident,
         ):
-            pass
+            plans_window = False
         elif page_size == 1 or topk == 1:
             batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
+                (bs * topk * window_cols,),
                 dtype=torch.int64,
                 device=batch.device,
             )
@@ -309,11 +332,19 @@ def prepare_for_draft(
                     batch.seq_lens,
                     batch.out_cache_loc,
                     topk,
-                    num_steps,
+                    window_cols,
                     host_req_pool_indices=batch.req_pool_indices_cpu,
                     host_seq_lens=batch.seq_lens_cpu,
                     positions=prepared_positions,
                     mrope=prepared_mrope_positions,
+                )
+            if plans_window:
+                kv_loc_plan = target_translator.plan(
+                    req_pool_indices=batch.req_pool_indices,
+                    seq_lens=batch.seq_lens,
+                    seq_lens_cpu=batch.seq_lens_cpu,
+                    write_virtual=batch.out_cache_loc,
+                    read_extent=num_draft_tokens,
                 )
         else:
             # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
@@ -375,6 +406,8 @@ def prepare_for_draft(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
         spec_mrope_positions=prepared_mrope_positions,
+        kv_loc_plan=kv_loc_plan,
+        write_cols=None if kv_loc_plan is None else slice(0, num_steps),
     )
     # Evaluate graph eligibility on the normalized physical DP shape.
     if forward_batch.forward_mode.is_idle():
@@ -382,7 +415,7 @@ def prepare_for_draft(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    return forward_batch, can_run_decode_cuda_graph
+    return forward_batch, can_run_decode_cuda_graph, kv_loc_plan
 
 
 def build_eagle_verify_input(

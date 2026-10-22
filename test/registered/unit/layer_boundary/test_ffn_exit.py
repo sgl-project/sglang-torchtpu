@@ -230,7 +230,7 @@ class TestFfnExit(CustomTestCase):
         stream = ResidualStream()
         stream.residual = self.residual
         communicator.output.complete_now(
-            self.hidden_states, stream, self.forward_batch, summed_by_compute=True
+            self.hidden_states, stream, self.forward_batch, already_reduced=True
         )
 
         communicator.output._complete_now.assert_called_once()
@@ -241,12 +241,12 @@ class TestFfnExit(CustomTestCase):
         communicator = make_communicator(
             fuse=False, reduce_scatter=False, move_sums=True
         )
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(ValueError, "already-reduced output"):
             communicator.output.complete_now(
                 self.hidden_states,
                 ResidualStream(),
                 self.forward_batch,
-                summed_by_compute=True,
+                already_reduced=True,
             )
         communicator.output._complete_now.assert_not_called()
 

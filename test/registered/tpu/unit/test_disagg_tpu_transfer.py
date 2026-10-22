@@ -46,7 +46,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Range
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -1557,7 +1556,8 @@ class TestPrepareForPrebuiltTpuPadding(CustomTestCase):
                 req.kv = SimpleNamespace(req_pool_idx=1)
                 req.prefix_indices = list(range(10))
                 req.get_fill_ids = lambda: array("q", range(110))
-                req.extend_range = Range(10, 110)  # length = 100
+                req.prefix_len = 10
+                req.extend_len = 100
                 req.origin_input_ids = list(range(110))
                 req.output_ids = []
                 req.retracted_stain = False

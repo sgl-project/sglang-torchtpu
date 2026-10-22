@@ -81,14 +81,3 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
 
     def get_dispatch_key_name(self) -> str:
         return "npu"
-
-    def supports_fp8(self) -> bool:
-        # NPU quantization backends in hardware_backend/npu/quantization
-        return True
-
-    def support_cuda_graph(self) -> bool:
-        # NPUGraphRunner in hardware_backend/npu/graph_runner
-        return True
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        return False

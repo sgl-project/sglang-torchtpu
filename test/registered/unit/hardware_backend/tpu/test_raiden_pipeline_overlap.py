@@ -138,6 +138,10 @@ class Manager:
         self.bus = bus
         bus[f"tcp://{self.local_ip}:{self.rank_port}"] = name
 
+    def _finish_pp_bootstrap_locked(self, room):
+        # Bootstrap readiness is test_tpu_pp_bootstrap_consensus's subject.
+        pass
+
     def update_status(self, room, status):
         self.status[room] = status
 

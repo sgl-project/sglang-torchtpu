@@ -78,7 +78,7 @@ class TpuOOTPlatform(TpuSRTPlatform):
         )
 
     def get_mla_kv_pool_cls(self) -> type:
-        # kv_cache_configurator._build_oot_mla_kv_pool passes index_head_dim=None.
+        # kv_cache_configurator._build_oot_mla_kv_pool passes index_head_dim for DSA only.
         return _with_index_head_dim(super().get_mla_kv_pool_cls())
 
     def get_full_graph_backend_cls(self) -> None:

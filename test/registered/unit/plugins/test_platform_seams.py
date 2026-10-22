@@ -122,11 +122,11 @@ class TestTpuCapabilities(CustomTestCase):
             },
         )
 
-    def test_graph_flags_agree_with_the_legacy_methods(self):
-        platform = self.TpuOOTPlatform()
-        caps = platform.capabilities
-        self.assertEqual(caps.graph_capture, platform.support_cuda_graph())
-        self.assertEqual(caps.piecewise_graph, platform.support_piecewise_cuda_graph())
+    def test_tpu_declares_no_device_graphs(self):
+        # The capability record is the only graph-capture switch core reads.
+        caps = self.TpuOOTPlatform().capabilities
+        self.assertFalse(caps.graph_capture)
+        self.assertFalse(caps.piecewise_graph)
 
 
 class TestOotReplaceable(CustomTestCase):

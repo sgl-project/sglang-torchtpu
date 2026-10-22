@@ -1509,15 +1509,12 @@ class HiRadixCache(RadixCache):
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values, last_node
+                return len(loading_values), last_node
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return (
-            self._empty_match_result.device_indices,
-            last_node,
-        )
+        return 0, last_node
 
     def query_storage_hit_length(
         self,
@@ -1785,10 +1782,7 @@ class HiRadixCache(RadixCache):
             return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
-        if value:
-            value = torch.cat(value)
-        else:
-            value = self._empty_match_result.device_indices
+        device_prefix_len = sum(len(part) for part in value)
 
         host_hit_length = 0
         last_host_node = last_node
@@ -1799,7 +1793,7 @@ class HiRadixCache(RadixCache):
             last_host_node = last_host_node.parent
 
         return MatchResult(
-            device_indices=value,
+            device_prefix_len=device_prefix_len,
             last_device_node=last_node,
             last_host_node=last_host_node,
             # TODO(ispobock): use best_match_node as start node for load_back

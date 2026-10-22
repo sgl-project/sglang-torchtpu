@@ -12,6 +12,7 @@ from threading import Lock
 
 import torch
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.runtime_context import get_forward
@@ -71,13 +72,18 @@ def get_twoshot_all_reduce_op(world_size: int) -> Callable:
     return op
 
 
+def _tp_size(linear: RowParallelLinear) -> int:
+    """Ranks the linear's partial output is reduced over (its retained TP group)."""
+    return get_group_rank_size(linear.tp_group)[1]
+
+
 class TwoShotAllReduceLinear(torch.nn.Module):
     """A reducing, bias-free RowParallelLinear whose small all-reduces run two-shot."""
 
     def __init__(self, linear: RowParallelLinear) -> None:
         super().__init__()
         self.linear = linear
-        self.world_size = linear.tp_size
+        self.world_size = _tp_size(linear)
 
     def _fits(self, x: torch.Tensor) -> bool:
         """A non-empty 2-D payload under the size cap, outside forwards that
@@ -113,13 +119,13 @@ def install_twoshot_all_reduce(
         if name in names
         and isinstance(child, RowParallelLinear)
         and child.reduce_results
-        and child.tp_size == world_size > 1
+        and _tp_size(child) == world_size > 1
         and child.output_size % (128 * world_size) == 0
         and child.bias is None
         and not child.use_dp_attention_reduce
         and not child.use_decode_attn_tp
     ]
     for parent, name, child in swaps:
-        get_twoshot_all_reduce_op(child.tp_size)
+        get_twoshot_all_reduce_op(world_size)
         setattr(parent, name, TwoShotAllReduceLinear(child))
     return len(swaps)

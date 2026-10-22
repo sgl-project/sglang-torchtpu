@@ -225,9 +225,7 @@ class MuseSparkAttention(nn.Module):
         prefix: str,
     ):
         super().__init__()
-        parallel = get_parallel()
-        tp_size = parallel.attn_tp_size
-        tp_rank = parallel.attn_tp_rank
+        tp_size = get_parallel().attn_tp_size
         self.head_dim = config.head_dim
         self.num_heads = config.num_attention_heads // tp_size
         self.num_kv_heads = max(1, config.num_key_value_heads // tp_size)
@@ -243,8 +241,7 @@ class MuseSparkAttention(nn.Module):
             bias=False,
             quant_config=None,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
         )
         self.gate_proj = ColumnParallelLinear(
             input_size=config.hidden_size,
@@ -253,8 +250,7 @@ class MuseSparkAttention(nn.Module):
             gather_output=False,
             quant_config=None,
             prefix=add_prefix("gate_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
         )
         self.o_proj = RowParallelLinear(
             input_size=config.num_attention_heads * self.head_dim,
@@ -263,8 +259,7 @@ class MuseSparkAttention(nn.Module):
             reduce_results=True,
             quant_config=None,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
         )
         # Shared across layers; NoPE layers (theta 0) skip it.
         self.rotary_emb = rotary_emb if config.layer_rope_theta[layer_idx] > 0 else None

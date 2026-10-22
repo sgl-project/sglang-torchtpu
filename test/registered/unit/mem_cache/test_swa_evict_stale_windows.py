@@ -91,16 +91,18 @@ class PrefillWorld:
         self.rid += 1
         self.req_to_token_pool.alloc([req])
         req.init_next_round_input(tree_cache=self.cache)
-        req.lock_receipt = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        cached = len(req.prefix_indices)
+        req.lock = self.cache.lock(req.last_node)
+        cached = req.prefix_len
         row = req.kv.req_pool_idx
         if cached:
-            self.req_to_token_pool.write((row, slice(0, cached)), req.prefix_indices)
+            self.req_to_token_pool.write(
+                (row, slice(0, cached)), self.cache.prefix_device_indices(req)
+            )
         req.kv.kv_committed_len = req.kv.kv_allocated_len = cached
         pos = cached
         while pos < len(tokens):
             end = min(pos + chunk, len(tokens))
-            req.set_extend_range(pos, end)
+            req.extend_end = end
             self.req_to_token_pool.write((row, slice(pos, end)), self._alloc(end - pos))
             req.kv.kv_committed_len = req.kv.kv_allocated_len = end
             pos = end
@@ -110,7 +112,7 @@ class PrefillWorld:
         req.output_ids.append(7)
         checkpoint_kv_cache(req, self.cache)
         req.finished_reason = FINISH_LENGTH(length=0)
-        release_kv_cache(req, self.cache)
+        release_kv_cache(req, self.cache, checkpoint=True)
         return cached
 
     def match(self, tokens: list[int]):
@@ -172,7 +174,7 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
                 num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep
             )
         )
-        self.assertEqual(len(w.match(shared + _tokens(10, 200)).device_indices), 160)
+        self.assertEqual(w.match(shared + _tokens(10, 200)).device_prefix_len, 160)
         w.cache.sanity_check()
 
 

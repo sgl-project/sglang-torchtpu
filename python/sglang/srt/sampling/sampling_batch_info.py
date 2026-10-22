@@ -119,6 +119,11 @@ class SamplingBatchInfo:
     # device avoids a scalar synchronization in the per-token sampling path.
     npu_top_k_top_p_eligible: bool = False
 
+    # Host-side upper bound on every row's top_k, or None when some row samples
+    # from the whole vocabulary. Any value >= the true max stays exact, so
+    # filter_batch keeps it unchanged.
+    max_top_k: Optional[int] = None
+
     @classmethod
     def from_schedule_batch(
         cls,
@@ -282,6 +287,11 @@ class SamplingBatchInfo:
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             npu_top_k_top_p_eligible=all(
                 1 <= r.sampling_params.top_k <= 1024 for r in reqs
+            ),
+            max_top_k=(
+                max(r.sampling_params.top_k for r in reqs)
+                if reqs and all(1 <= r.sampling_params.top_k < TOP_K_ALL for r in reqs)
+                else None
             ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
@@ -626,6 +636,11 @@ class SamplingBatchInfo:
         if self.uniform_top_k != other.uniform_top_k:
             self.uniform_top_k = None
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
+        self.max_top_k = (
+            None
+            if self.max_top_k is None or other.max_top_k is None
+            else max(self.max_top_k, other.max_top_k)
+        )
 
         self.adjusted_merge_batch(other)
 

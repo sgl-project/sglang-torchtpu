@@ -234,7 +234,7 @@ def stage(fabric, rank, mode, schedule):
 
         return process
 
-    scheduler.process_bootstrapped_queue = released("bootstrap")
+    scheduler.process_bootstrapped_queue = Mock()
     scheduler.process_disagg_prefill_inflight_queue = released("transfer")
     scheduler.process_retract_queue = released("retract")
     scheduler.process_prealloc_queue = released("prealloc")

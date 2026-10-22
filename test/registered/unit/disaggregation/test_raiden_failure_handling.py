@@ -70,6 +70,7 @@ def _prefill_manager():
     """A prefill-mode RaidenKVManager with its room tables, no sockets or engine."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
     mgr.attn_tp_rank = 0
+    mgr.pp_size = 1
     mgr._prefill = PrefillState(announce_pages=1)
     mgr._decode = None
     mgr.disaggregation_mode = DisaggregationMode.PREFILL

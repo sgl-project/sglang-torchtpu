@@ -322,31 +322,63 @@ class TestExperimentalSpecHooks(CustomTestCase):
             hidden = torch.arange(2 * width * 4, dtype=torch.float32).view(-1, 4)
             tokens = torch.arange(2 * width).view(-1)
 
-            def sample_block(
-                logits, *, first_prev_tokens, hidden_states, sampler, collect_corrected
-            ):
-                torch.testing.assert_close(first_prev_tokens, torch.tensor([0, width]))
-                expected = hidden.view(2, width, 4)
-                if not anchor:
-                    expected = expected[:, 1:]
-                torch.testing.assert_close(hidden_states, expected)
-                return torch.stack(
-                    [sampler(logits[:, i], i) for i in range(2)], dim=1
-                ), None
+            seen = {"prev": [], "states": []}
+
+            class Head:
+                def init_state(self, hidden_states):
+                    seen["hidden"] = hidden_states
+                    return 0
+
+                def step_bias(self, prev_tokens, *, hidden_states, state):
+                    seen["prev"].append(prev_tokens)
+                    seen["states"].append(state)
+                    return torch.zeros(4), state + 1
 
             model = SimpleNamespace(
                 gamma=2,
                 sample_from_anchor=anchor,
                 compute_base_logits=lambda values: (values, None),
-                markov_head=SimpleNamespace(sample_block=sample_block),
+                markov_head=Head(),
             )
             result = DSparkDraftModel.sample_draft_tokens_tpu(model, hidden, tokens)
             torch.testing.assert_close(result, torch.full((2, 2), 3, dtype=torch.int64))
+            expected = hidden.view(2, width, 4)
+            if not anchor:
+                expected = expected[:, 1:]
+            torch.testing.assert_close(seen["hidden"], expected)
+            torch.testing.assert_close(seen["prev"][0], torch.tensor([0, width]))
+            # Each step reads the token drafted before it and the head's carried state.
+            torch.testing.assert_close(seen["prev"][1], torch.tensor([3, 3]))
+            self.assertEqual(seen["states"], [0, 1])
         with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
             sentinel = object()
             self.assertIs(
                 sample_draft_tokens(lambda *args: sentinel, None, None, None), sentinel
             )
+
+    def test_markov_block_applies_the_vanilla_head_bias_per_step(self):
+        from sglang.srt.models.dspark import VanillaMarkov
+        from sglang_tpu.experimental.models.dspark import run_markov_block
+
+        torch.manual_seed(0)
+        head = VanillaMarkov(vocab_size=6, markov_rank=3)
+        base_logits = torch.randn(2, 3, 6)
+        first = torch.tensor([1, 4])
+
+        tokens, corrected = run_markov_block(
+            head,
+            base_logits,
+            first_prev_tokens=first,
+            hidden_states=None,
+            sampler=lambda logits, step: torch.argmax(logits, dim=-1),
+        )
+
+        prev = first
+        for step in range(3):
+            expected = base_logits[:, step] + head.markov_w2(head.markov_w1(prev))
+            torch.testing.assert_close(corrected[:, step], expected)
+            prev = torch.argmax(expected, dim=-1)
+            torch.testing.assert_close(tokens[:, step], prev)
 
     def test_either_flag_enables_the_experimental_worker(self):
         from sglang_tpu.experimental import (

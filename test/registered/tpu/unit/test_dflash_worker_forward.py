@@ -571,6 +571,14 @@ class TestDFlashWorkerForwardTpu(CustomTestCase):
             next_draft_input=None,
             speculative_num_draft_tokens=block_size,
             new_seq_lens=seq_lens_prefill,
+            # The target returns its prefill's plan, whose write window the
+            # draft KV materialization reuses.
+            kv_loc_plan=worker._target_worker.model_runner.kv_index_translator.plan(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens_prefill,
+                seq_lens_cpu=seq_lens_prefill.cpu(),
+                write_virtual=out_cache_loc,
+            ),
         )
         worker._target_worker.forward_batch_generation.return_value = prefill_target_res
 

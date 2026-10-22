@@ -126,6 +126,8 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
         failure_lock=threading.Lock(),
         failure_records={},
         update_status=Mock(),
+        # Bootstrap readiness is test_tpu_pp_bootstrap_consensus's subject.
+        _finish_pp_bootstrap_locked=Mock(),
         kv_args=SimpleNamespace(total_kv_head_num=8),
         local_ip="10.0.0.2",
         rank_port=31000,

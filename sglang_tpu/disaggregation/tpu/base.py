@@ -542,10 +542,19 @@ class TpuKVSenderBase(CommonKVSender):
         marks Success from its background push thread."""
 
     def poll(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status)
+
+    def poll_pp_consensus(self) -> KVPoll:
+        # PP stage 0 alone polls a bootstrapping room on a pipeline-parallel
+        # prefill, and every stage starts it from _handle_transfer. Reading the
+        # least advanced stage keeps the bootstrap deadline on the whole room.
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         self._pre_poll()
-        status = self.kv_mgr.check_status(self.bootstrap_room)
+        status = check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             if (
                 status == KVPoll.Success

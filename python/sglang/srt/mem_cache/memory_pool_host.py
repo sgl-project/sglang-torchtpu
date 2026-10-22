@@ -16,6 +16,8 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
+from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -124,13 +126,20 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         # Upstream HostKVCache packs MTP-draft KV layers behind the target's
         # (layer_num = target + draft); TPU has no packed draft pools, so the
         # target layer count is the whole pool.
+        self.device_pool = device_pool
+        self.dtype = device_pool.store_dtype
+        self.page_size = page_size
         self.target_layer_num = device_pool.layer_num
         super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
+            dtype=self.dtype,
+            device_capacity_tokens=device_pool.size,
+            size_per_token=self.get_size_per_token(),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
             pin_memory=pin_memory,
             device=device,
             allocator_type=allocator_type,
@@ -614,7 +623,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
@@ -1150,7 +1162,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(

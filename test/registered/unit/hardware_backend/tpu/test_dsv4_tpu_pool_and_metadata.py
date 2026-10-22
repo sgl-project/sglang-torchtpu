@@ -51,7 +51,6 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     DSV4TPUTokenToKVPool,
     TPUCompressStatePool,
 )
-from sglang_tpu.patches import _PALLAS_TPU_BACKENDS
 
 
 def _make_dsv4_tpu_pool(
@@ -390,9 +389,15 @@ class TestDSV4TPUAttentionMetadata(CustomTestCase):
 
 
 class TestDSV4TPUPatches(CustomTestCase):
-    def test_dsv4_in_pallas_tpu_backends(self):
-        self.assertIn("dsv4", _PALLAS_TPU_BACKENDS)
-        self.assertIn("tpu_dsv4", _PALLAS_TPU_BACKENDS)
+    def test_dsv4_backends_are_non_triton_on_tpu(self):
+        from unittest.mock import patch
+
+        import sglang.srt.utils.common as uc
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        with patch.object(uc, "current_platform", TpuSRTPlatform()):
+            self.assertFalse(uc.support_triton("dsv4"))
+            self.assertFalse(uc.support_triton("tpu_dsv4"))
 
     def test_register_dsv4_attention_backend(self):
         from sglang.srt.layers.attention.attention_registry import (

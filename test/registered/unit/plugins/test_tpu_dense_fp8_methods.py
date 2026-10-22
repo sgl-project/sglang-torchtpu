@@ -46,7 +46,7 @@ class TestDenseFp8Methods(unittest.TestCase):
     def test_partition_scale_geometry_and_loader_metadata_are_preserved(self):
         method = TpuFp8LinearMethod(_config())
         layer = torch.nn.Module()
-        layer.tp_rank = 1
+        layer.tp_group = SimpleNamespace(rank_in_group=1, world_size=2)
         loader = lambda *args: None
         method.create_weights(
             layer, 80, [80, 48], 160, 256, torch.bfloat16, weight_loader=loader
@@ -88,7 +88,7 @@ class TestDenseFp8Methods(unittest.TestCase):
             False,
         )
         layer = torch.nn.Module()
-        layer.tp_size = 1
+        layer.tp_group = None
         scheme.create_weights(layer, 4, [4], 4, 4, torch.bfloat16, lambda *args: None)
         layer.weight.data.fill_(1.0)
         layer.weight_scale.data.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))

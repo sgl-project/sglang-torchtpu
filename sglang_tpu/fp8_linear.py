@@ -26,6 +26,7 @@ _STATIC_FP8_GEMV_READY = False
 def compute_tpu_fp8_linear_scale_shape(
     layer: Module,
     *,
+    tp_rank: int,
     input_size: int,
     input_size_per_partition: int,
     output_size: int,
@@ -37,16 +38,6 @@ def compute_tpu_fp8_linear_scale_shape(
     """Record TPU TP partition offsets on ``layer`` and compute block-FP8 scale shape."""
     if output_size_per_partition is None:
         output_size_per_partition = sum(output_partition_sizes)
-    if (
-        output_size != output_size_per_partition
-        or input_size != input_size_per_partition
-    ):
-        tp_rank = getattr(layer, "tp_rank", None)
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-    else:
-        tp_rank = 0
-
     output_tp_rank = tp_rank if output_size != output_size_per_partition else 0
     input_offset = (
         tp_rank * input_size_per_partition

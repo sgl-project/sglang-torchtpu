@@ -46,8 +46,15 @@ def tpu_clip_cached_prefix_send_end(
     position, already aligned to a page boundary. The returned position stops
     before the first conflicting page, or keeps the proposed end if none match.
     """
+    if (
+        scheduler.tpu_inflight_kv_write_page_ids is None
+        or scheduler.tpu_inflight_kv_write_page_ids.numel() == 0
+    ):
+        return candidate_send_end
     return _find_safe_prefix_send_end(
-        prefix_indices=req.prefix_indices,
+        prefix_indices=scheduler.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :candidate_send_end
+        ],
         start_send_idx=req.start_send_idx,
         candidate_send_end=candidate_send_end,
         inflight_write_page_ids=scheduler.tpu_inflight_kv_write_page_ids,
@@ -84,8 +91,12 @@ def tpu_clip_hicache_load_send_end(
     ``hicache_load_page_ids`` holds the KV page IDs of the load-backs queued for
     the batch about to launch. Same contract as ``tpu_clip_cached_prefix_send_end``.
     """
+    if hicache_load_page_ids is None or hicache_load_page_ids.numel() == 0:
+        return candidate_send_end
     return _find_safe_prefix_send_end(
-        prefix_indices=req.prefix_indices,
+        prefix_indices=scheduler.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :candidate_send_end
+        ],
         start_send_idx=req.start_send_idx,
         candidate_send_end=candidate_send_end,
         inflight_write_page_ids=hicache_load_page_ids,
@@ -106,6 +117,8 @@ def tpu_update_inflight_kv_write_pages(
         return
     page_ids = _collect_prefill_write_page_ids(
         reqs=inflight_batch.reqs,
+        prefix_lens=inflight_batch.prefix_lens,
+        extend_lens=inflight_batch.extend_lens,
         req_to_token_table=scheduler.req_to_token_pool.req_to_token,
         page_size=scheduler.token_to_kv_pool_allocator.page_size,
     )
@@ -161,7 +174,11 @@ def _find_safe_prefix_send_end(
 
 
 def _collect_prefill_write_page_ids(
-    reqs: Sequence[Req], req_to_token_table: torch.Tensor, page_size: int
+    reqs: Sequence[Req],
+    prefix_lens: Sequence[int],
+    extend_lens: Sequence[int],
+    req_to_token_table: torch.Tensor,
+    page_size: int,
 ) -> torch.Tensor:
     """Collect physical KV page IDs touched by the requests' extend ranges.
 
@@ -169,18 +186,20 @@ def _collect_prefill_write_page_ids(
     Look up one KV slot per touched page, including partial first and last
     pages. Return the IDs on CPU. Duplicates are harmless for membership checks.
     """
+    if not reqs:
+        return torch.empty(0, dtype=torch.int64)
     rows = []
-    for req in reqs:
-        rng = req.extend_range
-        if rng is None or rng.end <= rng.start:
+    for req, start, tokens in zip(reqs, prefix_lens, extend_lens, strict=True):
+        end = start + tokens
+        if tokens == 0:
             continue
         # Sample the first token in the range, then each later page boundary.
         # This includes an unaligned first page without scanning every token.
         # Example: page_size=4, range [2, 9) samples positions [2, 4, 8].
         # If their KV slots are [14, 24, 32], the page IDs are [3, 6, 8].
-        first_boundary = (rng.start // page_size + 1) * page_size
+        first_boundary = (start // page_size + 1) * page_size
         positions = torch.tensor(
-            [rng.start, *range(first_boundary, rng.end, page_size)],
+            [start, *range(first_boundary, end, page_size)],
             device=req_to_token_table.device,
         )
         rows.append(req_to_token_table[req.kv.req_pool_idx, positions])

@@ -72,15 +72,12 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertFalse(self.platform.is_cuda())
         self.assertFalse(self.platform.is_npu())
 
-    def test_supports_fp8_false(self):
-        self.assertFalse(self.platform.supports_fp8())
-
     def test_pin_memory_unavailable(self):
         self.assertFalse(self.platform.is_pin_memory_available())
 
     def test_cuda_graph_disabled(self):
-        self.assertFalse(self.platform.support_cuda_graph())
-        self.assertFalse(self.platform.support_piecewise_cuda_graph())
+        self.assertFalse(self.platform.capabilities.graph_capture)
+        self.assertFalse(self.platform.capabilities.piecewise_graph)
 
     def test_decode_context_parallel_shards_every_kv_pool(self):
         self.assertTrue(self.platform.supports_decode_context_parallel())

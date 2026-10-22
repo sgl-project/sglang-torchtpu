@@ -13,7 +13,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
-    MAX_PREFIX_MATCHED_WAITING_REQS,
+    WAITING_QUEUE_PREFIX_MATCH_MAX,
     AddReqResult,
     PrefillAdder,
     matched_prefix_len,
@@ -56,14 +56,14 @@ def pending_step_limit(scheduler: Scheduler) -> int:
         del cached_prefix[rid]
     seen = set()
     pending = 0
-    matches_left = MAX_PREFIX_MATCHED_WAITING_REQS
+    matches_left = WAITING_QUEUE_PREFIX_MATCH_MAX
     for req in requests:
         if req.rid in seen:
             continue
         seen.add(req.rid)
         # The policy's match counts host hits; a partial request's computed
-        # chunks extend prefix_indices past that match.
-        cached = max(len(req.prefix_indices), req.num_matched_prefix_tokens)
+        # chunks advance prefix_len past that match.
+        cached = max(req.prefix_len, req.num_matched_prefix_tokens)
         if cached == 0 and req.rid in cached_prefix:
             cached = cached_prefix[req.rid]
         elif cached == 0 and matches_left > 0:
@@ -125,7 +125,7 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         self, req: Req, *, include_pending_host_load: bool = True
     ) -> Iterator[int]:
         original = self.rem_chunk_tokens
-        prefix = len(req.prefix_indices)
+        prefix = req.prefix_len
         if include_pending_host_load and req.needs_host_load_back():
             prefix += req.host_hit_length
         remaining = len(req.full_untruncated_fill_ids) - prefix
@@ -165,7 +165,7 @@ class TpuPipelinePrefillAdder(PrefillAdder):
             used_budget = budget - self.rem_chunk_tokens
             self.rem_chunk_tokens = original - used_budget
             if len(self.can_run_list) > before:
-                self._account(req.extend_range.length, len(req.prefix_indices))
+                self._account(req.extend_len, req.prefix_len)
 
     def add_chunked_req(self, req: Req) -> Optional[Req]:
         with self._request_budget(req, include_pending_host_load=False) as cap:
@@ -184,7 +184,7 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         with self._request_budget(req) as cap:
             if cap <= 0:
                 return AddReqResult.OTHER
-            remaining = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+            remaining = len(req.full_untruncated_fill_ids) - req.prefix_len
             if req.needs_host_load_back():
                 remaining -= req.host_hit_length
             if has_chunked_req and cap < remaining:

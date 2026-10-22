@@ -1255,6 +1255,8 @@ class PipelineTransfer:
         if not self.producer:
             raise ValueError("A pipeline request must target a prefill worker")
         self.replies.setdefault(room, {})[msg[2].decode()] = json.loads(msg[3])
+        with mgr._state_lock:
+            mgr._finish_pp_bootstrap_locked(room)
         for part in self.early.get(room, {}).get("parts", []):
             self._reply_part(room, part)
         if room in self.stage:

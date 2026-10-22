@@ -51,6 +51,29 @@ class _RecordingEmbedder:
         return outputs if self.as_list else torch.concat(outputs, dim=0)
 
 
+class TestCachedFeatureLease(CustomTestCase):
+    def test_cached_embedding_keeps_raw_feature_lease_for_reprefill(self):
+        from sglang_tpu.mm_embedding import TpuEmbeddingResult
+
+        item = _image(4)
+        item.hash = 123
+        raw_feature = item.feature = Mock()
+        cached = TpuEmbeddingResult(embedding=torch.arange(6).reshape(2, 3).float())
+        cache = Mock()
+        cache.get.return_value = cached
+        encoder = Mock()
+        ids = torch.tensor([10, 11])
+        with patch.object(mm_schedule, "embedding_cache", cache):
+            result, result_ids = mm_schedule_tpu._get_chunked_embedding_full(
+                encoder, [item], [(0, 1)], 0, 2, ids, torch.device("cpu")
+            )
+        torch.testing.assert_close(result, cached.embedding)
+        self.assertIs(result_ids, ids)
+        self.assertIs(item.feature, raw_feature)
+        self.assertEqual(raw_feature.mock_calls, [])
+        encoder.assert_not_called()
+
+
 class TestSplitItemsByPatchBudget(CustomTestCase):
     def test_items_near_the_budget_get_their_own_group(self):
         items = [_image(4752), _image(4836), _image(4784)]

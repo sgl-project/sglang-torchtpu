@@ -69,6 +69,45 @@ class TestAttnDpSize(CustomTestCase):
                 self.assertEqual(self.layout(legacy), (1, width, False))
                 self.assertEqual(legacy.resolved_dict(), new.resolved_dict())
 
+    def test_xpu_dcp_q_group_uses_resolved_attention_dp_width(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups import attention_hook
+
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="llama"),
+            head_dim=128,
+            v_head_dim=128,
+            get_num_kv_heads=lambda *args: 1,
+            get_max_num_attention_heads=lambda: 32,
+            attention_chunk_size=None,
+            is_encoder_decoder=False,
+        )
+        for width in (1, 2, 4):
+            view = SimpleNamespace(
+                tp_size=8,
+                dcp_size=2,
+                attn_dp_size=width,
+                attn_cp_size=1,
+                dp_size=1,
+                enable_dp_attention=False,
+                speculative_algorithm=None,
+            )
+            with (
+                self.subTest(attn_dp_size=width),
+                patch.object(attention_hook, "resolved_view", return_value=view),
+                patch.object(
+                    attention_hook, "attention_backends_of", return_value=("intel_xpu",)
+                ),
+                patch.object(attention_hook, "use_mla_backend", return_value=False),
+            ):
+                if width == 4:
+                    with self.assertRaisesRegex(ValueError, "GQA group"):
+                        attention_hook._check_xpu_dcp(None, model)
+                else:
+                    attention_hook._check_xpu_dcp(None, model)
+
     def test_without_attention_dp_the_width_is_one(self):
         for fields in (
             {"tp_size": 2},

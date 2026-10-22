@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
     InsertParams,
+    TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -106,10 +107,9 @@ def make_req():
         extra_key=None,
         kv_rotation_base=None,
         cache_salt=None,
-        prefix_indices=torch.arange(64),
+        prefix_len=64,
         last_node=1,
-        lock_receipt=swa_receipt(node_id=1, swa_uuid=17),
-        swa_prefix_lock_released=True,
+        lock=TreeLock(1, swa_receipt(node_id=1, swa_uuid=17), swa_released=True),
         swa_stale_window_floor=None,
         kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=64),
         _compute_max_prefix_len=lambda n: n - 1,
@@ -121,7 +121,7 @@ def make_req():
 
 def make_match(device_len=64, host_len=256):
     return SimpleNamespace(
-        device_indices=torch.arange(device_len),
+        device_prefix_len=device_len,
         last_device_node=2,
         last_host_node=3,
         best_match_node=3,
@@ -138,6 +138,16 @@ def full_only_cache(*, is_eagle=False):
     cache = MagicMock()
     cache.tree_core.is_eagle = is_eagle
     cache.swa_reprefill_tail_tokens.return_value = 0
+    cache.disable = False
+    cache.lock.side_effect = lambda node: UnifiedRadixCache.lock(cache, node)
+    cache.unlock.side_effect = lambda lock: UnifiedRadixCache.unlock(cache, lock)
+    cache.release_swa.side_effect = lambda lock: UnifiedRadixCache.release_swa(
+        cache, lock
+    )
+    cache.prefix_device_indices.side_effect = lambda req: torch.arange(req.prefix_len)
+    cache.path_device_indices.side_effect = lambda node: torch.arange(
+        320 if node == 3 else 64
+    )
     # No L3 storage backend in this mode.
     cache.query_storage_hit_length.return_value = 0
     mark_full_only(cache)
@@ -181,7 +191,6 @@ def make_ctx():
         is_hybrid_ssm=False,
         enable_hierarchical_cache=False,
         disable_radix_cache=False,
-        effective_chunked_prefill_size=None,
         tp_worker=None,
         model_config=None,
         tp_size=1,
@@ -524,7 +533,7 @@ class TestAdmissionAndAllocation(CustomTestCase):
         # Device and host hits are both bounded by fill_len - swa_tail_len.
         self.assertEqual(len(cache.match_prefix.call_args.args[0].key), 320)
         self.assertEqual(result.decode_prefix_len, 320)
-        self.assertEqual(swa_uuid(req.lock_receipt), 19)
+        self.assertEqual(swa_uuid(req.lock.receipt), 19)
 
     def test_eagle_match_still_reaches_the_swa_window(self):
         # Bigram keys need one token past the window start to match its page.
@@ -542,11 +551,9 @@ class TestAdmissionAndAllocation(CustomTestCase):
             (MagicMock(), 320),
         ):
             upstream = MagicMock()
-            tpu._restore_rematch(
-                upstream, cache, req, req.origin_input_ids[:320], include_req=True
-            )
+            tpu._restore_rematch(upstream, req, cache, req.origin_input_ids[:320])
             args, kwargs = upstream.call_args
-            self.assertEqual((len(args[2]), kwargs), (expected, {"include_req": True}))
+            self.assertEqual((len(args[2]), kwargs), (expected, {}))
 
     def test_other_caches_keep_upstream_match(self):
         upstream = MagicMock()
@@ -604,7 +611,7 @@ class TestRestore(CustomTestCase):
         self.queue.tree_cache = full_only_cache()
         self.cache = self.queue.tree_cache
         self.cache.match_prefix.return_value = make_match()
-        self.cache.init_load_back.return_value = (torch.arange(64, 320), 3)
+        self.cache.init_load_back.return_value = (256, 3)
         self.restored_receipt = swa_receipt(node_id=3, swa_uuid=23)
         self.cache.inc_lock_ref.return_value = MagicMock(
             to_dec_params=MagicMock(return_value=self.restored_receipt)
@@ -643,9 +650,11 @@ class TestRestore(CustomTestCase):
         write = self.cache.req_to_token_pool.write.call_args.args
         self.assertEqual(write[0], (0, slice(64, 320)))
         self.assertEqual(req.last_node, 3)
-        self.assertIs(req.lock_receipt, self.restored_receipt)
-        self.cache.dec_swa_lock_only.assert_called_once_with(3, self.restored_receipt)
-        self.assertTrue(req.swa_prefix_lock_released)
+        self.assertIs(req.lock.receipt, self.restored_receipt)
+        self.cache.tree_core.dec_swa_lock_only.assert_called_once_with(
+            3, self.restored_receipt
+        )
+        self.assertTrue(req.lock.swa_released)
 
     def test_other_caches_keep_upstream_commit(self):
         self.queue.tree_cache = MagicMock()
@@ -712,7 +721,7 @@ class TestInflightLoadGate(CustomTestCase):
         # and its own DMA finished first.
         self.issue_load(3, torch.arange(64, 320))
         restorer = self.request(torch.arange(64), host_len=256)
-        restorer.hicache_restored_node = 5
+        restorer.hicache_restore_lock = TreeLock(5, DecLockRefParams())
         restorer.hicache_restored_kv_indices = torch.arange(64, 320)
         restorer.hicache_load_consumer_index = 0
         self.assertEqual(self.process([restorer]), [HiCacheRestoreResult.PENDING])
@@ -908,9 +917,8 @@ class TestRealLockAccounting(CustomTestCase):
                 req.skip_radix_cache_insert = False
                 req.priority = None
                 req.last_node = prefix
-                req.lock_receipt = cache.inc_lock_ref(prefix).to_dec_params()
-                cache.dec_swa_lock_only(prefix, req.lock_receipt)
-                req.swa_prefix_lock_released = True
+                req.lock = cache.lock(prefix)
+                cache.release_swa(req.lock)
                 decode_req = DecodeRequest(
                     req=req,
                     kv_receiver=MagicMock(),
@@ -926,13 +934,13 @@ class TestRealLockAccounting(CustomTestCase):
                 )
                 if commit:
                     queue._commit_hicache_local_restore_to_req(decode_req)
-                    self.assertTrue(req.swa_prefix_lock_released)
+                    self.assertTrue(req.lock.swa_released)
                     req.kv.cache_protected_len = 320
-                    release_kv_cache(req, cache)
+                    release_kv_cache(req, cache, checkpoint=True)
                     queue._clean_hicache_prefetch_resources(decode_req)
                 else:
                     queue._clean_hicache_prefetch_resources(decode_req)
-                    release_kv_cache(req, cache, is_insert=False)
+                    release_kv_cache(req, cache, checkpoint=False)
                 self.assert_unlocked(cache)
 
 

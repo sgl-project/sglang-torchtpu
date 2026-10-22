@@ -1088,6 +1088,15 @@ class CompiledForwardShim:
                 forward_batch.seq_lens.shape[0]
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
+        if (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            # TPU attention consumes padded shapes and device metadata. Keep
+            # the live host extent out of graph guards, then restore it eagerly.
+            saved.update(
+                _pin_fields(forward_batch, {"global_num_token_non_padded_cpu": None})
+            )
         if not self._prompt_logprob_enabled and hasattr(
             forward_batch, "extend_logprob_start_lens_cpu"
         ):

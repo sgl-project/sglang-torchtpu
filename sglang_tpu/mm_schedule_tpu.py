@@ -10,7 +10,6 @@ import torch
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.mm_schedule import (
     PerImageRequestInfo,
-    _acknowledge_deferred_cuda_ipc_cache_hits,
     _count_mm_tokens_in_extend,
     _discard_mismatched_cached_embedding,
     _get_precomputed_embedding,
@@ -225,8 +224,8 @@ def _get_chunked_embedding_full(
             else embedding
         )
         mm_schedule.embedding_cache.set(embedding_items_hash, embedding_per_req)
-    else:
-        _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
+    # Cache hits retain raw-input leases until request cleanup, so eviction
+    # and re-prefill can still reconstruct the original features.
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]

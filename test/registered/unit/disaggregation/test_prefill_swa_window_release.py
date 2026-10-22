@@ -39,7 +39,7 @@ def scheduler(swa=True):
 def req(tokens):
     return NS(
         origin_input_ids=[0] * tokens,
-        extend_range=NS(end=tokens),
+        extend_end=tokens,
         kv=ReqKvInfo(req_pool_idx=0, kv_committed_len=tokens, kv_allocated_len=tokens),
     )
 

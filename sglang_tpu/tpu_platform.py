@@ -1078,6 +1078,16 @@ class TpuSRTPlatform(SRTPlatform):
             return TpuModelOptMixedPrecisionConfig
         return None
 
+    def get_kv_pool_cls(self, *, kind: str) -> Optional[type]:
+        if kind == "mha":
+            return self.get_mha_kv_pool_cls()
+        if kind == "mla":
+            return self.get_mla_kv_pool_cls()
+        # The split DSA layout uses its dedicated builder, not the generic
+        # DSATokenToKVPool subclass protocol. Unrelated models still resolve
+        # all three pool kinds during startup.
+        return None
+
     def get_mha_kv_pool_cls(self) -> type:
         # Pick per the resolved backend: the raw field is None when --attention-backend is omitted.
         from sglang.srt.runtime_context import get_exec
@@ -1104,7 +1114,8 @@ class TpuSRTPlatform(SRTPlatform):
             store_dtype=kv_cache_dtype,
         )
 
-    supports_mamba_extra_buffer = True
+    def support_mamba_cache_extra_buffer(self) -> bool:
+        return True
 
     def supports_mamba_prefix_cache(self, model_config) -> bool:
         from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
@@ -1274,16 +1285,7 @@ class TpuSRTPlatform(SRTPlatform):
     # Capability flags
     # ------------------------------------------------------------------
 
-    def supports_fp8(self) -> bool:
-        return False
-
     def is_pin_memory_available(self, device=None) -> bool:
-        return False
-
-    def support_cuda_graph(self) -> bool:
-        return False
-
-    def support_piecewise_cuda_graph(self) -> bool:
         return False
 
     def supports_decode_context_parallel(self) -> bool:

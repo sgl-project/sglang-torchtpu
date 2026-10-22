@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -35,6 +36,9 @@ class _FakeDevicePool:
         self._fused = torch.empty((2,) + page_shape, dtype=torch.float32)
         self.layer_num = LAYER_NUM
         self.start_layer = 0
+        self.end_layer = LAYER_NUM
+        self.size = 2 * PAGE_SIZE
+        self.store_dtype = torch.float32
         self.device = "cpu"
 
     def get_fused_kv_buffer(self, layer_id):
@@ -70,7 +74,20 @@ def _buffer_dims(pool):
     return seen["dims"]
 
 
-class TestTpuHostPoolKvLayout(unittest.TestCase):
+class TestTpuHostPoolKvLayout(CustomTestCase):
+    def test_constructor_passes_fused_geometry_to_shared_host_cache(self):
+        page_shape = (PAGE_SIZE, 1, 1, 2)
+        pool = TpuFusedMHATokenToKVPoolHost(
+            _FakeDevicePool(page_shape),
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=PAGE_SIZE,
+            layout="page_first_fused",
+        )
+        self.assertEqual(pool.kv_buffer.shape, (5, LAYER_NUM) + page_shape)
+        self.assertEqual(pool.size_per_token, LAYER_NUM * 2 * 4)
+        self.assertEqual(pool.dtype, torch.float32)
+
     def test_host_page_mirrors_device_page_in_both_layouts(self):
         # The invariant load_commit relies on: the host page IS the device
         # page, so `device[layer][dst] = src[:, layer]` broadcasts. Under the

@@ -632,70 +632,6 @@ def _patch_torch_native_attn_backend() -> None:
     TorchNativeAttnBackend._run_sdpa_forward_decode = _run_sdpa_forward_decode
 
 
-_support_triton_patched = False
-
-
-_PALLAS_TPU_BACKENDS = (
-    "pallas_tpu_flash",
-    "dsv4",
-    "tpu_dsv4",
-    "pallas_tpu_rpa_v3",
-    "pallas_tpu_rpa_batched",
-    "pallas_tpu_mla",
-    "pallas_tpu_mla_sparse",
-)
-
-
-def _patch_support_triton_for_tpu() -> None:
-    """Make `support_triton` return False for every `_PALLAS_TPU_BACKENDS` name.
-
-    SGLang gates Triton kernels behind `support_triton(attn_backend)`, which
-    is a hardcoded name allowlist: `backend not in ["torch_native",
-    "intel_amx"]`. The `torch_native` backend therefore dodges Triton (no
-    Triton driver exists for TPU), but the new Pallas backend names are not in
-    the list, so `mem_cache/common.py:write_cache_indices` and
-    `forward_batch_info.py` take the Triton path and crash with
-    `RuntimeError: 0 active drivers` on TPU.
-
-    Fix: treat the Pallas backend names exactly like "torch_native" w.r.t.
-    Triton availability (correct — TPU has no Triton driver regardless of
-    attention backend). Other backends are unaffected. `support_triton` is
-    imported by value in two modules, so rebind it there too. Keeps upstream
-    untouched.
-    """
-    global _support_triton_patched
-    if _support_triton_patched:
-        return
-    _support_triton_patched = True
-
-    import sglang.srt.utils.common as _utils_common
-
-    orig = _utils_common.support_triton
-
-    def support_triton(backend: str) -> bool:
-        if backend in _PALLAS_TPU_BACKENDS:
-            return False
-        return orig(backend)
-
-    _utils_common.support_triton = support_triton
-
-    # Rebind the by-value imports (and the package re-export).
-    for modname in (
-        "sglang.srt.utils",
-        # write_cache_indices moved out of mem_cache.common into mem_cache.allocation.
-        "sglang.srt.mem_cache.allocation",
-        "sglang.srt.mem_cache.common",
-        "sglang.srt.model_executor.forward_batch_info",
-        "sglang.srt.layers.rotary_embedding.mrope",
-    ):
-        try:
-            mod = importlib.import_module(modname)
-        except (ImportError, ModuleNotFoundError):
-            continue
-        if getattr(mod, "support_triton", None) is orig:
-            mod.support_triton = support_triton
-
-
 def _patch_tpu_torch_pallas_register_positional() -> None:
     """Let the torch_tpu bindings accept torch's inductor calling convention."""
     try:
@@ -969,7 +905,6 @@ def apply_tpu_patches() -> None:
     _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()
     _patch_torch_native_attn_backend()
-    _patch_support_triton_for_tpu()
     _register_aten_fallbacks()
     _patch_tpu_torch_pallas_register_positional()
     _patch_future_map_direct_handoff()
