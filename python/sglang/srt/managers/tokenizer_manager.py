@@ -1493,13 +1493,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
-            bootstrap_room = obj.bootstrap_room
-            if (
-                bootstrap_room is None
-                and get_disagg().disaggregation_transfer_backend == "fake"
-            ):
-                bootstrap_room = self.fake_bootstrap_room_counter
-                self.fake_bootstrap_room_counter += 1
+            bootstrap_room = self._resolve_bootstrap_room(obj.bootstrap_room)
 
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text=input_text,
@@ -1980,6 +1974,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
                     )
 
+    def _resolve_bootstrap_room(self, bootstrap_room: Optional[int]) -> Optional[int]:
+        if (
+            bootstrap_room is None
+            and get_disagg().disaggregation_transfer_backend == "fake"
+        ):
+            bootstrap_room = self.fake_bootstrap_room_counter
+            self.fake_bootstrap_room_counter += 1
+        return bootstrap_room
+
     async def _handle_batch_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -2036,8 +2039,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
+            # Cache the common prefix for parallel sampling. Skipped in PD
+            # disaggregation: the prefix request would need its own bootstrap room
+            # and a matching decode-side request, and caching on the prefill engine
+            # does not help the decode engine anyway.
+            cache_prefix = self.disaggregation_mode not in (
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.DECODE,
+            )
+            for i in range(batch_size if cache_prefix else 0):
                 tmp_obj = copy.copy(objs[i])
                 # Warmup borrows the samples' LoRA references; only samples release
                 # them. Keep LoRA on tokenized_obj for the correct prefix-cache key.
@@ -2071,9 +2081,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for k in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    # objs[i] only carries the first sample's bootstrap room; give
+                    # each sample the room that normalization reserved for it.
+                    sample_obj = obj[k * batch_size + i]
+                    tokenized_obj.bootstrap_host = sample_obj.bootstrap_host
+                    tokenized_obj.bootstrap_port = sample_obj.bootstrap_port
+                    tokenized_obj.bootstrap_room = self._resolve_bootstrap_room(
+                        sample_obj.bootstrap_room
+                    )
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
