@@ -726,140 +726,42 @@ Measured with the commands in 3.7.1 (the long-reasoning runs at
 
 #### 3.7.6 Decode megakernel (one request)
 
-The decode megakernel runs all 93 decoder layers as one Pallas call per
-step, with the cross-rank reductions and the next layer's weight prefetch inside
-the kernel. **One decode step takes 3.77 ms, 2.1x faster than the default path
-(7.81 ms at the same short context); with DSpark, sglang decodes at 2.21 ms per
-token, 3.6x faster.** It owns the decoder weights, so it serves one request at a
-time, and prefill chunks run through the same kernel in 8-token row blocks. It uses
-fp8 dense weights and bf16 reduction transport
-(`SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX`), at GSM8K 0.978.
+The decode megakernel runs all 93 decoder layers as one Pallas call per step,
+with the cross-rank reductions and the next layer's weight prefetch inside the
+kernel. It serves from its own OpenAI-compatible server
+(`/v1/chat/completions`, `/v1/completions`), without sglang's scheduler, and
+runs DSpark speculative decoding on device: every device call runs 32 rounds of
+draft + 8-row verify. **With DSpark it decodes real text at about 759 tokens/s
+for one request, 6x the default path.**
 
-1k in / 8k out at one request:
+One request; TPOT on random token ids, decode rate on 20 GSM8K questions:
 
-| Serving | TTFT | TPOT | Decode tok/s | TPOT vs default path |
-| --- | --- | --- | --- | --- |
-| sglang + megakernel + DSpark | 1.23 s | **2.21 ms** | **452** | **3.6x** |
-| Standalone megakernel server | 1.28 s | **4.25 ms** | **235** | **1.8x** |
-| Default path (3.7.4) | 0.21 s | 7.86 ms | 129 | 1.0x |
+| Workload | Megakernel + DSpark | Megakernel, no DSpark | Default path (3.7.4) |
+| --- | --- | --- | --- |
+| 1k in / 8k out | **1.42 ms (5.5x)** | 3.80 ms (2.1x) | 7.86 ms |
+| 1k in / 1k out | **1.52 ms (5.1x)** | 3.68 ms (2.1x) | 7.81 ms |
+| 8k in / 1k out | **1.92 ms (4.1x)** | 3.97 ms (2.0x) | 7.94 ms |
+| GSM8K questions (chat) | **≈759 tok/s (≈6x)**, accept length 5.58 | ≈270 tok/s (2.1x) | ≈127 tok/s |
 
-- Other shapes with DSpark: 2.34 ms at 1k in / 1k out and 3.10 ms at 8k in /
-  1k out (2.6x), at an accept length of 5.61. The standalone server decodes at
-  3.80 ms on a 3-token prompt and 4.61 ms at 8k in / 1k out.
+- Full GSM8K: 0.978 with DSpark (accept length 5.65).
+- Without DSpark, the decode rate does not depend on the text, and a 3-token
+  prompt decodes at 3.62 ms per token.
 - Prompts prefill more slowly than on the default path, because the chunks run
-  through the decode kernel: about 1.2 s for 1k tokens and 10 s for 8k.
-- On real text, 20 GSM8K questions take 41 s with DSpark and 85 s without
-  (2.1x end to end), at an accept length of 5.47.
+  through the decode kernel: about 1.0 s for 1k tokens and 8 s for 8k, against
+  0.2 s and 1.5 s.
+- It decodes greedily and serves one request at a time.
 
-**Through sglang, with DSpark.** Serves the full sglang API; DSpark runs its
-target verify through the kernel too:
-
-{/* render_recipe config=recipe/configs/kimi_k3/dspark_mk.py profile=long_8k1k_c1 */}
-**Hardware**: 4 tpu7x hosts (32 TensorCores), tp32/ep8.
-
-**Workload**: 8192 in / 1024 out at concurrency 1.
+Download the [Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark)
+draft to a local directory, then run on every host; the API comes up on the
+host of JAX process 0:
 
 ```bash
-export SGLANG_RAGGED_VERIFY_MODE=static
-export SGLANG_TPU_EAGER_MODE=DEFER_AND_FUSE
-export SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1
-export SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL=1
-export SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX=dense_fp8,pair_oproj,bf16_transport
-
-python3 -m sglang.launch_server \
-    --device tpu \
-    --dtype bfloat16 \
-    --host 127.0.0.1 \
-    --port 30000 \
-    --grammar-backend none \
-    --attention-backend pallas_tpu_mla \
-    --page-size 128 \
-    --max-running-requests 1 \
-    --chunked-prefill-size 1024 \
-    --max-prefill-tokens 1024 \
-    --context-length 9280 \
-    --torch-compile-max-bs 1 \
-    --enable-torch-compile \
-    --disable-radix-cache \
-    --model-path moonshotai/Kimi-K3 \
-    --nnodes 4 \
-    --tp-size 32 \
-    --ep-size 8 \
-    --tpu-compile-tokens 1024 \
-    --tpu-compile-bs 1 \
-    --mem-fraction-static 0.9 \
-    --trust-remote-code \
-    --reasoning-parser kimi_k3 \
-    --tool-call-parser kimi_k3 \
-    --mamba-ssm-dtype bfloat16 \
-    --scheduler-recv-interval 16 \
-    --weight-loader-disable-mmap \
-    --watchdog-timeout 3600 \
-    --speculative-algorithm DSPARK \
-    --speculative-draft-model-path RadixArk/Kimi-K3-DSpark \
-    --speculative-dspark-block-size 7 \
-    --speculative-draft-attention-backend pallas_tpu_rpa_v3 \
-    --max-mamba-cache-size 1 \
-    --max-total-tokens 10304
+bash sglang_tpu/k3_megakernel/server/run4h.sh k3mk --port 30000 --capacity 16384 \
+    --spec-draft dspark --draft-path /path/to/Kimi-K3-DSpark --spec-rounds 32 -- \
+    --ckpt /path/to/Kimi-K3 --layers 93 --expert-load stream --expert-load-procs 48 \
+    --relax dense_fp8,pair_oproj,expert_replicas=48 --kernel-opt wire_relax=bf16_transport
 ```
-{/* /render_recipe */}
 
-The per-op K3 kernel switches of 3.7.1 are left out: the megakernel replaces
-the layers they speed up. Without DSpark, drop the speculative flags; sglang's
-per-step host work then shows (5.56 ms TPOT at 1k in / 8k out, 1.4x the default
-path), and it is being reduced.
-
-{/* render_recipe config=recipe/configs/kimi_k3/server_mk.py profile=long_8k1k_c1 */}
-**Hardware**: 4 tpu7x hosts (32 TensorCores), tp32/ep8.
-
-**Workload**: 8192 in / 1024 out at concurrency 1.
-
-```bash
-export SGLANG_TPU_EAGER_MODE=DEFER_AND_FUSE
-export SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL=1
-export SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX=dense_fp8,pair_oproj,bf16_transport
-
-python3 -m sglang.launch_server \
-    --device tpu \
-    --dtype bfloat16 \
-    --host 127.0.0.1 \
-    --port 30000 \
-    --grammar-backend none \
-    --attention-backend pallas_tpu_mla \
-    --page-size 128 \
-    --max-running-requests 1 \
-    --chunked-prefill-size 1024 \
-    --max-prefill-tokens 1024 \
-    --context-length 9280 \
-    --torch-compile-max-bs 1 \
-    --enable-torch-compile \
-    --disable-radix-cache \
-    --model-path moonshotai/Kimi-K3 \
-    --nnodes 4 \
-    --tp-size 32 \
-    --ep-size 8 \
-    --tpu-compile-tokens 1024 \
-    --tpu-compile-bs 1 \
-    --mem-fraction-static 0.9 \
-    --trust-remote-code \
-    --reasoning-parser kimi_k3 \
-    --tool-call-parser kimi_k3 \
-    --mamba-ssm-dtype bfloat16 \
-    --scheduler-recv-interval 16 \
-    --weight-loader-disable-mmap \
-    --watchdog-timeout 3600 \
-    --max-total-tokens 10304
-```
-{/* /render_recipe */}
-
-**Standalone megakernel server.** An OpenAI-compatible server
-(`/v1/chat/completions`, `/v1/completions`) that runs the kernel without
-sglang's scheduler, 64 decode steps per device call: greedy decoding only, one
-request at a time. Run on every host; the API comes up on the host of JAX
-process 0:
-
-```bash
-bash sglang_tpu/k3_megakernel/server/run4h.sh k3mk --port 30000 -- \
-    --ckpt /path/to/Kimi-K3 --layers 93 --expert-load stream \
-    --relax dense_fp8,pair_oproj,bf16_transport
-```
+Without DSpark, drop `--capacity` and the `--spec-*` / `--draft-path` flags.
+The relaxations trade exactness for speed: fp8 dense weights, the paired o_proj,
+48 expert replicas and bf16 cross-host transport.

@@ -168,6 +168,9 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
     def test_tpu_direct_compile_defaults_off(self):
         self.assertFalse(self.algo.supports_tpu_direct_compile())
 
+    def test_pd_decode_swa_hicache_defaults_off(self):
+        self.assertFalse(self.algo.supports_pd_decode_swa_hicache())
+
     def test_supports_overlap_false_warns_deprecation(self):
         # supports_overlap=False plugins run the V2 schema synchronously; the
         # removed V1 path is surfaced as a deprecation warning at create time.

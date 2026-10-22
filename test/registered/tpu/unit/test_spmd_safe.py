@@ -28,8 +28,8 @@ from sglang_tpu.testing.spmd_safe import run_recipes, verify_startup
 
 register_tpu_ci(
     est_time=240,
-    chips=4,
     suite="stage-a-test-tpu-unit",
+    chips=4,
     labels=["singlehost", "infra", "compile-tracer", "tp"],
 )
 
@@ -246,7 +246,6 @@ def _run_worker(mode: str) -> None:
             spmd_safe=True,
             lift_rank=False,
         )
-
         with get_context().override_server_args(use_spmd_compile=True):
             with collect_warmups(group=group) as queue:
                 queue.calls.append(compiled.warmup_async(value))

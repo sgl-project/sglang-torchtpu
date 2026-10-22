@@ -14,7 +14,9 @@ from sglang.srt.managers.mm_schedule import (
     _count_mm_tokens_in_extend,
     _discard_mismatched_cached_embedding,
     _get_precomputed_embedding,
-    _move_items_to_device,
+)
+from sglang.srt.managers.mm_schedule import (
+    _move_items_to_device as _default_move_items_to_device,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
@@ -38,6 +40,23 @@ DataEmbeddingFunc = Callable[
     [List[MultimodalDataItem]],
     MultimodalEmbedding | List[MultimodalEmbedding] | EVSEmbeddingResult,
 ]
+
+
+def _move_items_to_device(
+    items: List[MultimodalDataItem],
+    device: torch.device,
+    data_embedding_func: DataEmbeddingFunc,
+) -> None:
+    """Let encoders with CPU patchification choose their own H2D boundary.
+
+    Muse assigns each image to one encoder-DP rank before uploading patches.
+    Moving every image on every rank first defeats that contract. Other
+    encoders keep the shared scheduler's upload behavior.
+    """
+    owner = getattr(data_embedding_func, "__self__", None)
+    if getattr(owner, "keeps_mm_features_on_host", False):
+        return
+    _default_move_items_to_device(items, device, data_embedding_func)
 
 
 def _patch_budget() -> int:

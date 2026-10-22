@@ -26,7 +26,7 @@ from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import dp_gather_width, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -1888,6 +1888,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
+        self._add_dummy_mamba_tracking(batch, bs=bs, mode=mode)
         if enable_num_token_non_padded():
             # Serving sets these in init_new and ModelRunner.forward; the MoE
             # path guards on the field being present, so warmup must carry it.
@@ -1907,6 +1908,28 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 ),
             )
         return batch
+
+    def _add_dummy_mamba_tracking(
+        self, batch: ForwardBatch, *, bs: int, mode: ForwardMode
+    ) -> None:
+        """Give warmup batches the radix tracking plan serving extend/decode carry.
+
+        Their upload and the GDN backend's tracking metadata are eager ops keyed on
+        the bucket; an all-False mask writes no snapshot.
+        """
+        if (
+            self.model_runner.is_draft_worker
+            or not isinstance(self.model_runner.req_to_token_pool, HybridReqToTokenPool)
+            or not (mode.is_extend() or mode.is_decode())
+            or mode.is_target_verify()
+            or not get_exec().mamba.enable_mamba_extra_buffer
+        ):
+            return
+        # The scheduler builds these on the host, as int64 / bool.
+        batch.mamba_track_indices = torch.zeros(bs, dtype=torch.int64)
+        batch.mamba_track_mask = torch.zeros(bs, dtype=torch.bool)
+        if mode.is_extend():
+            batch.mamba_track_seqlens = torch.zeros(bs, dtype=torch.int64)
 
     def _make_top_k_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
         """Mirror an eligible serving batch for the common static TopK width.

@@ -10,8 +10,9 @@ result back. The residual stream is kept in fp32.
 NVFP4 experts run through the Pallas fused-RS kernel, which applies the
 post-expert norm, the weighted combine and the cross-rank reduction. The BF16
 experts of the first and last layer are quantized to FP8 at load and take the
-FP8 fused-RS kernel. Only the text decoder is served; the vision and audio
-tower weights are skipped.
+FP8 fused-RS kernel. This module is the text decoder; ``muse_spark_omni`` adds
+the vision tower on top of it and is the registered architecture. Audio tower
+weights are skipped.
 """
 
 from __future__ import annotations
@@ -614,6 +615,10 @@ class MuseSparkTextModel(nn.Module):
 class MuseSparkForConditionalGeneration(nn.Module):
     """Muse Spark served text-only."""
 
+    # Parameters a subclass loads itself (perception towers); the checkpoint
+    # completeness check here skips them.
+    tower_param_prefixes: Tuple[str, ...] = ()
+
     def __init__(
         self,
         config: MuseSparkConfig,
@@ -821,6 +826,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             name
             for name in params
             if name not in loaded
+            and not name.startswith(self.tower_param_prefixes)
             and not name.endswith(("w13_input_scale", "w2_input_scale"))
             and not self._is_online_quant_scale(name)
         )
@@ -834,6 +840,3 @@ class MuseSparkForConditionalGeneration(nn.Module):
         for layer in self.model.layers:
             layer.post_attention_residual_gate.precompute_coefficients()
             layer.post_feedforward_residual_gate.precompute_coefficients()
-
-
-EntryClass = [MuseSparkForConditionalGeneration]

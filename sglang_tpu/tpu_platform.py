@@ -406,6 +406,17 @@ def _validate_raiden_optimistic_prefill(
     )
 
 
+def _validate_kv_checksum(enable_kv_checksum: bool) -> None:
+    if not enable_kv_checksum:
+        return
+    raise ValueError(
+        "--disaggregation-enable-kv-checksum is not supported on TPU: the KV "
+        "checksum has only a CUDA implementation. On TPU the server would pass "
+        "its health checks and then fail every rank on the first real request. "
+        "Remove the flag from both the prefill and the decode engines."
+    )
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -793,13 +804,19 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
-        from sglang_tpu.kimi_k3 import static_fp8_parts
+        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch, static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
-        static_fp8_parts()
+        parts = static_fp8_parts()
         cfg = resolving_view(server_args)
+        if "latent_up" in parts:
+            check_static_fp8_spec_batch(
+                parts,
+                speculative_algorithm=cfg.speculative_algorithm,
+                max_running_requests=cfg.max_running_requests,
+            )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
@@ -811,6 +828,7 @@ class TpuSRTPlatform(SRTPlatform):
             disaggregation_mode=cfg.disaggregation_mode,
             max_queued_requests=cfg.max_queued_requests,
         )
+        _validate_kv_checksum(cfg.disaggregation_enable_kv_checksum)
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray
