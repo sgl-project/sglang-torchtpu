@@ -23,12 +23,11 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_tpu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
-_is_tpu = is_tpu()
 
 logger = logging.getLogger(__name__)
 
@@ -587,37 +586,3 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
-
-
-@register_attention_backend("pallas_tpu_flash")
-def create_pallas_tpu_flash_backend(runner):
-    from sglang_tpu.attention_pallas import TpuPallasAttnBackend
-
-    return TpuPallasAttnBackend(runner)
-
-
-@register_attention_backend("pallas_tpu_rpa_v3")
-def create_pallas_tpu_rpa_v3_backend(runner):
-    from sglang_tpu.attention_pallas_rpa_v3 import (
-        TpuPallasRpaV3AttnBackend,
-    )
-
-    return TpuPallasRpaV3AttnBackend(runner)
-
-
-@register_attention_backend("pallas_tpu_rpa_batched")
-def create_pallas_tpu_rpa_batched_backend(runner):
-    from sglang_tpu.attention_pallas_rpa_batched import (
-        TpuPallasRpaBatchedAttnBackend,
-    )
-
-    return TpuPallasRpaBatchedAttnBackend(runner)
-
-
-@register_attention_backend("pallas_tpu_mla")
-def create_pallas_tpu_mla_backend(runner):
-    from sglang_tpu.attention_pallas_mla import (
-        TpuPallasMlaAttnBackend,
-    )
-
-    return TpuPallasMlaAttnBackend(runner)

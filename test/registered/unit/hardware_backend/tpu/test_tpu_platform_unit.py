@@ -153,6 +153,37 @@ class TestTpuPlatformInitialization(CustomTestCase):
             ],
         )
 
+    def test_registers_every_pallas_attention_backend_choice(self):
+        """Core does not register the pallas_tpu_* backends; a CLI choice the
+        plugin forgets to register fails only when a worker builds it."""
+        from sglang.srt.arg_groups.choices import ATTENTION_BACKEND_CHOICES
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
+        )
+        from sglang_tpu.tpu_platform import _register_attention_backends
+
+        with patch.dict(ATTENTION_BACKENDS):
+            _register_attention_backends()
+            pallas_choices = {
+                name
+                for name in ATTENTION_BACKEND_CHOICES
+                if name.startswith("pallas_tpu_")
+            }
+            self.assertTrue(pallas_choices)
+            self.assertLessEqual(pallas_choices, ATTENTION_BACKENDS.keys())
+
+    def test_default_vision_attention_backend_is_registered(self):
+        from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
+        from sglang_tpu.tpu_platform import _register_attention_backends
+        from sglang_tpu.vision_attention import VisionTpuAttention
+
+        with patch.dict(QKV_BACKEND_IMPL):
+            _register_attention_backends()
+            self.assertIs(
+                QKV_BACKEND_IMPL[self.platform.get_default_vision_attention_backend()],
+                VisionTpuAttention,
+            )
+
     def test_reentry_during_model_registration_registers_once(self):
         """init_backend re-entered while registering models (model_runner's OOT import
         hook does this) must not register the TPU models a second time."""

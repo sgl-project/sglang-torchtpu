@@ -103,6 +103,37 @@ def test_fa4_seqlens_from_vit_cuda_graph_list(monkeypatch, graph_env):
     assert calls[0]["cu_seqlens_q"] is cu_seqlens
 
 
+@pytest.mark.parametrize(
+    ("server_backend", "passed_backend", "expected"),
+    [
+        (None, None, "plugin_attn"),
+        (None, "sdpa", "sdpa"),
+        ("triton_attn", "sdpa", "triton_attn"),
+    ],
+)
+def test_platform_default_ranks_below_explicit_choices(
+    monkeypatch, server_backend, passed_backend, expected
+):
+    """A platform default must not shadow --mm-attention-backend or a model's
+    explicit backend, and must win over the built-in per-device chain."""
+    monkeypatch.setattr(vision, "is_cuda", lambda: True)
+    monkeypatch.setattr(vision, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(
+        vision,
+        "current_platform",
+        SimpleNamespace(get_default_vision_attention_backend=lambda: "plugin_attn"),
+    )
+    monkeypatch.setattr(
+        vision,
+        "get_mm",
+        lambda: SimpleNamespace(mm_attention_backend=server_backend),
+    )
+
+    backend = vision.VisionAttention._determine_attention_backend(None, passed_backend)
+
+    assert backend == expected
+
+
 def test_explicit_backend_without_published_mm_context(monkeypatch, npu_platform):
     monkeypatch.setattr(
         vision,

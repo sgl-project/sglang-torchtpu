@@ -160,14 +160,16 @@ class TestPallasFlashTokenSlotPadding(CustomTestCase):
 
 
 class TestPallasRegistration(CustomTestCase):
-    """Both Pallas backend names must be registered in the attention
-    registry at module import time (same convention as ascend / intel_xpu)."""
+    """Both Pallas backend names must be in the attention registry once the
+    TPU platform's init_backend() registers them."""
 
     def test_registered(self):
         from sglang.srt.layers.attention.attention_registry import (
             ATTENTION_BACKENDS,
         )
+        from sglang_tpu.tpu_platform import _register_attention_backends
 
+        _register_attention_backends()
         for name in ("pallas_tpu_flash", "pallas_tpu_rpa_v3"):
             self.assertIn(name, ATTENTION_BACKENDS)
             self.assertTrue(callable(ATTENTION_BACKENDS[name]))

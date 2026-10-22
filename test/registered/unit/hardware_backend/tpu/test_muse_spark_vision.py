@@ -37,11 +37,9 @@ class TestMuseVision(unittest.TestCase):
 
     def test_rejects_attention_backends_that_ignore_segment_ids(self):
         """A backend that drops segment_ids lets padding and other windows leak in."""
-        from sglang.srt.layers.attention.vision import (
-            VisionSdpaAttention,
-            VisionTpuAttention,
-        )
+        from sglang.srt.layers.attention.vision import VisionSdpaAttention
         from sglang_tpu.models import muse_spark_vision
+        from sglang_tpu.vision_attention import VisionTpuAttention
 
         def attention(backend_cls, name):
             backend = backend_cls.__new__(backend_cls)

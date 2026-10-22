@@ -29,10 +29,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.utils import is_tpu
 from sglang.srt.utils.custom_op import register_custom_op
-
-_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -116,14 +113,10 @@ class RadixLinearAttention(nn.Module):
 
         # Target verify rebuilds query_start_loc from the physical padded input,
         # unlike ordinary extend where it retains the logical sequence ends.
-        # TPU pads every extend to a compile bucket and its GDN kernel already
-        # bounds work by query_start_loc (padded rows write the null state slot);
-        # trimming inside the compiled graph would specialize on the real token
-        # count and trace data_ptr(), which Dynamo rejects.
         should_trim_padded_extend = (
             is_extend
             and not forward_batch.forward_mode.is_target_verify()
-            and not _is_tpu
+            and get_attn_backend().linear_extend_trims_padding
         )
         real_num_tokens = (
             getattr(forward_batch, "global_num_token_non_padded_cpu", None)

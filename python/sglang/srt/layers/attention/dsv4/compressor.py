@@ -27,10 +27,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip, _use_aiter
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import add_prefix, is_npu, is_tpu, set_weight_attrs
-
-_is_npu = is_npu()
-_is_tpu = is_tpu()
+from sglang.srt.utils import add_prefix, set_weight_attrs
 
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
@@ -415,7 +412,9 @@ class Compressor(BaseFusedOp):
     def _apply_ape_hotfix(self):
         self.ape_converted = True
 
-        if _is_npu or _is_tpu:
+        # Only forward_native's kernels read the re-laid-out APE; the platform
+        # forwards (forward_npu, forward_tpu) read the checkpoint layout.
+        if self.dispatch_forward() != self.forward_native:
             return
 
         if self.overlap:

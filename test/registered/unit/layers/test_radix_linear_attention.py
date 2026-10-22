@@ -15,6 +15,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeAttentionBackend:
+    linear_extend_trims_padding = True
+
     def forward(
         self,
         *,
@@ -37,6 +39,8 @@ class _FakeAttentionBackend:
 
 
 class _FailingAttentionBackend:
+    linear_extend_trims_padding = True
+
     def forward(self, **kwargs):
         del kwargs
         raise RuntimeError("backend failure")
@@ -59,6 +63,8 @@ class _TargetVerifyMode:
 
 
 class _PhysicalAttentionBackend:
+    linear_extend_trims_padding = True
+
     def forward(self, *, layer, forward_batch, mixed_qkv, a, b):
         del layer, forward_batch
         assert mixed_qkv.shape[0] == 5
@@ -68,13 +74,16 @@ class _PhysicalAttentionBackend:
 
 
 class _BucketAttentionBackend:
+    linear_extend_trims_padding = False
+
     def forward(self, *, mixed_qkv, **kwargs):
         return mixed_qkv.reshape(1, -1, 2, 4)
 
 
 class TestRadixLinearAttentionPadding(CustomTestCase):
-    def test_tpu_compiled_prefill_keeps_bucket_shape(self):
-        """Changing logical prompt length must reuse the padded TPU graph."""
+    def test_non_trimming_backend_keeps_bucket_shape_in_compiled_prefill(self):
+        """Changing logical prompt length must reuse the padded graph when the
+        backend declares it does not trim DP-padded extend rows (TPU GDN)."""
         layer = radix_linear_attention.RadixLinearAttention(0, 1, 1, 2, 4, 4, 4)
         batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -89,7 +98,6 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         counter = CompileCounter()
         compiled = torch.compile(layer.forward, backend=counter, fullgraph=True)
         with (
-            patch.object(radix_linear_attention, "_is_tpu", True),
             patch.object(
                 radix_linear_attention,
                 "get_tc_piecewise_forward_context",
@@ -268,6 +276,29 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                     torch.zeros((1, padded_num_tokens - 3, 2, 4)),
                 )
                 self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+
+class TestLinearExtendTrimsPaddingFlag(CustomTestCase):
+    def test_hybrid_wrapper_answers_for_its_linear_backend(self):
+        """RadixLinearAttention reads the flag off the hybrid wrapper, so the
+        wrapper must report its linear backend's value, not the base default."""
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        full = SimpleNamespace(
+            token_to_kv_pool=None,
+            req_to_token_pool=None,
+            kv_index_translator=None,
+            needs_cpu_seq_lens=True,
+        )
+        for trims in (True, False):
+            hybrid = HybridLinearAttnBackend(
+                full_attn_backend=full,
+                linear_attn_backend=SimpleNamespace(linear_extend_trims_padding=trims),
+                full_attn_layers=[0],
+            )
+            self.assertIs(hybrid.linear_extend_trims_padding, trims)
 
 
 if __name__ == "__main__":

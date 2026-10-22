@@ -152,6 +152,12 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # Linear-attention extend trims DP-padded rows past
+    # global_num_token_non_padded_cpu before the kernel and refills them after.
+    # False when the backend bounds work by query_start_loc and sends padded
+    # rows to a null state slot, so the padded shape reaches the kernel as is.
+    linear_extend_trims_padding: bool = True
+
     # True for backends that preallocate per-seq extend metadata at req-pool
     # size (e.g. triton's kv_indptr): dummy extend batches must then keep
     # batch_size <= req_to_token_pool.size.

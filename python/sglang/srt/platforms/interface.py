@@ -117,6 +117,11 @@ class SRTPlatform(DeviceMixin):
         """Return the default draft attention backend for an algorithm."""
         raise NotImplementedError
 
+    def get_default_vision_attention_backend(self) -> Optional[str]:
+        """Default multimodal (ViT) attention backend; None keeps the built-in
+        per-device choice in ``VisionAttention._determine_attention_backend``."""
+        return None
+
     def get_graph_runner_cls(self) -> type:
         """Return the graph runner class for this platform."""
         raise NotImplementedError

@@ -1,7 +1,7 @@
 """CPU-runnable unit tests for the TPU vision-encoder flash-attention wrapper.
 
 These cover the pure-PyTorch logic in ``VisionTpuAttention.forward``
-(``layers/attention/vision.py``): rearrange to ``[b, h, s, d]``, padding the
+(``sglang_tpu/vision_attention.py``): rearrange to ``[b, h, s, d]``, padding the
 sequence up to ``_BLOCK_SIZE``, extending ``segment_ids`` with a dedicated
 padding segment so pad tokens never attend to real ones, and slicing the output
 back to the real length.
@@ -23,8 +23,8 @@ import unittest
 import torch
 from einops import rearrange
 
-from sglang.srt.layers.attention.vision import VisionTpuAttention
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.vision_attention import VisionTpuAttention
 
 
 def _ref_segment_attention(q, k, v, seg_ids, scale):

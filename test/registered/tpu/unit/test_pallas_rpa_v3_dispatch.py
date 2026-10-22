@@ -33,14 +33,16 @@ from sglang.test.test_utils import CustomTestCase
 
 class TestPallasBackendRegistration(CustomTestCase):
     """Both Pallas backends must be registered and resolve to distinct
-    factory classes that match the documented design. Registration happens
-    at attention_registry import time (same as ascend / intel_xpu)."""
+    factory classes that match the documented design. The TPU platform
+    registers them from init_backend()."""
 
     def test_both_backends_registered(self):
         from sglang.srt.layers.attention.attention_registry import (
             ATTENTION_BACKENDS,
         )
+        from sglang_tpu.tpu_platform import _register_attention_backends
 
+        _register_attention_backends()
         self.assertIn("pallas_tpu_flash", ATTENTION_BACKENDS)
         self.assertIn("pallas_tpu_rpa_v3", ATTENTION_BACKENDS)
         self.assertTrue(callable(ATTENTION_BACKENDS["pallas_tpu_flash"]))

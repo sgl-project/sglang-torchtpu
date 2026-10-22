@@ -426,6 +426,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
     is irrelevant here (state is always updated).
     """
 
+    # Every extend is padded to a compile bucket; trimming inside the compiled
+    # graph would specialize on the real token count and trace data_ptr(),
+    # which Dynamo rejects.
+    linear_extend_trims_padding = False
+
     def __init__(self, model_runner: "ModelRunner"):
         super().__init__(model_runner)
         # Build (and JAX-export) the custom op eagerly at construction time so

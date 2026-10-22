@@ -55,7 +55,6 @@ from sglang.srt.utils import (
     envs,
     is_cpu,
     is_npu,
-    is_tpu,
     is_xpu,
     load_audio,
     load_image,
@@ -66,7 +65,6 @@ from sglang.srt.utils import (
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 
@@ -778,10 +776,6 @@ class BaseMultimodalProcessor(ABC):
             return "cpu"
         if _is_xpu:
             return "xpu"
-        if _is_tpu:
-            # transformers image processors don't support TPU as a device.
-            # Preprocess on CPU; the model runner will move tensors to TPU.
-            return "cpu"
         if not _is_npu:
             platform = platforms.current_platform
             if not platform.is_cuda_alike():

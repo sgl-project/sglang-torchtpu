@@ -1206,6 +1206,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.data_type
 
     @property
+    def linear_extend_trims_padding(self) -> bool:
+        return self.linear_attn_backend.linear_extend_trims_padding
+
+    @property
     def supports_ragged_verify_graph(self) -> bool:
         return (
             self.full_attn_backend.supports_ragged_verify_graph
