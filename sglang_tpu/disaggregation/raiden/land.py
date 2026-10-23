@@ -16,7 +16,18 @@ padding page, pages ``1 .. size // page_size`` belong to the allocator
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Iterable, Optional
+from dataclasses import dataclass, field
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.common import CHUNK_ANNOUNCE_TOKENS
@@ -135,3 +146,184 @@ class ScratchArena:
             )
         self._held -= unique
         self._free.extend(ids)
+
+
+# Carried by RESHARD_LAND_READY / RESHARD_LAND_CHUNK_READY. A prefill that
+# meets another version fails the room instead of pushing a schedule its
+# decode may place differently.
+LAND_VERSION = 1
+
+# Merge batch sizes (pairs), so a round compiles one of a few shapes; the
+# arena capacity tops the list.
+MERGE_BUCKETS = (8, 16, 32, 64)
+
+
+@dataclass
+class LandPlan:
+    """Scratch blocks one receive plan holds, from take to free."""
+
+    room: int
+    scratch: List[int]
+    # The final pages the scratch pairs with, set when the plan is published.
+    final: List[int] = field(default_factory=list)
+    # READY sent: the engine will report the plan done or failed.
+    published: bool = False
+    # Reported done while its room was live: waiting for the merge.
+    settled: bool = False
+
+
+@dataclass
+class LandHold:
+    """A take the arena could not serve yet, retried in FIFO order."""
+
+    key: str
+    room: int
+    pages: int
+    deadline: float
+    # Re-runs the registration from the take on; called without the lock.
+    retry: Callable[[], None]
+    # Fails the room once the hold expires; called without the lock.
+    expire: Callable[[], None]
+
+
+class LandState:
+    """The decode's scratch plans and holds over one ``ScratchArena``.
+
+    Not thread-safe: every call runs under ``RaidenKVManager._state_lock``.
+    A plan is keyed by its receive plan's req_id; ``free`` pops it, so each
+    plan returns its ids exactly once whichever terminal path gets there
+    first.
+    """
+
+    def __init__(self, arena: ScratchArena):
+        self.arena = arena
+        self.plans: Dict[str, LandPlan] = {}
+        self.holds: Deque[LandHold] = deque()
+        # When each room registered, for the hold deadline.
+        self.started: Dict[int, float] = {}
+
+    def take(self, key: str, room: int, n: int) -> Optional[List[int]]:
+        """``n`` scratch ids for plan ``key``, or None when it must wait.
+
+        A take never jumps the hold queue: only the head hold's own retry
+        can take while holds are queued. Raises ValueError for a plan the
+        arena can never serve.
+        """
+        if n > self.arena.capacity:
+            raise ValueError(
+                f"a landing plan of {n} pages exceeds the {self.arena.capacity}"
+                "-block reshard landing arena"
+            )
+        if key in self.plans:
+            raise ValueError(f"landing plan {key} already holds scratch")
+        if self.holds and self.holds[0].key != key:
+            return None
+        ids = self.arena.take(n)
+        if ids is None:
+            return None
+        if self.holds:
+            self.holds.popleft()
+        self.plans[key] = LandPlan(room=room, scratch=ids)
+        return ids
+
+    def hold(self, hold: LandHold) -> None:
+        if all(h.key != hold.key for h in self.holds):
+            self.holds.append(hold)
+
+    def publish(self, key: str, final: List[int]) -> None:
+        plan = self.plans[key]
+        plan.final = list(final)
+        plan.published = True
+
+    def free(self, key: str) -> None:
+        plan = self.plans.pop(key, None)
+        if plan is not None:
+            self.arena.free(plan.scratch)
+
+    def settle(
+        self,
+        done: Iterable[str],
+        failed: Iterable[str],
+        live: Callable[[int], bool],
+    ) -> None:
+        """Record engine reports. A failed plan may have H2D'd some layers
+        only, so it is never merged; the report fires once every H2D and
+        accepted push has ended, so its scratch is free at once. A done plan
+        merges if its room is still live, else frees."""
+        for key in failed:
+            self.free(key)
+        for key in done:
+            plan = self.plans.get(key)
+            if plan is None or not plan.published:
+                continue
+            if live(plan.room):
+                plan.settled = True
+            else:
+                self.free(key)
+
+    def drop_room(self, room: int) -> None:
+        """Forget a cleared room: its holds, and its settled plans (no merge,
+        the pages are gone). Unsettled plans keep their scratch until the
+        engine reports them."""
+        self.holds = deque(h for h in self.holds if h.room != room)
+        for key in [k for k, p in self.plans.items() if p.room == room and p.settled]:
+            self.free(key)
+        self.started.pop(room, None)
+
+    def merged(self, room: int) -> bool:
+        """No plan of ``room`` holds scratch: every landed page is merged."""
+        return all(p.room != room for p in self.plans.values())
+
+
+def merge_bucket(n: int, capacity: int) -> int:
+    """The batch size ``n`` merge pairs pad to."""
+    for b in (*MERGE_BUCKETS, capacity):
+        if n <= b:
+            return b
+    raise ValueError(f"{n} merge pairs exceed the {capacity}-block arena")
+
+
+def merge_pages(
+    kv_caches: Sequence[Any],
+    pairs: Sequence[Tuple[int, int]],
+    capacity: int,
+    layout_of: Callable[[Any], Any],
+) -> None:
+    """Merge every (final, scratch) block pair into the final page, in place
+    on each KV tensor: gather both, move scratch slots 0-1 into final slots
+    2-3 on a uint8 view of the gathered copy (never of the pool), and write
+    the final pages back. Pads to ``merge_bucket`` by repeating the last pair:
+    rewriting a page with its own merge is idempotent, a block-0 dummy is
+    not."""
+    import torch
+
+    from sglang_tpu.disaggregation.raiden.reshard_schedule import land_merge
+    from sglang_tpu.kv_page_write import write_pages_torch
+
+    if not pairs:
+        return
+    pairs = list(pairs)
+    pairs += [pairs[-1]] * (merge_bucket(len(pairs), capacity) - len(pairs))
+    final = torch.tensor([f for f, _ in pairs], dtype=torch.long)
+    scratch = torch.tensor([s for _, s in pairs], dtype=torch.long)
+    # One H2D of the ids per device, not per layer.
+    ids_on: dict = {}
+    for kv in kv_caches:
+        ptr = kv.data_ptr()
+        if kv.device not in ids_on:
+            ids_on[kv.device] = (final.to(kv.device), scratch.to(kv.device))
+        f, s = ids_on[kv.device]
+        pages = kv[f]
+        land_merge(pages.view(torch.uint8), kv[s].view(torch.uint8), layout_of(kv))
+        write_pages_torch(f, pages, kv)
+        # raiden pushes into this buffer by address: the merge must write in
+        # place, never rebind the tensor.
+        assert kv.data_ptr() == ptr, "landing merge moved a KV buffer"
+
+
+def device_sync(kv_caches: Sequence[Any]) -> None:
+    """``torch.accelerator.synchronize()``; a no-op for CPU tensors."""
+    if kv_caches and kv_caches[0].device.type != "cpu":
+        import torch
+
+        torch.accelerator.synchronize()

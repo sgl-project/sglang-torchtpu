@@ -747,6 +747,9 @@ class Envs:
     # fp8 token-major push reshard lands heads that do not fill a 32-bit
     # granule (#829). Costs 2 * ceil(8192 / page_size) pages of KV budget.
     SGLANG_RAIDEN_RESHARD_LAND_ARENA = EnvBool(False)
+    # Raiden decode: longest a landing plan waits for arena blocks before its
+    # room fails; also capped at the waiting timeout less 10 s.
+    SGLANG_RAIDEN_LAND_HOLD_TIMEOUT_S = EnvFloat(30.0)
     # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
     # instead of fixed max-length slots; asymmetric attention TP needs it.
     SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(

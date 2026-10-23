@@ -809,7 +809,10 @@ class TestPushReshardRefusal(unittest.TestCase):
         kwargs = dict(total_heads=8, own_tp=4, page_size=64, seq_along_lane=False)
         geom = mgr._make_geometry(8, 4)
         refused = rs.push_reshard_refusal(geom, fp8_2.shape, 1, **kwargs)
-        self.assertEqual(refused, self._decode([fp8_2], [2], total_heads=8))
+        # The manager appends a hint when the landing arena would admit it.
+        got = self._decode([fp8_2], [2], total_heads=8)
+        self.assertTrue(got.startswith(refused), got)
+        self.assertIn("SGLANG_RAIDEN_RESHARD_LAND_ARENA", got)
         self.assertIn("landing buffer", refused)
         self.assertEqual(
             rs.push_reshard_refusal(geom, fp8_2.shape, 1, land_ok=False, **kwargs),
