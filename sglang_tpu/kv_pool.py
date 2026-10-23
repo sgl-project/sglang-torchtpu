@@ -378,7 +378,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             self._raiden_backup_obj = None if swa_member else maybe_build_backup(self)
         return self._raiden_backup_obj
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        req_pool_index=None,
+        *,
+        allow_raiden_backup: bool = True,
+    ):
         """Copy the KV rows at ``indices`` out to host.
 
         Overrides the base version, which stores K and V in two separate
@@ -387,7 +394,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         DMA instead and come back the same way; rows that do not fill their
         pages sequentially use the row path.
         """
-        backup = self._raiden_backup()
+        backup = self._raiden_backup() if allow_raiden_backup else None
         if backup is not None:
             self._synchronize_device()
             handle = backup.try_save(indices)
@@ -672,9 +679,16 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
             n_blocks * page_size, kv_heads_x2, hd_words * packing
         )
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(
+        self,
+        indices,
+        mamba_indices=None,
+        req_pool_index=None,
+        *,
+        allow_raiden_backup: bool = True,
+    ):
         """Copy selected token lanes to the fused pool's host-row format."""
-        backup = self._raiden_backup()
+        backup = self._raiden_backup() if allow_raiden_backup else None
         if backup is not None:
             self._synchronize_device()
             handle = backup.try_save(indices)
