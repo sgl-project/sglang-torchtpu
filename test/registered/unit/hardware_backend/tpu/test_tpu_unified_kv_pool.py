@@ -140,6 +140,8 @@ def _hybrid_kvc(
         get_num_kv_heads=lambda tp_size, dcp_size=1: 1,
         get_swa_num_kv_heads=lambda tp_size, dcp_size=1: swa_kv_heads,
         hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+        full_attention_layer_ids=list(full_layer_ids),
+        swa_attention_layer_ids=list(swa_layer_ids),
     )
     return SimpleNamespace(
         is_hybrid_swa=True,
@@ -1377,6 +1379,44 @@ class TestUnifiedPoolEnabled(CustomTestCase):
             with _fused_rpa_platform(TpuSeqAlongLaneKVPool):
                 with self.assertRaisesRegex(ValueError, "TpuSeqAlongLaneKVPool"):
                     unified_kv_pool_enabled(_hybrid_kvc())
+
+    def test_accepts_prefill_but_not_decode_context_parallelism(self):
+        # A prefill-CP rank keeps the whole sequence in a pool of the usual
+        # geometry; decode CP allocates in a page space widened by its size.
+        def enabled_with(kvc=None, **parallel):
+            with (
+                _fused_rpa_platform(),
+                get_context().override_server_args(
+                    tpu_unified_kv_pool=True, tp_size=2, **parallel
+                ),
+            ):
+                return unified_kv_pool_enabled(kvc or _hybrid_kvc())
+
+        self.assertTrue(enabled_with(attn_cp_size=2))
+        with self.assertRaisesRegex(ValueError, "decode context parallelism"):
+            enabled_with(dcp_size=2)
+        # The CP write path writes the first sliding-window group only.
+        with self.assertRaisesRegex(ValueError, "prefill context parallelism"):
+            enabled_with(
+                attn_cp_size=2,
+                kvc=_hybrid_kvc(full_layer_ids=(0,), swa_layer_ids=(1, 2)),
+            )
+
+    def test_prefill_context_parallelism_counts_the_whole_models_groups(self):
+        """A rank's own layers can form one sliding-window group while the pool
+        groups by the whole model's layers (a pipeline stage); the refusal
+        counts the whole model's."""
+        stage = _hybrid_kvc(full_layer_ids=(4,), swa_layer_ids=(5,))
+        stage.model_config.full_attention_layer_ids = [0, 4]
+        stage.model_config.swa_attention_layer_ids = [1, 2, 3, 5, 6, 7]
+        with (
+            _fused_rpa_platform(),
+            get_context().override_server_args(
+                tpu_unified_kv_pool=True, tp_size=2, attn_cp_size=2
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "prefill context parallelism"):
+                unified_kv_pool_enabled(stage)
 
     def test_sliding_window_pages_must_match_or_merge_into_full_ones(self):
         # Sliding-window layers beyond the full count form groups, and two

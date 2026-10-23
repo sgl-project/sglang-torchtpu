@@ -10,9 +10,11 @@ import torch
 
 from sglang.srt.layers.cp.base import get_cp_strategy, init_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.mem_cache.allocator import swa as swa_allocator_module
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.attention_pallas_rpa_batched import (
     TpuPallasRpaBatchedAttnBackend,
 )
@@ -33,6 +35,10 @@ from sglang_tpu.cp_layout import (
 )
 from sglang_tpu.kv_row_write import kv_write_segments
 from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang_tpu.unified_kv_pool import (
+    TpuUnifiedSWAKVPool,
+    TpuUnifiedSWATokenToKVPoolAllocator,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -67,6 +73,45 @@ def _expand_runs(segments, num_segments):
     for src, dst, n in segments[:, : int(num_segments)].T.tolist():
         rows.update({src + i: dst + i for i in range(n)})
     return rows
+
+
+def _unified_pool_and_allocator(testcase, *, page_size, num_pages):
+    """A unified full/SWA pool (one layer of each kind) and its allocator, on
+    the TPU branches of the SWA allocator."""
+    for patcher in (
+        patch.object(swa_allocator_module, "_is_tpu", True),
+        patch.object(
+            swa_allocator_module,
+            "TpuPagedTokenToKVPoolAllocator",
+            TpuPagedTokenToKVPoolAllocator,
+            create=True,
+        ),
+    ):
+        patcher.start()
+        testcase.addCleanup(patcher.stop)
+    pool = TpuUnifiedSWAKVPool(
+        size=num_pages * page_size,
+        page_size=page_size,
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=128,
+        swa_head_num=1,
+        swa_head_dim=128,
+        swa_v_head_dim=128,
+        swa_attention_layer_ids=[1],
+        full_attention_layer_ids=[0],
+        device="cpu",
+        start_layer=0,
+    )
+    allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+        num_pages * page_size,
+        page_size=page_size,
+        dtype=torch.bfloat16,
+        device="cpu",
+        kvcache=pool,
+        need_sort=False,
+    )
+    return pool, allocator
 
 
 class TestZigzagLayout(CustomTestCase):
@@ -309,6 +354,40 @@ class TestCpMetadata(CustomTestCase):
         # Warmup rows all point at the padding slot, which is never mapped.
         _, warmup = self._metadata(torch.zeros_like(req_to_token), unmapped)
         self.assertEqual(int(warmup.cp_swa_write_num_segments), 0)
+
+    def test_unified_pool_swa_slots_are_shared_pages_apart_from_full_ones(self):
+        """With the unified pool a full and a sliding-window layer write the same
+        buffer, so every SWA write slot must sit on a page of that shared pool
+        that none of the batch's full slots use."""
+        pool, allocator = _unified_pool_and_allocator(
+            self, page_size=self.PAGE, num_pages=32
+        )
+        # Both requests from scratch: prefix and extend tokens in one allocation.
+        seq_lens = torch.tensor(self.PREFIX_LENS) + torch.tensor(self.EXTEND_LENS)
+        no_prefix = torch.zeros(2, dtype=torch.int64)
+        full_slots = allocator.alloc_extend(
+            no_prefix,
+            no_prefix,
+            seq_lens,
+            seq_lens,
+            torch.full((2,), -1),
+            int(seq_lens.sum()),
+        )
+        req_to_token = torch.zeros(3, 256, dtype=torch.int32)
+        for row, slots in zip(self.POOL_ROWS, full_slots.split(seq_lens.tolist())):
+            req_to_token[row, : len(slots)] = slots
+        _, metadata = self._metadata(req_to_token, allocator.full_to_swa_index_mapping)
+        full_rows = _expand_runs(
+            metadata.cp_write_segments, metadata.cp_write_num_segments
+        )
+        swa_rows = _expand_runs(
+            metadata.cp_swa_write_segments, metadata.cp_swa_write_num_segments
+        )
+        self.assertEqual(swa_rows.keys(), full_rows.keys())
+        swa_pages = {slot // self.PAGE for slot in swa_rows.values()}
+        num_blocks = pool.get_fused_kv_buffer(1).shape[0]
+        self.assertTrue(all(0 < page < num_blocks for page in swa_pages))
+        self.assertFalse(swa_pages & set((full_slots // self.PAGE).tolist()))
 
 
 class TestCpEmbeddingAndLogits(CustomTestCase):

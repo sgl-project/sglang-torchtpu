@@ -196,8 +196,23 @@ def _unsupported_reason(kvc: KVCacheConfigurator) -> Optional[str]:
         return "speculative decoding"
     if get_parallel().pp_size > 1:
         return "pipeline parallelism"
-    if get_parallel().attn_cp_size > 1 or get_parallel().dcp_enabled:
-        return "context parallelism"
+    if get_parallel().dcp_enabled:
+        return "decode context parallelism"
+    # The CP write path translates slots for the first sliding-window group only.
+    # Count the groups over the whole model's layers, as the pool does on every
+    # pipeline stage, not over this rank's.
+    if get_parallel().attn_cp_size > 1 and (
+        full_page != swa_page
+        or num_swa_groups(
+            num_full_layers=len(model_config.full_attention_layer_ids),
+            num_swa_layers=len(model_config.swa_attention_layer_ids),
+        )
+        > 1
+    ):
+        return (
+            "prefill context parallelism with sliding-window layer groups or "
+            "merged sliding-window heads"
+        )
     if get_disagg().disaggregation_mode != "null":
         return "PD disaggregation"
     # Only raiden's host pool can be shared by both views; torch_tpu's mirrors
