@@ -40,7 +40,16 @@ from __future__ import annotations
 
 import dataclasses
 from fractions import Fraction
-from typing import Any, Iterable, List, Optional, Protocol, Sequence, Tuple
+from typing import (
+    Any,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 
 class FusedKVLayerTensor(Protocol):
@@ -242,7 +251,36 @@ class KVLayoutGeometry:
 
 class LandRequired(ValueError):
     """A contribution whose bytes no whole-granule copy places correctly; it
-    needs a landing buffer and merge. TODO(#829): P1b."""
+    needs a landing buffer and merge (#829)."""
+
+
+class LandEntry(NamedTuple):
+    """Per-token whole-granule copy into a scratch block rather than the
+    final page; ``land_merge`` then moves its head into place."""
+
+    src_offset: int
+    size: int
+    src_stride: int
+    dst_offset: int
+    dst_stride: int
+
+
+# The merge, on the logical [blocks, page, granules, kv_packing, head_dim]
+# view of an fp8 pool: a landed head sits at scratch slots 0-1 of the granule
+# whose final slots 2-3 it owns.
+_LAND_PACKING = 4
+_LAND_FINAL_SLOTS = slice(2, 4)
+_LAND_SCRATCH_SLOTS = slice(0, 2)
+
+
+def _lands(src: KVLayoutGeometry, num_heads: int, dst_slot: int) -> bool:
+    """A one-head fp8 source placed at final slots 2-3 of a granule: the
+    class the merge serves. Wider (3-head) sources are not."""
+    return (
+        src.kv_packing == _LAND_PACKING
+        and src.heads_per_rank == num_heads == 1
+        and dst_slot % _LAND_PACKING == _LAND_FINAL_SLOTS.start
+    )
 
 
 def direct_granule_copy(
@@ -251,6 +289,8 @@ def direct_granule_copy(
     src_head_start: int,
     num_heads: int,
     dst_head_start: int,
+    *,
+    land: bool = False,
 ) -> Tuple[int, int, int, int, int]:
     """Per-token ``(src_offset, size, src_stride, dst_offset, dst_stride)``
     copying heads ``[src_head_start, +num_heads)`` of ``src`` to
@@ -261,6 +301,13 @@ def direct_granule_copy(
     within the granule, the copy stays inside both rows, and no source padding
     slot lands on a destination head (other source heads carried along land
     on their own destination slots: both windows are contiguous global heads).
+
+    With ``land``, a one-head fp8 source that starts mid-granule returns a
+    LandEntry: the same granules, aimed at scratch granule
+    ``min(dst_slot // g, granules - count)``. A one-head source whose padding
+    covers the next destination head copies directly, since that head lands
+    and the merge overwrites the padding. Either is exact only as part of a
+    whole plan (``land_plan_exact``).
     """
     if src.unit() != dst.unit():
         raise ValueError(f"reshard sides differ in layout: {src} vs {dst}")
@@ -277,14 +324,26 @@ def direct_granule_copy(
         or first + count > src.granules_per_token
         or dst_first + count > dst.granules_per_token
     ):
+        q = min(dst_slot // g, dst.granules_per_token - count)
+        if (
+            land
+            and _lands(src, num_heads, dst_slot)
+            and lead == 0
+            and q * g + _LAND_FINAL_SLOTS.start == dst_slot
+        ):
+            return LandEntry(
+                first * gb, count * gb, src.row_bytes, q * gb, dst.row_bytes
+            )
         raise LandRequired(
             f"heads [{src_head_start}, {src_head_start + num_heads}) of "
             f"{src.heads_per_rank} cannot land at head {dst_head_start} of "
             f"{dst.heads_per_rank} by whole {g}-slot granules"
         )
     src_pad = 2 * src.heads_per_rank
-    if (first + count) * g > src_pad and dst_slot + src_pad - first_slot < (
-        2 * dst.heads_per_rank
+    if (
+        (first + count) * g > src_pad
+        and dst_slot + src_pad - first_slot < 2 * dst.heads_per_rank
+        and not (land and _lands(src, num_heads, dst_slot + src_pad - first_slot))
     ):
         raise LandRequired(
             f"source padding after head {src.heads_per_rank - 1} would "
@@ -418,6 +477,7 @@ class ReshardGeometry:
         self.kv_packing = kv_packing
         self.element_size = element_size
         self.layout: Optional[KVLayoutGeometry] = None
+        self.land = False
 
     @classmethod
     def from_layout(
@@ -426,10 +486,13 @@ class ReshardGeometry:
         dst_tp: int,
         layout: KVLayoutGeometry,
         total_kv_heads: int,
+        *,
+        land: bool = False,
     ) -> "ReshardGeometry":
         """Geometry over ``layout`` (either side's: only its head count
         differs). ``entry_bytes`` raises LandRequired for a token-major
-        contribution no whole-granule copy places."""
+        contribution no whole-granule copy places, or with ``land`` returns
+        a LandEntry for one the merge places."""
         geom = cls(
             src_tp,
             dst_tp,
@@ -439,7 +502,16 @@ class ReshardGeometry:
             element_size=layout.element_size,
         )
         geom.layout = layout
+        geom.land = land
         return geom
+
+    def with_land(self) -> "ReshardGeometry":
+        """This geometry, classifying landing contributions as LandEntry."""
+        if self.layout is None:
+            return self
+        return ReshardGeometry.from_layout(
+            self.src_tp, self.dst_tp, self.layout, self.total_kv_heads, land=True
+        )
 
     def count_for(self, live_tokens: int) -> int:
         """Entry repeat count for a page holding ``live_tokens`` tokens: one
@@ -451,22 +523,17 @@ class ReshardGeometry:
     def entry_bytes(self, prefill_rank: int, decode_rank: int):
         """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
         prefill_rank -> decode_rank contribution, repeated ``count_for`` times
-        per page."""
+        per page; a LandEntry targets the scratch block."""
         sh_start, num_heads, dh_start, src_hpr, dst_hpr = head_slice_params(
             self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
         )
         if self.layout is not None:
-            copy = (
-                head_run_copy
-                if self.layout.kind == SEQ_ALONG_LANE
-                else direct_granule_copy
-            )
-            return copy(
-                self.layout.with_heads(src_hpr),
-                self.layout.with_heads(dst_hpr),
-                sh_start,
-                num_heads,
-                dh_start,
+            src = self.layout.with_heads(src_hpr)
+            dst = self.layout.with_heads(dst_hpr)
+            if self.layout.kind == SEQ_ALONG_LANE:
+                return head_run_copy(src, dst, sh_start, num_heads, dh_start)
+            return direct_granule_copy(
+                src, dst, sh_start, num_heads, dh_start, land=self.land
             )
         # A 32-bit pack holds kv_packing // 2 heads, and a rank's padded last
         # pack still spans its per-token width.
@@ -582,6 +649,101 @@ def _schedule(geom: ReshardGeometry) -> List[Tuple[int, int, int, int, int]]:
     return [geom.entry_bytes(p, p // geom.ratio) for p in range(geom.src_tp)]
 
 
+def _typed(schedule: Optional[List[Tuple[int, ...]]]) -> Optional[List[Any]]:
+    """A schedule compared with its entry kinds: a LandEntry equals the plain
+    tuple of its values."""
+    if schedule is None:
+        return None
+    return [(isinstance(e, LandEntry), tuple(e)) for e in schedule]
+
+
+def land_merge_slots(layout: KVLayoutGeometry) -> Tuple[slice, slice]:
+    """``(final, scratch)`` slices of the kv_packing axis that the merge
+    moves, on the logical ``[blocks, page, granules, kv_packing, head_dim]``
+    view of a token-major fp8 pool: every granule's final slots 2-3 take its
+    scratch slots 0-1."""
+    layout._require(TOKEN_MAJOR)
+    if layout.kv_packing != _LAND_PACKING:
+        raise ValueError(f"no landing merge for kv_packing {layout.kv_packing}")
+    return _LAND_FINAL_SLOTS, _LAND_SCRATCH_SLOTS
+
+
+def land_merge(final: Any, scratch: Any, layout: KVLayoutGeometry) -> Any:
+    """Merge gathered scratch pages into gathered final pages in place, both
+    in the logical ``[..., granules, kv_packing, head_dim]`` layout (numpy or
+    torch, any same-size dtype view). Returns ``final``."""
+    dst, src = land_merge_slots(layout)
+    final[..., dst, :] = scratch[..., src, :]
+    return final
+
+
+def _rank_heads(total: int, tp: int, rank: int) -> List[int]:
+    """Global kv heads attention-TP ``rank`` holds; replicated below tp."""
+    if total >= tp:
+        per_rank = total // tp
+        return list(range(rank * per_rank, (rank + 1) * per_rank))
+    return [rank // (tp // total)]
+
+
+def land_plan_exact(geom: ReshardGeometry) -> bool:
+    """Whether ``geom``'s landing schedule, followed on every plan holding a
+    LandEntry by ``land_merge``, leaves each decode rank exactly its own
+    heads. Checked per K/V slot from the global head ownership, independent
+    of ``head_slice_params``: a source's padding must be overwritten by the
+    merge. An odd head count per decode rank is refused conservatively: its
+    last granule's slots 2-3 are padding, and pad slots must not receive
+    scratch bytes."""
+    lay = geom.layout
+    if (
+        lay is None
+        or lay.kind != TOKEN_MAJOR
+        or lay.kv_packing != _LAND_PACKING
+        or geom.src_tp <= geom.dst_tp
+    ):
+        return False
+    total, g, gb = geom.total_kv_heads, lay.kv_packing, lay.granule_bytes
+    src = lay.with_heads(max(1, total // geom.src_tp))
+    dst = lay.with_heads(max(1, total // geom.dst_tp))
+    if dst.heads_per_rank % 2:
+        return False
+    width = dst.granules_per_token * g
+    for d in range(geom.dst_tp):
+        final: List[Any] = [None] * width
+        scratch: List[Any] = [None] * width
+        landed = False
+        for p in source_ranks_for(d, geom.ratio):
+            try:
+                e = geom.entry_bytes(p, d)
+            except LandRequired:
+                return False
+            if (
+                any(x % gb for x in (e[0], e[1], e[3]))
+                or (e[2], e[4]) != (src.row_bytes, dst.row_bytes)
+                or e[0] + e[1] > src.row_bytes
+                or e[3] + e[1] > dst.row_bytes
+            ):
+                return False
+            slots = [
+                (h, kv) for h in _rank_heads(total, geom.src_tp, p) for kv in (0, 1)
+            ]
+            slots += [None] * (src.granules_per_token * g - len(slots))
+            landed |= isinstance(e, LandEntry)
+            out = scratch if isinstance(e, LandEntry) else final
+            first, q = e[0] // gb * g, e[3] // gb * g
+            out[q : q + e[1] // gb * g] = slots[first : first + e[1] // gb * g]
+        if landed:
+            for k in range(0, width, g):
+                final[k + _LAND_FINAL_SLOTS.start : k + _LAND_FINAL_SLOTS.stop] = (
+                    scratch[
+                        k + _LAND_SCRATCH_SLOTS.start : k + _LAND_SCRATCH_SLOTS.stop
+                    ]
+                )
+        want = [(h, kv) for h in _rank_heads(total, geom.dst_tp, d) for kv in (0, 1)]
+        if final[: len(want)] != want:
+            return False
+    return True
+
+
 def push_reshard_refusal(
     geom: ReshardGeometry,
     shape: Sequence[int],
@@ -591,6 +753,7 @@ def push_reshard_refusal(
     own_tp: int,
     page_size: int,
     seq_along_lane: bool,
+    land_ok: bool = False,
 ) -> Optional[str]:
     """Why pushing one KV layer tensor with ``geom``'s schedule would misplace
     bytes, or None when the copy is byte-exact.
@@ -601,6 +764,10 @@ def push_reshard_refusal(
     exact iff ``geom`` plans exactly the schedule of the tensor's own layout:
     whole granules per token (``direct_granule_copy``) or whole head runs per
     page (``head_run_copy``).
+
+    ``land_ok`` also allows a schedule that needs scratch blocks and a merge
+    when ``land_plan_exact`` holds; the caller passes it only for groups that
+    have a landing arena (not sliding-window).
     """
     src_tp, dst_tp = geom.src_tp, geom.dst_tp
     where = push_reshard_where(src_tp, dst_tp)
@@ -640,18 +807,24 @@ def push_reshard_refusal(
             ReshardGeometry.from_layout(src_tp, dst_tp, layout, total_heads)
         )
     except LandRequired as e:
-        packed = "fp8" if pk == 4 else f"kv_packing {pk}"
-        return (
-            f"{where} cannot place {packed} KV of {src_heads} kv heads per "
-            f"prefill rank into {dst_heads} per decode rank by whole 32-bit "
-            f"packs ({e}), which needs a landing buffer (#829). Use equal "
-            "attention TP or a bf16 KV cache"
+        landing = ReshardGeometry.from_layout(
+            src_tp, dst_tp, layout, total_heads, land=True
         )
+        if not (land_ok and land_plan_exact(landing)):
+            packed = "fp8" if pk == 4 else f"kv_packing {pk}"
+            return (
+                f"{where} cannot place {packed} KV of {src_heads} kv heads per "
+                f"prefill rank into {dst_heads} per decode rank by whole 32-bit "
+                f"packs ({e}), which needs a landing buffer (#829). Use equal "
+                "attention TP or a bf16 KV cache"
+            )
+        exact = _schedule(landing)
+        geom = geom.with_land()
     try:
         planned = _schedule(geom)
     except ValueError:
         planned = None
-    if planned == exact:
+    if _typed(planned) == _typed(exact):
         return None
     if geom.total_kv_heads != total_heads:
         return (
@@ -688,6 +861,22 @@ def _add_entry(
     entry.count = count
 
 
+def _target_blocks(
+    entry: Tuple[int, ...],
+    dst_block_ids: Sequence[int],
+    scratch_block_ids: Optional[Sequence[int]],
+) -> Sequence[int]:
+    """The decode blocks a contribution writes: the final pages, or for a
+    LandEntry the scratch pages paired with them."""
+    if not isinstance(entry, LandEntry):
+        return dst_block_ids
+    if scratch_block_ids is None:
+        raise ValueError("a landing contribution needs scratch_block_ids")
+    if len(scratch_block_ids) != len(dst_block_ids):
+        raise ValueError("scratch_block_ids and dst_block_ids must be equal length")
+    return scratch_block_ids
+
+
 def build_sender_request(
     pb2,
     *,
@@ -700,19 +889,22 @@ def build_sender_request(
     src_block_ids: Sequence[int],
     dst_block_ids: Sequence[int],
     live_tokens: Sequence[int],
+    scratch_block_ids: Optional[Sequence[int]] = None,
 ):
     """Sender-side StartTransferRequest for one prefill rank pushing to one decode peer.
 
     ``src_block_ids``/``dst_block_ids`` are physical page ids on each side, paired
-    by token order; ``live_tokens[i]`` is the token count of page ``i``.
+    by token order; ``live_tokens[i]`` is the token count of page ``i``. A
+    landing contribution writes ``scratch_block_ids[i]`` instead of
+    ``dst_block_ids[i]``.
     """
     if not (len(src_block_ids) == len(dst_block_ids) == len(live_tokens)):
         raise ValueError(
             "src_block_ids, dst_block_ids, live_tokens must be equal length"
         )
-    src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-        prefill_rank % geom.src_tp, decode_rank
-    )
+    entry = geom.entry_bytes(prefill_rank % geom.src_tp, decode_rank)
+    src_off, size, src_stride, dst_off, dst_stride = entry
+    dst_block_ids = _target_blocks(entry, dst_block_ids, scratch_block_ids)
     req = pb2.StartTransferRequest()
     req.uuid = uuid
     req.req_id = req_id
@@ -751,6 +943,7 @@ def build_receiver_request(
     dst_block_ids: Sequence[int],
     live_tokens: Sequence[int],
     expected_block_count: Optional[int] = None,
+    scratch_block_ids: Optional[Sequence[int]] = None,
 ):
     """Receiver-side StartTransferRequest assembling all sources into decode HBM.
 
@@ -760,7 +953,9 @@ def build_receiver_request(
     id (``header.remote_id``), so each schedule is keyed by the sender engine's
     full id, while the byte geometry uses the engine's attention-TP rank within
     its replica (``sender_id % src_tp``). ``dst_mem_type = HBM`` makes the
-    receiver auto-H2D the assembled host staging into HBM.
+    receiver auto-H2D the assembled host staging into HBM. A landing source's
+    entries write ``scratch_block_ids``, as its sender's do: the receiver
+    matches entries on (dst block, src block).
     """
     req = pb2.StartTransferRequest()
     req.uuid = uuid
@@ -770,11 +965,11 @@ def build_receiver_request(
     req.use_block_chunks = True
     total = 0
     for sender_id, src_block_ids in sources:
-        src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-            sender_id % geom.src_tp, decode_rank
-        )
+        entry = geom.entry_bytes(sender_id % geom.src_tp, decode_rank)
+        src_off, size, src_stride, dst_off, dst_stride = entry
+        targets = _target_blocks(entry, dst_block_ids, scratch_block_ids)
         schedule = req.shard_push_schedules[sender_id]
-        for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
+        for src_b, dst_b, n in zip(src_block_ids, targets, live_tokens):
             if n <= 0:
                 continue
             _add_entry(
