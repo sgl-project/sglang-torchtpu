@@ -25,6 +25,7 @@ class HostPaddedDraftInput(SpecInput):
     """
 
     SPEC_INPUT_TYPE: ClassVar[SpecInputType]
+    supports_logprobs: ClassVar[bool] = False
     # Per-request tensors a subclass relays; filter/merge slice them before FutureMap owns the rows.
     RELAYED_FIELDS: ClassVar[tuple[str, ...]] = ("bonus_tokens", "new_seq_lens")
 
@@ -98,7 +99,7 @@ class HostPaddedDraftInput(SpecInput):
     ) -> None:
         # Kept on host: TpuSpecVerifyInput.from_batch uploads it at the forward's
         # bucket, which DP attention only fixes after this point.
-        if not _verify_window_eligible(batch):
+        if not _verify_window_eligible(batch, supports_logprobs=self.supports_logprobs):
             self.tpu_verify_cache_candidates = None
             self.tpu_committed_lens = None
             self.tpu_req_pool_indices = None
@@ -143,11 +144,12 @@ class HostPaddedDraftInput(SpecInput):
         keep_cpu = new_indices_cpu if new_indices_cpu is not None else new_indices.cpu()
         for name in self.RELAYED_FIELDS:
             value = getattr(self, name)
-            setattr(
-                self,
-                name,
-                value[keep_cpu if value.device.type == "cpu" else new_indices],
-            )
+            if value is not None:
+                setattr(
+                    self,
+                    name,
+                    value[keep_cpu if value.device.type == "cpu" else new_indices],
+                )
 
     def merge_batch(self, spec_info, *, future_indices=None):
         assert type(spec_info) is type(self), (type(self), type(spec_info))
@@ -173,12 +175,17 @@ class HostPaddedDraftInput(SpecInput):
             )
             return
         for name in self.RELAYED_FIELDS:
-            setattr(
-                self, name, torch.cat([getattr(self, name), getattr(spec_info, name)])
-            )
+            left, right = getattr(self, name), getattr(spec_info, name)
+            if left is None and right is None:
+                continue
+            if left is None or right is None:
+                raise ValueError(f"Cannot merge missing relay field {name}")
+            setattr(self, name, torch.cat([left, right]))
 
 
-def _verify_window_eligible(batch: ScheduleBatch) -> bool:
+def _verify_window_eligible(
+    batch: ScheduleBatch, *, supports_logprobs: bool = False
+) -> bool:
     # A verify commits at most one window, the single offset the plan enumerates.
     # grammar_retained_tokens can commit less, and the compact draft cache maps
     # its own window from host lengths.
@@ -186,7 +193,7 @@ def _verify_window_eligible(batch: ScheduleBatch) -> bool:
         batch.enable_overlap
         and isinstance(batch.req_pool_indices_cpu, torch.Tensor)
         and get_spec().speculative_draft_window_size is None
-        and not batch.return_logprob
+        and (not batch.return_logprob or supports_logprobs)
         and not batch.has_grammar
         and all(req.lora_id is None for req in batch.reqs)
     )

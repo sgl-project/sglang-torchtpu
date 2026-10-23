@@ -266,7 +266,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         return result
 
     def make_verify_input(
-        self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_tokens: torch.Tensor,
+        rows: VerifyRows,
     ) -> DFlashVerifyInput:
         return DFlashVerifyInput(
             draft_token=verify_tokens,

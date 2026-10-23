@@ -84,6 +84,7 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.compilation.warmup_queue import eager_warmup
 from sglang_tpu.experimental import register_host_batch_padder
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
@@ -164,6 +165,8 @@ class TpuSpecWorker(BaseSpecWorker):
     the batch.spec_info / verify ForwardBatch formats. verify, decode dispatch
     and result packing are shared.
     """
+
+    supports_logprobs = False
 
     def __init__(
         self,
@@ -315,7 +318,7 @@ class TpuSpecWorker(BaseSpecWorker):
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
             + [((pbs, 2 * self.num_verify_rows), torch.int64) for pbs in bucket_sizes]
         )
-        with torch.no_grad():
+        with torch.no_grad(), eager_warmup() as materialize:
             for bs in live_sizes:
                 # _bucket_state pads the relayed live state to each bucket it can run.
                 for padded_bs in self._decode_buckets_for(bs):
@@ -327,13 +330,17 @@ class TpuSpecWorker(BaseSpecWorker):
                         padded_bs,
                     )
             for shape, dtype in h2d_shapes:
-                torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True).cpu()
+                materialize(
+                    torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True)
+                )
             for pbs in bucket_sizes:
                 # _bucket_state derives live_mask from the padded pool rows.
-                (torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0).cpu()
+                materialize(
+                    torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0
+                )
                 # Eager ops compile per input layout, so bump finalize_accept's output.
                 next_seq_lens = self._warmup_accept(pbs).next_seq_lens
-                (next_seq_lens + self.num_verify_rows).to(torch.int32).cpu()
+                materialize((next_seq_lens + self.num_verify_rows).to(torch.int32))
 
     def _warmup_accept(self, padded_bs: int) -> AcceptResult:
         """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
@@ -442,16 +449,21 @@ class TpuSpecWorker(BaseSpecWorker):
         Noop: never.
         """
 
-    @abstractmethod
     def make_verify_input(
-        self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_tokens: torch.Tensor,
+        rows: VerifyRows,
     ) -> SpecInput:
         """The algorithm's own TARGET_VERIFY spec_info for [pbs * (N + 1)] verify rows.
 
         Why: attention backends and the dynamo tracer key on the algorithm's
         verify type; its compile policy must warm the same structure.
-        Noop: never.
+        Workers using the shared verify or idle-verify path must implement this.
+        A custom verify may construct its spec_info directly.
         """
+        raise NotImplementedError("Shared verification requires make_verify_input().")
 
     def make_dummy_carry(self, rows: int) -> Any:
         """A zero draft_carry of rows rows on device, shaped and typed like serving.
@@ -479,12 +491,18 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens = build_verify_tokens(
                 bucket.state.bonus_tokens, draft_result.draft_tokens
             )
+        spec_info = self.make_verify_input(
+            batch=batch,
+            verify_tokens=verify_tokens,
+            rows=rows,
+        )
         logits_output = self._forward_target_verify(
             batch=batch,
             bucket_state=bucket.state,
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=spec_info,
         )
         target_logits = logits_output.next_token_logits
         assert target_logits.shape[0] == draft_result.draft_tokens.shape[0] * (
@@ -835,6 +853,9 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=self.make_verify_input(
+                batch=batch, verify_tokens=verify_tokens, rows=rows
+            ),
         )
         site = SpecTpSyncSite.SPEC_ACCEPT_GREEDY
         padded_bs = state.seq_lens.shape[0]
@@ -898,7 +919,7 @@ class TpuSpecWorker(BaseSpecWorker):
         # A multimodal wrapper's eager outer logits processor emits live rows,
         # which TpuSampler pads to the batch bucket (whatever the input modality).
         eager_logits = not self._compile_policy()._compiles_logits_processor()
-        with torch.no_grad():
+        with torch.no_grad(), eager_warmup() as materialize:
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
                 for variant in _SAMPLING_WARMUP_VARIANTS:
                     # A target that keeps extend outputs padded samples all cap rows,
@@ -923,33 +944,40 @@ class TpuSpecWorker(BaseSpecWorker):
                             torch.zeros((rows,), dtype=torch.int64, device=self.device),
                         )
                         # extend() broadcasts these tokens; the collective compiles per shape.
-                        self.sync_target_tokens(next_token_ids).cpu()
+                        materialize(self.sync_target_tokens(next_token_ids))
             if self._dp_attention:
                 # A DP rank without prompts syncs no rows.
-                self.sync_target_tokens(
-                    torch.zeros((0,), dtype=torch.int64, device=self.device)
-                ).cpu()
+                materialize(
+                    self.sync_target_tokens(
+                        torch.zeros((0,), dtype=torch.int64, device=self.device)
+                    )
+                )
             for bs in extend_sizes:
                 # The shim pads the device-resident extend bs fields (seq_lens,
                 # req_pool_indices int64; orig_seq_lens int32) to the cap.
                 for dtype in (torch.int64, torch.int32):
-                    torch.nn.functional.pad(
-                        torch.zeros((bs,), dtype=dtype).to(self.device), (0, cap - bs)
-                    ).cpu()
+                    materialize(
+                        torch.nn.functional.pad(
+                            torch.zeros((bs,), dtype=dtype).to(self.device),
+                            (0, cap - bs),
+                        )
+                    )
                 # ModelRunner.sample positions, then the block-draft extend trim; a
                 # target that keeps extend outputs padded samples at the cap rows.
-                (torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1).cpu()
+                materialize(torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1)
                 for rows in {self._pad_bs(bs), cap}:
-                    torch.zeros((rows,), dtype=torch.int64, device=self.device)[
-                        :bs
-                    ].cpu()
+                    materialize(
+                        torch.zeros((rows,), dtype=torch.int64, device=self.device)[:bs]
+                    )
                 if eager_logits and self._pad_bs(bs) != bs:
-                    torch.nn.functional.pad(
-                        torch.zeros((bs, vocab_size), dtype=torch.float32).to(
-                            self.device
-                        ),
-                        (0, 0, 0, self._pad_bs(bs) - bs),
-                    ).cpu()
+                    materialize(
+                        torch.nn.functional.pad(
+                            torch.zeros((bs, vocab_size), dtype=torch.float32).to(
+                                self.device
+                            ),
+                            (0, 0, 0, self._pad_bs(bs) - bs),
+                        )
+                    )
 
     def _warmup_extend_logits(
         self, cap: int, rows: int, vocab_size: int
@@ -1209,11 +1237,9 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
     ) -> ForwardBatch:
         """TARGET_VERIFY ForwardBatch already at the [pbs, N + 1] bucket; the shim pads nothing."""
-        spec_info = self.make_verify_input(
-            batch=batch, verify_tokens=verify_tokens, rows=rows
-        )
         batch.out_cache_loc = rows.flat_cache_locs
         with self._bucket_view(
             batch,
@@ -1265,6 +1291,7 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
     ) -> LogitsProcessorOutput:
         verify_forward_batch = self._build_verify_batch(
             batch=batch,
@@ -1272,6 +1299,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=spec_info,
         )
         # Keep logits/hidden on the batch bucket so the compiled accept op needs no re-pad.
         assert verify_forward_batch.spec_info is not None
@@ -1366,7 +1394,7 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError("TpuSpecWorker under PP only extends.")
         if batch.has_grammar:
             raise NotImplementedError("TpuSpecWorker does not support grammar.")
-        if batch.return_logprob:
+        if batch.return_logprob and not self.supports_logprobs:
             raise NotImplementedError("TpuSpecWorker does not support logprobs.")
         sampling_info = batch.sampling_info
         if sampling_info is None:

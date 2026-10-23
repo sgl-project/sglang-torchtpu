@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import patch
 
 import torch
@@ -48,6 +49,11 @@ from sglang_tpu.hooks.experimental_spec import (
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class _OptionalCarry(NamedTuple):
+    hidden_states: torch.Tensor
+    optional: torch.Tensor | None = None
 
 
 def _chain_worker() -> TpuChainSpecWorker:
@@ -200,6 +206,11 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual(grown.top_ks.tolist(), [3, 1, 1, 1])
         worker._bucket = grown
         self.assertIs(bucket(4), grown)
+        worker._bucket = None
+        live = live._replace(draft_carry=_OptionalCarry(torch.ones((1, 2))))
+        carry = bucket(4).state.draft_carry
+        self.assertIsNone(carry.optional)
+        self.assertEqual(carry.hidden_states.tolist(), [[1, 1], [0, 0], [0, 0], [0, 0]])
 
     def test_target_only_acceptance_commits_target_distribution(self):
         """The first committed token follows p_0 whatever d_1 is, with the
@@ -400,10 +411,13 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         buckets = SimpleNamespace(next_bucket=lambda bs: 1 << (bs - 1).bit_length())
         with (
+            patch.object(torch, "tpu", create=True) as tpu,
             patch.object(TpuChainSpecWorker, "_compile_policy", return_value=policy),
             patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
         ):
             worker._warmup_extend_sampling()
+        tpu.current_stream.assert_called_once_with()
+        tpu.current_stream.return_value.synchronize.assert_called_once_with()
         self.assertEqual({shape for shape, _ in sampled}, {(1,), (2,), (4,)})
         self.assertEqual(
             broadcast,

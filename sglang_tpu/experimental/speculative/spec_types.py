@@ -27,8 +27,9 @@ class SpecState(NamedTuple):
       seq_lens: [pbs] committed prefix length n; r sits at position n. 0 on padded rows.
       req_pool_indices: [pbs] handle to the per-request KV. 0 (reserved) on padded rows.
       draft_carry: Draft conditioning not held in a KV cache, as a NamedTuple of
-        row-aligned [pbs, ...] tensors, e.g. EAGLE3's first draft token and draft
-        hidden state. None when the draft context lives in draft KV (DSpark).
+        row-aligned [pbs, ...] tensors or absent fields, e.g. EAGLE3's first
+        draft token and draft hidden state. None when the draft context lives
+        in draft KV (DSpark).
     """
 
     bonus_tokens: torch.Tensor
@@ -53,7 +54,11 @@ class CommitResult(NamedTuple):
 def map_carry(carry: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> Any:
     """Apply fn to every row-aligned tensor of a draft_carry NamedTuple."""
     # A list, not a generator: Dynamo cannot reconstruct a generator in pad_state_rows.
-    return None if carry is None else carry._make([fn(t) for t in carry])
+    return (
+        None
+        if carry is None
+        else carry._make([fn(t) if t is not None else None for t in carry])
+    )
 
 
 class BucketState(NamedTuple):
