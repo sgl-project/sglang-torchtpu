@@ -51,6 +51,7 @@ from sglang.srt.observability.trace import (
     process_tracing_init,
     trace_set_thread_info,
 )
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
     get_observability,
@@ -1719,6 +1720,8 @@ def launch_dp_worker(
     release_path: str,
     result_path: str,
 ):
+    # Spawned, so plugin hooks are not inherited from the launcher.
+    load_plugins()
     publish(server_args, role="encoder")
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
