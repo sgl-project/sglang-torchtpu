@@ -190,6 +190,10 @@ class KVFreeFence:
             return
         stats, self.stats = self.stats, KVFreeFenceStats()
         window_s, self._stats_since = now - self._stats_since, now
+        held_queues = {
+            id(allocator.held_pages): allocator.held_pages
+            for allocator in self._allocators
+        }.values()
         logger.info(
             "KV free fence over %.0fs: pages held %d, freed idle %d, freed past "
             "write horizon %d, borrowed %d, held now %d; non-forward pool "
@@ -199,7 +203,7 @@ class KVFreeFence:
             stats.pages_freed_idle,
             stats.pages_freed_past_write_horizon,
             stats.pages_borrowed,
-            sum(allocator.held_pages.num_pages for allocator in self._allocators),
+            sum(held.num_pages for held in held_queues),
             stats.non_forward_allocs,
             stats.device_syncs,
             stats.device_syncs / max(stats.non_forward_allocs, 1),
@@ -351,7 +355,7 @@ def _page_pools(
 ) -> List[BaseTokenToKVPoolAllocator]:
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
-    if type(allocator) is SWATokenToKVPoolAllocator:
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
         return [allocator.full_attn_allocator, allocator.swa_attn_allocator]
     return [allocator]
 
