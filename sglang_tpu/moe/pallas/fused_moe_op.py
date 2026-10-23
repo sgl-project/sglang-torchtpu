@@ -656,12 +656,20 @@ def _fused_moe_jax(
             topk_weights, ((0, m_pad - m), (0, 0))
         )  # pad -> weight 0
         m = m_pad
+
+    # The dense (one-hot matmul) permute and un-permute run below the dense
+    # threshold in routed rows (m*topk), and always together: a one-hot permute
+    # feeding the SparseCore combine (m < threshold <= m*topk) gave wrong tokens
+    # on Kimi-K3 whenever moe_front or latent_up ran static fp8, while either
+    # path end to end was right. m*topk < threshold implies m < threshold.
+    use_dense_permute = (m * topk) < permute_dense_threshold
+    use_dense_unpermute = use_dense_permute and not no_combine
     hidden_states, topk_ids, topk_weights = _drop_invalid_slots(
         hidden_states,
         topk_ids,
         topk_weights,
         max(global_num_experts, num_experts),
-        zero_dropped_tokens=m < permute_dense_threshold,
+        zero_dropped_tokens=use_dense_permute,
     )
 
     # Routing: build a permutation that puts rows of hidden_states in
@@ -669,10 +677,6 @@ def _fused_moe_jax(
     topk_ids_flat = topk_ids.reshape(-1).astype(jnp.int32)  # [m*topk]
     use_group_offset = global_num_experts > num_experts
 
-    # Decide whether to use the dense permute/un-permute paths based on the
-    # number of rows (m) and the number of routed rows (m*topk).
-    use_dense_permute = m < permute_dense_threshold
-    use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
     # One real token (bs=1 decode) on the dense path (threshold > m_pad * topk,
     # combine on): every routed row is token 0, so the permute is a broadcast
     # and only the expert-major metadata is needed. One SMEM kernel builds it
