@@ -539,7 +539,13 @@ class TestRequestTpotGating(CustomTestCase):
 
 
 class TestNonStreamingFirstTokenTime(CustomTestCase):
-    def _run(self, *, stream: bool, prefill_finished_time: float):
+    def _run(
+        self,
+        *,
+        stream: bool,
+        prefill_finished_time: float,
+        decode_prebuilt_finish_time: float = 0.0,
+    ):
         tm = _make_tokenizer_manager(self)
         rid = "ttft_rid"
         state = _make_req_state(rid)
@@ -547,7 +553,9 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
         state.time_stats.created_time = time.perf_counter() - 1.0
         tm.rid_to_state[rid] = state
         sched_stats = SchedulerReqTimeStats(
-            enable_metrics=True, prefill_finished_time=prefill_finished_time
+            enable_metrics=True,
+            prefill_finished_time=prefill_finished_time,
+            decode_prebuilt_finish_time=decode_prebuilt_finish_time,
         )
         batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
         batch_output.time_stats = wrap_as_pickle([sched_stats])
@@ -558,6 +566,16 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
     def test_non_streaming_uses_scheduler_time(self):
         produced = time.perf_counter() - 0.5
         stats, arrival = self._run(stream=False, prefill_finished_time=produced)
+        self.assertAlmostEqual(stats.first_token_time, produced, delta=1e-3)
+        self.assertGreaterEqual(stats.last_time, arrival)
+
+    def test_non_streaming_decode_uses_decode_prebuilt_finish_time(self):
+        produced = time.perf_counter() - 0.5
+        stats, arrival = self._run(
+            stream=False,
+            prefill_finished_time=0.0,
+            decode_prebuilt_finish_time=produced,
+        )
         self.assertAlmostEqual(stats.first_token_time, produced, delta=1e-3)
         self.assertGreaterEqual(stats.last_time, arrival)
 

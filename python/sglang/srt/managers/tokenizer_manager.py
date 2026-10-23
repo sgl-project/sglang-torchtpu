@@ -2640,6 +2640,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.time_stats.set_last_time(ts=first_output_time)
 
             if state.finished:
+                scheduler_time_stats = (
+                    recv_obj.time_stats[i] if recv_obj.time_stats is not None else None
+                )
                 span_attrs = (
                     self.convert_to_span_attrs(state, recv_obj, i)
                     if state.time_stats.trace_ctx.tracing_enable
@@ -2648,18 +2651,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Reuse the first batch's arrival time: a streaming request that
                 # finishes in its first output has no decode interval.
                 state.time_stats.set_finished_time(
-                    ts=first_output_time, span_attrs=span_attrs
+                    ts=first_output_time,
+                    span_attrs=span_attrs,
+                    scheduler_time_stats=scheduler_time_stats,
                 )
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
                 if get_spec().speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 if self.enable_metrics:
-                    scheduler_time_stats = (
-                        recv_obj.time_stats[i]
-                        if recv_obj.time_stats is not None
-                        else None
-                    )
                     completion_tokens = (
                         recv_obj.completion_tokens[i]
                         if not isinstance(recv_obj, BatchEmbeddingOutput)
@@ -2703,7 +2703,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Non-streaming outputs are batched; use the scheduler's first-token time.
         if getattr(state.obj, "stream", False) or recv_obj.time_stats is None:
             return None
-        ts = recv_obj.time_stats[i].prefill_finished_time
+        ts = (
+            recv_obj.time_stats[i].prefill_finished_time
+            or recv_obj.time_stats[i].decode_prebuilt_finish_time
+        )
         if state.time_stats.created_time < ts <= time.perf_counter():
             return ts
         return None
