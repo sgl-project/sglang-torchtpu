@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_server_args,
@@ -51,6 +52,7 @@ def _load_configurator(**dependencies):
         "get_parallel": get_parallel,
         "get_schedule": get_schedule,
         "get_exec": get_exec,
+        "get_memory": get_memory,
         "get_spec": get_spec,
         # The QSA pool build reads the indexer dtype off the model namespace.
         "get_model": lambda: SimpleNamespace(qsa_indexer_dtype="auto"),
@@ -75,6 +77,7 @@ class TestMXINT8Configurator(CustomTestCase):
         self.platform_pool = Mock(name="platform_pool")
         self.platform = SimpleNamespace(
             get_mha_kv_pool_cls=Mock(return_value=self.platform_pool),
+            build_swa_kv_pool=lambda *_, **__: None,
             is_cpu=lambda: False,
         )
         self.swa_pool = Mock(name="swa_pool")

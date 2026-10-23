@@ -22,6 +22,18 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.model_executor.pool_configurator import (
+    MemoryPoolConfig,
+    MemoryPoolConfigurator,
+)
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_server_args,
+)
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_free_fence import HeldPages
@@ -130,6 +142,136 @@ def resolve_unified_page_layout(
         num_shared_buffers=full.num_layers,
         num_swa_groups=num_swa_groups(full.num_layers, swa.num_layers),
     )
+
+
+def _kvc_unified_layout(kvc) -> UnifiedPageLayout:
+    tp = get_parallel().attn_tp_size
+    mc = kvc.model_config
+    return resolve_unified_page_layout(
+        full=AttnLayerSpec(
+            head_num=mc.get_num_kv_heads(tp),
+            head_dim=mc.head_dim,
+            layer_ids=kvc.layer_info.full_attention_layer_ids,
+        ),
+        swa=AttnLayerSpec(
+            head_num=mc.get_swa_num_kv_heads(tp),
+            head_dim=mc.swa_head_dim or mc.head_dim,
+            layer_ids=kvc.layer_info.swa_attention_layer_ids,
+        ),
+    )
+
+
+def _unsupported_reason(kvc) -> Optional[str]:
+    """Return a human-readable reason why ``kvc`` cannot use the TPU unified KV pool,
+    or ``None`` when supported."""
+    parallel = get_parallel()
+    memory = get_memory()
+    disagg_mode = get_disagg().disaggregation_mode
+    pool_cls = kvc._tpu_mha_pool_class()
+    checks = (
+        (not kvc.is_hybrid_swa, "requires a hybrid SWA model."),
+        (kvc.use_mla_backend, "does not support MLA models."),
+        (
+            kvc.model_config.has_asymmetric_kv,
+            "does not support asymmetric K/V head dimensions.",
+        ),
+        (
+            kvc.mambaish_config is not None
+            or kvc.hybrid_gdn_config is not None
+            or kvc.hybrid_kda_config is not None,
+            "does not support hybrid linear-attention or Mamba models.",
+        ),
+        (
+            kvc.is_draft_worker or not kvc.spec_algorithm.is_none(),
+            "does not support speculative decoding.",
+        ),
+        (
+            parallel.pp_size > 1 or kvc.pp_size > 1,
+            "does not support pipeline parallelism.",
+        ),
+        (
+            parallel.attn_cp_size > 1,
+            "does not support prefill context parallelism.",
+        ),
+        (
+            parallel.dcp_enabled or parallel.attn_dcp_size > 1,
+            "does not support decode context parallelism.",
+        ),
+        (
+            disagg_mode != "null",
+            f"does not support PD disaggregation (disaggregation_mode={disagg_mode!r}).",
+        ),
+        (
+            memory.enable_hierarchical_cache,
+            "does not support --enable-hierarchical-cache.",
+        ),
+        (
+            memory.enable_unified_cache_external_linker,
+            "does not support --enable-unified-cache-external-linker.",
+        ),
+        (
+            tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get(),
+            "does not support SGLANG_TPU_KV_PACK_HEADS.",
+        ),
+        (
+            tpu_envs.SGLANG_TPU_USE_BLOCK_MAJOR_KV.get(),
+            "does not support SGLANG_TPU_USE_BLOCK_MAJOR_KV.",
+        ),
+        (
+            not (
+                isinstance(pool_cls, type)
+                and issubclass(pool_cls, TpuFusedMHATokenToKVPool)
+            ),
+            f"requires a TpuFusedMHATokenToKVPool subclass, got {pool_cls}.",
+        ),
+        (
+            kvc.kv_cache_dtype_str == "mxint8",
+            "does not support mxint8 KV cache.",
+        ),
+        (
+            kvc.pool_page_size <= 1,
+            f"requires page_size > 1, got {kvc.pool_page_size}.",
+        ),
+    )
+    for bad, msg in checks:
+        if bad:
+            return f"--enable-unified-memory on TPU {msg}"
+    try:
+        _kvc_unified_layout(kvc)
+    except (ValueError, NotImplementedError) as exc:
+        return str(exc)
+    return None
+
+
+def _raise_if_unsupported(kvc) -> None:
+    reason = _unsupported_reason(kvc)
+    if reason is not None:
+        raise ValueError(reason)
+
+
+UNIFIED_KV_POOL_RESOLUTION_SOURCE = "tpu.unified_kv_pool"
+
+
+def unified_kv_pool_requested(server_args=None) -> bool:
+    """Return True if ``--enable-unified-memory`` (or ``SGLANG_TPU_UNIFIED_KV_POOL=1``)
+    requested the TPU unified Full+SWA KV pool."""
+    if tpu_envs.SGLANG_TPU_UNIFIED_KV_POOL.get():
+        return True
+    if server_args is None:
+        try:
+            server_args = get_server_args()
+        except ValueError:
+            return False
+    overrides = getattr(server_args, "_resolved_overrides", None) or ()
+    return any(source == UNIFIED_KV_POOL_RESOLUTION_SOURCE for source, _ in overrides)
+
+
+def unified_kv_pool_enabled(kvc) -> bool:
+    """Return True if ``--enable-unified-memory`` is active and validate ``kvc``."""
+    if not unified_kv_pool_requested(getattr(kvc, "server_args", None)):
+        return False
+    _raise_if_unsupported(kvc)
+    return True
 
 
 class TpuUnifiedSWAKVPool(BaseSWAKVPool):
@@ -775,3 +917,160 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             f"#full-pages: {self.full_attn_allocator.allocated_pages}, "
             f"#swa-pages: {self.swa_attn_allocator.allocated_pages}, "
         )
+
+
+class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
+    """Sizes the Logical-to-Physical unified Full+SWA KV pool from ``G = L_full``."""
+
+    def __init__(self, kvc):
+        _raise_if_unsupported(kvc)
+        layout = _kvc_unified_layout(kvc)
+        self._sliding_window_size = kvc.sliding_window_size
+        self._num_swa_groups = layout.num_swa_groups
+        self._full_layers_num = layout.num_shared_buffers
+        self._full_per_token = self._compute_full_per_token(kvc, layout)
+        self._page_bytes = (
+            kvc.pool_page_size * self._full_per_token * self._full_layers_num
+        )
+        self._reserved_bytes = self._page_bytes
+        self._align_pages = 8
+
+    @staticmethod
+    def _compute_full_per_token(kvc, layout: UnifiedPageLayout) -> int:
+        return kvc._tpu_mha_pool_class().kv_bytes_per_token_per_layer(
+            num_kv_heads=layout.page_head_num,
+            head_dim=layout.page_head_dim,
+            v_head_dim=layout.page_head_dim,
+            store_dtype=kvc.kv_cache_dtype,
+        )
+
+    def _window_overhead(self, page_size: int) -> int:
+        return self._num_swa_groups * _window_tokens(
+            self._sliding_window_size, page_size
+        )
+
+    def _validate_min_tokens(self, shared_tokens: int, page_size: int) -> None:
+        if self._sliding_window_size is not None:
+            min_tokens = (1 + self._num_swa_groups) * _window_tokens(
+                self._sliding_window_size, page_size
+            )
+        else:
+            min_tokens = (1 + self._num_swa_groups) * page_size
+        if shared_tokens <= min_tokens:
+            raise ValueError(
+                f"Unified KV pool ({shared_tokens} page-id tokens) cannot hold "
+                f"even one request: need > {min_tokens} tokens."
+            )
+
+    def calculate_total_physical_pages(
+        self, available_bytes: int, page_size: int
+    ) -> int:
+        """Compute aligned physical page count directly from free HBM quota and Full layers."""
+        usable = max(0, available_bytes - self._reserved_bytes)
+        page_bytes = page_size * self._full_per_token * self._full_layers_num
+        raw_pages = usable // page_bytes if page_bytes > 0 else 0
+        return (raw_pages // self._align_pages) * self._align_pages
+
+    def max_request_tokens(self, shared_tokens: int, page_size: int) -> int:
+        """Return the maximum single-request context length that fits in ``shared_tokens``
+        (reserving ``M_swa`` groups only for the trailing sliding window, enabling 256K+ sessions)."""
+        return _max_request_tokens(
+            shared_tokens,
+            page_size,
+            self._sliding_window_size,
+            self._num_swa_groups,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        shared_tokens = (
+            self.calculate_total_physical_pages(available_bytes, page_size) * page_size
+        )
+        self._validate_min_tokens(shared_tokens, page_size)
+        return MemoryPoolConfig(
+            max_total_num_tokens=self.max_request_tokens(shared_tokens, page_size),
+            full_max_total_num_tokens=shared_tokens,
+            swa_max_total_num_tokens=shared_tokens,
+        )
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        full_tokens = (max(0, max_total_num_tokens) // page_size) * page_size
+        raw_shared = (
+            full_tokens + self._window_overhead(page_size)
+            if self._sliding_window_size is not None
+            else full_tokens * (1 + self._num_swa_groups)
+        )
+        align = self._align_pages * page_size
+        shared_tokens = _cdiv(raw_shared, align) * align
+        self._validate_min_tokens(shared_tokens, page_size)
+        return MemoryPoolConfig(
+            max_total_num_tokens=full_tokens,
+            full_max_total_num_tokens=shared_tokens,
+            swa_max_total_num_tokens=shared_tokens,
+        )
+
+
+def maybe_create_unified_pool_configurator(kvc) -> Optional[MemoryPoolConfigurator]:
+    """Return ``TpuUnifiedSWAPoolConfigurator(kvc)`` when unified KV pool is enabled, else ``None``."""
+    if not unified_kv_pool_enabled(kvc):
+        return None
+    return TpuUnifiedSWAPoolConfigurator(kvc)
+
+
+def maybe_build_unified_kv_pool(
+    kvc,
+    *,
+    full_max_total_num_tokens: Optional[int],
+    swa_max_total_num_tokens: Optional[int],
+) -> Optional[TpuUnifiedSWAKVPool]:
+    """Build ``TpuUnifiedSWAKVPool`` for ``kvc`` when unified KV pool is enabled, else ``None``."""
+    if not unified_kv_pool_enabled(kvc):
+        return None
+    assert full_max_total_num_tokens == swa_max_total_num_tokens
+    tp = get_parallel().attn_tp_size
+    dcp = get_parallel().attn_dcp_size
+    head_dim = kvc.model_config.head_dim
+    return TpuUnifiedSWAKVPool(
+        size=full_max_total_num_tokens,
+        page_size=kvc.pool_page_size,
+        dtype=kvc.kv_cache_dtype,
+        full=AttnLayerSpec(
+            head_num=kvc.model_config.get_num_kv_heads(tp, dcp),
+            head_dim=head_dim,
+            layer_ids=kvc.layer_info.full_attention_layer_ids,
+        ),
+        swa=AttnLayerSpec(
+            head_num=kvc.model_config.get_swa_num_kv_heads(tp, dcp),
+            head_dim=kvc.model_config.swa_head_dim or head_dim,
+            layer_ids=kvc.layer_info.swa_attention_layer_ids,
+        ),
+        device=kvc.device,
+        token_to_kv_pool_class=kvc._tpu_mha_pool_class(),
+        start_layer=kvc.layer_info.start_layer,
+        enable_memory_saver=get_exec().features.enable_memory_saver,
+    )
+
+
+def maybe_build_unified_kv_pool_allocator(
+    kvc,
+    *,
+    sizes,
+    token_to_kv_pool,
+    req_to_token_pool,
+    need_sort: bool,
+) -> Optional[TpuUnifiedSWATokenToKVPoolAllocator]:
+    """Build ``TpuUnifiedSWATokenToKVPoolAllocator`` for ``kvc`` when unified KV pool is enabled, else ``None``."""
+    if not unified_kv_pool_enabled(kvc):
+        return None
+    return TpuUnifiedSWATokenToKVPoolAllocator(
+        sizes.full_max_total_num_tokens,
+        page_size=get_schedule().page_size,
+        dtype=kvc.kv_cache_dtype,
+        device=kvc.device,
+        kvcache=token_to_kv_pool,
+        need_sort=need_sort,
+        req_to_token_pool=req_to_token_pool,
+    )

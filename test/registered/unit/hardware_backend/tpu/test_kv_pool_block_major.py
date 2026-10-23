@@ -337,6 +337,7 @@ class TestBlockMajorStartupCheck(CustomTestCase):
         disaggregation_transfer_backend="mooncake",
         enable_hierarchical_cache=False,
         hicache_io_backend="kernel",
+        enable_unified_memory=False,
     )
 
     def _check(self, **overrides):
@@ -397,6 +398,7 @@ class TestBlockMajorStartupCheck(CustomTestCase):
             enable_prefill_cp=False,
             tpu_compile_tracer="dynamo",
             json_model_override_args=None,
+            enable_page_major_kv_layout=False,
             **{k: v for k, v in self._SUPPORTED.items() if k != "attention_backend"},
             attention_backend=None,
         )
@@ -441,6 +443,10 @@ class TestBlockMajorStartupCheck(CustomTestCase):
     def test_torch_tpu_hicache_is_refused(self):
         with self.assertRaisesRegex(ValueError, "hicache-io-backend"):
             self._check(enable_hierarchical_cache=True, hicache_io_backend="torch_tpu")
+
+    def test_unified_memory_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+            self._check(enable_unified_memory=True)
 
     def test_hybrid_linear_model_is_refused(self):
         self.mambaish_config.return_value = object()

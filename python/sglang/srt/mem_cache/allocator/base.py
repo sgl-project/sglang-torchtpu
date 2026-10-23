@@ -267,6 +267,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def alloc_decode(self, *args, **kwargs):
         raise NotImplementedError("alloc_decode is only for paged allocator")
 
+    def max_request_tokens(self, sliding_window_size: int | None) -> int | None:
+        """Maximum single-request context length when decoupled from ``full_capacity``."""
+        return None
+
     def resize(self, config) -> None:
         self.size = config.max_total_num_tokens
         if self.page_size > 1:
