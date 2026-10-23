@@ -10,7 +10,7 @@ import urllib
 import warnings
 from http import HTTPStatus
 from itertools import chain
-from typing import Optional
+from typing import Optional, Tuple
 
 import aiohttp
 import orjson
@@ -32,6 +32,52 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return f"[{address}]"
     except ValueError:
         return address
+
+
+def _response_failed(task: asyncio.Task) -> bool:
+    return task.exception() is not None or task.result().status != 200
+
+
+async def _post_prefill_and_decode(
+    *,
+    session: aiohttp.ClientSession,
+    prefill_url: str,
+    prefill_req: dict,
+    decode_url: str,
+    decode_req: dict,
+) -> Tuple[Optional[aiohttp.ClientResponse], Optional[aiohttp.ClientResponse]]:
+    """POST a request to its prefill and decode servers concurrently.
+
+    Returns both responses once both have answered. A PD request needs both
+    halves, so if one side fails (non-200 or transport error) while the other
+    is still pending, the pending side can never succeed -- e.g. a prefill
+    whose decode rejected the request would otherwise wait until its 300s
+    bootstrap timeout, and the client with it (#658). The pending request is
+    then cancelled, which closes its connection so that engine aborts the
+    request, and ``None`` is returned in its place. A side is therefore
+    ``None`` only when the other failed. A transport error of the failed side
+    is re-raised.
+    """
+    prefill_task = asyncio.create_task(session.post(prefill_url, json=prefill_req))
+    decode_task = asyncio.create_task(session.post(decode_url, json=decode_req))
+    pending = {prefill_task, decode_task}
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            if pending and any(_response_failed(task) for task in done):
+                break
+    finally:
+        # Also runs if this coroutine is cancelled (client disconnect).
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return (
+        None if prefill_task.cancelled() else prefill_task.result(),
+        None if decode_task.cancelled() else decode_task.result(),
+    )
 
 
 class MiniLoadBalancer:
@@ -149,7 +195,7 @@ class MiniLoadBalancer:
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
-    ) -> ORJSONResponse:
+    ) -> Response:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         expected_decode_dp_rank = None
@@ -169,13 +215,22 @@ class MiniLoadBalancer:
                 sock_connect=300,
             )  # Add timeout for request reliability
         ) as session:
-            tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
-            ]
-
-            # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            prefill_response, decode_response = await _post_prefill_and_decode(
+                session=session,
+                prefill_url=f"{prefill_server}/{endpoint}",
+                prefill_req=prefill_req,
+                decode_url=f"{decode_server}/{endpoint}",
+                decode_req=decode_req,
+            )
+            # Also covers a cancelled (None) side: the other one failed. Both
+            # can be non-None with one failed when it answered last.
+            for response in (prefill_response, decode_response):
+                if response is not None and response.status != 200:
+                    return Response(
+                        content=await response.read(),
+                        status_code=response.status,
+                        media_type=response.content_type,
+                    )
 
             if "return_logprob" in modified_request:
                 prefill_json = await prefill_response.json()
@@ -274,12 +329,18 @@ class MiniLoadBalancer:
         try:
             # Both servers answer the headers before any token is produced, so
             # a request either server rejects is known here, before the
-            # streaming response (and its 200 status) is committed.
-            prefill_response, decode_response = await asyncio.gather(
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
+            # streaming response (and its 200 status) is committed. A side
+            # still pending when the other fails is cancelled (None).
+            prefill_response, decode_response = await _post_prefill_and_decode(
+                session=session,
+                prefill_url=f"{prefill_server}/{endpoint}",
+                prefill_req=modified_request,
+                decode_url=f"{decode_server}/{endpoint}",
+                decode_req=modified_request,
             )
-            responses.extend((prefill_response, decode_response))
+            responses.extend(
+                r for r in (prefill_response, decode_response) if r is not None
+            )
             for response in responses:
                 if response.status != 200:
                     body = await response.read()
