@@ -326,6 +326,24 @@ class SWAComponent(TreeComponent):
             case _:
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
+    def can_end_match(self, node: UnifiedTreeNode) -> bool:
+        """Whether a match may end anywhere in ``node``, as the match validator
+        decides it: the live (device or host) sliding-window KV ending at the
+        node's end must span a window or reach the root."""
+        if is_swa_req_ring(self.cache.token_to_kv_pool_allocator):
+            return True
+        ct = self.component_type
+        span = 0
+        while node is not self.tree_core.root_node:
+            cd = node.component_data[ct]
+            if cd.value is None and cd.host_value is None:
+                return False
+            span += len(node.key)
+            if span >= self.sliding_window_size:
+                return True
+            node = node.parent
+        return True
+
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:

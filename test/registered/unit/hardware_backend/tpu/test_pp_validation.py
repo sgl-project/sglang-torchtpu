@@ -77,6 +77,8 @@ def _args(**overrides):
         moe_dp_size=1,
         tpu_compile_tracer="dynamo",
         nnodes=1,
+        enable_unified_memory=False,
+        enable_page_major_kv_layout=False,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

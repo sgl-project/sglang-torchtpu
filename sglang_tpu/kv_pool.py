@@ -126,6 +126,11 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # io backend asserts it moves all of the pool's KV state: a pool that keeps
     # quantization scales outside get_fused_kv_buffer must not list it.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+    # Whether --enable-unified-memory may share this class's per-layer buffers
+    # between the full-attention and sliding-window layers: the attention
+    # backends reading it must take each sliding-window group's page table.
+    # A subclass with its own layout or backends must restate this.
+    supports_unified_kv_pool: bool = True
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -603,6 +608,7 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     # raiden's page copy is layout-agnostic, and torch_tpu's host pool reads
     # its page shape from get_fused_kv_buffer, so it mirrors this layout too.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+    supports_unified_kv_pool: bool = False
 
     @classmethod
     def kv_bytes_per_token_per_layer(

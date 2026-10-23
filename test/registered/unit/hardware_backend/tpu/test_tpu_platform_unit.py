@@ -302,6 +302,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_hierarchical_cache=False,
             tpu_compile_tracer="dynamo",
             json_model_override_args=None,
+            enable_unified_memory=False,
+            enable_page_major_kv_layout=False,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -412,6 +414,23 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         # scheduler_overlap_mixin; the platform must NOT force-disable it.
         self.assertFalse(self._resolved(args, "disable_overlap_schedule"))
         self.assertEqual(self._resolved(args, "mem_fraction_static"), 0.40)
+        # Without --enable-unified-memory the static pools stay selected.
+        self.assertFalse(self._resolved(args, "tpu_unified_kv_pool"))
+
+    def test_unified_memory_selects_the_tpu_pool_and_clears_the_generic_flag(self):
+        # The generic flag's shared code paths build a pool the Pallas kernels
+        # cannot read; only the TPU field may stay set past resolution.
+        args = self._args(enable_unified_memory=True)
+        self._apply(args)
+        self.assertFalse(self._resolved(args, "enable_unified_memory"))
+        self.assertTrue(self._resolved(args, "tpu_unified_kv_pool"))
+
+    def test_page_major_kv_layout_is_rejected(self):
+        args = self._args(enable_unified_memory=True, enable_page_major_kv_layout=True)
+        with self.assertRaisesRegex(
+            ValueError, "enable-page-major-kv-layout is not supported on TPU"
+        ):
+            self._apply(args)
 
     def test_resolved_cuda_graphs_disabled_without_disabling_tpu_compile(self):
         graph_config = default_cuda_graph_config()
@@ -802,6 +821,8 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             use_ray=False,
             hicache_io_backend=None,
             max_total_tokens=None,
+            enable_unified_memory=False,
+            enable_page_major_kv_layout=False,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)

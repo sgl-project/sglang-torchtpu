@@ -143,6 +143,20 @@ class TpuEnvs:
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
 
+    # Unified KV pool (--enable-unified-memory)
+    # How shared-page pressure picks victims while requests keep their
+    # out-of-window sliding-window slots (SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=0;
+    # with out-of-window frees every value runs as full_first):
+    # compact (static_shadow, first dropping full KV no match can use and, for
+    # SWA, tombstoning sliding-window KV away from node ends and tips first),
+    # static_shadow (reclaim from the kind over its static pool's share, in the
+    # static pools' order), swa_first (full KV no match can use, then the SWA
+    # walk for the whole shortfall, then full_first) or full_first (full KV of
+    # LRU prefixes first).
+    SGLANG_TPU_UNIFIED_KV_EVICTION = EnvStr("compact")
+    # compact: sliding-window tokens kept before each tip (leaf end).
+    SGLANG_TPU_UNIFIED_KV_COMPACT_RETAIN_TOKENS = EnvInt(4096)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

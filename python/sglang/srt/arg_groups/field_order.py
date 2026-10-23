@@ -531,5 +531,6 @@ POSITIONAL_FIELD_ORDER = (
     "tpu_worker_hostnames",
     "torch_tpu_slicebuilder_addresses",
     "torch_tpu_topology",
+    "tpu_unified_kv_pool",
 )
 # fmt: on

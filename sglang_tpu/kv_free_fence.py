@@ -352,8 +352,12 @@ def _page_pools(
     allocator: BaseTokenToKVPoolAllocator,
 ) -> List[BaseTokenToKVPoolAllocator]:
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang_tpu.unified_kv_pool import TpuUnifiedSWATokenToKVPoolAllocator
 
-    if type(allocator) is SWATokenToKVPoolAllocator:
+    if type(allocator) in (
+        SWATokenToKVPoolAllocator,
+        TpuUnifiedSWATokenToKVPoolAllocator,
+    ):
         return [allocator.full_attn_allocator, allocator.swa_attn_allocator]
     return [allocator]
 

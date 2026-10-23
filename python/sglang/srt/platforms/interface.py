@@ -145,6 +145,23 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
+    def unified_kv_pool_enabled(self, kvc) -> bool:
+        """Whether ``kvc`` builds this platform's unified KV pool, whose
+        full-attention and sliding-window layers share pages."""
+        return False
+
+    def get_unified_kv_pool_cls(self) -> type:
+        """Return the unified KV pool class for this platform."""
+        raise NotImplementedError
+
+    def get_unified_kv_pool_allocator_cls(self) -> type:
+        """Return the allocator class of the unified KV pool."""
+        raise NotImplementedError
+
+    def get_unified_kv_pool_configurator_cls(self) -> type:
+        """Return the memory pool configurator class of the unified KV pool."""
+        raise NotImplementedError
+
     def get_zigzag_cp_strategy_cls(self) -> type:
         """Return the zigzag prefill context-parallel strategy class."""
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy

@@ -600,6 +600,35 @@ def _register_models() -> None:
     ModelRegistry.register("sglang_tpu.models")
 
 
+def _apply_unified_memory(server_args) -> None:
+    """Resolve ``--enable-unified-memory`` into ``tpu_unified_kv_pool``.
+
+    The shared code paths keyed on the generic flag implement the byte-buffer
+    pool with virtual page ids, which the Pallas kernels do not read, so the
+    flag is cleared and ``tpu_unified_kv_pool`` selects the TPU pool whose
+    full-attention and sliding-window KV share pages instead. That pool
+    validates the configuration when it is built: model, HiCache and
+    speculative settings resolve after this hook.
+    """
+    from sglang.srt.arg_groups.overrides import (
+        declare_resolution,
+        resolving_view,
+    )
+
+    if not resolving_view(server_args).enable_unified_memory:
+        return
+    declare_resolution(
+        server_args,
+        "tpu.apply_server_args_defaults",
+        enable_unified_memory=False,
+        tpu_unified_kv_pool=True,
+    )
+    logger.info(
+        "--enable-unified-memory: full-attention and sliding-window KV share "
+        "one page pool on TPU"
+    )
+
+
 def _resolve_num_hidden_layers(server_args) -> int:
     """Layer count from the model's HF config (lru-cached load), 0 when
     unresolvable — an unloadable model fails later with its real error, and
@@ -993,10 +1022,17 @@ class TpuSRTPlatform(SRTPlatform):
                     "lm_head over the draft's attention-TP group."
                 )
 
+        if cfg.enable_page_major_kv_layout:
+            raise ValueError(
+                "--enable-page-major-kv-layout is not supported on TPU: the TPU "
+                "attention backends read per-layer KV buffers."
+            )
+
         _apply_page_size_default(server_args)
         # After the page-size default: the DCP chunk check reads the page size.
         _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
+        _apply_unified_memory(server_args)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -1146,7 +1182,17 @@ class TpuSRTPlatform(SRTPlatform):
             from sglang_tpu.kv_pool_host import (
                 TpuRaidenHostKVCache,
             )
+            from sglang_tpu.unified_kv_pool import (
+                _SharedBufferView,
+            )
 
+            # The two views of the unified KV pool share one raiden host pool.
+            if isinstance(device_pool, _SharedBufferView):
+                from sglang_tpu.unified_kv_pool_host import (
+                    TpuRaidenUnifiedHostKVCache,
+                )
+
+                return TpuRaidenUnifiedHostKVCache
             return TpuRaidenHostKVCache
 
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):
@@ -1190,6 +1236,26 @@ class TpuSRTPlatform(SRTPlatform):
         )
 
         return TpuPagedTokenToKVPoolAllocator
+
+    def unified_kv_pool_enabled(self, kvc) -> bool:
+        from sglang_tpu.unified_kv_pool import unified_kv_pool_enabled
+
+        return unified_kv_pool_enabled(kvc)
+
+    def get_unified_kv_pool_cls(self) -> type:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+        return TpuUnifiedSWAKVPool
+
+    def get_unified_kv_pool_allocator_cls(self) -> type:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWATokenToKVPoolAllocator
+
+        return TpuUnifiedSWATokenToKVPoolAllocator
+
+    def get_unified_kv_pool_configurator_cls(self) -> type:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAPoolConfigurator
+
+        return TpuUnifiedSWAPoolConfigurator
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"

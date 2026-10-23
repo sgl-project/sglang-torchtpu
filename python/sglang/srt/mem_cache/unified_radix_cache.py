@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import atexit
+import heapq
 import logging
 import threading
 import time
 from dataclasses import replace
 from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -64,6 +73,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
+    EvictLayer,
     FullComponent,
     MambaComponent,
     PrepareLoadBackResult,
@@ -605,7 +615,140 @@ class UnifiedRadixCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
-    @rank_consensus(same_params=True, same_results=True)
+    # ``is_done`` is a closure, whose text carries an address: not compared.
+    @rank_consensus(same_results=True)
+    def evict_unmatchable_device_leaves(self, is_done: Callable[[], bool]) -> int:
+        """Evict device leaves no match can end in, oldest first, until
+        ``is_done()``, and the parents that become such leaves; returns the
+        full-layer tokens evicted.
+
+        Such a leaf lacks the sliding-window KV (on device and host) of the
+        window before each of its positions, so the match validator rejects
+        every match ending in it and its full KV serves nothing. Not run with
+        write-back HiCache (the leaf would be backed up first) or session refs.
+        """
+        swa = self.components.get(ComponentType.SWA)
+        if (
+            swa is None
+            or self.disable
+            or self.is_write_back
+            or self.tree_core.enable_session_radix_cache
+        ):
+            return 0
+        start_time = time.perf_counter()
+        tracker = {ct: 0 for ct in self.tree_components}
+        leaves = self.tree_core.evictable_device_leaves
+        heap = [
+            (node.last_access_time, node.id, node)
+            for node in leaves
+            if not swa.can_end_match(node)
+        ]
+        heapq.heapify(heap)
+        while heap and not is_done():
+            _, _, node = heapq.heappop(heap)
+            if node not in leaves or swa.can_end_match(node):
+                continue
+            parent = node.parent
+            self._evict_device_leaf(node.id, tracker)
+            if parent in leaves and not swa.can_end_match(parent):
+                heapq.heappush(heap, (parent.last_access_time, parent.id, parent))
+        self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        return tracker[BASE_COMPONENT_TYPE]
+
+    @rank_consensus(same_params=["retain_tokens"], same_results=True)
+    def compact_swa(self, retain_tokens: int, is_done: Callable[[], bool]) -> int:
+        """Tombstone the sliding-window KV only a match ending far from every
+        node end and tip needs, least recently used nodes first, until
+        ``is_done()``; full KV stays. Returns the SWA tokens tombstoned.
+
+        Every node end stays a valid match end with window + page tokens of SWA
+        before it, held by the node and, where a child is shorter, its parent;
+        each node also keeps the SWA within ``retain_tokens`` before the
+        nearest tip below it. The rest of a node's SWA, a page-aligned head, is
+        split off and tombstoned (the split the out-of-window-free insert path
+        makes). One kind of node end is not kept: the insert path splits each
+        fresh leaf longer than a window at one page-aligned window before its
+        end, to cap the leaf's SWA lock (_maybe_split_leaf_for_swa_lock), and
+        no prompt ends there. Order is the full KV's recency, which every match
+        refreshes along its whole path, not the SWA LRU, which refreshes only
+        the window before a hit. Not run with write-back HiCache or session
+        refs.
+        """
+        swa = self.components.get(ComponentType.SWA)
+        if (
+            swa is None
+            or self.disable
+            or self.is_write_back
+            or self.tree_core.enable_session_radix_cache
+        ):
+            return 0
+        page = self.page_size
+        # The insert path's SWA-lock split leaves this many tokens in the tail.
+        lock_tail = -(-swa.sliding_window_size // page) * page
+        end_keep = lock_tail + page
+        root = self.tree_core.root_node
+        nodes, stack = [], [root]
+        while stack:
+            node = stack.pop()
+            nodes.append(node)
+            stack.extend(node.children.values())
+        # Children before parents: tokens from a node's end to the nearest tip
+        # (leaf end) below it, and the SWA it must keep at its end for its own
+        # end and for the ends of children too short to hold theirs.
+        tip_distance, end_need = {}, {}
+        for node in reversed(nodes):
+            children = list(node.children.values())
+            tip_distance[node.id] = min(
+                (len(c.key) + tip_distance[c.id] for c in children), default=0
+            )
+            lock_split = len(children) == 1 and len(children[0].key) == lock_tail
+            end_need[node.id] = max(
+                [0 if lock_split else end_keep]
+                + [end_need[c.id] - len(c.key) for c in children]
+            )
+        heap = []
+        for node in nodes:
+            swa_data = node.component_data[ComponentType.SWA]
+            if (
+                node is root
+                or node.evicted
+                or swa_data.value is None
+                or swa_data.lock_ref > 0
+            ):
+                continue
+            keep = max(end_need[node.id], retain_tokens - tip_distance[node.id])
+            head = (len(node.key) - keep) // page * page
+            if head > 0:
+                heap.append((node.last_access_time, node.id, node, head))
+        heapq.heapify(heap)
+        tracker = {ct: 0 for ct in self.tree_components}
+        while heap and not is_done():
+            last_access, _, node, head = heapq.heappop(heap)
+            if node.evicted or node.component_data[ComponentType.SWA].value is None:
+                continue
+            victim = node
+            if head < len(node.key):
+                victim, action = self.tree_core._split_node(node.key, node, head)
+                # A split refreshes the suffix's recency; compaction is no use.
+                victim.last_access_time = node.last_access_time = last_access
+                if action is not None:
+                    self._apply_cache_actions([action])
+            device_frees = {ct: [] for ct in self.tree_components}
+            host_frees = {ct: [] for ct in self.tree_components}
+            self.tree_core._evict_component_and_detach_lru(
+                victim,
+                swa,
+                target=EvictLayer.DEVICE,
+                tracker=tracker,
+                device_frees=device_frees,
+                host_frees=host_frees,
+            )
+            self.tree_core._cascade_evict(
+                victim, swa, tracker, device_frees=device_frees, host_frees=host_frees
+            )
+            self._free_values(device_frees, host_frees)
+        return tracker[ComponentType.SWA]
+
     def evict_for_alloc(self, params: EvictParams) -> EvictResult:
         """Evict until the requested component allocations become feasible.
 

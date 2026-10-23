@@ -66,6 +66,22 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         strategy = _select_strategy(kvcache, {FULL, SWA})
         self.assertIsInstance(strategy, _SwaStrategy)
 
+    def test_swa_pool_survives_rebound_swa_class(self):
+        """A pool subclassing the original SWAKVPool still gets the SWA strategy
+        after a plugin rebinds swa_memory_pool.SWAKVPool to its own subclass."""
+        from sglang.srt.mem_cache import swa_memory_pool
+
+        class PlatformPool(swa_memory_pool.SWAKVPool):
+            pass
+
+        class PluginPool(swa_memory_pool.SWAKVPool):
+            pass
+
+        kvcache = _mock_kvcache(PlatformPool)
+        with patch.object(swa_memory_pool, "SWAKVPool", PluginPool):
+            strategy = _select_strategy(kvcache, {FULL, SWA})
+        self.assertIsInstance(strategy, _SwaStrategy)
+
     def test_dsa(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 

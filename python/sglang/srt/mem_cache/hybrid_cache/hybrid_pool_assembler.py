@@ -1891,11 +1891,13 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
 
 class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
+        # Plugins may rebind swa_memory_pool.SWAKVPool to a subclass that pools
+        # subclassing the original (e.g. the TPU unified pool) do not inherit.
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         return (
-            isinstance(kvcache, SWAKVPool)
+            isinstance(kvcache, BaseSWAKVPool)
             and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
             and components == {ComponentType.FULL, ComponentType.SWA}
         )

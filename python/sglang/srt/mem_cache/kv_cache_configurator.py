@@ -347,6 +347,14 @@ class KVCacheConfigurator:
     def _tpu_mha_pool_class(self):
         return current_platform.get_mha_kv_pool_cls()
 
+    def _tpu_unified_kv_pool_enabled(self) -> bool:
+        # Imported here: a CPU test execs this class body without module imports.
+        from sglang.srt.runtime_context import get_memory
+
+        if not get_memory().tpu_unified_kv_pool:
+            return False
+        return current_platform.unified_kv_pool_enabled(self)
+
     @property
     def kv_swa_layout(self) -> str | None:
         return "merged" if self.kv_cache_dtype_str == "mxint8" else None
@@ -1792,6 +1800,28 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
+        if self._tpu_unified_kv_pool_enabled():
+            UnifiedPoolCls = current_platform.get_unified_kv_pool_cls()
+            assert full_max_total_num_tokens == swa_max_total_num_tokens
+            return UnifiedPoolCls(
+                size=full_max_total_num_tokens,
+                page_size=self.pool_page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                ),
+                head_dim=self.model_config.head_dim,
+                swa_head_num=self.model_config.get_swa_num_kv_heads(
+                    get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                ),
+                swa_head_dim=self.model_config.swa_head_dim,
+                swa_v_head_dim=self.model_config.swa_v_head_dim,
+                swa_attention_layer_ids=self.layer_info.swa_attention_layer_ids,
+                full_attention_layer_ids=self.layer_info.full_attention_layer_ids,
+                device=self.device,
+                start_layer=self.layer_info.start_layer,
+                token_to_kv_pool_class=self._tpu_mha_pool_class(),
+            )
         PoolCls = self._tpu_mha_pool_class()
         # This stage's own layers, not the model's: under PP the global lists
         # would size every stage's pool to the whole model.
@@ -2348,10 +2378,10 @@ class KVCacheConfigurator:
                     need_sort=need_sort,
                 )
             elif current_platform.is_tpu() and not self.is_hybrid_swa:
-                # Hybrid SWA on TPU falls through to the generic SWA allocator
-                # arms below -- the sub-pools are TPU-fused but the allocator
-                # just bookkeeps token slots and the full<->swa mapping
-                # (queried by pallas_backend in _build_metadata).
+                # Hybrid SWA on TPU takes the unified arm below or falls through
+                # to the generic SWA allocator arms -- the sub-pools are TPU-fused
+                # but the allocator just bookkeeps token slots and the full<->swa
+                # mapping (queried by pallas_backend in _build_metadata).
                 # Under DCP the allocator is virtual: it hands out locations in
                 # a space widened by attn_dcp_size, where a location's physical
                 # slot is loc // attn_dcp_size and its physical page is
@@ -2366,6 +2396,20 @@ class KVCacheConfigurator:
                     device=self.device,
                     kvcache=token_to_kv_pool,
                     need_sort=need_sort,
+                )
+            elif (
+                get_memory().tpu_unified_kv_pool and self._tpu_unified_kv_pool_enabled()
+            ):
+                AllocatorCls = current_platform.get_unified_kv_pool_allocator_cls()
+                token_to_kv_pool_allocator = AllocatorCls(
+                    sizes.full_max_total_num_tokens,
+                    page_size=get_schedule().page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=token_to_kv_pool,
+                    need_sort=need_sort,
+                    req_to_token_pool=req_to_token_pool,
+                    static_full_tokens=sizes.max_total_num_tokens,
                 )
             elif _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
