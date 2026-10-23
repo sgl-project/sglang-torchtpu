@@ -3,7 +3,7 @@
 # in these comments -- the renderer would substitute them here too):
 #   IMAGE         digest-pinned image
 #   HOSTS         completions/parallelism (single-host = 1)
-#   TOPOLOGY/POOL node labels (looked up by host count in topology.yaml)
+#   TOPOLOGY/QUEUE slice shape and Kueue queue (looked up by host count in topology.yaml)
 #   RUN_NAME      DNS-safe label for the JobSet (a suite name or a launch-group name)
 #   SUITE         single-host: the run_suite suite; NIGHTLY_FLAG: --nightly or empty
 #   LAUNCH_SCRIPT multi-host: the launch group's recipe (relative to benchmark/tpu/);
@@ -26,16 +26,14 @@
 #     model + config); rank 0 runs each of the group's TEST_FILES in LIVE-SERVER mode
 #     against the one server; workers serve until the leader tears down, then exit 0.
 #     Files sharing an identical launch spec share this one server (grouping).
-# ci-tpu-pools: ${POOL_LIST}
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   generateName: tpu-ci-${RUN_NAME}-
   namespace: tpu-ci
   labels:
-    # Created suspended; Kueue releases it when a whole slice is free (kueue-tpu.yaml).
-    # The ci-tpu-pool nodeSelector below is redundant with the flavor, but keeps pods off
-    # the dev pools if Kueue is absent -- drop it when a second slice flavor is added.
+    # Created suspended; Kueue releases it when a whole slice is free (reconcile_quota.py
+    # keeps the queues).
     kueue.x-k8s.io/queue-name: ${QUEUE}
 spec:
   ttlSecondsAfterFinished: 7200
@@ -250,7 +248,7 @@ ${WEIGHTS_VOLUME}
                       google.com/tpu: "4"
                       cpu: "4"
                       memory: 32Gi
-                      # No ephemeral-storage here: kueue-tpu.yaml's coveredResources
+                      # No ephemeral-storage here: the CI ClusterQueues' coveredResources
                       # omit it, and Kueue silently never admits a workload asking
                       # for a resource the ClusterQueue does not cover.
                     limits:

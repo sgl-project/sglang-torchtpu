@@ -25,32 +25,39 @@ dashboard ◄── radixark/ci-monitor scrapes the job logs (12:00, 16:00, 21:0
 
 ## Capacity: pools, lanes and queues
 
-A **lane** is who a slice belongs to: `pr-gate` or `nightly`. `topology.yaml` maps a
-`(lane, host count)` to a slice shape, the node pools that serve it, and a Kueue queue.
-Each pool has its own Kueue ResourceFlavor (selected by the node label `ci-tpu-pool`), and
-each `(lane, host count)` has its own ClusterQueue.
+A **lane** is who a job is for: `pr-gate` or `nightly`. A **CI pool** is any node pool
+whose nodes carry a `ci-tpu-pool` label (a unique name per pool); its **shape** is its
+`cloud.google.com/gke-tpu-topology` label. **Every pool is shared by every lane**: no pool
+belongs to a lane, and `topology.yaml` holds only the lanes, the priority lane and, per
+shape, its hosts per slice and each lane's `min_hosts`.
 
-CI pools:
+`reconcile_quota.py` builds the Kueue objects from that and the live nodes:
+- one ResourceFlavor per CI pool (selecting its `ci-tpu-pool`);
+- per shape, one ClusterQueue + LocalQueue per lane, named `tpu-<lane>-<hosts>h`
+  (`tpu-prgate-1h`, `tpu-nightly-2h`, ...), all in cohort `ci-<shape>` and each listing
+  every pool of the shape.
 
-| Node pools | `ci-tpu-pool` | Shape | Hosts | Chips | Queues |
-|---|---|---|---|---|---|
-| `ci-tpu7x-2x2x1`, `ci-tpu7x-2x2x1-nightly` | `ci-2x2x1` | 2x2x1 | 8 | 32 | `tpu-prgate-1h`, `tpu-nightly-1h` |
-| `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 (one slice) | 8 | `tpu-nightly-2h` |
+CI pools today:
 
-**The 2x2x1 pool is shared** by pr-gate and nightly: both lanes list `ci-2x2x1` in
-`topology.yaml`, and pr-gate's entry carries `min_hosts`.
+| Node pool | `ci-tpu-pool` | Shape | Hosts |
+|---|---|---|---|
+| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 5 |
+| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 3 |
+| `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 (one slice) |
 
-- pr-gate always keeps `min_hosts` hosts (5). They are never lent, so a PR never waits
-  behind a nightly job.
-- nightly holds every other host. When a host frees up, a waiting nightly job gets it
-  before a PR job that would have to borrow it.
-- While nightly is idle, PR jobs may also use nightly's hosts. Running PR jobs are never
-  preempted; nightly waits for them to finish (at most one PR job's runtime).
+The `ci-tpu-pool` values are only names; they do not tie a pool to a lane.
 
-In Kueue this is the two 1-host queues sharing the `ci-2x2x1` flavor with the same
-`cohortName`, pr-gate's TPU quota carrying `lendingLimit: 0`; `reconcile_quota.py` sets
-the two quotas from the live host count. Two GKE node pools carry the same label; that is
-all "one pool" needs, since every 2x2x1 host is a whole slice.
+**How a shape's slices are split** (`priority: nightly`, `min_hosts: {pr-gate: 5}` on 2x2x1):
+- Each lane keeps its `min_hosts`, in whole slices, and never lends them, so a PR never
+  waits behind a nightly job for those 5 hosts.
+- The priority lane (nightly) holds every other slice. When one frees up, a waiting
+  nightly job gets it before a PR job that would have to borrow it.
+- While nightly is idle, PR jobs may also use nightly's slices. Running jobs are never
+  preempted; nightly waits for borrowed PR jobs to finish (at most one PR job's runtime).
+
+In Kueue terms: reserved quota has `lendingLimit: 0`, the priority lane's quota is fully
+lendable, queues prefer a pool where the job fits their own quota before borrowing
+(`flavorFungibility.whenCanBorrow: TryNextFlavor`), and `reclaimWithinCohort: Never`.
 
 The CI pools share one TPU reservation with the developer pools (tpuq, tpod, Haolin's).
 Moving chips between them is a node-pool change by hand.
@@ -144,20 +151,19 @@ Every in-project job calls this workflow; its work is one shell step. In order:
 
 1. **Auth.** Workload Identity Federation as `tpu-ci@`, then credentials for
    `tpu-cluster`. The step re-mints the one-hour cluster token itself every 40 minutes.
-2. **Pools.** `discover_pools.py --lane L --hosts H --sync` returns the pools this job may
-   use: `topology.yaml`'s list plus any live pool labelled `ci-tpu-lane=L` of that shape.
-   With `--sync` it creates a Kueue flavor for a pool it finds that has none.
+2. **Kueue sync.** `reconcile_quota.py` creates any missing flavor, queue or LocalQueue
+   and sets every CI queue's quota from the live Ready hosts (see Capacity). A multi-host
+   pool holding more than one slice gets no quota. It needs the `tpu-ci-kueue-sync` grant
+   (Enabling Kueue, step 3), and any error fails the job rather than carrying on with stale
+   quota.
 3. **Render.** `render_jobset.py` fills `jobset-tpu.yaml` (or `jobset-tpu-pd.yaml` for
    P/D) for one of four modes:
    - **suite:** one host runs `run_suite.py --suite S`;
    - **launch:** every host runs the recipe, rank 0 runs the files against it;
    - **exec:** every host runs one command;
    - **P/D:** prefill and decode replicated jobs, with `CI_PD_ROLE` set.
-4. **Quota.** `reconcile_quota.py --pool=P` sets each CI ClusterQueue's quota from the live
-   chip count (for the shared pool, pr-gate's hosts and nightly's rest), and refuses to
-   submit if a multi-host pool holds more than one slice. It needs the `tpu-ci-kueue-sync`
-   grant (Enabling Kueue, step 3); steps 2 and 4 fail the job on any error rather than
-   carrying on with stale quota.
+4. **Placement.** The pod's nodeAffinity allows any CI pool (`ci-tpu-pool` exists) of the
+   job's shape; the flavor Kueue admits it to pins the one pool.
 5. **Submit and admission.** `kubectl create` the JobSet (suspended, labelled with the
    queue), then check that Kueue created a Workload for it; no Workload fails the job.
    Wait for admission (pods appear) for up to `admit_s`; running out is
@@ -198,11 +204,11 @@ and the admission budget.
   whose pods cannot all start. While it waits, Kueue admits nothing else cluster-wide.
 - **Quota follows the pools** through `reconcile_quota.py`, before every CI job. Quota for
   chips that do not exist admits jobs that hang; missing quota leaves live hosts idle.
-- **Sharing:** queues with the same `cohortName` may use each other's idle quota. Only the
-  2x2x1 queues share. Kueue's default never preempts to take quota back.
+- **Sharing:** every shape's queues form one cohort, `ci-<shape>`, and may use each
+  other's idle, lendable quota. No preemption takes it back.
 - **Only labelled JobSets are managed.** A hand-launched JobSet in `tpu-ci` without a
   `kueue.x-k8s.io/queue-name` label bypasses admission and can deadlock a slice against
-  CI. Label it with the lane's queue from `topology.yaml`.
+  CI. Label it with the lane's queue, `tpu-<lane>-<hosts>h`.
 
 ## Adding things
 
@@ -214,15 +220,15 @@ and the admission budget.
 | A perf suite | Register it, add the suite to `run_suite.py`, and add the entry to both lists in `perf-test-tpu.yml` (the `model` choice and the default list), plus the `model` dispatch option. |
 | An accuracy benchmark | Register it, add the suite to `run_suite.py`, and add a job to `accuracy-test-tpu.yml` with its slot list. Keep `run_name` to 34 characters: it prefixes pod names, which are capped at 63. |
 | A hand-wired P/D or exec test | A job in `feature-validation-tpu.yml` with `files:`, plus the `only` dispatch option in both nightly workflows. |
-| A 2x2x1 host | Resize either 2x2x1 node pool. nightly's share grows; pr-gate's is `min_hosts` in `topology.yaml`. |
-| A multi-host slice | A new node pool with a unique `ci-tpu-pool` and `ci-tpu-lane=<lane>`, `--tpu-topology`, and a workload policy. |
+| A 2x2x1 host | Resize any 2x2x1 CI node pool. Nothing else; the priority lane's share grows. |
+| A slice of a listed shape | A new node pool with a unique `ci-tpu-pool` label (multi-host: `--tpu-topology` and a workload policy). Nothing else. |
+| A new shape | One line under `shapes` in `topology.yaml`, plus the pool. |
+| A lane's guaranteed hosts | `min_hosts` under the shape in `topology.yaml`, in whole slices. |
 
 `est_time` is read by the CI, not decoration; see Budgets.
 
 ## Known gaps
 
-- **Pool discovery adds nothing today:** no CI pool carries `ci-tpu-lane`, so the lists in
-  `topology.yaml` are the whole truth.
 - **The PR check can go green without running TPU tests:** fork PRs skip the build, and
   `pr-test-tpu-finish` treats skipped jobs as passed.
 - **`est_time` values are hand-written** and have drifted; there is no refit loop.
@@ -245,11 +251,10 @@ and the admission budget.
 | `.github/workflows/combo-test-tpu.yml` | Dispatch-only trigger for the GPT-OSS-120B 2P+2D test |
 | `.github/workflows/_tpu-build.yml` | Reusable: build the image once, output its digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: run one job on TPU (steps above) |
-| `.github/tpu-ci/topology.yaml` | `(lane, hosts)` to shape, pools and queue; which pools two lanes share, and `min_hosts` |
-| `.github/tpu-ci/kueue-tpu.yaml` | ResourceFlavors, ClusterQueues, LocalQueues |
+| `.github/tpu-ci/topology.yaml` | Lanes, the priority lane, and per shape its hosts and each lane's `min_hosts` |
+| `.github/tpu-ci/ci_topology.py` | Loads `topology.yaml`; queue and cohort names |
 | `.github/tpu-ci/kueue-controller-resources.yaml` | Lowers the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
-| `.github/tpu-ci/discover_pools.py` | Pools for a `(lane, hosts)`; registers new pools with Kueue |
-| `.github/tpu-ci/reconcile_quota.py` | Sets queue quotas from live chips (and the shared pool's split); refuses a multi-host pool holding two slices |
+| `.github/tpu-ci/reconcile_quota.py` | Creates and updates every CI flavor, queue and quota from `topology.yaml` and live pools |
 | `.github/tpu-ci/render_jobset.py` | Renders a JobSet for suite, launch, exec or P/D mode |
 | `.github/tpu-ci/jobset-tpu.yaml`, `jobset-tpu-pd.yaml` | JobSet templates |
 | `.github/tpu-ci/discover_tests.py`, `discover_multihost.py` | Nightly single-host and multi-host matrices |
@@ -271,7 +276,7 @@ in the project, the cluster-scoped `tpu-ci-kueue-sync` grant (Enabling Kueue, st
 `sgl-project/sglang-torchtpu`. Test pods run in namespace `tpu-ci`.
 
 New CI node pools: `--machine-type=tpu7x-standard-4t`, `--reservation-affinity=specific`
-on the reservation, `--node-labels=ci-tpu-pool=<unique>,ci-tpu-lane=<lane>`,
+on the reservation, `--node-labels=ci-tpu-pool=<unique>`,
 `--workload-metadata=GKE_METADATA`. Single-host pools take no `--tpu-topology`; multi-host
 pools need `--tpu-topology` and a `HIGH_THROUGHPUT` workload policy for that topology.
 `system-pool` (2 × e2-standard-2) runs the JobSet operator (v0.12.0) and the Kueue
@@ -457,7 +462,7 @@ silently queueing. Setting it `true` would add coverage only for hand-launched J
 while suspending any debug JobSet in `tpu-ci` that lacks a label.
 
 **So: a hand-launched JobSet in `tpu-ci` that needs a slice must carry the queue label**
-(see `topology.yaml` for the lane's queue). Without one it bypasses admission and can
+(`tpu-<lane>-<hosts>h`). Without one it bypasses admission and can
 deadlock a multi-host slice against a CI job. That is the one gap this design accepts.
 
 Trimming `integrations.frameworks` to `jobset` is defence in depth for that decision: if
@@ -468,26 +473,24 @@ error anywhere. With only `jobset` enabled, that mistake cannot reach them.
 
 Then confirm nothing unexpected was caught: `kubectl get workloads -A`.
 
-**3. Apply the queues, and let CI keep their quotas current.**
+**3. Let CI create and update its queues, then create them.** ClusterQueues and
+ResourceFlavors are cluster-scoped, which `container.developer` does not cover.
 
 ```bash
-kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
-kubectl get clusterqueues -o wide        # ACTIVE=True on each
-kubectl -n tpu-ci get localqueues
-# CI's quota sync patches the CI queues; ClusterQueues are cluster-scoped, which
-# container.developer does not cover. List every CI queue here.
-kubectl create clusterrole tpu-ci-kueue-sync --verb=get,patch \
-  --resource=clusterqueues.kueue.x-k8s.io \
-  --resource-name=tpu-prgate-1h --resource-name=tpu-nightly-1h --resource-name=tpu-nightly-2h
+kubectl create clusterrole tpu-ci-kueue-sync --verb=get,list,create,patch \
+  --resource=clusterqueues.kueue.x-k8s.io --resource=resourceflavors.kueue.x-k8s.io \
+  --resource=localqueues.kueue.x-k8s.io
 kubectl create clusterrolebinding tpu-ci-kueue-sync --clusterrole=tpu-ci-kueue-sync \
   --user=tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
-kubectl auth can-i patch clusterqueues/tpu-prgate-1h \
+kubectl auth can-i create clusterqueues \
   --as=tpu-ci@sglang-torchtpu.iam.gserviceaccount.com   # yes
+python3 .github/tpu-ci/reconcile_quota.py --dry-run     # server-validated plan
+python3 .github/tpu-ci/reconcile_quota.py               # every CI job also runs this
+kubectl get clusterqueues -o wide                       # ACTIVE=True on each
+kubectl -n tpu-ci get localqueues
 ```
 
-Without that grant, every CI job fails at the quota step with `Forbidden`. CI cannot create
-ResourceFlavors: a new pool's flavor goes into `kueue-tpu.yaml` before the pool is labelled
-`ci-tpu-lane`, or the job that discovers it fails.
+Without that grant, every CI job fails at the Kueue sync with `Forbidden`.
 
 `ACTIVE=True` is necessary but not sufficient. A queue is Active as soon as its flavors
 resolve, even if it can never admit anything — so also check that a real workload reaches
@@ -533,7 +536,7 @@ python3 .github/tpu-ci/render_jobset.py --image "$IMG" --suite stage-b-test-tpu-
   | kubectl -n tpu-ci create --dry-run=server -f -
 # multi-host matrix, as the nightly builds it:
 python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost
-# quota the next job would set, without writing it:
+# Kueue changes the next job would make, validated by the API server but not written:
 python3 .github/tpu-ci/reconcile_quota.py --dry-run
 ```
 
