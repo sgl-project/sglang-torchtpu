@@ -13,6 +13,7 @@ from sglang.multimodal_gen.test.unit.test_server_args import (  # noqa: F401
     TestTpuDistributedArgs,
 )
 from sglang.multimodal_gen.test.unit.test_tpu_platform import (  # noqa: F401
+    TestSplashBackendSelection,
     TestTorchTpuIntegration,
     TestTpuPlatformPlugin,
     TestTpuPlatformSurface,
