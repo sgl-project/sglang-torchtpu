@@ -52,6 +52,8 @@ class AttentionBackendEnum(enum.Enum):
     CUBE_SPARSE_ATTN = enum.auto()
     FP8_FA_SM120 = enum.auto()
     NO_ATTENTION = enum.auto()
+    # Appended so earlier members keep their auto() values.
+    TPU_SPLASH_ATTN = enum.auto()
 
     def __str__(self):
         return self.name.lower()
@@ -143,13 +145,38 @@ class Platform:
         """Apply defaults before argument normalization and validation."""
         pass
 
+    def supports_teacache_with_torch_compile(self) -> bool:
+        """Whether TeaCache may run under --enable-torch-compile.
+
+        TeaCache updates module state every denoising step; a backend that
+        recompiles on that (rather than graph-breaking cheaply) says False and
+        requests drop TeaCache with a warning.
+        """
+        return True
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend
 
+    def prepare_spmd_region_wrapper(self) -> Callable | None:
+        """Decorator for --regional-compile regions that every rank runs with the
+        same graph (the model sets ``_compile_regions_spmd_safe``). The regions
+        should trace as one graph each. May configure process-wide compile
+        state the wrapper needs (e.g. a cache-key tag); call it once, before
+        compiling."""
+        return None
+
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
         """Return backend-specific options for a diffusion module."""
         return None
+
+    def configure_compile_cache(self) -> None:
+        """Configure torch.compile caching for this worker.
+
+        Called once per worker after distributed initialization, before any
+        compilation.
+        """
+        pass
 
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.
@@ -269,7 +296,6 @@ class Platform:
         return self.is_rocm()
 
     @classmethod
-    @lru_cache(maxsize=1)
     def is_amp_supported(cls) -> bool:
         return True
 
@@ -289,6 +315,18 @@ class Platform:
     @classmethod
     def supports_device_tensor_pickle(cls) -> bool:
         return True
+
+    @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        """Whether safetensors can open tensors directly on this platform's device."""
+        return True
+
+    @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        """Whether the Ulysses output all-to-all sends a heads-major attention
+        output as per-head slabs instead of relayouting it to sequence-major
+        first. Both give bit-identical values."""
+        return False
 
     @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
@@ -516,6 +554,11 @@ class Platform:
         return CpuArchEnum.UNSPECIFIED
 
     @classmethod
+    def supports_vae_torch_compile(cls) -> bool:
+        """Whether ``--enable-torch-compile`` also compiles the VAE decode."""
+        return True
+
+    @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True
@@ -534,6 +577,15 @@ class Platform:
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        """Pass ``x`` through a point the graph compiler may not fuse across.
+
+        The values are unchanged; platforms without such a primitive return
+        ``x`` itself.
+        """
+        return x
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

@@ -13,6 +13,7 @@ from sglang.multimodal_gen.test.unit.test_server_args import (  # noqa: F401
     TestTpuDistributedArgs,
 )
 from sglang.multimodal_gen.test.unit.test_tpu_platform import (  # noqa: F401
+    TestSplashBackendSelection,
     TestTorchTpuIntegration,
     TestTpuPlatformPlugin,
     TestTpuPlatformSurface,
@@ -35,6 +36,15 @@ class TestWorkerBootstrap(CustomTestCase):
 
         self.assertGreater(TpuPlatform.get_device_total_memory(), 0)
         self.assertGreater(TpuPlatform.get_current_memory_usage(), 0.0)
+
+    def test_worker_installs_the_aten_fallbacks(self):
+        # Ring attention merges replicated-token partials with logaddexp, which
+        # torch_tpu has no kernel for.
+        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        a = torch.tensor([0.5, float("-inf"), float("-inf"), 3.0])
+        b = torch.tensor([-1.0, 2.0, float("-inf"), 3.0])
+        got = torch.logaddexp(a.to("tpu"), b.to("tpu")).cpu()
+        torch.testing.assert_close(got, torch.logaddexp(a, b))
 
     def test_device_tensors_survive_a_pickle_round_trip(self):
         import pickle

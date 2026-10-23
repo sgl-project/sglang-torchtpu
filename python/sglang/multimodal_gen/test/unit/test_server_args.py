@@ -3495,12 +3495,30 @@ class TestTpuDistributedArgs(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "tensor-parallel"):
                 args._adjust_platform_specific()
 
-    def test_ring_sequence_parallel_is_rejected(self):
+    def test_ring_sequence_parallel_uses_the_splash_backend(self):
         args = self._args(8)
         args.ring_degree = 2
-        with self._on_tpu(), self._slice_env():
-            with self.assertRaisesRegex(ValueError, "ring sequence-parallel"):
-                args._adjust_platform_specific()
+        with self._on_tpu():
+            args._adjust_attention_backend()
+        self.assertEqual(args.attention_backend, "tpu_splash_attn")
+
+        args = self._args(8)
+        args.ring_degree = 2
+        args.attention_backend = "torch_sdpa"
+        with self._on_tpu():
+            with self.assertRaisesRegex(ValueError, r"\(tpu_splash_attn\)"):
+                args._adjust_attention_backend()
+
+    def test_ring_backends_off_tpu_are_unchanged(self):
+        args = self._args(8)
+        args.ring_degree = 2
+        args.attention_backend = "torch_sdpa"
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_tpu",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(ValueError, r"\(fa, sage_attn\)"):
+                args._adjust_attention_backend()
 
     def test_other_platforms_are_unaffected(self):
         with patch(

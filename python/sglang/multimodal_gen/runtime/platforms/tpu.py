@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import functools
 import os
+from collections.abc import Callable
 
 import torch
 
@@ -45,10 +47,54 @@ def _memory_stat(key: str) -> int:
     return int(torch.accelerator.memory_stats().get(key, 0))
 
 
+def _tpu_plugin():
+    """The plugin's worker hooks: this platform's one import of sglang_tpu."""
+    from sglang_tpu.multimodal_gen import worker
+
+    return worker
+
+
 def _install_device_module_shims() -> None:
     for name, fn in _DEVICE_MODULE_SHIMS.items():
         if not hasattr(torch.tpu, name):
             setattr(torch.tpu, name, fn)
+
+
+def _expand_query_broadcast_mask(query, attn_mask):
+    """Expand a mask's size-1 query dim to the query length on TPU.
+
+    torch_tpu SDPA returns NaN for masks that broadcast over queries, e.g.
+    [B, 1, 1, S] key padding; reproduced on torch_tpu 0.2.0rc4 (libtpu
+    0.0.50). Remove once test_diffusion_tpu_sdpa_mask's canary stops
+    reproducing it.
+    """
+    if (
+        attn_mask is not None
+        and query.device.type == "tpu"
+        and attn_mask.dim() >= 2
+        and attn_mask.shape[-2] == 1
+        and query.shape[-2] > 1
+    ):
+        attn_mask = attn_mask.expand(
+            *attn_mask.shape[:-2], query.shape[-2], attn_mask.shape[-1]
+        )
+    return attn_mask
+
+
+def _patch_sdpa_query_broadcast_mask() -> None:
+    # Module-level aliases bound before worker init keep the unpatched
+    # function; hunyuan3d_vae's is the only one and passes no mask.
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    if getattr(sdpa, "_sglang_tpu_mask_patch", False):
+        return
+
+    @functools.wraps(sdpa)
+    def scaled_dot_product_attention(query, key, value, attn_mask=None, *a, **kw):
+        attn_mask = _expand_query_broadcast_mask(query, attn_mask)
+        return sdpa(query, key, value, attn_mask, *a, **kw)
+
+    scaled_dot_product_attention._sglang_tpu_mask_patch = True
+    torch.nn.functional.scaled_dot_product_attention = scaled_dot_product_attention
 
 
 # The launcher and benchmarks reach these through torch.get_device_module()
@@ -145,12 +191,51 @@ class TpuPlatform(Platform):
         return False
 
     @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        # safetensors rejects 'tpu:N'.
+        return False
+
+    @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        # torch_tpu relayouts a sequence-major staging copy around the
+        # collective; dense head slabs keep (8, 128) tiles unpadded.
+        return True
+
+    @classmethod
     def inference_mode(cls):
         # torch_tpu's lazy tensors do not support torch.inference_mode.
         return torch.no_grad()
 
     def get_device(self, local_rank: int) -> torch.device:
         return self.get_local_torch_device()
+
+    def prepare_spmd_region_wrapper(self) -> Callable | None:
+        # torch_tpu splits a compiled graph at every collective and re-lays out
+        # tensors at each split. Marking a region SPMD-safe keeps its
+        # collectives in one program. A whole-DiT program needs too much
+        # scratch, so only regions. The ranks must run identical programs: the
+        # fused collectives otherwise hang or exchange the wrong data.
+        import torch.compiler.config as compiler_config
+
+        try:
+            from torch_tpu._internal.distributed.spmd_util import spmd_safe
+        except ImportError:
+            # A private API: without it, regions keep split collectives.
+            logger.warning_once(
+                "torch_tpu has no spmd_safe; regional-compile programs keep "
+                "their collectives split."
+            )
+            return None
+
+        # The region annotation is not part of the compile cache key; keep
+        # persisted executables of the two region policies apart.
+        tag = "spmd-safe-regions-v1"
+        existing_tag = str(compiler_config.cache_key_tag or "")
+        if tag not in existing_tag.split("|"):
+            compiler_config.cache_key_tag = (
+                f"{existing_tag}|{tag}" if existing_tag else tag
+            )
+        return spmd_safe
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
@@ -161,10 +246,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _init_worker_process(cls) -> None:
-        from sglang_tpu.patches import (
-            _patch_set_device_tolerate_mismatch,
-            _prepare_tpu_env,
-        )
+        plugin = _tpu_plugin()
 
         # srt's activate() selects CPU-only JAX for TorchTPU processes; the
         # worker cannot rely on that having run in the parent (entry-point
@@ -175,21 +257,44 @@ class TpuPlatform(Platform):
         os.environ.setdefault(
             "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
         )
-        _prepare_tpu_env(world_size=_world_size(), resolve_single_host_topology=True)
+        plugin.prepare_env(_world_size())
         import torch_tpu  # noqa: F401
 
         # Registers the "tpu" dynamo backend that simple_compile_backend names.
         import torch_tpu._internal.compile  # noqa: F401
 
-        # PJRT owns the chiplet binding; local_rank is only a label.
-        _patch_set_device_tolerate_mismatch()
+        plugin.install_runtime_patches()
 
         _install_device_module_shims()
+        _patch_sdpa_query_broadcast_mask()
         torch.zeros(1, device="tpu")
+
+    def configure_compile_cache(self) -> None:
+        # torch_tpu persists XLA executables in AOTAutogradCache, whose key sees
+        # neither the device assignment behind collectives, opaque Pallas kernel
+        # sources nor the XLA flags: a stale hit can hang or ignore new flags.
+        _tpu_plugin().configure_compile_cache()
 
     def get_torch_distributed_backend_str(self) -> str:
         # tpu_dist needs one addressable PJRT device; a lone worker has many.
         return "gloo" if _world_size() == 1 else "tpu_dist"
+
+    def apply_server_args_defaults(self, server_args) -> None:
+        # The compile warmup layerwise-offloads the DiT, which TPU cannot run.
+        if (
+            server_args.is_arg_explicitly_set("offload_during_compile")
+            and server_args.offload_during_compile
+        ):
+            logger.warning(
+                "--offload-during-compile is not supported on TPU (the compile "
+                "warmup cannot layerwise-offload the DiT); disabling it."
+            )
+        server_args.offload_during_compile = False
+
+    def supports_teacache_with_torch_compile(self) -> bool:
+        # Every TeaCache state update is a full XLA recompile under the
+        # torch_tpu backend, up to the recompile limit.
+        return False
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -204,11 +309,37 @@ class TpuPlatform(Platform):
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
                 "sdpa.SDPABackend"
             )
+        if selected_backend is AttentionBackendEnum.TPU_SPLASH_ATTN:
+            logger.info(
+                "Using TPU Pallas splash attention backend (falls back to SDPA "
+                "per shape, or entirely off TPU v7x)."
+            )
+            return "sglang_tpu.multimodal_gen.tpu_splash_attn.TpuSplashAttentionBackend"
         raise ValueError(
             f"Attention backend {selected_backend} is not supported on TPU; "
-            "the supported backend is TORCH_SDPA (default)."
+            "the supported backends are TORCH_SDPA (default) and "
+            "TPU_SPLASH_ATTN."
         )
+
+    @classmethod
+    def supports_vae_torch_compile(cls) -> bool:
+        # Off for every VAE: the torch_tpu backend fails to compile the diffusers
+        # AutoencoderKL decoder (torch_tpu 0.2.0rc4, libtpu 0.0.50: view() cannot
+        # turn a channels-last [1, 512, 128, 128] activation into [1, 32, 262144]),
+        # and the other VAEs are untested under it.
+        return False
 
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         return False
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        # Only a compiled XLA program fuses; in eager the barrier would copy x.
+        if x.device.type != "tpu" or not torch.compiler.is_compiling():
+            return x
+        barrier = getattr(getattr(torch.tpu, "ops", None), "optimization_barrier", None)
+        if barrier is None:
+            # torch_tpu releases before torch.tpu.ops expose only the raw op.
+            barrier = torch.ops.tpu.optimization_barrier
+        return barrier([x])[0]

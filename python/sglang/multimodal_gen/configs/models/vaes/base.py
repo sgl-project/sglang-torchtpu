@@ -12,9 +12,6 @@ import torch
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 AUTO_PARALLEL_DECODE_MODE = "auto"
 SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial")
@@ -44,20 +41,18 @@ def _should_use_auto_spatial_shard_parallel_decode(
     return latent_elements_per_rank >= min_latent_elements_per_rank
 
 
+def auto_mode_may_shard_on_this_platform(shards_without_p2p: bool) -> bool:
+    """The no-p2p policy of auto mode, shared by decode and stage planning.
+
+    Without p2p the conv halos travel by all-gather, which pays off only for
+    VAEs that opt in (``auto_parallel_decode_shards_without_p2p``).
+    """
+    return current_platform.supports_distributed_p2p() or shards_without_p2p
+
+
 def should_use_spatial_shard_parallel_decode(
     config: Any, z: torch.Tensor | None = None, world_size: int = 1
 ) -> bool:
-    # Height shards exchange conv halos with isend/irecv.
-    if not current_platform.supports_distributed_p2p():
-        if is_spatial_shard_parallel_decode_mode(config.parallel_decode_mode):
-            logger.warning_once(
-                f"parallel_decode_mode={config.parallel_decode_mode!r} shards the "
-                f"height axis, which needs isend/irecv; {current_platform.device_type} "
-                "has collectives only, so the VAE decodes on one rank. "
-                "'tiled' and 'patch' still use every rank."
-            )
-        return False
-
     if not config.use_parallel_decode:
         return False
 
@@ -68,6 +63,11 @@ def should_use_spatial_shard_parallel_decode(
         return False
 
     if not config.auto_parallel_decode_prefers_spatial_shard():
+        return False
+
+    if not auto_mode_may_shard_on_this_platform(
+        config.auto_parallel_decode_shards_without_p2p()
+    ):
         return False
 
     if z is None:
@@ -118,6 +118,14 @@ class VAEConfig(ModelConfig):
         pass
 
     def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        return False
+
+    def auto_parallel_decode_shards_without_p2p(self) -> bool:
+        """Whether auto mode shards the height on platforms without p2p.
+
+        Their conv halos travel by all-gather, which pays off only for VAEs
+        measured to gain from it; the others decode on one rank there.
+        """
         return False
 
     def should_use_auto_spatial_shard_parallel_decode(

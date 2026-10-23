@@ -5,10 +5,15 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.models.vaes import base as vae_base
+from sglang.multimodal_gen.runtime.pipelines_core.stages import decoding
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+    mova,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
     LTX2RefinementStage,
 )
@@ -197,6 +202,112 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 stage.parallelism_type,
                 StageParallelismType.MAIN_RANK_ONLY,
             )
+
+
+class TestMovaDecodingStageParallelism(unittest.TestCase):
+    def test_cfg_parallel_runs_a_parallel_decode_on_every_rank(self):
+        # A spatial or tiled decode issues collectives over the whole decode
+        # group, so a main-rank-only stage would hang the other CFG ranks.
+        cases = (
+            (True, True, 2, StageParallelismType.REPLICATED),
+            (True, False, 2, StageParallelismType.MAIN_RANK_ONLY),
+            (True, True, 1, StageParallelismType.MAIN_RANK_ONLY),
+            (False, True, 2, StageParallelismType.REPLICATED),
+            (False, False, 1, StageParallelismType.REPLICATED),
+        )
+        stage = object.__new__(mova.MOVADecodingStage)
+        for cfg_parallel, parallel_decode, decode_world_size, expected in cases:
+            stage.video_vae = SimpleNamespace(
+                use_parallel_decode=parallel_decode,
+                parallel_decode_mode="spatial_shard",
+            )
+            with (
+                self.subTest(
+                    cfg_parallel=cfg_parallel,
+                    parallel_decode=parallel_decode,
+                    decode_world_size=decode_world_size,
+                ),
+                patch.object(
+                    mova,
+                    "get_global_server_args",
+                    return_value=SimpleNamespace(enable_cfg_parallel=cfg_parallel),
+                ),
+                patch.object(
+                    decoding, "model_parallel_is_initialized", return_value=True
+                ),
+                patch.object(
+                    decoding,
+                    "get_decode_parallel_world_size",
+                    return_value=decode_world_size,
+                ),
+            ):
+                self.assertEqual(stage.parallelism_type, expected)
+
+
+class TestDecodeUsesEveryRank(unittest.TestCase):
+    def test_auto_decode_without_p2p_uses_every_rank_only_for_opted_in_vaes(self):
+        def vae(mode, opted_in):
+            return SimpleNamespace(
+                use_parallel_decode=True,
+                parallel_decode_mode=mode,
+                auto_shards_without_p2p=opted_in,
+            )
+
+        cases = (
+            (False, vae("auto", True), True),
+            (False, vae("auto", False), False),
+            (False, vae("spatial_shard", False), True),
+            (False, vae("tiled", False), True),
+            (True, vae("auto", False), True),
+        )
+        for p2p, stub, expected in cases:
+            platform = SimpleNamespace(supports_distributed_p2p=lambda p2p=p2p: p2p)
+            with (
+                self.subTest(p2p=p2p, mode=stub.parallel_decode_mode),
+                # The policy helper lives with the VAE config policy.
+                patch.object(vae_base, "current_platform", platform),
+                patch.object(
+                    decoding, "model_parallel_is_initialized", return_value=True
+                ),
+                patch.object(
+                    decoding, "get_decode_parallel_world_size", return_value=2
+                ),
+            ):
+                self.assertEqual(decoding.decode_uses_every_rank(stub), expected)
+
+    def test_vae_policy_survives_an_arch_config_on_the_module(self):
+        # AutoencoderKLQwenImage replaces .config with its arch config; the
+        # policy comes from the VAEConfig given to ParallelTiledVAE.
+        from sglang.multimodal_gen.configs.models.vaes.qwenimage import (
+            QwenImageVAEConfig,
+        )
+        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
+        from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+
+        class _ArchConfigVAE(ParallelTiledVAE):
+            def __init__(self, config):
+                super().__init__(config)
+                self.config = config.arch_config
+
+            def _encode(self, x):
+                return x
+
+            def _decode(self, z):
+                return z
+
+        platform = SimpleNamespace(supports_distributed_p2p=lambda: False)
+        with (
+            patch.object(vae_base, "current_platform", platform),
+            patch.object(decoding, "model_parallel_is_initialized", return_value=True),
+            patch.object(decoding, "get_decode_parallel_world_size", return_value=2),
+        ):
+            for config, expected in (
+                (QwenImageVAEConfig(), False),
+                (WanVAEConfig(), True),
+            ):
+                with self.subTest(vae=type(config).__name__):
+                    vae = _ArchConfigVAE(config)
+                    self.assertEqual(decoding.decode_uses_every_rank(vae), expected)
 
 
 if __name__ == "__main__":

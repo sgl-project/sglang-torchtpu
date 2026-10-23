@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     _ensure_tensor_decode_output,
+    decode_uses_every_rank,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -277,6 +278,10 @@ class MOVADenoisingStage(PipelineStage):
             logger.info(
                 "Compiling %s with torchair backend on NPU",
                 module.__class__.__name__,
+            )
+        elif current_platform.is_tpu():
+            logger.info(
+                "Compiling %s with the torch_tpu backend", module.__class__.__name__
             )
         else:
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
@@ -950,6 +955,9 @@ class MOVADecodingStage(PipelineStage):
     @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:
+            # A parallel video decode spans the whole decode group.
+            if decode_uses_every_rank(self.video_vae):
+                return StageParallelismType.REPLICATED
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
 

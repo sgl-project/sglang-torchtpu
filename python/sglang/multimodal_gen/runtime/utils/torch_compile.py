@@ -8,6 +8,9 @@ from typing import Any
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def maybe_enable_inductor_compute_comm_overlap() -> None:
@@ -39,6 +42,18 @@ def build_torch_compile_kwargs(
             and mode is not None
         ):
             compile_kwargs["mode"] = mode
+    elif current_platform.is_tpu():
+        # The torch_tpu backend compiles static shapes only.
+        compile_kwargs["backend"] = current_platform.get_compile_backend(mode)
+        compile_kwargs["dynamic"] = False
+        if module is not None:
+            options = current_platform.get_compile_options(module)
+            if options is not None:
+                compile_kwargs["options"] = options
+        if mode is not None:
+            logger.info_once(
+                "torch.compile mode=%s is ignored by the torch_tpu backend.", mode
+            )
     elif current_platform.is_npu():
         from sglang.srt.utils.common import get_compiler_backend
 
@@ -104,7 +119,19 @@ def compile_matching_submodules(
             f"check {type(module).__name__}._compile_conditions"
         )
 
+    # Only for models whose ranks all run the same region graph.
+    wrap_region = (
+        current_platform.prepare_spmd_region_wrapper()
+        if getattr(module, "_compile_regions_spmd_safe", False)
+        else None
+    )
+    # The annotation covers a region only while it traces as one graph. It is
+    # not forced with fullgraph=True: under dynamic=False each new shape adds
+    # a graph, and past the recompile limit fullgraph raises instead of
+    # running the region eagerly.
     for submodule in matches:
+        if wrap_region is not None:
+            submodule.forward = wrap_region(submodule.forward)
         submodule.compile(**compile_kwargs)
     return len(matches)
 

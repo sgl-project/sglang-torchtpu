@@ -106,6 +106,7 @@ MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
 RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
+TPU_RING_CAPABLE_ATTENTION_BACKENDS = ("tpu_splash_attn",)
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -1154,17 +1155,22 @@ class ServerArgs(DisaggServerArgsMixin):
             self._automatic_component_attention_backend_keys.add("text_encoder")
 
         if self.ring_degree > 1:
+            ring_backends = (
+                TPU_RING_CAPABLE_ATTENTION_BACKENDS
+                if current_platform.is_tpu()
+                else RING_CAPABLE_ATTENTION_BACKENDS
+            )
             if (
                 self.attention_backend is not None
-                and self.attention_backend not in RING_CAPABLE_ATTENTION_BACKENDS
+                and self.attention_backend not in ring_backends
             ):
                 raise ValueError(
                     "Ring Attention requires one of the ring-capable backends "
-                    f"({', '.join(RING_CAPABLE_ATTENTION_BACKENDS)}), got "
+                    f"({', '.join(ring_backends)}), got "
                     f"{self.attention_backend!r}"
                 )
             if self.attention_backend is None:
-                self.attention_backend = RING_CAPABLE_ATTENTION_BACKENDS[0]
+                self.attention_backend = ring_backends[0]
                 logger.info(
                     "Ring Attention requires a ring-capable backend; "
                     "attention_backend has been automatically set to %s",
@@ -1671,11 +1677,6 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 "TPU diffusion has no tensor-parallel path yet; shard with "
                 f"--cfg-parallel-size / --sp-degree instead (got --tp-size {self.tp_size})."
-            )
-        if self.ring_degree not in (None, 1):
-            raise ValueError(
-                "TPU diffusion has no ring sequence-parallel path yet; use "
-                f"--ulysses-degree instead (got --ring-degree {self.ring_degree})."
             )
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
@@ -2469,7 +2470,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--offload-during-compile",
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
-            help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+            help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP. Off by default on TPU, which cannot run the layerwise offload.",
         )
         parser.add_argument(
             "--enable-breakable-cuda-graph",

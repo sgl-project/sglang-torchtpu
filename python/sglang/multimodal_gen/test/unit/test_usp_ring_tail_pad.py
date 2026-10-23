@@ -68,6 +68,41 @@ class TestRingTailPadDispatch(unittest.TestCase):
         self.assertTrue(torch.all(out[0, 1:] == 0))
         self.assertTrue(torch.all(out[0, :1] == 1))
 
+    def test_tail_pad_meta_reaches_the_allgather_ring(self):
+        obj = self._attn()
+        obj.backend = AttentionBackendEnum.TPU_SPLASH_ATTN
+        obj.attn_impl = SimpleNamespace(supports_ring_resume=lambda: True)
+        q = torch.randn(1, 8, 2, 8)
+        meta = {"pad_start": 13, "pad_end": 16, "local_pad": 3}
+        seen = {}
+
+        def fake_ring(qc, kc, vc, *, attn_impl, kv_real_len):
+            seen.update(shape=tuple(qc.shape), real=kv_real_len, impl=attn_impl)
+            return torch.ones_like(qc)
+
+        with (
+            patch(
+                f"{_LAYER}.get_forward_context",
+                return_value=SimpleNamespace(attn_metadata=None),
+            ),
+            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=4),
+            patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=2),
+            patch(
+                f"{_LAYER}._usp_input_all_to_all_qkv",
+                side_effect=lambda q, k, v: (q, k, v),
+            ),
+            patch(
+                f"{_LAYER}._usp_output_all_to_all", side_effect=lambda t, head_dim: t
+            ),
+            patch(f"{_LAYER}.allgather_kv_ring_attn", side_effect=fake_ring),
+        ):
+            out = obj.forward(q, q, q, attn_mask_meta=meta)
+
+        self.assertEqual(seen["real"], 13)
+        self.assertIs(seen["impl"], obj.attn_impl)
+        self.assertEqual(seen["shape"], (1, 8, 2, 8))
+        self.assertTrue(torch.all(out == 1))
+
     def test_explicit_mask_under_ring_still_refuses(self):
         obj = self._attn()
         q = torch.randn(1, 4, 2, 8)

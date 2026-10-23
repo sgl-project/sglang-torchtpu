@@ -29,6 +29,10 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    tail_attn_meta,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
@@ -119,6 +123,9 @@ class _WanGELUMLP(MLP):
                 bias,
                 use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
             )
+        # Keep the activation in fc_in's epilogue: XLA would otherwise fuse it
+        # into fc_out as a slower matmul prologue.
+        x = current_platform.fusion_barrier(x)
         x, _ = self.fc_out(x)
         return x
 
@@ -391,8 +398,12 @@ _WAN_TEMB_SLICES = BitExactFusionGate("Wan fused temb-table slices")
 def _eager_temb_table_slices(
     table: torch.Tensor, temb: torch.Tensor
 ) -> tuple[torch.Tensor, ...]:
-    parts = (table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
-    return tuple(part.squeeze(2) for part in parts)
+    # One contiguous (B, S, D) tensor per slice, as the fused kernel writes.
+    # Chunk views of the (B, S, 6, D) sum would cross the compiled graph's
+    # collective splits, and torch_tpu re-lays such views out in every block.
+    # fp32 (1, D) + bf16 (B, S, D) promotes to fp32 exactly, without a
+    # (B, S, D) fp32 temporary per slice.
+    return tuple(table[:, j] + temb[:, :, j] for j in range(6))
 
 
 def _wan_temb_table_slices(
@@ -625,6 +636,7 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
+        attn_mask_meta: dict | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -728,7 +740,19 @@ class WanTransformerBlock(nn.Module):
             query = torch.matmul(query, self.q_rot)
             key = torch.matmul(key, self.k_rot)
 
-        attn_output = self.attn1(query, key, value)
+        if (
+            attn_mask_meta is not None
+            and isinstance(self.attn1, USPAttention)
+            and not self.attn1.backend.is_sparse
+            and self.attn1.supports_tail_pad_meta(query.shape[0])
+        ):
+            # Keys past the sequence-parallel tail pad are not real tokens.
+            attn_output = self.attn1(query, key, value, attn_mask_meta=attn_mask_meta)
+        else:
+            # Sparse attention (SLA, USP sparse backends), and ring layouts
+            # whose kernel cannot skip the pad keys (e.g. sage_attn, or FA at
+            # batch > 1), attend to them, as before.
+            attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -910,7 +934,10 @@ class WanTransformerBlock_VSA(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
+        attn_mask_meta: dict | None = None,
     ) -> torch.Tensor:
+        # attn_mask_meta is unused: video sparse attention takes no mask, so
+        # sequence-parallel pad keys are attended, as before.
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -1020,6 +1047,10 @@ class WanTransformerBlock_VSA(nn.Module):
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
+    # SP ranks feed each block equal-length shards at storage offset 0 (see
+    # forward; torch_tpu keys executables on input storage offsets), so all
+    # ranks compile the same block program.
+    _compile_regions_spmd_safe = True
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
@@ -1216,21 +1247,30 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # shape is [B, T' * H' * W', C]
         seq_len_orig = hidden_states.shape[1]
         seq_shard_pad = 0
+        attn_mask_meta = None
         if sequence_shard_enabled:
-            if seq_len_orig % self.sp_size != 0:
-                seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
+            sp_rank = get_sp_group().rank_in_group
+            shard = build_shard_plan(seq_len_orig)
+            seq_shard_pad = shard.num_pad
+            if seq_shard_pad > 0:
                 pad = torch.zeros(
                     (batch_size, seq_shard_pad, hidden_states.shape[2]),
                     dtype=hidden_states.dtype,
                     device=hidden_states.device,
                 )
                 hidden_states = torch.cat([hidden_states, pad], dim=1)
-            sp_rank = get_sp_group().rank_in_group
-            local_seq_len = hidden_states.shape[1] // self.sp_size
+                attn_mask_meta = tail_attn_meta(shard, batch_size, hidden_states.device)
+            local_seq_len = shard.local_len
             hidden_states = hidden_states.view(
                 batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
             )
-            hidden_states = hidden_states[:, sp_rank, :, :]
+            # A fresh shard: a view starts at a rank-dependent storage offset,
+            # which torch_tpu keys compiled executables on. Unconditional on
+            # purpose: the copy is negligible elsewhere and keeps one trace on
+            # every platform.
+            hidden_states = hidden_states[:, sp_rank, :, :].clone(
+                memory_format=torch.contiguous_format
+            )
 
             frame_stride = post_patch_height * post_patch_width
             freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard(
@@ -1269,6 +1309,11 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
         if sequence_shard_enabled and ts_seq_len is not None:
+            # Per-token timesteps are sized from the unpadded latents.
+            assert timestep_proj.shape[1] == seq_len_orig, (
+                f"per-token timesteps ({timestep_proj.shape[1]}) must match the "
+                f"unpadded sequence ({seq_len_orig})"
+            )
             if seq_shard_pad > 0:
                 pad = torch.zeros(
                     (
@@ -1288,7 +1333,10 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 timestep_proj.shape[2],
                 timestep_proj.shape[3],
             )
-            timestep_proj = timestep_proj[:, sp_rank, :, :, :]
+            # Fresh for the same reason as the hidden-state shard.
+            timestep_proj = timestep_proj[:, sp_rank, :, :, :].clone(
+                memory_format=torch.contiguous_format
+            )
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat(
@@ -1335,13 +1383,17 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     timestep_proj,
                     freqs_cis,
                     rope_cos_sin_cache=rope_cos_sin_cache,
+                    attn_mask_meta=attn_mask_meta,
                 )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
             if enable_spectrum:
                 self.spectrum_record_features(hidden_states)
-        self.cnt += 1
+        # Only TeaCache reads the step counter; under torch.compile a mutated
+        # int attribute recompiles the forward every step.
+        if self.enable_teacache:
+            self.cnt += 1
 
         if sequence_shard_enabled:
             hidden_states = hidden_states.contiguous()

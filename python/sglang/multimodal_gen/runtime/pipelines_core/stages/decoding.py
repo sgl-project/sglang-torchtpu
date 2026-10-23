@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.vaes.base import (
+    auto_mode_may_shard_on_this_platform,
     is_auto_parallel_decode_mode,
-    is_spatial_shard_parallel_decode_mode,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows_kernel_fusions,
@@ -62,12 +62,14 @@ def decode_uses_every_rank(vae) -> bool:
     """
     if vae is None or not vae.use_parallel_decode:
         return False
-    mode = vae.parallel_decode_mode
-    # Only height shards trade conv halos over p2p; auto may resolve to one.
-    needs_p2p = is_auto_parallel_decode_mode(mode) or (
-        is_spatial_shard_parallel_decode_mode(mode)
-    )
-    if needs_p2p and not current_platform.supports_distributed_p2p():
+    # The same no-p2p policy as should_use_spatial_shard_parallel_decode.
+    # Read from the VAE: some replace .config with their arch config; a VAE
+    # without the attribute never opted in.
+    if is_auto_parallel_decode_mode(
+        vae.parallel_decode_mode
+    ) and not auto_mode_may_shard_on_this_platform(
+        getattr(vae, "auto_shards_without_p2p", False)
+    ):
         return False
     return model_parallel_is_initialized() and get_decode_parallel_world_size() > 1
 
@@ -192,7 +194,11 @@ class DecodingStage(PipelineStage):
         compiled_callable: ActiveTargetCompiledCallable | None = None,
     ):
         decode_fn = decode_fn or vae.decode
-        if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
+        if (
+            not server_args.enable_torch_compile
+            or not isinstance(vae, nn.Module)
+            or not current_platform.supports_vae_torch_compile()
+        ):
             return decode_fn
 
         compiled_callable = compiled_callable or self._compiled_vae_decode

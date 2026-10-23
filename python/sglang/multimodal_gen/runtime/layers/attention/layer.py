@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
+    allgather_kv_ring_attn,
     ring_attn,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -1249,9 +1250,18 @@ class USPAttention(nn.Module):
                     and self.backend == AttentionBackendEnum.FA
                 ):
                     return self._forward_ring_tail_pad(q, k, v, attn_mask_meta)
+                if (
+                    meta_only_pad
+                    and not self.causal
+                    and self.attn_impl.supports_ring_resume()
+                ):
+                    return self._forward_allgather_ring_tail_pad(
+                        q, k, v, attn_mask_meta
+                    )
                 raise NotImplementedError(
                     "USPAttention masked path supports ring parallelism only "
-                    "for batch-1 tail-pad metadata on the FA backend."
+                    "for tail-pad metadata, on the FA backend at batch 1 or on "
+                    "a backend with all-gather ring support."
                 )
             if attn_mask is not None and attn_mask.dim() != 2:
                 raise NotImplementedError(
@@ -1339,6 +1349,27 @@ class USPAttention(nn.Module):
                     ],
                     dim=1,
                 )
+                if sp_size > 1:
+                    out = _usp_output_all_to_all(out, head_dim=2)
+                return out
+
+            if (
+                meta_only_pad
+                and meta_pad_end == q.shape[1]
+                and not self.backend.is_sparse
+                and not self.causal
+            ):
+                # Padding only at the gathered tail: attend over the real key
+                # prefix with the selected backend; no mask to build. Sparse
+                # kernels need K/V as long as Q and keep the masked path below.
+                out = self.attn_impl.forward(
+                    q, k[:, :meta_pad_start], v[:, :meta_pad_start], ctx_attn_metadata
+                )
+                # Not an in-place write into the impl's output buffer.
+                real_rows = (
+                    torch.arange(out.shape[1], device=out.device) < meta_pad_start
+                )
+                out = torch.where(real_rows[None, :, None, None], out, 0)
                 if sp_size > 1:
                     out = _usp_output_all_to_all(out, head_dim=2)
                 return out
@@ -1463,14 +1494,23 @@ class USPAttention(nn.Module):
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
-            out = ring_attn(
-                q,
-                k,
-                v,
-                attn_impl=self.attn_impl,
-                is_causal=self.causal,
-                dropout_p=self.dropout_p,
-            )
+            if not self.causal and self.attn_impl.supports_ring_resume():
+                out = allgather_kv_ring_attn(q, k, v, attn_impl=self.attn_impl)
+            elif self.attn_impl.supports_ring_resume():
+                # Backends that ring by all-gather (TPU) lack a causal kernel
+                # path; the templated ring would run an unrolled reference.
+                raise NotImplementedError(
+                    "All-gather ring attention is non-causal only."
+                )
+            else:
+                out = ring_attn(
+                    q,
+                    k,
+                    v,
+                    attn_impl=self.attn_impl,
+                    is_causal=self.causal,
+                    dropout_p=self.dropout_p,
+                )
         else:
             # -> [B, S, H_local, D]
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
@@ -1481,6 +1521,18 @@ class USPAttention(nn.Module):
             out = _usp_output_all_to_all(out, head_dim=2)
 
         return out
+
+    def supports_tail_pad_meta(self, batch_size: int) -> bool:
+        """Whether tail-pad metadata alone (no mask) is served under the
+        current parallel layout; the masked path's ring branch raises for it
+        otherwise. A caller that cannot honour the padding attends to the pad
+        keys instead, as without the metadata."""
+        if get_ring_parallel_world_size() == 1:
+            return True
+        # The ring branches of forward's masked path.
+        return (self.backend == AttentionBackendEnum.FA and batch_size == 1) or (
+            not self.causal and self.attn_impl.supports_ring_resume()
+        )
 
     def _forward_ring_tail_pad(
         self,
@@ -1514,6 +1566,29 @@ class USPAttention(nn.Module):
         if pad_from < out.shape[0]:
             out[max(pad_from, 0) :].zero_()
         return _usp_output_all_to_all(out.unsqueeze(0), head_dim=2)
+
+    def _forward_allgather_ring_tail_pad(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask_meta: dict,
+    ) -> torch.Tensor:
+        """K/V all-gather ring attention for a tail-padded shard.
+
+        All padding sits at the global tail, so each gathered shard attends over
+        its real-key prefix and no mask is built; masked query rows read as
+        zeros.
+        """
+        q, k, v = _usp_input_all_to_all_qkv(q, k, v)
+        out = allgather_kv_ring_attn(
+            q,
+            k,
+            v,
+            attn_impl=self.attn_impl,
+            kv_real_len=int(attn_mask_meta["pad_start"]),
+        )
+        return _usp_output_all_to_all(out, head_dim=2)
 
     @staticmethod
     def _gather_sharded_sequence(
@@ -1576,6 +1651,30 @@ class USPAttention(nn.Module):
         if attn_mask is None and attn_mask_meta is None:
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
+        use_varlen_fa = (
+            _VARLEN_FA_ENABLED
+            and self.backend == AttentionBackendEnum.FA
+            and q.device.type == "cuda"
+            and q.dtype in (torch.float16, torch.bfloat16)
+        )
+        if (
+            attn_mask is None
+            and not use_varlen_fa
+            and not (num_replicated_prefix or num_replicated_suffix)
+        ):
+            pad_start = attn_mask_meta.get("pad_start", attn_mask_meta.get("gap_start"))
+            pad_end = attn_mask_meta.get("pad_end", attn_mask_meta.get("gap_end"))
+            if pad_start is not None and pad_end == k.shape[1]:
+                # Tail padding only: attend over the global real-key prefix
+                # with the selected backend. Every rank slices the same span,
+                # so every rank runs the same program (spmd-safe compiled
+                # regions need that) and no mask is built or gathered. Pad
+                # query rows keep their values; the caller trims them after
+                # the final gather.
+                return self.attn_impl.forward(
+                    q, k[:, :pad_start], v[:, :pad_start], ctx_attn_metadata
+                )
+
         explicit_mask = attn_mask is not None
         if attn_mask is None:
             local_pad = int(attn_mask_meta.get("local_pad", 0))
@@ -1623,12 +1722,7 @@ class USPAttention(nn.Module):
         else:
             key_mask = cached["key_mask"]
 
-        if (
-            _VARLEN_FA_ENABLED
-            and self.backend == AttentionBackendEnum.FA
-            and q.device.type == "cuda"
-            and q.dtype in (torch.float16, torch.bfloat16)
-        ):
+        if use_varlen_fa:
             if (
                 explicit_mask
                 and attn_mask_meta is not None
@@ -1676,6 +1770,16 @@ class USPAttention(nn.Module):
                 query_len,
             )
 
+        out = self._kv_gather_masked_sdpa(q, k, v, key_mask)
+        return out * attn_mask[:, :, None, None]
+
+    def _kv_gather_masked_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_mask: torch.Tensor,
+    ) -> torch.Tensor:
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
@@ -1695,7 +1799,7 @@ class USPAttention(nn.Module):
             else nullcontext()
         )
         with sdpa_context:
-            out = torch.nn.functional.scaled_dot_product_attention(
+            return torch.nn.functional.scaled_dot_product_attention(
                 q_,
                 k_,
                 v_,
@@ -1704,7 +1808,6 @@ class USPAttention(nn.Module):
                 is_causal=False,
                 scale=self.softmax_scale,
             ).transpose(1, 2)
-        return out * attn_mask[:, :, None, None]
 
     def _forward_with_replicated_prefix(
         self,

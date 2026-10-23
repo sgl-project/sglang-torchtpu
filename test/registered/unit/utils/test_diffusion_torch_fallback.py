@@ -7,8 +7,10 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.diffusion.common import fallback_torch
 from sglang.kernels.ops.diffusion.common.fallback_torch import (
     apply_rotary_embedding_native,
+    apply_rotary_embedding_pair_swap,
     fuse_scale_shift_kernel_native,
     norm_infer_native,
     rms_norm_fn_native,
@@ -52,6 +54,32 @@ class TestDiffusionPlatformDispatch(CustomTestCase):
             self.assertIs(
                 select_impl(triton_impl, cpu=cpu_impl, tpu=tpu_impl), tpu_impl
             )
+
+    def test_selected_lazy_fallback_resolves_to_its_function(self):
+        """Selection imports the fallback, so a compiled call never imports."""
+        from sglang.kernels.ops.diffusion.common import fallback_torch
+        from sglang.kernels.ops.diffusion.common.platform import lazy_fallback
+
+        def triton_impl():
+            pass
+
+        platforms_module = ModuleType("sglang.multimodal_gen.runtime.platforms")
+        platforms_module.current_platform = SimpleNamespace(
+            is_cuda=lambda: False,
+            is_hip=lambda: False,
+            is_tpu=lambda: True,
+        )
+
+        with patch.dict(
+            sys.modules,
+            {platforms_module.__name__: platforms_module},
+        ):
+            selected = select_impl(
+                triton_impl,
+                tpu=lazy_fallback("torch", "norm_infer_native"),
+                npu=lazy_fallback("npu", "fuse_scale_shift_native"),
+            )
+        self.assertIs(selected, fallback_torch.norm_infer_native)
 
 
 class TestDiffusionTorchFallback(unittest.TestCase):
@@ -170,6 +198,76 @@ class TestDiffusionTorchFallback(unittest.TestCase):
             x, full_cos, full_sin, interleaved=True
         )
         torch.testing.assert_close(interleaved.cpu(), reference.cpu())
+
+    def _rope_inputs(self, dtype, head_dim, interleaved):
+        x = torch.randn(33, 4, head_dim, dtype=dtype, device=self.device)
+        angles = torch.randn(33, head_dim // 2, device=self.device)
+        cos, sin = angles.cos(), angles.sin()
+        if interleaved:
+            cos = cos.repeat_interleave(2, dim=-1)
+            sin = sin.repeat_interleave(2, dim=-1)
+        return x, cos, sin
+
+    def test_bf16_pair_swap_rotary_embedding_matches_the_strided_form(self):
+        torch.manual_seed(0)
+        for head_dim in (64, 128):
+            for interleaved in (False, True):
+                with (
+                    self.subTest(head_dim=head_dim, interleaved=interleaved),
+                    patch.object(
+                        fallback_torch,
+                        "_pair_swap_matrix",
+                        wraps=fallback_torch._pair_swap_matrix,
+                    ) as pair_swap_matrix,
+                ):
+                    x, cos, sin = self._rope_inputs(
+                        torch.bfloat16, head_dim, interleaved
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            apply_rotary_embedding_pair_swap(x, cos, sin, interleaved),
+                            apply_rotary_embedding_native(x, cos, sin, interleaved),
+                        )
+                    )
+                    pair_swap_matrix.assert_called_once()
+
+    def test_pair_swap_rotary_embedding_keeps_the_strided_form_off_bf16(self):
+        # TPU float16/float32 matmuls are not exact, so only bf16 takes the swap.
+        torch.manual_seed(0)
+        with patch.object(
+            fallback_torch,
+            "_pair_swap_matrix",
+            side_effect=AssertionError("took the matmul path"),
+        ):
+            for dtype in (torch.float16, torch.float32):
+                for interleaved in (False, True):
+                    with self.subTest(dtype=dtype, interleaved=interleaved):
+                        x, cos, sin = self._rope_inputs(dtype, 128, interleaved)
+                        self.assertTrue(
+                            torch.equal(
+                                apply_rotary_embedding_pair_swap(
+                                    x, cos, sin, interleaved
+                                ),
+                                apply_rotary_embedding_native(x, cos, sin, interleaved),
+                            )
+                        )
+
+    def test_pair_swap_matrix_is_built_once_in_eager_and_traced_when_compiling(self):
+        fallback_torch._PAIR_SWAP_MATRICES.clear()
+        x = torch.arange(8.0).bfloat16()
+        rot = fallback_torch._pair_swap_matrix(8, torch.bfloat16, "cpu")
+        self.assertIs(fallback_torch._pair_swap_matrix(8, torch.bfloat16, "cpu"), rot)
+        swapped = torch.tensor([-1.0, 0, -3, 2, -5, 4, -7, 6]).bfloat16()
+        self.assertTrue(torch.equal(x @ rot, swapped))
+
+        fallback_torch._PAIR_SWAP_MATRICES.clear()
+        compiled = torch.compile(
+            lambda t: t @ fallback_torch._pair_swap_matrix(8, t.dtype, t.device),
+            backend="eager",
+            fullgraph=True,
+        )
+        self.assertTrue(torch.equal(compiled(x), swapped))
+        self.assertEqual(fallback_torch._PAIR_SWAP_MATRICES, {})
 
     def test_one_pass_rms_norm_matches_reference(self):
         x = torch.randn(8, 128, device=self.device, dtype=torch.float32)
