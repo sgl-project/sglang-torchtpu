@@ -8,6 +8,7 @@ import torch
 from sglang.srt.compilation.support_torch_compile import get_torch_compile_policy
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -27,6 +28,7 @@ def _forward(
     is_target_verify=False,
     has_mm_inputs=False,
     mm_extend_in_batch=False,
+    materialized_from=None,
 ):
     """Call the wrapper's forward on a stand-in self with a mocked LM."""
     language_model = MagicMock(return_value="lm-out")
@@ -43,6 +45,8 @@ def _forward(
         ),
         contains_mm_inputs=lambda: has_mm_inputs,
         is_tpu_mm_extend_in_batch=mm_extend_in_batch,
+        # Set when DP attention runs a decode (or idle) batch as extends.
+        _original_forward_mode=materialized_from,
     )
     input_ids = torch.tensor([1, 2, 3])
     positions = torch.tensor([0, 1, 2])
@@ -91,6 +95,32 @@ class TestKimiK3DecodeEmbedsInGraph(CustomTestCase):
         )
         self.assertEqual(out, "routine-out")
         routine.assert_called_once()
+
+    def test_image_decode_run_as_extends_keeps_the_text_program(self):
+        # A DP peer's text extend turns this rank's decode into one-token
+        # extends. Its image request embeds nothing new, so it must take the
+        # peers' input_ids program, not the routine (CDK j-0f28a1ee hung here).
+        out, lm, routine, ids, pos, fb = _forward(
+            decode_in_graph=True,
+            is_decode=False,
+            has_mm_inputs=True,
+            materialized_from=ForwardMode.DECODE,
+        )
+        self.assertEqual(out, "lm-out")
+        routine.assert_not_called()
+        lm.assert_called_once_with(ids, pos, fb, pp_proxy_tensors=None)
+
+    def test_decode_run_as_extends_follows_a_dp_peers_image_step(self):
+        out, lm, routine, *_ = _forward(
+            decode_in_graph=True,
+            is_decode=False,
+            has_mm_inputs=True,
+            mm_extend_in_batch=True,
+            materialized_from=ForwardMode.DECODE,
+        )
+        self.assertEqual(out, "routine-out")
+        routine.assert_called_once()
+        lm.assert_not_called()
 
     def test_decode_uses_the_embed_routine_when_disabled(self):
         out, lm, routine, *_ = _forward(decode_in_graph=False, is_decode=True)

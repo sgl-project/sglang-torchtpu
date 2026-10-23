@@ -122,6 +122,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -2561,7 +2562,13 @@ class KimiK3DecoderLayer(nn.Module):
         self._dp_attention = is_dp_attention_enabled()
         # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
         # attn_tp multiples; attention must then run on the real rows only.
-        self._trim_padded_attn = require_mlp_sync()
+        # Not where attention runs on padded token buckets anyway (TPU): a trim
+        # length read from the batch's host lists would specialize the
+        # compiled graph on every batch.
+        self._trim_padded_attn = (
+            require_mlp_sync()
+            and not current_platform.runs_attention_on_padded_tokens()
+        )
         # A layer runs MoE (vs a plain dense MLP) iff it is past the dense
         # prefix and on the MoE cadence — same predicate the mlp construction
         # below uses.
@@ -3014,7 +3021,11 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
-        self._trim_padded_attn = require_mlp_sync()
+        # Matches the decoder layers' trim (see there).
+        self._trim_padded_attn = (
+            require_mlp_sync()
+            and not current_platform.runs_attention_on_padded_tokens()
+        )
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3791,6 +3802,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
     # Text-only prefill takes the same direct path (the policy warms the
     # "text_ids" extend variant for it); image prefill keeps the routine.
     text_prefill_in_language_model = _is_tpu
+    # Serves DP attention under TPU compilation: forward() puts every rank on
+    # the input_embeds program when any DP group prefills an image
+    # (is_tpu_mm_extend_in_batch), the logits processor is compiled with the
+    # language model, and the replicated vision tower has no collectives.
+    serves_dp_attention = True
 
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -4205,7 +4221,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
             or forward_batch.forward_mode.is_target_verify()
             or (
                 self.text_prefill_in_language_model
-                and not forward_batch.contains_mm_inputs()
+                # A decode batch that DP attention runs as one-token extends
+                # (a peer is extending) still carries its image requests'
+                # inputs but embeds no image. It must take its peers' program:
+                # TPU ranks on different programs deadlock.
+                and not (
+                    forward_batch.contains_mm_inputs()
+                    and forward_batch._original_forward_mode is None
+                )
                 # A DP peer's image step puts every rank on the input_embeds path.
                 and not forward_batch.is_tpu_mm_extend_in_batch
             )

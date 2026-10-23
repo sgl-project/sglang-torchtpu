@@ -268,6 +268,12 @@ class SRTPlatform(DeviceMixin):
         so SWA segment frees require host indices."""
         return False
 
+    def runs_attention_on_padded_tokens(self) -> bool:
+        """Whether attention runs every batch on padded token buckets, padded
+        rows writing to a reserved KV slot, so a model must not trim the
+        mlp-sync padding off its attention input."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------

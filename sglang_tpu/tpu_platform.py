@@ -1273,6 +1273,11 @@ class TpuSRTPlatform(SRTPlatform):
         # host-resident req_to_token table hands its segment frees host indices.
         return True
 
+    def runs_attention_on_padded_tokens(self) -> bool:
+        # The compiled forward pads every batch to a token bucket, and padded
+        # rows write to the reserved page 0.
+        return True
+
     def supports_overlap_streams(self) -> bool:
         # torch_tpu serialises all device work on a single implicit PJRT queue:
         # cross-stream ordering (wait_stream / wait_event) is a no-op and a
