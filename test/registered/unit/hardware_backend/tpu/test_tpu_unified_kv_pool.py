@@ -7,9 +7,11 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.unified_kv_pool import (
     TpuUnifiedSWAKVPool,
+    TpuUnifiedSWATokenToKVPoolAllocator,
     merge_swa_kv_heads,
     num_swa_groups,
     split_swa_output,
@@ -166,6 +168,159 @@ class TestTpuUnifiedSWAKVPoolStorage(unittest.TestCase):
         )
         for i in range(8):
             self.assertTrue(torch.all(pool.get_state()[i][5] == float(100 + i)))
+
+
+class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
+    """Tests for PR 2: zero-fragmentation Logical-to-Physical unified allocator."""
+
+    def _make_pool_and_allocator(
+        self,
+        total_pages=24,
+        page_size=4,
+        full_ids=(4, 9),
+        swa_ids=(0, 1, 2, 3, 5, 6, 7, 8),
+    ):
+        size = total_pages * page_size
+        pool = TpuUnifiedSWAKVPool(
+            size=size,
+            size_swa=size,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=512,
+            swa_head_num=2,
+            swa_head_dim=256,
+            swa_attention_layer_ids=list(swa_ids),
+            full_attention_layer_ids=list(full_ids),
+            device="cpu",
+        )
+        alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+        return pool, alloc
+
+    def test_zero_fragmentation_and_companion_pages(self):
+        # 2 Full + 8 SWA -> G=2, M_swa=4; 24 physical pages (96 tokens).
+        pool, alloc = self._make_pool_and_allocator(total_pages=24, page_size=4)
+        self.assertEqual(
+            (alloc.full_available_size(), alloc.swa_available_size(), alloc.max_extend_tokens()),
+            (96, 24, 16),
+        )
+        fa, sa = alloc.full_attn_allocator, alloc.swa_attn_allocator
+        # Allocate 2 Full pages (2 phys IDs) + 3 SWA pages (12 phys IDs) -> 10 free.
+        full_a = fa.alloc(8)
+        swa_a = sa.alloc(12)
+        self.assertEqual(alloc._free_page_count(), 10)
+        swa_primary = (swa_a[::4] // 4).tolist()
+        companions = pool.swa_group_pages[:, swa_primary].reshape(-1).tolist()
+        all_claimed = (full_a[::4] // 4).tolist() + swa_primary + companions
+        self.assertEqual(len(set(all_claimed)), 14)
+
+        # Fragment free list by alternating Full allocations/frees, then allocate 2 SWA pages (8 IDs).
+        f1, f2, f3, f4 = (
+            fa.alloc(4),
+            fa.alloc(4),
+            fa.alloc(4),
+            fa.alloc(4),
+        )
+        fa.free(f1)
+        fa.free(f3)
+        self.assertEqual(alloc._free_page_count(), 8)
+        swa_b = sa.alloc(8)
+        self.assertIsNotNone(swa_b)
+        self.assertEqual(alloc._free_page_count(), 0)
+
+        for t, fn in (
+            (full_a, fa.free),
+            (f2, fa.free),
+            (f4, fa.free),
+            (swa_a, sa.free),
+            (swa_b, sa.free),
+        ):
+            fn(t)
+        self.assertEqual(alloc._free_page_count(), 24)
+
+    def test_non_divisible_swa_groups_alloc_and_free(self):
+        # 8 Full + 20 SWA -> G=8, M_swa=ceil(20/8)=3; 20 physical pages (80 tokens).
+        pool, alloc = self._make_pool_and_allocator(
+            total_pages=20,
+            page_size=4,
+            full_ids=range(8),
+            swa_ids=range(8, 28),
+        )
+        self.assertEqual(
+            (alloc.full_available_size(), alloc.swa_available_size(), alloc.max_extend_tokens()),
+            (80, 24, 20),
+        )
+        full_tok = alloc.full_attn_allocator.alloc(12)  # 3 * 1 = 3 phys IDs
+        swa_tok = alloc.swa_attn_allocator.alloc(8)  # 2 * 3 = 6 phys IDs
+        self.assertEqual(alloc._free_page_count(), 11)
+        f_p = (full_tok[::4] // 4).tolist()
+        s_p = (swa_tok[::4] // 4).tolist()
+        claimed = (
+            f_p
+            + s_p
+            + pool.swa_group_pages[:, s_p].reshape(-1).tolist()
+        )
+        self.assertEqual(len(set(claimed)), 9)
+        alloc.full_attn_allocator.free(full_tok)
+        alloc.swa_attn_allocator.free(swa_tok)
+        self.assertEqual(alloc._free_page_count(), 20)
+
+    def test_alloc_extend_decode_and_eviction(self):
+        _, alloc = self._make_pool_and_allocator(total_pages=20, page_size=4)
+        # 1+4=5 phys IDs per joint page -> 4 joint pages max (16 tokens).
+        out = alloc.alloc_extend(
+            prefix_lens=torch.tensor([0]),
+            prefix_lens_cpu=torch.tensor([0]),
+            seq_lens=torch.tensor([8]),
+            seq_lens_cpu=torch.tensor([8]),
+            last_loc=torch.tensor([-1]),
+            extend_num_tokens=8,
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(alloc._free_page_count(), 10)
+        dec = alloc.alloc_decode(
+            seq_lens=torch.tensor([9]),
+            seq_lens_cpu=torch.tensor([9]),
+            last_loc=out[-1:],
+        )
+        self.assertIsNotNone(dec)
+        self.assertEqual(alloc._free_page_count(), 5)
+
+        # Request 2 more joint pages (10 phys IDs): shortfall = 5 phys IDs.
+        self.assertEqual(
+            alloc.reclaim_plan(8, 8, full_evictable_tokens=8, swa_evictable_tokens=8),
+            (8, 4),
+        )
+        self.assertIsNone(
+            alloc.reclaim_plan(8, 8, full_evictable_tokens=4, swa_evictable_tokens=0)
+        )
+
+        class _TreeCache:
+            def supports_prefix_sharing(self):
+                return True
+
+            def full_evictable_size(self):
+                return 8
+
+            def swa_evictable_size(self):
+                return 8
+
+            def evict(self, params: EvictParams):
+                if params.swa_num_tokens > 0:
+                    alloc.free_swa(out[: params.swa_num_tokens])
+                if params.num_tokens > 0:
+                    alloc.free_full(out[: params.num_tokens])
+
+        self.assertIsNone(alloc.reclaim_for_prealloc(_TreeCache(), 8, 8))
+        self.assertGreaterEqual(alloc._free_page_count(), 10)
 
 
 if __name__ == "__main__":

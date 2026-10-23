@@ -407,11 +407,11 @@ def host_return_allocators(allocator) -> list[TpuPagedTokenToKVPoolAllocator]:
     """
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
-    if type(allocator) is TpuPagedTokenToKVPoolAllocator:
+    if isinstance(allocator, TpuPagedTokenToKVPoolAllocator):
         return [allocator]
-    if type(allocator) is SWATokenToKVPoolAllocator:
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
         inner = [allocator.full_attn_allocator, allocator.swa_attn_allocator]
-        if all(type(a) is TpuPagedTokenToKVPoolAllocator for a in inner) and (
+        if all(isinstance(a, TpuPagedTokenToKVPoolAllocator) for a in inner) and (
             allocator.full_to_swa_index_mapping.device.type == "cpu"
         ):
             return inner

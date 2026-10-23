@@ -353,7 +353,7 @@ def _page_pools(
 ) -> List[BaseTokenToKVPoolAllocator]:
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
-    if type(allocator) is SWATokenToKVPoolAllocator:
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
         return [allocator.full_attn_allocator, allocator.swa_attn_allocator]
     return [allocator]
 
