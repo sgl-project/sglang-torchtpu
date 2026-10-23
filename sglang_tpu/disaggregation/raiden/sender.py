@@ -738,11 +738,6 @@ class RaidenSenderMixin:
                 self._completed_send.add(self._swa_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
-        if self._state_engine is not None:
-            raise NotImplementedError(
-                "Raiden push resharding does not move GDN (linear-attention) "
-                "state yet; use equal attention TP on prefill and decode."
-            )
         req = ReshardReq.from_frames(msg)
         if self._bounded_staging:
             # The reshard push copies every layer with one engine.d2h call, which
