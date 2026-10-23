@@ -115,6 +115,8 @@ class SchedulerInternalStateController:
             state["torch_compile_bundle_aot_autograd_graphs"] = counters[
                 "aot_autograd"
             ]["total"]
+        if hasattr(current_platform, "get_recompilation_counters"):
+            state.update(current_platform.get_recompilation_counters())
 
     def _add_disaggregation(self, state: Dict[str, Any]) -> None:
         # PD role switch: report this instance's role and the decode CUDA graph
