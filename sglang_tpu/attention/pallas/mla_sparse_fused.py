@@ -53,10 +53,25 @@ QBLOCK_MIN_TOKENS = 512
 # grows with the context. Measured at 80 pages (10k context); longer contexts
 # keep the per-query kernel until measured.
 QBLOCK_MAX_PAGES_PER_SEQ = 128
+# The query-blocked kernel keeps num_heads * query_block score rows in VMEM:
+# the query window, the f32 accumulator and the output take about 6.5 KiB per
+# row. 8192 rows fit: 32 heads per chip (attention TP2) with 256-query blocks.
+# 64 heads per chip (attention TP1) with 256-query blocks need 113 MiB, so
+# they take 128-query blocks. More heads keep the per-query kernel.
+QBLOCK_MAX_ROWS = 8192
+QBLOCK_QUERY_BLOCKS = (256, 128)
 
 # The sparse kernels only support these two sizes.
 NOPE_DIM = 512
 ROPE_DIM = 64
+
+
+def qblock_query_block(num_heads: int) -> int | None:
+    """Queries per block of the query-blocked kernel for ``num_heads`` heads
+    per chip: the largest choice whose score rows fit, or None if none fits."""
+    return next(
+        (qb for qb in QBLOCK_QUERY_BLOCKS if num_heads * qb <= QBLOCK_MAX_ROWS), None
+    )
 
 
 def _split_specs(
@@ -133,8 +148,10 @@ def sparse_mla_attention_fused(
     )
 
     pages_per_seq = page_indices.shape[0] // (cu_q_lens.shape[0] - 1)
+    query_block = qblock_query_block(ql_nope.shape[1])
     if (
         qblock_kpool
+        and query_block is not None
         and ql_nope.shape[0] >= QBLOCK_MIN_TOKENS
         and pages_per_seq <= QBLOCK_MAX_PAGES_PER_SEQ
         # One 32-bit selection word per page: page_size // kpool pools.
@@ -156,6 +173,7 @@ def sparse_mla_attention_fused(
             sm_scale=sm_scale,
             k_scale=k_scale,
             kpool=qblock_kpool,
+            query_block=query_block,
         )
         return out, cache_nope, cache_rope
 
