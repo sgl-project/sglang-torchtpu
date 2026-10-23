@@ -113,10 +113,10 @@ def split_quota(slices, hosts, chips_per_slice, lanes, priority, min_hosts):
     """{lane: {pool: (chips, lendable_chips)}} for one shape.
 
     `slices` maps each pool of the shape to its usable slices. Lanes take their min_hosts
-    first, in `lanes` order and from pools in name order; the priority lane gets the rest
-    and may lend all of it.
+    first, in `lanes` order, from the pools with the most slices first (a reserve spans as
+    few pools as possible); the priority lane gets the rest and may lend all of it.
     """
-    left = dict(sorted(slices.items()))
+    left = dict(sorted(slices.items(), key=lambda kv: (-kv[1], kv[0])))
     out = {lane: {pool: [0, 0] for pool in left} for lane in lanes}
     for lane in lanes:
         want = min_hosts.get(lane, 0)
@@ -284,8 +284,11 @@ def sync_shape(shape, cfg, pools, topo, live, dry_run):
         )
         return
     per_host = pools[members[0]]["chips_per_host"]
+    slices = {p: usable_slices(pool=p, info=pools[p]) for p in members}
+    # Queues try flavors in this order too, so a lane looks in its reserve's pools first.
+    members.sort(key=lambda p: (-slices[p], p))
     split = split_quota(
-        slices={p: usable_slices(pool=p, info=pools[p]) for p in members},
+        slices=slices,
         hosts=hosts,
         chips_per_slice=hosts * per_host,
         lanes=topo["lanes"],

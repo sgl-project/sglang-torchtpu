@@ -37,6 +37,11 @@ class TestSplitQuota(unittest.TestCase):
             )
             self.assertEqual(out["nightly"][pool][1], out["nightly"][pool][0])
 
+    def test_reserve_fills_the_largest_pool_first(self):
+        out = split(slices={"a": 3, "b": 5}, hosts=1, min_hosts={"pr-gate": 5})
+        self.assertEqual(out["pr-gate"], {"b": (20, 0), "a": (0, 0)})
+        self.assertEqual(out["nightly"], {"b": (0, 0), "a": (12, 12)})
+
     def test_multi_host_reserve_takes_whole_slices_across_pools(self):
         # Two 2x2x2 slices, one pool each: one slice reserved, not half of each.
         out = split(slices={"a": 1, "b": 1}, hosts=2, min_hosts={"pr-gate": 2})
