@@ -168,3 +168,29 @@ need retracing. `SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED=0` skips export-rec
 clearing, JAX cache clearing, CPU-backend release, garbage collection before
 freezing and startup heap trimming. File-cache release retains its separate
 opt-outs.
+
+# Fixed-cohort P/D benchmark gate (draft)
+
+Set `SGLANG_TPU_BENCHMARK_PD_BATCH_SIZE=N` on the decoder to enable the
+opt-in gate. Zero (the default) preserves ordinary scheduling. Send a native
+batch with base request ID `hourly-pd-sync:<unique-cohort>`; native batch
+normalization appends `_0` through `_N-1`. When using a router that overrides
+request IDs, supply the same base ID in its `x-rid` header.
+
+The decoder keeps preallocation and transfer polling active but holds admission
+until all N requests have committed KV. It then admits the entire batch and
+measures from the first decoder forward to processing all request completions.
+The last completed cohort's summary is in `/server_info` internal state under
+`benchmark_pd_gate`, including its ID, decode duration, decoder output tokens,
+gate wait duration, and per-request TPOT. The first token is produced by
+prefill and excluded from decoder output tokens.
+
+The draft supports one DP/attention-DP/CP group, PP1, and device-resident decoder
+KV. Mixed requests, retraction, insufficient batch capacity, and incomplete
+transfer invalidate the benchmark. Admission times out after 600 seconds from
+the first tagged arrival (override `SGLANG_TPU_BENCHMARK_PD_TIMEOUT_SEC`).
+Untagged startup and health requests do not activate the gate.
+
+Host tests: `PYTHONPATH=.:python pytest -q
+test/registered/unit/plugins/test_benchmark_pd_gate.py`. TPU serving and trace
+validation are still required before enabling this draft in benchmark jobs.
