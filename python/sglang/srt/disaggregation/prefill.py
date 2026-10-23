@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.common import (
     free_swa_out_of_window_slots,
     kv_to_page_indices,
     kv_to_page_num,
+    pd_swa_transfer_window_start,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1541,11 +1542,19 @@ class SchedulerDisaggregationPrefillMixin:
             or not self.tree_cache.supports_swa()
         ):
             return
+        seq_len = min(req.extend_range.end, len(req.origin_input_ids))
+        page_size = self.tree_cache.page_size
+        # Keep exactly the pages _swa_payload sends: the transfer window can
+        # start one page before page_floor(seq_len - W), so the window handed
+        # to the release is measured from that start, not from W.
+        window_start = pd_swa_transfer_window_start(
+            seq_len, self.tree_cache.sliding_window_size, page_size
+        )
         free_swa_out_of_window_slots(
             req,
-            min(req.extend_range.end, len(req.origin_input_ids)),
-            sliding_window_size=self.tree_cache.sliding_window_size,
-            page_size=self.tree_cache.page_size,
+            seq_len,
+            sliding_window_size=seq_len - window_start,
+            page_size=page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             supports_prefix_sharing=False,
@@ -1639,8 +1648,9 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _swa_payload():
                 window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
+                window_start = pd_swa_transfer_window_start(
+                    seq_len, window_size, page_size
+                )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]

@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.common import pd_swa_transfer_window_start
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
@@ -59,8 +60,7 @@ def state_indices_for_request(
     if isinstance(pool, SWAKVPool):
         page_size = scheduler.token_to_kv_pool_allocator.page_size
         window_size = scheduler.sliding_window_size
-        window_start = max(0, seq_len - window_size)
-        window_start = (window_start // page_size) * page_size
+        window_start = pd_swa_transfer_window_start(seq_len, window_size, page_size)
         window_full = scheduler.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, window_start:seq_len
         ]

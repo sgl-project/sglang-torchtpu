@@ -367,6 +367,35 @@ class RaidenReceiverMixin:
                 self._fail_room_locked(room, reason)
         logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
 
+    def _swa_window_mismatch(
+        self, remote_swa: List[int], local_swa: List[int]
+    ) -> Optional[str]:
+        """Reason a pull must not pair ``remote_swa`` with ``local_swa``.
+
+        Both sides derive their sliding-window pages from the same window
+        start (``pd_swa_transfer_window_start``), so the prefill announces at
+        least as many pages as the decode allocated; fewer only when a decode
+        prefix hit kept the decode list short, in which case the tail pairs.
+        A prefill that announces fewer pages than this decode allocated runs a
+        build with the older window start (#1391): pairing would cut the
+        decode's newest window page out of the read and leave it unwritten,
+        so the room fails instead.
+        """
+        if not local_swa or len(remote_swa) >= len(local_swa):
+            return None
+        return (
+            f"Raiden SWA receive failed: the prefill announced {len(remote_swa)} "
+            f"sliding-window pages but this decode allocated {len(local_swa)}; "
+            "prefill and decode compute the P/D sliding-window transfer start "
+            "differently. Run the same sglang version on both sides."
+        )
+
+    def _reject_swa_window_mismatch(self, room: int, reason: str) -> None:
+        with self._state_lock:
+            if room in self._decode.local_blocks:
+                self._fail_room_locked(room, reason)
+        logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+
     def _start_read_or_fail(
         self,
         *,
@@ -475,6 +504,7 @@ class RaidenReceiverMixin:
                 )
             if holds_nothing:
                 return self._start_state_only_pull(room)
+        mismatch = None
         while True:
             with self._state_lock:
                 queue = self._decode.chunk_queue.get(room)
@@ -519,10 +549,12 @@ class RaidenReceiverMixin:
                 # the GDN state row, each on the engine that stages them.
                 closing = req_id == str(room)
                 if closing and self._swa_engine is not None:
-                    remote_swa, local_swa = self._pair_blocks(
-                        list(self._decode.remote_swa_blocks.get(room, [])),
-                        list(self._decode.local_swa_blocks.get(room, [])),
-                    )
+                    remote_swa = list(self._decode.remote_swa_blocks.get(room, []))
+                    local_swa = list(self._decode.local_swa_blocks.get(room, []))
+                    mismatch = self._swa_window_mismatch(remote_swa, local_swa)
+                    if mismatch is not None:
+                        break
+                    remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
                     swa_endpoint = self._decode.remote_swa_endpoint.get(room, "")
                     swa_pages = len(set(local_swa))
                     if swa_pages > self._swa_engine_max_blocks:
@@ -597,7 +629,10 @@ class RaidenReceiverMixin:
                 local=local_state,
             ):
                 return False
-        self._reject_oversized_pull(room, *oversized)
+        if mismatch is not None:
+            self._reject_swa_window_mismatch(room, mismatch)
+        else:
+            self._reject_oversized_pull(room, *oversized)
         return False
 
     def _start_whole_pull(self, room: int) -> bool:
@@ -663,6 +698,10 @@ class RaidenReceiverMixin:
         cost = self._staging_cost(full_pages, self._full_engine_max_blocks)
         swa_cost = 0
         if self._swa_engine is not None:
+            mismatch = self._swa_window_mismatch(remote_swa, local_swa)
+            if mismatch is not None:
+                self._reject_swa_window_mismatch(room, mismatch)
+                return False
             remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
             swa_pages = len(set(local_swa))
             if swa_pages > self._swa_engine_max_blocks:

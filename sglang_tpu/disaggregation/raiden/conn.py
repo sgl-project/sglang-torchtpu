@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.common import pd_swa_transfer_max_pages
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -545,9 +546,10 @@ class RaidenKVManager(
             raise RuntimeError(
                 "Raiden SWA KV caches require a positive sliding-window size"
             )
-        # SWA transfer payloads round their window start down to a page boundary.
-        max_tokens = window_size + self.kv_args.page_size - 1
-        return max(1, math.ceil(max_tokens / self.kv_args.page_size))
+        # The transfer window starts a full window before the page-aligned
+        # end of the prompt (pd_swa_transfer_window_start), so it can span one
+        # more page than the window itself.
+        return pd_swa_transfer_max_pages(window_size, self.kv_args.page_size)
 
     def _slot_ceiling(self) -> int:
         """Slots the pool is sized for, at most.

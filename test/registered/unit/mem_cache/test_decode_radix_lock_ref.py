@@ -49,7 +49,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import (
+    pd_swa_transfer_max_pages,
+    pd_swa_transfer_window_start,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -138,8 +142,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
     """Test lock_ref balance across decode transfer scenarios."""
 
     def test_swa_tail_len_matches_the_window_prefill_sends(self):
-        # Prefill sends SWA from page_floor(s - W); any longer tail would leave
-        # a page decode caches but nothing writes.
+        # Prefill sends SWA from pd_swa_transfer_window_start; any longer tail
+        # would leave a page decode caches but nothing writes, any shorter one
+        # fails the re-match gate (#1391).
         window, page = 127, 64
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
@@ -155,10 +160,61 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             ):
                 for seq_len in range(1, 4 * page + window):
                     with self.subTest(radix=radix, seq=seq_len):
-                        received_start = max(0, seq_len - window) // page * page
+                        received_start = pd_swa_transfer_window_start(
+                            seq_len, window, page
+                        )
                         self.assertEqual(
                             seq_len - queue._swa_tail_len(seq_len), received_start
                         )
+
+    def test_swa_transfer_window_start_moves_one_page_only_past_the_offset(self):
+        # page_floor(page_floor(L) - W) equals the old page_floor(L - W) except
+        # when W % P > 0 and L % P >= W % P, where it starts one page earlier;
+        # the window then spans at most ceil(W / P) + 1 pages.
+        for window, page in ((127, 64), (2047, 512), (1000, 512), (65, 64), (128, 64)):
+            for seq_len in range(1, 6 * page + window):
+                with self.subTest(window=window, page=page, seq=seq_len):
+                    start = pd_swa_transfer_window_start(seq_len, window, page)
+                    old_start = max(0, seq_len - window) // page * page
+                    self.assertEqual(start % page, 0)
+                    self.assertLessEqual(start, old_start)
+                    moved = window % page > 0 and seq_len % page >= window % page
+                    if old_start == 0:
+                        self.assertEqual(start, 0)
+                    else:
+                        self.assertEqual(old_start - start, page if moved else 0)
+                    pages = -(-seq_len // page) - start // page
+                    self.assertLessEqual(pages, pd_swa_transfer_max_pages(window, page))
+                    # Once a window fits before the insert boundary, the tail
+                    # holds a full window before it.
+                    boundary = seq_len // page * page
+                    if boundary >= window:
+                        self.assertGreaterEqual(boundary - start, window)
+
+    def test_swa_tail_always_passes_the_rematch_gate(self):
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
+        for window, page in ((127, 64), (2047, 512), (1000, 512), (65, 64), (128, 64)):
+            queue = self._swa_tail_queue(window, page)
+            queue.tree_cache = SimpleNamespace(
+                tree_core=SimpleNamespace(is_eagle=False, enable_hicache=False)
+            )
+            # Below this the prompt itself is shorter than a window and
+            # nothing before the tail could be reused anyway.
+            for fill_len in range(window + page, 6 * page + window):
+                with self.subTest(window=window, page=page, fill=fill_len):
+                    req = SimpleNamespace(
+                        origin_input_ids=[0] * fill_len, output_ids=[]
+                    )
+                    self.assertTrue(queue._can_ignore_swa_kv_miss(req))
+                    self.assertEqual(
+                        fill_len - queue._swa_tail_len(fill_len),
+                        pd_swa_transfer_window_start(fill_len, window, page),
+                    )
 
     def _swa_tail_queue(self, window_size, page_size):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -190,10 +246,12 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                 )
             ]
 
-        # The fresh tail holds less than a window before the insert boundary.
-        self.assertEqual(rejected(1535), [4607])
-        self.assertEqual(rejected(1000), list(range(4584, 4608)))
-        self.assertEqual(rejected(1535, eagle=True), [4096, 4607])
+        # The transfer window starts a full window before the page-aligned
+        # insert boundary, so every length passes (#1391). EAGLE's bigram key
+        # is one token shorter, so page-aligned prompts still fall short.
+        self.assertEqual(rejected(1535), [])
+        self.assertEqual(rejected(1000), [])
+        self.assertEqual(rejected(1535, eagle=True), [4096])
         self.assertEqual(rejected(1535, hicache=True), list(fill_lens))
         self.assertEqual(rejected(1535, tail_prealloc=False), list(fill_lens))
 
