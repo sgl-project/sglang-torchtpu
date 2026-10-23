@@ -162,6 +162,7 @@ def _stop_periodic() -> None:
 
 
 def _before_freeze() -> None:
+    release_startup_page_cache()
     if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
         # gc.freeze() keeps any cycle it sees forever, so collect first.
         gc.collect()
@@ -193,7 +194,6 @@ def install(scheduler_cls: Optional[type] = None) -> None:
         return orig_get_init_info(self, *args, **kwargs)
 
     def handle_freeze_gc(self, *args, **kwargs):
-        release_startup_page_cache()
         _before_freeze()
         result = orig(self, *args, **kwargs)
         _after_freeze()
