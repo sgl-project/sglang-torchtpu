@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.loader.readonly_safetensors import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     host_copies_are_redundant,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _BAR_FORMAT = "{desc}: {percentage:.0f}%|{bar}| {n_fmt}/{total_fmt}"
 
@@ -46,6 +47,10 @@ class SafetensorsMmapReader:
         clone_tensors: bool = True,
         show_progress: bool = True,
     ) -> Iterator[tuple[str, torch.Tensor]]:
+        # A device safetensors cannot address is read on the host, then moved.
+        read_on_host = (
+            device != "cpu" and not current_platform.supports_safetensors_device_load()
+        )
         for path in tqdm(
             files,
             desc="Loading safetensors checkpoint shards",
@@ -58,8 +63,19 @@ class SafetensorsMmapReader:
                         continue
                     yield name, tensor
                 continue
-            with safe_open(path, framework="pt", device=device) as handle:
+            with safe_open(
+                path, framework="pt", device="cpu" if read_on_host else device
+            ) as handle:
+                moved_to = None
                 for name in handle.keys():  # noqa: SIM118
                     if key_filter is not None and not key_filter(name):
                         continue
-                    yield name, handle.get_tensor(name)
+                    tensor = handle.get_tensor(name)
+                    if read_on_host:
+                        tensor = tensor.to(device)
+                        moved_to = tensor.device
+                    yield name, tensor
+                if moved_to is not None and moved_to.type != "cpu":
+                    # The host tensors are views into the mapping, which closes
+                    # with this block: finish the host-to-device copies first.
+                    torch.accelerator.synchronize()

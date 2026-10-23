@@ -2469,7 +2469,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--offload-during-compile",
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
-            help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+            help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP. Off by default on TPU, which cannot run the layerwise offload.",
         )
         parser.add_argument(
             "--enable-breakable-cuda-graph",
