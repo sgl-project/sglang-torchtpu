@@ -256,7 +256,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
             patch("sglang_tpu.tpu_platform.rank_slice._load"),
             patch("sglang_tpu.tpu_platform.traced_rank._load"),
             patch(
-                "sglang.srt.models.registry.ModelRegistry.register",
+                "sglang.srt.models.registry.ModelRegistry.register_lazy",
                 side_effect=register,
             ),
         ):
