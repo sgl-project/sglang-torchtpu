@@ -5,12 +5,14 @@ import itertools
 import pathlib
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu import kv_pool
 from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
@@ -18,17 +20,35 @@ from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     LandRequired,
     ReshardGeometry,
 )
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 PAGE = 64
+# SEQ_ALONG_LANE pages are a multiple of the 128-lane width (batched RPA
+# floor 256).
+SAL_PAGE = 256
 
 
-def _layer(dtype, heads, head_dim=128):
-    pool = TpuFusedMHATokenToKVPool(
-        size=128,
-        page_size=PAGE,
+def _sublane_tile_head_dim(*, head_dim, kv_packing):
+    """kv_pool._seq_along_lane_head_dim at 8 sublanes; the real query needs
+    JAX, which the CPU suite lacks."""
+    return _cdiv(head_dim, _SUBLANES * kv_packing) * _SUBLANES * kv_packing
+
+
+def _layer(dtype, heads, head_dim=128, sal=False):
+    if sal:
+        with mock.patch.object(
+            kv_pool, "_seq_along_lane_head_dim", _sublane_tile_head_dim
+        ):
+            return _new_layer(TpuSeqAlongLaneKVPool, dtype, heads, head_dim, SAL_PAGE)
+    return _new_layer(TpuFusedMHATokenToKVPool, dtype, heads, head_dim, PAGE)
+
+
+def _new_layer(cls, dtype, heads, head_dim, page):
+    pool = cls(
+        size=2 * page,
+        page_size=page,
         dtype=dtype,
         head_num=heads,
         head_dim=head_dim,
@@ -47,29 +67,40 @@ def _rank_heads(total, tp, rank):
     return [rank // (tp // total)]
 
 
-def _manager(dtype, full_heads, swa_heads, tp):
+def _manager(dtype, full_heads, swa_heads, tp, sal=False):
     """A RaidenKVManager holding one full and one SWA layer for an attention-TP
     rank of a model with the given global kv-head counts."""
     mgr = object.__new__(RaidenKVManager)
     mgr.attn_tp_size = tp
-    mgr._kv_caches = [_layer(dtype, max(1, full_heads // tp))]
-    mgr._swa_kv_caches = [_layer(dtype, max(1, swa_heads // tp))]
+    mgr._seq_along_lane = sal
+    mgr._kv_caches = [_layer(dtype, max(1, full_heads // tp), sal=sal)]
+    mgr._swa_kv_caches = [_layer(dtype, max(1, swa_heads // tp), sal=sal)]
     mgr.kv_args = SimpleNamespace(
         total_kv_head_num=full_heads,
         total_swa_kv_head_num=swa_heads,
-        page_size=PAGE,
+        page_size=SAL_PAGE if sal else PAGE,
     )
     return mgr
 
 
-def _fill(layer, heads):
+def _fill(layer, heads, sal=False):
     """Tag every live byte of page 0 by (global head, k|v, token, byte) and
     return (page bytes, live mask). The fused layout puts K and V of local
-    head i at kv-slots 2i, 2i+1, packed kv_packing slots per 32-bit word."""
+    head i at kv-slots 2i, 2i+1, packed kv_packing slots per 32-bit word;
+    SEQ_ALONG_LANE puts them at rows 2i, 2i+1, each spanning the page."""
     packing = int(layer.shape[3])
     raw = layer.view(torch.uint8)
     raw.fill_(0xFF)
     live = torch.zeros_like(raw, dtype=torch.bool)
+    if sal:
+        w, r, b = (torch.arange(n) for n in raw.shape[2:])
+        pos = w[:, None, None] * 5 + r[None, :, None] * 3 + b[None, None, :] * 7
+        for local, head in enumerate(heads):
+            for kv in (0, 1):
+                tag = ((2 * head + kv) * 131 + pos) % 251
+                raw[0, 2 * local + kv] = tag.to(torch.uint8)
+                live[0, 2 * local + kv] = True
+        return raw[0].flatten(), live[0].flatten()
     token = torch.arange(PAGE)[:, None]
     byte = torch.arange(raw.shape[-1])[None, :]
     for local, head in enumerate(heads):
@@ -81,14 +112,15 @@ def _fill(layer, heads):
     return raw[0].flatten(), live[0].flatten()
 
 
-def _replay(full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa):
+def _replay(full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa, sal=False):
     """Replay a push reshard byte for byte over real pool pages, each side
     building its geometry with _make_geometry. True when every decode rank
     holds exactly its own heads with no out-of-bounds copy; LandRequired when
     no whole-granule schedule exists."""
     total = swa_heads if swa else full_heads
-    sender = _manager(dtype, full_heads, swa_heads, src_tp)
-    receiver = _manager(dtype, full_heads, swa_heads, dst_tp)
+    sender = _manager(dtype, full_heads, swa_heads, src_tp, sal=sal)
+    receiver = _manager(dtype, full_heads, swa_heads, dst_tp, sal=sal)
+    page = SAL_PAGE if sal else PAGE
 
     def layer(mgr):
         return (mgr._swa_kv_caches if swa else mgr._kv_caches)[0]
@@ -97,15 +129,20 @@ def _replay(full_heads, swa_heads, src_tp, dst_tp, *, dtype, swa):
     recv_geom = receiver._make_geometry(src_tp, dst_tp, swa=swa)
     for dst_rank in range(dst_tp):
         want, live = _fill(
-            layer(receiver).clone(), _rank_heads(total, dst_tp, dst_rank)
+            layer(receiver).clone(), _rank_heads(total, dst_tp, dst_rank), sal
         )
         got = torch.full_like(want, 0xFF)
         ratio = send_geom.ratio
         for src_rank in range(dst_rank * ratio, (dst_rank + 1) * ratio):
-            src, _ = _fill(layer(sender).clone(), _rank_heads(total, src_tp, src_rank))
+            src, _ = _fill(
+                layer(sender).clone(), _rank_heads(total, src_tp, src_rank), sal
+            )
             src_off, size, src_stride, _, _ = send_geom.entry_bytes(src_rank, dst_rank)
             _, _, _, dst_off, dst_stride = recv_geom.entry_bytes(src_rank, dst_rank)
-            for t in range(PAGE):
+            count = send_geom.count_for(page)
+            if recv_geom.count_for(page) != count:
+                return False
+            for t in range(count):
                 a, b = src_off + t * src_stride, dst_off + t * dst_stride
                 if a + size > src.numel() or b + size > got.numel():
                     return False
@@ -277,16 +314,46 @@ class TestKVLayoutGeometry(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not hold 4 kv heads"):
             KVLayoutGeometry.from_tensor(one.shape, 1, 4, seq_along_lane=False)
 
-    def test_seq_along_lane_granules_are_not_modeled(self):
+    def test_seq_along_lane_matches_pool_strides(self):
+        """A head's K and V rows are adjacent and each spans the page, so a
+        head is one contiguous run of 2 * head_dim * page bytes."""
+        for dtype, heads, head_dim in itertools.product(
+            (torch.bfloat16, _FP8), (1, 2, 4, 8), (64, 128, 256)
+        ):
+            with self.subTest(dtype=dtype, heads=heads, head_dim=head_dim):
+                t = _layer(dtype, heads, head_dim, sal=True)
+                es = t.element_size()
+                g = KVLayoutGeometry.from_tensor(
+                    t.shape, es, heads, seq_along_lane=True, page_size=SAL_PAGE
+                )
+                self.assertEqual(g.block_bytes, t.stride(0) * es)
+                self.assertEqual(g.head_run_bytes, 2 * t.stride(1) * es)
+                self.assertEqual(g.head_run_bytes, 2 * head_dim * es * SAL_PAGE)
+                self.assertEqual(g.copy_unit_bytes, g.head_run_bytes)
+                for name in ("granule_bytes", "row_bytes", "heads_per_granule"):
+                    with self.assertRaises(ValueError):
+                        getattr(g, name)
+
+    def test_seq_along_lane_head_run_entries(self):
         g = KVLayoutGeometry.from_tensor(
-            _shape("HND", 1, 1, 128, 256), 1, 1, seq_along_lane=True, page_size=256
+            _shape("HND", 2, 1, 128, 256), 2, 1, seq_along_lane=True, page_size=256
         )
-        for name in ("granule_bytes", "block_bytes", "c_pad", "row_bytes"):
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(NotImplementedError, "#829-P1a-HND"):
-                    getattr(g, name)
-        with self.assertRaises(NotImplementedError):
-            ReshardGeometry.from_layout(8, 4, g, 4)
+        run = 2 * 128 * 2 * 256
+        # 8 kv heads at TP8 -> TP4: source rank 1 is decode rank 0's head 1.
+        geom = ReshardGeometry.from_layout(8, 4, g, 8)
+        self.assertEqual(geom.entry_bytes(1, 0), (0, run, run, run, 2 * run))
+        self.assertEqual(geom.count_for(256), 1)
+        # 4 kv heads at TP8 -> TP2: replicated sources, two heads per decode
+        # rank; only the first replica of each head contributes.
+        geom = ReshardGeometry.from_layout(8, 2, g, 4)
+        self.assertEqual(geom.entry_bytes(2, 0), (0, run, run, run, 2 * run))
+        with self.assertRaisesRegex(ValueError, "do not fit"):
+            rs.head_run_copy(g, g, 0, 2, 0)
+        token_major = KVLayoutGeometry.from_tensor(
+            _shape("NHD", 2, 1, 128, 64), 2, 1, seq_along_lane=False
+        )
+        with self.assertRaisesRegex(ValueError, "differ in layout"):
+            rs.head_run_copy(g, token_major, 0, 1, 0)
 
     def test_direct_and_land_contributions(self):
         fp8 = KVLayoutGeometry.from_tensor(
@@ -433,8 +500,6 @@ def _side_geometry(layout, t, heads, src_tp, dst_tp, geom_heads, page):
         seq_along_lane=layout == "HND",
         page_size=page,
     )
-    if layout == "HND":
-        return rs.ReshardGeometry(src_tp, dst_tp, lay.legacy_row_bytes, geom_heads)
     return rs.ReshardGeometry.from_layout(src_tp, dst_tp, lay, geom_heads)
 
 
@@ -447,6 +512,9 @@ class _Tampered:
 
     def entry_bytes(self, p, d):
         return self._tamper(self._geom.entry_bytes(p, d))
+
+    def count_for(self, live_tokens):
+        return self._geom.count_for(live_tokens)
 
 
 def _push_correct(
@@ -675,12 +743,28 @@ class TestPushReshardBytes(unittest.TestCase):
         # Spec §3.2 counterexample: shape-only heads would allow it.
         ("NHD", 1, 8, 4, 8, 4, 128, 64, False),
         ("NHD", 2, 8, 4, 16, 8, 128, 64, False),
-        # TODO(#829-P1a-HND) coincidence: SEQ_ALONG_LANE at one head per rank.
+        # SEQ_ALONG_LANE moves whole per-head runs, so fp8 one head per source
+        # into more per decode rank needs no landing buffer.
+        # 1 -> 1 (jcc arm A): 4 kv heads at TP8 -> TP4.
         ("HND", 2, 8, 4, 4, 4, 128, 128, True),
         ("HND", 1, 8, 4, 4, 4, 128, 256, True),
-        ("HND", 2, 8, 4, 4, 4, 256, 128, False),
-        ("HND", 2, 8, 4, 8, 8, 128, 128, False),
+        ("HND", 2, 8, 4, 4, 4, 256, 128, True),
+        # 1 -> 2 concat, replicated sources (jcc arm G): 4 kv heads TP8 -> TP2.
+        ("HND", 2, 8, 2, 4, 4, 128, 256, True),
+        ("HND", 1, 8, 2, 4, 4, 128, 256, True),
+        # 1 -> 2 concat (jcc arm I2): 8 kv heads at TP8 -> TP4.
+        ("HND", 2, 8, 4, 8, 8, 128, 128, True),
+        ("HND", 2, 8, 4, 8, 8, 128, 256, True),
+        ("HND", 1, 8, 4, 8, 8, 128, 256, True),
+        ("HND", 1, 8, 4, 8, 8, 64, 256, True),
+        # 2 -> 4, 1 -> 4, and replication on both sides.
+        ("HND", 1, 4, 2, 8, 8, 128, 256, True),
+        ("HND", 1, 16, 4, 16, 16, 128, 256, True),
         ("HND", 2, 8, 4, 2, 2, 128, 128, True),
+        ("HND", 1, 8, 4, 2, 2, 128, 256, True),
+        # Shape-only heads: the geometry's count is not what the layer holds.
+        ("HND", 1, 8, 4, 8, 4, 128, 256, False),
+        ("HND", 2, 8, 4, 16, 8, 128, 256, False),
     ]
 
     def test_verdict_matches_bytes(self):
@@ -728,6 +812,24 @@ class TestPushReshardBytes(unittest.TestCase):
             with self.subTest(tamper=name):
                 self.assertFalse(_push_correct(*case, tamper=tamper))
 
+    def test_replay_rejects_a_misplaced_head_run(self):
+        """Negative control for SEQ_ALONG_LANE: the fp8 1 -> 2 replay (8 kv
+        heads at TP8 -> TP4) fails once a head run lands on the wrong head,
+        or is cut short, and under the pre-#829 per-token row unit."""
+        case = ("HND", 1, 8, 4, 8, 8, 128, 256)
+        run = 2 * 128 * 256
+        self.assertTrue(_push_correct(*case, tamper=lambda e: e))
+        for name, tamper in (
+            ("dst offset", lambda e: (*e[:3], 0, e[4])),
+            ("src offset", lambda e: (e[0] + run, *e[1:])),
+            ("size", lambda e: (e[0], e[1] - 4, *e[2:])),
+        ):
+            with self.subTest(tamper=name):
+                self.assertFalse(_push_correct(*case, tamper=tamper))
+        # The pre-#829 unit, one (kv_packing, page) row per head, per token.
+        legacy = rs.ReshardGeometry(8, 4, 4 * 256, 8)
+        self.assertFalse(_replay_requests("HND", 1, 8, 4, 8, 128, 256, legacy, legacy))
+
 
 class TestRefusalWithSlidingWindow(unittest.TestCase):
     def test_refusal_matches_both_groups_bytes(self):
@@ -767,6 +869,40 @@ class TestRefusalWithSlidingWindow(unittest.TestCase):
                                 (src_tp, DisaggregationMode.PREFILL),
                             )
                         )
+                        self.assertEqual(allowed, exact)
+
+    def test_seq_along_lane_refusal_matches_both_groups_bytes(self):
+        """The same over real SEQ_ALONG_LANE pools: every cell's whole head
+        runs land byte for byte, so every multiple-of topology is allowed."""
+
+        def manager(dtype, full_heads, swa_heads, tp, mode):
+            mgr = _manager(dtype, full_heads, swa_heads, tp, sal=True)
+            mgr.disaggregation_mode = mode
+            mgr._kv_head_nums = (max(1, full_heads // tp),)
+            mgr._swa_kv_head_nums = (max(1, swa_heads // tp),)
+            return mgr
+
+        topologies = ((2, 1), (4, 2), (8, 4), (8, 2), (16, 4))
+        for dtype in (torch.bfloat16, _FP8):
+            for full_heads, swa_heads in ((4, 8), (8, 4), (2, 16), (8, 8)):
+                for src_tp, dst_tp in topologies:
+                    cell = (dtype, full_heads, swa_heads, src_tp, dst_tp)
+                    with self.subTest(cell=cell):
+                        heads = (full_heads, swa_heads, src_tp, dst_tp)
+                        exact = _replay(
+                            *heads, dtype=dtype, swa=False, sal=True
+                        ) and _replay(*heads, dtype=dtype, swa=True, sal=True)
+                        allowed = all(
+                            manager(
+                                dtype, full_heads, swa_heads, tp, mode
+                            ).reshard_refusal(src_tp, dst_tp)
+                            is None
+                            for tp, mode in (
+                                (dst_tp, DisaggregationMode.DECODE),
+                                (src_tp, DisaggregationMode.PREFILL),
+                            )
+                        )
+                        self.assertTrue(exact)
                         self.assertEqual(allowed, exact)
 
 

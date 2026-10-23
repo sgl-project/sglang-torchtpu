@@ -24,14 +24,21 @@ contiguous byte run, in the logical layout and in the tiled TPU layout alike.
 A bf16 granule holds one head's K+V, an fp8 granule two heads'. The push copies
 whole granules, so a contribution is placed directly only when its slots keep
 their position within the granule (``KVLayoutGeometry``,
-``direct_granule_copy``). These builders turn that geometry into
+``direct_granule_copy``).
+
+The SEQ_ALONG_LANE pool stores ``[num_blocks, 2 * kv_heads, head_dim //
+kv_packing, kv_packing, page_size]``: the packing rides the head dim, and K/V
+slot ``2h``/``2h + 1`` is an outer axis, so each head's K+V covers a whole
+page as one contiguous run (``head_run_copy``). Any regroup of whole heads is
+then one copy per page.
+
+These builders turn that geometry into
 ``raiden_service_pb2.StartTransferRequest`` push schedules.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import math
 from fractions import Fraction
 from typing import Any, Iterable, List, Optional, Protocol, Sequence, Tuple
 
@@ -80,7 +87,8 @@ def head_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
 
 TOKEN_MAJOR = "token_major"
 SEQ_ALONG_LANE = "seq_along_lane"
-_HND_TODO = "TODO(#829-P1a-HND): SEQ_ALONG_LANE reshard geometry"
+# Lanes per (8, 128) tile row: the TPU pads the minor (lane) dim to this.
+_LANES = 128
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,15 +100,20 @@ class KVLayoutGeometry:
     holding ``kv_packing`` K/V slots of ``head_dim`` padded lanes; slot ``2h``
     is head ``h``'s K and ``2h + 1`` its V. Pages are ``page_size`` tokens.
 
-    SEQ_ALONG_LANE puts the sequence along lanes; its geometry is not modeled
-    yet and its granule quantities raise NotImplementedError.
+    SEQ_ALONG_LANE (``[num_blocks, 2 * heads, head_dim // kv_packing,
+    kv_packing, page_size]``): the staged page is a row-major array of 32-bit
+    words ``[2 * heads, head_dim // kv_packing, c_pad]`` (token along lanes,
+    padded to whole 128-lane tiles), so slot ``j`` is a contiguous
+    ``head_dim * element_size * c_pad`` bytes and head ``h`` (slots ``2h``,
+    ``2h + 1``) one ``head_run_bytes`` run. ``head_dim`` is the packed lane
+    count ``shape[2] * kv_packing``.
     """
 
     kind: str
     kv_packing: int
     element_size: int
     heads_per_rank: int
-    head_dim: int  # shape[4]: padded head_dim lanes when token-major
+    head_dim: int
     page_size: int
 
     def __post_init__(self):
@@ -126,15 +139,16 @@ class KVLayoutGeometry:
         if len(shape) != 5:
             raise ValueError(f"expected a 5-D fused KV tensor, got {tuple(shape)}")
         kv_packing = int(shape[3])
+        pages = int(shape[4] if seq_along_lane else shape[1])
+        page_size = pages if page_size is None else int(page_size)
+        if page_size != pages:
+            raise ValueError(f"page size {page_size} != tensor pages {pages}")
         if seq_along_lane:
-            if page_size is None:
-                raise ValueError("SEQ_ALONG_LANE layout needs the page size")
             rows, want = int(shape[1]), 2 * heads_per_rank
+            head_dim = int(shape[2]) * kv_packing
         else:
-            page_size = int(shape[1]) if page_size is None else page_size
-            if page_size != int(shape[1]):
-                raise ValueError(f"page size {page_size} != tensor pages {shape[1]}")
             rows, want = int(shape[2]), -(-2 * heads_per_rank // kv_packing)
+            head_dim = int(shape[4])
         if rows != want:
             raise ValueError(
                 f"a KV tensor of shape {tuple(shape)} does not hold "
@@ -145,8 +159,8 @@ class KVLayoutGeometry:
             kv_packing=kv_packing,
             element_size=int(element_size),
             heads_per_rank=int(heads_per_rank),
-            head_dim=int(shape[4]),
-            page_size=int(page_size),
+            head_dim=head_dim,
+            page_size=page_size,
         )
 
     def with_heads(self, heads_per_rank: int) -> "KVLayoutGeometry":
@@ -163,55 +177,67 @@ class KVLayoutGeometry:
             self.page_size,
         )
 
-    def _token_major(self) -> None:
-        if self.kind != TOKEN_MAJOR:
-            raise NotImplementedError(_HND_TODO)
+    def _require(self, kind: str) -> None:
+        if self.kind != kind:
+            raise ValueError(f"{kind} quantity of a {self.kind} layout")
 
     @property
     def slots_per_granule(self) -> int:
-        self._token_major()
+        self._require(TOKEN_MAJOR)
         return self.kv_packing
 
     @property
     def heads_per_granule(self) -> Fraction:
-        self._token_major()
+        self._require(TOKEN_MAJOR)
         return Fraction(self.kv_packing, 2)
 
     @property
     def granule_bytes(self) -> int:
-        self._token_major()
+        self._require(TOKEN_MAJOR)
         return self.kv_packing * self.head_dim * self.element_size
 
     @property
     def granules_per_token(self) -> int:
-        self._token_major()
+        self._require(TOKEN_MAJOR)
         return -(-2 * self.heads_per_rank // self.kv_packing)
 
     @property
     def row_bytes(self) -> int:
-        """Per-token stride."""
+        """Per-token stride (token-major)."""
         return self.granules_per_token * self.granule_bytes
 
     @property
+    def c_pad(self) -> int:
+        """SEQ_ALONG_LANE lanes per staged slot row: ``page_size`` rounded up
+        to whole 128-lane tiles (measured on TPU; equal to ``page_size`` at
+        every legal SEQ_ALONG_LANE page size, which are multiples of 128)."""
+        self._require(SEQ_ALONG_LANE)
+        return -(-self.page_size // _LANES) * _LANES
+
+    @property
+    def head_run_bytes(self) -> int:
+        """SEQ_ALONG_LANE: one head's K+V across the whole page."""
+        return 2 * self.head_dim * self.element_size * self.c_pad
+
+    @property
     def block_bytes(self) -> int:
-        """Bytes of one page (the push's block)."""
+        """Bytes of one staged page (the push's block)."""
+        if self.kind == SEQ_ALONG_LANE:
+            return self.heads_per_rank * self.head_run_bytes
         return self.page_size * self.row_bytes
 
     @property
-    def c_pad(self) -> int:
-        """SEQ_ALONG_LANE padded lane count; not modeled yet."""
-        raise NotImplementedError(_HND_TODO)
+    def copy_unit_bytes(self) -> int:
+        """The smallest run a push entry moves: a granule per token, or a
+        head across the page."""
+        if self.kind == SEQ_ALONG_LANE:
+            return self.head_run_bytes
+        return self.granule_bytes
 
     @property
     def head_bytes(self) -> int:
-        """Bytes of one kv-head's K+V values, padding lanes excluded."""
+        """Bytes of one kv-head's K+V values per token, padding lanes excluded."""
         return 2 * self.head_dim * self.element_size
-
-    @property
-    def legacy_row_bytes(self) -> int:
-        """``kv_packing * shape[4]`` elements: the unit the SEQ_ALONG_LANE
-        push still uses. TODO(#829-P1a-HND): replace with its geometry."""
-        return self.kv_packing * self.head_dim * self.element_size
 
 
 class LandRequired(ValueError):
@@ -273,38 +299,39 @@ def direct_granule_copy(
     )
 
 
-def swa_geometry_kv_heads(
-    full_kv_heads: int,
-    swa_kv_heads: int,
-    kv_packing: int,
-    src_tp: int,
-    dst_tp: int,
-) -> int:
-    """kv-head count for a sliding-window ReshardGeometry whose granule is
-    ``KVLayoutGeometry.legacy_row_bytes`` (the SEQ_ALONG_LANE push), or
-    ValueError when no count yields byte-correct placement. Token-major
-    geometry is built in granule units and takes the SWA count directly.
-
-    The legacy unit is one kv-head only at kv_packing 2. At fp8 (kv_packing 4)
-    it is a 32-bit pack of two heads, so the schedule is right only where it
-    runs in pack units: every rank holds one head (a whole padded pack), or the
-    count is ``swa_kv_heads // 2`` packs and every rank holds whole packs.
-    TODO(#829-P1a-HND): remove with the SEQ_ALONG_LANE geometry.
-    """
-    if swa_kv_heads == full_kv_heads or kv_packing == 2:
-        return swa_kv_heads
-    if kv_packing == 4:
-        if swa_kv_heads <= min(src_tp, dst_tp):
-            return swa_kv_heads
-        if (
-            swa_kv_heads == 2 * full_kv_heads
-            and swa_kv_heads % (2 * max(src_tp, dst_tp)) == 0
-        ):
-            return full_kv_heads
-    raise ValueError(
-        f"Raiden reshard of sliding-window KV with {swa_kv_heads} kv-heads "
-        f"(full attention: {full_kv_heads}) at attention TP {src_tp}->{dst_tp} "
-        f"is unsupported at kv_packing {kv_packing}"
+def head_run_copy(
+    src: KVLayoutGeometry,
+    dst: KVLayoutGeometry,
+    src_head_start: int,
+    num_heads: int,
+    dst_head_start: int,
+) -> Tuple[int, int, int, int, int]:
+    """Per-page ``(src_offset, size, src_stride, dst_offset, dst_stride)``
+    copying heads ``[src_head_start, +num_heads)`` of a SEQ_ALONG_LANE ``src``
+    page to ``dst_head_start`` of ``dst``: one contiguous run, since a head's
+    K and V slots are adjacent rows that each span the page. Strides are the
+    page sizes (one run per page)."""
+    if src.unit() != dst.unit():
+        raise ValueError(f"reshard sides differ in layout: {src} vs {dst}")
+    src._require(SEQ_ALONG_LANE)
+    if (
+        min(src_head_start, dst_head_start) < 0
+        or num_heads <= 0
+        or src_head_start + num_heads > src.heads_per_rank
+        or dst_head_start + num_heads > dst.heads_per_rank
+    ):
+        raise ValueError(
+            f"heads [{src_head_start}, {src_head_start + num_heads}) of "
+            f"{src.heads_per_rank} do not fit at head {dst_head_start} of "
+            f"{dst.heads_per_rank}"
+        )
+    run = src.head_run_bytes
+    return (
+        src_head_start * run,
+        num_heads * run,
+        src.block_bytes,
+        dst_head_start * run,
+        dst.block_bytes,
     )
 
 
@@ -364,10 +391,10 @@ def head_slice_params(
 class ReshardGeometry:
     """Byte geometry for one (src_tp -> dst_tp) reshard over ``total_kv_heads``.
 
-    ``from_layout`` derives every entry from a token-major pool layout in
-    whole granules. The constructor takes an explicit per-head unit
-    ``hp_bytes`` instead; the pipeline (per-head unit with the tensor's
-    kv_packing) and the SEQ_ALONG_LANE push still use it.
+    ``from_layout`` derives every entry from the pool layout: whole granules
+    per token (token-major) or whole head runs per page (SEQ_ALONG_LANE). The
+    constructor takes an explicit per-head unit ``hp_bytes`` instead, for the
+    pipeline (per-head unit with the tensor's kv_packing).
     """
 
     def __init__(
@@ -400,13 +427,13 @@ class ReshardGeometry:
         layout: KVLayoutGeometry,
         total_kv_heads: int,
     ) -> "ReshardGeometry":
-        """Geometry over a token-major ``layout`` (either side's: only its
-        head count differs). ``entry_bytes`` raises LandRequired for a
+        """Geometry over ``layout`` (either side's: only its head count
+        differs). ``entry_bytes`` raises LandRequired for a token-major
         contribution no whole-granule copy places."""
         geom = cls(
             src_tp,
             dst_tp,
-            layout.granule_bytes,
+            layout.copy_unit_bytes,
             total_kv_heads,
             kv_packing=layout.kv_packing,
             element_size=layout.element_size,
@@ -414,14 +441,27 @@ class ReshardGeometry:
         geom.layout = layout
         return geom
 
+    def count_for(self, live_tokens: int) -> int:
+        """Entry repeat count for a page holding ``live_tokens`` tokens: one
+        chunk per token, or one run for a SEQ_ALONG_LANE page."""
+        if self.layout is not None and self.layout.kind == SEQ_ALONG_LANE:
+            return 1
+        return int(live_tokens)
+
     def entry_bytes(self, prefill_rank: int, decode_rank: int):
         """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
-        prefill_rank -> decode_rank contribution, per token."""
+        prefill_rank -> decode_rank contribution, repeated ``count_for`` times
+        per page."""
         sh_start, num_heads, dh_start, src_hpr, dst_hpr = head_slice_params(
             self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
         )
         if self.layout is not None:
-            return direct_granule_copy(
+            copy = (
+                head_run_copy
+                if self.layout.kind == SEQ_ALONG_LANE
+                else direct_granule_copy
+            )
+            return copy(
                 self.layout.with_heads(src_hpr),
                 self.layout.with_heads(dst_hpr),
                 sh_start,
@@ -557,10 +597,10 @@ def push_reshard_refusal(
 
     ``shape``/``element_size`` are this side's tensor (attention TP
     ``own_tp``) and ``total_heads`` the global kv-head count it really holds,
-    which differs from ``geom.total_kv_heads`` for draft layers. Token-major
-    KV is exact iff every contribution is a whole-granule copy over the
-    tensor's layout (``direct_granule_copy``) and ``geom`` plans exactly that
-    schedule.
+    which differs from ``geom.total_kv_heads`` for draft layers. The copy is
+    exact iff ``geom`` plans exactly the schedule of the tensor's own layout:
+    whole granules per token (``direct_granule_copy``) or whole head runs per
+    page (``head_run_copy``).
     """
     src_tp, dst_tp = geom.src_tp, geom.dst_tp
     where = push_reshard_where(src_tp, dst_tp)
@@ -586,23 +626,12 @@ def push_reshard_refusal(
             f"{where}: a KV tensor of shape {tuple(shape)} does not hold "
             f"{own_heads} kv heads per rank"
         )
-    if seq_along_lane:
-        # TODO(#829-P1a-HND): remove when the SEQ_ALONG_LANE geometry lands.
-        # The schedule treats one (kv_packing, page_size) row as a head; at one
-        # head per rank that is page_size contiguous chunks from offset 0 on
-        # both sides, which the sender's per-block cap turns into a whole-page
-        # copy once the chunks cover the page.
-        block = math.prod(int(d) for d in shape[1:]) * element_size
-        identity = all(e == (0, hp, hp, 0, hp) for e in _schedule(geom))
-        if src_heads == dst_heads == 1 and identity and page_size * hp >= block:
-            return None
-        return (
-            f"{where} supports SEQ_ALONG_LANE KV only with one kv head per rank "
-            "on both sides and page_size * kv_packing >= 2 * head_dim lanes "
-            f"(here {src_heads} -> {dst_heads} heads per rank)"
-        )
     layout = KVLayoutGeometry.from_tensor(
-        shape, element_size, own_heads, seq_along_lane=False
+        shape,
+        element_size,
+        own_heads,
+        seq_along_lane=seq_along_lane,
+        page_size=page_size if seq_along_lane else None,
     )
     if geom.layout is not None and geom.layout.unit() != layout.unit():
         return mixed
@@ -675,7 +704,7 @@ def build_sender_request(
     """Sender-side StartTransferRequest for one prefill rank pushing to one decode peer.
 
     ``src_block_ids``/``dst_block_ids`` are physical page ids on each side, paired
-    by token order; ``live_tokens[i]`` is the token count (``count``) of page ``i``.
+    by token order; ``live_tokens[i]`` is the token count of page ``i``.
     """
     if not (len(src_block_ids) == len(dst_block_ids) == len(live_tokens)):
         raise ValueError(
@@ -705,7 +734,7 @@ def build_sender_request(
             size=size,
             src_stride=src_stride,
             dst_stride=dst_stride,
-            count=int(n),
+            count=geom.count_for(n),
         )
     return req
 
@@ -759,7 +788,7 @@ def build_receiver_request(
                 size=size,
                 src_stride=src_stride,
                 dst_stride=dst_stride,
-                count=int(n),
+                count=geom.count_for(n),
             )
             total += 1
     req.expected_block_count = (
