@@ -67,6 +67,20 @@ class RaidenKVCacheGroups:
     state: List[torch.Tensor] = field(default_factory=list)
     # Maps a request's mamba slot to the state row a transfer moves.
     committed_state_row: Optional[Callable[[int], int]] = None
+    # Per-rank kv-head count of each tensor's pool (0 = unknown), parallel to
+    # full/swa. A fp8 tensor's row count cannot tell 1 head from 2.
+    full_head_nums: List[int] = field(default_factory=list)
+    swa_head_nums: List[int] = field(default_factory=list)
+    # Pools are TpuSeqAlongLaneKVPool (head-major, tokens on lanes).
+    seq_along_lane: bool = False
+
+
+def _is_seq_along_lane(pool: Any) -> bool:
+    try:
+        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+    except ImportError:
+        return False
+    return isinstance(pool, TpuSeqAlongLaneKVPool)
 
 
 def get_raiden_kv_caches(
@@ -121,16 +135,33 @@ def get_raiden_kv_caches(
             for layer_id, buf in zip(layer_ids, buffers, strict=True):
                 (swa if layers_mapping[layer_id][1] else full).append(buf)
                 (swa_ids if layers_mapping[layer_id][1] else full_ids).append(layer_id)
+            sub_pools = (
+                getattr(current_pool, "full_kv_pool", None),
+                getattr(current_pool, "swa_kv_pool", None),
+            )
             return RaidenKVCacheGroups(
-                full=full, swa=swa, full_layer_ids=full_ids, swa_layer_ids=swa_ids
+                full=full,
+                swa=swa,
+                full_layer_ids=full_ids,
+                swa_layer_ids=swa_ids,
+                full_head_nums=[getattr(sub_pools[0], "head_num", 0)] * len(full),
+                swa_head_nums=[getattr(sub_pools[1], "head_num", 0)] * len(swa),
+                seq_along_lane=any(_is_seq_along_lane(p) for p in sub_pools),
             )
         return RaidenKVCacheGroups(
-            full=buffers, swa=[], full_layer_ids=layer_ids, swa_layer_ids=[]
+            full=buffers,
+            swa=[],
+            full_layer_ids=layer_ids,
+            swa_layer_ids=[],
+            full_head_nums=[getattr(current_pool, "head_num", 0)] * len(buffers),
+            seq_along_lane=_is_seq_along_lane(current_pool),
         )
 
     groups = group_one(pool)
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
+    full_heads, swa_heads = list(groups.full_head_nums), list(groups.swa_head_nums)
+    seq_along_lane = groups.seq_along_lane
     num_draft_full = num_draft_swa = 0
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
@@ -139,6 +170,9 @@ def get_raiden_kv_caches(
         swa.extend(draft_groups.swa)
         full_ids.extend(draft_groups.full_layer_ids)
         swa_ids.extend(draft_groups.swa_layer_ids)
+        full_heads.extend(draft_groups.full_head_nums)
+        swa_heads.extend(draft_groups.swa_head_nums)
+        seq_along_lane = seq_along_lane or draft_groups.seq_along_lane
 
     state: List[torch.Tensor] = []
     committed_state_row = None
@@ -164,4 +198,7 @@ def get_raiden_kv_caches(
         num_draft_swa=num_draft_swa,
         state=state,
         committed_state_row=committed_state_row,
+        full_head_nums=full_heads,
+        swa_head_nums=swa_heads,
+        seq_along_lane=seq_along_lane,
     )

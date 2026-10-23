@@ -700,11 +700,6 @@ class RaidenSenderMixin:
                 self._completed_send.add(self._swa_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
-        if self._state_engine is not None:
-            raise NotImplementedError(
-                "Raiden push resharding does not move GDN (linear-attention) "
-                "state yet; use equal attention TP on prefill and decode."
-            )
         req = ReshardReq.from_frames(msg)
         room = req.room
         decode_ip = req.decode_ip
@@ -714,6 +709,30 @@ class RaidenSenderMixin:
         dst_attn_tp = req.dst_attn_tp
         decode_swa_blocks = req.decode_swa_blocks
         swa_push_endpoint = req.swa_push_endpoint
+        # A tombstoned room skips the geometry check and gets ROOM_FAILED below.
+        reason = None
+        if not self.is_aborted(room):
+            reason = self.reshard_refusal(self.attn_tp_size, dst_attn_tp)
+        if reason is not None:
+            # The decode refuses the same geometry at init; this covers a
+            # decode that does not, so nothing is staged or pushed.
+            self.log_reshard_refusal(("reshard_req", dst_attn_tp), reason)
+            failed_here = False
+            with self._state_lock:
+                if room not in self._aborted:
+                    self._mark_aborted_locked(room)
+                    self._fail_room_locked(room, reason)
+                    self.update_status(room, KVPoll.Failed)
+                    failed_here = True
+            if failed_here:
+                # Otherwise the decode holds the room's pages until its
+                # waiting timeout.
+                self._reply_room_failed(
+                    room=room,
+                    endpoint=_tcp_endpoint(ip=decode_ip, port=decode_port),
+                    reason=reason,
+                )
+            return
         with self._state_lock:
             failed_reason = self._tombstone_reason_locked(room)
             if failed_reason is None:
@@ -989,6 +1008,9 @@ class RaidenSenderMixin:
         engine = self._swa_engine
         fut = None
         try:
+            self._check_reshard_bounds(
+                req, self.attn_tp_size, req_meta["dst_attn_tp"], swa=True
+            )
             engine.register_active_plan(room, req, is_sender=True)
             host_blocks = engine.plan_host_blocks(room, swa_blocks)
             fut = engine.d2h(swa_blocks, host_blocks, [1] * len(swa_blocks))
@@ -1145,6 +1167,7 @@ class RaidenSenderMixin:
         # receiver matches on src_block_id (the prefill device blocks it
         # learned via RESHARD_BLOCKS), which is unaffected by where the bytes
         # are staged.
+        self._check_reshard_bounds(req, self.attn_tp_size, dst_attn_tp)
         engine.register_active_plan(uuid, req, is_sender=True)
         fut = None
         try:
