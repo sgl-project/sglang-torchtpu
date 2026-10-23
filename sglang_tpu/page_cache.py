@@ -41,7 +41,10 @@ def _handle_walk_error(error: OSError) -> None:
 
 
 def _cache_files(root: Path) -> list[Path]:
-    device = root.stat().st_dev
+    try:
+        device = root.stat().st_dev
+    except FileNotFoundError:
+        return []
     paths = []
     for directory, subdirectories, names in os.walk(root, onerror=_handle_walk_error):
         try:
@@ -133,7 +136,7 @@ def release_compile_page_cache() -> None:
 
 
 def release_startup_page_cache() -> None:
-    """Join cache writers, then release files once per host before GC freeze."""
+    """Join cache writers, then release startup files once per host."""
     resolve_compilations([])
     get_parallel().world_group.barrier()
     if int(os.environ["LOCAL_RANK"]) != 0:

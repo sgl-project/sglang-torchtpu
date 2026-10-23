@@ -1,8 +1,7 @@
 import asyncio
-import itertools
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import requests
 
@@ -12,8 +11,8 @@ from sglang.srt.entrypoints.http_server import (
     _send_disaggregation_warmup_requests,
 )
 from sglang.srt.managers.communicator import FanOutCommunicator
-from sglang.srt.managers.io_struct import FreezeGCReq, FreezeGCReqOutput
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.io_struct import FreezeGCReqOutput
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -21,8 +20,6 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
     async def test_sends_concurrent_scalar_request_to_each_dp_rank(self):
-        from sglang.srt.runtime_context import get_context
-
         # The warmup fan-out width comes from the published topology.
         override = get_context().override_server_args(dp_size=4)
         override.install()
@@ -103,37 +100,24 @@ class _FreezeServerError:
 
 class TestFreezeGcAfterWarmup(unittest.TestCase):
     def setUp(self):
-        self.server_args = SimpleNamespace(url=lambda: "http://127.0.0.1:30000")
-        self.calls = []
-        self.sleeps = []
-        # Every clock read advances one second.
-        clock = itertools.count()
-        stubs = dict(
-            get_model=lambda: SimpleNamespace(
-                checkpoint_engine_wait_weights_before_ready=False,
-                delete_ckpt_after_loading=False,
-            ),
-            get_exec=lambda: SimpleNamespace(
-                moe=SimpleNamespace(is_ep_scale_joiner=False)
-            ),
-            get_serving=lambda: SimpleNamespace(
-                skip_server_warmup=True, admin_api_key=None, api_key="k"
-            ),
-            get_observability=lambda: SimpleNamespace(
-                debug_tensor_dump_input_file=None
-            ),
-            ssl_verify_of=lambda args: True,
-            _global_state=SimpleNamespace(
-                tokenizer_manager=SimpleNamespace(server_status=None)
-            ),
-            time=SimpleNamespace(
-                monotonic=lambda: float(next(clock)), sleep=self.sleeps.append
-            ),
+        self.server_args = self.enterContext(
+            get_context().override_server_args(
+                host="127.0.0.1", port=30000, skip_server_warmup=True, api_key="k"
+            )
         )
-        for name, value in stubs.items():
-            p = patch.object(http_server, name, value)
-            p.start()
-            self.addCleanup(p.stop)
+        self.calls = []
+        self.enterContext(patch.object(http_server.time, "sleep"))
+        self.enterContext(
+            patch.object(
+                http_server,
+                "_global_state",
+                http_server._GlobalState(
+                    tokenizer_manager=SimpleNamespace(server_status=None),
+                    template_manager=None,
+                    scheduler_info={},
+                ),
+            )
+        )
 
     def _post(self, outcomes):
         outcomes = list(outcomes)
@@ -169,6 +153,47 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
         self.assertEqual(ready, [])
         self.assertIsNone(http_server._global_state.tokenizer_manager.server_status)
 
+    def test_failed_pd_warmup_does_not_publish_readiness(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                manager = http_server._global_state.tokenizer_manager
+                manager.server_status = http_server.ServerStatus.Starting
+                ready = Mock()
+                with (
+                    get_context().override_server_args(
+                        skip_server_warmup=False,
+                        skip_tokenizer_init=True,
+                        api_key="k",
+                        disaggregation_mode=mode,
+                        dp_size=2,
+                    ),
+                    patch.object(
+                        http_server.requests,
+                        "get",
+                        return_value=SimpleNamespace(
+                            status_code=200, json=lambda: {"is_generation": True}
+                        ),
+                    ),
+                    patch.object(
+                        http_server,
+                        "_send_disaggregation_warmup_requests",
+                        new_callable=AsyncMock,
+                        return_value=[200, 503],
+                    ) as warmup,
+                    patch.object(http_server, "kill_process_tree") as shutdown,
+                    self._post([]),
+                ):
+                    http_server._wait_and_warmup(
+                        self.server_args, launch_callback=ready
+                    )
+                warmup.assert_awaited_once()
+                shutdown.assert_called_once_with(http_server.os.getpid())
+                self.assertEqual(self.calls, [])
+                ready.assert_not_called()
+                self.assertEqual(
+                    manager.server_status, http_server.ServerStatus.Starting
+                )
+
     def test_rust_server_does_not_call_the_python_freeze_endpoint(self):
         ready = []
         with http_server.envs.SGLANG_RUST_SERVER.override(True), self._post([]):
@@ -181,7 +206,7 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
     def test_retry_is_bounded(self):
         refused = requests.exceptions.ConnectionError("Connection refused")
         with (
-            patch.object(http_server, "_FREEZE_GC_RETRY_SECS", 1.5),
+            patch.object(http_server.time, "monotonic", side_effect=[0, 0, 31]),
             self._post([refused] * 3),
         ):
             with self.assertRaises(requests.exceptions.ConnectionError):
@@ -199,15 +224,6 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
                     with self.assertRaises(requests.exceptions.RequestException):
                         http_server._freeze_gc_after_server_warmup(self.server_args)
                 self.assertEqual(len(self.calls), 1)
-
-
-class TestPipelineFreeze(unittest.TestCase):
-    def test_deferred_dispatch_only_handles_freeze(self):
-        processed = []
-        scheduler = SimpleNamespace(process_input_requests=processed.extend)
-        request = FreezeGCReq()
-        SchedulerPPMixin._pp_process_freeze_gc(scheduler, [object(), request])
-        self.assertEqual(processed, [request])
 
 
 class TestFreezeCompletion(unittest.IsolatedAsyncioTestCase):

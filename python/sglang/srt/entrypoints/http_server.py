@@ -2426,22 +2426,17 @@ def _execute_server_warmup(server_args: ServerArgs):
                 )
             )
             failed_status_codes = [code for code in status_codes if code != 200]
-            if not failed_status_codes:
-                logger.info(
-                    "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().num_dp_ranks,
+            if failed_status_codes:
+                raise RuntimeError(
+                    "Disaggregation warmup failed "
+                    f"(mode={get_disagg().disaggregation_mode}), "
+                    f"status codes: {failed_status_codes}"
                 )
-                logger.info("End of disaggregation warmup")
-            else:
-                logger.info(
-                    "Disaggregation warmup failed (mode=%s), status codes: %s",
-                    get_disagg().disaggregation_mode,
-                    failed_status_codes,
-                )
-            # In rust-server mode there is no TokenizerManager (readiness is
-            # the Rust server's own /health), so skip the status update.
-            if failed_status_codes and not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            logger.info(
+                "Disaggregation warmup requests completed for all %s DP ranks",
+                get_parallel().num_dp_ranks,
+            )
+            logger.info("End of disaggregation warmup")
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -2486,7 +2481,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
             if retry and time.monotonic() - start < _FREEZE_GC_RETRY_SECS:
                 time.sleep(0.5)
                 continue
-            logger.exception("post-warmup freeze_gc failed")
+            logger.warning("post-warmup freeze_gc failed", exc_info=True)
             raise
         if attempt > 1:
             # Scheduler cleanup has completed before this response is sent.
