@@ -60,7 +60,7 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
     def _f(self, *shape, scale=1.0):
         return jnp.asarray((self.rng.normal(size=shape) * scale).astype(np.float32))
 
-    def _case(self, seqs, num_tokens, max_seqs, ctx, sm_scale, k_scale):
+    def _case(self, seqs, num_tokens, max_seqs, ctx, sm_scale, k_scale, heads=QH):
         """seqs: (prefix, q_len) per request, prefixed requests first. Returns the
         q-block arguments and the per-query kernel's output for the last step."""
         kp = self.kp
@@ -96,8 +96,8 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
                 cu,
                 dist,
             )
-            ql = self._f(T, QH, 512).astype(jnp.bfloat16)
-            qpe = self._f(T, QH, 64).astype(jnp.bfloat16)
+            ql = self._f(T, heads, 512).astype(jnp.bfloat16)
+            qpe = self._f(T, heads, 64).astype(jnp.bfloat16)
             out, cn, cr = att(
                 ql,
                 qpe,
@@ -130,8 +130,14 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         )
         return args, ref
 
-    def _check(self, args, ref, sm_scale, k_scale):
-        out = self.qblock(*args, sm_scale=sm_scale, k_scale=k_scale, kpool=KPOOL)
+    def _check(self, args, ref, sm_scale, k_scale, query_block=256):
+        out = self.qblock(
+            *args,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            kpool=KPOOL,
+            query_block=query_block,
+        )
         cu, dist = args[7], args[8]
         n = int(cu[dist[2]])
         o = np.asarray(out[:n].astype(jnp.float32))
@@ -147,6 +153,19 @@ class TestSparseMlaPrefillQblock(CustomTestCase):
         seqs = [(1024, 2500), (600, 1800), (0, 2049), (0, 1)]
         args, ref = self._case(seqs, 8192, 6, 4096, 0.08, 0.75)
         self._check(args, ref, 0.08, 0.75)
+
+    def test_64_heads_128_query_blocks(self):
+        # 64 heads per chip (GLM-5.3-Flash at attention TP1) take 128-query
+        # blocks, since 64 x 256 score rows do not fit in VMEM. 8 and 32 heads
+        # per chip (TP8, TP2) keep 256.
+        from sglang_tpu.attention.pallas.mla_sparse_fused import qblock_query_block
+
+        self.assertEqual(qblock_query_block(8), 256)
+        self.assertEqual(qblock_query_block(32), 256)
+        self.assertEqual(qblock_query_block(64), 128)
+        seqs = [(300, 700), (0, 300)]
+        args, ref = self._case(seqs, 1024, 4, 1024, 0.08, 0.75, heads=64)
+        self._check(args, ref, 0.08, 0.75, query_block=qblock_query_block(64))
 
 
 if __name__ == "__main__":
