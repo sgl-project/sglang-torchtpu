@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import copy
+import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -11,10 +14,12 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.unified_kv_pool import (
     TpuUnifiedSWAKVPool,
+    TpuUnifiedSWAPoolConfigurator,
     TpuUnifiedSWATokenToKVPoolAllocator,
     merge_swa_kv_heads,
     num_swa_groups,
     split_swa_output,
+    unified_kv_pool_enabled,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -321,6 +326,260 @@ class TestTpuUnifiedSWAKVPoolAllocator(unittest.TestCase):
 
         self.assertIsNone(alloc.reclaim_for_prealloc(_TreeCache(), 8, 8))
         self.assertGreaterEqual(alloc._free_page_count(), 10)
+
+
+class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
+    """Tests for PR 3: configurator sizing, RPA page-table selection, and CLI guards."""
+
+    def _cfg_patches(self):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        for mod, val in (
+            (
+                "sglang.srt.runtime_context.get_exec",
+                types.SimpleNamespace(
+                    kernel=types.SimpleNamespace(attention_backend="pallas_tpu_rpa_v3")
+                ),
+            ),
+            (
+                "sglang.srt.model_executor.pool_configurator.get_parallel",
+                types.SimpleNamespace(
+                    tp_size=1,
+                    attn_tp_size=1,
+                    pp_size=1,
+                    attn_cp_size=1,
+                    attn_dcp_size=1,
+                    dcp_enabled=False,
+                ),
+            ),
+            (
+                "sglang.srt.model_executor.pool_configurator.get_disagg",
+                types.SimpleNamespace(disaggregation_mode="null"),
+            ),
+            (
+                "sglang.srt.model_executor.pool_configurator.get_memory",
+                types.SimpleNamespace(
+                    kv_cache_dtype="auto",
+                    swa_kv_cache_ratio=None,
+                    enable_hierarchical_cache=False,
+                    hicache_io_backend="raiden",
+                    enable_unified_cache_external_linker=False,
+                    enable_unified_memory=False,
+                    disable_radix_cache=False,
+                ),
+            ),
+            (
+                "sglang.srt.model_executor.pool_configurator.get_schedule",
+                types.SimpleNamespace(
+                    swa_full_tokens_ratio=0.5,
+                    chunked_prefill_size=4096,
+                    disable_overlap_schedule=False,
+                    max_running_requests=None,
+                ),
+            ),
+        ):
+            stack.enter_context(patch(mod, return_value=val))
+        return stack
+
+    def _make_mock_kvc(
+        self,
+        full_ids=None,
+        swa_ids=None,
+        head_num=1,
+        head_dim=512,
+        swa_head_num=2,
+        swa_head_dim=256,
+        dtype=torch.bfloat16,
+    ):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        full_ids = list(range(10)) if full_ids is None else list(full_ids)
+        swa_ids = list(range(10, 60)) if swa_ids is None else list(swa_ids)
+        mc = types.SimpleNamespace(
+            attention_arch=None,
+            head_dim=head_dim,
+            v_head_dim=head_dim,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_head_dim,
+            get_num_kv_heads=lambda tp=1, dcp=1: head_num,
+            get_swa_num_kv_heads=lambda tp=1, dcp=1: swa_head_num,
+        )
+        elem = torch.empty((), dtype=dtype).element_size()
+        full_row = TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+            num_kv_heads=head_num,
+            head_dim=head_dim,
+            v_head_dim=head_dim,
+            store_dtype=dtype,
+        )
+        swa_row = TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+            num_kv_heads=swa_head_num,
+            head_dim=swa_head_dim,
+            v_head_dim=swa_head_dim,
+            store_dtype=dtype,
+        )
+        return types.SimpleNamespace(
+            is_hybrid_swa=True,
+            use_mla_backend=False,
+            is_hybrid_gdn=False,
+            has_mamba_state=False,
+            is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            pp_size=1,
+            attn_dp_size=1,
+            dcp_enabled=False,
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+            kv_cache_dtype_str="fp8_e4m3" if elem == 1 else "bf16",
+            kv_cache_dtype=dtype,
+            pool_page_size=128,
+            page_size=128,
+            custom_mem_pool_head_num=None,
+            custom_mem_pool_head_dim=None,
+            sliding_window_size=1024,
+            max_Prefill_tokens=8192,
+            chunked_prefill_size=4096,
+            context_len=32768,
+            full_tokens_per_layer=None,
+            swa_tokens_per_layer=None,
+            swa_kv_cache_ratio=None,
+            model_config=mc,
+            layer_info=types.SimpleNamespace(
+                full_attention_layer_ids=full_ids,
+                swa_attention_layer_ids=swa_ids,
+            ),
+            _full_attention_cell_size=full_row * len(full_ids),
+            _swa_attention_cell_size=swa_row * len(swa_ids),
+            _cell_size=full_row * len(full_ids) + swa_row * len(swa_ids),
+        )
+
+    def test_configurator_sizes_from_shared_buffers_bf16_and_fp8(self):
+        with self._cfg_patches():
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                with self.subTest(dtype=dtype):
+                    kvc = self._make_mock_kvc(dtype=dtype)
+                    conf = TpuUnifiedSWAPoolConfigurator(kvc)
+                    self.assertEqual(conf._num_swa_groups, 5)
+                    budget = 2 * 1024**3
+                    cfg = conf.calculate_pool_sizes(budget, page_size=128)
+                    self.assertEqual(
+                        cfg.full_max_total_num_tokens, cfg.swa_max_total_num_tokens
+                    )
+                    pool = TpuUnifiedSWAKVPool(
+                        size=cfg.full_max_total_num_tokens,
+                        page_size=128,
+                        dtype=dtype,
+                        head_num=1,
+                        head_dim=512,
+                        swa_head_num=2,
+                        swa_head_dim=256,
+                        swa_attention_layer_ids=list(range(10, 60)),
+                        full_attention_layer_ids=list(range(10)),
+                        device="cpu",
+                    )
+                    self.assertLessEqual(sum(pool.get_kv_size_bytes()), budget)
+
+    def test_unsupported_configurations_rejected(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.server_args import ServerArgs
+        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+        from sglang_tpu.tpu_platform import _resolve_unified_kv_pool
+
+        base = self._make_mock_kvc()
+        with self._cfg_patches():
+            for attr, val, exc in (
+                ("is_hybrid_swa", False, ValueError),
+                ("use_mla_backend", True, ValueError),
+                ("is_hybrid_gdn", True, ValueError),
+                ("is_draft_worker", True, ValueError),
+                ("pp_size", 2, ValueError),
+                ("dcp_enabled", True, ValueError),
+                ("token_to_kv_pool_class", TpuSeqAlongLaneKVPool, ValueError),
+                ("kv_cache_dtype_str", "mxint8", NotImplementedError),
+                ("pool_page_size", 1, ValueError),
+            ):
+                kvc = copy.copy(base)
+                setattr(kvc, attr, val)
+                with self.assertRaises(exc):
+                    TpuUnifiedSWAPoolConfigurator(kvc)
+
+        with patch(
+            "sglang_tpu.unified_kv_pool.get_memory",
+            return_value=types.SimpleNamespace(
+                tpu_unified_kv_pool=True,
+                enable_hierarchical_cache=False,
+                enable_unified_cache_external_linker=False,
+            ),
+        ):
+            self.assertTrue(unified_kv_pool_enabled(base))
+
+        ok_args = ServerArgs(
+            model_path="dummy",
+            enable_unified_memory=True,
+            attention_backend="pallas_tpu_rpa_v3",
+            page_size=128,
+        )
+        _resolve_unified_kv_pool(ok_args)
+        view = resolving_view(ok_args)
+        self.assertFalse(view.enable_unified_memory)
+        self.assertTrue(view.tpu_unified_kv_pool)
+
+        for kwargs in (
+            dict(attention_backend="pallas_tpu_flash"),
+            dict(pp_size=2),
+            dict(dcp_size=2),
+            dict(attn_cp_size=2),
+            dict(disaggregation_mode="prefill"),
+            dict(speculative_algorithm="EAGLE"),
+            dict(enable_hierarchical_cache=True, hicache_io_backend="kernel"),
+            dict(page_size=1),
+        ):
+            bad_args = ServerArgs(
+                model_path="dummy",
+                enable_unified_memory=True,
+                **{"attention_backend": "pallas_tpu_rpa_v3", "page_size": 128, **kwargs},
+            )
+            with self.assertRaises(ValueError):
+                _resolve_unified_kv_pool(bad_args)
+
+    def test_rpa_backend_layer_page_indices_selects_full_and_swa_groups(self):
+        from sglang_tpu.attention_pallas_rpa_base import (
+            BaseTpuPallasRpaAttnBackend,
+            PallasForwardMetadata,
+        )
+
+        backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+        backend.token_to_kv_pool = types.SimpleNamespace(swa_raw_head_num=2)
+        backend._swa_kv_heads_merged = True
+        backend._swa_layer_groups = {2: 0, 3: 1, 4: 2}
+        f0 = torch.tensor([1, 2], dtype=torch.int32)
+        s0 = torch.tensor([3, 4], dtype=torch.int32)
+        sg = torch.tensor([[13, 14], [23, 24]], dtype=torch.int32)
+        backend.forward_metadata = PallasForwardMetadata(
+            kv_lens=torch.tensor([8], dtype=torch.int32),
+            page_indices=f0,
+            cu_q_lens=torch.tensor([0, 8], dtype=torch.int32),
+            cu_kv_lens=torch.tensor([0, 8], dtype=torch.int32),
+            distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+            active_num_tokens=torch.tensor([8], dtype=torch.int32),
+            swa_page_indices=s0,
+            swa_group_page_indices=sg,
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(0, is_swa_layer=False)[0], f0)
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(1, is_swa_layer=False)[0], f0)
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(2, is_swa_layer=True)[0], s0)
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(3, is_swa_layer=True)[0], sg[0])
+        )
+        self.assertTrue(
+            torch.equal(backend._layer_page_indices(4, is_swa_layer=True)[0], sg[1])
+        )
 
 
 if __name__ == "__main__":

@@ -469,6 +469,66 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     )
 
 
+def _resolve_unified_kv_pool(server_args) -> None:
+    """Resolve ``--enable-unified-memory`` on TPU into ``tpu_unified_kv_pool=True``."""
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+
+    cfg = resolving_view(server_args)
+    if not cfg.enable_unified_memory:
+        return
+    checks = (
+        (
+            cfg.attention_backend is not None
+            and cfg.attention_backend
+            not in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"),
+            f"requires --attention-backend pallas_tpu_rpa_v3 or pallas_tpu_rpa_batched, got {cfg.attention_backend!r}.",
+        ),
+        (
+            cfg.attention_backend == "pallas_tpu_rpa_batched"
+            and _uses_seq_along_lane_kv(),
+            "is not supported with SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1.",
+        ),
+        (
+            cfg.pp_size > 1,
+            f"is not supported with --pipeline-parallel-size > 1 (got {cfg.pp_size}).",
+        ),
+        (
+            cfg.dcp_size > 1,
+            f"is not supported with --decode-context-parallel-size > 1 (got {cfg.dcp_size}).",
+        ),
+        (
+            cfg.attn_cp_size > 1 or cfg.enable_prefill_cp,
+            f"is not supported with prefill context parallelism (--attn-cp-size {cfg.attn_cp_size}).",
+        ),
+        (
+            cfg.disaggregation_mode != "null",
+            f"is not supported with --disaggregation-mode {cfg.disaggregation_mode!r}.",
+        ),
+        (
+            cfg.speculative_algorithm is not None,
+            f"is not supported with speculative decoding (--speculative-algorithm {cfg.speculative_algorithm!r}).",
+        ),
+        (
+            cfg.enable_hierarchical_cache and cfg.hicache_io_backend != "raiden",
+            f"with --enable-hierarchical-cache requires --hicache-io-backend raiden, got {cfg.hicache_io_backend!r}.",
+        ),
+        (
+            cfg.enable_unified_cache_external_linker,
+            "is not supported with --enable-unified-cache-external-linker.",
+        ),
+        (cfg.page_size == 1, "requires --page-size > 1, got 1."),
+    )
+    for bad, msg in checks:
+        if bad:
+            raise ValueError(f"--enable-unified-memory on TPU {msg}")
+    declare_resolution(
+        server_args,
+        "tpu.apply_server_args_defaults",
+        enable_unified_memory=False,
+        tpu_unified_kv_pool=True,
+    )
+
+
 def _validate_dsa(server_args) -> None:
     """Reject the sparse-attention (DSA) setups that TPU cannot serve correctly."""
     from sglang.srt.arg_groups.overrides import resolving_view
@@ -800,6 +860,11 @@ class TpuSRTPlatform(SRTPlatform):
         # weights have loaded (its binder runs post-load).
         static_fp8_parts()
         cfg = resolving_view(server_args)
+        if cfg.enable_page_major_kv_layout:
+            raise ValueError(
+                "--enable-page-major-kv-layout is a CUDA-only layout flag and is "
+                "not supported on TPU."
+            )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(
@@ -967,6 +1032,7 @@ class TpuSRTPlatform(SRTPlatform):
         # After the page-size default: the DCP chunk check reads the page size.
         _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
+        _resolve_unified_kv_pool(server_args)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -1160,6 +1226,26 @@ class TpuSRTPlatform(SRTPlatform):
         )
 
         return TpuPagedTokenToKVPoolAllocator
+
+    def unified_kv_pool_enabled(self, kvc) -> bool:
+        from sglang_tpu.unified_kv_pool import unified_kv_pool_enabled
+
+        return unified_kv_pool_enabled(kvc)
+
+    def get_unified_kv_pool_cls(self) -> type:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+        return TpuUnifiedSWAKVPool
+
+    def get_unified_kv_pool_allocator_cls(self) -> type:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWATokenToKVPoolAllocator
+
+        return TpuUnifiedSWATokenToKVPoolAllocator
+
+    def get_unified_kv_pool_configurator_cls(self) -> type:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAPoolConfigurator
+
+        return TpuUnifiedSWAPoolConfigurator
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"

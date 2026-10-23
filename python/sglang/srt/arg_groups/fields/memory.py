@@ -81,8 +81,13 @@ class Memory(msgspec.Struct):
         "SWA/Mamba state) with one byte buffer split dynamically between "
         "sub-pools. Requires stride-aware attention, linear-attention and Mamba "
         "backends; the allowed backends and the supported PD-disaggregation and "
-        "speculative-decoding configurations are validated at startup.",
+        "speculative-decoding configurations are validated at startup. On TPU, hybrid "
+        "sliding-window models served by the Pallas RPA backends instead share "
+        "one page pool between the full-attention and sliding-window layers.",
     ] = False
+    # Resolved by the TPU platform from --enable-unified-memory; selects the
+    # pool that shares pages between full-attention and sliding-window KV.
+    tpu_unified_kv_pool: A[bool, Arg(no_cli=True)] = False
     enable_session_radix_cache: A[
         bool,
         "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
