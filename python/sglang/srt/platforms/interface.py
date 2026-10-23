@@ -145,6 +145,37 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
+    def unified_kv_pool_enabled(self, kvc) -> bool:
+        """Whether ``kvc`` builds this platform's unified KV pool, whose
+        full-attention and sliding-window layers share pages."""
+        return False
+
+    def create_memory_pool_configurator(self, kvc):
+        """Return a platform-specific ``MemoryPoolConfigurator`` for ``kvc``, or ``None``."""
+        return None
+
+    def build_swa_kv_pool(
+        self,
+        kvc,
+        *,
+        full_max_total_num_tokens: int | None,
+        swa_max_total_num_tokens: int | None,
+    ):
+        """Build a platform-specific hybrid SWA KV pool for ``kvc``, or ``None``."""
+        return None
+
+    def build_swa_kv_pool_allocator(
+        self,
+        kvc,
+        *,
+        sizes,
+        token_to_kv_pool,
+        req_to_token_pool,
+        need_sort: bool,
+    ):
+        """Build a platform-specific hybrid SWA KV pool allocator for ``kvc``, or ``None``."""
+        return None
+
     def get_zigzag_cp_strategy_cls(self) -> type:
         """Return the zigzag prefill context-parallel strategy class."""
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy

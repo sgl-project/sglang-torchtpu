@@ -383,6 +383,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             attn_cp_size=1,
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
+            enable_page_major_kv_layout=False,
+            enable_unified_memory=False,
             tpu_compile_tracer="dynamo",
             json_model_override_args=None,
         )
@@ -923,6 +925,8 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
             use_ray=False,
             hicache_io_backend=None,
             max_total_tokens=None,
+            enable_page_major_kv_layout=False,
+            enable_unified_memory=False,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)

@@ -290,7 +290,10 @@ class TestDefaultConfigurator(CustomTestCase):
 
         with patch(
             "sglang.srt.model_executor.pool_configurator.current_platform",
-            SimpleNamespace(get_mha_kv_bytes_per_token=padded_bytes),
+            SimpleNamespace(
+                get_mha_kv_bytes_per_token=padded_bytes,
+                create_memory_pool_configurator=lambda *_: None,
+            ),
         ):
             mr, _, config = self._run(available)
 
@@ -629,6 +632,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
                 SimpleNamespace(
                     get_mha_kv_bytes_per_token=padded_bytes,
                     dcp_shards_every_kv_pool=lambda: False,
+                    create_memory_pool_configurator=lambda *_: None,
                 ),
             ),
         ):
@@ -2082,6 +2086,7 @@ class TestOutOfTreeHybridSwaRouting(CustomTestCase):
         ) as platform:
             platform.is_out_of_tree.return_value = True
             platform.is_tpu.return_value = False
+            platform.build_swa_kv_pool_allocator.return_value = None
             KVCacheConfigurator._build_token_to_kv_pool(
                 fake,
                 sizes=self._sizes(),
@@ -2108,6 +2113,7 @@ class TestOutOfTreeHybridSwaRouting(CustomTestCase):
         ):
             platform.is_out_of_tree.return_value = True
             platform.is_tpu.return_value = False
+            platform.build_swa_kv_pool_allocator.return_value = None
             KVCacheConfigurator._build_token_to_kv_pool_allocator(
                 fake,
                 sizes=self._sizes(),

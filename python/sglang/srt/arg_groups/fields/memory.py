@@ -84,7 +84,9 @@ class Memory(msgspec.Struct):
         "SWA/Mamba state) with one byte buffer split dynamically between "
         "sub-pools. Requires stride-aware attention, linear-attention and Mamba "
         "backends; the allowed backends and the supported PD-disaggregation and "
-        "speculative-decoding configurations are validated at startup.",
+        "speculative-decoding configurations are validated at startup. On TPU, hybrid "
+        "sliding-window models served by the Pallas RPA backends instead share "
+        "one page pool between the full-attention and sliding-window layers.",
     ] = False
     enable_session_radix_cache: A[
         bool,
