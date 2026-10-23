@@ -291,11 +291,15 @@ class TestWanBlockInputsAreRankInvariant(unittest.TestCase):
             layouts, scalars = [], []
             for rank in range(world_size):
                 case = dict(ring=ring_world_size, batch=batch, rank=rank)
+                # USPAttention rejects a ring at construction when the default
+                # backend cannot rotate K/V. The recorded blocks replace the
+                # attention blocks, so build Ulysses-only and run the ring.
+                with _sp_rank(rank, world_size):
+                    model = _tiny_wan()
                 with (
                     self.subTest(**case),
                     _sp_rank(rank, world_size, ring_world_size),
                 ):
-                    model = _tiny_wan()
                     block = _RecordingBlock()
                     model.blocks = nn.ModuleList([block])
                     with (
