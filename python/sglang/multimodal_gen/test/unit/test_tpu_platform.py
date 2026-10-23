@@ -5,12 +5,16 @@ import os
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import tpu_platform_plugin
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import (
+    AttentionBackendEnum,
+    Platform,
+)
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
 
 _HAS_TORCH_TPU = hasattr(torch, "tpu")
@@ -30,6 +34,46 @@ class TestTpuPlatformPlugin(unittest.TestCase):
             self.assertIsNone(tpu_platform_plugin())
 
 
+class TestSplashBackendSelection(unittest.TestCase):
+    def setUp(self):
+        from sglang.multimodal_gen.runtime.layers.attention import selector
+
+        selector._cached_get_attn_backend.cache_clear()
+        self.addCleanup(selector._cached_get_attn_backend.cache_clear)
+
+    def test_explicit_selection_overrides_the_layer_preference_set(self):
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_attn_backend,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform", TpuPlatform()
+        ):
+            backend = get_attn_backend(
+                128,
+                torch.bfloat16,
+                supported_attention_backends={
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                },
+                selected_attention_backend=AttentionBackendEnum.TPU_SPLASH_ATTN,
+            )
+        self.assertEqual(
+            f"{backend.__module__}.{backend.__qualname__}",
+            TpuPlatform.get_attn_backend_cls_str(
+                AttentionBackendEnum.TPU_SPLASH_ATTN, 128, torch.bfloat16
+            ),
+        )
+
+    def test_selectable_by_cli_name(self):
+        # server_args resolves --attention-backend via the enum name.
+        self.assertIs(
+            AttentionBackendEnum["TPU_SPLASH_ATTN"],
+            AttentionBackendEnum.TPU_SPLASH_ATTN,
+        )
+        self.assertEqual(str(AttentionBackendEnum.TPU_SPLASH_ATTN), "tpu_splash_attn")
+
+
 class TestTpuPlatformSurface(unittest.TestCase):
     def test_identity(self):
         self.assertEqual(TpuPlatform.device_type, "tpu")
@@ -42,12 +86,24 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_inference_mode_is_no_grad(self):
         self.assertIsInstance(TpuPlatform.inference_mode(), torch.no_grad)
 
+    def test_only_tpu_exchanges_attention_output_in_head_slabs(self):
+        self.assertTrue(TpuPlatform.prefers_head_slab_output_exchange())
+        self.assertFalse(Platform.prefers_head_slab_output_exchange())
+
     def test_attn_backend_default_is_sdpa(self):
         for selected in (None, AttentionBackendEnum.TORCH_SDPA):
             self.assertIn(
                 "sdpa.SDPABackend",
                 TpuPlatform.get_attn_backend_cls_str(selected, 128, torch.bfloat16),
             )
+
+    def test_attn_backend_splash_class_path(self):
+        self.assertIn(
+            "tpu_splash_attn.TpuSplashAttentionBackend",
+            TpuPlatform.get_attn_backend_cls_str(
+                AttentionBackendEnum.TPU_SPLASH_ATTN, 128, torch.bfloat16
+            ),
+        )
 
     def test_attn_backend_unsupported_raises(self):
         with self.assertRaises(ValueError):
@@ -130,6 +186,124 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_layerwise_offload_disabled(self):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
 
+    def test_compile_warmup_keeps_the_dit_resident(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        def server_args(**kwargs):
+            # ServerArgs.__post_init__ applies the platform defaults.
+            with (
+                patch.object(
+                    PipelineConfig, "from_kwargs", return_value=PipelineConfig()
+                ),
+                patch.object(
+                    current_platform,
+                    "apply_server_args_defaults",
+                    TpuPlatform().apply_server_args_defaults,
+                ),
+            ):
+                return ServerArgs.from_kwargs(model_path="/fake", **kwargs)
+
+        self.assertFalse(server_args().offload_during_compile)
+        # An explicit request is overridden: the warmup offload crashes on TPU.
+        self.assertFalse(
+            server_args(offload_during_compile=True).offload_during_compile
+        )
+
+    def test_teacache_is_dropped_under_torch_compile(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        self.assertFalse(TpuPlatform().supports_teacache_with_torch_compile())
+        for compile_on, expected in ((True, False), (False, True)):
+            with (
+                self.subTest(enable_torch_compile=compile_on),
+                patch.object(
+                    current_platform,
+                    "supports_teacache_with_torch_compile",
+                    TpuPlatform().supports_teacache_with_torch_compile,
+                ),
+            ):
+                params = SamplingParams(enable_teacache=True)
+                params._drop_teacache_if_it_recompiles(
+                    SimpleNamespace(enable_torch_compile=compile_on)
+                )
+                self.assertEqual(params.enable_teacache, expected)
+
+
+class TestSdpaQueryBroadcastMask(unittest.TestCase):
+    """torch_tpu SDPA returns NaN for masks that broadcast over queries."""
+
+    @staticmethod
+    def _tpu_query(*shape):
+        query = MagicMock()
+        query.device.type = "tpu"
+        query.shape = torch.Size(shape)
+        return query
+
+    def test_key_padding_mask_is_expanded_over_queries(self):
+        from sglang.multimodal_gen.runtime.platforms.tpu import (
+            _expand_query_broadcast_mask,
+        )
+
+        mask = torch.zeros(2, 1, 1, 8)
+        out = _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), mask)
+        self.assertEqual(out.shape, (2, 1, 5, 8))
+        # expand() is a view: no copy of the mask.
+        self.assertEqual(out.data_ptr(), mask.data_ptr())
+
+    def test_other_masks_are_untouched(self):
+        from sglang.multimodal_gen.runtime.platforms.tpu import (
+            _expand_query_broadcast_mask,
+        )
+
+        full = torch.zeros(2, 1, 5, 8)
+        self.assertIs(
+            _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), full), full
+        )
+        # Single-query attention needs no expansion.
+        row = torch.zeros(2, 1, 1, 8)
+        self.assertIs(
+            _expand_query_broadcast_mask(self._tpu_query(2, 4, 1, 64), row), row
+        )
+        self.assertIsNone(
+            _expand_query_broadcast_mask(self._tpu_query(2, 4, 5, 64), None)
+        )
+        # Non-TPU tensors are never touched.
+        cpu_query = torch.zeros(2, 4, 5, 64)
+        self.assertIs(_expand_query_broadcast_mask(cpu_query, row), row)
+
+    def test_patch_is_idempotent_and_preserves_results(self):
+        from sglang.multimodal_gen.runtime.platforms import tpu as tpu_mod
+
+        current = torch.nn.functional.scaled_dot_product_attention
+        # A TPU worker in this process may already have installed the patch.
+        original = getattr(current, "__wrapped__", current)
+        try:
+            torch.nn.functional.scaled_dot_product_attention = original
+            tpu_mod._patch_sdpa_query_broadcast_mask()
+            patched = torch.nn.functional.scaled_dot_product_attention
+            tpu_mod._patch_sdpa_query_broadcast_mask()
+            self.assertIs(torch.nn.functional.scaled_dot_product_attention, patched)
+            self.assertIs(patched.__wrapped__, original)
+
+            q, k, v = (torch.randn(1, 2, 5, 8) for _ in range(3))
+            mask = torch.zeros(1, 1, 1, 5)
+            mask[..., :2] = float("-inf")
+            torch.testing.assert_close(
+                patched(q, k, v, attn_mask=mask), original(q, k, v, attn_mask=mask)
+            )
+            torch.testing.assert_close(
+                patched(q, k, v, mask, 0.0, False), original(q, k, v, mask, 0.0, False)
+            )
+        finally:
+            torch.nn.functional.scaled_dot_product_attention = current
+
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")
 class TestWorkerInitOnce(unittest.TestCase):
@@ -170,11 +344,12 @@ class TestTorchTpuIntegration(unittest.TestCase):
         self.assertFalse(torch.tpu.is_initialized())
 
     def test_srt_symbols_the_platform_imports_exist(self):
-        # tpu.py imports this lazily; a rename on the srt side must fail here,
-        # not at worker bootstrap.
-        from sglang_tpu.patches import _prepare_tpu_env
+        # The plugin's worker hooks import these lazily; a rename on the srt
+        # side must fail here, not at worker bootstrap.
+        from sglang_tpu.patches import _prepare_tpu_env, _register_aten_fallbacks
 
         self.assertTrue(callable(_prepare_tpu_env))
+        self.assertTrue(callable(_register_aten_fallbacks))
 
     def test_importing_the_platform_package_does_not_initialize_pjrt(self):
         # The parent resolves current_platform before spawning the worker;

@@ -854,9 +854,26 @@ class SamplingParams:
         if self.save_output and not server_args.comfyui_mode:
             self._set_output_file_name()
 
+    def _drop_teacache_if_it_recompiles(self, server_args) -> None:
+        if not (
+            self.enable_teacache and getattr(server_args, "enable_torch_compile", False)
+        ):
+            return
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        if not current_platform.supports_teacache_with_torch_compile():
+            # TeaCache mutates module state every step, which recompiles a
+            # compiled forward each step on such platforms.
+            logger.warning_once(
+                "enable_teacache is disabled: it recompiles the DiT every step "
+                "under --enable-torch-compile on this platform."
+            )
+            self.enable_teacache = False
+
     def _adjust_visual_fields(self, server_args, pipeline_config):
         if self.guidance_scale is None:
             self.guidance_scale = 1.0
+        self._drop_teacache_if_it_recompiles(server_args)
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():

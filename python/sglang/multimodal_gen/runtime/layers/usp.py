@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -97,8 +98,13 @@ def _a2a_staging_buffer(
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
-    x_shape = x.shape
-    x = x.flatten().contiguous()
+    # Every caller's dim 0 splits evenly over the group, so exchanging the
+    # tensor in its own shape moves the same bytes as a flat exchange; a
+    # flattened buffer costs torch_tpu relayout copies around the collective.
+    x = x.contiguous()
+    assert x.shape[0] % get_ulysses_parallel_world_size() == 0, (
+        f"dim 0 ({x.shape[0]}) must split evenly over the Ulysses group"
+    )
     if role is None:
         output = torch.empty_like(x)
     else:
@@ -106,7 +112,7 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
-    return output.reshape(x_shape)
+    return output
 
 
 def _usp_all_to_all_single_varlen(
@@ -602,6 +608,36 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
+    if (
+        head_dim == 2
+        and h_local > 1
+        and current_platform.prefers_head_slab_output_exchange()
+        and x.transpose(1, 2).is_contiguous()
+    ):
+        # Heads-major input ([b, h_local, s, d] viewed as [b, s, h_local, d]), on
+        # platforms that ask for it (TPU): exchange whole [s_local, d] head
+        # slabs instead of the sequence-major [s, b, h_local, d] buffer. The
+        # relayout copy before the exchange and the gather copy after it are the
+        # same two copies as the path below; what changes is the exchanged
+        # buffer, whose minor dims (s_local, d) stay dense where (h_local, d)
+        # would be padded to (8, 128) tiles on TPU. Values are bit-identical to
+        # the path below. Callers that slice a replicated prefix/suffix off the
+        # output (FLUX.2, Z-Image) are not heads-major contiguous and take the
+        # path below. h_local > 1: with one head,
+        # sequence-major inputs also pass the contiguity check.
+        x = (
+            x.transpose(1, 2)
+            .reshape(b, h_local, world_size, s_local, d)
+            .permute(2, 0, 1, 3, 4)
+            .contiguous()
+        )
+        x = _usp_all_to_all_single(x, role="usp_output")
+        # [world_size, b, h_local, s_local, d] -> [b, s_local, h_global, d]. A
+        # fresh tensor: contiguous() is a no-op when b == s_local == 1 and would
+        # return a view of the reused staging buffer.
+        x = x.permute(1, 3, 0, 2, 4).clone(memory_format=torch.contiguous_format)
+        return x.view(b, s_local, h_global, d)
+
     x = x.permute(permute_order).contiguous()
     x = _usp_all_to_all_single(x, role="usp_output")
     x = x.reshape(world_size, s_local, b, h_local, d)
@@ -932,3 +968,74 @@ def _ring_attention_varlen(
             pending_ops = None
             cur = nxt
     return out_acc.to(q.dtype)
+
+
+def allgather_kv_ring_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_impl: "AttentionImpl",
+    kv_real_len: int | None = None,
+) -> torch.Tensor:
+    """Ring attention over all-gathered K/V; inputs and output are [B, S, H, D].
+
+    The local shard is attended first so the gather can overlap it; each later
+    shard resumes the softmax inside the attention kernel
+    (``AttentionImpl.forward_ring_resume``), so there is no merge pass.
+
+    Ring rank ``r`` holds keys ``[r * S, (r + 1) * S)``. With tail padding,
+    keys from ``kv_real_len`` on are skipped and the query rows past it are
+    zeroed. Which shard is local and how many real keys each shard holds
+    depend on the rank, so they reach the kernel as device data: ranks running
+    collectives inside one compiled program must compile the same program.
+
+    Nothing rotates: K/V of the whole ring group stay resident on every device
+    (about ``2 * S_total * H_kv * D`` elements), and only the local shard's
+    compute (1/R of the layer) can hide the gathers. Bytes on the wire equal a
+    p2p ring's; this trades memory for not needing p2p, which TPU lacks.
+    Self-attention only: query and key shards have the same length.
+    """
+    ring_pg = get_sp_group().ring_group
+    assert ring_pg is not None, "Ring process group is not initialized."
+    world_size = dist.get_world_size(group=ring_pg)
+    batch, shard_len, kv_heads = key.shape[:3]
+    # Query rows are zeroed by key position below.
+    assert query.shape[1] == shard_len, (
+        f"all-gather ring needs equal query/key shards, got {query.shape[1]} "
+        f"and {shard_len}"
+    )
+    padded = kv_real_len is not None and kv_real_len < world_size * shard_len
+    if kv_real_len is None:
+        kv_real_len = world_size * shard_len
+    # This rank's ring position as data: an all-to-all of [0, .., R-1] hands
+    # rank r the value r. Issued before the K/V gathers it gates. A per-process
+    # constant tensor would skip the collective, but a compiler may fold it
+    # into a rank-specialised program, which breaks one-program-per-rank.
+    positions = torch.arange(world_size, dtype=torch.float32, device=key.device)
+    rank_t = ft_c.all_to_all_single(positions, None, None, group=ring_pg)
+    # Heads-major shards, the kernel's layout: the gathered K/V need no
+    # relayout.
+    query = query.transpose(1, 2).contiguous()
+    key = key.transpose(1, 2).contiguous()
+    value = value.transpose(1, 2).contiguous()
+    keys = ft_c.all_gather_tensor(key, 0, group=ring_pg)
+    values = ft_c.all_gather_tensor(value, 0, group=ring_pg)
+    rank_t = _maybe_wait(rank_t)[0].to(torch.int32)
+
+    def kv_info(shard_t: torch.Tensor, row_offset_t: torch.Tensor) -> torch.Tensor:
+        real = (kv_real_len - shard_t * shard_len).clamp(0, shard_len)
+        return torch.stack([row_offset_t, real]).to(torch.int32)
+
+    out, carry = attn_impl.forward_ring_resume(
+        query, key, value, kv_info(rank_t, torch.zeros_like(rank_t))
+    )
+    keys, values = _maybe_wait(keys), _maybe_wait(values)
+    for step in range(1, world_size):
+        peer_t = (rank_t + step) % world_size
+        out, carry = attn_impl.forward_ring_resume(
+            query, keys, values, kv_info(peer_t, peer_t * batch * kv_heads), carry
+        )
+    if padded:
+        rows = rank_t * shard_len + torch.arange(shard_len, device=out.device)
+        out = torch.where((rows < kv_real_len)[:, None], out, 0)
+    return out.transpose(1, 2)

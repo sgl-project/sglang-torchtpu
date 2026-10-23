@@ -192,7 +192,11 @@ class DecodingStage(PipelineStage):
         compiled_callable: ActiveTargetCompiledCallable | None = None,
     ):
         decode_fn = decode_fn or vae.decode
-        if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
+        if (
+            not server_args.enable_torch_compile
+            or not isinstance(vae, nn.Module)
+            or not current_platform.supports_vae_torch_compile()
+        ):
             return decode_fn
 
         compiled_callable = compiled_callable or self._compiled_vae_decode
