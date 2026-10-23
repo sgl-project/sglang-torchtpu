@@ -60,16 +60,28 @@ _EARLY_COMPLETION = "Only an empty producer registration may complete before"
 def pool_manifest(groups: Any) -> list[dict]:
     """Name each local full-attention or sliding-window tensor by model layer."""
     pools = []
-    for kind, tensors, layer_ids, num_draft in (
-        ("fa", groups.full, groups.full_layer_ids, groups.num_draft_full),
-        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa),
+    for kind, tensors, layer_ids, num_draft, num_hidden in (
+        (
+            "fa",
+            groups.full,
+            groups.full_layer_ids,
+            groups.num_draft_full,
+            groups.num_hidden_full,
+        ),
+        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa, 0),
     ):
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")
-        num_target = len(tensors) - num_draft
+        num_target = len(tensors) - num_draft - num_hidden
         for index, (tensor, layer) in enumerate(zip(tensors, layer_ids)):
-            # Draft layer IDs restart at 0, so they need their own namespace.
-            tag_kind = kind if index < num_target else f"draft.{kind}"
+            # Draft layer IDs restart at 0, so they need their own namespace; the
+            # PD hidden rows have their own page geometry, hence their own class.
+            if index < num_target:
+                tag_kind = kind
+            elif index < num_target + num_draft:
+                tag_kind = f"draft.{kind}"
+            else:
+                tag_kind = f"pdhid.{kind}"
             _kv_rank(tensor)
             size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
             pools.append(
@@ -125,6 +137,10 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
     classes = {}
     schema = "sglang-fused-kv-v2"
     for pool, tensor in zip(pools, tensors):
+        # Only the last stage holds the PD hidden pool, whose pages match no target
+        # class; both ends build it from the same geometry (pd_hidden_pool.py).
+        if pool_kind(pool["tag"]).startswith("pdhid."):
+            continue
         layout = materialized_storage_layout(tensor, getter)
         if layout is None:
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")

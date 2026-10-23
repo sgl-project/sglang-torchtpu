@@ -158,18 +158,25 @@ def build_disagg_eagle_input(
     # worker (MTP, EAGLE3) keeps the draft hidden in its carry table instead.
     if not uses_host_batch(batch):
         return original(batch, last_tokens_tensor, future_map)
-    from sglang_tpu.experimental import get_pd_carry_seeder
+    from sglang_tpu.experimental import get_pd_carry_seeder, pd_decode_draft_prefill
     from sglang_tpu.experimental.speculative.chain_info import (
         HostPaddedChainDraftInput,
+    )
+    from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+        get_pd_draft_prefiller,
     )
 
     assert is_experimental_chain(batch.spec_algorithm), batch.spec_algorithm
     if any(req.output_dsa_topk_indices is not None for req in batch.reqs):
         raise NotImplementedError("TpuChainSpecWorker does not support DSA PD seeds.")
-    get_pd_carry_seeder()(
-        batch.req_pool_indices_cpu,
-        torch.stack([req.hidden_states_tensor for req in batch.reqs]),
-    )
+    if pd_decode_draft_prefill():
+        # The draft prompt pass writes the draft KV and the carry.
+        get_pd_draft_prefiller()(batch)
+    else:
+        get_pd_carry_seeder()(
+            batch.req_pool_indices_cpu,
+            torch.stack([req.hidden_states_tensor for req in batch.reqs]),
+        )
     draft_input = HostPaddedChainDraftInput(
         bonus_tokens=last_tokens_tensor,
         new_seq_lens=batch.seq_lens.to(torch.int64),
@@ -184,13 +191,20 @@ def build_disagg_block_input(
     future_map: FutureMap,
 ) -> SpecInput:
     # DFlash/DSpark seed only the bonus token; the draft context KV arrives with
-    # the PD transfer of the draft pool.
+    # the PD transfer of the draft pool, or comes from the shipped hidden rows.
     if not uses_host_batch(batch):
         return original(batch, last_tokens_tensor, future_map)
+    from sglang_tpu.experimental import pd_decode_draft_prefill
     from sglang_tpu.experimental.speculative.block_info import (
         HostPaddedBlockDraftInput,
     )
+    from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+        get_pd_draft_prefiller,
+    )
 
+    if pd_decode_draft_prefill():
+        # The prefill shipped target hidden rows; project them into the draft KV here.
+        get_pd_draft_prefiller()(batch)
     draft_input = HostPaddedBlockDraftInput(
         bonus_tokens=last_tokens_tensor,
         new_seq_lens=batch.seq_lens.to(torch.int64),

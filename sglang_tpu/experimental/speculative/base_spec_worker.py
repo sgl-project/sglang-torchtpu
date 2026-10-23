@@ -84,7 +84,10 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
-from sglang_tpu.experimental import register_host_batch_padder
+from sglang_tpu.experimental import (
+    pd_decode_draft_prefill,
+    register_host_batch_padder,
+)
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
@@ -92,6 +95,16 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import (
 from sglang_tpu.experimental.speculative.draft_forward import set_bucket_dp_metadata
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
+from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+    build_pd_hidden_pool,
+    prebuilt_extend_groups,
+    prebuilt_extend_view,
+    register_pd_draft_prefiller,
+)
+from sglang_tpu.experimental.speculative.pd_hidden_pool import (
+    PdHiddenPool,
+    register_pd_hidden_pool,
+)
 from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_greedy,
     accept_drafts_sampled,
@@ -113,7 +126,11 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
     map_carry,
 )
-from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
+from sglang_tpu.experimental.speculative.spec_utils import (
+    overridden_fields,
+    pad_rows,
+    padded_h2d,
+)
 from sglang_tpu.mamba_pool import (
     TpuMambaPool,
     committed_read_offsets,
@@ -244,9 +261,130 @@ class TpuSpecWorker(BaseSpecWorker):
         # Per (batch bucket, forced num_correct_drafts).
         self._simulated_correct: dict[tuple[int, int], torch.Tensor] = {}
         register_host_batch_padder(self._pad_bs)
+        # Built in init_cuda_graphs: the target KV pool it pages after does not exist yet.
+        self._pd_hidden_pool: PdHiddenPool | None = None
+
+    def _init_pd_hidden_pool(self) -> PdHiddenPool | None:
+        """The PD hidden pool when the decode runs the draft prompt pass, else None."""
+        disagg_mode = get_disagg().disaggregation_mode
+        if not pd_decode_draft_prefill() or disagg_mode == "null":
+            return None
+        if self._dp_attention:
+            # Prebuilt batches land per DP rank; the draft pass would need the idle mirror.
+            raise NotImplementedError(
+                "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL does not support DP attention."
+            )
+        pool = build_pd_hidden_pool(self.target_worker.model_runner)
+        register_pd_hidden_pool(pool)
+        if disagg_mode == "decode":
+            register_pd_draft_prefiller(self.prefill_draft_from_pd)
+        return pool
+
+    @property
+    def ships_pd_hidden(self) -> bool:
+        """Whether this PD prefill hands the draft's hidden rows to the decode."""
+        return (
+            self._pd_hidden_pool is not None
+            and get_disagg().disaggregation_mode == "prefill"
+        )
+
+    def write_pd_hidden(
+        self, batch: ScheduleBatch, target_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Store an extend's target hidden rows for the decode; returns the kv_fence_tail."""
+        assert self._pd_hidden_pool is not None
+        cache_loc_cpu = batch.out_cache_loc
+        assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+        segments = self._pd_hidden_pool.write_segments(
+            cache_loc_cpu, target_hidden.shape[0]
+        )
+        return self._pd_hidden_pool.write(
+            target_hidden, segments=segments.to(self.device, non_blocking=True)
+        )
+
+    def prefill_draft_from_pd(self, batch: ScheduleBatch) -> None:
+        """Draft prompt pass of a PD decode's prebuilt batch, from the shipped hidden rows."""
+        assert self._pd_hidden_pool is not None
+        compile_policy = self._compile_policy()
+        t_bucketer = compile_policy.t_bucketer
+        assert t_bucketer is not None
+        cap = compile_policy._extend_compile_cap()
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        for group in prebuilt_extend_groups(
+            batch, max_tokens=t_bucketer.max_val, max_reqs=cap
+        ):
+            view = prebuilt_extend_view(batch, group, vocab_size=vocab_size)
+            # The draft graphs and writer were warmed with the allocator's dtype.
+            view.out_cache_loc = view.out_cache_loc.to(
+                compile_policy.live_cache_loc_dtype()
+            )
+            padded_tokens = t_bucketer.next_bucket(max(view.extend_num_tokens, cap))
+            cache_loc = pad_rows(view.out_cache_loc, padded_tokens).to(
+                self.device, non_blocking=True
+            )
+            bonus_tokens = padded_h2d(
+                torch.tensor(
+                    [req.output_ids[-1] for req in view.reqs], dtype=torch.int64
+                ),
+                self._pad_bs(len(view.reqs)),
+                self.device,
+            )
+            self.extend_draft_from_hidden(
+                view,
+                target_hidden=self._pd_hidden_pool.read(cache_loc),
+                cache_loc=cache_loc,
+                bonus_tokens=bonus_tokens,
+            )
+
+    def extend_draft_from_hidden(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> None:
+        """The draft's prompt pass over an extend batch's target hidden [token bucket, F]."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not run the PD decode draft prompt pass."
+        )
+
+    def _warmup_pd_hidden(self) -> None:
+        """The prefill's hidden write or the decode's read, per extend token bucket."""
+        pool = self._pd_hidden_pool
+        if pool is None:
+            return
+        compile_policy = self._compile_policy()
+        assert compile_policy.t_bucketer is not None
+        cap = compile_policy._extend_compile_cap()
+        with torch.no_grad():
+            for tokens in compile_policy.t_bucketer.buckets:
+                if tokens < cap:
+                    continue
+                if self.ships_pd_hidden:
+                    segments = pool.write_segments(
+                        torch.zeros((0,), dtype=torch.int64), tokens
+                    )
+                    pool.write(
+                        torch.zeros(
+                            (tokens, pool.feature_size),
+                            dtype=pool.buffer.dtype,
+                            device=self.device,
+                        ),
+                        segments=segments.to(self.device),
+                    ).cpu()
+                else:
+                    cache_loc = torch.zeros(
+                        (tokens,), dtype=compile_policy.live_cache_loc_dtype()
+                    ).to(self.device)
+                    pool.read(cache_loc).cpu()
+            for pbs in self._b_bucketer().buckets:
+                padded_h2d(torch.zeros((0,), dtype=torch.int64), pbs, self.device)
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
+        # Before the Raiden manager, which registers it, and before its warmup.
+        self._pd_hidden_pool = self._init_pd_hidden_pool()
         self._all_drafts = {
             padded_bs: torch.full(
                 (padded_bs,), self.num_drafts, dtype=torch.int32, device=self.device
@@ -256,6 +394,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
+        self._warmup_pd_hidden()
         if not self._sampled_drafts and get_disagg().disaggregation_mode != "prefill":
             self._warmup_target_only_accept()
         # A PD prefill server never verifies, so its mamba pool has no checkpoints.

@@ -94,6 +94,7 @@ def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
         full_layer_ids=[*full, *draft_full],
         swa_layer_ids=list(swa),
         num_draft_full=len(draft_full),
+        num_hidden_full=0,
         num_draft_swa=0,
     )
 

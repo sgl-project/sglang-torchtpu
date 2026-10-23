@@ -119,6 +119,10 @@ class TpuEnvs:
     # Same effect as SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER. Non-speculative
     # batches ignore it.
     SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
+    # PD on the experimental spec worker: the prefill ships the target's draft-input
+    # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
+    # instead of the prefill running the draft over the prompt.
+    SGLANG_TPU_PD_DECODE_DRAFT_PREFILL = EnvBool(False)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.

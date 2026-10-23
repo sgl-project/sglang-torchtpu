@@ -42,7 +42,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
-from sglang_tpu.experimental import register_pd_carry_seeder
+from sglang_tpu.experimental import register_pd_carry_seeder, runs_draft_prompt_pass
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_draft_input import (
     chain_draft_forward_input,
@@ -116,6 +116,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         self._disagg_mode = get_disagg().disaggregation_mode
         if self._disagg_mode == "decode":
             register_pd_carry_seeder(self._seed_carry)
+        self._pd_seed_placeholder: torch.Tensor | None = None
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
@@ -124,7 +125,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
             self._warmup_draft_ops()
         if self._disagg_mode == "decode":
             self._warmup_seed_carry()
-        else:
+        if self.ships_pd_hidden:
+            self._pd_seed_hidden(self.device)
+        if runs_draft_prompt_pass(self._disagg_mode):
             self._warmup_extend_ops()
             if self._target_is_multimodal:
                 self._warmup_multimodal_prefill()
@@ -304,12 +307,18 @@ class TpuChainSpecWorker(TpuSpecWorker):
         if target_hidden is None:
             raise RuntimeError("Chain-draft extend requires target hidden capture.")
         assert logits_output.hidden_states_token_indices is None
-        tail_hidden = self._extend_draft(
-            batch,
-            target_hidden=target_hidden,
-            bucket_tokens=bucket_tokens,
-            mm_input_embeds=logits_output.mm_input_embeds,
-        )
+        if self.ships_pd_hidden:
+            # The decode runs the draft over the prompt from these rows.
+            kv_fence_tail = self.write_pd_hidden(batch, target_hidden)
+            tail_hidden = self._pd_seed_hidden(target_hidden.device)
+        else:
+            tail_hidden = self._extend_draft(
+                batch,
+                target_hidden=target_hidden,
+                bucket_tokens=bucket_tokens,
+                mm_input_embeds=logits_output.mm_input_embeds,
+            )
+            kv_fence_tail = tail_hidden
         logits_output.hidden_states = None
         logits_output.mm_input_embeds = None
         next_state = SpecState(
@@ -319,8 +328,8 @@ class TpuChainSpecWorker(TpuSpecWorker):
         )
         result.new_seq_lens = next_state.seq_lens
         draft_input = self.state_to_spec_info(next_state)
-        # The draft prompt forward writes the step's last KV; tail_hidden is its output.
-        draft_input.kv_fence_tail = tail_hidden
+        # The draft prompt forward (or the hidden write) is the step's last KV write.
+        draft_input.kv_fence_tail = kv_fence_tail
         if self._disagg_mode == "prefill":
             _attach_pd_seeds(draft_input, tail_hidden=tail_hidden, bs=bs)
         result.next_draft_input = draft_input
@@ -369,6 +378,36 @@ class TpuChainSpecWorker(TpuSpecWorker):
         )
         self._chain_draft_worker.carry.index_copy_(0, pool_rows, tail_hidden)
         return tail_hidden
+
+    def _pd_seed_hidden(self, device: torch.device) -> torch.Tensor:
+        """Zero seed hidden at the extend cap; the decode derives the carry itself."""
+        if self._pd_seed_placeholder is None:
+            cap = self._compile_policy()._extend_compile_cap()
+            self._pd_seed_placeholder = torch.zeros(
+                (cap, self._chain_draft_worker.carry_size),
+                dtype=self._draft_runner.dtype,
+            ).to(device)
+        return self._pd_seed_placeholder
+
+    def extend_draft_from_hidden(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> None:
+        del cache_loc
+        if self._target_is_multimodal:
+            raise NotImplementedError(
+                "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL does not ship multimodal embeds."
+            )
+        self._extend_draft(
+            batch,
+            target_hidden=target_hidden,
+            bucket_tokens=bonus_tokens,
+            mm_input_embeds=None,
+        )
 
     def _seed_carry(
         self, req_pool_indices_cpu: torch.Tensor, hidden_cpu: torch.Tensor

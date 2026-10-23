@@ -158,6 +158,13 @@ Both raiden roles serve every algorithm with the same spec flags.
   stages run `TpuPipelineStageWorker`, which only forwards the target. The
   stages relay the EAGLE3 / DFlash aux captures to the last one (`../../pp_wave.py`),
   and PP runs without overlap, which a prefill-only server allows.
+- Draft prompt pass on the decode (`SGLANG_TPU_PD_DECODE_DRAFT_PREFILL`, off by
+  default): the prefill's last stage skips the draft and writes each prompt
+  token's draft-input hidden into `pd_hidden_pool.py`, a paged buffer Raiden
+  moves with the target KV in place of the draft KV; the decode reads it back
+  and runs the draft over the prompt on each prebuilt batch (`pd_draft_prefill.py`).
+  The buffer pages like the full KV pool, so it scales with the prefill's
+  `--max-total-tokens`. Needs the Raiden pipeline transfer; no DP attention.
 - DP attention on the decode: the decode ranks pull their own requests' KV, which
   relieves the PP transfer that bounds a non-DP decode (`pd_singlehost_pp_spec.py`
   `decode_dp`; it adds `--enable-dp-lm-head`).
