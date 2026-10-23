@@ -21,7 +21,7 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
@@ -2234,16 +2234,22 @@ class MMReceiverBase(ABC):
             )
             encode_thread.start()
             return scheduler_dispatch_ready
+        elif mm_data:
+            # A language-only server warms no vision path, so encoding locally
+            # would recompile (or run eager) instead of failing visibly.
+            logger.warning(
+                f"No encoder URLs available for request {obj.rid}; "
+                "rejecting instead of encoding locally."
+            )
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=(
+                    f"No encoder is registered to embed the {len(mm_data)} "
+                    "multimodal item(s) in this request."
+                ),
+            )
         else:
-            # No encoder URLs available (bootstrap may not have any registered yet);
-            # reset the flag so the scheduler does not wait for embeddings that will
-            # never arrive.  A warning is emitted so the user can diagnose why
-            # disaggregation is not happening for this request.
-            if mm_data:
-                logger.warning(
-                    f"No encoder URLs available for request {obj.rid}; "
-                    "processing without encoder disaggregation."
-                )
+            # Nothing to dispatch; the scheduler must not wait for embeddings.
             obj.need_wait_for_mm_inputs = False
             return None
 

@@ -9,6 +9,8 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 from sglang.srt.disaggregation.encoder.receiver import (
     MMReceiverBase,
     WaitingMMRequestStatus,
@@ -393,6 +395,29 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(waiting_req.released)
         self.assertTrue(waiting_req.closed)
         self.assertEqual(len(abort_reqs), 1)
+
+
+class TestEncodeDispatchWithoutEncoder(CustomTestCase):
+    """With no encoder registered, a multimodal request fails instead of encoding locally."""
+
+    @staticmethod
+    def _dispatch(mm_data):
+        receiver = SimpleNamespace(
+            encode_urls=[], _extract_url_data=lambda obj: mm_data
+        )
+        obj = SimpleNamespace(rid="request-1", need_wait_for_mm_inputs=True)
+        result = MMReceiverBase._send_encode_request(receiver, obj)
+        return obj, result
+
+    def test_rejects_mm_request(self):
+        with self.assertRaises(HTTPException) as raised:
+            self._dispatch(["http://example.invalid/a.png"])
+        self.assertEqual(raised.exception.status_code, HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def test_text_only_request_passes_without_waiting(self):
+        obj, result = self._dispatch([])
+        self.assertIsNone(result)
+        self.assertFalse(obj.need_wait_for_mm_inputs)
 
 
 if __name__ == "__main__":
