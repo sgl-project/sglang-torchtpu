@@ -126,6 +126,10 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # io backend asserts it moves all of the pool's KV state: a pool that keeps
     # quantization scales outside get_fused_kv_buffer must not list it.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+    # How raiden push-reshards a page between unequal attention TPs (a
+    # transfer_layout.PageSharding value): each rank holds its kv-head slice of
+    # every token. A subclass that changes the page layout must restate this.
+    raiden_page_sharding: str = "head_sliced"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -603,6 +607,11 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     # raiden's page copy is layout-agnostic, and torch_tpu's host pool reads
     # its page shape from get_fused_kv_buffer, so it mirrors this layout too.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+    # FIXME: "head_sliced" only keeps the push-resharding admission this pool
+    # has always had. raiden's head-slice geometry assumes the fused pool's
+    # token-major page, which this layout is not, and no P/D e2e covers it:
+    # teach the geometry this layout or declare "unsupported".
+    raiden_page_sharding: str = "head_sliced"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -789,6 +798,10 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
     """
 
     HEAD_DIM_ALIGNMENT = 128
+    # How raiden push-reshards a page between unequal attention TPs: the latent
+    # page has no head axis and is the same on every attention-TP rank, so it
+    # moves whole. A subclass that changes the page layout must restate this.
+    raiden_page_sharding: str = "replicated"
 
     def __init__(
         self,
@@ -965,24 +978,96 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # ------------------------------------------------------------------ #
-    # CPU offload / restore — unsupported on the paged MLA layout
+    # CPU offload / restore (retraction backup)
     # ------------------------------------------------------------------ #
+    #
+    # A page [page_size // kv_packing, kv_packing, dim] stores its tokens in
+    # order (token t at row t // kv_packing, lane t % kv_packing), so a page
+    # flattened to [page_size, dim] is indexed by the token's offset in it.
 
-    def get_cpu_copy(self, *args, **kwargs):
-        raise NotImplementedError(
-            "CPU offloading / HiCache is unsupported on the paged TPU fused MLA "
-            "layout: the base MLATokenToKVPool implementation indexes the KV "
-            "buffer by token id, which assumes the flat [size, 1, kv_cache_dim] "
-            "layout, not this pool's [num_pages, page_size // kv_packing, "
-            "kv_packing, dim] paged buffer. TODO: map token id -> (page, slot) "
-            "for the 4-D index before enabling offload with pallas_tpu_mla."
-        )
+    _synchronize_device = TpuFusedMHATokenToKVPool._synchronize_device
 
-    def load_cpu_copy(self, *args, **kwargs):
-        raise NotImplementedError(
-            "CPU offloading / HiCache is unsupported on the paged TPU fused MLA "
-            "layout (see TpuFusedMLATokenToKVPool.get_cpu_copy)."
-        )
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Copy the latent rows of the tokens ``indices`` out to host.
+
+        Returns ``cpu_offloading_chunk_size`` chunks of ``[tokens, dim]`` per
+        layer, the format `load_cpu_copy` and `filter_cpu_copy` read.
+
+        Only the pages holding ``indices`` leave the device, and their token
+        rows are picked on host: viewing a whole layer as token rows on TPU
+        relays out the entire buffer, which needs the layer's size again in
+        scratch HBM and fails on a real pool.
+        """
+        indices = indices.to(device="cpu", dtype=torch.long)
+        if indices.numel() == 0:
+            return [[] for _ in range(self.layer_num)]
+        pages, page_pos = torch.unique(indices // self.page_size, return_inverse=True)
+        rows_in_pages = page_pos * self.page_size + indices % self.page_size
+        device_pages = pages.to(self.kv_buffer[0].device)
+        self._synchronize_device()
+        kv_cache_cpu = []
+        for buf in self.kv_buffer[: self.layer_num]:
+            held = buf.index_select(0, device_pages).to("cpu")
+            rows = held.view(-1, buf.shape[-1]).index_select(0, rows_in_pages)
+            kv_cache_cpu.append(list(rows.split(self.cpu_offloading_chunk_size)))
+        self._synchronize_device()
+        return kv_cache_cpu
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        """Write a `get_cpu_copy` payload back to the tokens ``indices``.
+
+        Pages go through `write_pages_torch`, which updates the layer buffer
+        in place (an eager scatter would reallocate it and strand its
+        registrations); a page ``indices`` only partly covers is read back
+        first and merged.
+        """
+        from sglang_tpu.kv_page_write import write_pages_torch
+
+        indices = indices.to(device="cpu", dtype=torch.long)
+        if indices.numel() == 0:
+            return
+        page = self.page_size
+        blocks = indices // page
+        offsets = indices % page
+        uniq_blocks, block_pos = torch.unique(blocks, return_inverse=True)
+        full = torch.bincount(block_pos, minlength=uniq_blocks.numel()) == page
+        full_rows = full[block_pos]
+        # Position of each row's page within the full / partial page batches.
+        full_pos = torch.cumsum(full.long(), 0) - 1
+        part_pos = torch.cumsum((~full).long(), 0) - 1
+        device = self.kv_buffer[0].device
+        full_blocks = uniq_blocks[full].to(device)
+        part_blocks = uniq_blocks[~full].to(device)
+        full_page_pos = full_pos[block_pos][full_rows]
+        full_offsets = offsets[full_rows]
+        part_page_pos = part_pos[block_pos][~full_rows].to(device)
+        part_offsets = offsets[~full_rows].to(device)
+
+        self._synchronize_device()
+        for layer in range(self.layer_num):
+            rows = torch.cat(kv_cache_cpu[layer], dim=0)
+            assert rows.shape[0] == indices.numel()
+            dst = self.kv_buffer[layer]
+            page_shape = dst.shape[1:]
+            if full_blocks.numel():
+                pages = torch.empty(
+                    (full_blocks.numel(), page, rows.shape[-1]), dtype=rows.dtype
+                )
+                pages[full_page_pos, full_offsets] = rows[full_rows]
+                pages = pages.view(-1, *page_shape).to(device, non_blocking=True)
+                write_pages_torch(full_blocks, pages, dst)
+            if part_blocks.numel():
+                pages = dst[part_blocks].view(-1, page, rows.shape[-1])
+                pages[part_page_pos, part_offsets] = rows[~full_rows].to(
+                    device, non_blocking=True
+                )
+                write_pages_torch(part_blocks, pages.view(-1, *page_shape), dst)
+        self._synchronize_device()
+
+    # Same payload as the MHA pool's: per-layer chunks of token-major rows.
+    filter_cpu_copy = TpuFusedMHATokenToKVPool.filter_cpu_copy
 
     def get_mla_kv_buffer(self, *args, **kwargs):
         raise NotImplementedError(

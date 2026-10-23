@@ -390,8 +390,10 @@ def run_server(
 def load_recipe(name):
     """Load a recipe, or one P/D engine via module:PREFILL_CONFIG/DECODE_CONFIG.
 
-    Selecting an engine runs it on the local host without a router. A decode
-    service can therefore start without knowing the prefill pod's address.
+    Selecting an engine runs it without a router, so a decode service can start
+    without knowing the prefill pod's address. A single-host engine (from a
+    GROUP recipe) runs on the local host; a multi-host engine (``nnodes > 1``)
+    runs like any multi-node recipe on each host of its slice.
     """
     name, _, export = name.partition(":")
     name = name.removesuffix(".py").replace("/", ".")
@@ -402,18 +404,23 @@ def load_recipe(name):
     module = importlib.import_module(name)
     group = getattr(module, "GROUP", None)
     if export:
-        if (
-            not group
-            or not group.get("prefill_engines")
-            or export not in ("PREFILL_CONFIG", "DECODE_CONFIG")
+        engine = (
+            getattr(module, export, None)
+            if export in ("PREFILL_CONFIG", "DECODE_CONFIG")
+            else None
+        )
+        multi_host = engine is not None and engine["server_args"].get("nnodes", 1) > 1
+        if engine is None or not (
+            multi_host or (group and group.get("prefill_engines"))
         ):
             raise ValueError("Select PREFILL_CONFIG or DECODE_CONFIG from a P/D recipe")
-        config = deepcopy(getattr(module, export))
+        config = deepcopy(engine)
         config["server_args"].setdefault(
             "disaggregation_mode", export.removesuffix("_CONFIG").lower()
         )
         config["server_args"].setdefault("host", "0.0.0.0")
-        config["group"] = {"hosts": 1}
+        if not multi_host:
+            config["group"] = {"hosts": 1}
         if "runtime_env" in config:
             if "runtime_envs" in config:
                 raise ValueError("Use only one of runtime_envs and runtime_env")

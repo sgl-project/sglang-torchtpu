@@ -25,6 +25,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
+import collections
 import os
 import sys
 import threading
@@ -43,7 +44,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.common import (
+    VALIDATED_RESHARD_LAYOUTS,
     RaidenKVCacheGroups,
+    StateSharding,
     get_raiden_kv_caches,
 )
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -58,7 +61,9 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    ReshardState,
 )
+from sglang_tpu.disaggregation.transfer_layout import PageSharding
 from sglang_tpu.mamba_pool import TpuMambaPool
 
 
@@ -196,6 +201,7 @@ class RaidenRendezvousTestCase(CustomTestCase):
             m.kv_args = args
             m.server_args = server_args
             m.disaggregation_mode = disaggregation_mode
+            m.is_mla_backend = is_mla
             m.attn_tp_size = attn_tp_size
             m.attn_tp_rank = attn_tp_rank
             m.attn_dp_rank = 0
@@ -232,6 +238,7 @@ class RaidenRendezvousTestCase(CustomTestCase):
             sliding_window_size=None,
             engine_rank=attn_tp_rank,
             state_types=[],
+            is_hybrid_mla_backend=False,
         )
         server_args = SimpleNamespace(context_length=1024)
 
@@ -260,11 +267,12 @@ class RaidenRendezvousTestCase(CustomTestCase):
 
     @staticmethod
     def _release(m) -> None:
-        # __init__ creates _push_executor only on the prefill branch, so a
-        # decode manager genuinely has no such attribute to shut down.
-        executor = m.__dict__.get("_push_executor")
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+        # __init__ creates these executors only on the prefill branch, so a
+        # decode manager genuinely has no such attributes to shut down.
+        for name in ("_push_executor", "_state_copy_executor"):
+            executor = m.__dict__.get(name)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
 
     def _prefill(self, **kw):
         return self._manager(DisaggregationMode.PREFILL, **kw)
@@ -880,14 +888,20 @@ class TestRaidenStateTransfer(RaidenStateTestCase):
         prefill.clear_room(room)
         self.assertNotIn(room, prefill._prefill.send_state_rows)
 
-    def test_push_resharding_with_state_fails_closed(self):
+    def test_push_resharding_with_gdn_state_fails_closed(self):
+        """State fan-in is validated only beside replicated MLA latent pages; a
+        GDN model (head-sliced KV pages) refuses push-resharding on both sides."""
         prefill, decode = self._state_pair()
+        for m in (prefill, decode):
+            m._state_kv_caches = (torch.zeros(4, 3, 1, 8), torch.zeros(4, 2, 4, 4))
+            m._state_slice_axes = (2, 0)
         infos = self._bootstrap_info(prefill) * 2
-        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+        with self.assertRaisesRegex(NotImplementedError, "not validated"):
             decode.register_decode_request(
                 7330, [1], [], aux_index=None, bootstrap_infos=infos
             )
-        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+        self.assertEqual(self.inboxes[prefill.endpoint].frames, [])
+        with self.assertRaisesRegex(NotImplementedError, "not validated"):
             prefill._on_reshard_req(
                 ReshardReq(
                     room=7330,
@@ -912,6 +926,475 @@ class TestRaidenStateTransfer(RaidenStateTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "GDN"):
             decode.set_kv_caches(groups)
+
+
+# Kimi-K3-shaped GDN state at attention TP 1: a fused q|k|v conv channel axis
+# whose sub-blocks are sharded independently, and per-head recurrent state.
+_SLOTS, _K, _D, _HEADS = 4, 4, 8, 4
+_CONV_GROUPS = [64, 32, 32]
+
+
+class TestRaidenStateFanIn(RaidenStateTestCase):
+    """Decode attention TP < prefill TP: every source sends its committed state
+    row ahead of its RESHARD_BLOCKS, the decode assembles its wider row, and
+    the replicated MLA latent pages move whole."""
+
+    def _with_state(self, m, *, tp, seed=0, checkpoint_width=1):
+        super()._with_state(m)
+        generator = torch.Generator().manual_seed(seed)
+        # TpuMambaPool's layout: the slot rows, then with speculation one verify
+        # window of checkpoint_width rows per request. A transfer uses slot rows.
+        windows = _SLOTS * checkpoint_width if checkpoint_width > 1 else 0
+        rows = _SLOTS + windows
+        conv = torch.randn(
+            rows, _K - 1, 1, sum(_CONV_GROUPS) // tp, generator=generator
+        )
+        temporal = torch.randn(rows, _HEADS // tp, _D, _D, generator=generator)
+        m._engine.transfer_address = f"full-{m.rank_port}"
+        m._state_kv_caches = (conv, temporal)
+        m._state_slice_axes = (2, 0)
+        m._state_conv_groups = (_CONV_GROUPS, None)
+        m._full_sharding = PageSharding.REPLICATED
+        # MLA latent pages, the same on every attention-TP rank.
+        m._kv_caches = [torch.zeros(16, 2, 2, 64, dtype=torch.bfloat16)]
+        m.chunked_transfer = True
+        # Read by update_status; the stubbed common init does not set them.
+        m._deferred_ack_targets = {}
+        m._deferred_ack_poisoned_rooms = set()
+        m._staging_outstanding = collections.defaultdict(int)
+        return m
+
+    def _sources(self):
+        return [
+            self._with_state(
+                self._prefill(attn_tp_rank=r, attn_tp_size=2), tp=2, seed=r
+            )
+            for r in range(2)
+        ]
+
+    def _register(self, decode, sources, room, local_blocks, slot):
+        decode.register_decode_request(
+            room,
+            local_blocks,
+            [],
+            aux_index=None,
+            bootstrap_infos=[self._bootstrap_info(p)[0] for p in sources],
+            local_state_rows=decode._state_rows_from_state_indices(
+                _mamba_state_indices(slot)
+            ),
+        )
+
+    def _fan_in_room(self, room, local_blocks=(4,)):
+        """Both sources and a TP-1 decode that asked them for room (slot 1)."""
+        sources = self._sources()
+        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
+        self._register(decode, sources, room, list(local_blocks), 1)
+        return sources, decode
+
+    @staticmethod
+    def _drain_state_copies(prefill):
+        # One worker, first in first out: a no-op runs after every queued copy.
+        prefill._state_copy_executor.submit(lambda: None).result()
+
+    def _send(self, prefill, room, prefill_slot, blocks=(1, 2)):
+        prefill._on_reshard_req(
+            self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
+        )
+        self._finish_last_chunk(prefill, room, prefill_slot, blocks)
+        self._drain_state_copies(prefill)
+
+    @staticmethod
+    def _finish_last_chunk(prefill, room, prefill_slot, blocks=(1,)):
+        # What RaidenKVSender.send() runs once the room's last chunk is computed.
+        rows = prefill._state_rows_from_state_indices(
+            _mamba_state_indices(prefill_slot)
+        )
+        prefill.append_send_blocks(room, list(blocks), state_block_ids=rows)
+        prefill.finalize_send(room, aux_index=None)
+        prefill.stage_reshard_state(room)
+
+    def _send_all(self, decode, sources, room, blocks=(1,)):
+        """Source r sends slot r + 1; the decode takes each source's state rows,
+        then its block list, in wire order."""
+        for r, prefill in enumerate(sources):
+            self._send(prefill, room, prefill_slot=r + 1, blocks=blocks)
+        for prefill in sources:
+            frames = self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+            state = ReshardState.from_frames(frames)
+            self.assertEqual((state.room, state.src_rank), (room, prefill._local_rank))
+            decode._on_reshard_state(frames)
+            decode._on_reshard_blocks(
+                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+            )
+
+    def test_decode_assembles_its_row_from_both_sources(self):
+        sources = self._sources()
+        decode = self._with_state(
+            self._decode(attn_tp_size=1), tp=1, seed=9, checkpoint_width=2
+        )
+        before = [t.clone() for t in decode._state_kv_caches]
+        room, slot = 7401, 2
+
+        self._register(decode, sources, room, [4, 9], slot)
+        self._send_all(decode, sources, room, blocks=(1, 2))
+
+        # The full plan moves whole MLA pages from every source.
+        ((plan_args, plan_kwargs),) = decode._engine.plans
+        self.assertIs(plan_kwargs.get("is_sender"), False)
+        entries = [
+            e
+            for schedule in plan_args[1].shard_push_schedules.values()
+            for e in schedule.entries
+        ]
+        page_bytes = decode._kv_caches[0][0].nbytes
+        self.assertEqual(len(entries), 2 * 2)
+        self.assertTrue(
+            all((e.size_bytes, e.count) == (page_bytes, 1) for e in entries)
+        )
+        for prefill in sources:
+            ReshardReady.from_frames(
+                self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_READY)
+            )
+            # The state went out as host rows, so it is sent.
+            self.assertIn(f"state:{room}", prefill._completed_send)
+            self.assertEqual(prefill._state_engine.reads, [])
+
+        # Written on the scheduler thread, then the state read counts as landed.
+        self.assertNotIn(f"state:{room}", decode._completed_recv)
+        decode.apply_state_uploads()
+        self.assertIn(f"state:{room}", decode._completed_recv)
+
+        conv, temporal = decode._state_kv_caches
+        row = decode._committed_state_row(slot)
+        bounds = np.cumsum([0, *(g // 2 for g in _CONV_GROUPS)])
+        want_conv = torch.cat(
+            [
+                sources[w]._state_kv_caches[0][w + 1][..., lo:hi]
+                for lo, hi in zip(bounds[:-1], bounds[1:])
+                for w in range(2)
+            ],
+            dim=-1,
+        )
+        want_temporal = torch.cat(
+            [s._state_kv_caches[1][w + 1] for w, s in enumerate(sources)]
+        )
+        torch.testing.assert_close(conv[row], want_conv)
+        torch.testing.assert_close(temporal[row], want_temporal)
+        other_slots = [i for i in range(_SLOTS) if i != row]
+        for got, old in zip(decode._state_kv_caches, before):
+            torch.testing.assert_close(got[other_slots], old[other_slots])
+            # The verify windows after the slot rows stay untouched.
+            torch.testing.assert_close(got[_SLOTS:], old[_SLOTS:])
+
+    def test_a_reshard_without_a_state_row_fails_the_room(self):
+        room = 7403
+        sources, _ = self._fan_in_room(room)
+        prefill = sources[0]
+        prefill.request_status[room] = KVPoll.Transferring
+        prefill._on_reshard_req(
+            self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
+        )
+        prefill.append_send_blocks(room, [1])
+        prefill.finalize_send(room, aux_index=None)
+        prefill.stage_reshard_state(room)
+        self.assertIn("no GDN state row", prefill.failure_records[room])
+
+    def test_a_pulled_room_is_never_copied(self):
+        (prefill, _) = self._sources()
+        decode = self._decode()
+        room = 7404
+        prefill._on_pull_req(self._pull_req_frames(decode, room, 1))
+        prefill.append_send_blocks(room, [1], state_block_ids=[2])
+        prefill.stage_reshard_state(room)
+        self.assertNotIn(room, prefill._prefill.reshard_state_staged)
+
+    def test_a_late_pull_req_copies_no_state(self):
+        # A decode short of memory sends its PULL_REQ after the last chunk.
+        # The room is never resharded, so its row is not copied, either at
+        # the last chunk or when poll() runs after the request.
+        (prefill, _) = self._sources()
+        decode = self._decode()
+        room = 7408
+        prefill.request_status[room] = KVPoll.WaitingForInput
+        self._finish_last_chunk(prefill, room, prefill_slot=2)
+        prefill._on_pull_req(self._pull_req_frames(decode, room, 1))
+        prefill.stage_reshard_state(room)
+        self._drain_state_copies(prefill)
+        self.assertNotIn(room, prefill._prefill.reshard_state_staged)
+        self.assertNotIn(room, prefill._prefill.reshard_state)
+
+    def test_a_late_reshard_req_is_staged_by_poll_then_replied(self):
+        room = 7406
+        sources, decode = self._fan_in_room(room)
+        prefill = sources[0]
+        self._finish_last_chunk(prefill, room, prefill_slot=3)
+        # Nothing asked to reshard yet, so nothing was gathered.
+        self.assertNotIn(room, prefill._prefill.reshard_state_staged)
+        prefill._on_reshard_req(
+            self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
+        )
+        # The listener does not read the pool, so the reply waits for poll().
+        self.assertNotIn(room, prefill._prefill.reshard_state_staged)
+        self.assertEqual(self.inboxes[decode.endpoint].frames, [])
+        prefill.stage_reshard_state(room)
+        self._drain_state_copies(prefill)
+        state = ReshardState.from_frames(
+            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+        )
+        np.testing.assert_array_equal(
+            state.rows[1], prefill._state_kv_caches[1][3].numpy()
+        )
+        self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+
+    def test_the_host_copy_runs_on_the_state_copy_worker(self):
+        room = 7407
+        sources, decode = self._fan_in_room(room)
+        prefill = sources[0]
+        queued = []
+        worker = SimpleNamespace(submit=lambda fn, *args: queued.append((fn, args)))
+        with patch.object(prefill, "_state_copy_executor", worker):
+            prefill._on_reshard_req(
+                self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
+            )
+            self._finish_last_chunk(prefill, room, prefill_slot=2)
+        # The scheduler thread only gathered on device: no host copy, no reply.
+        self.assertEqual(len(queued), 1)
+        self.assertNotIn(room, prefill._prefill.reshard_state)
+        self.assertEqual(self.inboxes[decode.endpoint].frames, [])
+        fn, args = queued[0]
+        fn(*args)
+        state = ReshardState.from_frames(
+            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+        )
+        np.testing.assert_array_equal(
+            state.rows[1], prefill._state_kv_caches[1][2].numpy()
+        )
+        self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+
+    def test_missing_source_rows_fail_the_room(self):
+        room = 7405
+        sources, decode = self._fan_in_room(room)
+        for r, prefill in enumerate(sources):
+            self._send(prefill, room, prefill_slot=r + 1, blocks=(1,))
+        # The first source's rows are lost; both block lists arrive.
+        self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+        decode._on_reshard_blocks(
+            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+        )
+        decode._on_reshard_state(
+            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+        )
+        decode._on_reshard_blocks(
+            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+        )
+        self.assertTrue(decode.is_failed(room))
+        self.assertIn("state rows from source ranks", decode.failure_records[room])
+        self.assertEqual(decode._engine.plans, [])
+
+    def test_conv_rows_without_sub_block_widths_fail_the_room(self):
+        """Without its q | k | v widths a conv row cannot be split per
+        sub-block; whole rows side by side would be the wrong layout."""
+        room = 7408
+        sources, decode = self._fan_in_room(room)
+        decode._state_conv_groups = (None, None)
+        self._send_all(decode, sources, room)
+        self.assertTrue(decode.is_failed(room))
+        self.assertIn("conv sub-block widths", decode.failure_records[room])
+        self.assertEqual(decode._engine.plans, [])
+        self.assertEqual(decode._decode.state_uploads, {})
+
+    def test_pure_mla_push_resharding_fails_closed(self):
+        """Replicated latent pages are validated only beside row-sharded state,
+        so a pure MLA decode refuses before asking its sources instead of
+        timing out."""
+        sources = [self._prefill(attn_tp_rank=r, attn_tp_size=2) for r in range(2)]
+        decode = self._decode(attn_tp_size=1)
+        decode._full_sharding = PageSharding.REPLICATED
+        with self.assertRaisesRegex(NotImplementedError, "not validated"):
+            self._register(decode, sources, 7409, [4], 1)
+        for prefill in sources:
+            self.assertEqual(self.inboxes[prefill.endpoint].frames, [])
+
+    def test_full_prefix_hit_still_moves_state(self):
+        room = 7406
+        sources, decode = self._fan_in_room(room, local_blocks=())
+        self.assertNotIn(str(room), decode._completed_recv)
+        self._send_all(decode, sources, room)
+        # No page plan: the READY asks for no pages.
+        self.assertEqual(decode._engine.plans, [])
+        for prefill in sources:
+            ready = ReshardReady.from_frames(
+                self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_READY)
+            )
+            self.assertEqual(ready.pages, [])
+        self.assertFalse(decode.is_recv_done(room))
+        decode.apply_state_uploads()
+        self.assertTrue(decode.is_recv_done(room))
+
+    def test_clearing_a_room_drops_its_state_rows(self):
+        room = 7407
+        sources, decode = self._fan_in_room(room)
+        self._send(sources[0], room, prefill_slot=1, blocks=(1,))
+        decode._on_reshard_state(
+            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+        )
+        self.assertIn(room, decode._decode.reshard_state_sources)
+        decode.clear_room(room)
+        self.assertNotIn(room, decode._decode.reshard_state_sources)
+        sources[0].clear_room(room)
+        self.assertNotIn(room, sources[0]._prefill.reshard_state)
+
+
+_HEAD, _REPLICATED = PageSharding.HEAD_SLICED, PageSharding.REPLICATED
+_ROW = StateSharding.ROW_SHARDED
+
+# (full, SWA, state) layouts, whether push-resharding admits each, and the flags
+# set by the TPU pool that builds it, (is_mla_backend,
+# kv_args.is_hybrid_mla_backend), or None when no TPU pool builds it.
+_RESHARD_LAYOUTS = {
+    # TpuFusedMHATokenToKVPool
+    "head": ((_HEAD, None, None), True, (False, False)),
+    # SWAKVPool over two of them
+    "head + head SWA": ((_HEAD, _HEAD, None), True, (False, False)),
+    # TpuFusedMLATokenToKVPool
+    "replicated": ((_REPLICATED, None, None), False, (True, False)),
+    # The upstream MLATokenToKVPool, which declares nothing
+    "unsupported": ((PageSharding.UNSUPPORTED, None, None), False, (True, False)),
+    # HybridLinearKVPool over a fused MHA pool and a TpuMambaPool (GDN)
+    "head + row state": ((_HEAD, None, _ROW), False, (False, False)),
+    # HybridLinearKVPool over a fused MLA pool and a TpuMambaPool (KDA)
+    "replicated + row state": ((_REPLICATED, None, _ROW), True, (False, True)),
+    "replicated + row state + SWA": ((_REPLICATED, _HEAD, _ROW), False, None),
+    "replicated + state that cannot reshard": (
+        (_REPLICATED, None, StateSharding.UNSUPPORTED),
+        False,
+        None,
+    ),
+}
+# Layouts the flag gate let through, now refused before any page moves: a
+# hybrid MLA pool whose mamba pool is not a TpuMambaPool (its state never
+# moved), and an MLA-backed SWAKVPool (head-slice geometry raised on its rank-4
+# latent pages in the listener, so the room timed out).
+_NEWLY_REFUSED_LAYOUTS = {
+    "hybrid MLA without state": ((_REPLICATED, None, None), (False, True)),
+    "MLA-backed SWAKVPool": ((_REPLICATED, _REPLICATED, None), (False, False)),
+}
+
+
+def _flag_gate_refused(flags, state, *, decode: bool) -> bool:
+    """The gate the declared page shardings replaced: the decode refused an MLA
+    pool, and both sides refused state beside anything but a hybrid MLA pool."""
+    is_mla, is_hybrid_mla = flags
+    return (decode and is_mla) or (state is not None and not is_hybrid_mla)
+
+
+class TestRaidenReshardLayoutGate(RaidenStateTestCase):
+    """Push-resharding is admitted by the cache layout the pools declare, and
+    both sides refuse an unvalidated one before any page moves."""
+
+    def test_every_validated_layout_names_its_e2e(self):
+        e2e_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), os.pardir, "e2e"
+        )
+        for layout, tests in VALIDATED_RESHARD_LAYOUTS.items():
+            for name in tests.split(", "):
+                with self.subTest(layout=layout, test=name):
+                    self.assertTrue(os.path.isfile(os.path.join(e2e_dir, name)))
+
+    def _layout_manager(self, mode, layout, flags, **kw):
+        full, swa, state = layout
+        m = self._manager(mode, **kw)
+        m._full_sharding = full
+        if swa is not None:
+            m._swa_sharding = swa
+            m._swa_engine = _FakeRaidenEngine()
+            m._swa_engine.transfer_address = f"swa-{m.rank_port}"
+        if state is not None:
+            self._with_state(m)
+            m._state_kv_caches = (torch.zeros(4, 3, 1, 8), torch.zeros(4, 2, 4, 4))
+            # Rows can be reassembled only along an axis named for every tensor.
+            m._state_slice_axes = (2, 0) if state is _ROW else ()
+        # Set as the pool would, though they no longer decide anything.
+        m.is_mla_backend, m.kv_args.is_hybrid_mla_backend = flags
+        m._engine.transfer_address = f"full-{m.rank_port}"
+        # Read by update_status; the stubbed common init does not set them.
+        m._deferred_ack_targets = {}
+        m._deferred_ack_poisoned_rooms = set()
+        m._staging_outstanding = collections.defaultdict(int)
+        return m
+
+    def _refused(self, layout, flags, room) -> bool:
+        """Whether a TP-1 decode and its two TP-2 sources refuse to reshard
+        room; both sides must agree."""
+        sources = [
+            self._layout_manager(
+                DisaggregationMode.PREFILL,
+                layout,
+                flags,
+                attn_tp_rank=r,
+                attn_tp_size=2,
+            )
+            for r in range(2)
+        ]
+        decode = self._layout_manager(DisaggregationMode.DECODE, layout, flags)
+        try:
+            decode.register_decode_request(
+                room,
+                [4],
+                [],
+                aux_index=None,
+                bootstrap_infos=[self._bootstrap_info(p)[0] for p in sources],
+            )
+            refused = False
+        except NotImplementedError as e:
+            self.assertIn("not validated", str(e))
+            refused = True
+        for prefill in sources:
+            inbox = self.inboxes[prefill.endpoint]
+            if not refused:
+                prefill._on_reshard_req(inbox.take(MessageTag.RESHARD_REQ))
+                self.assertIn(room, prefill._prefill.reshard_req)
+                continue
+            self.assertEqual(inbox.frames, [])
+            with self.assertRaisesRegex(NotImplementedError, "not validated"):
+                prefill._on_reshard_req(
+                    ReshardReq(
+                        room=room,
+                        decode_ip="127.0.0.1",
+                        decode_port=decode.rank_port,
+                        push_endpoint="tcp://push",
+                        decode_blocks=[4],
+                        dst_attn_tp=1,
+                        decode_swa_blocks=[],
+                        swa_push_endpoint="",
+                    ).to_frames()
+                )
+            self.assertNotIn(room, prefill._prefill.reshard_req)
+        return refused
+
+    def test_refusals_match_the_flag_gate_they_replace(self):
+        for room, (name, (layout, admitted, flags)) in enumerate(
+            _RESHARD_LAYOUTS.items(), 7500
+        ):
+            with self.subTest(layout=name):
+                refused = self._refused(layout, flags or (False, False), room)
+                self.assertEqual(refused, not admitted)
+                if flags is None:
+                    continue
+                self.assertEqual(
+                    refused, _flag_gate_refused(flags, layout[2], decode=True)
+                )
+                # The prefill refused less than the decode; now they match.
+                if _flag_gate_refused(flags, layout[2], decode=False):
+                    self.assertTrue(refused)
+
+    def test_unvalidated_layouts_the_flag_gate_admitted_are_refused(self):
+        for room, (name, (layout, flags)) in enumerate(
+            _NEWLY_REFUSED_LAYOUTS.items(), 7520
+        ):
+            with self.subTest(layout=name):
+                self.assertFalse(_flag_gate_refused(flags, layout[2], decode=True))
+                self.assertTrue(self._refused(layout, flags, room))
 
 
 class TestRaidenStateEngine(RaidenRendezvousTestCase):
@@ -976,6 +1459,8 @@ class TestRaidenStateGroups(CustomTestCase):
         mamba.checkpoint_width = 3
         state = [torch.zeros(12, 2, 1, 4), torch.zeros(12, 4, 2, 2)]
         mamba.get_state = lambda: state
+        mamba.get_state_slice_axes = lambda: [2, 0]
+        mamba.get_state_conv_shard_groups = lambda: [[2, 1, 1], None]
         pool, kv = self._hybrid_pool(mamba_pool=mamba)
 
         groups = get_raiden_kv_caches(pool)
@@ -984,6 +1469,8 @@ class TestRaidenStateGroups(CustomTestCase):
         self.assertEqual(groups.full_layer_ids, [3, 7])
         self.assertEqual(groups.state, state)
         self.assertEqual(groups.committed_state_row(2), 2)
+        self.assertEqual(groups.state_slice_axes, [2, 0])
+        self.assertEqual(groups.state_conv_groups, [[2, 1, 1], None])
 
     def test_non_tpu_mamba_pool_contributes_no_state(self):
         pool, _ = self._hybrid_pool(mamba_pool=object())
@@ -997,6 +1484,8 @@ class TestRaidenStateGroups(CustomTestCase):
         mamba = TpuMambaPool.__new__(TpuMambaPool)
         mamba.checkpoint_width = 1
         mamba.get_state = lambda: [torch.zeros(4, 2), torch.zeros(5, 2)]
+        mamba.get_state_slice_axes = lambda: [0, 0]
+        mamba.get_state_conv_shard_groups = lambda: [None, None]
         pool, _ = self._hybrid_pool(mamba_pool=mamba)
 
         with self.assertRaisesRegex(RuntimeError, "uniform GDN state"):

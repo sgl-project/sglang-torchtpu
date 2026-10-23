@@ -108,6 +108,7 @@
     "decode-radix": "PD decode-side radix reuse",
     "prefix-cache": "Prefix cache",
     "kv-offload": "HiCache KV offload",
+    "retraction": "PD decode retraction and resume",
     "logprob": "Prompt logprobs",
     "compile": "torch.compile",
     "torch-compile": "torch.compile bundles",

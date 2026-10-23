@@ -33,6 +33,9 @@ on:
         options:
           - all
           - mh
+          - pd-sh-kimi-k3-tiny
+          - pd-sh-kimi-k3-tiny-reshard
+          - pd-sh-kimi-k3-tiny-retract
           - pd-sh-qwen3-vl-30b
           - sh
       test_filter:
@@ -98,6 +101,9 @@ jobs:
     outputs:
       single_host: ${{ steps.tests.outputs.single_host }}
       pd_singlehost_qwen3_vl_30b: ${{ steps.tests.outputs.pd_singlehost_qwen3_vl_30b }}
+      pd_singlehost_kimi_k3_tiny: ${{ steps.tests.outputs.pd_singlehost_kimi_k3_tiny }}
+      pd_singlehost_kimi_k3_tiny_reshard: ${{ steps.tests.outputs.pd_singlehost_kimi_k3_tiny_reshard }}
+      pd_singlehost_kimi_k3_tiny_retract: ${{ steps.tests.outputs.pd_singlehost_kimi_k3_tiny_retract }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -126,6 +132,9 @@ jobs:
           echo "single_host=$single_host" >> "$GITHUB_OUTPUT"
           discover_files='python3 .github/tpu-ci/discover_files.py'
           echo "pd_singlehost_qwen3_vl_30b=$($discover_files --entry test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_kimi_k3_tiny=$($discover_files --entry test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_kimi_k3_tiny_reshard=$($discover_files --entry test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd_reshard.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_kimi_k3_tiny_retract=$($discover_files --entry test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd_retract.py)" >> "$GITHUB_OUTPUT"
 
   single-host:
     needs: [build, discover-tests]
@@ -180,6 +189,86 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_qwen3_vl_30b_a3b_pd_singlehost_mmmu.py
       weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_qwen3_vl_30b)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Kimi-K3 (MLA + KDA) on a tiny random-weight model, one TP4 host per engine:
+  # each request's MLA latent pages and KDA conv / recurrent state slot cross
+  # to the decode, whose greedy output must equal the colocated server's.
+  pd-sh-kimi-k3-tiny:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-kimi-k3-tiny"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_kimi_k3_tiny)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_kimi_k3_tiny_pd
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd.py
+      files: test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd.py
+      weights_pvc: model-weights
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_kimi_k3_tiny)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # The same with a TP2 decode: each decode rank assembles its KDA state slot
+  # from two prefill ranks and takes the MLA pages whole by push-resharding.
+  pd-sh-kimi-k3-tiny-reshard:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-kimi-k3-tiny-reshard"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd_reshard.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_kimi_k3_tiny_reshard)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_kimi_k3_tiny_pd_reshard
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd_reshard.py
+      files: test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd_reshard.py
+      weights_pvc: model-weights
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_kimi_k3_tiny_reshard)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # The same at equal TP, with the decode retracting its longest request every
+  # third step and resuming it from the host backup of its MLA pages and KDA
+  # state while the other requests keep decoding.
+  pd-sh-kimi-k3-tiny-retract:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-kimi-k3-tiny-retract"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd_retract.py', inputs.test_filter) }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_kimi_k3_tiny_retract)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_kimi_k3_tiny_pd_retract
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd_retract.py
+      files: test/registered/tpu/e2e/test_tpu_kimi_k3_tiny_pd_retract.py
+      weights_pvc: model-weights
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_kimi_k3_tiny_retract)[0].run_name }}
     permissions:
       contents: read
       id-token: write

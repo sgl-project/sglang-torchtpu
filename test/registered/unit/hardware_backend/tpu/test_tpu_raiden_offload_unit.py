@@ -1019,6 +1019,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
+        mgr.is_mla_backend = False
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
@@ -1050,7 +1051,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         )
 
         mgr._register_reshard_request.assert_called_once_with(
-            31, [8, 9], [6, 7], None, [{}, {}]
+            31, [8, 9], [6, 7], None, [{}, {}], local_state_rows=()
         )
 
     def test_hybrid_swa_reshard_prefix_hit_settles_both_engines(self):

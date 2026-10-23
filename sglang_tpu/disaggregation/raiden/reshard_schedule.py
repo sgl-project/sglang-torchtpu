@@ -22,11 +22,18 @@ kv_packing, padded_head_dim]`` tensor per layer. Native host copies retain
 heads. Only complete head packs are contiguous, so a head slice must cover
 whole packs. These builders turn that geometry into
 ``raiden_service_pb2.StartTransferRequest`` push schedules.
+
+A cache replicated across attention-TP ranks (an MLA latent pool) moves as
+whole blocks instead (``WholeBlockGeometry``), and a hybrid linear-attention
+model's per-request state, which is small, is assembled on the decode from
+each source's rows (``assemble_state_fan_in``) rather than pushed.
 """
 
 from __future__ import annotations
 
 from typing import Any, List, Optional, Protocol, Sequence, Tuple
+
+import numpy as np
 
 
 class FusedKVLayerTensor(Protocol):
@@ -186,6 +193,81 @@ class ReshardGeometry:
         )
 
 
+class WholeBlockGeometry:
+    """Geometry of a cache whose blocks are identical on every attention-TP
+    rank, such as an MLA latent pool: each writer lands the whole source block
+    on the whole destination block (redundant but idempotent across the
+    ``ratio`` writers), so the byte layout inside a block never matters."""
+
+    whole_block = True
+
+    def __init__(self, src_tp: int, dst_tp: int, block_bytes: int):
+        self.src_tp = src_tp
+        self.dst_tp = dst_tp
+        self.ratio = reshard_ratio(src_tp, dst_tp)
+        if block_bytes <= 0:
+            raise ValueError("Raiden block bytes must be positive")
+        self.block_bytes = block_bytes
+
+    def entry_bytes(self, prefill_rank: int, decode_rank: int):
+        del prefill_rank, decode_rank
+        size = self.block_bytes
+        return 0, size, size, 0, size
+
+
+def _entry_count(geom: Any, live: int) -> int:
+    """Runs per block: one whole block, else one per live token."""
+    return 1 if getattr(geom, "whole_block", False) else int(live)
+
+
+def assemble_state_fan_in(
+    sources: Sequence[Sequence[np.ndarray]],
+    slice_axes: Sequence[int],
+    conv_groups: Sequence[Optional[Sequence[int]]],
+    src_tp: int,
+) -> List[np.ndarray]:
+    """One decode rank's state rows from its ``ratio`` prefill sources.
+
+    ``sources[w][i]`` is writer ``w``'s row of state tensor ``i`` (writers in
+    attention-TP order). A tensor is sharded on per-row axis ``slice_axes[i]``;
+    when ``conv_groups[i]`` gives the full widths of sub-blocks laid side by
+    side on that axis (a fused q|k|v conv channel), each sub-block is sharded
+    on its own, so the decode row concatenates every writer's slice of the
+    first sub-block, then of the next. Otherwise the writers' slices simply
+    concatenate.
+    """
+    if not sources:
+        raise ValueError("state fan-in needs at least one source")
+    out = []
+    for i, axis in enumerate(slice_axes):
+        rows = [writer[i] for writer in sources]
+        groups = conv_groups[i]
+        if not groups:
+            out.append(np.concatenate(rows, axis=axis))
+            continue
+        widths = []
+        for full in groups:
+            if full % src_tp:
+                raise ValueError(
+                    f"state sub-block of width {full} does not shard over "
+                    f"{src_tp} ranks"
+                )
+            widths.append(full // src_tp)
+        if sum(widths) != rows[0].shape[axis]:
+            raise ValueError(
+                f"state sub-blocks {list(groups)} at TP {src_tp} cover "
+                f"{sum(widths)} of the source row's {rows[0].shape[axis]}"
+            )
+        bounds = np.cumsum([0, *widths])
+        parts = []
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            index = [slice(None)] * rows[0].ndim
+            index[axis] = slice(int(lo), int(hi))
+            parts.extend(row[tuple(index)] for row in rows)
+        out.append(np.concatenate(parts, axis=axis))
+    return out
+
+
 def _add_entry(
     schedule: Any,
     *,
@@ -259,7 +341,7 @@ def build_sender_request(
             size=size,
             src_stride=src_stride,
             dst_stride=dst_stride,
-            count=int(n),
+            count=_entry_count(geom, n),
         )
     return req
 
@@ -313,7 +395,7 @@ def build_receiver_request(
                 size=size,
                 src_stride=src_stride,
                 dst_stride=dst_stride,
-                count=int(n),
+                count=_entry_count(geom, n),
             )
             total += 1
     req.expected_block_count = (

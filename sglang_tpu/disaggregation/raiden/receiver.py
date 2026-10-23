@@ -31,6 +31,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    ReshardState,
     RoomFailed,
     write_aux_blob,
 )
@@ -215,11 +216,13 @@ class RaidenReceiverMixin:
             )
             return
         if len(bootstrap_infos) != 1:
-            if self._state_engine is not None:
+            refusal = self._reshard_refusal()
+            if refusal is not None:
+                # Refused before any source is asked: an unvalidated layout can
+                # fail in a listener and leave the room to time out.
                 raise NotImplementedError(
-                    "Raiden push resharding does not move GDN (linear-attention) "
-                    f"state yet (got {len(bootstrap_infos)} prefill sources for "
-                    "one decode rank); use equal attention TP on prefill and decode."
+                    f"{len(bootstrap_infos)} prefill sources for one decode rank: "
+                    f"{refusal}; use equal attention TP on prefill and decode."
                 )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
@@ -233,18 +236,25 @@ class RaidenReceiverMixin:
                     "rank) needs per-transfer host staging; do not set "
                     "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING=0."
                 )
-            if not local_blocks:
+            if not local_blocks and self._state_engine is None:
                 # Full prefix-cache hit: decode already holds every page,
                 # nothing to receive. A hybrid model's sliding-window pages sit
                 # inside that prefix, so its engine has nothing to receive
-                # either -- mark both so is_recv_done can settle.
+                # either -- mark both so is_recv_done can settle. GDN state
+                # cannot be rebuilt from cached pages, so a linear-attention
+                # room still asks its sources, for the state alone.
                 with self._state_lock:
                     self._completed_recv.add(str(room))
                     if self._swa_engine is not None:
                         self._completed_recv.add(self._swa_req_id(room))
                 return
             self._register_reshard_request(
-                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+                room,
+                local_blocks,
+                local_swa_blocks,
+                aux_index,
+                bootstrap_infos,
+                local_state_rows=local_state_rows,
             )
             self.update_status(room, KVPoll.WaitingForInput)
             return
@@ -802,6 +812,8 @@ class RaidenReceiverMixin:
         local_swa_blocks: List[int],
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
+        *,
+        local_state_rows: Sequence[int] = (),
     ) -> None:
         # bootstrap_infos is ordered by the decode->prefill target_tp_ranks
         # (range(r*ratio, (r+1)*ratio)); ratio == number of prefill sources.
@@ -824,6 +836,7 @@ class RaidenReceiverMixin:
             self._decode.reshard_meta[room] = dict(
                 local_blocks=list(local_blocks),
                 local_swa_blocks=list(local_swa_blocks or []),
+                local_state_rows=[int(row) for row in local_state_rows],
                 source_ranks=list(source_ranks),
                 src_attn_tp=int(src_attn_tp),
                 aux_index=aux_index,
@@ -1089,6 +1102,114 @@ class RaidenReceiverMixin:
         self._unregister_plan(uuid)
         return False
 
+    def _on_reshard_state(self, msg: List[bytes]) -> None:
+        state = ReshardState.from_frames(msg)
+        room = state.room
+        with self._state_lock:
+            if (
+                room not in self._decode.reshard_meta
+                or room in self._aborted
+                or room in self._decode.reshard_registered
+            ):
+                return
+            self._decode.reshard_state_sources.setdefault(room, {})[state.src_rank] = (
+                state.rows
+            )
+
+    def _assemble_reshard_state(self, room: int) -> bool:
+        """Build a resharded room's GDN state row from every source's and queue
+        it for the scheduler thread. True to continue.
+
+        Each source sends its row ahead of its RESHARD_BLOCKS on the same
+        ordered socket, so once every source's blocks arrived its row did too.
+        Non-hybrid models have no state engine and skip this.
+        """
+        if self._state_engine is None:
+            return True
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            assemble_state_fan_in,
+        )
+
+        def fail(reason: str) -> bool:
+            reason = f"Raiden reshard state receive: room {room} {reason}"
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                if room in self._decode.reshard_meta:
+                    self._fail_room_locked(room, reason)
+            return False
+
+        with self._state_lock:
+            meta = self._decode.reshard_meta.get(room)
+            sources = dict(self._decode.reshard_state_sources.get(room, {}))
+        if meta is None:
+            return False
+        if not any(self._state_conv_groups):
+            # Whole conv rows side by side would order channels by source, not
+            # by q | k | v sub-block; the pool gives all conv tensors widths or none.
+            return fail("has no conv sub-block widths to split the sources' rows by")
+        src_attn_tp = meta["src_attn_tp"]
+        local_rows = meta["local_state_rows"]
+        need = set(meta["source_ranks"])
+        by_rank = {nid % src_attn_tp: rows for nid, rows in sources.items()}
+        if set(by_rank) != need:
+            return fail(
+                f"has state rows from source ranks {sorted(by_rank)}, needs "
+                f"{sorted(need)}"
+            )
+        if len(local_rows) != 1:
+            return fail(f"holds {len(local_rows)} state rows, expected 1")
+        try:
+            rows = assemble_state_fan_in(
+                [by_rank[r] for r in sorted(need)],
+                list(self._state_slice_axes),
+                list(self._state_conv_groups),
+                src_attn_tp,
+            )
+        except ValueError as e:
+            return fail(str(e))
+        for tensor, row in zip(self._state_kv_caches, rows, strict=True):
+            if tuple(row.shape) != tuple(tensor.shape[1:]):
+                return fail(
+                    f"assembled a row of shape {list(row.shape)} for a "
+                    f"{list(tensor.shape[1:])} state"
+                )
+        with self._state_lock:
+            if room not in self._decode.reshard_meta or room in self._aborted:
+                return False
+            self._decode.state_uploads[room] = (local_rows[0], rows)
+        return True
+
+    def apply_state_uploads(self) -> None:
+        """Write assembled resharded GDN state rows into their rooms' slots.
+
+        Runs on the scheduler thread, ordered with the forwards that read the
+        slots, and writes in place: an eager scatter would reallocate the
+        state tensors the transfer engine and the compiled step hold.
+        """
+        # A prefill-side manager has no decode state.
+        decode = getattr(self, "_decode", None)
+        if decode is None or not decode.state_uploads:
+            return
+        import torch
+
+        from sglang_tpu.kv_page_write import write_pages_torch
+
+        with self._state_lock:
+            uploads = dict(decode.state_uploads)
+            decode.state_uploads.clear()
+        for room, (row, rows) in uploads.items():
+            for tensor, value in zip(self._state_kv_caches, rows, strict=True):
+                write_pages_torch(
+                    torch.tensor([row], dtype=torch.int32, device=tensor.device),
+                    torch.from_numpy(np.ascontiguousarray(value))
+                    .unsqueeze(0)
+                    .to(tensor.device),
+                    tensor,
+                )
+            with self._state_lock:
+                if room in decode.reshard_meta:
+                    self._completed_recv.add(self._state_req_id(room))
+
     def _register_reshard_swa_receiver(
         self,
         room: int,
@@ -1215,6 +1336,8 @@ class RaidenReceiverMixin:
         if not self._register_reshard_swa_receiver(
             room, src_attn_tp, local_swa_blocks, swa_sources_map
         ):
+            return
+        if not self._assemble_reshard_state(room):
             return
 
         geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
@@ -1376,6 +1499,7 @@ class RaidenKVReceiver(CommonKVReceiver):
         if self.conclude_state is not None:
             return self.conclude_state
         self.kv_mgr._drain_engine()
+        self.kv_mgr.apply_state_uploads()
         if self.kv_mgr.is_failed(self.bootstrap_room):
             return self._conclude_failed()
         status = self.kv_mgr.check_status(self.bootstrap_room)

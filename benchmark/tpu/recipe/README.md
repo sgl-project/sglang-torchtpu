@@ -104,6 +104,7 @@ diverge on serving says why in a comment.
 | `gpt_oss_120b/` | `server`, `accuracy`, `accuracy_{aime,gpqa,gsm8k,mmlupro}`, `singlehost_spec`, `pd_singlehost`, `pd_singlehost_{spec,decode_radix,kv_offload,kv_offload_spec,mxint8_multiturn}` | `nightly-tpu-accuracy-gpt-oss-120b-*`, `tpu-integration`, `external-nightly-1host` |
 | `gpt_oss_20b/` | `server`, `accuracy`, `perf`, `spec`, `spec_dpa`, `prefix_cache_kv_offload`, `pcp`, `pp4_pcp2`, `pp4_tp2` | `nightly-tpu-accuracy-gpt-oss-20b`, `nightly-tpu-perf-gpt-oss-20b`, `stage-b-test-tpu-4-v7` |
 | `kimi_k26/` | `mmmu`, `perf` | `nightly-tpu-multihost-accuracy`, `nightly-tpu-perf-kimi-k26` |
+| `kimi_k3/` | `pd` (one 2x2x4 slice per engine; select `pd.py:PREFILL_CONFIG` / `pd.py:DECODE_CONFIG` on each host of its slice) | manual |
 | `qwen3_0_6b.py` | (flat) | the compile-tracer e2e; single chip |
 | `qwen3_5_397b/` | `server`, `perf` | `nightly-tpu-perf-qwen3-5-397b` |
 | `qwen3_coder_30b_a3b_fp8.py` | (flat) | `stage-b-test-tpu-4-v7` |

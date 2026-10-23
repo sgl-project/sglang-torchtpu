@@ -100,20 +100,71 @@ go on a third engine with `max_blocks=1`. Each side maps its request's
 decode may use different checkpoint widths. The state row rides the `BLOCKS`
 reply and is read as `state:<room>` alongside the whole read (or the closing
 read of a chunked transfer); a full prefix hit still moves it, since state
-cannot be rebuilt from cached KV. Push-resharding and pipeline transfer raise
-`NotImplementedError` for these models.
+cannot be rebuilt from cached KV. Pipeline transfer raises
+`NotImplementedError` for these models, and so does push-resharding outside
+the validated cache layouts (see Scope).
+
+Under push-resharding (`dst_tp < src_tp`) a decode rank's state row is wider
+than any source's: its conv channels are the q | k | v sub-blocks of `ratio`
+sources side by side, its recurrent heads theirs concatenated. The rows are
+small, so the state engine does not push them. Once a room's last chunk is
+computed and its decode has asked to reshard (`RESHARD_REQ`), each source
+gathers its committed row on the scheduler thread (`stage_reshard_state`, from
+`send()` or, for a later request, `poll()`); a worker copies it to host, so
+the scheduler does not wait for the forward in flight, and sends it as
+`RESHARD_STATE` ahead of its `RESHARD_BLOCKS` on the same ordered socket. A
+room pulled at equal TP is never copied, even when its `PULL_REQ` comes after
+the last chunk. The decode assembles its row
+(`reshard_schedule.assemble_state_fan_in`, from `TpuMambaPool`'s slice axes
+and conv sub-block widths), and its receiver poll writes it in place on the
+scheduler thread (`apply_state_uploads`, via `write_pages_torch`) before
+marking `state:<room>` received. A source without a state row, a failed host
+copy, a decode missing a source's rows, or a pool without conv sub-block
+widths fails the room.
+
+## MLA models
+
+The fused MLA pool (`pallas_tpu_mla`) registers its per-layer
+`[pages, page_size // packing, packing, dim]` latent tensors on the full
+engine. Pulls are per page and need no layout knowledge. A latent page is the
+same on every attention-TP rank, so the pool declares its pages `replicated`
+and push-resharding moves each as a whole block (`WholeBlockGeometry`): each of
+the `ratio` sources writes the whole page, redundantly but identically, and the
+receive barrier counts every writer. That layout is validated only beside
+row-sharded request state (hybrid MLA + linear attention); push-resharding MLA
+pages alone raises `NotImplementedError` on the decode.
+Decode retraction backup (`--disaggregation-decode-retraction-backup
+cpu_tensor`) covers both pools (`get_cpu_copy` / `load_cpu_copy` on
+`TpuFusedMLATokenToKVPool` and `TpuMambaPool`). State slots freed while a
+forward may still write them wait on the KV free fence (`TpuMambaSlotAllocator`),
+so a received state row cannot be overwritten by a finishing request's last step.
 
 ## Scope (v1)
 
 Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models (incl. hybrid
-sliding-window at symmetric TP and under push-resharding, and hybrid GDN at
-symmetric TP), decode in
-chunk-cache mode.
+sliding-window at symmetric TP and under push-resharding), MLA models
+(`pallas_tpu_mla`) and hybrid GDN / KDA models at symmetric TP, and hybrid
+MLA + linear-attention models under push-resharding, decode in chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
 push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
-as this fork (tpu-sync `build.sh`). Not covered: MLA,
-NSA, Mamba/GDN under push-resharding or pipeline transfer, speculative draft
-KV, decode prefix-cache reuse, `dst_tp > src_tp`.
+as this fork (tpu-sync `build.sh`). Not covered: NSA, the split MLA pool,
+push-resharding a cache layout not validated below, Mamba/GDN under pipeline
+transfer, speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
+
+Push-resharding is admitted by cache layout, never by model. Each KV pool
+declares how its pages split across attention-TP ranks (`raiden_page_sharding`,
+a `transfer_layout.PageSharding` value): `head_sliced` (the fused MHA pool),
+`replicated` (the fused MLA pool), or `unsupported`, the default for a pool
+that declares nothing. `TpuSeqAlongLaneKVPool` keeps `head_sliced` only to
+preserve its admission: the head-slice geometry assumes the fused pool's
+token-major page, which its layout is not, and no e2e covers it.
+`VALIDATED_RESHARD_LAYOUTS` (`common.py`) lists the validated layouts, each
+with its e2e: head-sliced full-attention pages, alone or with head-sliced
+sliding-window pages, and replicated full-attention pages with row-sharded
+request state (one row per request, every state tensor sliced on a per-row
+axis its pool names). Any other layout raises `NotImplementedError` on both
+sides before a page moves; a model whose layout is listed needs no Raiden
+change, and validating another layout adds one entry plus its e2e.
 
 ## Tunables (env)
 

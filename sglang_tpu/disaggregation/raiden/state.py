@@ -6,7 +6,7 @@ manager because they can survive protocol-state cleanup.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 
 @dataclass
@@ -22,6 +22,10 @@ class PrefillState:
     send_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
     # Committed state row/pages of the room, on the state engine.
     send_state_rows: Dict[int, List[int]] = field(default_factory=dict)
+    # Host copy of that row (one array per state tensor), for a resharded room.
+    reshard_state: Dict[int, List[Any]] = field(default_factory=dict)
+    # Resharded rooms whose row the scheduler thread has gathered for that copy.
+    reshard_state_staged: Set[int] = field(default_factory=set)
     send_state_meta: Dict[int, bytes] = field(default_factory=dict)
     send_aux: Dict[int, bytes] = field(default_factory=dict)
 
@@ -117,3 +121,8 @@ class DecodeState:
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
+
+    # GDN state rows of a resharded room from each source rank, and the row
+    # assembled from them, waiting for the scheduler thread to write it.
+    reshard_state_sources: Dict[int, Dict[int, List[Any]]] = field(default_factory=dict)
+    state_uploads: Dict[int, Tuple[int, List[Any]]] = field(default_factory=dict)

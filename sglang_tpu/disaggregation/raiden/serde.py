@@ -9,9 +9,10 @@ from __future__ import annotations
 import ctypes
 import enum
 import struct
-from typing import ClassVar, List
+from typing import Any, ClassVar, List
 
 import msgspec
+import numpy as np
 
 from sglang_tpu.disaggregation.tpu.wire import WireMessage, require_non_negative
 
@@ -42,6 +43,9 @@ class MessageTag(bytes, enum.Enum):
     RESHARD_CHUNK_READY = (
         b"RAIDEN_RESHARD_CHUNK_READY"  # decode -> prefill: chunk registered, push it
     )
+    # prefill -> decode: a source's linear-attention state rows, ahead of its
+    # RESHARD_BLOCKS
+    RESHARD_STATE = b"RAIDEN_RESHARD_STATE"
 
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
 
@@ -207,6 +211,72 @@ class RoomFailed(WireMessage):
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
+
+
+class StateRow(msgspec.Struct, forbid_unknown_fields=True):
+    """Dtype and shape of one raw state-row frame."""
+
+    dtype: str
+    shape: list[int]
+
+
+class ReshardStateHeader(msgspec.Struct, forbid_unknown_fields=True):
+    room: int
+    src_rank: int
+    rows: list[StateRow]
+
+
+class ReshardState:
+    """A source's per-request linear-attention state rows for a resharded room.
+
+    ``[TAG, JSON header, *row frames]``: one raw frame per state tensor, in the
+    pool's transfer-entry order, so the rows travel without a JSON copy.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.RESHARD_STATE
+
+    def __init__(self, room: int, src_rank: int, rows: List[np.ndarray]):
+        require_non_negative(room, "room")
+        require_non_negative(src_rank, "src_rank")
+        self.room = room
+        self.src_rank = src_rank
+        self.rows = rows
+
+    def to_frames(self) -> list[Any]:
+        header = ReshardStateHeader(
+            room=self.room,
+            src_rank=self.src_rank,
+            rows=[StateRow(str(r.dtype), list(r.shape)) for r in self.rows],
+        )
+        return [
+            self.TAG,
+            msgspec.json.encode(header),
+            *(np.ascontiguousarray(r).tobytes() for r in self.rows),
+        ]
+
+    @classmethod
+    def from_frames(cls, frames: list[Any]) -> ReshardState:
+        if len(frames) < 2 or bytes(frames[0]) != cls.TAG:
+            raise ValueError("malformed ReshardState message")
+        try:
+            header = msgspec.json.decode(bytes(frames[1]), type=ReshardStateHeader)
+        except (msgspec.DecodeError, ValueError) as exc:
+            raise ValueError(f"malformed ReshardState payload: {exc}") from exc
+        if len(frames) != 2 + len(header.rows):
+            raise ValueError(
+                f"malformed ReshardState message: {len(header.rows)} rows "
+                f"declared, {len(frames) - 2} sent"
+            )
+        rows = []
+        for spec, frame in zip(header.rows, frames[2:]):
+            row = np.frombuffer(bytes(frame), dtype=np.dtype(spec.dtype))
+            if row.size != int(np.prod(spec.shape)):
+                raise ValueError(
+                    f"malformed ReshardState row: {row.size} elements for shape "
+                    f"{spec.shape}"
+                )
+            rows.append(row.reshape(spec.shape))
+        return cls(header.room, header.src_rank, rows)
 
 
 def decode_text(frame: bytes, field: str) -> str:

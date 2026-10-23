@@ -411,4 +411,10 @@ def install_kv_free_fence(
     allocator.kv_free_fence = fence
     for pool in _page_pools(allocator):
         fence.attach(pool)
+    # A hybrid linear-attention model's per-request state slots are written by
+    # forwards and filled by DMAs (a PD decode's received state) the same way.
+    mamba_pool = getattr(getattr(allocator, "_kvcache", None), "mamba_pool", None)
+    slot_allocator = getattr(mamba_pool, "slot_allocator", None)
+    if slot_allocator is not None and hasattr(slot_allocator, "release_held_pages"):
+        fence.attach(slot_allocator)
     return fence
