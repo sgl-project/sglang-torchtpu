@@ -26,11 +26,13 @@ from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 __all__ = [
     "DCP_OP_NAME",
     "DcpWriteSpans",
+    "_dcp_merge_partials",
     "broadcast_own_kv_heads",
     "build_dcp_kernel_op",
     "build_owner_write_spans",
     "fused_kv_rows",
     "gather_heads",
+    "max_write_spans",
     "merge_across_ranks",
     "merge_lse",
     "sink_fold",
@@ -111,10 +113,13 @@ def build_dcp_kernel_op(spec):
         cache_only: bool = False,
         skip_kv_write: bool = False,
         cp_group_size: int = 0,
+        attention_scope: int = 0,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         # The kernel takes ``cp_group_size=None`` for the non-CP form and then
         # rejects the two CP operands, so drop them together.
         cp_size = cp_group_size if cp_group_size else None
+        if cache_only and attention_scope == 0:
+            attention_scope = 1
         return _jax_rpa(
             queries,
             keys,
@@ -139,6 +144,7 @@ def build_dcp_kernel_op(spec):
             cp_group_size=cp_size,
             cp_rank=cp_rank if cp_size else None,
             kv_lens_global=kv_lens_global if cp_size else None,
+            attention_scope=attention_scope,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -146,8 +152,8 @@ def build_dcp_kernel_op(spec):
         name=f"jax_{DCP_OP_NAME}",
         # Static (non-traced) args by _wrapped position: 11=sm_scale,
         # 12=sliding_window, 13=soft_cap, 14=k_scale, 15=v_scale,
-        # 16=cache_only, 17=skip_kv_write, 18=cp_group_size.
-        static_argnums=(11, 12, 13, 14, 15, 16, 17, 18),
+        # 16=cache_only, 17=skip_kv_write, 18=cp_group_size, 19=attention_scope.
+        static_argnums=(11, 12, 13, 14, 15, 16, 17, 18, 19),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -178,6 +184,7 @@ def build_dcp_kernel_op(spec):
         cache_only: bool = False,
         skip_kv_write: bool = False,
         cp_group_size: int = 0,
+        attention_scope: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with tpu_info_for_cpu_export():
             output, _updated_kv, lse = jax_kernel(
@@ -200,6 +207,7 @@ def build_dcp_kernel_op(spec):
                 cache_only,
                 skip_kv_write,
                 cp_group_size,
+                attention_scope,
             )
         return output, lse
 
@@ -442,10 +450,109 @@ def _all_reduce_gather(
 
 
 def gather_heads(
-    x: torch.Tensor, group, world_size: int, rank_mask: torch.Tensor
+    x: torch.Tensor,
+    group,
+    world_size: int,
+    rank_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``[T, H, D]`` of every rank as ``[T, H * world_size, D]``, rank-major."""
+    if world_size == 1:
+        return x
+    if hasattr(group, "all_gather_into_tensor") and not getattr(
+        group, "_simulate_all_reduce_only", False
+    ):
+        num_tokens, heads, head_dim = x.shape
+        gathered = x.new_empty((world_size * num_tokens * heads, head_dim))
+        group.all_gather_into_tensor(gathered, x.contiguous().view(-1, head_dim))
+        return (
+            gathered.view(world_size, num_tokens, heads, head_dim)
+            .permute(1, 0, 2, 3)
+            .reshape(num_tokens, world_size * heads, head_dim)
+            .contiguous()
+        )
     return _all_reduce_gather(x, group, world_size, rank_mask, dim=1)
+
+
+def _dcp_merge_partials(
+    gathered_partials: list[tuple[torch.Tensor, torch.Tensor]],
+    cp_group,
+    cp_size: int,
+    out_dtype: torch.dtype,
+    layer=None,
+    sinks: torch.Tensor | None = None,
+    local_partials: tuple[tuple[torch.Tensor, torch.Tensor], ...] = (),
+) -> torch.Tensor:
+    """Merge per-rank softmax partial states ``(out [T,H,D], lse [T,H])``.
+
+    ``gathered_partials`` are all-gathered over the CP group (every rank holds
+    a different partial); ``local_partials`` are identical on every rank and
+    are merged once.
+
+    The payload is moved as lane-dense f32 rows of 128, concatenated along
+    8-aligned rows: [out (T*H rows) | lse (padded rows)]. Lane-dense f32 rows
+    gather cleanly without lowering issues or compiler hang.
+    """
+    if cp_size == 1 and not local_partials:
+        out0, lse0 = gathered_partials[0]
+        if sinks is None and layer is not None:
+            sinks = getattr(layer, "sinks", None)
+        if sinks is not None:
+            out0 = out0 * torch.sigmoid(lse0 - sinks.to(torch.float32))[..., None]
+        return out0.to(out_dtype)
+
+    out0, lse0 = gathered_partials[0]
+    num_tok, num_heads = lse0.shape[0], lse0.shape[1]
+    head_dim = out0.shape[-1]
+    n_lse = num_tok * num_heads
+    lanes = 128
+    assert head_dim == lanes, f"head_dim must be {lanes}, got {head_dim}"
+    lse_rows = -(-n_lse // (lanes * 8)) * 8
+    out_rows = n_lse  # [T*H, D] rows
+    rows_per_partial = out_rows + lse_rows
+
+    def _pack(out, lse):
+        lse = torch.nan_to_num(lse.to(torch.float32), nan=-float("inf")).reshape(1, -1)
+        lse = torch.nn.functional.pad(lse, (0, lse_rows * lanes - n_lse)).reshape(lse_rows, lanes)
+        out = torch.nan_to_num(out.to(torch.float32), nan=0.0).reshape(out_rows, lanes)
+        return torch.cat([out, lse], dim=0)
+
+    packed = torch.cat([_pack(o, l) for o, l in gathered_partials], dim=0).contiguous()
+    n_part = len(gathered_partials)
+    gathered = packed.new_empty((cp_size * packed.shape[0], lanes))
+    cp_group.all_gather_into_tensor(gathered, packed)
+    g = gathered.reshape(cp_size * n_part, rows_per_partial, lanes)
+    outs = [g[:, :out_rows, :].reshape(-1, num_tok, num_heads, head_dim)]
+    lse_g = g[:, out_rows:, :].reshape(cp_size * n_part, -1)[:, :n_lse]
+    lses = [lse_g.reshape(-1, num_tok, num_heads)]
+    for out, lse in local_partials:
+        lses.append(torch.nan_to_num(lse.to(torch.float32), nan=-float("inf")).unsqueeze(0))
+        outs.append(torch.nan_to_num(out.to(torch.float32), nan=0.0).unsqueeze(0))
+
+    stacked_lses = torch.cat(lses, dim=0)
+    stacked_outs = torch.cat(outs, dim=0)
+    global_max_lse = torch.amax(stacked_lses, dim=0)
+    global_max_lse_safe = torch.where(
+        torch.isinf(global_max_lse), torch.zeros_like(global_max_lse), global_max_lse
+    )
+    # A partial with no tokens in scope reports lse = -inf; give it weight 0.
+    weights = torch.where(
+        torch.isinf(stacked_lses),
+        torch.zeros_like(stacked_lses),
+        torch.exp(stacked_lses - global_max_lse_safe.unsqueeze(0)),
+    )
+    sum_exp = torch.sum(weights, dim=0)
+    sum_exp_safe = torch.where(sum_exp == 0.0, torch.ones_like(sum_exp), sum_exp)
+    total_out = torch.sum(weights.unsqueeze(-1) * stacked_outs, dim=0)
+    merged_out = total_out / sum_exp_safe.unsqueeze(-1)
+
+    # Fold in attention sinks if present (e.g. GPT-OSS-120B)
+    if sinks is None and layer is not None:
+        sinks = getattr(layer, "sinks", None)
+    if sinks is not None:
+        merged_lse = torch.log(sum_exp_safe) + global_max_lse_safe
+        merged_out = merged_out * torch.sigmoid(merged_lse - sinks.to(torch.float32))[..., None]
+
+    return merged_out.to(out_dtype)
 
 
 def merge_across_ranks(

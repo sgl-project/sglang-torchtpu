@@ -576,6 +576,7 @@ def ragged_paged_attention(
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     kv_lens_global: jax.Array | None = None,
+    attention_scope: configs.AttentionScope | int = configs.AttentionScope.FULL,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -685,6 +686,17 @@ def ragged_paged_attention(
         mask_value=mask_value,
         has_attention_sink=attention_sink is not None,
     )
+    if isinstance(attention_scope, int):
+        _scope_map = {
+            0: configs.AttentionScope.FULL,
+            1: configs.AttentionScope.CACHE_ONLY,
+            2: configs.AttentionScope.NEW_TOKENS_ONLY,
+            3: configs.AttentionScope.STRIPED,
+        }
+        attention_scope = _scope_map.get(attention_scope, configs.AttentionScope.FULL)
+    if cache_only:
+        attention_scope = configs.AttentionScope.CACHE_ONLY
+
     serve_cfgs = configs.ServingConfigs(
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
@@ -701,6 +713,7 @@ def ragged_paged_attention(
         skip_kv_write=skip_kv_write,
         return_lse=return_lse,
         cp_group_size=cp_group_size,
+        attention_scope=attention_scope,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
@@ -795,9 +808,10 @@ def ragged_paged_attention(
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm
     )
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
-    )
+    if serve_cfgs.attention_scope != configs.AttentionScope.STRIPED:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+        )
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)

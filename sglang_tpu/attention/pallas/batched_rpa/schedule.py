@@ -568,6 +568,22 @@ def compute_metadata(
             # locally-computed k/v is unused. Drives kv_left_frm_new -> 0 ->
             # new_sz -> 0 -> do_writeback -> 0 automatically.
             kv_left_frm_cache = kv_left
+        elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
+            # Under STRIPED decode, this rank only writes back if it owns the page
+            # of the new token (global position k_len_global - 1).
+            k_len_global = (
+                kv_lens_global_ref[s_idx] if kv_lens_global_ref is not None else 0
+            )
+            page_size = cfgs.serve.page_size
+            cp_size = cfgs.serve.cp_group_size
+            rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
+            owns_token = (
+                (k_len_global > 0)
+                & (((k_len_global - 1) // page_size) % cp_size == rank)
+            )
+            kv_left_frm_cache = jnp.where(
+                owns_token, jnp.maximum(kv_left - q_len, 0), kv_left
+            )
         else:
             kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
@@ -726,7 +742,7 @@ def compute_metadata(
                 sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
                 start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-        if cfgs.serve.cache_only:
+        if cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe:
             # No causal bound. One k block always runs, so a q block with no key
             # in range still writes output 0 and LSE -inf.
             end_k_idx = jnp.maximum(num_k, start_k_idx + 1)

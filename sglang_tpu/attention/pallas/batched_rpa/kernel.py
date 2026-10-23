@@ -240,7 +240,7 @@ def rpa_body(
     # Step 1: Fetch metadata.
     processed_q_len = []
     processed_kv_len = []
-    kv_len_left = [] if cfgs.serve.cache_only else None
+    kv_len_left = [] if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe) else None
     global_q_k_gap = None
     if cfgs.serve.cp_group_size is not None and cfgs.model.sliding_window is not None:
         global_q_k_gap = []
@@ -263,7 +263,11 @@ def rpa_body(
         q_end = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx + 1], 0)
         q_len = q_end - q_start
         # cache_only queries follow every one of the kv_len keys.
-        offset = kv_len if cfgs.serve.cache_only else kv_len - q_len
+        offset = (
+            kv_len
+            if (cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe)
+            else kv_len - q_len
+        )
 
         processed_q_len.append((q_idx * cfgs.bq_sz + offset))
         processed_kv_len.append(k_id)
@@ -277,7 +281,24 @@ def rpa_body(
 
         # Stitching metadata
         kv_left = jnp.maximum(kv_len - k_id, 0)
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+        if cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
+            k_len_global = (
+                kv_lens_global_ref[safe_s_idx]
+                if kv_lens_global_ref is not None
+                else 0
+            )
+            page_size = cfgs.serve.page_size
+            cp_size = cfgs.serve.cp_group_size
+            rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
+            owns_token = (
+                (k_len_global > 0)
+                & (((k_len_global - 1) // page_size) % cp_size == rank)
+            )
+            kv_left_frm_cache = jnp.where(
+                owns_token, jnp.maximum(kv_left - q_len, 0), kv_left
+            )
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
 
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)

@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang_tpu.attention_pallas_rpa_dcp import (
     DcpWriteSpans,
+    _dcp_merge_partials,
     broadcast_own_kv_heads,
     build_dcp_kernel_op,
     build_owner_write_spans,
@@ -1752,44 +1753,85 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         cp = self._dcp
         group = self._dcp_group
 
-        write_owned_kv(
-            self._kv_write_op, kv_cache, fused_kv_rows(k, v, kv_cache), spans
-        )
-
         q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
         if forward_batch.forward_mode.is_decode():
+            # In decode mode:
+            # 1. Page-striped cache sharding: rank owns page iff page_idx % cp == rank.
+            # Local page table is sliced from the global page indices:
+            num_reqs = md.kv_lens.shape[0]
+            pages_per_seq = page_indices.shape[0] // num_reqs
+            pages_2d = page_indices.view(num_reqs, pages_per_seq)
+            owned_pages = pages_2d[:, self._dcp_rank::cp]
+            pad_len = pages_per_seq - owned_pages.shape[1]
+            if pad_len > 0:
+                striped_page_indices = torch.nn.functional.pad(
+                    owned_pages, (0, pad_len), value=0
+                ).reshape(-1)
+            else:
+                striped_page_indices = owned_pages.reshape(-1)
+
+            # Global cache length before adding current decode token:
+            # seq_lens has length including current decode token (k_len = seq_len).
+            # The token lives at position pos = seq_len - 1.
+            seq_lens = (
+                md.dcp_kv_lens_global
+                if md.dcp_kv_lens_global is not None
+                else forward_batch.seq_lens
+            )
+            cache_lens_global = torch.clamp(seq_lens - 1, min=0).to(torch.int32)
+            page_size = self.page_size
+            own = (
+                ((cache_lens_global // page_size) % cp == self._dcp_rank)
+                & (seq_lens > 0)
+            )
+            own_i32 = own.to(torch.int32)
+
+            from sglang_tpu.attention.pallas.batched_rpa.utils import cp_local_cache_len
+
+            local_cache_lens = cp_local_cache_len(
+                cache_lens_global, cp, self._dcp_rank, page_size
+            )
+            local_kv_lens = local_cache_lens + own_i32
+
             out_p, lse_p = self._dcp_op(
                 q_all,
                 k,
                 v,
                 kv_cache,
-                md.kv_lens,
-                page_indices,
+                local_kv_lens,
+                striped_page_indices,
                 md.cu_q_lens,
                 md.distribution,
-                md.dcp_kv_lens_global,
+                seq_lens.to(torch.int32),
                 md.dcp_cp_rank,
-                None,  # attention_sink: folded in after the merge
+                None,  # attention_sink: folded in _dcp_merge_partials
                 sm_scale,
                 sliding_window,
                 soft_cap,
                 k_scale,
                 v_scale,
-                True,  # cache_only
-                True,  # skip_kv_write
+                False,  # cache_only
+                False,  # skip_kv_write (owner rank writes its token!)
                 cp,  # cp_group_size
+                3,  # attention_scope: STRIPED
             )
-            out, lse = merge_across_ranks(
-                out_p.float(),
-                lse_p,
+            merged_out = _dcp_merge_partials(
+                [(out_p, lse_p)],
                 group,
                 cp,
-                self._cp_rank_mask,
-                self._cp_rank_index,
+                q.dtype,
+                layer=None,
+                sinks=sinks,
             )
-            if sinks is not None:
-                out = sink_fold(out, lse, sinks)
-            return out.to(q.dtype)
+            heads_all = q_all.shape[1]
+            heads_local = heads_all // cp
+            head_start = self._dcp_rank * heads_local
+            head_end = head_start + heads_local
+            return merged_out[:, head_start:head_end, :].contiguous()
+
+        write_owned_kv(
+            self._kv_write_op, kv_cache, fused_kv_rows(k, v, kv_cache), spans
+        )
 
         out_prefix, lse_prefix = self._dcp_op(
             q_all,

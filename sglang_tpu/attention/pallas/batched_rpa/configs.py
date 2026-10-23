@@ -52,6 +52,34 @@ class ModelConfigs:
         return self.num_q_heads // self.num_kv_heads
 
 
+class AttentionScope(enum.StrEnum):
+    """Which KV positions to attend to.
+
+    FULL:            attend all positions (default).
+    CACHE_ONLY:      attend only cached tokens, skip new tokens.
+    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
+    STRIPED:         decode under decode context parallelism in one launch:
+                     attend this rank's page stripe of the cache plus the
+                     sequence's new token when this rank owns its page. The
+                     caller passes kv_new_lens / update_kv_cache as 1
+                     on the owner and 0 elsewhere; the new token is stitched
+                     and written at the end of the stripe, which is exactly
+                     its slot because the owner's stripe ends on that page.
+                     Decode-only (one query per sequence); the mask attends
+                     every key of the stripe, so no causal offset is needed.
+    """
+
+    FULL = enum.auto()
+    CACHE_ONLY = enum.auto()
+    NEW_TOKENS_ONLY = enum.auto()
+    STRIPED = enum.auto()
+
+    @property
+    def walks_cache_stripe(self) -> bool:
+        """Whether the KV index space of this call is one rank's page stripe."""
+        return self in (AttentionScope.CACHE_ONLY, AttentionScope.STRIPED)
+
+
 class KVLayout(enum.StrEnum):
     """Represents the different layouts for KV cache.
 
@@ -85,6 +113,13 @@ class ServingConfigs:
     skip_kv_write: bool = False
     return_lse: bool = False
     cp_group_size: int | None = None
+    attention_scope: AttentionScope = AttentionScope.FULL
+
+    def __post_init__(self):
+        if self.cache_only and self.attention_scope == AttentionScope.FULL:
+            object.__setattr__(self, "attention_scope", AttentionScope.CACHE_ONLY)
+        elif self.attention_scope == AttentionScope.CACHE_ONLY and not self.cache_only:
+            object.__setattr__(self, "cache_only", True)
 
     @property
     def pages_per_seq(self) -> int:
@@ -212,6 +247,24 @@ class RpaConfigs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
+
+    def local_kv_cache_len(self, global_kv_cache_len, rank):
+        """This call's cache length in its own KV index space. CP only.
+
+        The cache is page-striped across the CP group, so a cache-phase call walks
+        only one rank's stripe.
+        """
+        if (
+            self.serve.cp_group_size is None
+            or not self.serve.attention_scope.walks_cache_stripe
+        ):
+            return global_kv_cache_len
+        return utils.cp_local_cache_len(
+            global_kv_cache_len,
+            self.serve.cp_group_size,
+            rank,
+            self.serve.page_size,
+        )
 
     @property
     def bkv_p(self) -> int:
@@ -497,8 +550,11 @@ class RpaConfigs:
         if self.serve.cp_group_size is not None:
             if self.serve.cp_group_size < 1:
                 raise ValueError(f"Expected {self.serve.cp_group_size=} >= 1.")
-            if not self.serve.cache_only:
-                raise ValueError("cp_group_size requires cache_only.")
+            if self.serve.attention_scope == AttentionScope.FULL:
+                raise ValueError(
+                    "Context Parallel does not support AttentionScope.FULL"
+                    " where cache is sharded."
+                )
             if cp_rank is None or kv_lens_global is None:
                 raise ValueError("cp_group_size requires cp_rank and kv_lens_global.")
             if cp_rank.shape != (1,) or cp_rank.dtype != jnp.int32:
@@ -509,5 +565,16 @@ class RpaConfigs:
                 raise ValueError(
                     f"Expected int32 {kv_lens_global.shape=} to be {kv_lens.shape}."
                 )
+        elif self.serve.attention_scope == AttentionScope.STRIPED:
+            raise ValueError("AttentionScope.STRIPED requires cp_group_size.")
         elif cp_rank is not None or kv_lens_global is not None:
             raise ValueError("cp_rank and kv_lens_global require cp_group_size.")
+
+        if self.serve.attention_scope == AttentionScope.STRIPED:
+            if self.mode != RpaCase.DECODE:
+                raise ValueError("AttentionScope.STRIPED is decode-only.")
+            if self.model.sliding_window is not None:
+                raise ValueError(
+                    "AttentionScope.STRIPED does not support sliding-window layers;"
+                    " use the CACHE_ONLY + NEW_TOKENS_ONLY pair."
+                )
