@@ -3,7 +3,7 @@
 
 Why: under ``--hicache-write-policy write_back`` the unified cache copies a
      victim's KV to host at eviction time and waits for the copy before it
-     frees the device pages. On TPU the raiden D2H is a background DMA that
+     frees the device pages. On TPU the engine D2H is a background DMA that
      is also fenced behind every in-flight forward, so each such eviction
      stalls the scheduler for a device sync plus the copy, on the allocation
      path of the batch being formed.
@@ -22,7 +22,7 @@ How: ``WriteBackCopyAhead`` keeps the next ``copy_ahead_tokens`` of KV in
      UnifiedRadixCache._evict (skip the trailing drain), AFTER
      UnifiedRadixCache.check_hicache_events (refill the window), AROUND
      UnifiedRadixCache._finish_write_through_ack (a window copy's lock release
-     leaves the write horizon alone). Only raiden write_back caches take the
+     leaves the write horizon alone). Only TPU DMA write_back caches take the
      new arms.
 Upstream PR or issue: not filed; the walk reads the Python tree core.
 Remove when: core backs up the eviction frontier asynchronously itself.
@@ -243,15 +243,13 @@ class WriteBackCopyAhead:
 def attach_copy_ahead(
     *, cache: UnifiedRadixCache, chunked_prefill_size: Optional[int]
 ) -> None:
-    """Give a raiden write_back cache its copy-ahead window; others keep None."""
-    from sglang_tpu.raiden_hybrid_cache_controller import (
-        TpuRaidenHybridCacheController,
-    )
+    """Give a TPU DMA write_back cache a copy-ahead window; others get None."""
+    from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
     cache._write_back_copy_ahead = None
     controller = cache.cache_controller
     if (
-        not isinstance(controller, TpuRaidenHybridCacheController)
+        not isinstance(controller, TpuDMAHybridCacheController)
         or controller.write_policy != "write_back"
         or cache.host_memory_mode != "cache"
     ):
@@ -303,7 +301,7 @@ def evict_with_copy_ahead(
 
 
 def install(cache_cls: Optional[type] = None) -> None:
-    """Wrap ``UnifiedRadixCache`` so raiden write_back caches copy ahead."""
+    """Wrap ``UnifiedRadixCache`` so TPU DMA write_back caches copy ahead."""
     if cache_cls is None:
         from sglang.srt.mem_cache.unified_radix_cache import (
             UnifiedRadixCache as cache_cls,

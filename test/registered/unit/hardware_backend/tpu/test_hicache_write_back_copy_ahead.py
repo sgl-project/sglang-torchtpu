@@ -42,10 +42,10 @@ from sglang_tpu.hicache_write_back_copy_ahead import (
     attach_copy_ahead,
     resolve_copy_ahead_tokens,
 )
-from sglang_tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
-)
 from sglang_tpu.raiden_transfer import NOOP_EVENT
+from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+    TpuDMAHybridCacheController,
+)
 
 FULL = ComponentType.FULL
 
@@ -88,7 +88,7 @@ class _FakeHostPool:
         self.used = 0
 
 
-class _FakeRaidenController(TpuRaidenHybridCacheController):
+class _FakeRaidenController(TpuDMAHybridCacheController):
     """The controller surface the cache's backup and ack paths touch."""
 
     def __init__(self, *, host_capacity: int, write_policy: str = "write_back"):

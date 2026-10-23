@@ -1,21 +1,21 @@
 """Host-side KV pools for TPU HiCache.
 
 ``TpuFusedMHATokenToKVPoolHost`` backs the torch_tpu io backend with plain torch
-copies; ``TpuRaidenHostKVCache`` backs the raiden io backend with raiden's
-DMA-pinned pool. The rest of this docstring describes the raiden pool.
+copies; ``TpuDMAHostKVPool`` backs the TPU DMA io backends with the backend's
+host memory. The rest of this docstring describes the TPU DMA pool.
 
 ``MHATokenToKVPoolHost`` (the CUDA host pool) allocates split ``[layer, token,
 head, dim]`` K/V tensors and moves data with ``sgl_kernel`` kernels — neither
 works on TPU. This subclass keeps the HiCache ``HostKVCache`` interface but
-delegates storage and transfer to ``RaidenKVTransfer``: raiden owns the host
-memory (DMA-pinned) and copies whole pages of the fused device buffer via
-direct PJRT DMA.
+delegates storage and transfer to a ``TpuDMAKVTransfer`` engine (raiden unless
+``--hicache-io-backend`` names another): the engine owns the host memory and
+copies whole pages of the fused device buffer.
 
-HiCache addresses the host pool at **token** granularity, but raiden addresses
+HiCache addresses the host pool at **token** granularity, but engines address
 **pages**. A page is ``page_size`` consecutive tokens. To keep the two
 consistent under fragmentation, this pool allocates and frees at page
 granularity and only ever hands out whole, page-aligned token runs, so
-``host_index // page_size`` is an exact raiden page id.
+``host_index // page_size`` is an exact engine page id.
 
 Scope is L2 (TPU<->host) only; the L3 flat-page accessors raise so a future
 storage-backend port has an explicit, loud extension point.
@@ -23,6 +23,7 @@ storage-backend port has an explicit, loud extension point.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import threading
@@ -36,15 +37,15 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.utils import next_power_of_2
+from sglang_tpu.tpu_dma_hicache import TransferEvent, create_tpu_dma_kv_transfer
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
-    from sglang_tpu.raiden_transfer import RaidenFutureEvent
 
 logger = logging.getLogger(__name__)
 
 # Marketing name surfaced as ``layout`` for logs / compatibility reads.
-RAIDEN_LAYOUT = "fused_raiden"
+TPU_DMA_LAYOUT = "fused_tpu_dma"
 
 
 class TpuFusedMHATokenToKVPoolHost(HostKVCache):
@@ -317,13 +318,16 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         )
 
 
-class TpuRaidenHostKVCache(HostKVCache):
-    """Page-granular host KV pool whose storage + transfer live in raiden.
+class TpuDMAHostKVPool(HostKVCache):
+    """Page-granular host KV pool whose storage + transfer live in an engine.
 
     One instance mirrors one fused device pool: a hybrid sliding-window model
-    builds two of these (one per ``SWAKVPool`` sub-pool), each owning a raiden
+    builds two of these (one per ``SWAKVPool`` sub-pool), each owning an
     engine over just its sub-pool's layers and page-id space.
     """
+
+    # The --hicache-io-backend engine; tpu_dma_host_kv_pool_cls binds another.
+    io_backend = "raiden"
 
     device_pool: TpuFusedMHATokenToKVPool
     # The hybrid HostPoolGroup reads this directly off every entry; the JIT
@@ -346,14 +350,15 @@ class TpuRaidenHostKVCache(HostKVCache):
     ):
         if mtp_draft_device_pools:
             raise NotImplementedError(
-                "MTP draft KV offload is not supported on the TPU raiden path."
+                "MTP draft KV offload is not supported on --hicache-io-backend "
+                f"{self.io_backend}."
             )
-        # Raiden owns the DMA-pinned storage, so skip the base allocator setup
+        # The engine owns the host storage, so skip the base allocator setup
         # but retain its sizing and host-memory admission check.
         self.device_pool = device_pool
         self.pool_label = pool_label
         self.page_size = page_size
-        self.layout = RAIDEN_LAYOUT
+        self.layout = TPU_DMA_LAYOUT
         self.pin_memory = pin_memory
         self.device = device
 
@@ -398,9 +403,9 @@ class TpuRaidenHostKVCache(HostKVCache):
             requested_bytes / 1e9,
         )
 
-        from sglang_tpu.raiden_transfer import RaidenKVTransfer
-
-        self.transfer = RaidenKVTransfer(device_pool, self.page_num)
+        self.transfer = create_tpu_dma_kv_transfer(
+            self.io_backend, device_pool, self.page_num
+        )
 
         self.lock = threading.RLock()
         self.clear()
@@ -413,7 +418,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         """Host bytes per cached token = fused device page bytes / page_size.
 
         Uses the *real* (padded) fused-page byte size so the host_size GB
-        budget matches raiden's actual per-page allocation, not the logical
+        budget matches the engine's actual per-page allocation, not the logical
         ``2 * head_num * head_dim`` lower bound.
         """
         fused = self.device_pool.get_fused_kv_buffer(self.start_layer)
@@ -422,7 +427,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         return per_token * self.layer_num
 
     def init_kv_buffer(self):
-        # raiden owns host memory; there is no torch host buffer.
+        # The engine owns host memory; there is no torch host buffer.
         return None
 
     # ------------------------------------------------------------------ #
@@ -441,7 +446,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         """Allocate ``need_size`` token slots as whole pages.
 
         Returns page-aligned token indices (int64) so ``// page_size`` yields
-        exact raiden page ids, or ``None`` if the pool is full.
+        exact engine page ids, or ``None`` if the pool is full.
         """
         assert need_size % self.page_size == 0, (
             "host alloc size must be a multiple of page_size"
@@ -464,12 +469,12 @@ class TpuRaidenHostKVCache(HostKVCache):
         return len(indices)
 
     # ------------------------------------------------------------------ #
-    # Transfer (token indices -> raiden page ids)
+    # Transfer (token indices -> engine page ids)
     # ------------------------------------------------------------------ #
 
     def _to_page_ids(self, token_indices: torch.Tensor) -> List[int]:
         """Whole-page token runs -> page ids, one per page, order preserved."""
-        # Indices are host-resident (raiden runs with
+        # Indices are host-resident (the transfer path runs with
         # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1), so
         # this is a pure host slice+divide. Take the first token of each
         # page-sized run; the runs are page-aligned and contiguous within a page
@@ -478,16 +483,16 @@ class TpuRaidenHostKVCache(HostKVCache):
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
-    ) -> RaidenFutureEvent:
-        """D2H for all layers in one raiden call; returns its future-event."""
+    ) -> TransferEvent:
+        """D2H for all layers in one engine call; returns its future-event."""
         device_pages = self._to_page_ids(device_indices)
         host_pages = self._to_page_ids(host_indices)
         return self.transfer.backup(device_pages, host_pages)
 
     def load_all_layer(
         self, device_pool, host_indices, device_indices
-    ) -> RaidenFutureEvent:
-        """H2D for all layers in one raiden call; returns its future-event."""
+    ) -> TransferEvent:
+        """H2D for all layers in one engine call; returns its future-event."""
         host_pages = self._to_page_ids(host_indices)
         device_pages = self._to_page_ids(device_indices)
         return self.transfer.load(host_pages, device_pages)
@@ -502,11 +507,11 @@ class TpuRaidenHostKVCache(HostKVCache):
         *,
         is_draft: bool = False,
     ) -> None:
-        # The raiden controller issues a single all-layer ``load_all_layer``;
+        # The TPU controllers issue a single all-layer ``load_all_layer``;
         # the per-layer path must never be reached on this pool.
         raise NotImplementedError(
-            "TpuRaidenHostKVCache uses all-layer loads via load_all_layer(); "
-            "load_to_device_per_layer should not be called on the raiden path."
+            "TpuDMAHostKVPool uses all-layer loads via load_all_layer(); "
+            "load_to_device_per_layer should not be called on this path."
         )
 
     # ------------------------------------------------------------------ #
@@ -514,10 +519,28 @@ class TpuRaidenHostKVCache(HostKVCache):
     # ------------------------------------------------------------------ #
 
     def get_data_page(self, index, flat: bool = True):
-        raise NotImplementedError("L3 storage not yet supported on TPU raiden path")
+        raise NotImplementedError(
+            f"L3 storage is not supported on --hicache-io-backend {self.io_backend}"
+        )
 
     def get_dummy_flat_data_page(self):
-        raise NotImplementedError("L3 storage not yet supported on TPU raiden path")
+        raise NotImplementedError(
+            f"L3 storage is not supported on --hicache-io-backend {self.io_backend}"
+        )
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        raise NotImplementedError("L3 storage not yet supported on TPU raiden path")
+        raise NotImplementedError(
+            f"L3 storage is not supported on --hicache-io-backend {self.io_backend}"
+        )
+
+
+@functools.cache
+def tpu_dma_host_kv_pool_cls(io_backend: str) -> type[TpuDMAHostKVPool]:
+    """The ``TpuDMAHostKVPool`` class whose instances copy with ``io_backend``."""
+    if io_backend == TpuDMAHostKVPool.io_backend:
+        return TpuDMAHostKVPool
+    return type(
+        f"TpuDMAHostKVPool[{io_backend}]",
+        (TpuDMAHostKVPool,),
+        {"io_backend": io_backend},
+    )

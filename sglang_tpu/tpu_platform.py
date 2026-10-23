@@ -19,6 +19,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
+from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -920,13 +921,13 @@ class TpuSRTPlatform(SRTPlatform):
                 server_args, "tpu.apply_server_args_defaults", mem_fraction_static=0.40
             )
 
-        # raiden's load-back keeps the reloaded prefix's slot indices on CPU
-        # (TpuRaidenHiCacheController.load), so req_to_token must stay
+        # A TPU DMA backend's load-back keeps the reloaded prefix's slot indices
+        # on CPU (TpuDMAHiCacheController.load), so req_to_token must stay
         # host-resident: a device-resident req_to_token would put the other
         # nodes' prefix indices on device and mix devices in the prefix cat. Pin
-        # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for raiden.
-        if cfg.hicache_io_backend == "raiden":
-            _pin_req_to_token_on_host("the raiden KV-offload backend")
+        # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for every engine.
+        if is_tpu_dma_hicache_backend(cfg.hicache_io_backend):
+            _pin_req_to_token_on_host(f"--hicache-io-backend {cfg.hicache_io_backend}")
 
         # There is no CUDA coredump on TPU: on a crash the handler would trigger
         # a no-op dump, then sleep SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS
@@ -1123,7 +1124,7 @@ class TpuSRTPlatform(SRTPlatform):
         )
         from sglang.srt.runtime_context import get_memory
 
-        if get_memory().hicache_io_backend != "raiden":
+        if not is_tpu_dma_hicache_backend(get_memory().hicache_io_backend):
             return super().get_hicache_explicit_size_context()
         # Full, SWA, and draft pools must fit within one combined RAM budget.
         return host_memory_budget_scope(host_memory_budget_bytes())
@@ -1134,13 +1135,14 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
         from sglang_tpu.kv_pool_host import (
             TpuFusedMHATokenToKVPoolHost,
-            TpuRaidenHostKVCache,
+            tpu_dma_host_kv_pool_cls,
         )
 
-        # raiden offloads through tpu-sync's DMA-pinned host pool instead of the
+        # TPU DMA backends offload through their own host memory instead of the
         # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
-        if get_memory().hicache_io_backend == "raiden":
-            return TpuRaidenHostKVCache
+        io_backend = get_memory().hicache_io_backend
+        if is_tpu_dma_hicache_backend(io_backend):
+            return tpu_dma_host_kv_pool_cls(io_backend)
 
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):
             return TpuFusedMHATokenToKVPoolHost
