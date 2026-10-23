@@ -8,6 +8,9 @@ from typing import Any
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def maybe_enable_inductor_compute_comm_overlap() -> None:
@@ -39,6 +42,18 @@ def build_torch_compile_kwargs(
             and mode is not None
         ):
             compile_kwargs["mode"] = mode
+    elif current_platform.is_tpu():
+        # The torch_tpu backend compiles static shapes only.
+        compile_kwargs["backend"] = current_platform.get_compile_backend(mode)
+        compile_kwargs["dynamic"] = False
+        if module is not None:
+            options = current_platform.get_compile_options(module)
+            if options is not None:
+                compile_kwargs["options"] = options
+        if mode is not None:
+            logger.info_once(
+                "torch.compile mode=%s is ignored by the torch_tpu backend.", mode
+            )
     elif current_platform.is_npu():
         from sglang.srt.utils.common import get_compiler_backend
 

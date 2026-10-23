@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -30,6 +31,46 @@ class TestTpuPlatformPlugin(unittest.TestCase):
             self.assertIsNone(tpu_platform_plugin())
 
 
+class TestSplashBackendSelection(unittest.TestCase):
+    def setUp(self):
+        from sglang.multimodal_gen.runtime.layers.attention import selector
+
+        selector._cached_get_attn_backend.cache_clear()
+        self.addCleanup(selector._cached_get_attn_backend.cache_clear)
+
+    def test_explicit_selection_overrides_the_layer_preference_set(self):
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_attn_backend,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform", TpuPlatform()
+        ):
+            backend = get_attn_backend(
+                128,
+                torch.bfloat16,
+                supported_attention_backends={
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                },
+                selected_attention_backend=AttentionBackendEnum.TPU_SPLASH_ATTN,
+            )
+        self.assertEqual(
+            f"{backend.__module__}.{backend.__qualname__}",
+            TpuPlatform.get_attn_backend_cls_str(
+                AttentionBackendEnum.TPU_SPLASH_ATTN, 128, torch.bfloat16
+            ),
+        )
+
+    def test_selectable_by_cli_name(self):
+        # server_args resolves --attention-backend via the enum name.
+        self.assertIs(
+            AttentionBackendEnum["TPU_SPLASH_ATTN"],
+            AttentionBackendEnum.TPU_SPLASH_ATTN,
+        )
+        self.assertEqual(str(AttentionBackendEnum.TPU_SPLASH_ATTN), "tpu_splash_attn")
+
+
 class TestTpuPlatformSurface(unittest.TestCase):
     def test_identity(self):
         self.assertEqual(TpuPlatform.device_type, "tpu")
@@ -48,6 +89,14 @@ class TestTpuPlatformSurface(unittest.TestCase):
                 "sdpa.SDPABackend",
                 TpuPlatform.get_attn_backend_cls_str(selected, 128, torch.bfloat16),
             )
+
+    def test_attn_backend_splash_class_path(self):
+        self.assertIn(
+            "tpu_splash_attn.TpuSplashAttentionBackend",
+            TpuPlatform.get_attn_backend_cls_str(
+                AttentionBackendEnum.TPU_SPLASH_ATTN, 128, torch.bfloat16
+            ),
+        )
 
     def test_attn_backend_unsupported_raises(self):
         with self.assertRaises(ValueError):
@@ -130,6 +179,55 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_layerwise_offload_disabled(self):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
 
+    def test_compile_warmup_keeps_the_dit_resident(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        def server_args(**kwargs):
+            # ServerArgs.__post_init__ applies the platform defaults.
+            with (
+                patch.object(
+                    PipelineConfig, "from_kwargs", return_value=PipelineConfig()
+                ),
+                patch.object(
+                    current_platform,
+                    "apply_server_args_defaults",
+                    TpuPlatform().apply_server_args_defaults,
+                ),
+            ):
+                return ServerArgs.from_kwargs(model_path="/fake", **kwargs)
+
+        self.assertFalse(server_args().offload_during_compile)
+        # An explicit request is overridden: the warmup offload crashes on TPU.
+        self.assertFalse(
+            server_args(offload_during_compile=True).offload_during_compile
+        )
+
+    def test_teacache_is_dropped_under_torch_compile(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        self.assertFalse(TpuPlatform().supports_teacache_with_torch_compile())
+        for compile_on, expected in ((True, False), (False, True)):
+            with (
+                self.subTest(enable_torch_compile=compile_on),
+                patch.object(
+                    current_platform,
+                    "supports_teacache_with_torch_compile",
+                    TpuPlatform().supports_teacache_with_torch_compile,
+                ),
+            ):
+                params = SamplingParams(enable_teacache=True)
+                params._drop_teacache_if_it_recompiles(
+                    SimpleNamespace(enable_torch_compile=compile_on)
+                )
+                self.assertEqual(params.enable_teacache, expected)
+
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch.device('tpu') needs torch_tpu")
 class TestWorkerInitOnce(unittest.TestCase):
@@ -170,8 +268,8 @@ class TestTorchTpuIntegration(unittest.TestCase):
         self.assertFalse(torch.tpu.is_initialized())
 
     def test_srt_symbols_the_platform_imports_exist(self):
-        # tpu.py imports this lazily; a rename on the srt side must fail here,
-        # not at worker bootstrap.
+        # The plugin's worker hooks import this lazily; a rename on the srt
+        # side must fail here, not at worker bootstrap.
         from sglang_tpu.patches import _prepare_tpu_env
 
         self.assertTrue(callable(_prepare_tpu_env))

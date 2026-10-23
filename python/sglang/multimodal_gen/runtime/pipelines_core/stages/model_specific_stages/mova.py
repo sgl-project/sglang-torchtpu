@@ -278,6 +278,10 @@ class MOVADenoisingStage(PipelineStage):
                 "Compiling %s with torchair backend on NPU",
                 module.__class__.__name__,
             )
+        elif current_platform.is_tpu():
+            logger.info(
+                "Compiling %s with the torch_tpu backend", module.__class__.__name__
+            )
         else:
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
 

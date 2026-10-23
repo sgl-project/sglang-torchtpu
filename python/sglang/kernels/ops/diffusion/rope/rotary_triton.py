@@ -127,7 +127,7 @@ def apply_rotary_embedding(
 
 apply_rotary_embedding = select_impl(
     apply_rotary_embedding,
-    tpu=lazy_fallback("torch", "apply_rotary_embedding_native"),
+    tpu=lazy_fallback("torch", "apply_rotary_embedding_pair_swap"),
     npu=lazy_fallback("npu", "apply_rotary_embedding_native"),
     mps=lazy_fallback("torch", "apply_rotary_embedding_native"),
     cpu=lazy_fallback("torch", "apply_rotary_embedding_native"),
