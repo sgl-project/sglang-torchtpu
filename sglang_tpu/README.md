@@ -169,28 +169,34 @@ clearing, JAX cache clearing, CPU-backend release, garbage collection before
 freezing and startup heap trimming. File-cache release retains its separate
 opt-outs.
 
-# Fixed-cohort P/D benchmark gate (draft)
+## Fixed-cohort benchmark gate (draft)
 
-Set `SGLANG_TPU_BENCHMARK_PD_BATCH_SIZE=N` on the decoder to enable the
-opt-in gate. Zero (the default) preserves ordinary scheduling. Send a native
-batch with base request ID `hourly-pd-sync:<unique-cohort>`; native batch
+Set `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` to enable the opt-in gate for unified
+or P/D decode scheduling. Zero (the default) preserves ordinary scheduling.
+Send a native batch with base ID `hourly-batch:<unique-cohort>`; native batch
 normalization appends `_0` through `_N-1`. When using a router that overrides
-request IDs, supply the same base ID in its `x-rid` header.
+IDs, supply the same base ID in its `x-rid` header. Startup/health requests
+without the tag do not activate the gate.
 
-The decoder keeps preallocation and transfer polling active but holds admission
-until all N requests have committed KV. It then admits the entire batch and
-measures from the first decoder forward to processing all request completions.
-The last completed cohort's summary is in `/server_info` internal state under
-`benchmark_pd_gate`, including its ID, decode duration, decoder output tokens,
-gate wait duration, and per-request TPOT. The first token is produced by
-prefill and excluded from decoder output tokens.
+P/D keeps preallocation and transfer polling active, then admits all requests
+once every KV transfer has committed. Unified keeps its chunked-prefill planner,
+with decode mixing disabled, and holds decode until every request has produced
+its prefill token. The first decode forward must contain the whole batch.
 
-The draft supports one DP/attention-DP/CP group, PP1, and device-resident decoder
-KV. Mixed requests, retraction, insufficient batch capacity, and incomplete
-transfer invalidate the benchmark. Admission times out after 600 seconds from
-the first tagged arrival (override `SGLANG_TPU_BENCHMARK_PD_TIMEOUT_SEC`).
-Untagged startup and health requests do not activate the gate.
+One scheduler `perf_counter` start before the first decode forward and existing
+request completion timestamps define the timing window. No per-token completion
+hook or finish-time map is needed. `/server_info` internal state exposes the
+completed batch's summary under `benchmark_batch_gate`, including its cohort ID,
+decode duration, decoder output tokens, gate wait duration, and TPOT. Output
+throughput excludes the token supplied by prefill. A later metadata read does
+not extend the measurement interval.
+
+This draft requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and
+full request capacity. Mixed cohorts, retraction, invalid completion, or a
+600-second prefill/KV wait invalidate the benchmark (override
+`SGLANG_TPU_BENCHMARK_TIMEOUT_SEC`).
 
 Host tests: `PYTHONPATH=.:python pytest -q
-test/registered/unit/plugins/test_benchmark_pd_gate.py`. TPU serving and trace
-validation are still required before enabling this draft in benchmark jobs.
+ test/registered/unit/plugins/test_benchmark_batch_gate.py`.
+TPU serving and trace validation remain required before enabling scheduled
+workloads. A scheduler policy seam should eventually replace these wrappers.
