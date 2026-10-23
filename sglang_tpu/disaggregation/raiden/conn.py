@@ -337,20 +337,17 @@ class RaidenKVManager(
     # ----- resharding geometry / host-slot helpers --------------------------
 
     def _make_geometry(self, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False):
-        """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer, sized from
-        the local fused KV tensor (the K+V head-pair granule matches on both
-        sides) and the global kv-head count.
+        """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer, from
+        the local fused KV tensor's layout (only its head count differs from
+        the peer's) and the global kv-head count.
 
-        ``swa`` sizes it from the sliding-window sub-pool instead: the granule
-        from the SWA tensor and the head count from ``total_swa_kv_head_num``.
-        SWA layers may carry a different kv-head count than full attention
-        (MiMo-V2: 8 vs 4), and the SWA sub-pool is sized from that count. At
-        fp8 the count comes from ``swa_geometry_kv_heads``, which may keep the
-        full count or refuse.
+        ``swa`` uses the sliding-window sub-pool and ``total_swa_kv_head_num``
+        instead: SWA layers may carry a different kv-head count than full
+        attention (MiMo-V2: 8 vs 4).
         """
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            KVLayoutGeometry,
             ReshardGeometry,
-            head_pair_bytes,
             swa_geometry_kv_heads,
         )
 
@@ -362,22 +359,42 @@ class RaidenKVManager(
                 + " KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
-        hp = head_pair_bytes(tensor)
         # Distinct model kv-head counts (model_config.get_total_num_kv_heads()
         # and get_total_swa_num_kv_heads()), set on both the prefill and decode
         # KVArgs.
-        total_kv_heads = int(self.kv_args.total_kv_head_num)
+        total_kv_heads = int(
+            self.kv_args.total_swa_kv_head_num
+            if swa
+            else self.kv_args.total_kv_head_num
+        )
+        head_nums = self._swa_kv_head_nums if swa else self._kv_head_nums
+        heads = (head_nums[0] if head_nums else 0) or max(
+            1, total_kv_heads // max(1, self.attn_tp_size)
+        )
+        layout = KVLayoutGeometry.from_tensor(
+            tensor.shape,
+            tensor.element_size(),
+            heads,
+            seq_along_lane=self._seq_along_lane,
+            page_size=int(self.kv_args.page_size) if self._seq_along_lane else None,
+        )
+        if not self._seq_along_lane:
+            return ReshardGeometry.from_layout(
+                src_attn_tp, dst_attn_tp, layout, total_kv_heads
+            )
+        # TODO(#829-P1a-HND): SEQ_ALONG_LANE keeps the legacy unit, and at fp8
+        # the SWA count that unit needs.
         if swa:
-            # Usually the SWA count; the full count where the fp8 granule
-            # offsets it. TODO(#829): drop with B1.
             total_kv_heads = swa_geometry_kv_heads(
+                int(self.kv_args.total_kv_head_num),
                 total_kv_heads,
-                int(self.kv_args.total_swa_kv_head_num),
-                int(tensor.shape[3]),
+                layout.kv_packing,
                 src_attn_tp,
                 dst_attn_tp,
             )
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+        return ReshardGeometry(
+            src_attn_tp, dst_attn_tp, layout.legacy_row_bytes, total_kv_heads
+        )
 
     def _reshard_layers(self, swa: bool) -> List[Tuple[tuple, int, int]]:
         """Distinct (shape, element_size, per-rank kv heads) of a KV group."""
