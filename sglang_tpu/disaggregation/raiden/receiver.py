@@ -233,6 +233,8 @@ class RaidenReceiverMixin:
             )
             return
         if len(bootstrap_infos) != 1:
+            # init()'s _push_reshard_refusal fails the room in both cases
+            # first, so these raises are not reached through send_metadata.
             if self._state_engine is not None:
                 raise NotImplementedError(
                     "Raiden push resharding does not move GDN (linear-attention) "

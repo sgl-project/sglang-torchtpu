@@ -58,6 +58,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    RoomFailed,
 )
 from sglang_tpu.mamba_pool import TpuMambaPool
 
@@ -887,19 +888,30 @@ class TestRaidenStateTransfer(RaidenStateTestCase):
             decode.register_decode_request(
                 7330, [1], [], aux_index=None, bootstrap_infos=infos
             )
-        with self.assertRaisesRegex(NotImplementedError, "GDN"):
-            prefill._on_reshard_req(
-                ReshardReq(
-                    room=7330,
-                    decode_ip="127.0.0.1",
-                    decode_port=decode.rank_port,
-                    push_endpoint="tcp://push",
-                    decode_blocks=[1],
-                    dst_attn_tp=1,
-                    decode_swa_blocks=[],
-                    swa_push_endpoint="",
-                ).to_frames()
-            )
+        # A prefill at twice the decode's attention TP fails the room and tells
+        # the decode, instead of raising out of its listener (#1671).
+        prefill = self._with_state(self._prefill(attn_tp_size=2))
+        # set_kv_caches sets this alongside the state engine.
+        prefill._state_kv_caches = (torch.zeros(3, 2),)
+        prefill._on_reshard_req(
+            ReshardReq(
+                room=7330,
+                decode_ip="127.0.0.1",
+                decode_port=decode.rank_port,
+                push_endpoint="tcp://push",
+                decode_blocks=[1],
+                dst_attn_tp=1,
+                decode_swa_blocks=[],
+                swa_push_endpoint="",
+            ).to_frames()
+        )
+        self.assertTrue(prefill.is_aborted(7330))
+        failed = RoomFailed.from_frames(
+            self.inboxes[decode.endpoint].take(MessageTag.ROOM_FAILED)
+        )
+        self.assertEqual(failed.room, 7330)
+        self.assertIn("GDN", failed.reason)
+        self.assertEqual(self.inboxes[decode.endpoint].frames, [])
 
     def test_pipeline_transfer_with_state_fails_closed(self):
         decode = self._decode()

@@ -427,6 +427,12 @@ class RaidenKVManager(
                 f"{push_reshard_where(src_attn_tp, dst_attn_tp)} needs the "
                 "prefill attention TP to be a multiple of the decode's"
             )
+        if self._state_kv_caches:
+            return (
+                f"{push_reshard_where(src_attn_tp, dst_attn_tp)} does not move "
+                "hybrid model state (GDN/Mamba linear-attention rows or DSV4 "
+                "compressor state); use equal attention TP on prefill and decode"
+            )
         own_tp = self.attn_tp_size
         peer_tp = dst_attn_tp if own_tp == src_attn_tp else src_attn_tp
         page_size = int(self.kv_args.page_size)

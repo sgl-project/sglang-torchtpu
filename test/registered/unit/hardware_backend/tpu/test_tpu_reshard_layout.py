@@ -471,6 +471,29 @@ class TestPushReshardRefusal(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIs(mgr.reshard_refusal(8, 4), reason)
 
+    def test_gdn_state_refused_by_name(self):
+        # Each side's fixture is servable 8 -> 4 until it holds GDN state.
+        fixtures = {
+            "decode": ([_layer(torch.bfloat16, 2)], [2], 4),
+            "prefill": ([_layer(torch.bfloat16, 1)], [1], 8),
+        }
+        for side, (tensors, heads, own_tp) in fixtures.items():
+            with self.subTest(side=side):
+                plain = _refusal_manager(
+                    tensors, heads, own_tp, total_heads=8, side=side
+                )
+                self.assertIsNone(plain.reshard_refusal(8, 4))
+                hybrid = _refusal_manager(
+                    tensors, heads, own_tp, total_heads=8, side=side
+                )
+                hybrid._state_kv_caches = (torch.zeros(4, 8),)
+                self.assertEqual(
+                    hybrid.reshard_refusal(8, 4),
+                    f"{rs.push_reshard_where(8, 4)} does not move hybrid model "
+                    "state (GDN/Mamba linear-attention rows or DSV4 compressor "
+                    "state); use equal attention TP on prefill and decode",
+                )
+
     def test_bounds_check_fires_for_fp8_one_to_two(self):
         geom = rs.ReshardGeometry(8, 4, 4 * 128, 8)
         # Each decode rank holds two fp8 heads in one 32-bit row; the default

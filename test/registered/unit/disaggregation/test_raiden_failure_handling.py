@@ -1264,7 +1264,9 @@ class TestReceiverInitRefusals(unittest.TestCase):
     """init() fails a room the legacy transport would corrupt or hang, before
     send_metadata can reach the prefill."""
 
-    def _init(self, src_tp, dst_tp, *, infos=None, pp=1, cp=1, **mgr_overrides):
+    def _init(
+        self, src_tp, dst_tp, *, infos=None, pp=1, cp=1, real=(), **mgr_overrides
+    ):
         fields = dict(
             attn_tp_size=dst_tp,
             _pipeline=None,
@@ -1274,6 +1276,8 @@ class TestReceiverInitRefusals(unittest.TestCase):
             register_decode_request=Mock(),
         )
         fields.update(mgr_overrides)
+        for name in real:  # use the RaidenKVManager method, not a Mock
+            del fields[name]
         mgr = _decode_manager_stub(**fields)
         recv = _receiver(mgr)
         n = max(1, src_tp // dst_tp) if infos is None else infos
@@ -1344,6 +1348,55 @@ class TestReceiverInitRefusals(unittest.TestCase):
         recv, mgr, abort = self._init(8, 4, _dynamic_host_staging=False)
         self._assert_refused(recv, mgr, abort, "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING")
 
+    def _gdn(self, src_tp, dst_tp):
+        """A hybrid GDN decode whose full-attention KV the push schedule would
+        serve (no layer to refuse), with the real refusal and registration."""
+        return self._init(
+            src_tp,
+            dst_tp,
+            real=("reshard_refusal", "register_decode_request"),
+            _state_kv_caches=(object(),),
+            _state_engine=object(),
+            _swa_kv_caches=[],
+            _reshard_layers=lambda swa: [],
+            _make_geometry=lambda *args, **kwargs: None,
+            _state_rows_from_state_indices=lambda state_indices: [],
+            kv_args=SimpleNamespace(page_size=64),
+            _decode=DecodeState(),
+            local_ip="10.0.0.3",
+            rank_port=6000,
+            _send_multipart_locked=Mock(),
+        )
+
+    def test_gdn_push_reshard_refused_at_init(self):
+        # Without the refusal, send_metadata raised NotImplementedError on the
+        # scheduler thread and took down the decode (#1671).
+        recv, mgr, abort = self._gdn(8, 4)
+        recv.send_metadata(np.asarray([1], dtype=np.int32))
+        self.assertEqual(recv.poll(), KVPoll.Failed)
+        abort.assert_called_once()
+        mgr.log_reshard_refusal.assert_called_once()
+        mgr._send_multipart_locked.assert_not_called()
+        with self.assertRaises(Exception) as cm:
+            recv.failure_exception()
+        self.assertIn("GDN", str(cm.exception))
+        self.assertIn("8 -> decode 4", str(cm.exception))
+
+    def test_gdn_equal_tp_pulls(self):
+        recv, mgr, abort = self._gdn(4, 4)
+        self.assertIsNone(recv.conclude_state)
+        recv.send_metadata(np.asarray([1, 2], dtype=np.int32))
+        self.assertIsNone(recv.conclude_state)
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.WaitingForInput)
+        self.assertEqual(mgr.failure_records, {})
+        abort.assert_not_called()
+        mgr.log_reshard_refusal.assert_not_called()
+        self.assertEqual(mgr._decode.local_blocks[ROOM], [1, 2])
+        [(endpoint, frames)] = _sent_frames(mgr)
+        self.assertEqual(endpoint, "tcp://10.0.0.1:4444")
+        self.assertEqual(frames[0], PullReq.TAG)
+        self.assertEqual(PullReq.from_frames(frames).room, ROOM)
+
 
 class TestPrefillReshardRefusal(unittest.TestCase):
     def _mgr(self, reason):
@@ -1402,6 +1455,26 @@ class TestPrefillReshardRefusal(unittest.TestCase):
         mgr.reshard_refusal.assert_called_once_with(8, 4)
         self.assertEqual(_sent_frames(mgr), [])
         self.assertFalse(mgr.is_aborted(ROOM))
+
+    def test_gdn_pool_fails_the_room_and_tells_the_decode_once(self):
+        # A RESHARD_REQ from a decode that skipped the init refusal used to
+        # raise into _listen, leaving the decode to its waiting timeout.
+        mgr = self._mgr(None)
+        del mgr.reshard_refusal  # the real check
+        mgr._state_kv_caches = (object(),)
+        mgr._state_engine = object()
+        with patch("sglang_tpu.disaggregation.raiden.conn.logger.error"):
+            mgr._dispatch(self._req())
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertTrue(mgr.is_aborted(ROOM))
+        self.assertNotIn(ROOM, mgr._prefill.reshard_req)
+        mgr._maybe_reshard_reply.assert_not_called()
+        [(endpoint, frames)] = _sent_frames(mgr)
+        self.assertEqual(endpoint, "tcp://10.0.0.2:5555")
+        notice = RoomFailed.from_frames(frames)
+        self.assertEqual(notice.room, ROOM)
+        self.assertIn("GDN", notice.reason)
+        self.assertEqual(mgr.failure_records[ROOM], notice.reason)
 
 
 class TestDecodeBoundsViolationFailsTheRoom(unittest.TestCase):

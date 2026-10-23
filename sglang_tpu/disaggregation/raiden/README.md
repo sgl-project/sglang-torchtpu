@@ -123,9 +123,10 @@ other than `src_tp / dst_tp`, and push-resharding of KV the schedule cannot
 place: non-5-D pools (MLA, MXINT8), `page_size > 1024`, layers whose head_dim
 or dtype differ from the first layer's (e.g. a draft model's), fp8 with more
 than one kv head per decode rank, and SEQ_ALONG_LANE pools unless both sides
-hold one kv head per rank. The prefill re-checks the push geometry on
-`RESHARD_REQ`, and every push plan is bounds-checked per block before
-registration.
+hold one kv head per rank. Pools with hybrid model state are refused too:
+push-resharding does not move it (GDN/Mamba linear-attention rows or DSV4
+compressor state). The prefill re-checks the push geometry on `RESHARD_REQ`,
+and every push plan is bounds-checked per block before registration.
 
 ## Tunables (env)
 
