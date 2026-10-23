@@ -317,6 +317,29 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         return resolution_result(args, field)
 
+    def test_unset_backend_follows_the_checkpoint_attention(self):
+        """MLA checkpoints get the MLA kernel; the RPA default cannot read a latent
+        KV cache. An explicit --attention-backend is left alone."""
+        from sglang.srt.configs.model_config import AttentionArch
+
+        mla = SimpleNamespace(attention_arch=AttentionArch.MLA)
+        mha = SimpleNamespace(attention_arch=AttentionArch.MHA)
+        cases = (
+            (dict(return_value=mla), None, "pallas_tpu_mla"),
+            (dict(return_value=mha), None, "pallas_tpu_rpa_v3"),
+            (dict(return_value=mla), "pallas_tpu_rpa_v3", "pallas_tpu_rpa_v3"),
+            (dict(side_effect=OSError("no config")), None, "pallas_tpu_rpa_v3"),
+        )
+        for model_config, backend, expected in cases:
+            with self.subTest(model_config=model_config, backend=backend):
+                args = self._args(attention_backend=backend)
+                with patch(
+                    "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                    **model_config,
+                ):
+                    self._apply(args)
+                self.assertEqual(self._resolved(args, "attention_backend"), expected)
+
     def test_rejects_optimistic_prefill_on_raiden_pd(self):
         """Optimistic prefill on raiden parks KV for requests the decode has
         no pages for, and deadlocked the PD pools under burst load."""
@@ -1139,6 +1162,54 @@ class TestTpuKvPoolBytesPerToken(CustomTestCase):
             self.assertIsNone(platform.get_mha_kv_bytes_per_token(**shape))
         with get_context().override_server_args(attention_backend="pallas_tpu_rpa_v3"):
             self.assertEqual(platform.get_mha_kv_bytes_per_token(**shape), 4096)
+
+
+class TestTpuMlaKvPoolBytesPerToken(CustomTestCase):
+    """The fused MLA pool pads the latent and rope segments to 128 separately;
+    the KV budget must be drawn at that padded price."""
+
+    def _built(self, *, kv_lora_rank, qk_rope_head_dim, dtype):
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+
+        page_size = 16
+        pool = TpuFusedMLATokenToKVPool(
+            size=4 * page_size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        buf = pool.kv_buffer[0]
+        return buf.numel() * buf.element_size() // (pool.num_pages * page_size)
+
+    def test_segments_are_priced_at_their_padded_widths(self):
+        """Bug regression: sizing priced kv_lora_rank + qk_rope_head_dim (576 for
+        Kimi-K3 / DeepSeek) while the pool stores 512 + 128 = 640 per token."""
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+
+        # qk_rope_head_dim 0 (NoPE MLA) still stores a padded rope segment.
+        for rope in (64, 0):
+            for dtype, itemsize in ((torch.bfloat16, 2), (torch.float8_e4m3fn, 1)):
+                with self.subTest(qk_rope_head_dim=rope, dtype=dtype):
+                    shape = dict(kv_lora_rank=512, qk_rope_head_dim=rope)
+                    per_token = TpuFusedMLATokenToKVPool.kv_bytes_per_token_per_layer(
+                        **shape, store_dtype=dtype
+                    )
+                    self.assertEqual(per_token, 640 * itemsize)
+                    self.assertEqual(per_token, self._built(**shape, dtype=dtype))
+
+    def test_platform_prices_only_the_fused_mla_pool(self):
+        platform = TpuSRTPlatform()
+        shape = dict(
+            kv_lora_rank=512, qk_rope_head_dim=64, kv_cache_dtype=torch.bfloat16
+        )
+        with get_context().override_server_args(attention_backend="torch_native"):
+            self.assertIsNone(platform.get_mla_kv_bytes_per_token(**shape))
+        with get_context().override_server_args(attention_backend="pallas_tpu_mla"):
+            self.assertEqual(platform.get_mla_kv_bytes_per_token(**shape), 1280)
 
 
 if __name__ == "__main__":

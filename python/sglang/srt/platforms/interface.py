@@ -106,6 +106,18 @@ class SRTPlatform(DeviceMixin):
         del num_kv_heads, head_dim, v_head_dim, kv_cache_dtype
         return None
 
+    def get_mla_kv_bytes_per_token(
+        self,
+        *,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        """Per-token, per-layer bytes of this platform's MLA pool; ``None`` means
+        the generic ``(kv_lora_rank + qk_rope_head_dim) * itemsize``."""
+        del kv_lora_rank, qk_rope_head_dim, kv_cache_dtype
+        return None
+
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         """Return the host (L2) MHA KV pool class matching ``device_pool``.
 

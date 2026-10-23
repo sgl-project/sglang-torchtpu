@@ -3,6 +3,7 @@
 Launches a server with Qwen3-0.6B on a single TPU chip and verifies basic inference.
 """
 
+import json
 import os
 import unittest
 
@@ -20,13 +21,13 @@ from sglang.test.test_utils import (
 register_tpu_ci(
     est_time=70,
     suite="stage-b-test-tpu-4-v7",
-    labels=["singlehost", "qwen3-0.6b", "smoke"],
+    labels=["singlehost", "qwen3-0.6b", "smoke", "structured-output"],
 )
 register_tpu_ci(
     est_time=300,
     suite="external-nightly-1host",
     nightly=True,
-    labels=["singlehost", "qwen3-0.6b", "smoke"],
+    labels=["singlehost", "qwen3-0.6b", "smoke", "structured-output"],
 )
 
 MODEL = "Qwen/Qwen3-0.6B"
@@ -62,8 +63,9 @@ class TestTpuQwen306bSinglehostSmoke(CustomTestCase):
                 "bfloat16",
                 "--device",
                 "tpu",
+                # Constrained requests run after warmup has frozen torch.compile.
                 "--grammar-backend",
-                "none",
+                "xgrammar",
                 # torch.compile is opt-in on TPU; enabling it auto-disables the
                 # tc_piecewise prefill graph, which is unimplemented on TPU
                 # (TpuDeviceModule has no graph_pool_handle) and otherwise crashes.
@@ -172,6 +174,29 @@ class TestTpuQwen306bSinglehostSmoke(CustomTestCase):
             self.assertEqual(resp.status_code, 200)
             data = resp.json()
             self.assertGreater(len(data["choices"][0]["text"]), 0)
+
+    def test_constrained_requests_keep_the_server_up(self):
+        def generate(sampling_params):
+            resp = requests.post(
+                f"{self.base_url}/generate",
+                json={
+                    "text": "The year the Eiffel Tower opened is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 16,
+                        **sampling_params,
+                    },
+                },
+                timeout=300,
+            )
+            self.assertEqual(resp.status_code, 200, resp.text)
+            return resp.json()["text"]
+
+        self.assertRegex(generate({"regex": "[0-9]{4}"}), r"^[0-9]{4}$")
+        ebnf = 'root ::= "{\\"year\\": " [0-9] [0-9] [0-9] [0-9] "}"'
+        self.assertIsInstance(json.loads(generate({"ebnf": ebnf}))["year"], int)
+        generate({})
+        self.assertIsNone(self.process.poll())
 
 
 if __name__ == "__main__":

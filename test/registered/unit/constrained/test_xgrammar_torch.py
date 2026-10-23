@@ -55,14 +55,14 @@ class TestXGrammarTpuDispatch(unittest.TestCase):
         src = inspect.getsource(mod.XGrammarGrammar.apply_vocab_mask)
         self.assertIn('"tpu"', src)
         self.assertIn("apply_token_bitmask_inplace", src)
-        self.assertIn('backend="torch_compile"', src)
+        self.assertIn('backend="torch_native"', src)
 
     def test_backend_apply_vocab_mask_routes_tpu_through_torch_fallback(self):
         mod = self._get_backend_module()
         src = inspect.getsource(mod.XGrammarGrammarBackend.apply_vocab_mask)
         self.assertIn('"tpu"', src)
         self.assertIn("apply_token_bitmask_inplace", src)
-        self.assertIn('backend="torch_compile"', src)
+        self.assertIn('backend="torch_native"', src)
 
 
 if __name__ == "__main__":

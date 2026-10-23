@@ -488,6 +488,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * effective_num_layers
                 * kv_size
             )
+            # A pool that pads its latent layout reports its own price; the
+            # generic product would under-count it.
+            if not is_deepseek_dsa(model_config.hf_config):
+                exact = current_platform.get_mla_kv_bytes_per_token(
+                    kv_lora_rank=model_config.kv_lora_rank,
+                    qk_rope_head_dim=model_config.qk_rope_head_dim,
+                    kv_cache_dtype=kv_cache_dtype,
+                )
+                if exact is not None:
+                    cell_size = exact * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

@@ -480,6 +480,19 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     )
 
 
+def _model_default_attention_backend(server_args, default: str) -> str:
+    """MLA checkpoints need the MLA kernel; RPA cannot read a latent KV cache."""
+    from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+
+    # Not model_config_of: its memo would freeze fields later hooks resolve.
+    try:
+        attention_arch = ModelConfig.from_server_args(server_args).attention_arch
+    except Exception:
+        # A model that cannot be loaded here fails later with its real error.
+        return default
+    return "pallas_tpu_mla" if attention_arch == AttentionArch.MLA else default
+
+
 def _validate_dsa(server_args) -> None:
     """Reject the sparse-attention (DSA) setups that TPU cannot serve correctly."""
     from sglang.srt.arg_groups.overrides import resolving_view
@@ -883,7 +896,9 @@ class TpuSRTPlatform(SRTPlatform):
             declare_resolution(
                 server_args,
                 "tpu.apply_server_args_defaults",
-                attention_backend=self.get_default_attention_backend(),
+                attention_backend=_model_default_attention_backend(
+                    server_args, self.get_default_attention_backend()
+                ),
             )
 
         if cfg.sampling_backend is None:
@@ -1162,6 +1177,24 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         return MLATokenToKVPool
+
+    def get_mla_kv_bytes_per_token(
+        self,
+        *,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+
+        pool_cls = self.get_mla_kv_pool_cls()
+        if not issubclass(pool_cls, TpuFusedMLATokenToKVPool):
+            return None
+        return pool_cls.kv_bytes_per_token_per_layer(
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            store_dtype=kv_cache_dtype,
+        )
 
     def get_dsa_kv_pool_cls(self) -> type:
         from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool

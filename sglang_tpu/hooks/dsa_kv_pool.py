@@ -13,7 +13,8 @@ size_tpu_dsa_kv_pool
        bytes_per_token for the layers this runner allocates, plus the EAGLE /
        MTP draft's layers the target reserves for.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1072.
-  Remove when: the configurator asks the platform pool for its bytes per token.
+  Remove when: the configurator asks the platform for the DSA pool's bytes per
+       token (get_mla_kv_bytes_per_token covers non-DSA MLA only).
 """
 
 from __future__ import annotations

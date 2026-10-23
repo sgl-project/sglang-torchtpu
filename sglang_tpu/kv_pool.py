@@ -846,12 +846,8 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
         # Physical segment dims: each aligned to 128 *independently* (the
         # kernel slices the last axis at ``nope_dim``, so a combined align
         # would misplace the rope segment for kv_lora_rank % 128 != 0).
-        self.nope_dim = (
-            _cdiv(kv_lora_rank, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
-        )
-        rope_width = qk_rope_head_dim or NOPE_MLA_ROPE_DIM
-        self.rope_dim = (
-            _cdiv(rope_width, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
+        self.nope_dim, self.rope_dim = self._padded_segment_dims(
+            kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
         )
         self.padded_kv_cache_dim = self.nope_dim + self.rope_dim
 
@@ -871,6 +867,16 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
         self.num_pages = self.size // self.page_size + 1
 
         self._create_buffers()
+        # The KV budget was drawn at this per-token price before the pool existed.
+        if self.kv_buffer:
+            priced = self.kv_bytes_per_token_per_layer(
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                store_dtype=self.store_dtype,
+            )
+            assert (
+                self.kv_buffer[0].nbytes == self.num_pages * self.page_size * priced
+            ), f"MLA KV layer buffer {self.kv_buffer[0].shape} != {priced} B/token"
 
         self.device_module = torch.get_device_module(self.device)
 
@@ -884,6 +890,29 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
     # ------------------------------------------------------------------ #
     # Buffer creation / accessors
     # ------------------------------------------------------------------ #
+
+    @classmethod
+    def kv_bytes_per_token_per_layer(
+        cls,
+        *,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        store_dtype: torch.dtype,
+    ) -> int:
+        """Bytes one token occupies in one layer's buffer; must track
+        ``_create_buffers``, since the KV budget is spent before the pool exists."""
+        nope_dim, rope_dim = cls._padded_segment_dims(
+            kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
+        )
+        return (nope_dim + rope_dim) * torch._utils._element_size(store_dtype)
+
+    @classmethod
+    def _padded_segment_dims(
+        cls, *, kv_lora_rank: int, qk_rope_head_dim: int
+    ) -> tuple[int, int]:
+        align = cls.HEAD_DIM_ALIGNMENT
+        rope_width = qk_rope_head_dim or NOPE_MLA_ROPE_DIM
+        return _cdiv(kv_lora_rank, align) * align, _cdiv(rope_width, align) * align
 
     def _create_buffers(self):
         shape = (

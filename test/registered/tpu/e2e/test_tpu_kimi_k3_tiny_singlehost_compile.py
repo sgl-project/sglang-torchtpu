@@ -60,8 +60,6 @@ SERVER_ARGS = [
     "4",
     "--ep-size",
     "4",
-    "--attention-backend",
-    "pallas_tpu_mla",
     "--page-size",
     "128",
     "--context-length",

@@ -109,6 +109,7 @@
     "prefix-cache": "Prefix cache",
     "kv-offload": "HiCache KV offload",
     "logprob": "Prompt logprobs",
+    "structured-output": "Structured output (xgrammar)",
     "compile": "torch.compile",
     "torch-compile": "torch.compile bundles",
     "compile-tracer": "Direct compile tracer",

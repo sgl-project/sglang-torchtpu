@@ -308,6 +308,26 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
+    def test_mla_cell_size_uses_the_platform_price(self):
+        """Bug regression: MLA sizing priced kv_lora_rank + qk_rope_head_dim while
+        the TPU pool pads each segment, so the pool outgrew its budget."""
+        num_layers = 2
+        for platform_price, expected in ((None, 576), (640, 640)):
+            with self.subTest(platform_price=platform_price):
+                mr = _make_model_runner(
+                    self, num_layers=num_layers, use_mla_backend=True
+                )
+                with mock_cpu_env(kv_size=1):
+                    from sglang.srt.model_executor import pool_configurator
+
+                    with patch.object(
+                        pool_configurator.current_platform,
+                        "get_mla_kv_bytes_per_token",
+                        return_value=platform_price,
+                    ):
+                        configurator = pool_configurator.DefaultPoolConfigurator(mr)
+                self.assertEqual(configurator._cell_size, expected * num_layers)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         side_effect=(576, 656),
