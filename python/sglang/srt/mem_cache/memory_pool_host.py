@@ -105,6 +105,7 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
     """
 
     device_pool: TpuFusedMHATokenToKVPool
+    storage_format_tag = "tpu-page-first-fused"
 
     def __init__(
         self,
@@ -154,7 +155,14 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
     def init_kv_buffer(self):
         # layout is asserted page_first_fused in __init__, so no re-check here.
-        dims = (self.page_num, self.layer_num) + self._device_page_shape()
+        page_shape = self._device_page_shape()
+        # Token-major and seq-along-lane have the same byte count per page; tag
+        # the storage key with the live shape and dtype so incompatible pages
+        # miss instead of loading or failing with a short read.
+        shape_tag = "x".join(str(d) for d in page_shape)
+        dtype_tag = str(self.dtype).removeprefix("torch.")
+        self.storage_format_tag = f"tpu-fused-{dtype_tag}-{shape_tag}"
+        dims = (self.page_num, self.layer_num) + page_shape
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         return alloc_func(
             dims,
@@ -319,22 +327,31 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             return
         self.backup_copy_d2h(staged, host_indices)
 
-    # -- L3 storage hooks (not supported in the 2-tier TPU phase) -------- #
+    # -- L3 storage seams ------------------------------------------------ #
+    # The host buffer is page-major, so one page's all-layer KV is the
+    # contiguous row kv_buffer[page_id] of shape (layer_num, *device_page_shape).
+    # Storage backends move that row as one opaque flat blob; the interior keeps
+    # the device's packed layout and is never interpreted on the host.
+
+    def _page_id(self, index) -> int:
+        # Callers pass the first token slot of a page; drop any sub-page
+        # offset, consistent with _to_page_ids.
+        return int(index) // self.page_size
+
+    def _page_dims(self) -> tuple:
+        return tuple(self.kv_buffer.shape[1:])  # (layer_num, *device_page_shape)
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        data_page = self.kv_buffer[self._page_id(index)]
+        return data_page.flatten() if flat else data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        return torch.zeros(
+            self._page_dims(), dtype=self.dtype, device=self.device
+        ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        self.kv_buffer[self._page_id(index)] = data_page.reshape(self._page_dims())
 
 
 # ---- V4 Compressed KV Host Pools ----
