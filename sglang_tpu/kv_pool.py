@@ -258,7 +258,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                 "for the TPU fused KV pool."
             )
         # Pad with one extra page so loc == 0 (the padded-token slot) is harmless.
-        self.num_blocks = self.size // self.page_size + 1
+        # Raiden's reshard landing arena follows the allocator's pages.
+        self.land_arena_blocks = self._land_arena_blocks()
+        self.num_blocks = self.size // self.page_size + 1 + self.land_arena_blocks
 
         self._create_buffers()
         # The KV budget was drawn at this per-token price before the pool existed.
@@ -284,6 +286,20 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # single contiguous row per slot of width ``num_kv_heads_x2 * head_dim``.
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = True
+
+    def _land_arena_blocks(self) -> int:
+        """Pool blocks reserved for raiden reshard landing (raiden/land.py).
+
+        One count per raiden group, not per pool: a draft pool reserves the
+        target's count whatever its own dtype or page size.
+        """
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
+            return 0
+        from sglang_tpu.disaggregation.raiden.land import land_arena_blocks
+
+        return land_arena_blocks(swa=self.allocation_label == "SWA")
 
     def _synchronize_device(self) -> None:
         device = getattr(self, "device", None)
