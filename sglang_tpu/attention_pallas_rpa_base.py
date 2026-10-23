@@ -580,7 +580,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # allocator hands out slots from a pool widened by dcp, so one page
         # spans page_size * dcp logical tokens over page_size physical slots.
         parallel = get_parallel()
-        self._dcp = parallel.attn_dcp_size
+        if model_runner.is_draft_worker and parallel.attn_dcp_size > 1:
+            # A spec draft's pool is replicated over the group and pages the
+            # widened location space raw (kv_cache_configurator.loc_space_scale).
+            self.page_size *= parallel.attn_dcp_size
+            self._dcp = 1
+        else:
+            self._dcp = parallel.attn_dcp_size
         self._dcp_rank = parallel.attn_dcp_rank if self._dcp > 1 else 0
         self._dcp_group = parallel.dcp_group if self._dcp > 1 else None
         self._page_stride = self.page_size * self._dcp
@@ -1067,13 +1073,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if self._dcp > 1 and forward_batch.forward_mode not in (
             ForwardMode.DECODE,
             ForwardMode.EXTEND,
+            ForwardMode.TARGET_VERIFY,
         ):
             raise ValueError(
-                "Decode context parallelism supports plain decode and extend "
-                f"batches only; got {forward_batch.forward_mode.name}. "
-                "Speculative decoding, mixed batches and split prefill are not "
-                "supported on the TPU DCP path."
+                "Decode context parallelism supports decode, extend and target "
+                f"verify batches only; got {forward_batch.forward_mode.name}. "
+                "Mixed batches and split prefill are not supported on the TPU "
+                "DCP path."
             )
+        # The spec worker's host lengths only bound a verify step's, so its DCP
+        # lengths and write targets come from the device lengths instead.
+        dcp_verify = self._dcp > 1 and forward_batch.forward_mode.is_target_verify()
 
         kv_len_bump = 0
         query_width = None
@@ -1126,7 +1136,16 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         dcp_cp_rank: torch.Tensor | None = None
         seq_lens_host: torch.Tensor | None = None
         ext_host: torch.Tensor | None = None
-        if self._dcp > 1:
+        if dcp_verify:
+            dcp_kv_lens_global = kv_lens
+            kv_lens = self._get_dcp_lens(kv_lens, self._dcp, self._dcp_rank).to(
+                torch.int32
+            )
+            dcp_prefix_kv_lens = self._get_dcp_lens(
+                forward_batch.seq_lens, self._dcp, self._dcp_rank
+            ).to(torch.int32)
+            dcp_cp_rank = self._cp_rank_t
+        elif self._dcp > 1:
             # The kernel derives the global query position of a local key from
             # the unsharded lengths, so it needs them alongside the shard. The
             # prefix shard excludes this step's own tokens: the extend path
@@ -1182,6 +1201,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
         page_indices = (per_seq // self._page_stride).to(torch.int32)
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
+        page_indices_device = self._value_metadata(
+            name="page_indices", value=page_indices, device=device
+        )
 
         # Sliding-window attention uses a separate KV pool. Translate full-pool
         # page indices through the CPU mapping before uploading or reusing them.
@@ -1191,7 +1213,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         step_slots: torch.Tensor | None = None
         step_positions: torch.Tensor | None = None
         num_tokens = 0
-        if self._dcp > 1:
+        if dcp_verify:
+            write_spans = self._dcp_verify_write_spans(
+                forward_batch=forward_batch,
+                page_indices=page_indices_device,
+                width=query_width,
+                pages_per_seq=pages_per_seq,
+                bs=bs,
+            )
+        elif self._dcp > 1:
             # The slots and positions of this step's tokens come from the host
             # request-to-token table, so the owner-masked write targets are
             # built here and shipped with the rest of the metadata, padded to
@@ -1237,7 +1267,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 ),
                 device=device,
             )
-            if self._dcp > 1:
+            if dcp_verify:
+                swa_write_spans = self._dcp_verify_write_spans(
+                    forward_batch=forward_batch,
+                    page_indices=swa_page_indices,
+                    width=query_width,
+                    pages_per_seq=pages_per_seq,
+                    bs=bs,
+                )
+            elif self._dcp > 1:
                 # SWA layers write into the SWA sub-pool, whose slots the
                 # mapping gives for the same tokens.
                 swa_slots = full_to_swa[step_slots.to(full_to_swa.device)].to(
@@ -1258,9 +1296,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
-            page_indices=self._value_metadata(
-                name="page_indices", value=page_indices, device=device
-            ),
+            page_indices=page_indices_device,
             distribution=distribution,
             active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
@@ -1271,6 +1307,43 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             dcp_swa_write=swa_write_spans,
             decode_query_size=decode_query_size,
             segments=segments,
+        )
+
+    def _dcp_verify_write_spans(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        page_indices: torch.Tensor,
+        width: int,
+        pages_per_seq: int,
+        bs: int,
+    ) -> DcpWriteSpans:
+        """Owner-masked write of a verify window, built on device.
+
+        One single-row span per token, empty where another rank owns it; each
+        slot is read off the request's device page row, so nothing here waits
+        on the host.
+        """
+        num_tokens = bs * width
+        assert forward_batch.out_cache_loc.shape[0] == num_tokens, (
+            forward_batch.out_cache_loc.shape,
+            bs,
+            width,
+        )
+        device = forward_batch.seq_lens.device
+        tokens = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        reqs = tokens // width
+        positions = forward_batch.seq_lens.to(torch.int64)[reqs] + tokens % width
+        cols = torch.clamp(positions // self._page_stride, max=pages_per_seq - 1)
+        offsets = positions % self._page_stride
+        pages = page_indices.view(bs, pages_per_seq)[reqs, cols].to(torch.int64)
+        slots = pages * self.page_size + offsets // self._dcp
+        owned = offsets % self._dcp == self._dcp_rank
+        return DcpWriteSpans(
+            index=tokens,
+            dst=slots.to(torch.int32),
+            src=tokens.to(torch.int32),
+            lens=owned.to(torch.int32),
         )
 
     def _host_page_columns(self, pages_per_seq: int, page_size: int) -> torch.Tensor:

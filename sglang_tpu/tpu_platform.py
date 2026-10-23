@@ -659,11 +659,14 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--pipeline-parallel-size > 1 is not supported with "
             f"--decode-context-parallel-size > 1 on TPU (got pp_size={cfg.pp_size})."
         )
-    if cfg.speculative_algorithm is not None:
+    if cfg.speculative_algorithm is not None and not _serves_experimental_chain(
+        cfg.speculative_algorithm
+    ):
         raise ValueError(
-            "--speculative-algorithm is not supported with "
-            "--decode-context-parallel-size > 1 on TPU (got "
-            f"{cfg.speculative_algorithm!r})."
+            "--decode-context-parallel-size > 1 on TPU supports speculative "
+            "decoding only with EAGLE3 or MTP on the experimental spec worker "
+            "(SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1), got "
+            f"{cfg.speculative_algorithm!r}."
         )
     if cfg.enable_mixed_chunk:
         raise ValueError(
@@ -760,6 +763,14 @@ def _validate_decode_context_parallel(server_args) -> None:
             "SparseCore gather offloads off and returns wrong first tokens with "
             "them on."
         )
+
+
+def _serves_experimental_chain(algorithm: str) -> bool:
+    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang_tpu.experimental import is_experimental_chain
+
+    return is_experimental_chain(SpeculativeAlgorithm.from_string(algorithm))
 
 
 def _experimental_spec_enabled() -> bool:

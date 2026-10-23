@@ -133,6 +133,17 @@ Startup checks:
 Known gap: DFlash with HiCache under DP attention passes GSM8K, but the KV
 offload probe sees one verify forward fewer on a host reload than on a device hit.
 
+## Decode context parallelism
+
+The chain family (EAGLE3, MTP) serves `--dcp-size 2` on the batched RPA backend.
+Target verify takes the DCP extend path (cached-prefix pass, merged with a local
+causal pass over the window); its shard lengths and owner-masked KV writes are
+built on device, because the worker's host lengths only bound the device ones.
+The draft runs without DCP over its replicated pool (`kv_cache_configurator`
+`loc_space_scale`). DFlash and DSpark are refused at startup: their non-causal
+draft cannot run on the causal-only batched backend. Every other DCP limit (`tpu_platform._validate_decode_context_parallel`)
+still applies.
+
 ## Not supported
 
 Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP outside a P/D
