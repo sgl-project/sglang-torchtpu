@@ -31,6 +31,7 @@ from typing import Callable, Optional, Tuple
 
 import jax
 import msgspec
+from jax._src import xla_bridge
 from torch.compiler._cache import CacheArtifactManager
 
 from sglang.srt.runtime_context import get_parallel
@@ -46,6 +47,7 @@ _MEMORY_CURRENT = Path("/sys/fs/cgroup/memory.current")
 
 _periodic_thread: Optional[threading.Thread] = None
 _periodic_stop = threading.Event()
+_jax_get_backend_uncached = xla_bridge._get_backend_uncached
 
 Release = Tuple[str, Callable[[], object]]
 
@@ -164,11 +166,42 @@ def _stop_periodic() -> None:
     _periodic_thread = None
 
 
+def _get_backend_with_cpu_reinit(platform=None):
+    # JAX skips backend initialization while any backend remains registered.
+    if platform is None or isinstance(platform, str):
+        requested = (
+            platform or xla_bridge._XLA_BACKEND.value or xla_bridge._PLATFORM_NAME.value
+        )
+        if requested == "cpu":
+            with xla_bridge._backend_lock:
+                if xla_bridge._backends and "cpu" not in xla_bridge._backends:
+                    xla_bridge._backends["cpu"] = xla_bridge._init_backend("cpu")
+    return _jax_get_backend_uncached(platform)
+
+
+def _release_cpu_backend() -> bool:
+    """Drop registry references at the idle, post-warmup cleanup boundary.
+
+    Call after clearing JAX caches and before collecting/freezing GC. Existing
+    arrays or executables keep their clients alive. Preserve CPU when it is the
+    default backend, and never initialize a backend just to release it.
+    """
+    with xla_bridge._backend_lock:
+        backend = xla_bridge._backends.get("cpu")
+        if backend is None or backend is xla_bridge._default_backend:
+            return False
+        xla_bridge._get_backend_uncached = _get_backend_with_cpu_reinit
+        del xla_bridge._backends["cpu"]
+        xla_bridge.get_backend.cache_clear()
+    return True
+
+
 def _before_freeze() -> None:
     release_startup_page_cache()
     CacheArtifactManager.clear()
     # Serving executables are owned by TorchTPU; discard JAX tracing caches.
     jax.clear_caches()
+    _release_cpu_backend()
     # gc.freeze() keeps any cycle it sees forever, so collect first even if
     # returning allocator pages is disabled.
     gc.collect()

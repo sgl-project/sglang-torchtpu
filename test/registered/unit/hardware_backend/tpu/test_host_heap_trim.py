@@ -117,13 +117,25 @@ class TestInstall(CustomTestCase):
                 "clear_caches",
                 side_effect=lambda: scheduler.calls.append("clear JAX"),
             ),
+            patch.object(
+                tpu,
+                "_release_cpu_backend",
+                side_effect=lambda: scheduler.calls.append("CPU backend"),
+            ),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.assertEqual(scheduler.handle_freeze_gc("req"), "forwarded")
         self.assertEqual(
             scheduler.calls,
-            ["export records", "clear JAX", "collect", "req", "after warmup"],
+            [
+                "export records",
+                "clear JAX",
+                "CPU backend",
+                "collect",
+                "req",
+                "after warmup",
+            ],
         )
         self.assertIsNone(tpu._periodic_thread)
 
@@ -197,6 +209,88 @@ class TestInstall(CustomTestCase):
             self.cls().handle_freeze_gc("req")
             self.assertTrue(trimmed.wait(2.0))
         self.assertIsNotNone(tpu._periodic_thread)
+
+
+class _Backend:
+    def __init__(self, platform):
+        self.platform = platform
+
+
+class TestCpuBackendRelease(CustomTestCase):
+    def setUp(self):
+        self.bridge = tpu.xla_bridge
+        self.tpu_backend = _Backend("tpu")
+        self.enterContext(
+            patch.object(
+                self.bridge,
+                "_backends",
+                {"cpu": _Backend("cpu"), "tpu": self.tpu_backend},
+            )
+        )
+        self.enterContext(
+            patch.object(self.bridge, "_default_backend", self.tpu_backend)
+        )
+        self.enterContext(
+            patch.object(
+                self.bridge, "_get_backend_uncached", tpu._jax_get_backend_uncached
+            )
+        )
+        self.enterContext(self.bridge.config.jax_platforms("tpu,cpu"))
+        self.init = self.enterContext(
+            patch.object(self.bridge, "_init_backend", side_effect=self.init_backend)
+        )
+        self.bridge.get_backend.cache_clear()
+        self.addCleanup(self.bridge.get_backend.cache_clear)
+
+    def init_backend(self, platform):
+        return self.tpu_backend if platform == "tpu" else _Backend(platform)
+
+    def test_release_preserves_tpu_and_recreates_cpu_once(self):
+        cpu_ref = weakref.ref(self.bridge.get_backend("cpu"))
+        self.assertTrue(tpu._release_cpu_backend())
+        gc.collect()
+        self.assertIsNone(cpu_ref())
+        self.assertIs(self.bridge.get_backend(), self.tpu_backend)
+        self.assertIs(self.bridge.get_backend("tpu"), self.tpu_backend)
+        self.assertIs(self.bridge.get_backend(self.tpu_backend), self.tpu_backend)
+        self.init.assert_not_called()
+
+        cpu = self.bridge.get_backend("cpu")
+        self.assertIs(self.bridge.get_backend("cpu"), cpu)
+        self.init.assert_called_once_with("cpu")
+        wrapper = self.bridge._get_backend_uncached
+        self.assertTrue(tpu._release_cpu_backend())
+        self.assertIs(self.bridge._get_backend_uncached, wrapper)
+        self.assertIsNot(self.bridge.get_backend("cpu"), cpu)
+        self.assertEqual(self.init.call_count, 2)
+
+    def test_default_or_absent_cpu_is_preserved_without_initialization(self):
+        wrapper = self.bridge._get_backend_uncached
+        self.bridge._default_backend = self.bridge._backends["cpu"]
+        self.assertFalse(tpu._release_cpu_backend())
+        self.assertIs(self.bridge._backends["cpu"], self.bridge._default_backend)
+        del self.bridge._backends["cpu"]
+        self.assertFalse(tpu._release_cpu_backend())
+        self.assertIs(self.bridge._get_backend_uncached, wrapper)
+        self.init.assert_not_called()
+
+    def test_empty_registry_uses_normal_backend_initialization(self):
+        tpu._release_cpu_backend()
+        self.bridge._backends.clear()
+        self.bridge._default_backend = None
+        self.bridge.get_backend.cache_clear()
+        cpu = self.bridge.get_backend("cpu")
+        self.assertIs(cpu, self.bridge._backends["cpu"])
+        self.assertIs(self.bridge.get_backend(), self.tpu_backend)
+        self.assertEqual(self.init.call_count, 2)
+
+    def test_cpu_initialization_failure_propagates_without_losing_tpu(self):
+        tpu._release_cpu_backend()
+        self.init.side_effect = RuntimeError("CPU initialization failed")
+        with self.assertRaisesRegex(RuntimeError, "CPU initialization failed"):
+            self.bridge.get_backend("cpu")
+        self.assertNotIn("cpu", self.bridge._backends)
+        self.assertIs(self.bridge.get_backend("tpu"), self.tpu_backend)
 
 
 if __name__ == "__main__":
