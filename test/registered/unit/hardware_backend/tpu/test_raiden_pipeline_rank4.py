@@ -56,7 +56,7 @@ def test_rank4_head_slices_land_on_owning_rank(total_kv_heads, dst_tp, dtype):
     pools = pl.pool_manifest(_groups([src], [swa_src], [1], [2]))
     full_ids, swa_ids = [4, 0, 2], [1, 3]
     spans = pp_common.head_slice_spans(
-        pools, [src, swa_src], full_ids, swa_ids, dst_tp, total_kv_heads
+        pools, [src, swa_src], full_ids, swa_ids, dst_tp, total_kv_heads, total_kv_heads
     )
     rng = np.random.default_rng(0)
     heads_per_rank = max(1, total_kv_heads // dst_tp)
@@ -80,6 +80,26 @@ def test_rank4_head_slices_land_on_owning_rank(total_kv_heads, dst_tp, dtype):
                 ]
                 got = dst[rank][index * dst_page_bytes : (index + 1) * dst_page_bytes]
                 assert np.array_equal(got, want), (rank, index)
+
+
+def test_rank4_swa_pool_slices_over_swa_heads():
+    """A sliding-window pool with fewer kv-heads than full attention is sliced
+    over its own head count, not the full-attention one."""
+    head_dim, page, dst_tp = 128, 512, 4
+    full_heads, swa_heads = 16, 4
+    src = torch.zeros((3, 2 * full_heads, head_dim, page), dtype=torch.bfloat16)
+    swa_src = torch.zeros((3, 2 * swa_heads, head_dim, page), dtype=torch.bfloat16)
+    pools = pl.pool_manifest(_groups([src], [swa_src], [1], [2]))
+    full_spans, swa_spans = pp_common.head_slice_spans(
+        pools, [src, swa_src], [0, 1], [2], dst_tp, full_heads, swa_heads
+    )
+    run = 2 * head_dim * page * src.element_size()
+    assert {s.size_bytes for s in full_spans.spans} == {full_heads // dst_tp * run}
+    assert {s.size_bytes for s in swa_spans.spans} == {swa_heads // dst_tp * run}
+    # The SWA source page holds 2 * swa_heads rows; no span may read past it.
+    assert max(s.src_offset_bytes + s.size_bytes for s in swa_spans.spans) == (
+        swa_heads * run
+    )
 
 
 def test_rank4_fingerprint_ignores_per_rank_heads():

@@ -741,6 +741,7 @@ class PipelineTransfer:
                 swa,
                 dst_attn_tp,
                 int(self.manager.kv_args.total_kv_head_num),
+                int(self.manager.kv_args.total_swa_kv_head_num),
                 with_swa=with_swa,
             )
             self.client.register_request_blocks(
