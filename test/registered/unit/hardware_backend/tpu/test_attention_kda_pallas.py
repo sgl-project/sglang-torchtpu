@@ -18,7 +18,9 @@ _N_V, _D_K, _D_V, _K, _T = 2, 4, 4, 4, 3
 _DIM = 2 * _N_V * _D_K + _N_V * _D_V
 
 
-def _run(lower_bound, conv_weights=None, is_decode=True, **layer_attrs):
+def _run(
+    lower_bound, conv_weights=None, is_decode=True, track=(None, None), **layer_attrs
+):
     conv_state, rec_state = (
         torch.zeros(4, _K - 1, 1, _DIM),
         torch.zeros(4, _N_V, _D_K, _D_V),
@@ -41,6 +43,7 @@ def _run(lower_bound, conv_weights=None, is_decode=True, **layer_attrs):
     backend.req_to_token_pool = SimpleNamespace(mamba2_layer_cache=lambda _: cache)
     backend._query_start_loc = backend._state_indices = backend._seq_lens = None
     backend._distribution = None
+    backend._track_indices, backend._track_end = track
     backend._is_decode = is_decode
     backend._read_offsets, backend._num_spec_tokens, backend._spec_window = None, 0, 1
     backend._op = Mock(return_value=torch.zeros(_T, _N_V, _D_V))
@@ -100,6 +103,21 @@ class TestTpuKDAAttnBackend(CustomTestCase):
         # lets the op skip trailing qkv columns.
         self.assertFalse(_run(-5.0)[3]["fused_qkvg"])
         self.assertTrue(_run(-5.0, fused_qkvg=True)[3]["fused_qkvg"])
+
+    def test_radix_snapshot_plan_is_forwarded(self):
+        # Without a plan (radix cache off) the op takes no snapshot.
+        kwargs = _run(-5.0)[3]
+        self.assertIsNone(kwargs["track_indices"])
+        self.assertIsNone(kwargs["track_end"])
+        # With one, both decode and extend hand the shared metadata through
+        # as is, so donated slots receive real KDA checkpoints.
+        indices = torch.tensor([3, 0], dtype=torch.int32)
+        ends = torch.tensor([128, -1], dtype=torch.int32)
+        for is_decode in (True, False):
+            with self.subTest(is_decode=is_decode):
+                kwargs = _run(-5.0, is_decode=is_decode, track=(indices, ends))[3]
+                self.assertIs(kwargs["track_indices"], indices)
+                self.assertIs(kwargs["track_end"], ends)
 
 
 if __name__ == "__main__":

@@ -372,5 +372,101 @@ class TestGDNPrefixCache(CustomTestCase):
         self.assertEqual(backend._track_end.cpu().tolist(), [-1] * 4)
 
 
+class TestKDAPrefixCache(CustomTestCase):
+    """The same snapshot contract in KDA mode (Kimi-K3: per-channel gate,
+    gate_lower_bound=-5.0), which the radix cache relies on for KDA hybrids."""
+
+    LOWER_BOUND = -5.0
+
+    def setUp(self):
+        from sglang_tpu.attention_gdn_pallas import build_gdn_pallas_op
+
+        self.op = build_gdn_pallas_op()
+        torch.manual_seed(11)
+        self.nk = self.nv = 2
+        self.dk, self.dv, self.k = 128, 128, 4
+        self.dim = self.nk * self.dk * 2 + self.nv * self.dv
+        self.weights = [
+            torch.randn(self.dim, 1, self.k).to("tpu") * 0.1,
+            None,
+            torch.randn(self.nv).to("tpu"),
+            # KDA's dt_bias is per (head, channel).
+            torch.randn(self.nv, self.dk).to("tpu"),
+        ]
+        self.inputs = [
+            torch.randn(193, self.dim).to("tpu"),
+            torch.randn(193, self.nv).to("tpu"),
+            torch.randn(193, self.nv * self.dk).to("tpu"),
+        ]
+
+    def states(self):
+        return (
+            torch.zeros(7, self.k - 1, self.dim, device="tpu"),
+            torch.zeros(7, self.nv, self.dk, self.dv, device="tpu"),
+        )
+
+    def run_op(self, states, start, end, slot, *, prefix=0, track=None, decode=False):
+        def ids(x):
+            return torch.tensor(x, dtype=torch.int32, device="tpu")
+
+        return self.op(
+            *(t[start:end] for t in self.inputs),
+            *states,
+            *self.weights,
+            ids([0, end - start]),
+            ids([slot]),
+            ids([1 if decode else 0, 1 if decode else 0, 1]),
+            ids([prefix + end - start]),
+            self.nk,
+            self.nv,
+            self.dk,
+            self.dv,
+            self.k,
+            True,
+            self.LOWER_BOUND,
+            batched_only=decode,
+            prefill_only=not decode,
+            track_indices=ids([track[0]]) if track else None,
+            track_end=ids([track[1]]) if track else None,
+        )
+
+    def test_prefill_snapshot_and_resume(self):
+        # The checkpoint must hold the state after 128 tokens, not after the
+        # whole 193-token prefill, and resuming from a copy of it must
+        # reproduce the uninterrupted prefill's tail.
+        full, reference = self.states(), self.states()
+        output = self.run_op(full, 0, 193, 1, track=(2, 128))
+        self.run_op(reference, 0, 128, 1)
+        for actual, expected in zip(full, reference):
+            torch.testing.assert_close(
+                actual[2].cpu(), expected[1].cpu(), atol=1e-4, rtol=1e-4
+            )
+        from sglang_tpu.mamba_pool import TpuMambaPool, TpuPerLayerState
+
+        pool = TpuMambaPool.__new__(TpuMambaPool)
+        pool.device = "tpu"
+        pool.checkpoint_width = 1
+        pool.mamba_cache = TpuPerLayerState(conv=[[full[0]]], temporal=[full[1]])
+        pool.copy_from(torch.tensor([2]), torch.tensor([3]))
+        resumed = self.run_op(full, 128, 193, 3, prefix=128)
+        torch.testing.assert_close(
+            resumed.cpu(), output[128:].cpu(), atol=1e-4, rtol=1e-4
+        )
+
+    def test_final_decode_and_disabled_snapshots(self):
+        for length, decode in [(64, False), (1, True)]:
+            with self.subTest(length=length, decode=decode):
+                states = self.states()
+                self.run_op(states, 0, length, 1, track=(2, length), decode=decode)
+                for state in states:
+                    torch.testing.assert_close(
+                        state[2].cpu(), state[1].cpu(), atol=0, rtol=0
+                    )
+                saved = [t[2].cpu().clone() for t in states]
+                self.run_op(states, 0, length, 1, track=(2, -1), decode=decode)
+                for state, expected in zip(states, saved):
+                    torch.testing.assert_close(state[2].cpu(), expected, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

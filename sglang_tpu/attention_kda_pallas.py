@@ -68,6 +68,12 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             fused_qkvg=getattr(layer, "fused_qkvg", False),
             # Kimi-K3 packs conv / dt_bias / A_log into one f32 operand post-load.
             packed_weights=getattr(layer, "packed_kernel_weights", None),
+            # Radix checkpoint plan from the shared GDN metadata
+            # (init_forward_metadata): the kernel snapshots conv + recurrent
+            # state into track_indices at track_end, or skips rows marked -1.
+            # Both are None when prefix caching is off.
+            track_indices=self._track_indices,
+            track_end=self._track_end,
             read_offsets=read_offsets,
             num_spec_tokens=self._num_spec_tokens,
         )

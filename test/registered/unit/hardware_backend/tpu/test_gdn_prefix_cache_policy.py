@@ -10,7 +10,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.arg_groups import mamba_hook, overrides
-from sglang.srt.configs import Qwen3NextConfig
+from sglang.srt.configs import (
+    BailingHybridConfig,
+    Glm5NextConfig,
+    KimiK3Config,
+    KimiLinearConfig,
+    Qwen3NextConfig,
+    hybrid_arch,
+)
 from sglang.srt.mem_cache import kv_cache_builder as builder
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.test_utils import CustomTestCase
@@ -92,19 +99,92 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                     ):
                         platform_cls().validate_mamba_prefix_cache(view)
 
+    def test_kda_speculative_prefix_cache_is_rejected_only_on_tpu(self):
+        """Prefix hits on the checkpoints a KDA speculative verify writes are
+        unvalidated on TPU; KDA without speculation and GDN with it keep radix."""
+        kimi_k3 = KimiK3Config(
+            text_config={
+                "linear_attn_config": {"kda_layers": [1], "full_attn_layers": [2]}
+            },
+            architectures=["KimiK3ForConditionalGeneration"],
+        )
+        cases = (
+            (kimi_k3, "DSPARK", True),
+            (kimi_k3, None, False),
+            (Qwen3NextConfig(), "EAGLE", False),
+        )
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform, SRTPlatform):
+            for hf_config, algorithm, rejected_on_tpu in cases:
+                with self.subTest(
+                    platform=platform_cls.__name__,
+                    model=type(hf_config).__name__,
+                    algorithm=algorithm,
+                ):
+                    view = SimpleNamespace(
+                        enable_mixed_chunk=False,
+                        disable_radix_cache=False,
+                        mamba_radix_cache_strategy="extra_buffer",
+                        enable_hierarchical_cache=False,
+                        enable_int8_mamba_checkpoint=False,
+                        speculative_algorithm=algorithm,
+                    )
+                    rejects = rejected_on_tpu and platform_cls is not SRTPlatform
+                    with (
+                        self.assertRaisesRegex(
+                            ValueError,
+                            "TPU KDA prefix caching.*speculative.*"
+                            "--disable-radix-cache",
+                        )
+                        if rejects
+                        else contextlib.nullcontext()
+                    ):
+                        platform_cls().validate_mamba_prefix_cache(view, hf_config)
+
+    def test_only_kimi_k3_among_kda_hybrids_reaches_prefix_checkpoints(self):
+        """KDA hybrids other than Kimi-K3's multimodal entry keep the startup
+        refusal: none is validated, and GLM-5.3-Flash's megakernel writes no
+        snapshots."""
+        bailing_kda = BailingHybridConfig(
+            short_conv_kernel_size=4, architectures=["BailingMoeV3ForCausalLM"]
+        )
+        cases = (
+            (KimiK3Config(architectures=["KimiK3ForConditionalGeneration"]), True),
+            # The text-only K3 entry skips the mamba radix resolution
+            # (_MAMBA_RADIX_CACHE_ARCHS), so no TPU validation would run for it.
+            (KimiLinearConfig(architectures=["KimiK3LinearForCausalLM"]), False),
+            (KimiLinearConfig(architectures=["KimiLinearForCausalLM"]), False),
+            (bailing_kda, False),
+            (Glm5NextConfig(architectures=["Glm5NextForConditionalGeneration"]), False),
+        )
+        for hf_config, supported in cases:
+            model = SimpleNamespace(hf_config=hf_config, is_draft_model=False)
+            with self.subTest(arch=hf_config.architectures[0]):
+                # Reached through KDA, not by being mistaken for a GDN model.
+                self.assertIsNone(hybrid_arch.hybrid_gdn_config(model))
+                self.assertIsNotNone(hybrid_arch.hybrid_kda_config(model))
+                for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+                    self.assertEqual(
+                        platform_cls().supports_mamba_prefix_cache(model),
+                        supported,
+                        platform_cls.__name__,
+                    )
+
     def test_backend_guard_preserves_other_devices_and_explicit_disable(self):
         """Unsupported backends must not silently disable caching after pool sizing."""
+        # (tpu, recurrent, gdn, kda, disabled, expected); None means "rejects".
         cases = (
-            (True, True, False, False, None),  # Unsupported backend must reject
-            (True, True, False, True, True),  # Explicit disable sizes pools correctly
-            (True, True, True, False, False),
-            (True, True, True, True, True),
-            (True, False, False, False, False),  # Ordinary attention
-            (False, True, False, False, False),  # GPU KDA remains supported
+            (True, True, False, False, False, None),  # Unsupported backend rejects
+            (True, True, False, False, True, True),  # Explicit disable sizes pools
+            (True, True, True, False, False, False),
+            (True, True, True, False, True, True),
+            (True, True, False, True, False, False),  # TPU Kimi-K3 writes checkpoints
+            (True, True, False, True, True, True),
+            (True, False, False, False, False, False),  # Ordinary attention
+            (False, True, False, False, False, False),  # GPU KDA remains supported
         )
-        for platform_cls, recurrent, gdn, disabled, expected in (
-            (platform_cls, recurrent, gdn, disabled, expected)
-            for tpu, recurrent, gdn, disabled, expected in cases
+        for platform_cls, recurrent, gdn, kda, disabled, expected in (
+            (platform_cls, recurrent, gdn, kda, disabled, expected)
+            for tpu, recurrent, gdn, kda, disabled, expected in cases
             for platform_cls in (
                 (TpuSRTPlatform, TpuOOTPlatform) if tpu else (SRTPlatform,)
             )
@@ -113,6 +193,7 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                 platform=platform_cls.__name__,
                 recurrent=recurrent,
                 gdn=gdn,
+                kda=kda,
                 disabled=disabled,
             ):
                 worker = MagicMock()
@@ -121,7 +202,12 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                 text_config = Qwen3NextConfig() if gdn else object()
                 model = SimpleNamespace(
                     is_multimodal=False,
-                    hf_config=SimpleNamespace(get_text_config=lambda: text_config),
+                    hf_config=SimpleNamespace(
+                        get_text_config=lambda: text_config,
+                        architectures=(
+                            ["KimiK3ForConditionalGeneration"] if kda else None
+                        ),
+                    ),
                 )
                 memory = MagicMock(disable_radix_cache=disabled)
                 parallel = MagicMock(dcp_enabled=False, enable_dp_attention=False)
@@ -144,6 +230,15 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                         stack.enter_context(
                             patch.object(builder, name, return_value=value)
                         )
+                    # The platform resolves KDA from the model config; a mock
+                    # config has no real KimiLinearConfig to detect.
+                    stack.enter_context(
+                        patch.object(
+                            hybrid_arch,
+                            "hybrid_kda_config",
+                            return_value=object() if kda else None,
+                        )
+                    )
                     stack.enter_context(
                         patch("sglang.srt.platforms.current_platform", platform_cls())
                     )

@@ -123,10 +123,17 @@ def attach_k3_megakernel(result: None, causal_lm: Any, *args, **kwargs) -> None:
     """AFTER KimiK3LinearForCausalLM.post_load_weights."""
     if not _enabled():
         return
+    from sglang.srt.runtime_context import get_memory
     from sglang_tpu.k3_megakernel.ops import build_runtime
 
     if _owns_weights():
         _check_server_args()
+    elif not get_memory().disable_radix_cache:
+        # With sglang's weights kept, bs=1 decode still runs on the kernel.
+        raise ValueError(
+            "SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL=1 needs --disable-radix-cache: "
+            "its decode steps write no radix snapshot of the KDA state."
+        )
     causal_lm.model._k3_megakernel = build_runtime(
         causal_lm, owns_weights=_owns_weights()
     )

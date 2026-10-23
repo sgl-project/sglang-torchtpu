@@ -27,8 +27,14 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
     # The MTP draft has its own graph runner; the kernel serves the target.
     if not ops.enabled() or type(model) is not Glm5NextForConditionalGeneration:
         return result
+    from sglang.srt.runtime_context import get_memory
     from sglang_tpu.envs import envs as tpu_envs
 
+    if not get_memory().disable_radix_cache:
+        raise ValueError(
+            "SGLANG_TPU_GLM_FLASH_MEGAKERNEL=1 needs --disable-radix-cache: "
+            "its steps write no radix snapshot of the KDA state."
+        )
     args = runner.model_runner.server_args
     n_query = (
         (args.speculative_num_draft_tokens or 1) if args.speculative_algorithm else 1

@@ -112,6 +112,28 @@ class TestK3MegakernelHooks(CustomTestCase):
             with self.subTest(**kw), self.assertRaisesRegex(ValueError, needle):
                 check(**kw)
 
+    def test_kept_weights_still_require_radix_cache_off(self):
+        """With sglang's weights kept, bs=1 decode still runs on the kernel, which
+        writes no radix snapshot, so a radix-on server must refuse to attach it."""
+        keep = tpu_envs.SGLANG_TPU_K3_MEGAKERNEL_KEEP_SGLANG_WEIGHTS
+        for disabled in (False, True):
+            causal_lm = SimpleNamespace(model=SimpleNamespace())
+            memory = SimpleNamespace(disable_radix_cache=disabled)
+            with (
+                self.subTest(disable_radix_cache=disabled),
+                _FLAG.override(True),
+                keep.override(True),
+                patch("sglang.srt.runtime_context.get_memory", return_value=memory),
+                patch("sglang_tpu.k3_megakernel.ops.build_runtime") as build,
+            ):
+                with (
+                    contextlib.nullcontext()
+                    if disabled
+                    else self.assertRaisesRegex(ValueError, "--disable-radix-cache")
+                ):
+                    hooks.attach_k3_megakernel(None, causal_lm)
+                self.assertEqual(build.called, disabled)
+
     def test_dspark_capture_builds_the_capturing_kernels(self):
         runtime = MagicMock()
         causal_lm = SimpleNamespace(model=SimpleNamespace(_k3_megakernel=runtime))
