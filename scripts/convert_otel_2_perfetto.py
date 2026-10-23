@@ -223,7 +223,7 @@ def __convert_to_perfetto_span(span, rid, bootstrap_room, pid, host_id):
 
     span["perfetto_span"] = perfetto_span
 
-    for child_span in span["child"]:
+    for child_span in span.get("child", []):
         __convert_to_perfetto_span(child_span, rid, bootstrap_room, pid, host_id)
 
 
@@ -262,7 +262,7 @@ def generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data):
 def __set_span_tid(span, line):
     span["perfetto_span"]["tid"] = line
 
-    for child_span in span["child"]:
+    for child_span in span.get("child", []):
         __set_span_tid(child_span, line)
 
 
@@ -329,7 +329,7 @@ def __convert_to_perfetto_events(span):
 
             span["perfetto_events"].append(perfetto_event)
 
-    for child_span in span["child"]:
+    for child_span in span.get("child", []):
         __convert_to_perfetto_events(child_span)
 
 
@@ -401,7 +401,7 @@ def __gather_one_span(span):
     if "perfetto_links" in span:
         elems.extend(span["perfetto_links"])
 
-    for child_span in span["child"]:
+    for child_span in span.get("child", []):
         elems.extend(__gather_one_span(child_span))
 
     return elems
