@@ -234,8 +234,10 @@ class _SharedBufferView(TpuFusedMHATokenToKVPool):
         shared_buffers: Optional[List[torch.Tensor]] = None,
         layer_groups: Optional[List[int]] = None,
         group_pages: Optional[torch.Tensor] = None,
+        parent_pool: Optional[TpuUnifiedSWAKVPool] = None,
         **kwargs,
     ):
+        self.parent_pool = parent_pool
         self._shared_buffers = None if shared_buffers is None else list(shared_buffers)
         if self._shared_buffers is not None:
             kwargs["layer_num"] = len(self._shared_buffers)
@@ -412,12 +414,14 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+        self._shared_raiden_state = None
         self.full_kv_pool = _SharedBufferView(
             head_num=head_num,
             head_dim=head_dim,
             v_head_dim=v_head_dim,
             layer_num=G,
             allocation_label="Full",
+            parent_pool=self,
             **common,
         )
         bufs = self.full_kv_pool.kv_buffer
@@ -429,8 +433,13 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             allocation_label="SWA",
             layer_groups=[j // G for j in range(self.swa_layer_nums)],
             group_pages=self.swa_group_pages if self.num_swa_groups > 1 else None,
+            parent_pool=self,
             **common,
         )
+        self.full_kv_pool.host_capacity_bytes = sum(
+            self.full_kv_pool.get_kv_size_bytes()
+        )
+        self.swa_kv_pool.host_capacity_bytes = 0
 
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         self._swa_layer_group: Dict[int, int] = {}

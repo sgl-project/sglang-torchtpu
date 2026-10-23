@@ -244,3 +244,198 @@ class TpuRaidenHostKVCache(HostKVCache):
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         raise NotImplementedError("L3 storage not yet supported on TPU raiden path")
+
+
+class _SharedRaidenHostState:
+    """Single Raiden host transfer engine and logical-to-physical page table shared by Full and SWA views."""
+
+    def __init__(
+        self,
+        parent_pool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+    ):
+        from sglang_tpu.raiden_transfer import RaidenKVTransfer
+
+        backing_pool = parent_pool.full_kv_pool
+        self.num_swa_groups = parent_pool.num_swa_groups
+        fused = backing_pool.get_fused_kv_buffer(backing_pool.start_layer)
+        page_bytes = int(np.prod(fused.shape[1:])) * fused.element_size()
+        self.size_per_token = (page_bytes // page_size) * backing_pool.layer_num
+
+        if host_size > 0:
+            raw_tokens = int(host_size * 1e9 // self.size_per_token)
+        else:
+            raw_tokens = int(parent_pool.size * host_to_device_ratio)
+        usable_pages = max(raw_tokens // page_size, self.num_swa_groups)
+        self.size = usable_pages * page_size
+        # Page 0 is reserved as the dummy page.
+        self.page_num = usable_pages + 1
+
+        requested_bytes = self.page_num * page_size * self.size_per_token
+        available_bytes = host_memory_budget_bytes(requested_bytes)
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
+        logger.info(
+            "Allocating unified hierarchical KV host pool: %d tokens (%d pages, "
+            "%d SWA groups), %.2f GB host memory.",
+            self.size,
+            usable_pages,
+            self.num_swa_groups,
+            requested_bytes / 1e9,
+        )
+
+        self.transfer = RaidenKVTransfer(backing_pool, self.page_num)
+        self.swa_group_pages = torch.zeros(
+            (max(0, self.num_swa_groups - 1), self.page_num),
+            dtype=torch.int32,
+            device="cpu",
+        )
+        self.free_pages = torch.arange(1, self.page_num, dtype=torch.int32)
+        self.lock = threading.RLock()
+
+    def clear(self) -> None:
+        self.free_pages = torch.arange(1, self.page_num, dtype=torch.int32)
+        self.swa_group_pages.zero_()
+
+
+class TpuRaidenUnifiedHostKVCache(TpuRaidenHostKVCache):
+    """Logical-to-physical host KV pool sharing one ``RaidenKVTransfer`` between Full and SWA."""
+
+    def __init__(
+        self,
+        device_pool: TpuFusedMHATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = False,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        *,
+        pool_label: str = "kv",
+        mtp_draft_device_pools: tuple = (),
+    ):
+        del layout, allocator_type
+        if mtp_draft_device_pools:
+            raise NotImplementedError(
+                "MTP draft KV offload is not supported on the TPU raiden path."
+            )
+        parent_pool = getattr(device_pool, "parent_pool", None)
+        if parent_pool is None:
+            raise ValueError(
+                "TpuRaidenUnifiedHostKVCache requires a _SharedBufferView with parent_pool."
+            )
+        state = getattr(parent_pool, "_shared_raiden_state", None)
+        if state is None:
+            state = _SharedRaidenHostState(
+                parent_pool=parent_pool,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=host_size,
+                page_size=page_size,
+            )
+            parent_pool._shared_raiden_state = state
+
+        self.device_pool = device_pool
+        self.pool_label = pool_label
+        self.page_size = page_size
+        self.layout = RAIDEN_LAYOUT
+        self.pin_memory = pin_memory
+        self.device = device
+        self.dtype = device_pool.store_dtype
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+        self.layer_num = device_pool.layer_num
+
+        self._state = state
+        self.is_swa = getattr(device_pool, "allocation_label", "") == "SWA"
+        self._m = state.num_swa_groups if self.is_swa else 1
+        self._host_group_pages = state.swa_group_pages if self.is_swa else None
+        self.transfer = state.transfer
+        self.lock = state.lock
+        self.page_num = state.page_num
+        self.size = state.size // self._m
+        self.size_per_token = state.size_per_token * self._m
+
+    def clear(self) -> None:
+        with self.lock:
+            self._state.clear()
+
+    def available_size(self) -> int:
+        with self.lock:
+            free_count = len(self._state.free_pages)
+            pages = free_count // self._m
+            return pages * self.page_size
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        assert need_size % self.page_size == 0, (
+            "host alloc size must be a multiple of page_size"
+        )
+        num_pages = need_size // self.page_size
+        if num_pages == 0:
+            return torch.empty((0,), dtype=torch.int64)
+        total_needed = num_pages * self._m
+        with self.lock:
+            if total_needed > len(self._state.free_pages):
+                return None
+            primary_pages = self._state.free_pages[:num_pages]
+            if self._m > 1:
+                companions = self._state.free_pages[num_pages:total_needed]
+                self._host_group_pages[:, primary_pages.long()] = companions.view(
+                    self._m - 1, num_pages
+                )
+            self._state.free_pages = self._state.free_pages[total_needed:]
+        pages = primary_pages.to(torch.int64)
+        offsets = torch.arange(self.page_size, dtype=torch.int64)
+        return (pages[:, None] * self.page_size + offsets[None, :]).reshape(-1)
+
+    def free(self, indices: torch.Tensor) -> int:
+        if indices.numel() == 0:
+            return 0
+        page_ids = torch.unique(indices.cpu() // self.page_size).to(torch.int32)
+        page_ids = page_ids[page_ids > 0]
+        if page_ids.numel() == 0:
+            return len(indices)
+        with self.lock:
+            if self._m > 1:
+                companions = self._host_group_pages[:, page_ids.long()].reshape(-1)
+                released = torch.cat([page_ids, companions])
+            else:
+                released = page_ids
+            self._state.free_pages = torch.cat([self._state.free_pages, released])
+        return len(indices)
+
+    def _expand_pages(
+        self, token_indices: torch.Tensor, group_pages: Optional[torch.Tensor]
+    ) -> List[int]:
+        primary_pages = (token_indices[:: self.page_size] // self.page_size).tolist()
+        if self._m <= 1 or group_pages is None:
+            return primary_pages
+        expanded: List[int] = []
+        for p in primary_pages:
+            expanded.append(p)
+            expanded.extend(group_pages[:, p].tolist())
+        return expanded
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> RaidenFutureEvent:
+        del io_backend
+        dev_group_pages = getattr(device_pool, "group_pages", None)
+        device_pages = self._expand_pages(device_indices, dev_group_pages)
+        host_pages = self._expand_pages(host_indices, self._host_group_pages)
+        return self.transfer.backup(device_pages, host_pages)
+
+    def load_all_layer(
+        self, device_pool, host_indices, device_indices
+    ) -> RaidenFutureEvent:
+        dev_group_pages = getattr(device_pool, "group_pages", None)
+        host_pages = self._expand_pages(host_indices, self._host_group_pages)
+        device_pages = self._expand_pages(device_indices, dev_group_pages)
+        return self.transfer.load(host_pages, device_pages)
