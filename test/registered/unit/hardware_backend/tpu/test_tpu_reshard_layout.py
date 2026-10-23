@@ -506,6 +506,28 @@ class TestPushReshardRefusal(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds the block"):
             mgr._check_reshard_bounds(req, 8, 4)
 
+    def test_packed_heads_refused_by_name(self):
+        """SGLANG_TPU_KV_PACK_HEADS: a pool storing two 64-wide heads in one
+        row reports one 128-wide head; the refusal must say so, not trip over
+        the head count."""
+        from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+        from sglang_tpu.envs import envs as tpu_envs
+
+        for dtype in (torch.bfloat16, _FP8):
+            with tpu_envs.SGLANG_TPU_KV_PACK_HEADS.override(True):
+                pool = TpuFusedMHATokenToKVPool(
+                    size=128, page_size=PAGE, dtype=dtype, head_num=2, head_dim=64,
+                    layer_num=1, device="cpu", enable_memory_saver=False,
+                )  # fmt: skip
+            groups = get_raiden_kv_caches(pool)
+            self.assertEqual(groups.kv_pack_heads, 2)
+            # 8 heads: decode TP 4 holds 2 per rank (packed), prefill TP 8 holds 1.
+            mgr = _refusal_manager(groups.full, groups.full_head_nums, 4, total_heads=8)
+            mgr._kv_pack_heads = groups.kv_pack_heads
+            reason = mgr.reshard_refusal(8, 4)
+            self.assertIn("SGLANG_TPU_KV_PACK_HEADS", reason)
+            self.assertIn("pack 2 heads per row", reason)
+
 
 class TestPushReshardBytes(unittest.TestCase):
     """Byte-level pins: the predicate allows a cell iff the push is exact."""

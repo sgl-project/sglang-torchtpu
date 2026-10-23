@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    get_kv_layout,
     get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
     is_aborted,
@@ -327,6 +328,7 @@ class PrefillBootstrapQueue:
             kv_args.total_swa_kv_head_num = (
                 self.scheduler.model_config.get_total_swa_num_kv_heads()
             )
+        kv_args.kv_layout = get_kv_layout(self.token_to_kv_pool)
         kv_args.page_size = self.token_to_kv_pool.page_size
         kv_args.sliding_window_size = self.scheduler.sliding_window_size
 

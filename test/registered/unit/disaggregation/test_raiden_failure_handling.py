@@ -1060,6 +1060,7 @@ class TestReceiverInitRefusals(unittest.TestCase):
             reshard_refusal=Mock(return_value=None),
             log_reshard_refusal=Mock(),
             register_decode_request=Mock(),
+            kv_args=SimpleNamespace(kv_layout=None),
         )
         fields.update(mgr_overrides)
         for name in real:  # use the RaidenKVManager method, not a Mock
@@ -1069,7 +1070,7 @@ class TestReceiverInitRefusals(unittest.TestCase):
         n = max(1, src_tp // dst_tp) if infos is None else infos
 
         def common_init(self, prefill_dp_rank):
-            self.prefill_info = SimpleNamespace(attn_tp_size=src_tp)
+            self.prefill_info = SimpleNamespace(attn_tp_size=src_tp, kv_layout=None)
             self.target_pp_ranks = list(range(pp))
             self.target_cp_ranks = list(range(cp))
             self.bootstrap_infos = [{"rank_ip": "10.0.0.1", "rank_port": 4444}] * n
@@ -1147,7 +1148,7 @@ class TestReceiverInitRefusals(unittest.TestCase):
             _reshard_layers=lambda swa: [],
             _make_geometry=lambda *args, **kwargs: None,
             _state_rows_from_state_indices=lambda state_indices: [],
-            kv_args=SimpleNamespace(page_size=64),
+            kv_args=SimpleNamespace(page_size=64, kv_layout=None),
             _decode=DecodeState(),
             local_ip="10.0.0.3",
             rank_port=6000,
@@ -2883,6 +2884,165 @@ class TestAnnounceSendFailureIsContained(unittest.TestCase):
             _announce(mgr)
         self.assertEqual(log_error.call_count, 1)
         self.assertIn("CHUNK announce", log_error.call_args[0][0])
+
+
+SEQ = "seq_along_lane"
+
+
+class TestKVLayoutCompatibility(unittest.TestCase):
+    """#1077: the decode refuses a prefill whose KV pool layout differs."""
+
+    def test_mismatch_reason(self):
+        from sglang_tpu.disaggregation.raiden.common import kv_layout_mismatch_reason
+
+        self.assertIsNone(kv_layout_mismatch_reason(None, None))
+        self.assertIsNone(kv_layout_mismatch_reason(SEQ, SEQ))
+        self.assertIsNone(kv_layout_mismatch_reason("token_major", None))
+        reason = kv_layout_mismatch_reason(None, SEQ)
+        self.assertIn(f"prefill uses {SEQ}, decode uses token_major", reason)
+        self.assertIn("SGLANG_TPU_USE_SEQ_ALONG_LANE_KV", reason)
+        reason = kv_layout_mismatch_reason(SEQ, None)
+        self.assertIn(f"prefill uses token_major, decode uses {SEQ}", reason)
+
+    def _init(self, local, remote, n_infos=1, pipeline=None):
+        # Decode attention TP 4; n_infos sources means prefill TP 4 * n_infos,
+        # which passes the legacy-transport checks of #1079.
+        mgr = _decode_manager_stub(
+            request_status={ROOM: KVPoll.Bootstrapping},
+            kv_args=SimpleNamespace(kv_layout=local),
+            _pipeline=pipeline,
+            attn_tp_size=4,
+            _dynamic_host_staging=True,
+            reshard_refusal=Mock(return_value=None),
+            log_reshard_refusal=Mock(),
+        )
+        recv = _receiver(mgr)
+        recv.bootstrap_addr = "10.0.0.1:8998"
+        infos = [{"rank_ip": "10.0.0.1", "rank_port": 4444 + i} for i in range(n_infos)]
+
+        def common_init(self_, prefill_dp_rank):
+            self_.prefill_info = SimpleNamespace(
+                kv_layout=remote, attn_tp_size=4 * n_infos
+            )
+            self_.target_pp_ranks = [0]
+            self_.target_cp_ranks = [0]
+            self_.bootstrap_infos = infos
+            mgr.update_status(ROOM, KVPoll.WaitingForInput)
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.CommonKVReceiver.init",
+                common_init,
+            ),
+            patch.object(RaidenKVReceiver, "_send_abort_notification") as abort,
+        ):
+            recv.init(0)
+        return mgr, recv, abort
+
+    def test_matching_layouts_pass(self):
+        # None/None is what old peers on both sides look like.
+        for layout in (None, SEQ):
+            for n_infos in (1, 2):  # pull (S == D) and push-reshard (S > D)
+                for pipeline in (None, object()):
+                    mgr, recv, abort = self._init(layout, layout, n_infos, pipeline)
+                    self.assertIsNone(recv.conclude_state)
+                    self.assertEqual(mgr.check_status(ROOM), KVPoll.WaitingForInput)
+                    self.assertEqual(mgr.failure_records, {})
+                    abort.assert_not_called()
+                    # The geometry checks stay off the pipeline transport.
+                    if pipeline is None and n_infos == 2:
+                        mgr.reshard_refusal.assert_called_once_with(8, 4)
+                    else:
+                        mgr.reshard_refusal.assert_not_called()
+
+    def test_mismatch_fails_request_with_reason_and_aborts_prefill(self):
+        # (decode, prefill); (SEQ, None) is also an old prefill + new HND decode.
+        for local, remote in ((None, SEQ), (SEQ, None)):
+            for n_infos in (1, 2):
+                for pipeline in (None, object()):
+                    mgr, recv, abort = self._init(local, remote, n_infos, pipeline)
+                    self.assertEqual(recv.poll(), KVPoll.Failed)
+                    abort.assert_called_once()
+                    mgr.log_reshard_refusal.assert_called_once()
+                    # Checked first: no geometry check runs on a mismatch.
+                    mgr.reshard_refusal.assert_not_called()
+                    with self.assertRaises(Exception) as cm:
+                        recv.failure_exception()
+                    self.assertIn("KV layout mismatch", str(cm.exception))
+                    # No PULL_REQ / RESHARD_REQ goes out afterwards.
+                    mgr.register_decode_request = Mock()
+                    recv.send_metadata(np.asarray([1], dtype=np.int32))
+                    mgr.register_decode_request.assert_not_called()
+
+    def _pool_layout(self, dtype, pack):
+        from sglang.srt.disaggregation.utils import get_kv_layout
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        with tpu_envs.SGLANG_TPU_KV_PACK_HEADS.override(pack):
+            pool = TpuFusedMHATokenToKVPool(
+                size=128, page_size=16, dtype=dtype, head_num=2, head_dim=64,
+                layer_num=1, device="cpu", enable_memory_saver=False,
+            )  # fmt: skip
+        return pool.get_fused_kv_buffer(0).shape, get_kv_layout(pool)
+
+    def test_kv_pack_heads_on_one_side_is_refused(self):
+        """SGLANG_TPU_KV_PACK_HEADS on one side only, equal attention TP: a
+        page copy would mix head layouts (fp8 shapes even match)."""
+        import torch
+
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            packed_shape, packed = self._pool_layout(dtype, True)
+            plain_shape, plain = self._pool_layout(dtype, False)
+            self.assertEqual(packed, "token_major_pack2")
+            self.assertIsNone(plain)
+            if dtype is torch.float8_e4m3fn:
+                self.assertEqual(packed_shape, plain_shape)
+            for local, remote in ((packed, plain), (plain, packed)):
+                mgr, recv, abort = self._init(local, remote)
+                self.assertEqual(recv.poll(), KVPoll.Failed)
+                abort.assert_called_once()
+                with self.assertRaises(Exception) as cm:
+                    recv.failure_exception()
+                self.assertIn("SGLANG_TPU_KV_PACK_HEADS", str(cm.exception))
+            # Both sides packed: identical pages, the pull stays allowed.
+            mgr, recv, abort = self._init(packed, packed)
+            self.assertIsNone(recv.conclude_state)
+            abort.assert_not_called()
+
+    def test_failed_common_init_is_left_alone(self):
+        mgr = _decode_manager_stub(kv_args=SimpleNamespace(kv_layout=SEQ))
+        recv = _receiver(mgr)
+
+        def common_init(self_, prefill_dp_rank):
+            self_.conclude_state = KVPoll.Failed
+            mgr.record_failure(ROOM, "prefill down")
+
+        with patch(
+            "sglang.srt.disaggregation.common.conn.CommonKVReceiver.init",
+            common_init,
+        ):
+            recv.init(0)
+        self.assertEqual(mgr.failure_records[ROOM], "prefill down")
+
+
+class TestPipelinePackedHeads(unittest.TestCase):
+    """The pipeline's head slicing models a packed row as one head."""
+
+    def _register(self, pack, dst_attn_tp):
+        transfer = object.__new__(PipelineTransfer)
+        transfer.manager = SimpleNamespace(_kv_pack_heads=pack, attn_tp_size=1)
+        transfer.replies = {ROOM: {0: {"attn_tp_size": dst_attn_tp}}}
+        transfer._fail_room = Mock()
+        ok = transfer._register_blocks(
+            ROOM, req_id="r", uuid=1, full=[0], swa=[], with_swa=False
+        )
+        return ok, transfer._fail_room
+
+    def test_packed_heads_with_other_decode_tp_fail_the_room(self):
+        ok, fail_room = self._register(pack=2, dst_attn_tp=2)
+        self.assertFalse(ok)
+        self.assertIn("SGLANG_TPU_KV_PACK_HEADS", fail_room.call_args[0][1])
 
 
 if __name__ == "__main__":

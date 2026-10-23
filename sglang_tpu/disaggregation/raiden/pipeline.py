@@ -734,6 +734,13 @@ class PipelineTransfer:
         room."""
         try:
             dst_attn_tp = self._dst_attn_tp(room)
+            pack = getattr(self.manager, "_kv_pack_heads", 1)
+            if pack > 1 and dst_attn_tp != self.manager.attn_tp_size:
+                # TODO(#829): head_slice_spans treats a packed row as one head.
+                raise ValueError(
+                    f"KV pools that pack {pack} heads per row need equal attention "
+                    "TP on both sides; unset SGLANG_TPU_KV_PACK_HEADS"
+                )
             spans = part_spans(
                 self.pools,
                 self.tensors,
