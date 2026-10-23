@@ -331,6 +331,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             kpool,
             self._kpool_width,
             metadata.decode_query_size,
+            # Only DECODE metadata guarantees a uniform query width. Mixed
+            # prefill/verify graphs use the token bucket as a safe static bound.
+            (
+                metadata.decode_query_size
+                if metadata.segments == "decode"
+                else query.shape[0]
+            ),
         )
 
     def _forward_mla(

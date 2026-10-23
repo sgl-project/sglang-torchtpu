@@ -8,8 +8,8 @@ tokens (upstream ``IndexerKPool``, CUDA only). Per indexer layer and forward:
    gate score (compress_gate(x), bf16) in the layer's raw cache.
 2. Every token that closes a pool (``pos % kpool == kpool - 1``) compresses it:
    per channel, a softmax over the pool's slots of ``gate + ape`` weights the
-   raw keys; the sum is rounded to bf16, Hadamard-rotated, rounded again and
-   quantized to FP8 with a power-of-two scale. Pool ``p`` is stored at position
+   raw keys; the sum is rounded to bf16, Hadamard-rotated and quantized to
+   FP8 with a power-of-two scale. Pool ``p`` is stored at position
    ``p`` of the request in the pooled cache (the GLM-5.2 index-key layout).
 3. Each query scores the closed pools before it,
    ``sum over heads of w_h * relu(q_h . k_pool) * scale``, keeps the top
@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sglang_tpu.attention.pallas.kpool_compress import compress_and_store
 from sglang_tpu.dsv4.streamindex_topk import KVLayout, streamindex_topk
 
 _FP8_MAX = 448.0
@@ -152,13 +153,14 @@ def kpool_indexer_step(
     kpool: int,
     out_width: int = 0,
     decode_query_size: int = 1,
+    max_query_length: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Returns (topk_indices i32[num_tokens, max(out_width, topk + kpool - 1)],
     raw_cache, pooled_cache). Rows list sequence-relative token positions: the
     selected pools' tokens, then the tail, then -1."""
     num_tokens, n_heads, d = query.shape
     num_pages, page_size, _ = raw_cache.shape
-    rows_per_page, tokens_per_row, record_bytes = pooled_cache.shape[1:]
+    _, tokens_per_row, record_bytes = pooled_cache.shape[1:]
     num_seqs = kv_lens.shape[0]
     expected = (
         num_pages,
@@ -188,23 +190,38 @@ def kpool_indexer_step(
     raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
 
     # 2. Compress the pools this step closes, reading the cache just written.
-    closing = valid & (pos % kpool == kpool - 1)
-    first = pos - (kpool - 1)
-    member = first[:, None] + jnp.arange(kpool, dtype=jnp.int32)[None, :]
-    m_page, m_slot = _page_slot(
-        jnp.broadcast_to(req[:, None], member.shape),
-        jnp.maximum(member, 0),
-        valid=jnp.broadcast_to(closing[:, None], member.shape),
-        **loc,
-    )
-    rows = raw_cache[jnp.minimum(m_page, num_pages - 1), m_slot]  # [T, kpool, 2d]
-    pooled = compress_pools(rows[..., :d], rows[..., d:], ape)
-    records = _pool_records(pooled, record_bytes)
-    pool_id = pos // kpool
-    p_page, p_slot = _page_slot(req, pool_id, valid=closing, **loc)
-    pooled_cache = pooled_cache.at[
-        p_page, p_slot // tokens_per_row, p_slot % tokens_per_row
-    ].set(records, mode="drop")
+    if kpool == 4 and d == 128 and page_size == 128 and raw_cache.dtype == jnp.bfloat16:
+        # Keep the native cache layout through the update. A generic scatter
+        # can introduce full-pool layout conversions even for a few new pools.
+        pooled_cache = compress_and_store(
+            raw_cache,
+            pooled_cache,
+            ape,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            num_tokens,
+            max_query_length=max_query_length,
+        )
+    else:
+        closing = valid & (pos % kpool == kpool - 1)
+        first = pos - (kpool - 1)
+        member = first[:, None] + jnp.arange(kpool, dtype=jnp.int32)[None, :]
+        m_page, m_slot = _page_slot(
+            jnp.broadcast_to(req[:, None], member.shape),
+            jnp.maximum(member, 0),
+            valid=jnp.broadcast_to(closing[:, None], member.shape),
+            **loc,
+        )
+        rows = raw_cache[jnp.minimum(m_page, num_pages - 1), m_slot]  # [T, kpool, 2d]
+        pooled = compress_pools(rows[..., :d], rows[..., d:], ape)
+        records = _pool_records(pooled, record_bytes)
+        pool_id = pos // kpool
+        p_page, p_slot = _page_slot(req, pool_id, valid=closing, **loc)
+        pooled_cache = pooled_cache.at[
+            p_page, p_slot // tokens_per_row, p_slot % tokens_per_row
+        ].set(records, mode="drop")
 
     # 3. Score each query against its request's closed pools and keep the best
     # topk // kpool. Pool p sits at position p of its request, so the kernel
