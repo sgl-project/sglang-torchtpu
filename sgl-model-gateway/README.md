@@ -389,7 +389,16 @@ python3 -m sglang_router.launch_router \
   --prefill http://localhost:30001 \
   --decode http://localhost:30011
 ```
-MiniLB forwards PD requests using simple random routing and is intended for local debugging only.
+MiniLB is intended for local debugging only. By default (`--mini-lb-policy random`) it picks prefill and decode uniformly at random. Opt in with `--mini-lb-policy session_affinity` for load-aware P/D placement: prefill sticks to the engine pinned for the `x-routing-key` header and spills when the pinned one is overloaded. New keys and requests without a key choose the sampled prefill engine with the fewest waiting requests; decode chooses the sampled engine with the fewest running requests. Each pool randomly samples up to eight reachable engines, then applies its guardrails. Loads come from polling each engine's `/v1/loads`, and requests are answered with 429 when no sampled choice passes the load guardrails.
+
+Configure the sample limits with the `PREFILL_SAMPLE_SIZE` and `DECODE_SAMPLE_SIZE` constants in [mini_lb_policy.py](bindings/python/src/sglang_router/mini_lb_policy.py). Both default to `8` and are capped by the number of eligible engines. Eight samples check more candidates than a two-engine sample and can trigger spillover more often. The prefill limit also controls sampling for sticky spillover checks. Selection uses the last polled snapshot, so requests arriving between polls can choose the same low-load engine.
+
+Load metrics and guardrails are summed across DP ranks. Prefill rejects engines with more than 2,000,000 waiting uncached tokens. Decode rejects engines with more than 24 waiting requests across the entire engine, including preallocation, transfer, and retracted queues. These limits apply regardless of sample size or DP size.
+
+
+With session affinity, failed load connections and three consecutive load-poll timeouts exclude an engine until a successful poll restores it. Reachability transitions are logged once. If every engine in a pool is excluded, placement falls back to its configured engines and logs a warning. Default random routing and upstream forwarding stay unchanged.
+
+The stacked follow-ups add request retries and pair failure tracking, then the stall watchdog and `/stalls` diagnostics.
 
 ### Running Worker Servers
 Use upstream SGLang binaries to start dedicated worker processes.
