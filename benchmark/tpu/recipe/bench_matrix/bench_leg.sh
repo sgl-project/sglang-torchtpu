@@ -8,7 +8,7 @@
 # Emits into $OUTPUT_DIR (all tagged c<BS>-long<NUM_LONG>):
 #   <tag>.jsonl / <tag>.meta.json / <tag>.bench.log / <tag>.status
 #   <tag>.metrics.{pre,post,delta}.json           (from PROBE_URL)
-#   <tag>.decode.metrics.{pre,post}.json          (P/D only, from PROBE_URL_2)
+#   <tag>.decode.metrics.{pre,post,delta}.json    (P/D only, from PROBE_URL_2)
 #
 # Env (beyond config.sh):
 #   BS=            REQUIRED  client concurrency
@@ -204,6 +204,15 @@ fi
     --out "$OUTPUT_DIR/${TAG}.metrics.delta.json" \
     --expect-context "$expect_context" \
     --expect-concurrency "$BS" 2>&1 | tee -a "$BENCH_LOG" || true
+if [[ -n "$PROBE_URL_2" ]]; then
+    # Decode-side stages (bootstrap, transfer queue, waiting) and failures; the
+    # prefill-side snapshot above has the KV transfer histograms.
+    "$PYTHON" "$NIGHTLY_TOOLS_DIR/metrics_probe.py" diff --role decode \
+        --pre "$OUTPUT_DIR/${TAG}.decode.metrics.pre.json" \
+        --post "$OUTPUT_DIR/${TAG}.decode.metrics.post.json" \
+        --out "$OUTPUT_DIR/${TAG}.decode.metrics.delta.json" 2>&1 \
+        | sed 's/^\[metrics_probe\]/[metrics_probe decode]/' | tee -a "$BENCH_LOG" || true
+fi
 
 bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${bench_args[@]}")
 "$PYTHON" "$TPU_BENCH_DIR/dump_meta.py" --kind bench \
