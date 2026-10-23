@@ -84,7 +84,8 @@ def _find_releases() -> Tuple[Release, ...]:
 _RELEASES = _find_releases()
 
 
-def _rss_bytes() -> int:
+def rss_bytes() -> int:
+    """This process's resident set size in bytes, 0 when unreadable."""
     try:
         with open("/proc/self/statm") as f:
             return int(f.read().split()[1]) * _PAGE_SIZE
@@ -98,12 +99,12 @@ def trim_host_heap(reason: str) -> Optional[HeapTrimResult]:
         logger.info("host heap trim skipped, no release call found (%s)", reason)
         return None
     names = tuple(name for name, _ in _RELEASES)
-    rss_before = _rss_bytes()
+    rss_before = rss_bytes()
     start = time.perf_counter()
     for _, release in _RELEASES:
         release()
     seconds = time.perf_counter() - start
-    rss_after = _rss_bytes()
+    rss_after = rss_bytes()
     logger.info(
         "host heap trim via %s (%s): rss %.2f -> %.2f GiB in %.2fs",
         "+".join(names),

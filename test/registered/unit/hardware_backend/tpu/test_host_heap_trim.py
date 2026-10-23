@@ -35,6 +35,33 @@ class _Node:
     ref = None
 
 
+class TestRssBytes(CustomTestCase):
+    """``rss_bytes`` feeds the recompilation checker's report; it must never raise."""
+
+    def test_reads_the_resident_pages_of_this_process(self):
+        rss = tpu.rss_bytes()
+        self.assertGreater(rss, 0)
+        self.assertEqual(rss % tpu._PAGE_SIZE, 0)
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        # The process keeps allocating; the two readings agree to a few MiB.
+        self.assertLess(abs(rss - pages * tpu._PAGE_SIZE), 64 << 20)
+
+    def test_unreadable_proc_reads_as_zero(self):
+        for exc in (FileNotFoundError("no /proc"), PermissionError("denied")):
+            with self.subTest(exc=exc):
+                with patch("builtins.open", side_effect=exc):
+                    self.assertEqual(tpu.rss_bytes(), 0)
+
+    def test_malformed_statm_reads_as_zero(self):
+        import io
+
+        for content in ("", "garbage", "12\n", "a b c\n"):
+            with self.subTest(content=content):
+                with patch("builtins.open", return_value=io.StringIO(content)):
+                    self.assertEqual(tpu.rss_bytes(), 0)
+
+
 class TestTrimHostHeap(CustomTestCase):
     def test_finds_glibc_and_the_preloaded_tcmalloc(self):
         expected = ["glibc"]
