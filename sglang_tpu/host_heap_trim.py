@@ -8,7 +8,8 @@ so each rank stays near its startup peak.
 ``install`` releases startup file-cache pages before the scheduler-ready
 handshake, including for offline Engine and Rust launches. It also wraps
 ``Scheduler.handle_freeze_gc`` to release pages created by subsequent warmup,
-collect garbage before freezing GC, and return freed heap pages.
+clear export records and JAX caches, collect garbage before freezing GC,
+and return freed heap pages.
 
 A release goes through every allocator loaded in the process (tcmalloc,
 glibc) because the one serving ``malloc`` cannot be detected reliably, and
@@ -28,7 +29,9 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
+import jax
 import msgspec
+from torch.compiler._cache import CacheArtifactManager
 
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu._logging import get_logger
@@ -163,9 +166,12 @@ def _stop_periodic() -> None:
 
 def _before_freeze() -> None:
     release_startup_page_cache()
-    if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
-        # gc.freeze() keeps any cycle it sees forever, so collect first.
-        gc.collect()
+    CacheArtifactManager.clear()
+    # Serving executables are owned by TorchTPU; discard JAX tracing caches.
+    jax.clear_caches()
+    # gc.freeze() keeps any cycle it sees forever, so collect first even if
+    # returning allocator pages is disabled.
+    gc.collect()
 
 
 def _after_freeze() -> None:

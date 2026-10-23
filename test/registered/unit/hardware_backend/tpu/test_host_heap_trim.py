@@ -98,6 +98,7 @@ class TestInstall(CustomTestCase):
 
         self.cls = Scheduler
         tpu.install(scheduler_cls=self.cls)
+        self.clear = self.enterContext(patch.object(tpu.CacheArtifactManager, "clear"))
 
     def tearDown(self):
         tpu._stop_periodic()
@@ -105,13 +106,25 @@ class TestInstall(CustomTestCase):
 
     def test_trims_after_the_handler_and_keeps_the_forward(self):
         scheduler = self.cls()
+        self.clear.side_effect = lambda: scheduler.calls.append("export records")
         with (
+            patch.object(
+                tpu.gc, "collect", side_effect=lambda: scheduler.calls.append("collect")
+            ),
             patch.object(tpu, "trim_host_heap", side_effect=scheduler.calls.append),
+            patch.object(
+                tpu.jax,
+                "clear_caches",
+                side_effect=lambda: scheduler.calls.append("clear JAX"),
+            ),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.assertEqual(scheduler.handle_freeze_gc("req"), "forwarded")
-        self.assertEqual(scheduler.calls, ["req", "after warmup"])
+        self.assertEqual(
+            scheduler.calls,
+            ["export records", "clear JAX", "collect", "req", "after warmup"],
+        )
         self.assertIsNone(tpu._periodic_thread)
 
     def test_collects_cycles_before_the_handler_freezes_them(self):
@@ -124,7 +137,7 @@ class TestInstall(CustomTestCase):
         del node
         with (
             patch.object(tpu, "trim_host_heap"),
-            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.cls().handle_freeze_gc("req")
@@ -138,6 +151,19 @@ class TestInstall(CustomTestCase):
         ):
             self.cls().handle_freeze_gc("req")
         trim.assert_not_called()
+        self.clear.assert_called_once_with()
+
+    def test_failed_cache_save_does_not_clear_records_or_freeze(self):
+        scheduler = self.cls()
+        with patch.object(
+            page_cache,
+            "resolve_compilations",
+            side_effect=RuntimeError("cache save failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cache save failed"):
+                scheduler.handle_freeze_gc("req")
+        self.clear.assert_not_called()
+        self.assertEqual(scheduler.calls, [])
 
     def test_install_wraps_once(self):
         wrapped = self.cls.handle_freeze_gc
