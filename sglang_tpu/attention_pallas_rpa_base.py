@@ -544,6 +544,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # Set by each subclass to select the kernel variant; None on the base only.
     kernel_spec: ClassVar[RpaKernelSpec | None] = None
 
+    # Set by a subclass whose own forward runs decode context parallelism. The
+    # base then keeps the logical page stride but builds unsharded metadata
+    # (global kv_lens, logical page tables) and leaves its DCP path off.
+    owns_decode_context_parallel: ClassVar[bool] = False
+
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
@@ -590,6 +595,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self._dcp_op = None
         self._kv_write_op = None
         self._get_dcp_lens = None
+        # The DCP group as seen by a subclass that owns DCP; (1, 0, None) otherwise.
+        self.dcp_size, self.dcp_rank, self.dcp_group = 1, 0, None
+        if self._dcp > 1 and self.owns_decode_context_parallel:
+            self.dcp_size, self.dcp_rank, self.dcp_group = (
+                self._dcp,
+                self._dcp_rank,
+                self._dcp_group,
+            )
+            self._dcp, self._dcp_rank, self._dcp_group = 1, 0, None
         if self._dcp > 1:
             if self.req_to_token_pool.req_to_token.device.type != "cpu":
                 raise ValueError(
