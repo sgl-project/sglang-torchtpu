@@ -188,6 +188,47 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
+def _share_group_failure_reason(gated, pollers, groups) -> None:
+    """Hand every rank the reason of the rank whose failure started the group
+    failure.
+
+    Receivers init and poll without a collective, so one rank can fail a room
+    (a refusal, a transfer error) one poll before its peers have looked at it.
+    The MIN reduction then fails the room on every rank, and each peer records
+    only a placeholder as its reason. Scheduler rank 0 alone writes the HTTP
+    body, so whenever rank 0 is not the rank that failed first, the client
+    gets the placeholder.
+
+    Pollers opt in with two methods: ``group_failure_reason()`` returns the
+    reason this rank recorded itself, or None when it only holds the
+    placeholder, and ``adopt_group_failure_reason(reason)`` replaces that
+    placeholder. The gathers run over the same CPU groups as the drain bits,
+    one leg per group, so after the last leg every rank holds the same list
+    and picks the same reason: the first originating one in group-rank order.
+    ``gated`` is identical on every rank, so the collective cannot deadlock.
+    Backends without the methods keep today's behavior.
+    """
+    sharers = [
+        i
+        for i in gated
+        if hasattr(pollers[i], "group_failure_reason")
+        and hasattr(pollers[i], "adopt_group_failure_reason")
+    ]
+    if not sharers or not groups:
+        return
+    local = [pollers[i].group_failure_reason() for i in sharers]
+    for group in groups:
+        gathered = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, local, group=group)
+        local = [
+            next((ranks[k] for ranks in gathered if ranks[k] is not None), None)
+            for k in range(len(sharers))
+        ]
+    for k, i in enumerate(sharers):
+        if local[k] is not None:
+            pollers[i].adopt_group_failure_reason(local[k])
+
+
 def _gate_group_failure_on_drain(polls, pollers, groups):
     """Quiesce a group-wide failure, then deliver it once every rank drains.
 
@@ -214,6 +255,7 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
                 "A drain-gated transfer poller must implement quiesce_group_failure()"
             )
         quiesce()
+    _share_group_failure_reason(gated, pollers, groups)
     drained = [1 if pollers[i].drained() else 0 for i in gated]
     if groups:
         drained_tensor = torch.tensor(drained, dtype=torch.uint8, device="cpu")

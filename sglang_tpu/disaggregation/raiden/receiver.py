@@ -21,7 +21,11 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
-from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.common import (
+    GROUP_FAILURE_PLACEHOLDER,
+    _tcp_endpoint,
+    logger,
+)
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -1313,6 +1317,8 @@ class RaidenKVReceiver(CommonKVReceiver):
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self._started = False
+        # Set when the room's reason came from a peer rank (drain gate).
+        self._reason_from_another_rank = False
         # Bounds the wait before send_metadata, see _check_handshake_timeout.
         self._handshake_start = time.time()
         self._handshake_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
@@ -1446,9 +1452,17 @@ class RaidenKVReceiver(CommonKVReceiver):
         # Failed state below owns every subsequent local poll, and notify the
         # corresponding prefill rank to stop publishing work for this room.
         self.conclude_state = None
-        self._conclude_failed(
-            reason="Raiden transfer failed on another attention TP/CP rank.",
-        )
+        self._conclude_failed(reason=GROUP_FAILURE_PLACEHOLDER)
+
+    def group_failure_reason(self) -> Optional[str]:
+        """This rank's own reason for the room, None if it only holds the
+        placeholder (see ``_share_group_failure_reason``)."""
+        return self.kv_mgr.group_failure_reason(self.bootstrap_room)
+
+    def adopt_group_failure_reason(self, reason: str) -> None:
+        """Take the reason of the rank that failed the room first."""
+        if self.kv_mgr.adopt_group_failure_reason(self.bootstrap_room, reason):
+            self._reason_from_another_rank = True
 
     def _conclude_failed(
         self,
@@ -1491,7 +1505,14 @@ class RaidenKVReceiver(CommonKVReceiver):
             reason = self.kv_mgr.failure_records.pop(
                 self.bootstrap_room, "Raiden receive failed"
             )
-        raise KVTransferError(self.bootstrap_room, reason)
+        # A reason adopted from a peer, or the placeholder a peer failure
+        # leaves behind, was already logged by the rank that failed first.
+        raise KVTransferError(
+            self.bootstrap_room,
+            reason,
+            is_from_another_rank=getattr(self, "_reason_from_another_rank", False)
+            or reason == GROUP_FAILURE_PLACEHOLDER,
+        )
 
     def clear(self) -> None:
         super().clear()

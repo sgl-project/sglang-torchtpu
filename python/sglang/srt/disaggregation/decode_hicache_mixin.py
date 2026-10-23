@@ -196,6 +196,14 @@ class HiCacheRestoreGatedKVReceiver:
             raise RuntimeError("The wrapped drain-gated receiver has no drained()")
         return bool(drained())
 
+    def __getattr__(self, name: str):
+        # The drain gate's optional reason exchange (group_failure_reason /
+        # adopt_group_failure_reason) is forwarded only when the wrapped
+        # receiver has it, so the gate sees the same capability either way.
+        if name in ("group_failure_reason", "adopt_group_failure_reason"):
+            return getattr(self.decode_req.kv_receiver, name)
+        raise AttributeError(name)
+
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
         if (

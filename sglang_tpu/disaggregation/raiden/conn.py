@@ -57,6 +57,7 @@ from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
+    GROUP_FAILURE_PLACEHOLDER,
     PORTS_PER_RANK,
     STATE_PORT_OFFSET,
     SWA_PORT_OFFSET,
@@ -927,6 +928,25 @@ class RaidenKVManager(
                 else "Raiden receive failed"
             )
         self._fail_room_locked(room, reason, preserve_reason=True)
+
+    def group_failure_reason(self, room: int) -> Optional[str]:
+        """The reason this rank recorded for ``room`` itself, or None when it
+        only holds the group-failure placeholder (or nothing)."""
+        with self.failure_lock:
+            reason = self.failure_records.get(room)
+        if reason is None or reason == GROUP_FAILURE_PLACEHOLDER:
+            return None
+        return reason
+
+    def adopt_group_failure_reason(self, room: int, reason: str) -> bool:
+        """Replace the group-failure placeholder of ``room`` with the reason
+        of the rank that failed first. A room with a reason of its own, or
+        one already cleared, keeps what it has; returns whether it adopted."""
+        with self.failure_lock:
+            if self.failure_records.get(room) != GROUP_FAILURE_PLACEHOLDER:
+                return False
+            self.failure_records[room] = reason
+        return True
 
     def _handle_node_failure(self, failed_bootstrap_addr: str) -> None:
         """Fail the rooms of a prefill the heartbeat declared down and close
