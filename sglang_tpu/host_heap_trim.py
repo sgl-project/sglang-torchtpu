@@ -11,7 +11,9 @@ handler freezes the GC, then releases the free pages. File caches and export
 records are released before collection.
 
 The graph-initialization wrapper starts checkpoint eviction after serial
-weight loading, so it can overlap warmup. The final cleanup joins that work.
+weight loading, so it can overlap warmup. With HiCache enabled, model-worker
+initialization releases compiler state before the host KV pools are allocated.
+Final cleanup still releases anything allocated later in startup.
 The platform's warmup-complete callback runs after the first forward and
 does not provide this startup boundary.
 
@@ -209,6 +211,15 @@ def _after_freeze() -> None:
     _start_periodic(tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.get())
 
 
+def release_before_hicache() -> None:
+    """Finish compilation cleanup on all ranks before host-pool admission."""
+    release_startup_page_cache()
+    _before_freeze()
+    if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
+        trim_host_heap("before HiCache")
+    get_parallel().world_group.barrier()
+
+
 def install(scheduler_cls: Optional[type] = None) -> None:
     """Start checkpoint eviction before warmup and finish cleanup before GC freeze."""
     if scheduler_cls is None:
@@ -220,10 +231,17 @@ def install(scheduler_cls: Optional[type] = None) -> None:
         return
 
     init_graphs = scheduler_cls.init_all_cuda_graphs
+    init_worker = scheduler_cls.init_model_worker
 
     def init_all_cuda_graphs(self, *args, **kwargs):
         start_checkpoint_page_cache_release()
         return init_graphs(self, *args, **kwargs)
+
+    def init_model_worker(self, *args, **kwargs):
+        result = init_worker(self, *args, **kwargs)
+        if self.enable_hierarchical_cache:
+            release_before_hicache()
+        return result
 
     def handle_freeze_gc(self, *args, **kwargs):
         release_startup_page_cache()
@@ -238,4 +256,5 @@ def install(scheduler_cls: Optional[type] = None) -> None:
 
     handle_freeze_gc._tpu_host_heap_trim = True
     scheduler_cls.init_all_cuda_graphs = init_all_cuda_graphs
+    scheduler_cls.init_model_worker = init_model_worker
     scheduler_cls.handle_freeze_gc = handle_freeze_gc

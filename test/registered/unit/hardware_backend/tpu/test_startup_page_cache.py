@@ -183,7 +183,9 @@ def test_checkpoint_release_overlaps_and_is_joined_before_compiler_cleanup(
             else:
                 finished.result(timeout=5)
                 assert calls == [["target", "draft"], "compiler"]
-                assert page_cache._checkpoint_release is None
+                assert page_cache._checkpoint_release.done()
+                page_cache.release_startup_page_cache()
+                assert calls == [["target", "draft"], "compiler", "compiler"]
     finally:
         release.set()
 

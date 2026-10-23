@@ -17,8 +17,14 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _Scheduler:
-    def __init__(self):
+    def __init__(self, enable_hierarchical_cache=False):
         self.calls = []
+        self.enable_hierarchical_cache = enable_hierarchical_cache
+
+    def init_model_worker(self):
+        self.init_all_cuda_graphs()
+        self.calls.append("sampling warmup")
+        return "initialized"
 
     def init_all_cuda_graphs(self):
         self.calls.append("graphs")
@@ -162,9 +168,11 @@ class TestInstall(CustomTestCase):
     def test_install_wraps_once(self):
         wrapped = self.cls.handle_freeze_gc
         graphs = self.cls.init_all_cuda_graphs
+        worker = self.cls.init_model_worker
         tpu.install(scheduler_cls=self.cls)
         self.assertIs(self.cls.handle_freeze_gc, wrapped)
         self.assertIs(self.cls.init_all_cuda_graphs, graphs)
+        self.assertIs(self.cls.init_model_worker, worker)
         scheduler = self.cls()
         with patch.object(
             tpu,
@@ -173,6 +181,56 @@ class TestInstall(CustomTestCase):
         ):
             scheduler.init_all_cuda_graphs()
         self.assertEqual(scheduler.calls, ["checkpoint release", "graphs"])
+
+    def test_hicache_waits_for_cleanup_without_freezing_gc(self):
+        scheduler = self.cls(enable_hierarchical_cache=True)
+        gc.disable()
+        self.addCleanup(gc.enable)
+        node = _Node()
+        node.ref = node
+        alive = weakref.ref(node)
+        del node
+        group = SimpleNamespace(barrier=lambda: scheduler.calls.append("barrier"))
+        with (
+            patch.object(
+                tpu, "get_parallel", return_value=SimpleNamespace(world_group=group)
+            ),
+            patch.object(
+                tpu,
+                "release_startup_page_cache",
+                side_effect=lambda: scheduler.calls.append("files"),
+            ),
+            patch.object(tpu.jax, "clear_caches"),
+            patch.object(tpu, "trim_host_heap", side_effect=scheduler.calls.append),
+            patch.object(tpu.gc, "freeze") as freeze,
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
+        ):
+            self.assertEqual(scheduler.init_model_worker(), "initialized")
+            scheduler.calls.append("allocate HiCache")
+        self.assertIsNone(alive())
+        freeze.assert_not_called()
+        self.clear.assert_called_once_with()
+        self.assertEqual(
+            scheduler.calls,
+            [
+                "graphs",
+                "sampling warmup",
+                "files",
+                "before HiCache",
+                "barrier",
+                "allocate HiCache",
+            ],
+        )
+
+    def test_early_cleanup_only_runs_for_hicache_and_propagates_failures(self):
+        with patch.object(
+            tpu, "release_before_hicache", side_effect=RuntimeError("cache save failed")
+        ) as cleanup:
+            self.assertEqual(self.cls().init_model_worker(), "initialized")
+            cleanup.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, "cache save failed"):
+                self.cls(enable_hierarchical_cache=True).init_model_worker()
+        self.clear.assert_not_called()
 
     def test_cleanup_finishes_before_the_scheduler_reply(self):
         scheduler = self.cls()

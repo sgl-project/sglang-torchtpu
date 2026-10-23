@@ -212,7 +212,6 @@ def start_checkpoint_page_cache_release() -> None:
 
 def release_startup_page_cache() -> None:
     """Join checkpoint eviction and cache writers before releasing compiler files."""
-    global _checkpoint_release
     resolve_compilations([])
     get_parallel().world_group.barrier()
     if int(os.environ["LOCAL_RANK"]) != 0:
@@ -221,7 +220,8 @@ def release_startup_page_cache() -> None:
         release_checkpoint_page_cache(_model_paths())
     else:
         _join_checkpoint_page_cache_release()
-        _checkpoint_release = None
+        # Final cleanup can follow an earlier release before HiCache allocation.
+        # Keep the completed future so checkpoint files are not scanned again.
     release_compile_artifacts()
 
 
