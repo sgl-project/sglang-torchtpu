@@ -2581,8 +2581,14 @@ class Scheduler(
                 if self.full_tokens_per_layer is not None
                 else None
             ),
+            # An unsplit SWA sub-pool counts its own rows, not widened locations.
             swa_tokens_per_layer=(
-                self.swa_tokens_per_layer * widening
+                self.swa_tokens_per_layer
+                * (
+                    1
+                    if widening > 1 and current_platform.dcp_replicates_swa_kv()
+                    else widening
+                )
                 if self.swa_tokens_per_layer is not None
                 else None
             ),

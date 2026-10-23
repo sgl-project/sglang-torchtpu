@@ -3,7 +3,7 @@
 import contextlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
@@ -412,6 +412,51 @@ class TestHybridSWAConfigurator(CustomTestCase):
             return cfg._full_per_token, cfg._swa_per_token, floor.call_args
 
         self.assertEqual(geometry(2), geometry(1))
+
+    def test_dcp_unsplit_swa_keeps_plain_tp_heads_and_row_floor(self):
+        """TPU DCP with an unsplit SWA sub-pool: full layers price tp // dcp heads,
+        SWA layers keep plain-TP heads, and the SWA admission floor counts rows
+        at the dcp-wide page instead of widened locations."""
+        from sglang.srt.model_executor import pool_configurator
+
+        def geometry(dcp_size, unsplit):
+            mr = self._make_swa_runner(page_size=16)
+            mc = mr.model_config
+            mc.get_num_kv_heads = lambda tp_size, dcp_size=1: 8 // (tp_size // dcp_size)
+            mc.get_swa_num_kv_heads = mc.get_num_kv_heads
+            with (
+                mock_cpu_env(tp_size=8),
+                get_parallel().override(attn_dcp_size=dcp_size),
+                patch.object(
+                    pool_configurator.current_platform,
+                    "dcp_shards_every_kv_pool",
+                    return_value=True,
+                ),
+                patch.object(
+                    pool_configurator.current_platform,
+                    "dcp_replicates_swa_kv",
+                    return_value=unsplit,
+                ),
+                patch.object(
+                    pool_configurator.MemoryPoolConfigurator, "validate_swa_pool_size"
+                ) as floor,
+            ):
+                cfg = pool_configurator.create_memory_pool_configurator(mr)
+                config = cfg.calculate_pool_sizes(10_000_000, 16)
+            return cfg, config, floor.call_args.args
+
+        base, _, _ = geometry(1, unsplit=True)
+        split, split_config, split_floor = geometry(2, unsplit=False)
+        unsplit, unsplit_config, unsplit_floor = geometry(2, unsplit=True)
+        self.assertEqual(unsplit._full_per_token, 2 * base._full_per_token)
+        self.assertEqual(split._swa_per_token, 2 * base._swa_per_token)
+        self.assertEqual(unsplit._swa_per_token, base._swa_per_token)
+        self.assertEqual(
+            split_floor, (2 * split_config.swa_max_total_num_tokens, ANY, 32)
+        )
+        self.assertEqual(
+            unsplit_floor, (unsplit_config.swa_max_total_num_tokens, ANY, 32)
+        )
 
     def test_draft_does_not_inherit_target_shared_byte_budget(self):
         """A separate draft pool must not allocate the target's byte envelope again."""
