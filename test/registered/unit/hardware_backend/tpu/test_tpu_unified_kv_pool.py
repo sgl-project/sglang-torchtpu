@@ -647,9 +647,50 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         # Verify max_request_tokens supports 256K sessions when shared_tokens >= 256K + M_swa * (W + page_size)
         self.assertGreaterEqual(conf.max_request_tokens(270336, 128), 262144)
 
+    def test_radix_core_cascade_reclaim_tombstone_and_prefix_validation(self):
+        _, alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=20, page_size=128
+        )
+        # Allocate 2 pages (256 tokens): costs 2 * (1 + M_swa=4) = 10 physical pages, leaving 10 free
+        idx = alloc.alloc_extend(
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([256], dtype=torch.int64),
+            torch.tensor([256], dtype=torch.int64),
+            torch.tensor([-1], dtype=torch.int64),
+            256,
+        )
+        self.assertIsNotNone(idx)
+        # Request 384 tokens (3 pages = 15 physical pages, shortfall = 5 physical pages):
+        # With credit_swa_cascade=True, evicting 1 full leaf page cascades to free 1 + 4 = 5 physical pages!
+        plan_cascade = alloc.reclaim_plan(
+            384,
+            384,
+            full_evictable_tokens=256,
+            swa_evictable_tokens=256,
+            credit_swa_cascade=True,
+            policy="full_first",
+        )
+        self.assertEqual(plan_cascade, (128, 0))
+        plan_swa_first = alloc.reclaim_plan(
+            384,
+            384,
+            full_evictable_tokens=256,
+            swa_evictable_tokens=256,
+            policy="swa_first",
+        )
+        self.assertEqual(plan_swa_first, (0, 256))
+
+        # Validate SWA prefix window before and after tombstoning the tail page
+        self.assertEqual(alloc.validate_swa_prefix_window(idx, 128), 256)
+        freed_phys = alloc.tombstone_swa_pages(idx[128:])
+        self.assertEqual(freed_phys, 4)
+        self.assertEqual(alloc.validate_swa_prefix_window(idx, 128), 128)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

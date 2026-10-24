@@ -603,6 +603,8 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
 class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Logical-to-Physical Unified KV allocator for Full + SWA attention on TPU."""
 
+    SUPPORTED_EVICTION_POLICIES = ("full_first", "swa_first")
+
     def __init__(
         self,
         size: int,
@@ -614,13 +616,19 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         kvcache: TpuUnifiedSWAKVPool,
         need_sort: bool,
         req_to_token_pool=None,
+        eviction_policy: str = "full_first",
     ):
         del size_swa
         if page_size <= 1:
             raise ValueError(
                 f"TpuUnifiedSWATokenToKVPoolAllocator requires page_size > 1, got {page_size}."
             )
+        if eviction_policy not in self.SUPPORTED_EVICTION_POLICIES:
+            raise ValueError(
+                f"Unsupported eviction_policy={eviction_policy!r}; expected one of {self.SUPPORTED_EVICTION_POLICIES}."
+            )
         assert isinstance(kvcache, TpuUnifiedSWAKVPool)
+        self.eviction_policy = eviction_policy
         self._page_store = _SharedPageStore()
         self._swa_groups = getattr(kvcache, "num_swa_groups", 1)
         self.need_sort = need_sort
@@ -748,9 +756,12 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
         empty_pool: bool = False,
+        credit_swa_cascade: bool = False,
+        policy: Optional[str] = None,
     ) -> Optional[Tuple[int, int]]:
         if full_tokens < 0 or swa_tokens < 0:
             return None
+        active_policy = policy or self.eviction_policy
         ps = self.page_size
         need = self._page_ids_needed(
             (math.ceil(full_tokens) + ps - 1) // ps,
@@ -773,9 +784,48 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         if self._page_ids_needed(max_f, max_s) < short:
             return None
+        if active_policy == "swa_first":
+            s_reclaim = min(max_s, _cdiv(short, ms))
+            rem = max(0, short - s_reclaim * ms)
+            f_reclaim = min(max_f, rem)
+            return (f_reclaim * ps, s_reclaim * ps)
+        if credit_swa_cascade:
+            coupled = min(max_f, max_s)
+            coupled_take = min(coupled, _cdiv(short, 1 + ms))
+            rem = max(0, short - coupled_take * (1 + ms))
+            extra_f = min(max_f - coupled_take, rem)
+            rem -= extra_f
+            extra_s = _cdiv(rem, ms) if rem > 0 else 0
+            return ((coupled_take + extra_f) * ps, extra_s * ps)
         f_reclaim = min(max_f, short)
         rem = short - f_reclaim
         return (f_reclaim * ps, (_cdiv(rem, ms) if rem > 0 else 0) * ps)
+
+    def tombstone_swa_pages(self, full_indices: torch.Tensor) -> int:
+        """Evict SWA pages for ``full_indices`` while keeping Full KV pages intact (tombstoning)."""
+        if full_indices.numel() == 0:
+            return 0
+        before = self._free_page_count()
+        self.free_swa(full_indices)
+        return self._free_page_count() - before
+
+    def validate_swa_prefix_window(
+        self, full_indices: torch.Tensor, sliding_window_size: int
+    ) -> int:
+        """Return longest page-aligned prefix length whose trailing SWA window is non-tombstoned."""
+        n = int(full_indices.numel())
+        if n == 0 or sliding_window_size <= 0:
+            return 0
+        ps = self.page_size
+        aligned_n = (n // ps) * ps
+        if aligned_n == 0:
+            return 0
+        mapped = self.translate_loc_from_full_to_swa(full_indices[:aligned_n])
+        for end in range(aligned_n, 0, -ps):
+            win_start = max(0, end - sliding_window_size)
+            if bool((mapped[win_start:end] > 0).all()):
+                return end
+        return 0
 
     def can_reserve(
         self,
