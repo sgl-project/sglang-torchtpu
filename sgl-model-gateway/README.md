@@ -400,6 +400,8 @@ With session affinity, failed load connections and three consecutive load-poll t
 
 Session-affinity engine requests use a 10-second connection timeout, separate from `--request-timeout-secs`. Adjust the private `_CONNECT_TIMEOUT_SECS` constant in `mini_lb.py` to change it.
 
+Connection failures before the response starts return HTTP 502 with `{"error":{"message":"upstream unreachable: ..."}}` and mark the failing engine unreachable. The peer request is cancelled and closed. The request is not retried automatically. Errors after streaming starts keep the existing stream behavior.
+
 ### Running Worker Servers
 Use upstream SGLang binaries to start dedicated worker processes.
 - **Prefill worker server (gRPC mode)**:

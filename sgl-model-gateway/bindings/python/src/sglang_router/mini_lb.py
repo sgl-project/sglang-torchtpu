@@ -42,6 +42,10 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return address
 
 
+class _UpstreamConnectionError(aiohttp.ClientConnectionError):
+    """A connection failure recorded in the affinity load table."""
+
+
 class MiniLoadBalancer:
     """Debug P/D router with opt-in prefill affinity and sampled load placement."""
 
@@ -80,10 +84,36 @@ class MiniLoadBalancer:
         affinity = self.affinity_policy is not None
         return aiohttp.ClientTimeout(
             total=self.timeout,
-            sock_read=self.timeout,
+            # The total deadline already bounds affinity reads.
+            sock_read=None if affinity else self.timeout,
             connect=_CONNECT_TIMEOUT_SECS if affinity else None,
             sock_connect=_CONNECT_TIMEOUT_SECS if affinity else 300,
         )
+
+    async def _engine_request(self, engine, operation, *args, **kwargs):
+        try:
+            return await operation(*args, **kwargs)
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as error:
+            if self.affinity_policy is None:
+                raise
+            self.affinity_policy.loads.mark_unreachable(engine)
+            raise _UpstreamConnectionError(f"{engine}: {error!r}") from error
+
+    async def _gather_requests(self, *requests):
+        """Cancel and close the peer when affinity loses one upstream."""
+        if self.affinity_policy is None:
+            return await asyncio.gather(*requests)
+        tasks = [asyncio.ensure_future(request) for request in requests]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for response in responses:
+                if isinstance(response, aiohttp.ClientResponse):
+                    response.close()
+            raise
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -137,12 +167,17 @@ class MiniLoadBalancer:
             else {}
         )
         async with aiohttp.ClientSession(**session_args) as session:
-            async with session.get(f"{self.prefill_urls[0]}/server_info") as resp:
-                info = await resp.json()
-                self.prefill_dp_size = len(info.get("internal_states", [1]))
-            async with session.get(f"{self.decode_urls[0]}/server_info") as resp:
-                info = await resp.json()
-                self.decode_dp_size = len(info.get("internal_states", [1]))
+            async with await self._engine_request(
+                self.prefill_urls[0], session.get, f"{self.prefill_urls[0]}/server_info"
+            ) as resp:
+                info = await self._engine_request(self.prefill_urls[0], resp.json)
+                prefill_dp_size = len(info.get("internal_states", [1]))
+            async with await self._engine_request(
+                self.decode_urls[0], session.get, f"{self.decode_urls[0]}/server_info"
+            ) as resp:
+                info = await self._engine_request(self.decode_urls[0], resp.json)
+                decode_dp_size = len(info.get("internal_states", [1]))
+        self.prefill_dp_size, self.decode_dp_size = prefill_dp_size, decode_dp_size
         logger.info(
             f"[MiniLB] DP sizes: prefill={self.prefill_dp_size}, decode={self.decode_dp_size}"
         )
@@ -236,16 +271,30 @@ class MiniLoadBalancer:
 
         async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
             tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                self._engine_request(
+                    prefill_server,
+                    session.post,
+                    f"{prefill_server}/{endpoint}",
+                    json=prefill_req,
+                ),
+                self._engine_request(
+                    decode_server,
+                    session.post,
+                    f"{decode_server}/{endpoint}",
+                    json=decode_req,
+                ),
             ]
 
             # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            prefill_response, decode_response = await self._gather_requests(*tasks)
 
             if "return_logprob" in modified_request:
-                prefill_json = await prefill_response.json()
-                ret_json = await decode_response.json()
+                prefill_json = await self._engine_request(
+                    prefill_server, prefill_response.json
+                )
+                ret_json = await self._engine_request(
+                    decode_server, decode_response.json
+                )
 
                 # merge `meta_info.input_token_logprobs` from prefill to decode
                 if "meta_info" in ret_json:
@@ -255,7 +304,9 @@ class MiniLoadBalancer:
                             + ret_json["meta_info"]["input_token_logprobs"]
                         )
             else:
-                ret_json = await decode_response.json()
+                ret_json = await self._engine_request(
+                    decode_server, decode_response.json
+                )
 
             if expected_decode_dp_rank is not None:
                 actual = ret_json.get("meta_info", {}).get("dp_rank")
@@ -335,14 +386,24 @@ class MiniLoadBalancer:
             # Both servers answer the headers before any token is produced, so
             # a request either server rejects is known here, before the
             # streaming response (and its 200 status) is committed.
-            prefill_response, decode_response = await asyncio.gather(
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
+            prefill_response, decode_response = await self._gather_requests(
+                self._engine_request(
+                    prefill_server,
+                    session.post,
+                    f"{prefill_server}/{endpoint}",
+                    json=modified_request,
+                ),
+                self._engine_request(
+                    decode_server,
+                    session.post,
+                    f"{decode_server}/{endpoint}",
+                    json=modified_request,
+                ),
             )
             responses.extend((prefill_response, decode_response))
-            for response in responses:
+            for response, engine in zip(responses, (prefill_server, decode_server)):
                 if response.status != 200:
-                    body = await response.read()
+                    body = await self._engine_request(engine, response.read)
                     return Response(
                         content=body,
                         status_code=response.status,
@@ -602,9 +663,16 @@ async def _forward_to_backend(
         }
     )
     forward = lb.generate_stream if request_data.get("stream", False) else lb.generate
-    return await forward(
-        modified_request, prefill_server, decode_server, endpoint=endpoint_name
-    )
+    try:
+        return await forward(
+            modified_request, prefill_server, decode_server, endpoint=endpoint_name
+        )
+    except _UpstreamConnectionError as error:
+        logger.warning("[MiniLB] upstream unreachable: %s", error)
+        return ORJSONResponse(
+            content={"error": {"message": f"upstream unreachable: {error}"}},
+            status_code=HTTPStatus.BAD_GATEWAY,
+        )
 
 
 @app.post("/v1/chat/completions")
