@@ -14,53 +14,96 @@ import torch
 
 
 def merge_swa_kv_heads(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    target_kv_heads: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack ``k``/``v`` ``[T, Hkv, D]`` into 1 KV head ``[T, 1, Hkv * D]``
-    and block-diagonalize ``q`` ``[T, Hq, D]`` -> ``[T, Hq, Hkv * D]``.
+    """Pack ``k``/``v`` ``[T, Hkv, D]`` into ``target_kv_heads`` KV heads
+    ``[T, target_kv_heads, (Hkv // target_kv_heads) * D]`` and block-diagonalize
+    ``q`` within each target KV head group.
 
     Uses a one-hot ``torch.eye`` multiply so ``torch_tpu`` avoids strided
     slice concatenations.
     """
     num_tokens, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
-    if num_kv_heads == 1:
+    if num_kv_heads == target_kv_heads:
         return q, k, v
-    merged_dim = num_kv_heads * head_dim
-    eye = torch.eye(num_kv_heads, dtype=q.dtype, device=q.device).view(
-        1, num_kv_heads, 1, num_kv_heads, 1
+    group_factor = num_kv_heads // target_kv_heads
+    merged_dim = group_factor * head_dim
+    eye = torch.eye(group_factor, dtype=q.dtype, device=q.device).view(
+        1, 1, group_factor, 1, group_factor, 1
     )
     q_merged = (
-        q.reshape(num_tokens, num_kv_heads, num_q_heads // num_kv_heads, 1, head_dim)
+        q.reshape(
+            num_tokens,
+            target_kv_heads,
+            group_factor,
+            num_q_heads // num_kv_heads,
+            1,
+            head_dim,
+        )
         * eye
     ).reshape(num_tokens, num_q_heads, merged_dim)
     return (
         q_merged,
-        k.reshape(num_tokens, 1, merged_dim),
-        v.reshape(num_tokens, 1, merged_dim),
+        k.reshape(num_tokens, target_kv_heads, merged_dim),
+        v.reshape(num_tokens, target_kv_heads, merged_dim),
     )
 
 
-def split_swa_output(out: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
-    """Unpack block-diagonal SWA attention output ``[T, Hq, Hkv * D]`` -> ``[T, Hq, D]``."""
-    if num_kv_heads == 1:
+def split_swa_output(
+    out: torch.Tensor, num_kv_heads: int, target_kv_heads: int = 1
+) -> torch.Tensor:
+    """Unpack block-diagonal SWA attention output back to ``[T, Hq, D]``."""
+    if num_kv_heads == target_kv_heads:
         return out
+    group_factor = num_kv_heads // target_kv_heads
     num_tokens, num_q_heads, merged_dim = out.shape
-    head_dim = merged_dim // num_kv_heads
-    eye = torch.eye(num_kv_heads, dtype=out.dtype, device=out.device).view(
-        1, num_kv_heads, 1, num_kv_heads, 1
+    head_dim = merged_dim // group_factor
+    eye = torch.eye(group_factor, dtype=out.dtype, device=out.device).view(
+        1, 1, group_factor, 1, group_factor, 1
     )
     return (
         (
             out.reshape(
                 num_tokens,
-                num_kv_heads,
+                target_kv_heads,
+                group_factor,
                 num_q_heads // num_kv_heads,
-                num_kv_heads,
+                group_factor,
                 head_dim,
             )
             * eye
         )
-        .sum(dim=3)
+        .sum(dim=4)
         .reshape(num_tokens, num_q_heads, head_dim)
     )
+
+
+def split_swa_kv_into_halves(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> Tuple[
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]:
+    """Split SWA ``(q, k, v)`` along the head axis into two equal half-size halves
+    when the SWA page is twice the size of the Global/Full page (e.g. Gemma 4 at TP2/TP4)."""
+    q0, q1 = torch.chunk(q, 2, dim=1)
+    k0, k1 = torch.chunk(k, 2, dim=1)
+    v0, v1 = torch.chunk(v, 2, dim=1)
+    return (q0.contiguous(), k0.contiguous(), v0.contiguous()), (
+        q1.contiguous(),
+        k1.contiguous(),
+        v1.contiguous(),
+    )
+
+
+def concat_swa_halves_output(
+    out0: torch.Tensor, out1: torch.Tensor
+) -> torch.Tensor:
+    """Recombine the two half-size SWA attention outputs along the query-head axis."""
+    return torch.cat([out0, out1], dim=1)

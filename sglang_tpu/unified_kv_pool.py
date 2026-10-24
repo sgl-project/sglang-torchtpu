@@ -35,7 +35,9 @@ from sglang_tpu.kv_free_fence import HeldPages
 from sglang_tpu.kv_pool import (
     GB,
     TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
     _cdiv,
+    _seq_along_lane_head_dim,
     _torch_dtype_packing,
 )
 from sglang_tpu.unified_kv_heads import merge_swa_kv_heads, split_swa_output
@@ -59,16 +61,27 @@ def _fused_page_shape(
     head_dim: int,
     v_head_dim: int,
     store_dtype: torch.dtype,
+    *,
+    seq_along_lane: bool = False,
 ) -> Tuple[int, int, int, int]:
-    """Return per-page 4D shape ``(page_size, kv_heads_packed, kv_packing, padded_head_dim)``."""
+    """Return per-page 4D shape for ``SEQ_ACROSS_LANE`` (standard fused) or ``SEQ_ALONG_LANE``."""
     if v_head_dim > head_dim:
         raise NotImplementedError(
             "TpuUnifiedSWAKVPool requires v_head_dim <= head_dim "
             f"(got v_head_dim={v_head_dim} > head_dim={head_dim})."
         )
+    kv_packing = _torch_dtype_packing(store_dtype)
+    if seq_along_lane:
+        try:
+            hd_lanes = _seq_along_lane_head_dim(
+                head_dim=head_dim, kv_packing=kv_packing
+            )
+        except ValueError:
+            align = TpuFusedMHATokenToKVPool.HEAD_DIM_ALIGNMENT
+            hd_lanes = _cdiv(head_dim, align) * align
+        return (head_num * 2, hd_lanes // kv_packing, kv_packing, page_size)
     align = TpuFusedMHATokenToKVPool.HEAD_DIM_ALIGNMENT
     padded_head_dim = _cdiv(head_dim, align) * align
-    kv_packing = _torch_dtype_packing(store_dtype)
     kv_heads_packed = _cdiv(head_num * 2, kv_packing)
     return (page_size, kv_heads_packed, kv_packing, padded_head_dim)
 
@@ -83,22 +96,55 @@ def resolve_unified_page_shape(
     swa_head_dim: int,
     swa_v_head_dim: int,
     store_dtype: torch.dtype,
+    seq_along_lane: bool = False,
 ) -> Tuple[Tuple[int, int, int, int], bool]:
     """Validate Full/SWA page compatibility and return ``(page_shape, swa_kv_heads_merged)``."""
     full_shape = _fused_page_shape(
-        page_size, head_num, head_dim, v_head_dim, store_dtype
+        page_size,
+        head_num,
+        head_dim,
+        v_head_dim,
+        store_dtype,
+        seq_along_lane=seq_along_lane,
     )
     swa_shape = _fused_page_shape(
-        page_size, swa_head_num, swa_head_dim, swa_v_head_dim, store_dtype
+        page_size,
+        swa_head_num,
+        swa_head_dim,
+        swa_v_head_dim,
+        store_dtype,
+        seq_along_lane=seq_along_lane,
     )
     if full_shape == swa_shape:
         return full_shape, False
-    if swa_head_num > 1 and swa_v_head_dim == swa_head_dim:
-        merged_dim = swa_head_num * swa_head_dim
+    if (
+        swa_head_num > head_num
+        and swa_head_num % head_num == 0
+        and swa_v_head_dim == swa_head_dim
+    ):
+        group_factor = swa_head_num // head_num
+        merged_dim = group_factor * swa_head_dim
         if full_shape == _fused_page_shape(
-            page_size, 1, merged_dim, merged_dim, store_dtype
+            page_size,
+            head_num,
+            merged_dim,
+            merged_dim,
+            store_dtype,
+            seq_along_lane=seq_along_lane,
         ):
             return full_shape, True
+        # Gemma 4 at TP2/TP4: SWA page is a multiple (e.g. 2x) of the Global/Full page size
+        # because SWA has 2x the KV heads at the same head_dim; each SWA layer splits into
+        # group_factor half-size sub-pages matching full_shape.
+        if full_shape == _fused_page_shape(
+            page_size,
+            head_num,
+            swa_head_dim,
+            swa_v_head_dim,
+            store_dtype,
+            seq_along_lane=seq_along_lane,
+        ):
+            return full_shape, False
     raise ValueError(
         "TpuUnifiedSWAKVPool requires Full and SWA layers to share an identical "
         f"per-page fused shape (directly or after merging SWA KV heads), "
@@ -161,7 +207,8 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "does not support --enable-unified-cache-external-linker.",
         ),
         (
-            pool_cls is not None and pool_cls is not TpuFusedMHATokenToKVPool,
+            pool_cls is not None
+            and pool_cls not in (TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool),
             f"requires a fused MHA KV pool, got {getattr(pool_cls, '__name__', pool_cls)}.",
         ),
         (
@@ -202,6 +249,7 @@ def _unsupported_reason(kvc) -> Optional[str]:
             swa_head_dim=swa_dim,
             swa_v_head_dim=getattr(mc, "swa_v_head_dim", None) or swa_dim,
             store_dtype=kvc.kv_cache_dtype,
+            seq_along_lane=(pool_cls is TpuSeqAlongLaneKVPool),
         )
     except (ValueError, NotImplementedError) as exc:
         return str(exc)
@@ -328,6 +376,10 @@ class _SharedBufferView(TpuFusedMHATokenToKVPool):
                 )
 
 
+class _SeqAlongLaneSharedBufferView(_SharedBufferView, TpuSeqAlongLaneKVPool):
+    """``TpuSeqAlongLaneKVPool`` that either owns the shared buffers or views them."""
+
+
 class TpuUnifiedSWAKVPool(SWAKVPool):
     """Unified Hybrid Full/SWA KV pool backed by ``G = num_full_layers`` shared 5D buffers."""
 
@@ -351,8 +403,12 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
         enable_memory_saver: bool = False,
         **kwargs,
     ):
-        del full_kv_pool_class, swa_kv_pool_class
+        del swa_kv_pool_class
         del full_kv_pool_kwargs, swa_kv_pool_kwargs
+        self.seq_along_lane = bool(
+            kwargs.pop("seq_along_lane", False)
+            or full_kv_pool_class is TpuSeqAlongLaneKVPool
+        )
         self.size = size
         self.size_swa = size
         self.dtype = dtype
@@ -385,22 +441,57 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             swa_head_dim=swa_head_dim,
             swa_v_head_dim=swa_v_head_dim,
             store_dtype=dtype,
+            seq_along_lane=self.seq_along_lane,
         )
         self.swa_raw_head_num = swa_head_num
         self.swa_raw_head_dim = swa_head_dim
-        swa_view_heads = 1 if self.swa_kv_heads_merged else swa_head_num
+        full_raw_shape = _fused_page_shape(
+            page_size,
+            head_num,
+            head_dim,
+            v_head_dim,
+            dtype,
+            seq_along_lane=self.seq_along_lane,
+        )
+        swa_raw_shape = _fused_page_shape(
+            page_size,
+            swa_head_num,
+            swa_head_dim,
+            swa_v_head_dim,
+            dtype,
+            seq_along_lane=self.seq_along_lane,
+        )
+        self.swa_page_splits = (
+            swa_head_num // head_num
+            if (
+                not self.swa_kv_heads_merged
+                and swa_raw_shape != full_raw_shape
+                and swa_head_num > head_num
+                and swa_head_num % head_num == 0
+            )
+            else 1
+        )
+        group_factor = (
+            swa_head_num // head_num if self.swa_kv_heads_merged else 1
+        )
+        swa_view_heads = (
+            head_num
+            if (self.swa_kv_heads_merged or self.swa_page_splits > 1)
+            else swa_head_num
+        )
         swa_view_dim = (
-            swa_head_num * swa_head_dim if self.swa_kv_heads_merged else swa_head_dim
+            group_factor * swa_head_dim if self.swa_kv_heads_merged else swa_head_dim
         )
         swa_view_v_dim = (
-            swa_head_num * swa_v_head_dim
+            group_factor * swa_v_head_dim
             if self.swa_kv_heads_merged
             else swa_v_head_dim
         )
 
         G = self.full_layer_nums
         self.num_shared_buffers = G
-        self.num_swa_groups = num_swa_groups(G, self.swa_layer_nums)
+        effective_swa_layers = self.swa_layer_nums * self.swa_page_splits
+        self.num_swa_groups = num_swa_groups(G, effective_swa_layers)
         num_blocks = size // page_size + 1
         self.swa_group_pages = torch.zeros(
             (max(0, self.num_swa_groups - 1), num_blocks), dtype=torch.int32
@@ -413,7 +504,10 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        self.full_kv_pool = _SharedBufferView(
+        view_cls = (
+            _SeqAlongLaneSharedBufferView if self.seq_along_lane else _SharedBufferView
+        )
+        self.full_kv_pool = view_cls(
             head_num=head_num,
             head_dim=head_dim,
             v_head_dim=v_head_dim,
@@ -422,13 +516,13 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             **common,
         )
         bufs = self.full_kv_pool.kv_buffer
-        self.swa_kv_pool = _SharedBufferView(
-            shared_buffers=[bufs[j % G] for j in range(self.swa_layer_nums)],
+        self.swa_kv_pool = view_cls(
+            shared_buffers=[bufs[j % G] for j in range(effective_swa_layers)],
             head_num=swa_view_heads,
             head_dim=swa_view_dim,
             v_head_dim=swa_view_v_dim,
             allocation_label="SWA",
-            layer_groups=[j // G for j in range(self.swa_layer_nums)],
+            layer_groups=[j // G for j in range(effective_swa_layers)],
             group_pages=self.swa_group_pages if self.num_swa_groups > 1 else None,
             **common,
         )
