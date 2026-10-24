@@ -106,7 +106,7 @@ export DISABLE_RADIX_CACHE=0
 # raiden vs torch_tpu: both are TPU KV-offload io backends; both require
 # page_first_fused and a KV pool that supports them (rpa_v3's fused pool does
 # both). raiden is the actively developed path and routes through
-# TpuRaidenHostKVCache instead of
+# TpuDMAHostKVPool instead of
 # TpuFusedMHATokenToKVPoolHost -- which matters because hiradix_cache only runs
 # precompile_kv_offload() for the fused pool. That warmup stages a
 # pow2-ROUNDED whole-pool D2H (next_power_of_2(device_blocks)), needing ~2x the

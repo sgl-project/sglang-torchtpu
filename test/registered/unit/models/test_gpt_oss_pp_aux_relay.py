@@ -1,4 +1,4 @@
-"""Hermetic unit tests for gpt-oss Eagle3 aux capture across pipeline stages.
+"""Hermetic unit tests for gpt-oss Eagle3/DFlash aux capture across pipeline stages.
 
 Eagle3 captures three target layers that PP spreads over different stages
 (`[1, 17, 32]` +1 for gpt-oss-120b-Eagle3, so layers 2/18/33 of 36), while the
@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.models.gpt_oss import GptOssModel
+from sglang.srt.models.gpt_oss import GptOssForCausalLM, GptOssModel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -92,6 +92,26 @@ class TestGptOssPpAuxRelay(CustomTestCase):
         )
         slots = torch.split(buffer, HIDDEN, dim=-1)
         self.assertEqual([float(slot.abs().max()) for slot in slots], [1.0, 0.0, 0.0])
+
+    def test_dflash_marks_the_captures_of_every_stage(self):
+        """An earlier stage that skipped DFlash marking would relay zero slots, and the
+        last stage would inject them into the draft KV without any error."""
+        for is_last_rank in (False, True):
+            with self.subTest(is_last_rank=is_last_rank):
+                stage = _stage(0, 4)
+                stage.set_dflash_layers_to_capture = lambda ids, stage=stage: (
+                    GptOssModel._set_layers_to_capture(stage, ids)
+                )
+                causal_lm = SimpleNamespace(
+                    pp_group=SimpleNamespace(is_last_rank=is_last_rank),
+                    model=stage,
+                    capture_aux_hidden_states=False,
+                )
+                GptOssForCausalLM.set_dflash_layers_to_capture(causal_lm, [1, 17, 32])
+                self.assertEqual(stage.layers_to_capture, CAPTURE_LAYERS)
+                self.assertEqual(stage.local_capture_slots, [0])
+                # Only the last stage unpacks the relayed buffer from the model return.
+                self.assertEqual(causal_lm.capture_aux_hidden_states, is_last_rank)
 
 
 if __name__ == "__main__":

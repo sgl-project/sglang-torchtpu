@@ -38,6 +38,9 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 )
 from sglang_tpu.compilation.warmup_queue import collect_warmups
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.experimental.compilation.block_compile_policy import (
+    TpuBlockSpecDecodeCompilePolicyMixin,
+)
 from sglang_tpu.experimental.compilation.chain_compile_policy import (
     TpuChainSpecDecodeCompilePolicyMixin,
 )
@@ -425,27 +428,43 @@ class TestTpuGraphRunner(CustomTestCase):
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
 
-    def test_experimental_worker_takes_native_mtp_to_the_chain_policy(self):
+    def test_experimental_worker_takes_eagle_family_to_the_chain_policy(self):
+        for algo, name in (
+            (SpeculativeAlgorithm.EAGLE, "EAGLE"),
+            (SpeculativeAlgorithm.EAGLE3, "EAGLE3"),
+        ):
+            mr = SimpleNamespace(
+                spec_algorithm=algo,
+                server_args=SimpleNamespace(
+                    speculative_num_steps=3, speculative_algorithm=name
+                ),
+            )
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+            self.assertTrue(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
+            self.assertFalse(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+
+    def test_experimental_worker_takes_dflash_to_the_block_policy(self):
         mr = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
             server_args=SimpleNamespace(
-                speculative_num_steps=3, speculative_algorithm="EAGLE"
+                speculative_num_steps=3, speculative_algorithm="DFLASH"
             ),
         )
-        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
-            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
-        self.assertTrue(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
-        self.assertFalse(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, TpuBlockSpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
 
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
-        # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy.
+        # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy
+        # when the experimental spec worker is disabled.
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
             server_args=SimpleNamespace(
                 speculative_num_steps=3, speculative_algorithm="EAGLE3"
             ),
         )
-        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
@@ -469,15 +488,18 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertIs(_augment_spec_policy(cls, mr), cls)
 
     def test_augment_spec_policy_mixes_spec_over_base_for_dflash(self):
-        # DFLASH spec composes the DFlash spec mixin over the resolved policy.
+        # DFLASH spec composes the DFlash spec mixin over the resolved policy
+        # when the experimental spec worker is disabled.
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             server_args=SimpleNamespace(
                 speculative_num_steps=3, speculative_algorithm="DFLASH"
             ),
         )
-        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
         self.assertTrue(issubclass(cls, DFlashSpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(cls, TpuBlockSpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
         self.assertIs(_augment_spec_policy(cls, mr), cls)

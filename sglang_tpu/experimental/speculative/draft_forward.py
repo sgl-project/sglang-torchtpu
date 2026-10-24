@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -14,10 +15,31 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.experimental.speculative.spec_types import (
     DraftBlockInputs,
     TpuSpecVerifyInput,
 )
+
+
+def set_bucket_dp_metadata(
+    forward_batch: ForwardBatch,
+    *,
+    runner: ModelRunner,
+    num_tokens: int,
+    bs: int,
+    mode: ForwardMode,
+) -> None:
+    """Under DP attention, give a forward at the agreed batch bucket the DP metadata warmup traced.
+
+    The scheduler's per-rank counts are live rows; the worker runs bucket rows,
+    so the MLP sync would otherwise pad past them.
+    """
+    if not is_dp_attention_enabled():
+        return
+    compile_policy = runner.compile_policy
+    assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+    compile_policy.set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
 
 
 def forward_draft_rows(
@@ -76,6 +98,13 @@ def forward_draft_rows(
         # Tensor-vs-None per input.
         num_token_non_padded=num_token_non_padded,
         global_num_token_non_padded_cpu=num_live_tokens,
+    )
+    set_bucket_dp_metadata(
+        forward_batch,
+        runner=draft_runner,
+        num_tokens=padded_bs * width,
+        bs=padded_bs,
+        mode=ForwardMode.TARGET_VERIFY,
     )
     # Dynamo guards grad mode; the TPU warmup traced under no_grad.
     with torch.no_grad():

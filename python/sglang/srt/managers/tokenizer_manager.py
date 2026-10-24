@@ -110,6 +110,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
 )
+from sglang.srt.managers.scheduler_components.node_fanout import node_fanout_enabled
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -1696,7 +1697,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
-            tokenized_obj = wrap_shm_features(tokenized_obj)
+            tokenized_obj = wrap_shm_features(
+                tokenized_obj,
+                force=node_fanout_enabled(),
+            )
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)

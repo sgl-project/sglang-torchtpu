@@ -3,6 +3,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import contextlib
 import ipaddress
 import logging
 import random
@@ -15,9 +16,14 @@ from typing import Optional
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-from sglang_router.router_args import RouterArgs
+from sglang_router.mini_lb_policy import (
+    EngineOverloaded,
+    LoadPoller,
+    SessionAffinityPolicy,
+)
+from sglang_router.router_args import MINI_LB_POLICY_CHOICES, RouterArgs
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +41,8 @@ def maybe_wrap_ipv6_address(address: str) -> str:
 
 
 class MiniLoadBalancer:
+    """Debug P/D router with opt-in prefill affinity and sampled load placement."""
+
     def __init__(
         self,
         router_args: RouterArgs,
@@ -50,16 +58,37 @@ class MiniLoadBalancer:
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefill_dp_size = None
         self.decode_dp_size = None
+        self.affinity_policy = (
+            SessionAffinityPolicy()
+            if router_args.mini_lb_policy == "session_affinity"
+            else None
+        )
+        self._load_poller = (
+            LoadPoller(
+                loads=self.affinity_policy.loads,
+                metric_names=self.affinity_policy.metric_names,
+                interval_secs=1.0,
+                timeout_secs=5.0,
+            )
+            if self.affinity_policy is not None
+            else None
+        )
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
-            "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
+            "\x1b[33mMiniLB is for debugging only. "
+            "Routing policy comes from --mini-lb-policy.\033[0m"
         )
 
         # NOTE: too many arguments unsupported, just validate some important ones
         if router_args.policy != "random":
-            logger.warning("[MiniLB] Overriding policy to random")
+            logger.warning("[MiniLB] Ignoring --policy, see --mini-lb-policy")
             router_args.policy = "random"
+        if router_args.mini_lb_policy not in MINI_LB_POLICY_CHOICES:
+            raise ValueError(
+                f"Unknown MiniLB policy {router_args.mini_lb_policy!r}, "
+                f"expected one of {MINI_LB_POLICY_CHOICES}"
+            )
 
         if not router_args.pd_disaggregation:
             raise ValueError("MiniLB only supports PD disaggregation mode")
@@ -72,7 +101,21 @@ class MiniLoadBalancer:
     def start(self):
         global lb
         lb = self
+        if self.affinity_policy is not None:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+                force=True,
+            )
         uvicorn.run(app, host=self.host, port=self.port)
+
+    def start_load_polling(self) -> Optional[asyncio.Task]:
+        """Poll engine loads only when session affinity is enabled."""
+        if self._load_poller is None:
+            return None
+        return asyncio.create_task(
+            self._load_poller.run(lambda: self.prefill_urls + self.decode_urls)
+        )
 
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
@@ -100,16 +143,29 @@ class MiniLoadBalancer:
 
         return prefill_req, decode_req, d_rank
 
-    def select_pair(self):
-        assert len(self.prefill_urls) > 0, "No prefill servers available"
-        assert len(self.decode_urls) > 0, "No decode servers available"
-        pidx = random.randint(0, len(self.prefill_urls) - 1)
-        didx = random.randint(0, len(self.decode_urls) - 1)
-        return (
-            self.prefill_urls[pidx],
-            self.prefill_bootstrap_ports[pidx],
-            self.decode_urls[didx],
-        )
+    def select_pair(self, routing_key=None, room=None):
+        """Return a random or affinity-selected (prefill, bootstrap port, decode)."""
+        prefill_urls = self.prefill_urls
+        decode_urls = self.decode_urls
+        assert prefill_urls, "No prefill servers available"
+        assert decode_urls, "No decode servers available"
+        if self.affinity_policy is None:
+            prefill = prefill_urls[random.randint(0, len(prefill_urls) - 1)]
+            decode = decode_urls[random.randint(0, len(decode_urls) - 1)]
+        else:
+            decisions = self.affinity_policy.select(
+                prefill_urls=prefill_urls,
+                decode_urls=decode_urls,
+                routing_key=routing_key,
+            )
+            for decision in decisions:
+                logger.info(
+                    "[MiniLB] routing decision %s",
+                    decision.to_log_json(room=room, routing_key=routing_key),
+                )
+            prefill, decode = (decision.engine for decision in decisions)
+        pidx = self.prefill_urls.index(prefill)
+        return prefill, self.prefill_bootstrap_ports[pidx], decode
 
     def current_role_and_port(self, worker_url):
         """Return (role, bootstrap_port) of a registered server, or (None, None)
@@ -298,7 +354,19 @@ class MiniLoadBalancer:
                 await close_upstreams()
 
 
-app = FastAPI()
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    load_polling = lb.start_load_polling() if lb is not None else None
+    try:
+        yield
+    finally:
+        if load_polling is not None:
+            load_polling.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await load_polling
+
+
+app = FastAPI(lifespan=_lifespan)
 lb: Optional[MiniLoadBalancer] = None
 
 
@@ -485,83 +553,68 @@ async def get_model_info():
 
 
 @app.post("/generate")
-async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+async def handle_generate_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "generate", x_routing_key)
 
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
 
-    batch_size = _get_request_batch_size(modified_request)
-    if batch_size is not None:
-        modified_request.update(
-            {
-                "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
-            }
+async def _forward_to_backend(
+    request_data: dict, endpoint_name: str, routing_key: Optional[str]
+):
+    batch_size = _get_request_batch_size(request_data)
+    bootstrap_rooms = [
+        _generate_bootstrap_room()
+        for _ in range(batch_size if batch_size is not None else 1)
+    ]
+    try:
+        prefill_server, bootstrap_port, decode_server = lb.select_pair(
+            routing_key=routing_key,
+            room=bootstrap_rooms[0] if bootstrap_rooms else None,
         )
-    else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
+    except EngineOverloaded as error:
+        logger.warning(f"[MiniLB] POST /{endpoint_name} failed: {error}")
+        return ORJSONResponse(
+            content={"error": {"message": str(error)}},
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
         )
 
-    if request_data.get("stream", False):
-        return await lb.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-    else:
-        return await lb.generate(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-
-
-async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
     modified_request.update(
         {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
+            "bootstrap_host": (
+                [hostname] * batch_size if batch_size is not None else hostname
+            ),
+            "bootstrap_port": (
+                [bootstrap_port] * batch_size
+                if batch_size is not None
+                else bootstrap_port
+            ),
+            "bootstrap_room": (
+                bootstrap_rooms if batch_size is not None else bootstrap_rooms[0]
+            ),
         }
     )
-
-    if request_data.get("stream", False):
-        return await lb.generate_stream(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint=endpoint_name,
-        )
-    else:
-        return await lb.generate(
-            modified_request,
-            prefill_server,
-            decode_server,
-            endpoint=endpoint_name,
-        )
+    forward = lb.generate_stream if request_data.get("stream", False) else lb.generate
+    return await forward(
+        modified_request, prefill_server, decode_server, endpoint=endpoint_name
+    )
 
 
 @app.post("/v1/chat/completions")
-async def handle_chat_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/chat/completions")
+async def handle_chat_completion_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "v1/chat/completions", x_routing_key)
 
 
 @app.post("/v1/completions")
-async def handle_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/completions")
+async def handle_completion_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "v1/completions", x_routing_key)
 
 
 def _generate_bootstrap_room():

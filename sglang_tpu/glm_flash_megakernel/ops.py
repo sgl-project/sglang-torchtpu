@@ -12,6 +12,7 @@ one checkpoint per draft token, and a verify resumes from the last accepted one.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import torch
 
@@ -204,6 +205,8 @@ class GlmFlashMegakernel:
             donate=tuple(range(4 + nw, 4 + nw + nd)),
         )
         self.req, self.prev_pos, self.last_steps = None, None, None
+        self.slot: Optional[torch.Tensor] = None
+        self.req_rows: Optional[torch.Tensor] = None
 
     def handles(self, forward_batch, input_ids) -> bool:
         if forward_batch.batch_size != 1 or input_ids.shape[0] != self.Q:
@@ -269,12 +272,9 @@ class GlmFlashMegakernel:
                 ik[d].index_copy_(0, rows, raw[:, :idh].contiguous())
                 ig[d].index_copy_(0, rows, raw[:, idh:].contiguous())
         self.dsa_caches[3] = self.init_ip(ik, ig, self.smalls)[0]
-        # With MTP the committed state is checkpoint read_offsets[slot] of the slot.
         self.slot = lin._slot_indices(forward_batch.req_pool_indices)[0][:1].to(device)
-        row = self.slot
-        if self.Q > 1:
-            offsets = req_pool.mamba_pool.checkpoint_read_offsets
-            row = self.slot * self.Q + offsets.to(device).index_select(0, self.slot)
+        self.req_rows = forward_batch.req_pool_indices[:1].to(device)
+        row = req_pool.mamba_pool.committed_state_rows(self.slot, self.req_rows)
         recur, conv = self.kda_caches
         k1 = spec.linear_conv_kernel_dim - 1
         for k, L in enumerate(spec.kda_layers):
@@ -343,7 +343,8 @@ class GlmFlashMegakernel:
                 pool.get_index_key_cache(L).index_put_(idx, records[d])
         recur, conv = self.kda_caches
         if Q > 1:
-            rows = self.slot * Q + torch.arange(Q, dtype=self.slot.dtype, device=device)
+            # The verify checkpoints of the request's window, as serving writes them.
+            rows = req_pool.mamba_pool.checkpoint_rows(self.req_rows).reshape(-1)
         else:
             rows = self.slot
         for k, L in enumerate(spec.kda_layers):

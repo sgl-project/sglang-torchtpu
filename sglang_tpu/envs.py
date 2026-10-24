@@ -8,7 +8,7 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvTuple
+from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvStr, EnvTuple
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -81,11 +81,44 @@ class TpuEnvs:
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)
+    # Kimi-K3: run decode steps and prefill chunks as one Pallas megakernel per step
+    # (k3_megakernel); the kernel owns the weights, so this replaces sglang's path.
+    SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL = EnvBool(False)
+    # Kimi-K3 megakernel numeric relaxations (comma list, see k3_megakernel/config.py Relax);
+    # empty = none: BF16 weights and f32 reduction wires (the default kernel options still
+    # reorder some f32 sums). Each relaxation must pass the GSM8K / GPQA gates before use.
+    SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX = EnvTuple(())
+    # Kimi-K3 megakernel StackKernel options, "key=value;..." (values as Python literals, e.g.
+    # "moe_ring=6;wire_relax=bf16_transport"); empty = the kernel defaults. Serving accepts only
+    # k3_megakernel/ops.py SERVING_KERNEL_OPTIONS. wire_relax adds the wire relaxations
+    # (bf16_transport, host_bf16, oproj_flat) without touching the weight layout.
+    SGLANG_TPU_K3_MEGAKERNEL_KERNEL_OPTS = EnvStr("")
+    # Kimi-K3 megakernel prefill kernel: "auto" (8-token rows blocks when --chunked-prefill-size is
+    # a multiple of 8, else one stack pass per token), "rows" or "loop".
+    SGLANG_TPU_K3_MEGAKERNEL_PREFILL = EnvStr("auto")
+    # Kimi-K3 megakernel verify kernel (speculative serving): "rows" or "loop" (one stack pass per
+    # row, bit-identical to decode steps; parity checks).
+    SGLANG_TPU_K3_MEGAKERNEL_VERIFY = EnvStr("rows")
+    # Kimi-K3 megakernel expert loading: reader processes per rank, and ranks of a host that may
+    # hold their expert set in host memory at once (lower it when host RAM peaks during load).
+    SGLANG_TPU_K3_MEGAKERNEL_EXPERT_LOAD_PROCS = EnvInt(8)
+    SGLANG_TPU_K3_MEGAKERNEL_EXPERT_LOAD_SLOTS = EnvInt(4)
+    # Dev only: with the megakernel on, keep sglang's decoder layers (and its prefill path) for
+    # A/B comparisons; the default lets the kernel own the decoder weights.
+    SGLANG_TPU_K3_MEGAKERNEL_KEEP_SGLANG_WEIGHTS = EnvBool(False)
+
+    # Host padding
+    # Keep eligible host-built inputs on CPU through bucket padding, then upload
+    # once to avoid per-length XLA compilations. Device inputs are not read back.
+    SGLANG_TPU_HOST_PADDING = EnvBool(False)
 
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
     # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
-    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
+    # Same effect as SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER. Non-speculative
+    # batches ignore it.
+    SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.

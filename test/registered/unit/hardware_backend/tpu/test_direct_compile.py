@@ -248,6 +248,69 @@ class TestAuxHiddenStatePytree(CustomTestCase):
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_random_compiled_op_warmup_preserves_rng(self):
+        torch_compile = torch.compile
+
+        def compile_on_cpu(fn, **kwargs):
+            return torch_compile(fn, backend="eager", fullgraph=True)
+
+        def draw(*, value):
+            return torch.rand_like(value)
+
+        value = torch.ones(4)
+        with torch.random.fork_rng(devices=[]):
+            for enabled, tpu in ((False, True), (True, False), (True, True)):
+                with (
+                    self.subTest(enabled=enabled, tpu=tpu),
+                    envs.SGLANG_ENABLE_TORCH_COMPILE.override(enabled),
+                    patch(
+                        "sglang.srt.compilation.compiled_op.is_tpu", return_value=tpu
+                    ),
+                    patch("torch.compile", side_effect=compile_on_cpu) as compiler,
+                    get_context().override_server_args(tpu_compile_tracer="dynamo"),
+                ):
+                    eager_calls = []
+
+                    def eager(*, value):
+                        eager_calls.append(value)
+                        return draw(value=value)
+
+                    op = compiled_op(uses_rng=True)(draw if enabled and tpu else eager)
+                    state = torch.random.get_rng_state()
+                    with collect_warmups() as queue:
+                        warmup_compiled_op(op, value=value)
+                        self.assertTrue(
+                            torch.equal(torch.random.get_rng_state(), state)
+                        )
+                        self.assertEqual(queue.calls, [])
+                    warmup_compiled_op(op, value=value)
+                    self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
+                    if not enabled or not tpu:
+                        self.assertEqual(eager_calls, [])
+                        compiler.assert_not_called()
+                    actual = op(value=value)
+                    after = torch.random.get_rng_state()
+                    self.assertFalse(torch.equal(after, state))
+                    torch.random.set_rng_state(state)
+                    self.assertTrue(torch.equal(actual, draw(value=value)))
+                    self.assertTrue(torch.equal(torch.random.get_rng_state(), after))
+
+            @compiled_op(uses_rng=True)
+            def fail(value):
+                torch.rand_like(value)
+                raise RuntimeError("warmup failed")
+
+            state = torch.random.get_rng_state()
+            with (
+                envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+                patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+                patch("torch.compile", side_effect=lambda fn, **kwargs: fn),
+                get_context().override_server_args(tpu_compile_tracer="dynamo"),
+                self.assertRaisesRegex(RuntimeError, "warmup failed"),
+            ):
+                warmup_compiled_op(fail, value)
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
+
     def test_cold_call_and_synchronous_mode_return_real_results(self):
         def compile_helper(fn, **kwargs):
             compiled = MagicMock(side_effect=fn)
@@ -259,7 +322,10 @@ class TestDirectCompile(CustomTestCase):
 
         with (
             patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
-            patch.object(direct_compile, "direct_compile", side_effect=compile_helper),
+            patch(
+                "sglang.srt.compilation.compiled_op.direct_compile",
+                new=compile_helper,
+            ),
             get_context().override_server_args(tpu_compile_tracer="direct"),
             envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
         ):
@@ -529,12 +595,27 @@ class TestDirectCompile(CustomTestCase):
                     op = compiled_op(uses_rng=True)(draw)
                     before = torch.tpu.get_rng_state()
                     compiler = direct_compile.tpu_torch_compile
-                    with patch.object(
-                        compiler, "execute", wraps=compiler.execute
-                    ) as execute:
+                    with (
+                        patch.object(
+                            compiler, "execute", wraps=compiler.execute
+                        ) as execute,
+                        patch.object(
+                            compiler,
+                            "get_device_layout_if_materialized",
+                            wraps=compiler.get_device_layout_if_materialized,
+                        ) as layout,
+                    ):
                         with collect_warmups():
                             warmup_compiled_op(op, value)
                         execute.assert_not_called()
+                        if asynchronous:
+                            self.assertTrue(layout.called)
+                            self.assertTrue(
+                                all(
+                                    call.args[0] is not value
+                                    for call in layout.call_args_list
+                                )
+                            )
                     self.assertTrue(torch.equal(before, torch.tpu.get_rng_state()))
                     torch.accelerator.synchronize()
                     misses = torch.tpu._get_cache_misses()

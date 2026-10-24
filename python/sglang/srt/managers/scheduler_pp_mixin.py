@@ -1417,9 +1417,10 @@ class SchedulerPPMixin:
             )
             if key in pp_outputs.tensors
         }
-        if self._pp_wave is not None:
+        if self._pp_wave is not None and get_disagg().disaggregation_mode != "prefill":
             # The relayed outputs stay on the host, and pp_outputs is relayed on
             # as is; decode reads its input IDs and the draft state from device.
+            # A PD prefill only ships them, so they stay on the host there.
             next_token_ids = next_token_ids.to(batch.device, non_blocking=True)
             draft_state = {
                 key: value.to(batch.device, non_blocking=True)
@@ -1442,12 +1443,11 @@ class SchedulerPPMixin:
                 dsa_topk_indices=draft_state.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
-        elif batch.spec_algorithm.is_dspark():
-            from sglang.srt.speculative.dspark_components.dspark_draft import (
-                make_next_draft_input,
-            )
+        elif batch.spec_algorithm.is_dflash_family():
+            # DFlash (PP prefill on TPU) seeds only the bonus token, like DSpark.
+            from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 
-            next_draft_input = make_next_draft_input(
+            next_draft_input = make_draft_input_v2(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
             )

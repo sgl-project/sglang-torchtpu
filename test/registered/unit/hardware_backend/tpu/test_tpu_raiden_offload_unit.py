@@ -65,15 +65,11 @@ from sglang_tpu.disaggregation.raiden.serde import (
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang_tpu.kv_pool_host import (
-    RAIDEN_LAYOUT,
-    TpuRaidenHostKVCache,
+    TPU_DMA_LAYOUT,
+    TpuDMAHostKVPool,
 )
-from sglang_tpu.raiden_transfer import (
-    NOOP_EVENT,
-    CombinedFutureEvent,
-    RaidenFutureEvent,
-    RaidenKVTransfer,
-)
+from sglang_tpu.raiden_transfer import RaidenFutureEvent, RaidenKVTransfer
+from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, CombinedFutureEvent
 
 
 def _polled(sent=(), received=(), failed=(), completed_ns=None):
@@ -123,11 +119,11 @@ class _FakeTransfer:
 
 
 def _make_host_pool(page_size=4, page_num=3):
-    pool = object.__new__(TpuRaidenHostKVCache)
+    pool = object.__new__(TpuDMAHostKVPool)
     pool.page_size = page_size
     pool.page_num = page_num
     pool.size = page_size * page_num
-    pool.layout = RAIDEN_LAYOUT
+    pool.layout = TPU_DMA_LAYOUT
     import threading
 
     pool.lock = threading.RLock()
@@ -166,7 +162,7 @@ class TestRaidenHostMemoryBudget(CustomTestCase):
         )
 
     def _host_pool(self, *, host_size=0, pool_label="kv"):
-        return TpuRaidenHostKVCache(
+        return TpuDMAHostKVPool(
             self._device_pool(),
             host_to_device_ratio=2,
             host_size=host_size,
@@ -293,7 +289,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as transfer_cls,
             self.assertLogs("sglang_tpu.kv_pool_host", level="WARNING") as logs,
         ):
-            pool = TpuRaidenHostKVCache(
+            pool = TpuDMAHostKVPool(
                 device_pool,
                 host_to_device_ratio=0.5,
                 host_size=0,

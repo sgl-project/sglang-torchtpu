@@ -19,8 +19,12 @@ from sglang.srt.arg_groups.validation_hook import (
 )
 from sglang.srt.distributed import parallel_state
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    SpecAuxHiddenStateConfig,
+)
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pp_stage_chips, pp_stage_groups
+from sglang_tpu.envs import envs
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
@@ -66,6 +70,7 @@ def _args(**overrides):
         optimistic_prefill_attempts=0,
         max_queued_requests=None,
         enable_priority_scheduling=False,
+        disaggregation_enable_kv_checksum=False,
         attn_cp_size=1,
         enable_prefill_cp=False,
         cp_strategy=None,
@@ -287,6 +292,29 @@ class TestEagle3PipelineParallelCompat(CustomTestCase):
                 _compat_cfg(enable_multi_layer_eagle=True),
             )
 
+    def test_experimental_dflash_is_admitted_on_a_prefill_node_only(self):
+        """The experimental worker seeds DFlash draft KV on a PP prefill; nothing else runs it."""
+        cfg = dict(
+            speculative_algorithm="DFLASH",
+            min_free_slots_delay=None,
+            disaggregation_mode="prefill",
+        )
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            check_pipeline_parallel_compat(
+                core_check_pipeline_parallel_compat, _compat_cfg(**cfg)
+            )
+            with self.assertRaisesRegex(AssertionError, "disaggregation-mode=prefill"):
+                check_pipeline_parallel_compat(
+                    core_check_pipeline_parallel_compat,
+                    _compat_cfg(**{**cfg, "disaggregation_mode": "null"}),
+                )
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            # Core's DFlash worker builds its draft on every stage.
+            with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+                check_pipeline_parallel_compat(
+                    core_check_pipeline_parallel_compat, _compat_cfg(**cfg)
+                )
+
     def test_stage_without_draft_skips_spec_op_precompile(self):
         original = Mock()
         scheduler = SimpleNamespace(draft_worker=SimpleNamespace(draft_worker=None))
@@ -315,6 +343,18 @@ class TestEagle3PipelineParallelCompat(CustomTestCase):
         self.assertEqual(num_relayed_aux_slots(config, SimpleNamespace()), 0)
         relaying = SimpleNamespace(relays_pp_aux_hidden_states=True)
         self.assertEqual(num_relayed_aux_slots(config, relaying), 2)
+
+    def test_dflash_captures_size_the_aux_slots(self):
+        """The wave width must match the DFlash capture count the stages relay."""
+        relaying = SimpleNamespace(relays_pp_aux_hidden_states=True)
+        config = SpecAuxHiddenStateConfig(
+            dflash_use_aux_hidden_state=True, dflash_target_layer_ids=[1, 9, 17, 25, 33]
+        )
+        self.assertEqual(num_relayed_aux_slots(config, relaying), 5)
+        with self.assertRaisesRegex(NotImplementedError, "dflash_target_layer_ids"):
+            num_relayed_aux_slots(
+                SpecAuxHiddenStateConfig(dflash_use_aux_hidden_state=True), relaying
+            )
 
 
 def _group(*ranks):

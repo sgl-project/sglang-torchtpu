@@ -128,9 +128,10 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
 
             c4_state = pool.get_state_buffer(layer_id, from_indexer=False)
             c4_idx_state = pool.get_state_buffer(layer_id, from_indexer=True)
-            # 1 dummy page + 5 * 8 ring pages + 8192 // 4 scratch pages = 2089 pages
-            self.assertEqual(tuple(c4_state.shape), (2089, 64, 4, 128))
-            self.assertEqual(tuple(c4_idx_state.shape), (2089, 8, 4, 256))
+            # Uniform across C4, C4-Indexer, and C128:
+            # 1 dummy page + 5 * 32 slot pages + 2048 scratch pages = 2209 pages
+            self.assertEqual(tuple(c4_state.shape), (2209, 64, 4, 128))
+            self.assertEqual(tuple(c4_idx_state.shape), (2209, 8, 4, 256))
             self.assertIsNone(c4_state._base)
             self.assertIsNone(c4_idx_state._base)
 
@@ -142,16 +143,22 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
             self.assertIsNone(hca_buf._base)
 
             c128_state = pool.get_state_buffer(layer_id, from_indexer=False)
-            # 1 dummy page + 5 * 32 ring pages + 8192 // 8 scratch pages = 1185 pages
-            self.assertEqual(tuple(c128_state.shape), (1185, 64, 4, 128))
+            self.assertEqual(tuple(c128_state.shape), (2209, 64, 4, 128))
             self.assertIsNone(c128_state._base)
 
     def test_state_block_table_decode_and_extend_transitions(self):
         pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
         c4_proto = pool._state_pool_proto[4]
+        c128_proto = pool._state_pool_proto[128]
         self.assertIsInstance(c4_proto, TPUCompressStatePool)
-        ring_pages = c4_proto.ring_pages_per_req  # 8 pages/req
-        scratch_start = c4_proto.scratch_start_page  # 1 + 5 * 8 = 41
+        self.assertIsInstance(c128_proto, TPUCompressStatePool)
+        self.assertEqual(c4_proto.ring_pages_per_req, 8)
+        self.assertEqual(c128_proto.ring_pages_per_req, 32)
+        slot_stride = c4_proto.slot_stride_pages
+        self.assertEqual(slot_stride, 32)
+        self.assertEqual(c128_proto.slot_stride_pages, 32)
+        scratch_start = c4_proto.scratch_start_page  # 1 + 5 * 32 = 161
+        self.assertEqual(scratch_start, 161)
 
         # 1. Short initial prefill (12 tokens -> b_prev = -1, b_end = 2, 3 blocks <= 4):
         # Fits inside persistent ring without scratch pages.
@@ -168,7 +175,7 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         self.assertEqual(tuple(table_short.shape), (2, 6))
         self.assertEqual(
             table_short[0].tolist(),
-            [1 + 1 * ring_pages, 0, 0, 0, 0, 0],
+            [1 + 1 * slot_stride, 0, 0, 0, 0, 0],
         )
         self.assertEqual(table_short[1].tolist(), [0, 0, 0, 0, 0, 0])
 
@@ -186,12 +193,12 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         )
         self.assertEqual(
             table_long[0].tolist(),
-            [1 + 2 * ring_pages, -1, 0, 12, 0, scratch_start],
+            [1 + 2 * slot_stride, -1, 0, 12, 0, scratch_start],
         )
 
         # 3. Long continuation chunk on req 2 (start_pos = 64, q_len = 32 -> seq_len = 96,
         # b_prev = 15, b_end = 23, b_end - b_prev = 8 > 4 -> b_tail_start = 20,
-        # new_shift = (0 + 4 - 8) % 8 = 4):
+        # new_shift = (0 + 4 - 8) % 8 = 4 — still modulo 8 for C4!):
         table_cont = pool.build_state_block_table(
             ratio=4,
             req_pool_indices_cpu=[2],
@@ -204,7 +211,7 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         )
         self.assertEqual(
             table_cont[0].tolist(),
-            [1 + 2 * ring_pages, 15, 0, 20, 4, scratch_start],
+            [1 + 2 * slot_stride, 15, 0, 20, 4, scratch_start],
         )
         self.assertEqual(int(pool._req_state_shifts[4][2].item()), 4)
 
@@ -221,13 +228,77 @@ class TestDSV4TPUMemoryPool(CustomTestCase):
         )
         self.assertEqual(
             table_decode[0].tolist(),
-            [1 + 2 * ring_pages, 0, 4, 0, 4, 0],
+            [1 + 2 * slot_stride, 0, 4, 0, 4, 0],
         )
 
         # 5. Clearing req 2 resets its ring shift to 0:
         pool.clear_c4_req_states([2])
         self.assertEqual(int(pool._req_state_shifts[4][2].item()), 0)
         self.assertEqual(int(pool._req_state_shifts[128][2].item()), 0)
+
+    def test_pd_disagg_buf_infos_transfer_indices_and_pjrt_pointer_stability(self):
+        from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+        from sglang.srt.disaggregation.utils import (
+            get_kv_transfer_buf_infos,
+            setup_state_kv_args,
+        )
+
+        pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+
+        kv_ptrs, kv_lens, kv_items = get_kv_transfer_buf_infos(pool)
+        # 2 C4 NoPE + 2 C4 RoPE + 2 C4 Indexer + 2 C128 HCA = 8 full-page tensors
+        self.assertEqual(len(kv_ptrs), 8)
+        self.assertEqual(
+            kv_items,
+            [64 * 4 * 128] * 2
+            + [16 * 4 * 128] * 2
+            + [16 * 4 * 256] * 2
+            + [4 * 4 * 128] * 2,
+        )
+
+        kv_args = KVArgs()
+        setup_state_kv_args(kv_args, pool, total_kv_layers=6)
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.SWA, StateType.DSV4_REQUEST_STATE],
+        )
+        # 6 SWA layers on StateType.SWA + (4 attn state + 2 indexer state) on DSV4_REQUEST_STATE
+        self.assertEqual(len(kv_args.state_data_ptrs[0]), 6)
+        self.assertEqual(len(kv_args.state_data_ptrs[1]), 6)
+        total_pd_bytes = (
+            sum(kv_lens)
+            + sum(kv_args.state_data_lens[0])
+            + sum(kv_args.state_data_lens[1])
+        )
+        self.assertEqual(total_pd_bytes, pool.get_kv_size_bytes()[0])
+
+        # Transfer indices + (shift_c4, shift_c128) round-trip from prefill slot 3 -> decode slot 1
+        src_rows = pool.request_state_transfer_indices(3, seq_len=517)
+        dst_rows = pool.request_state_transfer_indices(1, seq_len=517)
+        self.assertEqual(src_rows.tolist(), list(range(1 + 3 * 32, 1 + 4 * 32)))
+        self.assertEqual(dst_rows.tolist(), list(range(1 + 1 * 32, 1 + 2 * 32)))
+
+        pool._req_state_shifts[4][3] = 5
+        pool._req_state_shifts[128][3] = 19
+        meta_blob = pool.pack_req_state_meta(src_rows)
+
+        # Simulate decode.py pre-transfer clear_request_scoped_state followed by metadata unpack:
+        # Must NOT touch underlying HBM state_buffer contents or reallocate pointers.
+        sentinel_buf = pool.get_state_buffer(2, from_indexer=False)
+        ptr_before = sentinel_buf.data_ptr()
+        sentinel_buf[dst_rows[0], 0, 0, 0] = 0xAB
+        pool._req_state_shifts[4][1] = 7
+        pool._req_state_shifts[128][1] = 29
+
+        pool.clear_request_scoped_state(1)
+        self.assertEqual(sentinel_buf.data_ptr(), ptr_before)
+        self.assertEqual(int(sentinel_buf[dst_rows[0], 0, 0, 0].item()), 0xAB)
+        self.assertEqual(int(pool._req_state_shifts[4][1].item()), 0)
+        self.assertEqual(int(pool._req_state_shifts[128][1].item()), 0)
+
+        pool.unpack_req_state_meta(dst_rows, meta_blob)
+        self.assertEqual(int(pool._req_state_shifts[4][1].item()), 5)
+        self.assertEqual(int(pool._req_state_shifts[128][1].item()), 19)
 
     def test_deepseek_v4_pro_61_layers_with_trailing_mtp_compress_ratios(self):
         """Verify DeepSeek-V4-Pro's 61-layer config (`[128, 128, 4, ..., 4, 0, 0, 0]`).

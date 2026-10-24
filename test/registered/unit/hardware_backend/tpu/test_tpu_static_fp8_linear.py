@@ -227,6 +227,28 @@ class TestKimiK3StaticFp8Selector(CustomTestCase):
                 TpuSRTPlatform().apply_server_args_defaults(mock.Mock())
 
 
+class TestKimiK3StaticFp8SpecBatch(CustomTestCase):
+    def test_latent_up_needs_one_request_under_speculation(self):
+        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch as check
+
+        latent_up = frozenset({"moe_front", "latent_up"})
+        check(latent_up, speculative_algorithm="DSPARK", max_running_requests=1)
+        check(latent_up, speculative_algorithm=None, max_running_requests=4)
+        check(
+            frozenset({"moe_front"}),
+            speculative_algorithm="DSPARK",
+            max_running_requests=4,
+        )
+        for n in (4, None):
+            with self.subTest(max_running_requests=n):
+                with self.assertRaisesRegex(ValueError, "max-running-requests 1"):
+                    check(
+                        latent_up,
+                        speculative_algorithm="DSPARK",
+                        max_running_requests=n,
+                    )
+
+
 class TestStaticFp8PallasGemvGate(CustomTestCase):
     def _w(self, n):
         return mock.Mock(weight=torch.zeros(1024, n))

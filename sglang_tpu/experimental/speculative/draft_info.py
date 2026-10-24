@@ -139,8 +139,15 @@ class HostPaddedDraftInput(SpecInput):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
+        # A PD prefill without overlap keeps its seq_lens on host.
+        keep_cpu = new_indices_cpu if new_indices_cpu is not None else new_indices.cpu()
         for name in self.RELAYED_FIELDS:
-            setattr(self, name, getattr(self, name)[new_indices])
+            value = getattr(self, name)
+            setattr(
+                self,
+                name,
+                value[keep_cpu if value.device.type == "cpu" else new_indices],
+            )
 
     def merge_batch(self, spec_info, *, future_indices=None):
         assert type(spec_info) is type(self), (type(self), type(spec_info))

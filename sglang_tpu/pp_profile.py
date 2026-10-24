@@ -114,7 +114,7 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
             ).to(device)
 
         proxy = {"hidden_states": randn(hidden), "residual": randn(hidden)}
-        # Serving hands the Eagle3 capture slots on with the activations, so
+        # Serving hands the aux capture slots on with the activations, so
         # the profiled chunk must carry them too.
         num_aux = num_relayed_aux_slots(runner.spec_aux_config, runner.model)
         if num_aux:

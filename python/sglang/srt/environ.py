@@ -375,6 +375,9 @@ class Envs:
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    # Opt-in multi-node TP: broadcast requests to node leaders, then share multimodal
+    # tensors with the other ranks on each node through /dev/shm.
+    SGLANG_ENABLE_NODE_LEADER_REQUEST_BROADCAST = EnvBool(False)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
     # When set, get_open_port() and shm_broadcast search upwards from this
@@ -1934,12 +1937,6 @@ class Envs:
     # Restore device MM scatter instead of host placement.
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
-    # Opt in to host padding for small prefill metadata tensors to avoid
-    # per-length XLA compilations.
-    SGLANG_TPU_HOST_PADDING = EnvBool(False)
-    # Opt in to host-staged batch metadata: eligible batches keep it on CPU,
-    # pad it to the compile bucket, and upload it once, with no D2H copy.
-    SGLANG_TPU_HOST_PADDING_NO_D2H = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
     SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)

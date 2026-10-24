@@ -780,6 +780,20 @@ GEMMA4_26B_A4B = {
     "sampling": _GEMMA4_SAMPLING,
 }
 
+GLM_5_3_FLASH = {
+    "served_model_name": "zai-org/GLM-5.3-Flash",
+    "display_name": "GLM-5.3-Flash",
+    "variant": "TP8-DSA",
+    "config_module": "recipe/configs/glm_5_3_flash/accuracy.py",
+    # The model card's sampling; the template always thinks, with no toggle.
+    "sampling": {
+        "max_tokens": 290000,
+        "num_threads": 32,
+        "temperature": 1.0,
+        "top_p": 0.95,
+    },
+}
+
 
 def fixture_runtime_envs(base_url: str = BASE_URL) -> dict[str, str | None]:
     """Fixture environment: MODEL=None keeps a stray job MODEL from winning."""

@@ -719,7 +719,7 @@ class GptOssModel(nn.Module):
     ) -> torch.Tensor:
         """The global [tokens, num_captures * hidden] slot buffer.
 
-        Under PP the Eagle3 capture layers are spread over the stages, so
+        Under PP the Eagle3/DFlash capture layers are spread over the stages, so
         earlier stages' captures ride through untouched while this stage's
         land in their own slots. Slots nobody has filled yet are zero.
         """
@@ -808,7 +808,7 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
-    # The forward hands earlier stages' Eagle3 captures on in PPProxyTensors.
+    # The forward hands earlier stages' Eagle3/DFlash captures on in PPProxyTensors.
     relays_pp_aux_hidden_states = True
 
     _lora_pattern_moe = re.compile(
@@ -1421,15 +1421,13 @@ class GptOssForCausalLM(nn.Module):
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
 
-        self.capture_aux_hidden_states = True
+        # As for Eagle3: every stage relays the captures it owns to the last.
+        self.capture_aux_hidden_states = self.pp_group.is_last_rank
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     @classmethod

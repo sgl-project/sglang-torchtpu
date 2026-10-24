@@ -45,6 +45,7 @@ def _lb(prefill_url, decode_url):
         host="127.0.0.1",
         port=0,
         policy="random",
+        mini_lb_policy="random",
         pd_disaggregation=True,
         prefill_urls=[(prefill_url, 8998)],
         decode_urls=[decode_url],

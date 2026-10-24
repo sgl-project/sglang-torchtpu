@@ -948,6 +948,12 @@ def _ragged_paged_attention_kernel_loop(
                 start_bkv_idx = (
                     jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
                 )
+                # The next query block starts here: this query block is the
+                # last one to visit the KV blocks before it.
+                next_bq_start_bkv_idx = (
+                    jnp.maximum(processed_q_len + actual_bq_sz - sliding_window, 0)
+                    // bkv_sz
+                )
             if use_causal_mask:
                 effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
             else:
@@ -1014,9 +1020,20 @@ def _ragged_paged_attention_kernel_loop(
                 if custom_mask_ref is not None:
                     wait_fetch_mask(seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
 
-                # Start updating bkv to kv cache if applicable.
-                # Only needed in last bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                # Write this block's new tokens to the KV cache on the last
+                # query block that visits it. Without a sliding window, that is
+                # the sequence's last query block. With one, each query block
+                # starts at its own window, so blocks left of the next query
+                # block's window are not visited again: write them now, or the
+                # new tokens there never reach the cache and a later prefix hit
+                # inside this prompt reads stale K/V.
+                is_last_visit = bq_idx == num_bq - 1
+                if sliding_window is not None:
+                    is_last_visit = jnp.logical_or(
+                        is_last_visit, bkv_idx < next_bq_start_bkv_idx
+                    )
+
+                @pl.when(jnp.logical_and(update_sz > 0, is_last_visit))
                 def update_cur_bkv_to_cache():
                     start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 

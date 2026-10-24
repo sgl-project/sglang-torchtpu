@@ -8,7 +8,6 @@ from unittest.mock import patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.environ import envs
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
@@ -19,11 +18,12 @@ from sglang_tpu import patches
 from sglang_tpu.compilation import compiled_forward_shim as shim
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
-    _pad_tensor_on_host,
+    _pad_tensor,
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -126,19 +126,19 @@ class TestPositionOnHost(CustomTestCase):
                     self.assertEqual(uploads[1].tolist(), expected_starts)
 
 
-class TestPadTensorOnHost(CustomTestCase):
-    """Runs the host path on CPU tensors. The TPU copies need a real TPU."""
+class TestPadTensor(CustomTestCase):
+    """Padding preserves values on the input's device and handles token axes."""
 
     def test_bucketed_metadata_is_returned_without_copying(self):
         value = torch.arange(6).reshape(2, 3)
 
-        self.assertIs(_pad_tensor_on_host(value, 2), value)
-        self.assertIs(_pad_tensor_on_host(value, 3, dim=-1), value)
+        self.assertIs(_pad_tensor(value, 2), value)
+        self.assertIs(_pad_tensor(value, 3, dim=-1), value)
 
     def test_dim0_preserves_values_and_zero_fills(self):
         value = torch.arange(6, dtype=torch.int64).reshape(3, 2)
 
-        result = _pad_tensor_on_host(value, 5)
+        result = _pad_tensor(value, 5)
 
         self.assertEqual(result.shape, (5, 2))
         self.assertTrue(torch.equal(result[:3], value))
@@ -147,7 +147,7 @@ class TestPadTensorOnHost(CustomTestCase):
     def test_last_dim_preserves_values_and_zero_fills(self):
         value = torch.arange(6, dtype=torch.int64).reshape(2, 3)
 
-        result = _pad_tensor_on_host(value, 5, dim=-1)
+        result = _pad_tensor(value, 5, dim=-1)
 
         self.assertEqual(result.shape, (2, 5))
         self.assertTrue(torch.equal(result[:, :3], value))
@@ -214,29 +214,11 @@ class TestHostPadFieldSelection(CustomTestCase):
         )
 
     def _run(self, batch):
-        """Return the tensors padded on device and those padded on host."""
-        with patch.object(shim, "_pad_tensor", wraps=shim._pad_tensor) as pad:
-            self._policy().prepare_forward_batch(batch)
-        calls = pad.call_args_list
-        return (
-            [call.args[0] for call in calls if not call.kwargs.get("on_host")],
-            [call.args[0] for call in calls if call.kwargs.get("on_host")],
-        )
+        self._policy().prepare_forward_batch(batch)
 
     def _assert_extend_uses_device_padding(self):
         batch = self._extend_batch()
-        originals = (
-            batch.input_ids,
-            batch.positions,
-            batch.out_cache_loc,
-            batch.mrope_positions,
-        )
-
-        device_padded, host_padded = self._run(batch)
-
-        self.assertEqual(host_padded, [])
-        for original in originals:
-            self.assertTrue(any(t is original for t in device_padded))
+        self._run(batch)
         self.assertEqual(batch.input_ids.tolist(), [0, 1, 2, 3, 4, 0, 0, 0])
         self.assertEqual(batch.positions.tolist(), [11, 12, 13, 50, 51, 0, 0, 0])
         self.assertEqual(batch.out_cache_loc.tolist(), [0, 1, 2, 3, 4, 0, 0, 0])
@@ -252,34 +234,124 @@ class TestHostPadFieldSelection(CustomTestCase):
         with envs.SGLANG_TPU_HOST_PADDING.override(False):
             self._assert_extend_uses_device_padding()
 
-    def test_extend_metadata_takes_host_round_trip_when_enabled(self):
+    def test_device_token_padding_never_reads_back(self):
         batch = self._extend_batch()
-        input_ids, out_cache_loc = batch.input_ids, batch.out_cache_loc
-        positions, mrope = batch.positions, batch.mrope_positions
+        fields = (
+            "input_ids",
+            "positions",
+            "out_cache_loc",
+            "mrope_positions",
+            "seq_lens",
+            "extend_seq_lens",
+            "extend_prefix_lens",
+            "extend_start_loc",
+        )
+        for name in fields:
+            setattr(batch, name, getattr(batch, name).to("meta"))
+        policy = self._policy()
+        policy.model_runner.device = "meta"
 
-        with envs.SGLANG_TPU_HOST_PADDING.override(True):
-            device_padded, host_padded = self._run(batch)
+        class RejectReadbacks(TorchDispatchMode):
+            def __torch_dispatch__(mode, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                if (
+                    func == torch.ops.aten._to_copy.default
+                    and args[0].device.type == "meta"
+                    and kwargs.get("device") == torch.device("cpu")
+                ):
+                    raise AssertionError("padding must not read device inputs back")
+                return func(*args, **kwargs)
 
-        for original in (input_ids, positions, out_cache_loc, mrope):
-            self.assertTrue(any(t is original for t in host_padded))
-            self.assertFalse(any(t is original for t in device_padded))
-        self.assertEqual(batch.input_ids.tolist(), [0, 1, 2, 3, 4, 0, 0, 0])
-        self.assertEqual(batch.out_cache_loc.tolist(), [0, 1, 2, 3, 4, 0, 0, 0])
+        with envs.SGLANG_TPU_HOST_PADDING.override(True), RejectReadbacks():
+            policy.prepare_forward_batch(batch)
+        for name in fields:
+            self.assertEqual(getattr(batch, name).device.type, "meta")
+        self.assertEqual(batch.input_ids.shape, (8,))
         self.assertEqual(batch.mrope_positions.shape, (3, 8))
-        self.assertEqual(batch.mrope_positions[1].tolist(), [5, 6, 7, 8, 9, 0, 0, 0])
-        self.assertEqual(batch.positions.tolist(), [11, 12, 13, 50, 51, 0, 0, 0])
+
+    def test_device_prefill_tokens_warn_but_device_decode_does_not(self):
+        shim.print_warning_once.cache_clear()
+        self.addCleanup(shim.print_warning_once.cache_clear)
+        policy = self._policy()
+        policy.model_runner.device = "meta"
+        decode = self._decode_batch()
+        decode.input_ids = decode.input_ids.to("meta")
+        with envs.SGLANG_TPU_HOST_PADDING.override(True):
+            with self.assertNoLogs("sglang.srt.utils.common", level="WARNING"):
+                policy.prepare_forward_batch(decode)
+            prefill = self._extend_batch()
+            prefill.input_ids = prefill.input_ids.to("meta")
+            with self.assertLogs("sglang.srt.utils.common", level="WARNING"):
+                policy.prepare_forward_batch(prefill)
+
+    def test_extend_mrope_follows_the_extend_metadata_placement(self):
+        """Extend mRoPE positions must land where the extend lengths do.
+
+        A backend hook that keeps extend metadata on the host (the spec worker
+        does) would otherwise see mRoPE positions padded on the device at the
+        live length, one XLA program per prompt length.
+        """
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        fb = object.__new__(ForwardBatch)
+        fb.seq_lens_cpu = torch.tensor([5, 3])
+        batch = SimpleNamespace(
+            multimodal_inputs=[None, None],
+            extend_lens=[5, 3],
+            prefix_lens=[0, 2],
+            reqs=[SimpleNamespace(session=None)] * 2,
+            input_tensor_device=None,
+        )
+        runner = SimpleNamespace(device="meta")
+        with get_context().override_server_args():
+            fb._compute_mrope_positions_extend(runner, batch)
+            self.assertEqual(fb.mrope_positions.device.type, "meta")
+            with patch.object(
+                forward_batch_info, "_extend_metadata_device", lambda b, d: "cpu"
+            ):
+                fb._compute_mrope_positions_extend(runner, batch)
+        self.assertEqual(fb.mrope_positions.device.type, "cpu")
+        self.assertEqual(fb.mrope_positions.shape, (3, 8))
+        self.assertEqual(fb.mrope_positions[0].tolist(), [0, 1, 2, 3, 4, 2, 3, 4])
+
+    def test_startup_check_rejects_configs_that_can_never_stage(self):
+        """A set env with no host-return KV path fails at startup, not per batch."""
+        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+        from sglang_tpu.host_padding import check_host_padding_config
+
+        def runner(allocator):
+            return SimpleNamespace(
+                token_to_kv_pool_allocator=allocator,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((2, 8))),
+            )
+
+        allocator = TpuPagedTokenToKVPoolAllocator(
+            size=8,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="meta",
+            kvcache=None,
+            need_sort=False,
+        )
+        with get_context().override_server_args(enable_torch_compile=True):
+            check_host_padding_config(runner(allocator))
+            with self.assertRaisesRegex(ValueError, "returns device KV indices"):
+                check_host_padding_config(runner(SimpleNamespace(page_size=4)))
+            allocator.page_size = 1
+            with self.assertRaisesRegex(ValueError, "page size 1"):
+                check_host_padding_config(runner(allocator))
+        with get_context().override_server_args(enable_torch_compile=False):
+            allocator.page_size = 4
+            with self.assertRaisesRegex(ValueError, "torch.compile is off"):
+                check_host_padding_config(runner(allocator))
 
     def test_overridden_positions_are_padded_not_reconstructed(self):
         batch = self._extend_batch()
         batch.positions = torch.tensor([90, 70, 71, 22, 21])
         batch.spec_info = EagleDraftExtendInput(positions=batch.positions)
-        positions = batch.positions
-
         with envs.SGLANG_TPU_HOST_PADDING.override(True):
-            device_padded, host_padded = self._run(batch)
+            self._run(batch)
 
-        self.assertTrue(any(t is positions for t in host_padded))
-        self.assertFalse(any(t is positions for t in device_padded))
         self.assertEqual(batch.positions.tolist(), [90, 70, 71, 22, 21, 0, 0, 0])
 
     def test_target_verify_keeps_device_pad(self):
@@ -301,10 +373,8 @@ class TestHostPadFieldSelection(CustomTestCase):
         )
 
         with envs.SGLANG_TPU_HOST_PADDING.override(True):
-            device_padded, host_padded = self._run(batch)
+            self._run(batch)
 
-        self.assertEqual(host_padded, [])
-        self.assertGreaterEqual(len(device_padded), 3)
         self.assertEqual(batch.input_ids.tolist(), [0, 1, 2, 3, 4, 5, 0, 0])
         self.assertEqual(batch.positions.tolist(), [13, 14, 51, 52, 7, 8, 0, 0])
         self.assertEqual(batch.mrope_positions.shape, (3, 8))
@@ -366,10 +436,8 @@ class TestHostPadFieldSelection(CustomTestCase):
         batch = self._decode_batch()
 
         with envs.SGLANG_TPU_HOST_PADDING.override(True):
-            device_padded, host_padded = self._run(batch)
+            self._run(batch)
 
-        self.assertEqual(host_padded, [])
-        self.assertGreaterEqual(len(device_padded), 3)
         self.assertEqual(batch.input_ids.tolist(), [0, 1, 2, 0])
         self.assertEqual(batch.positions.tolist(), [13, 51, 7, 0])
 
@@ -401,6 +469,47 @@ class TestHostPadFieldSelection(CustomTestCase):
         self.assertIn(
             [11, 12, 13, 50, 51, 0, 0, 0], [x.tolist() for x in copies.values()]
         )
+
+    def test_host_extend_metadata_uploads_when_tokens_are_on_device(self):
+        """Host extend lengths upload even when tokens and seq_lens are on device."""
+        batch = self._extend_batch()
+        for name in ("input_ids", "positions", "out_cache_loc", "seq_lens"):
+            setattr(batch, name, getattr(batch, name).to("meta"))
+        batch.mrope_positions = None
+        policy = object.__new__(DecoderTpuCompilePolicy)
+        policy.model_runner = SimpleNamespace(device="meta")
+        with envs.SGLANG_TPU_HOST_PADDING.override(True):
+            policy._upload_host_inputs(batch)
+        for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
+            self.assertEqual(getattr(batch, name).device.type, "meta", name)
+
+    def test_experimental_spec_keeps_non_overlap_metadata_on_host(self):
+        """An experimental-worker PD-prefill batch filters and pads its lengths on
+        host; an overlap batch, or one off the worker, keeps them on the device."""
+        from sglang_tpu.hooks import host_padding
+
+        def batch(*, overlap):
+            return SimpleNamespace(
+                host_pad_bs=8,
+                enable_overlap=overlap,
+                spec_algorithm=SimpleNamespace(is_none=lambda: False),
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.zeros(1, device="cpu")
+                ),
+                hisparse_coordinator=None,
+                reqs=[],
+            )
+
+        original = lambda b: "tpu"  # noqa: E731
+        self.assertEqual(
+            host_padding.metadata_device(original, batch(overlap=False)), "cpu"
+        )
+        self.assertEqual(
+            host_padding.metadata_device(original, batch(overlap=True)), "tpu"
+        )
+        off_worker = batch(overlap=False)
+        off_worker.host_pad_bs = None
+        self.assertEqual(host_padding.metadata_device(original, off_worker), "tpu")
 
     def test_decode_mrope_builds_on_host_and_uploads_only_bucket_shape(self):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -722,23 +831,19 @@ class TestHostPadFieldSelection(CustomTestCase):
                     self.assertEqual(batch.req_pool_indices.tolist(), [1])
                     self.assertEqual(batch.orig_seq_lens.dtype, torch.int32)
                     self.assertIsNone(batch.input_ids)
-                    batch.prefill_input_ids_cpu = torch.tensor([10, 11, 12])
-                    tokens = host_padding.stage_prefill_tokens(
-                        lambda b: b.prefill_input_ids_cpu.to("meta"), batch
-                    )
-                    self.assertEqual(
-                        tokens.device.type, "meta" if multimodal else "cpu"
-                    )
         # The placement hook defaults to the existing backend contract.
         with envs.SGLANG_TPU_HOST_PADDING.override(False):
             self.assertEqual(placement(batch), "meta")
 
     def test_vl_kv_locations_upload_only_after_padding(self):
-        """VL embedding IDs need the device, but KV slots must upload bucketed."""
+        """VL KV slots stay on CPU until forward-input padding and upload."""
         from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
+        from sglang.srt.model_executor.forward_batch_info import (
+            _extend_metadata_device,
+        )
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
-        from sglang_tpu.hooks import host_padding
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
         override = get_context().override_server_args(
             enable_torch_compile=True, enable_mixed_chunk=False
@@ -749,6 +854,7 @@ class TestHostPadFieldSelection(CustomTestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             mix_running_indices=None,
             dllm_config=None,
+            input_tensor_device=None,
             model_config=SimpleNamespace(
                 is_generation=True,
                 is_multimodal=True,
@@ -777,8 +883,11 @@ class TestHostPadFieldSelection(CustomTestCase):
                 )
                 prefix = torch.tensor([0, 0])
                 lengths = torch.tensor([3, 2])
-                slots = host_padding.alloc_extend(
-                    alloc_paged_token_slots_extend,
+                batch.token_to_kv_pool_allocator = allocator
+                batch.input_tensor_device = TpuSRTPlatform().get_batch_input_device(
+                    batch
+                )
+                slots = alloc_paged_token_slots_extend(
                     tree,
                     prefix,
                     prefix,
@@ -796,9 +905,7 @@ class TestHostPadFieldSelection(CustomTestCase):
                 forward.input_ids = forward.input_ids.to("meta")
                 forward.out_cache_loc = slots
                 batch.input_ids = forward.input_ids
-                metadata_device = host_padding.extend_metadata_device(
-                    lambda batch, device: device, batch, "meta"
-                )
+                metadata_device = _extend_metadata_device(batch, "meta")
                 forward.extend_seq_lens = lengths.to(metadata_device)
                 forward.extend_prefix_lens = prefix.to(metadata_device)
                 self.assertEqual(forward.extend_seq_lens.device.type, "cpu")
@@ -827,51 +934,67 @@ class TestHostPadFieldSelection(CustomTestCase):
                 allocator.merge_and_sort_free()
                 self.assertEqual(allocator.available_size(), 24)
 
-    def test_staging_fallbacks_preserve_device_inputs(self):
+    def test_prebuilt_tokens_upload_only_after_relay_padding(self):
+        """PD handoff must not upload live-size tokens before the bucketed relay."""
+        from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+            ScheduleBatchDisaggregationDecodeMixin,
+        )
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.hooks import host_padding
+        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
 
-        override = get_context().override_server_args(
-            enable_torch_compile=True,
-            sampling_backend="pytorch",
-            enable_mixed_chunk=False,
+        pool = SimpleNamespace(
+            req_to_token=torch.zeros((9, 16), dtype=torch.int32),
+            _tpu_relay_bucketer=Bucketer("Bs", [1, 2, 4, 8]),
         )
-        override.install()
-        self.addCleanup(override.restore)
+        relay = HostPaddingFutureMap("meta", SpeculativeAlgorithm.NONE, pool)
         batch = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            mix_running_indices=None,
-            dllm_config=None,
-            model_config=SimpleNamespace(
-                is_generation=True,
-                is_multimodal=False,
-                is_encoder_decoder=False,
-                use_ngram_embedding=False,
-                use_engram=False,
-            ),
-            prefill_input_ids_cpu=torch.tensor([1, 2, 3]),
-        )
-
-        def upload(batch):
-            return batch.prefill_input_ids_cpu.to("meta")
-
-        with envs.SGLANG_TPU_HOST_PADDING.override(True):
-            staged = host_padding.stage_prefill_tokens(upload, batch)
-            self.assertIs(staged, batch.prefill_input_ids_cpu)
-            for field, value in (
-                ("mix_running_indices", [0]),
-                ("spec_algorithm", SpeculativeAlgorithm.EAGLE3),
-            ):
-                old = getattr(batch, field)
-                setattr(batch, field, value)
-                self.assertEqual(
-                    host_padding.stage_prefill_tokens(upload, batch).device.type, "meta"
+            device="meta",
+            reqs=[
+                SimpleNamespace(
+                    output_ids=[token],
+                    swa_branching_seqlen=None,
+                    grammar=None,
+                    finished=lambda: False,
+                    skip_radix_cache_insert=True,
                 )
-                setattr(batch, field, old)
-        with envs.SGLANG_TPU_HOST_PADDING.override(False):
-            self.assertEqual(
-                host_padding.stage_prefill_tokens(upload, batch).device.type, "meta"
-            )
+                for token in (11, 22, 33)
+            ],
+            req_pool_indices=torch.tensor([1, 2, 3]),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            tree_cache=None,
+        )
+        uploads = []
+
+        class ObserveUploads(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                if func == torch.ops.aten._to_copy.default and kwargs.get(
+                    "device"
+                ) == torch.device("meta"):
+                    uploads.append(args[0].clone())
+                return func(*args, **kwargs)
+
+        # The platform decides the placement; None keeps the live-size upload.
+        for placement in ("cpu", None):
+            uploads.clear()
+            platform = SimpleNamespace(get_batch_input_device=lambda b: placement)
+            with (
+                self.subTest(placement=placement),
+                patch(
+                    "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+                    "current_platform",
+                    platform,
+                ),
+                ObserveUploads(),
+            ):
+                ScheduleBatchDisaggregationDecodeMixin.process_prebuilt(batch, relay)
+                self.assertIsNone(batch.input_ids)
+                if placement is None:
+                    self.assertEqual(uploads[0].shape, (3,))
+                    continue
+                self.assertEqual([value.shape for value in uploads], [(4,), (4,)])
+                self.assertEqual(uploads[0].tolist(), [11, 22, 33, 0])
+                self.assertEqual(uploads[1].tolist(), [1, 2, 3, 12])
 
     def test_bucketed_relay_preserves_live_slots_and_only_uses_bucket_shapes(self):
         from sglang.srt.managers.overlap_utils import RelayPayload

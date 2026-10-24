@@ -1227,6 +1227,27 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x arrives padded to a patch bucket, so every tensor reaching the
         device is shape-static. cu_seqlens keeps the real segmentation.
         """
+        x, cu_seqlens, cos, sin = self.prepare_tpu_graph_inputs(x, grid_thw)
+        return self.graph_runners.run(
+            x=x,
+            position_embeddings=None,
+            rotary_pos_emb_cos=cos,
+            rotary_pos_emb_sin=sin,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=None,
+            output_indices=None,
+        )
+
+    def prepare_tpu_graph_inputs(
+        self, x: torch.Tensor, grid_thw: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the pre-encoder prologue of ``forward_with_tpu_graph``.
+
+        Returns ``(x, cu_seqlens, cos, sin)`` for ``graph_runners.run``: x is
+        the patch-embedded, position-embedded device tensor, and cu_seqlens
+        stays on the host. The TPU compile policy calls this directly to warm
+        a bucket's compiled boundary asynchronously.
+        """
         if x.device.type != "cpu" or grid_thw.device.type != "cpu":
             raise ValueError("forward_with_tpu_graph expects CPU inputs")
         bucket_len = x.shape[0]
@@ -1248,16 +1269,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x = self.patch_embed(x)
         pos_embeds = self.pos_embed(idx.view(-1)).view(4, bucket_len, -1)
         x += (pos_embeds * weights.unsqueeze(-1)).sum(dim=0)
-
-        return self.graph_runners.run(
-            x=x,
-            position_embeddings=None,
-            rotary_pos_emb_cos=cos,
-            rotary_pos_emb_sin=sin,
-            cu_seqlens=cu_seqlens,
-            cu_window_seqlens=None,
-            output_indices=None,
-        )
+        return x, cu_seqlens, cos, sin
 
 
 if _is_tpu:

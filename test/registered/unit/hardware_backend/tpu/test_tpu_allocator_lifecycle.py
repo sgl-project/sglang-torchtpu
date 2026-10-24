@@ -6,15 +6,20 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import swa
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import print_warning_once
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
     host_return_allocators,
 )
+from sglang_tpu.envs import envs
 from sglang_tpu.kv_free_fence import install_kv_free_fence
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
@@ -323,13 +328,15 @@ class TestHostExtendAllocation(CustomTestCase):
         self.assertEqual(allocator.available_size(), 24)
 
     def test_swa_host_return_reaches_both_inner_allocators(self):
-        """SWA extend and decode return host locations once opted in.
+        """Host-capable SWA wrappers stage tokens and allocation outputs on CPU.
 
-        Device-resident locations at the live batch size compiled a transfer for
-        every new decode batch size under host padding.
+        Rejecting the wrapper uploaded tokens before padding at arbitrary prompt
+        lengths. Wrappers with device-resident mappings retain device staging.
         """
         page_size, size = 4, 32
         with (
+            get_context().override_server_args(enable_torch_compile=True),
+            envs.SGLANG_TPU_HOST_PADDING.override(True),
             patch.object(swa, "_is_tpu", True),
             patch.object(swa, "current_platform", TpuSRTPlatform()),
             patch.object(
@@ -366,10 +373,42 @@ class TestHostExtendAllocation(CustomTestCase):
             )
             mapping = allocator.full_to_swa_index_mapping
 
+            batch = ScheduleBatch(
+                reqs=[
+                    SimpleNamespace(
+                        positional_embed_overrides=None,
+                        input_embeds=None,
+                        beam_group=None,
+                    )
+                    for _ in range(2)
+                ],
+                device="meta",
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=SimpleNamespace(
+                    is_generation=True,
+                    is_multimodal=False,
+                    is_encoder_decoder=False,
+                    use_ngram_embedding=False,
+                    use_engram=False,
+                ),
+                token_to_kv_pool_allocator=allocator,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.empty(2, 16)),
+                prefill_input_ids_cpu=torch.arange(5),
+            )
+            batch.input_tensor_device = TpuSRTPlatform().get_batch_input_device(batch)
+            resolve_forward_inputs(batch, None)
+            self.assertEqual(batch.input_ids.device.type, "cpu")
+
             zero = torch.zeros(2, dtype=torch.int64)
             lengths = torch.tensor([3, 2])
             full = allocator.alloc_extend(
-                zero, zero, lengths, lengths, zero - 1, 5, return_host=True
+                zero,
+                zero,
+                lengths,
+                lengths,
+                zero - 1,
+                5,
+                return_host=batch.input_tensor_device == "cpu",
             )
             self.assertEqual(full.device.type, "cpu")
             self.assertTrue((mapping[full.long()] > 0).all())
@@ -385,6 +424,21 @@ class TestHostExtendAllocation(CustomTestCase):
             self.assertEqual(
                 torch.unique(swa_slots).numel(), decoded.numel(), "SWA slots alias"
             )
+
+            # A wrapper with a device mapping cannot support host staging, and
+            # the skipped env must be reported with its reason.
+            allocator.full_to_swa_index_mapping = mapping.to("meta")
+            print_warning_once.cache_clear()
+            with self.assertLogs("sglang.srt.utils.common", level="WARNING") as logs:
+                batch.input_tensor_device = TpuSRTPlatform().get_batch_input_device(
+                    batch
+                )
+            self.assertIsNone(batch.input_tensor_device)
+            self.assertIn("allocator returns device indices", logs.output[0])
+            batch.prefill_input_ids_cpu = torch.arange(5)
+            resolve_forward_inputs(batch, None)
+            self.assertEqual(batch.input_ids.device.type, "meta")
+            allocator.full_to_swa_index_mapping = mapping
 
         self.assertEqual(
             host_return_allocators(allocator.full_attn_allocator),

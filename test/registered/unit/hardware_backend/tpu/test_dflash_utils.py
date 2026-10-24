@@ -13,11 +13,13 @@ import torch
 
 import sglang.srt.managers.overlap_utils as overlap_utils
 import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
+import sglang_tpu.dflash_utils_tpu as dflash_utils_tpu
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
+    argmax_draft_tokens_tpu,
     build_dflash_draft_block,
     gather_dflash_candidate_window,
     select_dflash_verify_cache_locs_tpu,
@@ -497,3 +499,46 @@ def test_fused_draft_block_matches_the_step_by_step_prep():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_sharded_draft_argmax_outside_pallas_sizes_takes_the_global_best():
+    """A DP-attention draft on TP2/TP4 has a vocab-sharded head the Pallas TopK cannot
+    serve; drafting from the local shard alone would silently drop acceptance."""
+    # Rank 0 of TP2: tokens 0..3 here, 4..7 on rank 1.
+    weight = torch.eye(4)
+    lm_head = SimpleNamespace(
+        weight=weight,
+        quant_method=SimpleNamespace(apply=lambda head, hs: hs @ head.weight.T),
+        enable_tp=True,
+        num_embeddings=8,
+        num_embeddings_per_partition=4,
+        org_vocab_size=8,
+        shard_indices=SimpleNamespace(num_org_elements=4, org_vocab_start_index=0),
+    )
+    # Block of 3 rows; rows 1 and 2 draft: local best token 1 (5.0) and 2 (1.0).
+    hidden = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0], [0.0, 5.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    )
+    # Rank 1's shard bests: 3.0 at token 6, 9.0 at token 7.
+    peer = {
+        torch.float32: torch.tensor([[3.0], [9.0]]),
+        torch.int64: torch.tensor([[6], [7]]),
+    }
+    group = SimpleNamespace(
+        world_size=2,
+        all_gather=lambda t, dim: torch.cat([t, peer[t.dtype]], dim=dim),
+    )
+    with (
+        patch.object(
+            dflash_utils_tpu, "model_parallel_is_initialized", return_value=True
+        ),
+        patch.object(
+            dflash_utils_tpu,
+            "get_parallel",
+            return_value=SimpleNamespace(tp_group=group),
+        ),
+    ):
+        tokens = argmax_draft_tokens_tpu(
+            lm_head=lm_head, hidden_states=hidden, block_size=3
+        )
+    assert tokens.tolist() == [[1, 7]]

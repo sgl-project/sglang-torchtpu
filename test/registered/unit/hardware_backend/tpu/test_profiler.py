@@ -8,6 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components import (
+    profiler_manager as scheduler_profiler,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.profiler import (
@@ -191,6 +195,73 @@ class TestStartStopUsesLibtpuTrace(CustomTestCase):
             stop_tpu_profile(None)
 
         self.assertEqual([c[0] for c in calls], ["stop"])
+
+
+def _stopping_manager(tmp_path, trace):
+    with envs.SGLANG_PROFILE_V2.override(False):
+        manager = scheduler_profiler.SchedulerProfilerManager(
+            ps=types.SimpleNamespace(),
+            dp_tp_cpu_group=None,
+            get_forward_ct=lambda: 0,
+        )
+    manager.profile_in_progress = True
+    manager.tpu_profiler = trace
+    manager.torch_profiler_output_dir = tmp_path
+    manager.profiler_activities = ["TPU"]
+    manager.profile_prefix = ""
+    return manager
+
+
+def test_stage_tpu_profile_synchronizes_before_stopping(tmp_path):
+    calls = []
+    trace = object()
+    manager = _stopping_manager(tmp_path, trace)
+
+    with (
+        patch.object(
+            scheduler_profiler.current_platform,
+            "synchronize",
+            side_effect=lambda: calls.append("synchronize"),
+        ),
+        patch(
+            "sglang_tpu.profiler.stop_tpu_profile",
+            side_effect=lambda actual: calls.append(("stop", actual)),
+        ),
+    ):
+        manager._stop_profile(stage=ForwardMode.EXTEND)
+
+    assert calls == ["synchronize", ("stop", trace)]
+
+
+def test_non_stage_tpu_profile_stops_without_synchronizing(tmp_path):
+    calls = []
+    trace = object()
+    manager = _stopping_manager(tmp_path, trace)
+
+    with (
+        patch.object(
+            scheduler_profiler.current_platform,
+            "synchronize",
+            side_effect=lambda: calls.append("synchronize"),
+        ),
+        patch(
+            "sglang_tpu.profiler.stop_tpu_profile",
+            side_effect=lambda actual: calls.append(("stop", actual)),
+        ),
+    ):
+        manager._stop_profile()
+
+    assert calls == [("stop", trace)]
+
+
+def test_stage_profile_without_tpu_trace_does_not_synchronize(tmp_path):
+    manager = _stopping_manager(tmp_path, None)
+    manager.profiler_activities = ["CPU"]
+
+    with patch.object(scheduler_profiler.current_platform, "synchronize") as sync:
+        manager._stop_profile(stage=ForwardMode.EXTEND)
+
+    sync.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import is_tpu
 from sglang.srt.utils.common import is_pin_memory_available
@@ -149,14 +150,14 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        # Non-blocking H2D: with overlap this runs on the schedule stream after
-        # its wait on the in-flight forward, so a blocking copy would stall the
-        # host until that forward ends and leave the GPU idle.
+        # Same placement as prefill: None uploads now, a backend may keep the
+        # host-built first token on CPU until its relay pads it.
+        input_device = current_platform.get_batch_input_device(self) or self.device
         last_tokens_tensor = torch.tensor(
             last_tokens,
             dtype=torch.int64,
             pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
+        ).to(input_device, non_blocking=True)
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,

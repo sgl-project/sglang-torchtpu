@@ -295,16 +295,22 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if attn_dp_enabled_of(cfg) and not cfg.device == "npu":
+    # DFLASH + dp attention is validated on NPU, and on platforms that opt in.
+    if (
+        attn_dp_enabled_of(cfg)
+        and not cfg.device == "npu"
+        and not current_platform.supports_speculative_dp_attention(algorithm)
+    ):
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp "
             "attention on non-NPU devices."
         )
 
-    if cfg.pp_size != 1:
+    # check_pipeline_parallel_compat decides which platforms serve a DFLASH PP prefill.
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; "
+            "decode and non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:

@@ -1764,20 +1764,21 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
-    def _uses_raiden_hicache(self) -> bool:
-        return (
-            self.enable_hierarchical_cache
-            and get_memory().hicache_io_backend == "raiden"
+    def _uses_tpu_dma_hicache(self) -> bool:
+        from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
+
+        return self.enable_hierarchical_cache and is_tpu_dma_hicache_backend(
+            get_memory().hicache_io_backend
         )
 
     def _needs_kv_free_fence(self) -> bool:
         """Whether unordered DMAs can write pages an in-flight forward writes:
-        raiden HiCache loads, or KV arriving on a PD decode server."""
+        TPU DMA HiCache loads, or KV arriving on a PD decode server."""
         return (
             self.device == "tpu"
             and self.enable_overlap
             and (
-                self._uses_raiden_hicache()
+                self._uses_tpu_dma_hicache()
                 or self.disaggregation_mode == DisaggregationMode.DECODE
             )
         )
@@ -1805,8 +1806,8 @@ class Scheduler(
             # Unfenced, a DMA into a freed page can land before an in-flight
             # forward's write to it and be overwritten without any error.
             needed_by = (
-                "The raiden HiCache backend"
-                if self._uses_raiden_hicache()
+                f"--hicache-io-backend {get_memory().hicache_io_backend}"
+                if self._uses_tpu_dma_hicache()
                 else "A PD decode server under overlap scheduling"
             )
             raise ValueError(
@@ -1818,7 +1819,7 @@ class Scheduler(
             synchronize_device=self.device_module.synchronize,
             **fence_kwargs,
         )
-        if self._uses_raiden_hicache():
+        if self._uses_tpu_dma_hicache():
             fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
 
     def precompile_tpu_spec_ops(self) -> None:

@@ -804,15 +804,13 @@ def _patch_raiden_is_load_back_event_done() -> None:
     _raiden_is_load_back_event_done_patched = True
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang_tpu.raiden_hybrid_cache_controller import (
-        TpuRaidenHybridCacheController,
-    )
+    from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
     orig_is_load_back_event_done = UnifiedRadixCache.is_load_back_event_done
 
     def is_load_back_event_done(self, consumer_index):
         controller = self.cache_controller
-        if not isinstance(controller, TpuRaidenHybridCacheController):
+        if not isinstance(controller, TpuDMAHybridCacheController):
             return orig_is_load_back_event_done(self, consumer_index)
         return controller.is_load_back_event_done(consumer_index, self._all_reduce)
 
@@ -872,7 +870,8 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
 def _patch_pd_decode_swa_hicache() -> None:
     """Allow PD decode prefix cache + RAM offload on sliding-window models.
 
-    Only full-attention KV goes to RAM. See ``pd_decode_swa_hicache``.
+    Only full-attention KV goes to RAM. Also hold PD decode requests that reuse
+    an unfinished raiden restore, on any model. See ``pd_decode_swa_hicache``.
     """
     from sglang_tpu import pd_decode_swa_hicache
 

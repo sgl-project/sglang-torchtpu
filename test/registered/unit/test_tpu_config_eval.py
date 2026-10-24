@@ -256,7 +256,10 @@ class TestRenderedCookbookCommands(unittest.TestCase):
     has since renamed is a bring-up failure nobody sees in CI.
     """
 
-    PAGES = ("docs/cookbook/autoregressive/OpenAI/GPT-OSS.mdx",)
+    PAGES = (
+        "docs/cookbook/autoregressive/OpenAI/GPT-OSS.mdx",
+        "docs/cookbook/autoregressive/Moonshotai/Kimi-K3.mdx",
+    )
 
     def test_generated_blocks_parse_as_server_args(self):
         import argparse

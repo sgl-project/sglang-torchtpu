@@ -186,6 +186,7 @@ class TestSRTPlatform(CustomTestCase):
                 "DFLASH", "custom_backend"
             )
         )
+        self.assertFalse(base.supports_speculative_dp_attention("DFLASH"))
 
 
 class TestOverlapStreamCapability(CustomTestCase):

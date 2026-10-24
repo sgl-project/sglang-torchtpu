@@ -52,8 +52,10 @@ materializing defensive copies during `torch.compile`.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, Sequence, Tuple
+import struct
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 # Cache of `[max_pos, rope_head_dim]` float32 cos_sin tables derived from
@@ -102,6 +104,15 @@ _TPU_INDEXER_LANE_DIM = 256
 # single-step prefill batch (up to 8192 tokens) never collides with persistent
 # per-request ring pages even when --max-total-tokens is small.
 _TPU_MIN_PREFILL_STATE_TOKENS = 8192
+
+# Uniform per-request page stride (`32` pages) and scratch page count (`2048`
+# pages) across ALL TPUCompressStatePool instances (C4, C4-Indexer, C128).
+# Keeping `shape[0] = 1 + num_req_slots * 32 + 2048` identical across every
+# state tensor allows Raiden's single state engine to pull all C4, C4-Indexer,
+# and C128 persistent rings for a request in one 32-page transfer without
+# changing `compressor_v1`'s internal modulo `8` / `32` ring arithmetic.
+_TPU_STATE_SLOT_STRIDE_PAGES = 32
+_TPU_STATE_SCRATCH_PAGES = _TPU_MIN_PREFILL_STATE_TOKENS // 4
 
 
 def _zeros_kv_buffer(
@@ -332,11 +343,13 @@ class TPUCompressStatePool(CompressStatePool):
 
     Layout of `num_state_pages`:
     - Page `0`: reserved dummy padding page.
-    - Pages `[1 .. 1 + num_req_slots * ring_pages_per_req)`: persistent
-      per-request ring pages (`4` pages = `16` tokens/req for C4; `16` pages =
-      `128` tokens/req for C128).
-    - Pages `[1 + num_req_slots * ring_pages_per_req .. num_state_pages)`:
-      scratch pages for intra-prefill blocks (`>= 8192` tokens).
+    - Pages `[1 .. 1 + num_req_slots * 32)`: persistent per-request ring slots
+      strided uniformly at `slot_stride_pages = 32` across C4, C4-Indexer, and
+      C128 (`compressor_v1` wraps within the first `ring_pages_per_req = 8`
+      pages of each 32-page slot for C4 and all `32` pages for C128).
+    - Pages `[1 + num_req_slots * 32 .. num_state_pages)`: uniform `2048`
+      scratch pages for intra-prefill blocks (`>= 8192` tokens for C4,
+      `>= 16384` tokens for C128).
     """
 
     def __init__(
@@ -369,6 +382,9 @@ class TPUCompressStatePool(CompressStatePool):
             raise ValueError(f"Unsupported compress ratio for TPU state pool: {ratio}")
 
         self.ring_pages_per_req = self.ring_tokens_per_req // self.state_block_size
+        self.slot_stride_pages = max(
+            self.ring_pages_per_req, _TPU_STATE_SLOT_STRIDE_PAGES
+        )
         self.last_dim_u8 = _TPU_INDEXER_LANE_DIM if self.is_indexer else _TPU_LANE_DIM
         coff = 1 + int(overlap)
         state_bytes_per_token = 2 * coff * head_dim * 4  # float32 bytes
@@ -379,14 +395,14 @@ class TPUCompressStatePool(CompressStatePool):
             self.state_block_size * self.state_rows_per_token
         )
 
-        # Exact page count for TPU compressor_v1:
-        # 1) Page 0 dummy page (1 page = state_block_size tokens)
-        # 2) Persistent per-request rings (num_req_slots * ring_pages_per_req)
-        # 3) Prefill scratch pages (_TPU_MIN_PREFILL_STATE_TOKENS // state_block_size)
-        min_ring_tokens = self.num_req_slots * self.ring_tokens_per_req
-        exact_total_tokens = (
-            self.state_block_size + min_ring_tokens + _TPU_MIN_PREFILL_STATE_TOKENS
-        )
+        # Uniform page count across C4, C4-Indexer, and C128 state pools:
+        # 1) Page 0 dummy page (1 page)
+        # 2) Persistent per-request slots (num_req_slots * slot_stride_pages)
+        # 3) Prefill scratch pages (_TPU_STATE_SCRATCH_PAGES = 2048 pages)
+        self.scratch_start_page = 1 + self.num_req_slots * self.slot_stride_pages
+        self.num_scratch_pages = _TPU_STATE_SCRATCH_PAGES
+        self.num_state_pages = self.scratch_start_page + self.num_scratch_pages
+        exact_total_tokens = self.num_state_pages * self.state_block_size
 
         super().__init__(
             size=exact_total_tokens,
@@ -408,9 +424,7 @@ class TPUCompressStatePool(CompressStatePool):
         self._size = exact_total_tokens
         self._logical_size = exact_total_tokens
         assert self._size % self.state_block_size == 0
-        self.num_state_pages = self._size // self.state_block_size
-        self.scratch_start_page = 1 + self.num_req_slots * self.ring_pages_per_req
-        self.num_scratch_pages = self.num_state_pages - self.scratch_start_page
+        assert self.num_state_pages == self._size // self.state_block_size
 
         shape = (
             self.num_state_pages,
@@ -667,6 +681,7 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         state_block_size = proto.state_block_size
         window_blocks = proto.window_blocks
         ring_pages = proto.ring_pages_per_req
+        slot_stride = proto.slot_stride_pages
         scratch_start_page = proto.scratch_start_page
         num_state_pages = proto.num_state_pages
         shifts = self._req_state_shifts[ratio]
@@ -680,7 +695,7 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 req_pool_indices_cpu[:non_empty_bs], dtype=torch.long, device="cpu"
             )
             req_shifts = shifts[reqs]
-            table_cpu[:non_empty_bs, 0] = 1 + reqs.to(torch.int32) * ring_pages
+            table_cpu[:non_empty_bs, 0] = 1 + reqs.to(torch.int32) * slot_stride
             table_cpu[:non_empty_bs, 2] = req_shifts
             table_cpu[:non_empty_bs, 4] = req_shifts
             return table_cpu.to(device=device)
@@ -703,7 +718,7 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             b_prev = (start_pos - 1) // state_block_size if start_pos > 0 else -1
             b_end = (seq_len - 1) // state_block_size
             old_shift = int(shifts[req_idx].item())
-            ring_base = 1 + req_idx * ring_pages
+            ring_base = 1 + req_idx * slot_stride
             if b_end - b_prev <= window_blocks:
                 table_cpu[i, 0] = ring_base
                 table_cpu[i, 2] = old_shift
@@ -733,6 +748,111 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 shifts[req_idx] = new_shift
 
         return table_cpu.to(device=device)
+
+    # ------------------------------------------------------------------ #
+    # Prefill/Decode Disaggregation buffer descriptors & state metadata
+    # ------------------------------------------------------------------ #
+
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Page-major descriptors for 256-token full-page compressed KV pools.
+
+        Mirrors :meth:`TpuFusedMHATokenToKVPool.get_contiguous_buf_infos`: each
+        4D ``torch.uint8`` buffer has ``buf.shape[0] = num_pages`` and
+        ``item_len = buf[0].nbytes``. Ordering is deterministic across prefill
+        and decode peers: C4 NoPE, C4 RoPE, C4 Indexer K, then C128 HCA.
+        """
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        groups: List[Sequence[torch.Tensor]] = []
+        if isinstance(self.c4_kv_pool, TPUDeepSeekV4CSAKVPool):
+            groups.append(self.c4_kv_pool.nope_buffer)
+            groups.append(self.c4_kv_pool.rope_buffer)
+        if isinstance(self.c4_indexer_kv_pool, TPUDeepSeekV4IndexerPool):
+            groups.append(self.c4_indexer_kv_pool.index_k_with_scale_buffer)
+        if isinstance(self.c128_kv_pool, TPUDeepSeekV4HCAKVPool):
+            groups.append(self.c128_kv_pool.k_buffer)
+        for group in groups:
+            for buf in group:
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes)
+        return data_ptrs, data_lens, item_lens
+
+    def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Page-major descriptors for 256-token SWA sliding-window KV pages."""
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        if isinstance(self.swa_kv_pool, TPUDeepSeekV4SWAKVPool):
+            for buf in self.swa_kv_pool.k_buffer:
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes)
+        return data_ptrs, data_lens, item_lens
+
+    def get_request_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Page-major descriptors for all request-slot compressor state rings.
+
+        On TPU, C4 Attention, C4 Indexer, and C128 Attention state pools are all
+        request-slot-scoped with uniform ``num_state_pages`` and a 32-page slot
+        stride ``[1 + req_pool_idx * 32 .. +32)``.
+        """
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for pool in (*self.compress_state_pools, *self.indexer_compress_state_pools):
+            if pool is None:
+                continue
+            assert isinstance(pool, TPUCompressStatePool)
+            buf = pool.state_buffer
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(buf[0].nbytes)
+        return data_ptrs, data_lens, item_lens
+
+    def request_state_transfer_indices(
+        self, req_pool_idx: int, seq_len: int = 0
+    ) -> np.ndarray:
+        """Return the 32 persistent state page indices owned by ``req_pool_idx``."""
+        del seq_len
+        req_idx = int(req_pool_idx)
+        assert 0 <= req_idx < self.num_req_slots, (
+            f"req_pool_idx={req_idx} out of range [0, {self.num_req_slots})"
+        )
+        base = 1 + req_idx * _TPU_STATE_SLOT_STRIDE_PAGES
+        return np.arange(base, base + _TPU_STATE_SLOT_STRIDE_PAGES, dtype=np.int32)
+
+    @staticmethod
+    def _req_idx_from_state_rows(state_rows: Sequence[int]) -> int:
+        if len(state_rows) != _TPU_STATE_SLOT_STRIDE_PAGES:
+            raise ValueError(
+                f"Expected {_TPU_STATE_SLOT_STRIDE_PAGES} state pages, "
+                f"got {len(state_rows)}"
+            )
+        req_idx, rem = divmod(int(state_rows[0]) - 1, _TPU_STATE_SLOT_STRIDE_PAGES)
+        if rem != 0 or req_idx < 0:
+            raise ValueError(
+                f"Invalid base state page {state_rows[0]} for stride "
+                f"{_TPU_STATE_SLOT_STRIDE_PAGES}"
+            )
+        return req_idx
+
+    def pack_req_state_meta(self, state_rows: Sequence[int]) -> bytes:
+        """Pack post-prefill ``(shift_c4, shift_c128)`` for ``state_rows``."""
+        req_idx = self._req_idx_from_state_rows(state_rows)
+        return struct.pack(
+            "<ii",
+            int(self._req_state_shifts[4][req_idx].item()),
+            int(self._req_state_shifts[128][req_idx].item()),
+        )
+
+    def unpack_req_state_meta(self, state_rows: Sequence[int], blob: bytes) -> None:
+        """Apply incoming prefill ``(shift_c4, shift_c128)`` to ``state_rows``."""
+        req_idx = self._req_idx_from_state_rows(state_rows)
+        shift_4, shift_128 = struct.unpack("<ii", blob)
+        self._req_state_shifts[4][req_idx] = int(shift_4)
+        self._req_state_shifts[128][req_idx] = int(shift_128)
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
@@ -780,6 +900,17 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def clear_c128_req_state(self, req_pool_idx: int) -> None:
         if 0 <= req_pool_idx < self.num_req_slots:
+            self._req_state_shifts[128][req_pool_idx] = 0
+
+    def clear_request_scoped_state(self, req_pool_idx: int) -> None:
+        """Reset host ring-shift metadata without eager HBM writes.
+
+        Must NEVER execute an eager in-place write (``clear()`` / ``fill_``) on
+        ``state_buffer``: on ``torch_tpu``, eager mutation reallocates the
+        underlying PJRT buffer and invalidates pointers registered with Raiden.
+        """
+        if 0 <= req_pool_idx < self.num_req_slots:
+            self._req_state_shifts[4][req_pool_idx] = 0
             self._req_state_shifts[128][req_pool_idx] = 0
 
     def clear_unaccepted_c128_draft_states(

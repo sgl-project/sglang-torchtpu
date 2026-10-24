@@ -15,13 +15,13 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
@@ -85,11 +85,6 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 "TpuBlockSpecWorker only supports SGLANG_RAGGED_VERIFY_MODE=static."
             )
         target_runner = target_worker.model_runner
-        # Idle DP ranks would need to mirror the draft's collectives (_forward_idle_step).
-        if is_dp_attention_enabled():
-            raise NotImplementedError(
-                "TpuBlockSpecWorker does not support DP attention."
-            )
         self._spec_algorithm = target_runner.spec_algorithm
         draft_worker = _DRAFT_WORKER_CLS[self._spec_algorithm](target_runner)
         super().__init__(target_worker, draft_worker, draft_worker.num_drafts)
@@ -110,7 +105,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
         self._warmup_draft_block_inputs()
-        self._warmup_draft_sampling()
+        if self._sampled_drafts:
+            self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
@@ -126,17 +122,18 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         state = bucket.state
         bs = state.seq_lens.shape[0]
         block_hidden, graph_draft_tokens = self._forward_draft_block(
-            bucket=bucket, rows=rows, verify_input=verify_input
+            state=state,
+            live_mask=bucket.live_mask,
+            rows=rows,
+            verify_input=verify_input,
         )
         # No confidence budget yet: every bucket verifies all gamma drafts.
         num_verify_drafts = self._all_drafts[bs]
         temperatures, top_ks = bucket.temperatures, bucket.top_ks
-        if temperatures is None or top_ks is None:
+        if temperatures is None or top_ks is None or not self._sampled_drafts:
             # The draft graph already drafted greedily (sample_draft_tokens_tpu).
             return DraftResult(
-                draft_tokens=self._tp_sync.sync(
-                    SpecTpSyncSite.SPEC_DRAFT_GREEDY, graph_draft_tokens
-                ),
+                draft_tokens=self._sync_greedy_drafts(graph_draft_tokens),
                 draft_logits=None,
                 num_verify_drafts=num_verify_drafts,
             )
@@ -167,9 +164,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             )
             return self._tp_sync.sync(SpecTpSyncSite.SPEC_DRAFT_SAMPLE, tokens)
 
-        return self._block_draft_worker.sample_drafts(
-            block_hidden=block_hidden, bonus_tokens=bonus_tokens, sampler=sampler
-        )
+        with self._block_draft_worker.draft_context():
+            return self._block_draft_worker.sample_drafts(
+                block_hidden=block_hidden, bonus_tokens=bonus_tokens, sampler=sampler
+            )
+
+    def _sync_greedy_drafts(self, draft_tokens: torch.Tensor) -> torch.Tensor:
+        return self._tp_sync.sync(SpecTpSyncSite.SPEC_DRAFT_GREEDY, draft_tokens)
 
     def commit(
         self,
@@ -187,13 +188,14 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             "verify hidden must keep the batch bucket rows"
         )
         # Padded rows commit 0 tokens, so the writer skips them.
-        kv_fence_tail = self._block_draft_worker.write_draft_kv(
-            target_hidden=target_hidden,
-            positions=rows.flat_positions,
-            cache_loc=rows.flat_cache_locs,
-            cache_loc_2d=rows.cache_locs,
-            commit_lens=accept.accept_lens,
-        )
+        with self._block_draft_worker.draft_context():
+            kv_fence_tail = self._block_draft_worker.write_draft_kv(
+                target_hidden=target_hidden,
+                positions=rows.flat_positions,
+                cache_loc=rows.flat_cache_locs,
+                cache_loc_2d=rows.cache_locs,
+                commit_lens=accept.accept_lens,
+            )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
         next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,
@@ -202,11 +204,15 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         return CommitResult(state=next_state, kv_fence_tail=kv_fence_tail)
 
-    def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def extend(
+        self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
+    ) -> GenerationBatchResult:
         result = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
-        self._tp_sync.sync(SpecTpSyncSite.SPEC_TARGET, result.next_token_ids)
+        result.next_token_ids = self.sync_target_tokens(result.next_token_ids)
         # Sampling ran at the batch bucket; the scheduler takes live rows.
         result.next_token_ids = result.next_token_ids[: batch.seq_lens.shape[0]]
         logits_output = result.logits_output
@@ -217,23 +223,37 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         # finalize keeps HOST_PADDED hidden at the token bucket; pad the host rows to
         # match and upload once. Padded rows write slot 0, like the target forward.
         padded_rows = target_hidden.shape[0]
-        cache_loc_cpu = batch.out_cache_loc
-        assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
-        positions = pad_rows(
-            prompt_positions(
+        if not batch.reqs:
+            # A DP-attention rank without prompts (DP padding relabels its batch)
+            # still issues the draft KV write; all its rows are padding.
+            compile_policy = self.target_worker.model_runner.compile_policy
+            assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+            positions_cpu = torch.zeros((padded_rows,), dtype=torch.int64)
+            # The writer was warmed with the allocator's dtype; idle batches carry int64.
+            cache_loc_cpu = torch.zeros(
+                (padded_rows,), dtype=compile_policy.live_cache_loc_dtype()
+            )
+        else:
+            positions_cpu = prompt_positions(
                 prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
-            ),
-            padded_rows,
-        ).to(self.device, non_blocking=True)
+            )
+            cache_loc_cpu = batch.out_cache_loc
+            assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+        positions = pad_rows(positions_cpu, padded_rows).to(
+            self.device, non_blocking=True
+        )
         cache_loc = pad_rows(cache_loc_cpu, padded_rows).to(
             self.device, non_blocking=True
         )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
-        kv_fence_tail = self._block_draft_worker.write_draft_kv(
-            target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
-        )
+        with self._block_draft_worker.draft_context():
+            kv_fence_tail = self._block_draft_worker.write_draft_kv(
+                target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
+            )
         logits_output.hidden_states = None
+        if not batch.reqs:
+            return self._idle_extend_result(result)
         next_state = SpecState(
             bonus_tokens=result.next_token_ids,
             seq_lens=batch.seq_lens,
@@ -278,34 +298,35 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     def _forward_draft_block(
         self,
         *,
-        bucket: BucketState,
+        state: SpecState,
+        live_mask: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns the block's [pbs, width, H] draft hidden and the graph's greedy [pbs, gamma] drafts."""
-        state = bucket.state
         padded_bs = state.seq_lens.shape[0]
         width = self._draft_block_width
         inputs = build_draft_block_inputs(
             state.bonus_tokens,
             rows,
             state.seq_lens,
-            bucket.live_mask,
+            live_mask,
             self._mask_token_id,
             width,
         )
         # Writes the block's draft KV into the same slots target verify uses next.
-        logits_output = forward_draft_rows(
-            draft_runner=self._draft_runner,
-            spec_algorithm=self._spec_algorithm,
-            inputs=inputs,
-            req_pool_indices=state.req_pool_indices,
-            verify_input=verify_input,
-            offset=0,
-            width=width,
-            spec_info=self._draft_block_spec_info,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
+        with self._block_draft_worker.draft_context():
+            logits_output = forward_draft_rows(
+                draft_runner=self._draft_runner,
+                spec_algorithm=self._spec_algorithm,
+                inputs=inputs,
+                req_pool_indices=state.req_pool_indices,
+                verify_input=verify_input,
+                offset=0,
+                width=width,
+                spec_info=self._draft_block_spec_info,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
         hidden = logits_output.hidden_states
         draft_tokens = logits_output.next_draft_tokens
         if hidden is None or draft_tokens is None:

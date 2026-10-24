@@ -19,6 +19,7 @@ from torch import nn
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.runtime_context import get_parallel
+from sglang_tpu.kernels.distributed_topk import SUPPORTED_WORLD_SIZES
 from sglang_tpu.spec_op_warmup import (
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
@@ -238,12 +239,19 @@ def _tp_size() -> int:
     )
 
 
+def _uses_pallas_top_k(lm_head: nn.Module, tp_size: int) -> bool:
+    """Whether the draft argmax runs the Pallas distributed TopK on a vocab-sharded head."""
+    return tp_size in SUPPORTED_WORLD_SIZES and supports_distributed_tpu_top_k(
+        lm_head, top_k=1
+    )
+
+
 def register_argmax_draft_top_k(lm_head: nn.Module) -> None:
     """Register the distributed TopK op argmax_draft_tokens_tpu traces under TP."""
     # The target registers it when compiling its logits processor, which a P/D
     # decode engine never does; tracing would otherwise build it in the forward.
     tp_size = _tp_size()
-    if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
+    if _uses_pallas_top_k(lm_head, tp_size):
         from sglang_tpu.distributed_topk_pallas import (
             register_pallas_distributed_top_k_op,
         )
@@ -284,7 +292,7 @@ def argmax_draft_tokens_tpu(
     tp_size = _tp_size()
     # Through the head's own quant method, so a quantized head serves the draft too.
     local_logits = lm_head.quant_method.apply(lm_head, hs)
-    if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
+    if _uses_pallas_top_k(lm_head, tp_size):
         _, global_token_ids = distributed_tpu_top_k(
             local_logits,
             TpuVocabShard.from_lm_head(lm_head),
@@ -300,9 +308,18 @@ def argmax_draft_tokens_tpu(
     if num_org > 0:
         local_logits = local_logits[:, :num_org]
 
-    tokens = torch.argmax(local_logits, dim=-1).to(torch.long)
+    local_max, tokens = local_logits.max(dim=-1)
+    tokens = tokens.to(torch.long)
     if org_vocab_start > 0:
         tokens.add_(org_vocab_start)
+    if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
+        # A vocab-sharded head outside the Pallas TopK sizes (e.g. a DP-attention
+        # draft on TP2/TP4): take each shard's best and keep the global one.
+        group = get_parallel().tp_group
+        shard_max = group.all_gather(local_max.float().unsqueeze(-1), dim=-1)
+        shard_tokens = group.all_gather(tokens.unsqueeze(-1), dim=-1)
+        best_shard = shard_max.argmax(dim=-1, keepdim=True)
+        tokens = shard_tokens.gather(-1, best_shard).squeeze(-1)
     return tokens.view(bs, block_size - 1)
 
 
