@@ -468,6 +468,14 @@ class CommonKVManager(BaseKVManager):
             and not get_parallel().enable_dsa_cache_layer_split
         )
 
+    def supports_dcp_decode(self) -> bool:
+        """Whether this backend moves KV into a decode that splits each
+        request's cache across its DCP group: the decode may take it, and the
+        prefill may re-lay it out. MLA KV is replicated over attention TP, so
+        each DCP rank pulls its share from the same prefill rank; a backend
+        that reshards GQA KV into the decode's DCP layout overrides this."""
+        return self.is_mla_backend or self.is_hybrid_mla_backend
+
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
             if self.dcp_rank != dst_dcp_rank:
@@ -477,11 +485,7 @@ class CommonKVManager(BaseKVManager):
                 )
             return False
 
-        if (
-            self.dcp_size == 1
-            and dst_dcp_size > 1
-            and (self.is_mla_backend or self.is_hybrid_mla_backend)
-        ):
+        if self.dcp_size == 1 and dst_dcp_size > 1 and self.supports_dcp_decode():
             return True
 
         raise RuntimeError(
@@ -1208,9 +1212,10 @@ class CommonKVManager(BaseKVManager):
                 )
 
         if self.dcp_size > 1:
-            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+            if not self.supports_dcp_decode():
                 raise RuntimeError(
-                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
+                    "PD decode DCP requires an MLA or hybrid-MLA KV pool, or a "
+                    "transfer backend that reshards KV into the decode's DCP layout."
                 )
             if info.attn_cp_size != 1:
                 raise RuntimeError(

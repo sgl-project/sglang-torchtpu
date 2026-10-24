@@ -69,6 +69,31 @@ each rank owns 6 ports —
 full-engine control/data, SWA-engine control/data, then GDN-state-engine
 control/data.
 
+The byte granule depends on the pool layout: the fused pool
+(`[num_blocks, page, kv_heads_packed, kv_packing, head_dim]`) moves one
+kv-head's K+V per token, strided over the page; the head-major RPA-seq pool
+(`[num_blocks, 2 * kv_heads, head_dim_lanes, page]`) moves one kv-head's whole
+K+V run of a page at once. `ReshardGeometry.page_entry` builds either.
+
+### Decode context parallelism
+
+A decode launched with `--decode-context-parallel-size N` keeps the prefill's
+attention TP and splits each request's full-attention pages across its DCP
+group by page interleave: logical page `l` of the request is DCP rank
+`l % N`'s local page `l // N`, and every rank of the group stores the group's
+`N` kv heads for the pages it holds (the sliding-window pool stays one head per
+rank over every page). The transfer is the push-resharding above with a
+per-rank page filter: decode rank `u` is fed by the prefill ranks of its
+group's heads, `u // N * N .. u // N * N + N - 1`, through the
+`src_tp -> src_tp // N` fan-in geometry at decode rank `u // N`, and it places
+only its own pages (`reshard_schedule.dcp_page_split`). Its window comes whole
+from prefill rank `u` alone. `RESHARD_REQ` carries `dcp_size`/`dcp_rank` and
+`decode_blocks` as the request's logical pages; `RESHARD_READY` carries the
+answering rank and its closing plan's transfer id, since each prefill rank
+pushes to every rank of the group and settles the room only when all of them
+have been served. DCP rooms are never chunked: the prefill folds every page
+into the closing push.
+
 ## Hybrid sliding-window models
 
 Hybrid-SWA models (e.g. gpt-oss) keep two KV pools with distinct page-id
@@ -109,9 +134,10 @@ Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models (incl. hybrid
 sliding-window at symmetric TP and under push-resharding, and hybrid GDN at
 symmetric TP), decode in
 chunk-cache mode.
-Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
-push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
-as this fork (tpu-sync `build.sh`). Not covered: MLA,
+Symmetric attn TP uses the pull path; `dst_tp < src_tp` and a
+decode-context-parallel decode use the push-resharding path above. Needs
+`tpu_sync` built against the same `torch_tpu` as this fork (tpu-sync
+`build.sh`). Not covered: MLA,
 NSA, Mamba/GDN under push-resharding or pipeline transfer, speculative draft
 KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 

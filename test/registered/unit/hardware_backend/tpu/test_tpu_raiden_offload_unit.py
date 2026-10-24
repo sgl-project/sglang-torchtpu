@@ -2021,9 +2021,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         # the chunk's push, and a duplicate request moves nothing twice.
         mgr = self._prefill()
         room = self.ROOM
-        mgr._prefill.reshard_req[room] = dict(
-            reply_addr=("10.0.0.2", 5555), decode_blocks=list(range(64))
-        )
+        mgr._prefill.reshard_req[room] = {
+            0: dict(reply_addr=("10.0.0.2", 5555), decode_blocks=list(range(64)))
+        }
         mgr._prefill.reshard_chunks[room] = {
             0: (0, list(range(16))),
             1: (16, list(range(16))),
@@ -2039,10 +2039,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
     def test_reshard_chunk_racing_the_closing_message_is_skipped(self):
         mgr = self._prefill()
         room = self.ROOM
-        mgr._prefill.reshard_req[room] = dict(
-            reply_addr=("10.0.0.2", 5555), decode_blocks=list(range(40))
-        )
-        mgr._prefill.reshard_replied.add(room)
+        mgr._prefill.reshard_req[room] = {
+            0: dict(reply_addr=("10.0.0.2", 5555), decode_blocks=list(range(40)))
+        }
+        mgr._prefill.reshard_replied[room] = {0}
         mgr._announce_reshard_chunk(room, 0, list(range(16)), 64)
         self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK), [])
         self.assertNotIn(room, mgr._prefill.reshard_chunk_acked)
@@ -2134,6 +2134,12 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 local_blocks=list(self.DECODE_BLOCKS),
                 source_ranks=[0, 1],
                 src_attn_tp=8,
+                dst_attn_tp=4,
+                decode_rank=0,
+                dcp_size=1,
+                dcp_rank=0,
+                swa_source_ranks=[0, 1],
+                uuid=self.ROOM,
                 aux_index=None,
                 ready_endpoints=["tcp://10.0.0.10:1", "tcp://10.0.0.11:1"],
             )

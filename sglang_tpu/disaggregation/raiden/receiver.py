@@ -282,19 +282,20 @@ class RaidenReceiverMixin:
     def _paired_swa_read(self, key: str) -> Optional[str]:
         """The sliding-window read issued alongside the read ``key``, if any.
 
-        A whole-room read and the closing read of a chunked transfer carry the
-        sliding-window pages on the second engine; earlier chunks do not.
+        A whole-room read, the closing read of a chunked transfer and a
+        decode-context-parallel rank's closing push carry the sliding-window
+        pages on the second engine; earlier chunks do not.
         """
-        if self._swa_engine is None or "#" in key:
+        if self._swa_engine is None or ("#" in key and "#dcp" not in key):
             return None
-        return self._swa_req_id(int(key))
+        return self._swa_req_id(self._room_of(key))
 
     def _paired_state_read(self, key: str) -> Optional[str]:
         """The GDN state read issued alongside the read key, if any; it rides
         on the same reads as the sliding-window one."""
-        if self._state_engine is None or "#" in key:
+        if self._state_engine is None or ("#" in key and "#dcp" not in key):
             return None
-        return self._state_req_id(int(key))
+        return self._state_req_id(self._room_of(key))
 
     def _paired_reads(self, key: str) -> List[str]:
         return [
@@ -452,6 +453,12 @@ class RaidenReceiverMixin:
         Returns True once at least one read is in flight for the room. A False
         return is a retry: the caller polls again on the next scheduler pass.
         """
+        with self._state_lock:
+            waiting = room in self._decode.reshard_waiting
+        if waiting:
+            # A resharded room whose closing plan found no host staging asks
+            # for its seat again on every poll, in line with the pulls.
+            self._register_receiver_and_signal(room)
         if self._pipeline is not None:
             return self._pipeline.maybe_start_pull(room)
         if self.chunked_transfer:
@@ -806,9 +813,33 @@ class RaidenReceiverMixin:
         # bootstrap_infos is ordered by the decode->prefill target_tp_ranks
         # (range(r*ratio, (r+1)*ratio)); ratio == number of prefill sources.
         ratio = len(bootstrap_infos)
-        src_attn_tp = self.attn_tp_size * ratio
-        r = self.kv_args.engine_rank % self.attn_tp_size
-        source_ranks = list(range(r * ratio, (r + 1) * ratio))
+        rank = self.kv_args.engine_rank % self.attn_tp_size
+        if self.dcp_size > 1:
+            # Decode context parallelism keeps the prefill's attention TP and
+            # splits each request's pages across the DCP group: rank u stores
+            # its group's kv heads (as one decode rank of a TP attn_tp //
+            # dcp_size instance would) for the pages dcp_page_split gives it,
+            # fed by the prefill ranks of those heads. Sliding-window layers
+            # stay one head per rank over every page, taken from prefill
+            # rank u alone.
+            if ratio != self.dcp_size or rank % self.dcp_size != self.dcp_rank:
+                raise RuntimeError(
+                    f"Raiden DCP decode rank {rank} (dcp_rank {self.dcp_rank} "
+                    f"of {self.dcp_size}) expected {self.dcp_size} prefill "
+                    f"sources, got {ratio}"
+                )
+            src_attn_tp = self.attn_tp_size
+            dst_attn_tp = self.attn_tp_size // self.dcp_size
+            decode_rank = rank // self.dcp_size
+            swa_source_ranks = [rank]
+            uuid = secrets.randbelow((1 << 63) - 1) + 1
+        else:
+            src_attn_tp = self.attn_tp_size * ratio
+            dst_attn_tp = self.attn_tp_size
+            decode_rank = rank
+            swa_source_ranks = None
+            uuid = room
+        source_ranks = list(range(decode_rank * ratio, (decode_rank + 1) * ratio))
         push_endpoint = self._ensure_engine().transfer_address
         # A hybrid model's sliding-window pool is a second block-id space on a
         # second engine, so it needs its own destination pages and its own push
@@ -826,6 +857,12 @@ class RaidenReceiverMixin:
                 local_swa_blocks=list(local_swa_blocks or []),
                 source_ranks=list(source_ranks),
                 src_attn_tp=int(src_attn_tp),
+                dst_attn_tp=int(dst_attn_tp),
+                decode_rank=int(decode_rank),
+                dcp_size=int(self.dcp_size),
+                dcp_rank=int(self.dcp_rank),
+                swa_source_ranks=swa_source_ranks or list(source_ranks),
+                uuid=uuid,
                 aux_index=aux_index,
                 ready_endpoints=ready_endpoints,
             )
@@ -839,9 +876,11 @@ class RaidenReceiverMixin:
             decode_port=self.rank_port,
             push_endpoint=push_endpoint,
             decode_blocks=list(local_blocks),
-            dst_attn_tp=self.attn_tp_size,
+            dst_attn_tp=dst_attn_tp,
             decode_swa_blocks=list(local_swa_blocks or []),
             swa_push_endpoint=swa_push_endpoint,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         ).to_frames()
         for info in bootstrap_infos:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
@@ -862,6 +901,18 @@ class RaidenReceiverMixin:
                 or room in self._decode.final_seen
                 or room in self._decode.reshard_registered
             ):
+                return
+            if self._decode.reshard_meta[room]["dcp_size"] > 1:
+                # The prefill moves a DCP room in one closing push per rank;
+                # a chunk here means the two sides disagree on the protocol.
+                reason = (
+                    f"Raiden receive failed: room {room} was announced chunk "
+                    f"{index} by prefill rank {src_rank}, but a decode context "
+                    "parallel room moves in its closing push alone"
+                )
+                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                self._failed.add(str(room))
+                self.record_failure(room, reason)
                 return
             per_source = self._decode.reshard_chunk_sources.setdefault(
                 room, {}
@@ -937,6 +988,8 @@ class RaidenReceiverMixin:
             meta = self._decode.reshard_meta[room]
             local_blocks = list(meta["local_blocks"])
             src_attn_tp = meta["src_attn_tp"]
+            dst_attn_tp = meta["dst_attn_tp"]
+            decode_rank = meta["decode_rank"]
             ready_endpoints = list(meta["ready_endpoints"])
         window = chunk_pull_window(start, length, total_pages, len(local_blocks))
         if not window:
@@ -955,8 +1008,8 @@ class RaidenReceiverMixin:
             uuid=uuid,
             req_id=req_id,
             peer=self._ensure_engine().transfer_address,
-            decode_rank=self.attn_tp_rank,
-            geom=self._make_geometry(src_attn_tp, self.attn_tp_size),
+            decode_rank=decode_rank,
+            geom=self._make_geometry(src_attn_tp, dst_attn_tp),
             sources=sources,
             dst_block_ids=dst,
             live_tokens=[self.kv_args.page_size] * window.length,
@@ -986,9 +1039,8 @@ class RaidenReceiverMixin:
             ):
                 return
             self._decode.reshard_sources[room][src_rank] = prefill_blocks
-            self._decode.reshard_swa_sources.setdefault(room, {})[src_rank] = (
-                prefill_swa_blocks
-            )
+            swa_sources = self._decode.reshard_swa_sources.setdefault(room, {})
+            swa_sources[src_rank] = prefill_swa_blocks
             aux_index = self._decode.reshard_meta[room].get("aux_index")
             src_attn_tp = self._decode.reshard_meta[room]["src_attn_tp"]
             have = {nid % src_attn_tp for nid in self._decode.reshard_sources[room]}
@@ -1092,7 +1144,7 @@ class RaidenReceiverMixin:
     def _register_reshard_swa_receiver(
         self,
         room: int,
-        src_attn_tp: int,
+        meta: dict,
         local_swa_blocks: List[int],
         swa_sources_map: Dict[int, List[int]],
     ) -> bool:
@@ -1107,9 +1159,34 @@ class RaidenReceiverMixin:
         over the same window, so the lists must be the same length. They can be
         shorter on the decode after a prefix hit, in which case the tail pairs,
         matching what the non-chunked full path does.
+
+        The window keeps one kv head per rank over every page, so under decode
+        context parallelism it comes whole from the prefill rank of this rank's
+        index (``meta["swa_source_ranks"]``); the other sources' window pages
+        are ignored.
         """
         if self._swa_engine is None:
             return True
+        src_attn_tp = meta["src_attn_tp"]
+        swa_source_ranks = set(meta["swa_source_ranks"])
+        swa_sources_map = {
+            sender_id: pages
+            for sender_id, pages in swa_sources_map.items()
+            if sender_id % src_attn_tp in swa_source_ranks
+        }
+        if {sender_id % src_attn_tp for sender_id in swa_sources_map} != (
+            swa_source_ranks
+        ):
+            reason = (
+                f"Raiden reshard SWA receive: room {room} needs window pages "
+                f"from prefill ranks {sorted(swa_source_ranks)}, got "
+                f"{sorted(swa_sources_map)}"
+            )
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._failed.add(str(room))
+                self.record_failure(room, reason)
+            return False
         if not local_swa_blocks:
             # Let is_recv_done settle -- but this side has a window engine, so a
             # room with no window pages to place means the two sides disagree
@@ -1190,82 +1267,169 @@ class RaidenReceiverMixin:
         return True
 
     def _register_receiver_and_signal(self, room: int) -> None:
-        from tpu_sync.rpc import raiden_service_pb2 as pb2
-
-        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
-            build_receiver_request,
-        )
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import dcp_page_split
 
         with self._state_lock:
             if room in self._decode.reshard_registered:
                 return
-            self._decode.reshard_registered.add(room)
-            meta = self._decode.reshard_meta[room]
+            meta = self._decode.reshard_meta.get(room)
+            if meta is None:
+                return  # cleared before its plan was placed
             local_blocks = list(meta["local_blocks"])
             local_swa_blocks = list(meta.get("local_swa_blocks") or [])
+            dcp_size, dcp_rank = meta["dcp_size"], meta["dcp_rank"]
+            closing_id = self._reshard_closing_id(room, dcp_size, dcp_rank)
+            admission = self._pulling
+            if admission is not None:
+                # The closing plan stages this rank's share of the pages, and
+                # the window, on the host like a pull does, so it takes its
+                # seat through the same admission under the id the engine
+                # settles it by: a room that does not fit waits its turn and
+                # asks again on every poll instead of failing to register.
+                n_full = len(dcp_page_split(local_blocks, dcp_size, dcp_rank)[1])
+                cost = self._staging_cost(n_full, self._full_engine_max_blocks)
+                swa_cost = 0
+                if self._swa_engine is not None and local_swa_blocks:
+                    swa_cost = self._staging_cost(
+                        len(local_swa_blocks), self._swa_engine_max_blocks
+                    )
+                if cost > admission.capacity or (
+                    swa_cost > 0
+                    and (
+                        admission.swa_capacity is None
+                        or swa_cost > admission.swa_capacity
+                    )
+                ):
+                    reason = (
+                        f"Raiden reshard receive failed: room {room} needs "
+                        f"{n_full} pages and {len(local_swa_blocks)} window pages "
+                        "of host staging, more than this rank's pools seat "
+                        f"({admission.capacity} and {admission.swa_capacity}). "
+                        "Raise SGLANG_RAIDEN_MAX_BLOCKS or "
+                        "SGLANG_RAIDEN_SWA_MAX_BLOCKS if this request size is "
+                        "expected."
+                    )
+                    self._fail_room_locked(room, reason)
+                    logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                    return
+                if not admission.admit(closing_id, cost, swa_cost):
+                    self._decode.reshard_waiting.add(room)
+                    return
+                self._decode.reshard_waiting.discard(room)
+            self._decode.reshard_registered.add(room)
             src_attn_tp = meta["src_attn_tp"]
             ready_endpoints = list(meta["ready_endpoints"])
             sources_map = dict(self._decode.reshard_sources[room])
             swa_sources_map = dict(self._decode.reshard_swa_sources.get(room, {}))
+        if not self._place_reshard_plan(
+            room,
+            meta,
+            closing_id,
+            local_blocks,
+            local_swa_blocks,
+            src_attn_tp,
+            ready_endpoints,
+            sources_map,
+            swa_sources_map,
+        ):
+            # No plan of the room holds staging (nothing left to receive, or
+            # the registration failed): hand the seat back now. A registered
+            # plan's completion releases it.
+            with self._state_lock:
+                if admission is not None:
+                    admission.release(closing_id)
+                self._pulling_cleared.discard(closing_id)
+
+    def _place_reshard_plan(
+        self,
+        room: int,
+        meta: dict,
+        closing_id: str,
+        local_blocks: List[int],
+        local_swa_blocks: List[int],
+        src_attn_tp: int,
+        ready_endpoints: List[str],
+        sources_map: Dict[int, List[int]],
+        swa_sources_map: Dict[int, List[int]],
+    ) -> bool:
+        """Registers the room's window and closing receive plans and sends the
+        READY; True when a registered plan now holds host staging."""
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
+
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            build_receiver_request,
+            dcp_page_split,
+        )
 
         # Arm the sliding-window receive before the READY goes out: the READY is
         # what tells every source to push, and its closing push carries the SWA
         # pages, so the second engine's plan has to be registered by then. A
         # failure here fails the room, so no READY is sent either way.
         if not self._register_reshard_swa_receiver(
-            room, src_attn_tp, local_swa_blocks, swa_sources_map
+            room, meta, local_swa_blocks, swa_sources_map
         ):
-            return
+            return False
 
-        geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
+        geom = self._make_geometry(src_attn_tp, meta["dst_attn_tp"])
+        dcp_size, dcp_rank = meta["dcp_size"], meta["dcp_rank"]
+        uuid = meta["uuid"]
         n = len(local_blocks)
         if self.chunked_transfer:
             # Only the pages no registered chunk plan covers are left to
             # move. The covered set is not a prefix -- a chunk can lose its
             # race anywhere in the range -- so the closing plan is its exact
             # complement, and the READY tells the sources to push just that.
+            # A decode-context-parallel rank asks for its own pages of it.
             any_blocks = next(iter(sources_map.values()))
             total = len(any_blocks)
             base = total - n
             with self._state_lock:
                 covered = list(self._decode.reshard_covered.get(room, []))
             missing = [pg for pg in self._uncovered_pages(total, covered) if pg >= base]
+            owned, local_blocks = dcp_page_split(
+                [local_blocks[pg - base] for pg in missing], dcp_size, dcp_rank
+            )
+            missing = [missing[i] for i in owned]
             with self._state_lock:
                 if room not in self._decode.reshard_meta:
-                    return  # cleared while the complement was computed
+                    return False  # cleared while the complement was computed
                 # The closing read is owed from the moment the room can look
                 # complete: it is recorded before _final_seen so completion
                 # can never be inferred while its registration is pending.
                 if missing:
-                    self._decode.chunk_reads.setdefault(room, []).append(str(room))
+                    self._decode.chunk_reads.setdefault(room, []).append(closing_id)
                 self._decode.final_seen.add(room)
             if not missing:
                 for endpoint in ready_endpoints:
-                    payload = ReshardReady(room=room).to_frames()
+                    payload = ReshardReady(
+                        room=room, dcp_rank=dcp_rank, uuid=uuid
+                    ).to_frames()
                     self._send_multipart_locked(endpoint, payload)
-                return
+                return False
             sources = [
                 (p_rank, [sources_map[p_rank][pg] for pg in missing])
                 for p_rank in sorted(sources_map)
             ]
-            local_blocks = [local_blocks[pg - base] for pg in missing]
             n = len(missing)
         else:
             # A decode prefix hit leaves decode holding fewer (tail) pages than
             # the prefill produced; keep the last n of each source's blocks so
             # both sides pair the same pages.
+            owned, local_blocks = dcp_page_split(local_blocks, dcp_size, dcp_rank)
             sources = []
             for p_rank in sorted(sources_map):
                 pb = sources_map[p_rank]
-                sources.append((p_rank, pb[-n:] if len(pb) > n else pb))
+                pb = pb[-n:] if len(pb) > n else pb
+                sources.append((p_rank, [pb[i] for i in owned]))
+            n = len(local_blocks)
         live = [self.kv_args.page_size] * n
 
         req = build_receiver_request(
             pb2,
-            uuid=room,
-            req_id=str(room),
+            uuid=uuid,
+            req_id=closing_id,
             peer=self._ensure_engine().transfer_address,
-            decode_rank=self.attn_tp_rank,
+            decode_rank=meta["decode_rank"],
             geom=geom,
             sources=sources,
             dst_block_ids=local_blocks,
@@ -1288,12 +1452,15 @@ class RaidenReceiverMixin:
                 local_blocks[:4],
             )
         ready_payload = ReshardReady(
-            room=room, pages=missing if self.chunked_transfer else []
+            room=room,
+            pages=missing if self.chunked_transfer else [],
+            dcp_rank=dcp_rank,
+            uuid=uuid,
         ).to_frames()
-        self._publish_reshard_plan(
+        return self._publish_reshard_plan(
             room,
-            str(room),
-            room,
+            closing_id,
+            uuid,
             req,
             ready_payload,
             ready_endpoints,

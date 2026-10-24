@@ -188,11 +188,11 @@ class RaidenSenderMixin:
                 endpoints.extend(self._pipeline.replies.get(room, ()))
         with self._state_lock:
             addr = self._prefill.decode_addr.get(room)
-            req = self._prefill.reshard_req.get(room)
+            peers = list(self._prefill.reshard_req.get(room, {}).values())
         if addr is not None:
             endpoints.append(_tcp_endpoint(ip=addr[0], port=addr[1]))
-        if req is not None:
-            ip, port = req["reply_addr"]
+        for peer in peers:
+            ip, port = peer["reply_addr"]
             endpoints.append(_tcp_endpoint(ip=ip, port=port))
         if not endpoints:
             return
@@ -243,8 +243,14 @@ class RaidenSenderMixin:
             self._mark_aborted_locked(room)
             self._fail_room_locked(room, reason)
             self.update_status(room, KVPoll.Failed)
-            decode_addr = self._prefill.decode_addr.get(room) or (
-                self._prefill.reshard_req.get(room, {}).get("reply_addr")
+            decode_addr = self._prefill.decode_addr.get(room)
+            decode_addrs = (
+                [decode_addr]
+                if decode_addr is not None
+                else [
+                    peer["reply_addr"]
+                    for peer in self._prefill.reshard_req.get(room, {}).values()
+                ]
             )
         logger.error(
             "RaidenKVManager rank%d room %s: %s, failing the room",
@@ -252,7 +258,7 @@ class RaidenSenderMixin:
             room,
             reason,
         )
-        if decode_addr is not None:
+        for decode_addr in decode_addrs:
             self._reply_room_failed(
                 room=room,
                 endpoint=_tcp_endpoint(ip=decode_addr[0], port=decode_addr[1]),
@@ -725,14 +731,33 @@ class RaidenSenderMixin:
         swa_push_endpoint = req.swa_push_endpoint
         with self._state_lock:
             failed_reason = self._tombstone_reason_locked(room)
+            if (
+                failed_reason is None
+                and req.dcp_size > 1
+                and dst_attn_tp * req.dcp_size != self.attn_tp_size
+            ):
+                # A decode-context-parallel decode keeps this attention TP and
+                # takes its group's heads as a dst_attn_tp = attn_tp // dcp
+                # fan-in; anything else is a topology this push cannot place.
+                failed_reason = (
+                    f"Raiden reshard: decode context parallel size {req.dcp_size} "
+                    f"with attention TP {dst_attn_tp * req.dcp_size} cannot take "
+                    f"KV from attention TP {self.attn_tp_size}"
+                )
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(room, failed_reason)
+                self.update_status(room, KVPoll.Failed)
             if failed_reason is None:
-                self._prefill.reshard_req[room] = dict(
+                self._prefill.reshard_req.setdefault(room, {})[req.dcp_rank] = dict(
                     reply_addr=(decode_ip, decode_port),
                     push_endpoint=push_endpoint,
                     decode_blocks=decode_blocks,
                     dst_attn_tp=dst_attn_tp,
                     decode_swa_blocks=decode_swa_blocks,
                     swa_push_endpoint=swa_push_endpoint,
+                    dcp_size=req.dcp_size,
+                    dcp_rank=req.dcp_rank,
+                    closing_uuid=room,
                 )
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
@@ -743,8 +768,11 @@ class RaidenSenderMixin:
                 reason=failed_reason,
             )
             return
-        for start, block_ids in held:
-            self._announce_reshard_chunk(room, start, block_ids, total_pages)
+        # A decode-context-parallel room moves in one closing push per decode
+        # rank (each rank's own pages); its held chunks ride that push.
+        if req.dcp_size == 1:
+            for start, block_ids in held:
+                self._announce_reshard_chunk(room, start, block_ids, total_pages)
         self._maybe_reshard_reply(room)
 
     def _announce_reshard_chunk(
@@ -766,7 +794,12 @@ class RaidenSenderMixin:
                     # pages travel with the closing transfer, whose span the
                     # decode decides from the chunks that did arrive.
                     return
-                req = self._prefill.reshard_req[room]
+                peers = self._prefill.reshard_req[room]
+                if any(meta["dcp_size"] > 1 for meta in peers.values()):
+                    # The closing push moves a DCP room's pages; its peers
+                    # may all have asked before the first chunk is offered.
+                    return
+                (req,) = peers.values()
                 window = chunk_pull_window(
                     start, len(block_ids), total_pages, len(req["decode_blocks"])
                 )
@@ -825,16 +858,22 @@ class RaidenSenderMixin:
 
     def _maybe_reshard_reply(self, room: int) -> None:
         with self._state_lock:
-            # Only reply once, and only after send() finished accumulating this
-            # room's blocks (a RESHARD_REQ may arrive mid-accumulation).
-            if room in self._prefill.reshard_replied:
-                return
+            # Reply to each decode peer once, and only after send() finished
+            # accumulating this room's blocks (a RESHARD_REQ may arrive
+            # mid-accumulation, and a DCP group's peers arrive one by one).
             if (
                 room not in self._prefill.reshard_req
                 or room not in self._prefill.reshard_finalized
             ):
                 return
-            addr = self._prefill.reshard_req[room]["reply_addr"]
+            replied = self._prefill.reshard_replied.get(room, set())
+            addrs = {
+                peer: meta["reply_addr"]
+                for peer, meta in self._prefill.reshard_req[room].items()
+                if peer not in replied
+            }
+            if not addrs:
+                return
             blocks = list(self._prefill.send_blocks.get(room, []))
             # The sliding-window pages are settled by the time this reply is
             # owed (it is sent once the send accumulation is finalized), so the
@@ -846,9 +885,8 @@ class RaidenSenderMixin:
                 if room not in self._prefill.reshard_req:
                     return
                 # Committed under the order lock: no announcement can follow.
-                self._prefill.reshard_replied.add(room)
+                self._prefill.reshard_replied.setdefault(room, set()).update(addrs)
                 self._prefill.reshard_replied_at[room] = time.time()
-            endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             payload = ReshardBlocks(
                 room=room,
                 prefill_blocks=blocks,
@@ -856,42 +894,61 @@ class RaidenSenderMixin:
                 aux_blob=aux_blob,
                 prefill_swa_blocks=swa_blocks,
             ).to_frames()
-            self._send_multipart_locked(endpoint, payload)
+            for addr in addrs.values():
+                endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
+                self._send_multipart_locked(endpoint, payload)
 
     def _on_reshard_ready(self, msg: List[bytes]) -> None:
         req = ReshardReady.from_frames(msg)
         room = req.room
         pages = req.pages
+        peer = req.dcp_rank
         with self._state_lock:
             if room in self._aborted:
                 return
-            self._prefill.reshard_ready.add(room)
-            self._prefill.reshard_ready_pages[room] = pages
-        self._maybe_reshard_push(room)
+            meta = self._prefill.reshard_req.get(room, {}).get(peer)
+            if meta is None:
+                logger.error(
+                    "RaidenKVManager rank%d room %s cleared to push by decode "
+                    "rank %d, which never asked for it",
+                    self.attn_tp_rank,
+                    room,
+                    peer,
+                )
+                return
+            if req.uuid:
+                meta["closing_uuid"] = req.uuid
+            self._prefill.reshard_ready.setdefault(room, set()).add(peer)
+            self._prefill.reshard_ready_pages.setdefault(room, {})[peer] = pages
+        self._maybe_reshard_push(room, peer)
 
-    def _maybe_reshard_push(self, room: int) -> None:
+    def _maybe_reshard_push(self, room: int, peer: int = 0) -> None:
         with self._state_lock:
             if (
                 room in self._aborted
-                or room not in self._prefill.reshard_ready
-                or room not in self._prefill.reshard_req
+                or peer not in self._prefill.reshard_ready.get(room, ())
+                or peer not in self._prefill.reshard_req.get(room, {})
                 or room not in self._prefill.send_blocks
-                or room in self._prefill.reshard_pushed
+                or peer in self._prefill.reshard_pushed.get(room, ())
             ):
                 return
-            self._prefill.reshard_pushed.add(room)
+            self._prefill.reshard_pushed.setdefault(room, set()).add(peer)
             self._reshard_pushes_pending[room] = (
                 self._reshard_pushes_pending.get(room, 0) + 1
             )
-        self._push_executor.submit(self._do_reshard_push, room)
+        self._push_executor.submit(self._do_reshard_push, room, None, None, peer)
 
     def _do_reshard_push(
-        self, room: int, chunk: Optional[int] = None, uuid: Optional[int] = None
+        self,
+        room: int,
+        chunk: Optional[int] = None,
+        uuid: Optional[int] = None,
+        peer: int = 0,
     ) -> None:
         # A push failure marks the room failed so the sender poll surfaces it
         # instead of the request hanging until the decode-side timeout.
         try:
-            self._run_reshard_push(room, chunk, uuid)
+            self._run_reshard_push(room, chunk, uuid, peer)
         except Exception as e:
             logger.error("raiden reshard push failed for room %s: %s", room, e)
             with self._state_lock:
@@ -906,14 +963,18 @@ class RaidenSenderMixin:
                 else:
                     self._reshard_pushes_pending[room] = left
                 if self.chunked_transfer:
-                    # The room is sent once its closing push and every chunk
-                    # push asked for before it have finished.
+                    # The room is sent once every decode peer's closing push
+                    # and every chunk push asked for before it have finished.
                     if chunk is None:
-                        self._prefill.reshard_final_pushed.add(room)
+                        self._prefill.reshard_final_pushed.setdefault(room, set()).add(
+                            peer
+                        )
+                    peers = self._prefill.reshard_req.get(room)
                     if (
                         left <= 0
-                        and room in self._prefill.reshard_final_pushed
-                        and room in self._prefill.reshard_req
+                        and peers
+                        and len(self._prefill.reshard_final_pushed.get(room, ()))
+                        >= peers[peer]["dcp_size"]
                     ):
                         self._completed_send.add(str(room))
 
@@ -982,7 +1043,13 @@ class RaidenSenderMixin:
             build_sender_request,
         )
 
-        geom = self._make_geometry(self.attn_tp_size, req_meta["dst_attn_tp"], swa=True)
+        # The window keeps one kv head per rank over every page: a decode-
+        # context-parallel decode takes it at the prefill's attention TP.
+        geom = self._make_geometry(
+            self.attn_tp_size,
+            req_meta["dst_attn_tp"] * req_meta["dcp_size"],
+            swa=True,
+        )
         req = build_sender_request(
             pb2,
             uuid=room,
@@ -1059,46 +1126,57 @@ class RaidenSenderMixin:
                 self._completed_send.add(swa_req_id)
 
     def _run_reshard_push(
-        self, room: int, chunk: Optional[int] = None, uuid: Optional[int] = None
+        self,
+        room: int,
+        chunk: Optional[int] = None,
+        uuid: Optional[int] = None,
+        peer: int = 0,
     ) -> None:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             build_sender_request,
+            dcp_page_split,
         )
 
         with self._state_lock:
-            if room in self._aborted or room not in self._prefill.reshard_req:
+            if room in self._aborted or peer not in self._prefill.reshard_req.get(
+                room, {}
+            ):
                 return  # the room failed or was cleared before the push ran
-            req_meta = dict(self._prefill.reshard_req[room])
+            req_meta = dict(self._prefill.reshard_req[room][peer])
             if chunk is None:
                 prefill_blocks = list(self._prefill.send_blocks[room])
-                ready_pages = list(self._prefill.reshard_ready_pages.get(room, []))
+                ready_pages = list(
+                    self._prefill.reshard_ready_pages.get(room, {}).get(peer, [])
+                )
                 swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
                 start = 0
             else:
                 start, prefill_blocks = self._prefill.reshard_chunks[room].pop(chunk)
             total_pages = self._prefill.send_total.get(room, len(prefill_blocks))
 
+        dcp_size, dcp_rank = req_meta["dcp_size"], req_meta["dcp_rank"]
         # The window rides on the closing push only, and has to go out even when
         # the closing full-attention push has nothing left to move: chunks can
         # already cover every full page, and the window is never chunked, so
         # returning early below would strand it and is_send_done would never
-        # settle.
-        if chunk is None:
+        # settle. It keeps one head per rank, so of a decode-context-parallel
+        # group only the decode rank of this rank's index receives it.
+        if chunk is None and self.attn_tp_rank % dcp_size == dcp_rank:
             self._run_reshard_swa_push(room, req_meta, swa_blocks)
 
         decode_blocks = req_meta["decode_blocks"]
         dst_attn_tp = req_meta["dst_attn_tp"]
         push_endpoint = req_meta["push_endpoint"]
         n = len(decode_blocks)
-        req_id = str(room)
+        req_id = self._reshard_closing_id(room, dcp_size, dcp_rank)
         if self.chunked_transfer:
             if chunk is None:
                 # The decode declared exactly which pages its closing plan
                 # covers; pushing this side's frontier instead could skip a
                 # chunk that lost its race mid-range on the decode.
-                uuid = room
+                uuid = req_meta["closing_uuid"]
                 if not ready_pages:
                     return
                 base = total_pages - n
@@ -1118,9 +1196,14 @@ class RaidenSenderMixin:
                 ]
                 n = window.length
         else:
-            uuid = room
+            uuid = req_meta["closing_uuid"]
             if len(prefill_blocks) > n:
                 prefill_blocks = prefill_blocks[-n:]
+        # A decode-context-parallel rank holds its own pages of the request
+        # under local ids; the others are not pushed to it.
+        owned, decode_blocks = dcp_page_split(decode_blocks, dcp_size, dcp_rank)
+        prefill_blocks = [prefill_blocks[i] for i in owned]
+        n = len(decode_blocks)
         geom = self._make_geometry(self.attn_tp_size, dst_attn_tp)
         live = [self.kv_args.page_size] * n
 

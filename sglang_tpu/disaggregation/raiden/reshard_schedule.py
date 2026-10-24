@@ -20,8 +20,19 @@ The fused KV pool stores one ``[num_blocks, page_size, kv_heads_packed,
 kv_packing, padded_head_dim]`` tensor per layer. Native host copies retain
 32-bit packing: BF16 packs one head's K/V into each word, while FP8 packs two
 heads. Only complete head packs are contiguous, so a head slice must cover
-whole packs. These builders turn that geometry into
-``raiden_service_pb2.StartTransferRequest`` push schedules.
+whole packs. The head-major RPA-seq pool stores ``[num_blocks, 2 * kv_heads,
+head_dim_lanes, page_size]`` instead: a head's K and V rows are adjacent and
+the token index sits on the lane axis, so one kv-head is a contiguous run of
+a page and a slice is copied per page rather than per token. These builders
+turn either geometry into ``raiden_service_pb2.StartTransferRequest`` push
+schedules.
+
+A decode-context-parallel (DCP) decode keeps prefill attention TP but splits
+each request's full-attention pages across its DCP group by page interleave:
+logical page ``l`` is DCP rank ``l % dcp_size``'s local page ``l // dcp_size``
+(``PageInterleavePlacement`` in page units). ``dcp_page_split`` is that filter
+over a request's logical page list; each DCP rank then receives its pages as
+a ``src_tp -> src_tp // dcp_size`` fan-in of its group's kv heads.
 """
 
 from __future__ import annotations
@@ -87,6 +98,39 @@ def per_rank_head_count(fused_layer_tensor: FusedKVLayerTensor) -> int:
     return int(fused_layer_tensor.shape[2])
 
 
+def is_head_major(layer_tensor: FusedKVLayerTensor) -> bool:
+    """Whether a KV layer tensor has the rank-4 head-major RPA-seq layout."""
+    return len(layer_tensor.shape) == 4
+
+
+def head_major_run_bytes(layer_tensor: FusedKVLayerTensor) -> int:
+    """Bytes of one kv-head's whole-page K+V run in a head-major layer tensor
+    ``[num_blocks, 2 * kv_heads, head_dim_lanes, page_size]``."""
+    shape = layer_tensor.shape
+    return 2 * int(shape[2]) * int(shape[3]) * layer_tensor.element_size()
+
+
+def dcp_page_split(
+    pages: Sequence[int], dcp_size: int, dcp_rank: int
+) -> Tuple[List[int], List[int]]:
+    """Positions of ``pages`` that DCP rank ``dcp_rank`` holds, with their
+    local page ids.
+
+    ``pages`` is a request's logical page list in token order, so the
+    positions also index the prefill's page list of the same request. With
+    ``dcp_size == 1`` every page is local under its own id.
+    """
+    if dcp_size == 1:
+        return list(range(len(pages))), [int(page) for page in pages]
+    positions: List[int] = []
+    local: List[int] = []
+    for position, page in enumerate(pages):
+        if int(page) % dcp_size == dcp_rank:
+            positions.append(position)
+            local.append(int(page) // dcp_size)
+    return positions, local
+
+
 def head_slice_params(
     src_tp: int,
     dst_tp: int,
@@ -141,7 +185,13 @@ def head_slice_params(
 
 
 class ReshardGeometry:
-    """Byte geometry for one (src_tp -> dst_tp) reshard over ``total_kv_heads``."""
+    """Byte geometry for one (src_tp -> dst_tp) reshard over ``total_kv_heads``.
+
+    ``hp_bytes`` is the per-head granule: one kv-head's K+V per token in the
+    fused layout, or its whole-page run when ``page_tokens`` names a head-major
+    page (then an entry copies head runs of a page rather than token granules,
+    and ``kv_packing`` only has to satisfy the 32-bit dtype rule).
+    """
 
     def __init__(
         self,
@@ -151,6 +201,8 @@ class ReshardGeometry:
         total_kv_heads: int,
         kv_packing: int = 2,
         element_size: int = 2,
+        *,
+        page_tokens: Optional[int] = None,
     ):
         self.src_tp = src_tp
         self.dst_tp = dst_tp
@@ -161,12 +213,43 @@ class ReshardGeometry:
             raise ValueError("Raiden fused KV requires native 32-bit dtype packing")
         if hp_bytes <= 0 or hp_bytes % (2 * element_size):
             raise ValueError("Raiden head-pair bytes must contain whole K/V elements")
+        if page_tokens is not None and (
+            page_tokens <= 0 or hp_bytes % (2 * page_tokens * element_size)
+        ):
+            raise ValueError("Raiden head-major runs must hold whole K/V rows")
         self.kv_packing = kv_packing
         self.element_size = element_size
+        self.page_tokens = page_tokens
+
+    def page_entry(self, prefill_rank: int, decode_rank: int, live_tokens: int):
+        """Byte (src_offset, size, src_stride, dst_offset, dst_stride, count)
+        of one page's prefill_rank -> decode_rank contribution carrying
+        ``live_tokens`` tokens."""
+        if self.page_tokens is None:
+            return (*self.entry_bytes(prefill_rank, decode_rank), int(live_tokens))
+        sh_start, num_heads, dh_start, _, _ = head_slice_params(
+            self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
+        )
+        run = self.hp_bytes
+        if live_tokens == self.page_tokens:
+            return (sh_start * run, num_heads * run, 0, dh_start * run, 0, 1)
+        # A partial page: the live tokens are the leading lanes of every K/V
+        # row of the slice, one strided copy per row on both sides.
+        row = self.page_tokens * self.element_size
+        return (
+            sh_start * run,
+            int(live_tokens) * self.element_size,
+            row,
+            dh_start * run,
+            row,
+            num_heads * run // row,
+        )
 
     def entry_bytes(self, prefill_rank: int, decode_rank: int):
         """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
         prefill_rank -> decode_rank contribution, per token."""
+        if self.page_tokens is not None:
+            raise ValueError("head-major pages have no per-token granule")
         sh_start, num_heads, dh_start, src_hpr, dst_hpr = head_slice_params(
             self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
         )
@@ -235,9 +318,6 @@ def build_sender_request(
         raise ValueError(
             "src_block_ids, dst_block_ids, live_tokens must be equal length"
         )
-    src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-        prefill_rank % geom.src_tp, decode_rank
-    )
     req = pb2.StartTransferRequest()
     req.uuid = uuid
     req.req_id = req_id
@@ -248,6 +328,9 @@ def build_sender_request(
     for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
         if n <= 0:
             continue
+        src_off, size, src_stride, dst_off, dst_stride, count = geom.page_entry(
+            prefill_rank % geom.src_tp, decode_rank, int(n)
+        )
         _add_entry(
             schedule,
             peer=peer,
@@ -259,7 +342,7 @@ def build_sender_request(
             size=size,
             src_stride=src_stride,
             dst_stride=dst_stride,
-            count=int(n),
+            count=count,
         )
     return req
 
@@ -295,13 +378,13 @@ def build_receiver_request(
     req.use_block_chunks = True
     total = 0
     for sender_id, src_block_ids in sources:
-        src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-            sender_id % geom.src_tp, decode_rank
-        )
         schedule = req.shard_push_schedules[sender_id]
         for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
             if n <= 0:
                 continue
+            src_off, size, src_stride, dst_off, dst_stride, count = geom.page_entry(
+                sender_id % geom.src_tp, decode_rank, int(n)
+            )
             _add_entry(
                 schedule,
                 peer=peer,
@@ -313,7 +396,7 @@ def build_receiver_request(
                 size=size,
                 src_stride=src_stride,
                 dst_stride=dst_stride,
-                count=int(n),
+                count=count,
             )
             total += 1
     req.expected_block_count = (

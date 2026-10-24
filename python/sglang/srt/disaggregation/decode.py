@@ -115,6 +115,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_PROCESS_QUEUE,
     scheduler_stage_method,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -1663,7 +1664,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.req.kv.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
-            kv_transfer_page_size = page_size
+            kv_transfer_page_size, swa_transfer_page_size = self._transfer_page_sizes()
             raw_kv_indices = self.req_to_token_pool.req_to_token[
                 decode_req.req.kv.req_pool_idx
             ][total_prefix_len:origin_input_len]
@@ -1700,7 +1701,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
                 window_start = max(total_prefix_len, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
+                window_start = page_align_floor(window_start, swa_transfer_page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]
@@ -1709,7 +1710,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return kv_to_page_indices(window_kv_indices_swa, swa_transfer_page_size)
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -2179,6 +2180,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> np.ndarray:
         # int32 for ZMQ serialization -- from_zmq reads np.int32.
         return kv_to_page_indices(kv_indices, page_size).astype(np.int32)
+
+    def _transfer_page_sizes(self) -> Tuple[int, int]:
+        """Page sizes of the full-attention and sliding-window transfer lists.
+
+        Both lists are paged at the allocator's page, which is the device
+        pools' page, except under decode context parallelism on a platform
+        that widens every allocator by attn_dcp_size: there one allocator page
+        spans attn_dcp_size pool pages, each prefill page lands whole on one
+        DCP rank, and the transfer names the pools' own pages.
+        """
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if (
+            get_parallel().attn_dcp_size == 1
+            or not current_platform.dcp_shards_every_kv_pool()
+        ):
+            return page_size, page_size
+        pool = self.token_to_kv_pool
+        if StateType.SWA in self.kv_manager.kv_args.state_types:
+            return pool.page_size, pool.swa_kv_pool.page_size
+        return pool.page_size, pool.page_size
 
     def _pre_alloc(
         self,
