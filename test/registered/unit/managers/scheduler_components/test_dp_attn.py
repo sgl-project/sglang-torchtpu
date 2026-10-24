@@ -10,6 +10,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.layers.logits_processor import (  # noqa: E402
+    LogitsMetadata,
+    LogitsProcessor,
+)
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
@@ -211,6 +215,139 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         for info in infos:
             info.all_gather(device="cpu", group=None)
             self.assertFalse(info.can_run_prefill_cuda_graph)
+
+
+class TestInputLogprobRowsSync(CustomTestCase):
+    """A backend that serves input (prompt) logprobs outside its compiled
+    forward needs every DP rank to run that gather's collectives at one
+    shape; the MLP sync carries the largest gather of the step."""
+
+    @staticmethod
+    def _info(num_input_logprob_rows, num_dp_ranks=2):
+        return dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=num_dp_ranks,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=64,
+            num_tokens_for_logprob=max(num_input_logprob_rows, 1),
+            can_run_decode_cuda_graph=False,
+            can_run_draft_cuda_graph=False,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=True,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.EXTEND.value,
+            num_input_logprob_rows=num_input_logprob_rows,
+        )
+
+    @patch.object(dp_attn, "get_parallel")
+    @patch.object(dp_attn, "all_gather_single")
+    def test_every_rank_sees_the_largest_gather(self, gather, parallel):
+        infos = [self._info(0), self._info(37)]
+        values = torch.cat([i._get_local_tensor(device="cpu") for i in infos])
+        gather.side_effect = lambda output, *a, **kw: output.copy_(values)
+        parallel.return_value.tp_group.active_ranks_cpu = torch.ones(2)
+        for info in infos:
+            info.all_gather(device="cpu", group=None)
+            self.assertEqual(info.max_input_logprob_rows, 37)
+
+    def test_an_inactive_rank_gathers_nothing(self):
+        self.assertEqual(self._info(37)._get_fallback_tensor(device="cpu")[-1], 0)
+
+    def test_a_single_dp_rank_keeps_its_own_count(self):
+        info = self._info(12, num_dp_ranks=1)
+        info.finalize_local()
+        self.assertEqual(info.max_input_logprob_rows, 12)
+
+    def test_the_count_reaches_the_batch(self):
+        info = self._info(12, num_dp_ranks=1)
+        info.finalize_local()
+        batch = SimpleNamespace()
+        dp_attn._update_gather_batch(batch, info, require_mlp_tp_gather=True)
+        self.assertEqual(batch.max_input_logprob_rows, 12)
+
+    def test_wants_input_logprobs(self):
+        def batch(mode=ForwardMode.EXTEND, return_logprob=True, starts=(0, 6)):
+            return SimpleNamespace(
+                forward_mode=mode,
+                return_logprob=return_logprob,
+                extend_logprob_start_lens=list(starts),
+                extend_lens=[6, 6],
+            )
+
+        self.assertTrue(dp_attn._wants_input_logprobs(batch()))
+        # A start at the extend length scores no prompt position: the request
+        # asked for output logprobs only.
+        self.assertFalse(dp_attn._wants_input_logprobs(batch(starts=(6, 6))))
+        self.assertFalse(dp_attn._wants_input_logprobs(batch(return_logprob=False)))
+        self.assertFalse(dp_attn._wants_input_logprobs(batch(mode=ForwardMode.DECODE)))
+        self.assertFalse(dp_attn._wants_input_logprobs(None))
+
+    def test_count_is_the_logits_processors_pruned_rows(self):
+        # A backend pads its gather to the DP-wide count and refuses more rows,
+        # so the count is what the LogitsProcessor scores: each request from
+        # its logprob start on, or only its sampled row once the start reaches
+        # the extend length.
+        extend_lens, starts = [6, 5, 4, 3], [0, 5, 3, 1]
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_num_tokens=sum(extend_lens),
+            extend_lens=extend_lens,
+            extend_logprob_start_lens=starts,
+            return_logprob=True,
+            batch_size=lambda: len(extend_lens),
+            spec_info=None,
+            multimodal_inputs=None,
+        )
+        tbo_preparer = Mock()
+        tbo_preparer.prepare_all_gather.return_value = (
+            False,
+            ForwardMode.EXTEND.value,
+        )
+        tbo_preparer.compute_output.return_value = (0, ForwardMode.EXTEND)
+        with (
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    num_dp_ranks=1,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=object(), device="cpu", cpu_group=object()
+                    ),
+                ),
+            ),
+        ):
+            # One DP rank: the DP-wide count the batch carries is its own.
+            synced = dp_attn.prepare_mlp_sync_batch_raw(
+                batch,
+                model_runner=SimpleNamespace(
+                    prefill_cuda_graph_runner=None,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    model_config=object(),
+                ),
+                get_idle_batch=Mock(side_effect=AssertionError("no idle batch")),
+                disable_cuda_graph=False,
+                require_mlp_tp_gather=False,
+                disable_overlap_schedule=True,
+                offload_tags=set(),
+            )
+        pruned_states, *_ = LogitsProcessor._get_pruned_states(
+            None,
+            torch.zeros(sum(extend_lens), 1),
+            None,
+            None,
+            LogitsMetadata(
+                forward_mode=ForwardMode.EXTEND,
+                extend_return_logprob=True,
+                extend_seq_lens_cpu=extend_lens,
+                extend_logprob_start_lens_cpu=starts,
+            ),
+        )
+        self.assertEqual(synced.max_input_logprob_rows, pruned_states.shape[0])
 
 
 if __name__ == "__main__":

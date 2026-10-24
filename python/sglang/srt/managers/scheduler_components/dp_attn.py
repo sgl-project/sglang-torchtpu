@@ -123,11 +123,14 @@ class MLPSyncBatchInfo:
     # TPU: an extend batch carrying multimodal inputs (upstream tests build
     # this record without it).
     is_tpu_mm_extend_in_batch: bool = False
+    # Rows of this rank's input (prompt) logprob gather, 0 when it wants none.
+    num_input_logprob_rows: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    max_input_logprob_rows: int = 0
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -145,6 +148,7 @@ class MLPSyncBatchInfo:
                 self.prefill_cuda_graph_max_prefix_len,
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_tpu_mm_extend_in_batch),
+                self.num_input_logprob_rows,
             ],
             device=device,
             dtype=dtype,
@@ -163,6 +167,7 @@ class MLPSyncBatchInfo:
                 0,  # prefill_cuda_graph_max_prefix_len
                 1,  # can_run_draft_cuda_graph
                 0,  # is_tpu_mm_extend_in_batch
+                0,  # num_input_logprob_rows
             ],
             device=device,
             dtype=dtype,
@@ -173,6 +178,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.max_input_logprob_rows = self.num_input_logprob_rows
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -247,6 +253,7 @@ class MLPSyncBatchInfo:
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.is_tpu_mm_extend_in_batch = bool(tp0_info_cpu[:, 9].max())
+        self.max_input_logprob_rows = int(tp0_info_cpu[:, 10].max())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -294,6 +301,9 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.is_tpu_mm_extend_in_batch = getattr(
             mlp_sync_info, "is_tpu_mm_extend_in_batch", False
+        )
+        batch.max_input_logprob_rows = getattr(
+            mlp_sync_info, "max_input_logprob_rows", 0
         )
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
@@ -437,6 +447,27 @@ def _batch_has_mm_inputs(batch: ScheduleBatch) -> bool:
     )
 
 
+def _wants_input_logprobs(local_batch: Optional[ScheduleBatch]) -> bool:
+    """Whether this extend batch gathers input (prompt) logprobs.
+
+    Gathered as a row count so that, on a backend that serves that gather
+    outside its compiled forward, every DP rank can run the gather's
+    collectives with one shape (see ``max_input_logprob_rows``).
+    """
+    if (
+        local_batch is None
+        or not local_batch.forward_mode.is_extend()
+        or not local_batch.return_logprob
+    ):
+        return False
+    return any(
+        extend_len - start_len > 0
+        for start_len, extend_len in zip(
+            local_batch.extend_logprob_start_lens, local_batch.extend_lens
+        )
+    )
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -460,9 +491,11 @@ def prepare_mlp_sync_batch_raw(
     ):
         num_tokens = 0
         num_tokens_for_logprob = 0
+        num_input_logprob_rows = 0
     elif local_batch.forward_mode.is_decode():
         num_tokens = local_batch.batch_size()
         num_tokens_for_logprob = num_tokens
+        num_input_logprob_rows = 0
     else:
         num_tokens = local_batch.extend_num_tokens
         num_tokens_for_logprob = sum(
@@ -476,6 +509,9 @@ def prepare_mlp_sync_batch_raw(
         assert (
             local_batch.return_logprob
             or num_tokens_for_logprob == local_batch.batch_size()
+        )
+        num_input_logprob_rows = (
+            num_tokens_for_logprob if _wants_input_logprobs(local_batch) else 0
         )
 
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
@@ -552,6 +588,7 @@ def prepare_mlp_sync_batch_raw(
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
         is_tpu_mm_extend_in_batch=is_tpu_mm_extend_in_batch,
+        num_input_logprob_rows=num_input_logprob_rows,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
