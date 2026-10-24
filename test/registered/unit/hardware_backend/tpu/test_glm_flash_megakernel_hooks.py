@@ -31,6 +31,22 @@ class TestGlmFlashMegakernelHooks(CustomTestCase):
             hook.drop_freed_glm_flash_megakernel_request(object(), [5])
         self.assertEqual(mk.req, 3)
 
+    def test_radix_cache_is_refused(self):
+        """Steps the kernel serves would leave the radix tree's KDA snapshots stale."""
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+        from sglang_tpu.glm_flash_megakernel import ops
+
+        runner = mock.MagicMock()
+        runner.model = object.__new__(Glm5NextForConditionalGeneration)
+        runner.model_runner.server_args.disable_radix_cache = False
+        with (
+            mock.patch.object(ops, "enabled", return_value=True),
+            mock.patch.object(ops, "GlmFlashMegakernel") as kernel,
+            self.assertRaisesRegex(ValueError, "--disable-radix-cache"),
+        ):
+            hook.route_glm_flash_megakernel(None, runner)
+        kernel.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
