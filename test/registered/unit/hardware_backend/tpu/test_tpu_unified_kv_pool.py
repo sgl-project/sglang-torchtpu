@@ -491,7 +491,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ("is_hybrid_swa", False, ValueError),
                 ("use_mla_backend", True, ValueError),
                 ("is_hybrid_gdn", True, ValueError),
-                ("pp_size", 2, ValueError),
                 ("pool_page_size", 1, ValueError),
             ):
                 kvc = copy.copy(base)
@@ -528,7 +527,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
 
         for kwargs in (
             dict(attention_backend="pallas_tpu_flash"),
-            dict(pp_size=2),
             dict(enable_hierarchical_cache=True, hicache_io_backend="kernel"),
             dict(page_size=1),
         ):
@@ -1146,6 +1144,39 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertEqual(int(full_spans.lens.sum().item()), 4)
         for sp in swa_spans:
             self.assertEqual(int(sp.lens.sum().item()), 4)
+
+    def test_pipeline_parallel_stage_local_unified_pool_sizing(self):
+        from sglang_tpu.unified_kv_pool import (
+            TpuUnifiedSWAPoolConfigurator,
+            slice_pp_stage_hybrid_layers,
+        )
+
+        # 8-layer hybrid model: Full=[3, 7], SWA=[0, 1, 2, 4, 5, 6]
+        # Across PP=2 stages ([0, 4) and [4, 8)), each stage owns 1 Full layer and 3 SWA layers (M_swa_stage = 3)
+        stage0_full, stage0_swa, stage0_m = slice_pp_stage_hybrid_layers(
+            [3, 7], [0, 1, 2, 4, 5, 6], pp_start_layer=0, pp_end_layer=4
+        )
+        self.assertEqual(stage0_full, [3])
+        self.assertEqual(stage0_swa, [0, 1, 2])
+        self.assertEqual(stage0_m, 3)
+
+        kvc_global = self._make_mock_kvc(
+            full_ids=[3, 7],
+            swa_ids=[0, 1, 2, 4, 5, 6],
+        )
+        kvc_pp = copy.copy(kvc_global)
+        kvc_pp.pp_size = 2
+        with self._cfg_patches():
+            global_conf = TpuUnifiedSWAPoolConfigurator(kvc_global)
+            stage_conf = TpuUnifiedSWAPoolConfigurator.for_pp_stage(
+                kvc_pp, pp_start_layer=0, pp_end_layer=4
+            )
+        # With half the Full layers per PP stage (G_stage=1 vs G_global=2), the same HBM byte budget yields 2x the physical pages!
+        avail_bytes = 64 * 1024 * 1024
+        global_pages = global_conf.calculate_total_physical_pages(avail_bytes, 128)
+        stage_pages = stage_conf.calculate_total_physical_pages(avail_bytes, 128)
+        self.assertGreater(stage_pages, global_pages)
+        self.assertEqual(stage_conf._num_swa_groups, 3)
 
 
 if __name__ == "__main__":
