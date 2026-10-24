@@ -618,6 +618,113 @@ def _resolve_num_hidden_layers(server_args) -> int:
         return 0
 
 
+# Architectures whose vision encoder runs under Qwen3VLVisionTpuCompilePolicy.
+_QWEN3_VL_ARCHITECTURES = frozenset(
+    {"Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration"}
+)
+
+
+def _processor_min_pixels(cfg) -> int | None:
+    """The image processor's own minimum image size, from preprocessor_config.json."""
+    try:
+        from transformers.utils import cached_file
+
+        path = cached_file(
+            cfg.model_path,
+            "preprocessor_config.json",
+            revision=cfg.revision,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if path is None:
+            return None
+        with open(path) as f:
+            processor_config = json.load(f)
+    except (OSError, ValueError):
+        # Unreadable or malformed: no known minimum, so no cap.
+        return None
+    return processor_config.get("size", {}).get(
+        "shortest_edge"
+    ) or processor_config.get("min_pixels")
+
+
+def _vit_bucket_image_size(cfg) -> dict | None:
+    """The image processor ``size`` that keeps every image inside the
+    precompiled ViT, as ``{"longest_edge": max pixels, "shortest_edge": min}``.
+
+    None when the cap does not apply: turned off, no compiled ViT, not a Qwen3-VL
+    model, precompile disabled, or the user already chose an image size.
+    """
+    if not cfg.enable_torch_compile:
+        return None
+    if not envs.SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP.get():
+        return None
+    try:
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        hf_config = get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
+        )
+    except Exception:
+        # An unloadable model fails later with its real error.
+        return None
+    if not set(hf_config.architectures or []) & _QWEN3_VL_ARCHITECTURES:
+        return None
+    image_config = (cfg.mm_process_config or {}).get("image", {})
+    if "max_pixels" in image_config or "size" in image_config:
+        return None
+    if envs.SGLANG_IMAGE_MAX_PIXELS.is_set():
+        return None
+    from sglang_tpu.graph_runner.vit_patch_buckets import env_patch_buckets
+
+    vision_config = hf_config.vision_config
+    buckets = env_patch_buckets(vision_config.spatial_merge_size)
+    if not buckets:
+        return None
+    min_pixels = image_config.get("min_pixels") or _processor_min_pixels(cfg)
+    if not min_pixels:
+        return None
+    # The image processor shrinks an image until height * width <= longest_edge,
+    # and each patch_size x patch_size square is one patch.
+    return {
+        "longest_edge": max(buckets) * vision_config.patch_size**2,
+        "shortest_edge": min_pixels,
+    }
+
+
+def _apply_vit_max_pixels_default(server_args, cfg) -> None:
+    """Shrink images to the top precompiled ViT bucket instead of running them
+    uncompiled.
+
+    The default SGLANG_IMAGE_MAX_PIXELS admits ~50k patches against a 4,900
+    patch ladder, so a 1920x1080 image (8,160 patches) would otherwise take the
+    slower uncompiled fallback in VisionTpuCompilePolicy.run.
+
+    This sets the processor's ``size`` rather than ``max_pixels``: the pinned
+    transformers (5.8) ignores ``max_pixels`` passed at call time.
+    """
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    size = _vit_bucket_image_size(cfg)
+    if size is None:
+        return
+    mm_process_config = dict(cfg.mm_process_config or {})
+    mm_process_config["image"] = {**mm_process_config.get("image", {}), "size": size}
+    declare_resolution(
+        server_args,
+        "tpu.apply_server_args_defaults",
+        mm_process_config=mm_process_config,
+    )
+    logger.info(
+        "Capping images at %d pixels, the largest precompiled ViT bucket. Set an "
+        "image size in --mm-process-config to change it, "
+        "SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP=0 to turn it off, or "
+        "SGLANG_LOG_IMAGE_DOWNSCALE=1 to log each image it shrinks.",
+        size["longest_edge"],
+    )
+
+
 # The attention backend TPU decode context parallelism runs on.
 _DCP_ATTENTION_BACKEND = "pallas_tpu_rpa_batched"
 
@@ -998,6 +1105,7 @@ class TpuSRTPlatform(SRTPlatform):
         # After the page-size default: the DCP chunk check reads the page size.
         _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
+        _apply_vit_max_pixels_default(server_args, cfg)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
