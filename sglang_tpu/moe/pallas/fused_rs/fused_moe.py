@@ -36,6 +36,7 @@ from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
 )
 from sglang_tpu.moe.pallas.fused_rs.post_combine import (
     fused_post_combine,
+    pair_post_combine,
     supports_fused_post_combine,
 )
 from sglang_tpu.moe.pallas.fused_rs.utils import (
@@ -137,6 +138,45 @@ def _compute_expert_tp_routing(
     topk_slot_indices = virtual_order % kernel_topk
     group_sizes = jnp.tile(group_sizes_real, ep_size)
     return lhs_indices, group_sizes, lhs_indices, topk_slot_indices
+
+
+def _pair_post_combine(
+    recv: jax.Array,  # [blocks * chunk * topk, ...] receive blocks, rows in owned-row rank order
+    topk_indices: jax.Array,  # [num_tokens, topk], replicated
+    topk_weights: jax.Array,  # [chunk, topk], this rank's tokens
+    post_expert_norm_weight: jax.Array | None,
+    *,
+    my_id: jax.Array,
+    chunk_size: int,
+    topk: int,
+    hidden_size: int,
+) -> jax.Array:
+    """[chunk, hidden]: sum the source blocks, post-expert norm, top-k weighted sum.
+
+    Rank r is the r-th row owned by this rank in the kernel's row order (expert-sorted,
+    then token-sorted); the weighted sum maps ranks back to tokens with a 0/1 matmul.
+    """
+    rows = chunk_size * topk
+    flat_sorted = jnp.argsort(topk_indices.reshape(-1))
+    owned = (flat_sorted // topk) // chunk_size == my_id
+    flat = flat_sorted[jnp.nonzero(owned, size=rows)[0]]
+    token = flat // topk - my_id * chunk_size
+    weight = topk_weights.astype(jnp.float32)[token, flat % topk]
+    out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
+    if post_expert_norm_weight is not None and recv.ndim == 3:
+        weighted = pair_post_combine(
+            recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
+        ).reshape(rows, hidden_size)
+    else:
+        y = jnp.sum(recv.reshape(-1, rows, hidden_size).astype(jnp.float32), axis=0)
+        y = y.astype(recv.dtype).astype(jnp.float32)
+        if post_expert_norm_weight is not None:
+            norm_size = post_expert_norm_weight.shape[0]
+            y = y * (post_expert_norm_weight.astype(jnp.float32) + 1.0)[None, :]
+            y = y * jax.lax.rsqrt(jnp.sum(y * y, axis=-1, keepdims=True) / norm_size + 1e-8)
+        weighted = (y.astype(recv.dtype).astype(jnp.float32) * weight[:, None]).astype(recv.dtype)
+    scatter = (token[None, :] == jnp.arange(chunk_size, dtype=jnp.int32)[:, None]).astype(weighted.dtype)
+    return jnp.dot(scatter, weighted, preferred_element_type=jnp.float32).astype(out_dtype)
 
 
 # ============================================================================
@@ -299,6 +339,16 @@ def moe_gmm_local_rs_nodedup(
         dtype=jnp.int32,
     )
 
+    # Below 4096 tokens per call the extra sibling stage costs more than it saves (bench).
+    pair_exchange = (
+        expert_tp
+        and num_tokens >= 4096
+        and local_rows
+        and ep_size % 2 == 0
+        and ep_size >= 4
+        and not fp8_direct_write
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get()
+    )
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -330,6 +380,7 @@ def moe_gmm_local_rs_nodedup(
         skip_out_zero=expert_tp
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
         staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
+        pair_exchange=pair_exchange,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -344,6 +395,17 @@ def moe_gmm_local_rs_nodedup(
         )
     )
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
+    if pair_exchange:
+        return _pair_post_combine(
+            out_buf,
+            topk_indices,
+            local_topk_weights,
+            post_expert_norm_weight,
+            my_id=my_id,
+            chunk_size=chunk_size,
+            topk=topk,
+            hidden_size=hidden_size,
+        )
     if (
         expert_tp
         and post_expert_norm_weight is not None
