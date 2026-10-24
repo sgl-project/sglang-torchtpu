@@ -30,7 +30,7 @@ the 2x2x2 slices). A P/D group whose roles each fill a slice gets a job per slic
 (full 4+2 utilization); groups that land on the same slice run **serially inside that one job**,
 so two JobSets never race for a slice (no half-placement, no drops). A slice-keyed
 `concurrency` group guards the cross-run case. When Kueue is installed on the cluster this all
-collapses to a queue-label + gang admission (see the repo's in-project `kueue-tpu.yaml`).
+collapses to a queue-label + gang admission (see the repo's in-project `reconcile_quota.py`).
 
 It is separate from the in-project CI because the external cluster differs structurally:
 
