@@ -30,6 +30,46 @@ class TestTpuPlatformPlugin(unittest.TestCase):
             self.assertIsNone(tpu_platform_plugin())
 
 
+class TestSplashBackendSelection(unittest.TestCase):
+    def setUp(self):
+        from sglang.multimodal_gen.runtime.layers.attention import selector
+
+        selector._cached_get_attn_backend.cache_clear()
+        self.addCleanup(selector._cached_get_attn_backend.cache_clear)
+
+    def test_explicit_selection_overrides_the_layer_preference_set(self):
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_attn_backend,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform", TpuPlatform()
+        ):
+            backend = get_attn_backend(
+                128,
+                torch.bfloat16,
+                supported_attention_backends={
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                },
+                selected_attention_backend=AttentionBackendEnum.TPU_SPLASH_ATTN,
+            )
+        self.assertEqual(
+            f"{backend.__module__}.{backend.__qualname__}",
+            TpuPlatform.get_attn_backend_cls_str(
+                AttentionBackendEnum.TPU_SPLASH_ATTN, 128, torch.bfloat16
+            ),
+        )
+
+    def test_selectable_by_cli_name(self):
+        # server_args resolves --attention-backend via the enum name.
+        self.assertIs(
+            AttentionBackendEnum["TPU_SPLASH_ATTN"],
+            AttentionBackendEnum.TPU_SPLASH_ATTN,
+        )
+        self.assertEqual(str(AttentionBackendEnum.TPU_SPLASH_ATTN), "tpu_splash_attn")
+
+
 class TestTpuPlatformSurface(unittest.TestCase):
     def test_identity(self):
         self.assertEqual(TpuPlatform.device_type, "tpu")
@@ -48,6 +88,14 @@ class TestTpuPlatformSurface(unittest.TestCase):
                 "sdpa.SDPABackend",
                 TpuPlatform.get_attn_backend_cls_str(selected, 128, torch.bfloat16),
             )
+
+    def test_attn_backend_splash_class_path(self):
+        self.assertIn(
+            "tpu_splash_attn.TpuSplashAttentionBackend",
+            TpuPlatform.get_attn_backend_cls_str(
+                AttentionBackendEnum.TPU_SPLASH_ATTN, 128, torch.bfloat16
+            ),
+        )
 
     def test_attn_backend_unsupported_raises(self):
         with self.assertRaises(ValueError):

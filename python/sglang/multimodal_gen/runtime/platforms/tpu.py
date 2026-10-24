@@ -204,9 +204,16 @@ class TpuPlatform(Platform):
                 "sglang.multimodal_gen.runtime.layers.attention.backends."
                 "sdpa.SDPABackend"
             )
+        if selected_backend is AttentionBackendEnum.TPU_SPLASH_ATTN:
+            logger.info(
+                "Using TPU Pallas splash attention backend (falls back to SDPA "
+                "per shape, or entirely off TPU v7x)."
+            )
+            return "sglang_tpu.multimodal_gen.tpu_splash_attn.TpuSplashAttentionBackend"
         raise ValueError(
             f"Attention backend {selected_backend} is not supported on TPU; "
-            "the supported backend is TORCH_SDPA (default)."
+            "the supported backends are TORCH_SDPA (default) and "
+            "TPU_SPLASH_ATTN."
         )
 
     @classmethod

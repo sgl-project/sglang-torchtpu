@@ -50,6 +50,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>PyTorch <code>scaled_dot_product_attention</code>.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`tpu_splash_attn`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`TPU_SPLASH_ATTN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>TPU only, opt-in; the TPU default is <code>torch_sdpa</code>. Pallas kernels for bf16, head_dim 128: a flash kernel for non-causal attention with at least 256 queries and 512 keys, and JAX's <code>make_splash_mha</code> for causal attention, shorter queries and cross-attention to fewer than 512 aligned keys; short and other shapes fall back to SDPA (the log line names the path per shape). Block sizes and VMEM limits are tuned and validated on TPU v7x only; on other chips every call uses SDPA, with a logged warning. Each new (shape, dtype, scale, causal) combination traces and compiles its kernel on first use, so warm up the served resolutions; if a kernel fails to compile for a shape, use <code>--attention-backend torch_sdpa</code>.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sliding_tile_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`SLIDING_TILE_ATTN`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Sliding Tile Attention (STA). Requires <code>st_attn</code>. Configure via <code>--attention-backend-config</code>.</td>
