@@ -226,18 +226,6 @@ and the admission budget.
 
 `est_time` is read by the CI, not decoration; see Budgets.
 
-## Known gaps
-
-- **The PR check can go green without running TPU tests:** fork PRs skip the build, and
-  `pr-test-tpu-finish` treats skipped jobs as passed.
-- **`est_time` values are hand-written** and have drifted; there is no refit loop.
-- **`combo-test-tpu.yml` cannot be admitted:** its 2-prefill + 2-decode job needs two 2x2x2
-  slices, and there is one.
-- **Hand-maintained lists:** the perf matrix (twice), seven near-identical accuracy jobs,
-  the dispatch `model` and `only` choices, the PR path list (also copied, and drifted, in
-  `.github/labeler.yml`), and the project, cluster and service-account values repeated in
-  `_tpu-build.yml` and `_tpu-test.yml`.
-
 ## Files
 
 | Path | Purpose |
@@ -493,26 +481,26 @@ resolve, even if it can never admit anything — so also check that a real workl
 - **The flavor's pool does not exist** — see step 4.
 
 **4. Every flavor's pool must exist**, or workloads queue until the admission timeout. A
-quota whose pool is absent is fiction — Kueue admits against the number and the pods then
-find no matching node. See "Capacity" for the pools that exist today.
+quota whose pool does not exist still admits workloads, and their pods then find no
+matching node. See "Capacity" for the pools that exist today.
 
 ```bash
 kubectl get nodes -L ci-tpu-pool,cloud.google.com/gke-tpu-topology
 # compare with the Capacity table
 ```
 
-**5. Verify gang admission** before merging. The design assumes Kueue assigns a whole
-PodSet to one ResourceFlavor; everything about slice isolation rests on it. Submit two
-multi-host JobSets at once — the first should admit, the second stay queued (not
-half-scheduled), and the admitted one's two pods share a pool:
+**5. Check gang admission.** Slice isolation relies on Kueue assigning each PodSet to a
+single ResourceFlavor. Submit two multi-host JobSets at the same time: the first is
+admitted and the second stays queued with no pods scheduled, and both pods of the
+admitted JobSet run in the same pool:
 
 ```bash
 kubectl -n tpu-ci get workloads
 kubectl -n tpu-ci get pods -o wide
 ```
 
-If pods from one JobSet ever straddle two pools, flavor-per-slice is wrong and this needs
-Topology-Aware Scheduling instead.
+If the pods of one JobSet are spread across two pools, one flavor per slice is not
+enough, and the queues need Topology-Aware Scheduling.
 
 ## Local validation helpers
 
