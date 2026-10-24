@@ -299,7 +299,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             )
             result = DSparkDraftModel.sample_draft_tokens_tpu(model, hidden, tokens)
             torch.testing.assert_close(result, torch.full((2, 2), 3, dtype=torch.int64))
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             sentinel = object()
             self.assertIs(
                 sample_draft_tokens(lambda *args: sentinel, None, None, None), sentinel
@@ -471,7 +474,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 # The carry stays in the draft's table, so FutureMap relays no hidden.
                 self.assertFalse(spec_need_hidden_states(lambda: True))
         self.assertEqual(prepared, [batch])
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             self.assertIsNone(select_experimental_spec_worker(None, mtp, None))
             # Off the flag, init_new never sets host_pad_bs, so core prepares.
             prepare_spec_decode(core_prepare, core_batch)
@@ -500,7 +506,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertTrue(
                 supports_pd_decode_swa_hicache(core, SpeculativeAlgorithm.EAGLE3)
             )
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             self.assertFalse(
                 supports_pd_decode_swa_hicache(core, SpeculativeAlgorithm.DSPARK)
             )
@@ -558,7 +567,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         select_experimental_spec_worker(None, algorithm, None),
                         TpuPipelineStageWorker,
                     )
-            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            with (
+                envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            ):
                 for algorithm in algorithms:
                     self.assertIsNone(
                         select_experimental_spec_worker(None, algorithm, None)
@@ -597,6 +609,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             with (
                 self.subTest(algo=algo, experimental=experimental),
                 envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(experimental),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(experimental),
                 patch(
                     "sglang.srt.arg_groups.overrides.resolving_view",
                     side_effect=lambda server_args: server_args,
@@ -906,7 +919,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
         platform = TpuSRTPlatform()
         for enabled in (True, False):
-            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled):
+            with (
+                envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+                envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(enabled),
+            ):
                 for algorithm in ("DFLASH", "DSPARK", "EAGLE3", "NEXTN"):
                     with self.subTest(algorithm=algorithm, enabled=enabled):
                         self.assertEqual(

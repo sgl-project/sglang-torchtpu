@@ -212,11 +212,14 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
 
     def test_dspark_is_claimed_only_with_experimental_spec_worker(self):
-        """DSPARK is served by TpuBlockSpecWorker when the experimental spec worker is enabled."""
+        """DSPARK is served by TpuBlockSpecWorker when either experimental spec flag is on."""
         from sglang_tpu.envs import envs
 
         self.assertTrue(self.platform.supports_speculative_algorithm("DSPARK"))
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             self.assertFalse(self.platform.supports_speculative_algorithm("DSPARK"))
 
     def test_claimed_draft_backends_are_registered(self):

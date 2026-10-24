@@ -185,7 +185,6 @@ class TestPdSingleHostGptOss120bRecompileIntegration(PDSingleHostTestCase):
     self_hostname = staticmethod(self_hostname)
     runtime_envs = {
         "SGLANG_IS_IN_CI": None,
-        "SGLANG_TPU_HOST_PADDING": "1",
         "SGLANG_TPU_CHECK_RECOMPILATION": "1",
         "SGLANG_TPU_CHECK_RECOMPILATION_SITES": "1",
     }
@@ -261,7 +260,6 @@ class TestPdSingleHostGptOss120bRecompileConfiguration(unittest.TestCase):
                             "FORCE_SINGLE_HOST": "1",
                             "SGLANG_HOST_IP": "127.0.0.1",
                             "SGLANG_IS_IN_CI": None,
-                            "SGLANG_TPU_HOST_PADDING": "1",
                             "SGLANG_TPU_CHECK_RECOMPILATION": "1",
                             "SGLANG_TPU_CHECK_RECOMPILATION_SITES": "1",
                         }

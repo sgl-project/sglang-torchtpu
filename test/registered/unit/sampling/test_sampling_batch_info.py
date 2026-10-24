@@ -1101,7 +1101,6 @@ class TestHostSamplingMode(CustomTestCase):
         from sglang_tpu.compilation.decoder_compile_policy import (
             Qwen3VLDecoderTpuCompilePolicy,
         )
-        from sglang_tpu.envs import envs
 
         runtime = get_context().override_server_args(
             tp_size=1, pp_size=1, enable_mixed_chunk=False
@@ -1129,32 +1128,29 @@ class TestHostSamplingMode(CustomTestCase):
             return_pooled_hidden_states=False,
             return_hidden_states_before_norm=False,
         )
-        with envs.SGLANG_TPU_HOST_PADDING.override(True):
-            self.assertTrue(policy.keep_outputs_padded(batch))
-            batch._tpu_real_b = 3
-            batch.seq_lens = torch.ones(8)
-            self.assertTrue(policy.keep_outputs_padded(batch))
-            for obj, field, value in (
-                (batch, "return_logprob", True),
-                (batch, "is_prefill_only", True),
-                (batch, "capture_hidden_mode", CaptureHiddenMode.FULL),
-                (batch, "spec_info", object()),
-                (batch, "_tpu_real_b", 4),  # beam tail before padding
-                (info, "sampling_params_on_cpu", False),
-                (info, "grammars", [object()]),
-                (info, "logit_bias", torch.zeros(3, 8)),
-                (info, "has_custom_logit_processor", True),
-                (info, "acc_additive_penalties", torch.zeros(3, 8)),
-                (info, "sampling_mask_batch_indices", torch.tensor([1])),
-                (config, "use_ngram_embedding", True),
-            ):
-                with self.subTest(field=field):
-                    previous = getattr(obj, field)
-                    setattr(obj, field, value)
-                    self.assertFalse(policy.keep_outputs_padded(batch))
-                    setattr(obj, field, previous)
-        with envs.SGLANG_TPU_HOST_PADDING.override(False):
-            self.assertFalse(policy.keep_outputs_padded(batch))
+        self.assertTrue(policy.keep_outputs_padded(batch))
+        batch._tpu_real_b = 3
+        batch.seq_lens = torch.ones(8)
+        self.assertTrue(policy.keep_outputs_padded(batch))
+        for obj, field, value in (
+            (batch, "return_logprob", True),
+            (batch, "is_prefill_only", True),
+            (batch, "capture_hidden_mode", CaptureHiddenMode.FULL),
+            (batch, "spec_info", object()),
+            (batch, "_tpu_real_b", 4),  # beam tail before padding
+            (info, "sampling_params_on_cpu", False),
+            (info, "grammars", [object()]),
+            (info, "logit_bias", torch.zeros(3, 8)),
+            (info, "has_custom_logit_processor", True),
+            (info, "acc_additive_penalties", torch.zeros(3, 8)),
+            (info, "sampling_mask_batch_indices", torch.tensor([1])),
+            (config, "use_ngram_embedding", True),
+        ):
+            with self.subTest(field=field):
+                previous = getattr(obj, field)
+                setattr(obj, field, value)
+                self.assertFalse(policy.keep_outputs_padded(batch))
+                setattr(obj, field, previous)
 
     def test_seeded_bucket_sampling_matches_live_rows(self):
         from dataclasses import replace
@@ -1261,7 +1257,6 @@ class TestHostSamplingMode(CustomTestCase):
         from sglang.srt.runtime_context import get_context
         from sglang.srt.sampling.sampling_params import SamplingParams
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.envs import envs
         from sglang_tpu.hooks.host_padding import sampling_from_batch
         from sglang_tpu.host_padding import _can_stage_forward_metadata
 
@@ -1310,33 +1305,22 @@ class TestHostSamplingMode(CustomTestCase):
                 )
                 mode.install()
                 try:
-                    with envs.SGLANG_TPU_HOST_PADDING.override(True):
-                        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-                        self.assertEqual(info.sampling_params_on_cpu, host_sampling)
-                        self.assertEqual(
-                            _can_stage_forward_metadata(batch), host_inputs
-                        )
+                    info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                    self.assertEqual(info.sampling_params_on_cpu, host_sampling)
+                    self.assertEqual(_can_stage_forward_metadata(batch), host_inputs)
                 finally:
                     mode.restore()
-        with envs.SGLANG_TPU_HOST_PADDING.override(True):
-            info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-            self.assertIs(type(info), SamplingBatchInfo)
-            self.assertTrue(info.sampling_params_on_cpu)
-            self.assertEqual(info.top_ks.tolist(), [5])
-            torch.testing.assert_close(info.top_ps, torch.tensor([0.8]))
-            batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
-            self.assertFalse(
-                SamplingBatchInfo.from_schedule_batch(
-                    batch, VOCAB_SIZE
-                ).sampling_params_on_cpu
-            )
-        batch.spec_algorithm = SpeculativeAlgorithm.NONE
-        with envs.SGLANG_TPU_HOST_PADDING.override(False):
-            self.assertFalse(
-                SamplingBatchInfo.from_schedule_batch(
-                    batch, VOCAB_SIZE
-                ).sampling_params_on_cpu
-            )
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertIs(type(info), SamplingBatchInfo)
+        self.assertTrue(info.sampling_params_on_cpu)
+        self.assertEqual(info.top_ks.tolist(), [5])
+        torch.testing.assert_close(info.top_ps, torch.tensor([0.8]))
+        batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+        self.assertFalse(
+            SamplingBatchInfo.from_schedule_batch(
+                batch, VOCAB_SIZE
+            ).sampling_params_on_cpu
+        )
 
     def test_merge_rejects_incompatible_modes_before_mutating(self):
         info = self._host_info(2)

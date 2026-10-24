@@ -60,7 +60,6 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
@@ -180,10 +179,7 @@ class TestHostStagedPrefillInputs(CustomTestCase):
         self.assertIsNone(batch.prefill_input_ids_cpu)
 
     def test_mixed_and_speculative_batches_keep_the_device_contract(self):
-        with (
-            get_context().override_server_args(enable_torch_compile=True),
-            tpu_envs.SGLANG_TPU_HOST_PADDING.override(True),
-        ):
+        with get_context().override_server_args(enable_torch_compile=True):
             allocator = TpuPagedTokenToKVPoolAllocator(
                 size=32,
                 page_size=4,
@@ -214,8 +210,6 @@ class TestHostStagedPrefillInputs(CustomTestCase):
             )
             platform = TpuSRTPlatform()
             self.assertEqual(platform.get_batch_input_device(batch), "cpu")
-            with tpu_envs.SGLANG_TPU_HOST_PADDING.override(False):
-                self.assertIsNone(platform.get_batch_input_device(batch))
             with get_schedule().override(enable_mixed_chunk=True):
                 self.assertIsNone(platform.get_batch_input_device(batch))
             batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
@@ -248,7 +242,6 @@ class TestHostStagedPrefillInputs(CustomTestCase):
         with (
             get_context().override_server_args(),
             get_parallel().override(attn_dcp_size=1),
-            tpu_envs.SGLANG_TPU_HOST_PADDING.override(True),
             patch(
                 "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch",
                 return_value=None,

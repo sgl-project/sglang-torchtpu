@@ -1194,11 +1194,8 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.layers.cp.base import get_cp_strategy
         from sglang.srt.utils.common import print_warning_once
         from sglang_tpu.allocator_tpu import host_return_allocators
-        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.host_padding import _can_stage_forward_metadata
 
-        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get():
-            return None
         # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
         allocator = batch.token_to_kv_pool_allocator
         checks = (
@@ -1215,8 +1212,8 @@ class TpuSRTPlatform(SRTPlatform):
         for reason, ok in checks:
             if not ok:
                 print_warning_once(
-                    "SGLANG_TPU_HOST_PADDING is set, but prefill inputs upload at "
-                    f"the live length because {reason}. This may compile a program "
+                    "Prefill inputs upload at the live length instead of host-padded "
+                    f"because {reason}. This may compile a program "
                     "per prompt length."
                 )
                 return None

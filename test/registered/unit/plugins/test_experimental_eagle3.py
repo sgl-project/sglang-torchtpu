@@ -101,7 +101,10 @@ class TestExperimentalEagle3(CustomTestCase):
                 select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE, None),
                 TpuChainSpecWorker,
             )
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        ):
             self.assertIsNone(
                 select_experimental_spec_worker(None, SpeculativeAlgorithm.EAGLE3, None)
             )

@@ -56,7 +56,6 @@ class TestTpuGptOss120bSinglehostRecompile(TPULauncherTestCase):
         **fixture_runtime_envs(),
         "MODEL": MODEL_PATH,
         "SGLANG_IS_IN_CI": None,
-        "SGLANG_TPU_HOST_PADDING": "1",
         "SGLANG_TPU_CHECK_RECOMPILATION": "1",
         "SGLANG_TPU_CHECK_RECOMPILATION_SITES": "1",
     }

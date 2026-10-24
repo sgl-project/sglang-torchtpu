@@ -80,7 +80,6 @@ from sglang_tpu.cp_layout import warmup_request_lengths
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.host_padding import (
-    check_host_padding_config,
     ordinary_compiled_forward,
 )
 from sglang_tpu.pp_wave import num_relayed_aux_slots
@@ -1078,7 +1077,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         # EAGLE warmup and serving have different sampling_info values. Avoid
         # guarding that metadata in compiled paths which cannot use this mode.
-        if not tpu_envs.SGLANG_TPU_HOST_PADDING.get() or batch.spec_info is not None:
+        if batch.spec_info is not None:
             return False
         info = getattr(batch, "sampling_info", None)
         if info is None or not supports_padded_sampling(info):
@@ -1102,10 +1101,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
     def _upload_host_inputs(self, forward_batch: ForwardBatch) -> None:
-        if (
-            not tpu_envs.SGLANG_TPU_HOST_PADDING.get()
-            or forward_batch.spec_info is not None
-        ):
+        if forward_batch.spec_info is not None:
             return
         # Each field is checked on its own: tokens, lengths and extend metadata
         # are placed by separate decisions, so one device-side field does not
@@ -1337,13 +1333,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if disagg_mode != "prefill":
             pending += self._precompile_decode()
         spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
-        host_padded_prefill = (
-            tpu_envs.SGLANG_TPU_HOST_PADDING.get()
-            and spec_algorithm is not None
-            and spec_algorithm.is_none()
-        )
-        if host_padded_prefill:
-            check_host_padding_config(self.model_runner)
+        host_padded_prefill = spec_algorithm is not None and spec_algorithm.is_none()
         if (
             host_padded_prefill
             and get_exec().kernel.sampling_backend == "tpu"
