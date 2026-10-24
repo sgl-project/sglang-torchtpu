@@ -22,13 +22,13 @@ Requires a TPU device; skipped otherwise. Adapted from vllm-torchtpu
 
 from __future__ import annotations
 
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
-
+import math
 import unittest
 
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
 
 
 def _has_jax_tpu() -> bool:
@@ -325,6 +325,78 @@ _SHAPES = [
 _GATES = [("softplus", None), ("bounded", -5.0)]
 
 
+_SERVED_GDN_HEADS = ((2, 8), (8, 32), (16, 64))
+_SERVED_KDA_HEADS = ((3, 3), (12, 12), (4, 4), (32, 32))
+_TOKEN_BUCKETS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+_SLOT_COUNTS = (8, 16, 32, 64, 128, 256, 384, 512)
+
+
+def _reachable_tile_batches(
+    n_kq: int,
+    n_v: int,
+    state_dtype,
+    window: int,
+    attention_mode=None,
+) -> list[dict]:
+    """One batch per reachable decode or mixed tile size across serving buckets."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.attention.pallas.gdn import compute_gdn, config, tiling
+
+    if attention_mode is None:
+        attention_mode = config.AttentionMode.GDN
+    d_k = d_v = 128
+    kernel_size = 4
+    dim = 2 * n_kq * d_k + n_v * d_v
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    batch_align = math.lcm(2, compute_gdn.INVERT_BLOCK)
+    decode_limit = config.GDNConfig.get_vmem_limit_bytes(window)
+    mixed_limit = config.GDNConfig.get_vmem_limit_bytes(1)
+
+    seen_decode: set[int] = set()
+    seen_mixed: set[int] = set()
+    batches = []
+    for batch_size in _TOKEN_BUCKETS:
+        for num_seqs in _SLOT_COUNTS:
+            if batch_size <= window:
+                continue
+            padded = pl.cdiv(batch_size, batch_align) * batch_align
+            dec, mix = tiling.get_tile_sizes(
+                batch_size=batch_size,
+                num_seqs=num_seqs,
+                padded_batch_size=padded,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=jnp.dtype(jnp.bfloat16),
+                recurrent_state_dtype=jnp.dtype(state_dtype),
+                num_lanes=num_lanes,
+                decode_vmem_limit_bytes=decode_limit,
+                mixed_vmem_limit_bytes=mixed_limit,
+                window_size=window,
+                attention_mode=attention_mode,
+            )
+            if dec in seen_decode and mix in seen_mixed:
+                continue
+            seen_decode.add(dec)
+            seen_mixed.add(mix)
+            lengths = [window, batch_size - window] + [0] * (num_seqs - 2)
+            batches.append(
+                dict(
+                    max_reqs=num_seqs,
+                    lengths=lengths,
+                    q_loc=[0, *np.cumsum(lengths)],
+                    distribution=[1, 2, 2],
+                )
+            )
+    assert batches, f"No reachable tile pairs for n_v={n_v}, window={window}"
+    return batches
+
+
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestGDNAttentionV3KDA(CustomTestCase):
     """Compare the KDA mode of the fused kernel against a float64 recurrence."""
@@ -588,6 +660,286 @@ class TestGDNAttentionV3KDA(CustomTestCase):
                 kwargs.update(overrides)
                 with self.assertRaises(ValueError):
                     kernel(**kwargs)
+
+    def _assert_matches_reference(
+        self, kwargs, out_conv, out_state, out, num_seqs: int
+    ):
+        (ref_conv, ref_state), ref_out = _kda_attention_ref(**kwargs)
+        np.testing.assert_allclose(
+            np.asarray(out, np.float64), ref_out, rtol=2e-2, atol=5e-3
+        )
+        slots = np.asarray(kwargs["state_indices"])[:num_seqs]
+        np.testing.assert_allclose(
+            np.asarray(out_state, np.float64)[slots],
+            np.asarray(ref_state, np.float64)[slots],
+            rtol=2e-2,
+            atol=1e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(out_conv, np.float64)[slots],
+            np.asarray(ref_conv, np.float64)[slots],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_kda_vmem_and_tile_sizes_across_parallelism(self):
+        """KDA VMEM accounting and tile picks across TP/DP/MTP regimes."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.attention.pallas.gdn import config, tiling
+
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        d_k = d_v = 128
+        kernel_size = 4
+        vmem_64m = 64 * 1024 * 1024
+        limit_w1 = config.GDNConfig.get_vmem_limit_bytes(
+            1, vmem_capacity_bytes=vmem_64m
+        )
+        limit_w4 = config.GDNConfig.get_vmem_limit_bytes(
+            4, vmem_capacity_bytes=vmem_64m
+        )
+        for n_kq, n_v, w_sz, expected in (
+            (3, 3, 1, (16, 128)),
+            (3, 3, 4, (16, 128)),
+            (12, 12, 1, (8, 128)),
+            (12, 12, 4, (4, 128)),
+            (4, 4, 1, (16, 128)),
+            (4, 4, 4, (16, 128)),
+            (32, 32, 1, (4, 64)),
+            (32, 32, 4, (2, 64)),
+        ):
+            dim = 2 * n_kq * d_k + n_v * d_v
+            got = tiling.get_tile_sizes(
+                batch_size=512,
+                num_seqs=64,
+                padded_batch_size=512,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=jnp.dtype(jnp.bfloat16),
+                recurrent_state_dtype=jnp.dtype(jnp.float32),
+                num_lanes=num_lanes,
+                decode_vmem_limit_bytes=limit_w4 if w_sz > 1 else limit_w1,
+                mixed_vmem_limit_bytes=limit_w1,
+                window_size=w_sz,
+                attention_mode=config.AttentionMode.KDA,
+            )
+            self.assertEqual(got, expected)
+
+    def test_kda_spec_decode_dynamic_tiling_head_splits(self):
+        """Multi-sequence KDA spec verify tiles across served head splits."""
+        from sglang_tpu.attention.pallas.gdn import config
+
+        kernel = self._kernel()
+        d_k, d_v, kernel_size = self.D_K, self.D_V, self.KERNEL_SIZE
+        num_spec_tokens = 3
+        window = num_spec_tokens + 1
+        query_lens = [4, 3, 2, 4, 1, 3, 4, 2]
+        context_lens = [12, 0, 5, 20, 7, 1, 9, 3]
+        read_offsets = jnp.array([2, 0, 1, 3, 0, 1, 2, 1], dtype=jnp.int32)
+        num_seqs = len(query_lens)
+        ends = np.cumsum([0] + query_lens)
+        q_loc = jnp.array(ends, dtype=jnp.int32)
+        num_tokens = int(ends[-1])
+        distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+        state_indices = jnp.array(
+            [1 + i * window for i in range(num_seqs)], dtype=jnp.int32
+        )
+        num_blocks = 1 + num_seqs * window
+        seq_lens = jnp.array(
+            [q + c for q, c in zip(query_lens, context_lens)], dtype=jnp.int32
+        )
+
+        for n_v, gate_lower_bound in ((3, -5.0), (12, -5.0), (4, None)):
+            with self.subTest(n_v=n_v, gate_lower_bound=gate_lower_bound):
+                n_kq = n_v
+                dim = 2 * n_kq * d_k + n_v * d_v
+                rngs = iter(jax.random.split(jax.random.key(50 + n_v), 10))
+                conv_state = jax.random.normal(
+                    next(rngs), (num_blocks, kernel_size - 1, dim)
+                )
+                recurrent_state = 0.1 * jax.random.normal(
+                    next(rngs), (num_blocks, n_v, d_k, d_v)
+                )
+                kwargs = dict(
+                    qkv=jax.random.normal(next(rngs), (num_tokens, dim)),
+                    b=jax.random.normal(next(rngs), (num_tokens, n_v)),
+                    a=jax.random.normal(next(rngs), (num_tokens, n_v * d_k)),
+                    conv_state=conv_state,
+                    recurrent_state=recurrent_state,
+                    conv_weight=jax.random.normal(next(rngs), (dim, 1, kernel_size)),
+                    conv_bias=jax.random.normal(next(rngs), (dim,)),
+                    a_log=jax.random.normal(next(rngs), (n_v,)),
+                    dt_bias=jax.random.normal(next(rngs), (n_v, d_k)),
+                    query_start_loc=q_loc,
+                    state_indices=state_indices,
+                    distribution=distribution,
+                    seq_lens=seq_lens,
+                    read_offsets=read_offsets,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    gate_lower_bound=gate_lower_bound,
+                )
+                (ref_conv, ref_state), ref_out = _kda_attention_spec_ref(**kwargs)
+                (out_conv, out_state), out = kernel(
+                    **{
+                        **kwargs,
+                        "conv_state": conv_state.copy(),
+                        "recurrent_state": recurrent_state.copy(),
+                    },
+                    attention_mode=config.AttentionMode.KDA,
+                    num_spec_tokens=num_spec_tokens,
+                    batched_only=True,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(out, np.float64),
+                    np.asarray(ref_out, np.float64),
+                    rtol=2e-2,
+                    atol=5e-3,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(out_state, np.float64),
+                    np.asarray(ref_state, np.float64),
+                    rtol=2e-2,
+                    atol=1e-2,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(out_conv, np.float64),
+                    np.asarray(ref_conv, np.float64),
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+
+    def test_kda_spec_window_multi_sequence_tile(self):
+        """Multi-sequence KDA spec verify tile matches decode_tile_size=1."""
+        from sglang_tpu.attention.pallas.gdn import config
+
+        kernel = self._kernel()
+        d_k, d_v, kernel_size = self.D_K, self.D_V, self.KERNEL_SIZE
+        n_kq = n_v = 3
+        num_spec_tokens = 3
+        window = num_spec_tokens + 1
+        query_lens = [4, 2, 3, 1, 4, 3, 2, 4, 3, 1, 4, 2, 3, 4, 2, 1]
+        context_lens = [10 + i for i in range(len(query_lens))]
+        num_seqs = len(query_lens)
+        read_offsets = jnp.array([i % window for i in range(num_seqs)], dtype=jnp.int32)
+        ends = np.cumsum([0] + query_lens)
+        q_loc = jnp.array(ends, dtype=jnp.int32)
+        num_tokens = int(ends[-1])
+        distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+        state_indices = jnp.array(
+            [1 + i * window for i in range(num_seqs)], dtype=jnp.int32
+        )
+        num_blocks = 1 + num_seqs * window
+        seq_lens = jnp.array(
+            [q + c for q, c in zip(query_lens, context_lens)], dtype=jnp.int32
+        )
+        dim = 2 * n_kq * d_k + n_v * d_v
+        rngs = iter(jax.random.split(jax.random.key(88), 10))
+        conv_state = jax.random.normal(next(rngs), (num_blocks, kernel_size - 1, dim))
+        recurrent_state = 0.1 * jax.random.normal(
+            next(rngs), (num_blocks, n_v, d_k, d_v)
+        )
+        common = dict(
+            qkv=jax.random.normal(next(rngs), (num_tokens, dim)),
+            b=jax.random.normal(next(rngs), (num_tokens, n_v)),
+            a=jax.random.normal(next(rngs), (num_tokens, n_v * d_k)),
+            conv_weight=jax.random.normal(next(rngs), (dim, 1, kernel_size)),
+            conv_bias=jax.random.normal(next(rngs), (dim,)),
+            a_log=jax.random.normal(next(rngs), (n_v,)),
+            dt_bias=jax.random.normal(next(rngs), (n_v, d_k)),
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            read_offsets=read_offsets,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            gate_lower_bound=-5.0,
+            attention_mode=config.AttentionMode.KDA,
+            num_spec_tokens=num_spec_tokens,
+            batched_only=True,
+        )
+        (conv_dyn, state_dyn), out_dyn = kernel(
+            conv_state=conv_state.copy(),
+            recurrent_state=recurrent_state.copy(),
+            **common,
+        )
+        (conv_t1, state_t1), out_t1 = kernel(
+            conv_state=conv_state.copy(),
+            recurrent_state=recurrent_state.copy(),
+            decode_tile_size=1,
+            **common,
+        )
+        np.testing.assert_allclose(out_dyn, out_t1, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(state_dyn, state_t1, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(conv_dyn, conv_t1, rtol=1e-5, atol=1e-5)
+
+    def test_kda_head_dense_prefill_c64_execution(self):
+        """32-head KDA prefill runs dynamically at C=64 without VMEM overflow."""
+        from sglang_tpu.attention.pallas.gdn import config
+
+        kernel = self._kernel()
+        query_lens = [128, 64]
+        context_lens = [0, 0]
+        distribution = [0, 2, 2]
+        kwargs = self._inputs(query_lens, context_lens, distribution, None, n_v=32)
+        (out_conv, out_state), out = kernel(
+            **{
+                **kwargs,
+                "conv_state": kwargs["conv_state"].copy(),
+                "recurrent_state": kwargs["recurrent_state"].copy(),
+            },
+            attention_mode=config.AttentionMode.KDA,
+        )
+        self._assert_matches_reference(
+            kwargs, out_conv, out_state, out, len(query_lens)
+        )
+
+    def test_every_reachable_tile_matches_recurrence(self):
+        """Every reachable (T, C) tile pair across served KDA heads matches recurrence."""
+        from sglang_tpu.attention.pallas.gdn import config
+
+        kernel = self._kernel()
+        for n_kq, n_v in _SERVED_KDA_HEADS:
+            for batch in _reachable_tile_batches(
+                n_kq, n_v, jnp.float32, 1, config.AttentionMode.KDA
+            ):
+                query_lens = batch["lengths"]
+                context_lens = [4, 4] + [0] * (len(query_lens) - 2)
+                distribution = batch["distribution"]
+                with self.subTest(
+                    n_v=n_v,
+                    max_reqs=batch["max_reqs"],
+                    tokens=batch["q_loc"][-1],
+                ):
+                    kwargs = self._inputs(
+                        query_lens,
+                        context_lens,
+                        distribution,
+                        gate_lower_bound=-5.0,
+                        n_v=n_v,
+                    )
+                    (out_conv, out_state), out = kernel(
+                        **{
+                            **kwargs,
+                            "conv_state": kwargs["conv_state"].copy(),
+                            "recurrent_state": kwargs["recurrent_state"].copy(),
+                        },
+                        attention_mode=config.AttentionMode.KDA,
+                    )
+                    self._assert_matches_reference(
+                        kwargs, out_conv, out_state, out, int(distribution[2])
+                    )
 
 
 if __name__ == "__main__":
