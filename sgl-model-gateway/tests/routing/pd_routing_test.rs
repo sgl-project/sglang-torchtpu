@@ -1090,6 +1090,143 @@ mod pd_early_stream_error_tests {
         p.abort();
         d.abort();
     }
+
+    // --- A streaming prefill that fails inside its 200 body (B1) ---
+
+    /// What a prefill engine streams when the scheduler aborts the request,
+    /// e.g. a prompt over its KV capacity (`prepare_abort` with 400).
+    const PREFILL_ABORT_STREAM: &str = "data: {\"text\":\"\",\"meta_info\":{\"id\":\"p\",\"finish_reason\":{\"type\":\"abort\",\"message\":\"Request exceeds the maximum number of tokens\",\"status_code\":400}}}\n\ndata: [DONE]\n\n";
+    /// What a prefill engine streams when it finished its part normally.
+    const PREFILL_DONE_STREAM: &str = "data: {\"text\":\"\",\"meta_info\":{\"id\":\"p\",\"finish_reason\":{\"type\":\"length\",\"length\":0}}}\n\ndata: [DONE]\n\n";
+    /// A decode waiting for KV produces nothing for this long.
+    const SLOW_DECODE_MS: u64 = 3000;
+
+    /// Counts a decode stream dropped before producing its last chunk, i.e. a
+    /// decode request the router cancelled.
+    struct CancelProbe {
+        finished: bool,
+        cancelled: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CancelProbe {
+        fn drop(&mut self) {
+            if !self.finished {
+                self.cancelled.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Like `spawn_decode`, but counts requests cancelled mid-stream.
+    async fn spawn_cancel_tracked_decode(
+        chunks: Vec<&'static str>,
+        gap_ms: u64,
+        cancelled: Arc<AtomicUsize>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/generate",
+            post(move || {
+                let probe = CancelProbe {
+                    finished: false,
+                    cancelled: cancelled.clone(),
+                };
+                let state = (chunks.clone().into_iter(), probe);
+                async move {
+                    let body =
+                        futures::stream::unfold(state, move |(mut chunks, mut probe)| async move {
+                            let chunk = chunks.next()?;
+                            tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                            probe.finished = chunks.as_slice().is_empty();
+                            Some((
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)),
+                                (chunks, probe),
+                            ))
+                        });
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), task)
+    }
+
+    /// Waits up to `EARLY_RETURN_BOUND` for `count` to reach `expected`.
+    async fn wait_for_count(count: &AtomicUsize, expected: usize) -> usize {
+        let deadline = Instant::now() + EARLY_RETURN_BOUND;
+        while count.load(Ordering::SeqCst) != expected && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        count.load(Ordering::SeqCst)
+    }
+
+    /// Runs one streaming request whose prefill sends `prefill_body` with
+    /// status 200 and whose decode streams `TOKEN_STREAM` after
+    /// `decode_delay_ms`. Returns (status, body, elapsed, decode cancellations
+    /// after waiting up to `EARLY_RETURN_BOUND` for `expected_cancels`).
+    async fn run_prefill_stream(
+        prefill_body: &'static str,
+        decode_delay_ms: u64,
+        expected_cancels: usize,
+    ) -> (StatusCode, String, Duration, usize) {
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let (prefill_url, p) = spawn_decode(vec![prefill_body], 0).await;
+        let (decode_url, d) =
+            spawn_cancel_tracked_decode(vec![TOKEN_STREAM], decode_delay_ms, cancelled.clone())
+                .await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, elapsed) = stream_once(&router).await;
+        let cancels = wait_for_count(&cancelled, expected_cancels).await;
+        p.abort();
+        d.abort();
+        (status, body, elapsed, cancels)
+    }
+
+    /// A prefill that rejects the request streams 200 plus an error event.
+    /// Decode would wait for KV that never comes, so the router must relay
+    /// prefill's error at once and cancel decode.
+    #[tokio::test]
+    async fn test_in_band_prefill_stream_error_does_not_wait_for_decode() {
+        let (status, body, elapsed, cancels) =
+            run_prefill_stream(ENGINE_ERROR_STREAM, SLOW_DECODE_MS, 1).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, ENGINE_ERROR_STREAM, "client must get prefill's error");
+        assert!(
+            elapsed < EARLY_RETURN_BOUND,
+            "router waited {elapsed:?} for a decode that can never get KV (delay {SLOW_DECODE_MS}ms)"
+        );
+        assert_eq!(cancels, 1, "decode request must be cancelled");
+    }
+
+    /// Same for a prefill the scheduler aborted: its stream is a normal event
+    /// whose finish reason is `abort`.
+    #[tokio::test]
+    async fn test_aborted_prefill_stream_does_not_wait_for_decode() {
+        let (status, body, elapsed, cancels) =
+            run_prefill_stream(PREFILL_ABORT_STREAM, SLOW_DECODE_MS, 1).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body, PREFILL_ABORT_STREAM,
+            "client must get prefill's abort"
+        );
+        assert!(elapsed < EARLY_RETURN_BOUND, "router waited {elapsed:?}");
+        assert_eq!(cancels, 1, "decode request must be cancelled");
+    }
+
+    /// Regression guard: a prefill that finished normally (finish reason
+    /// `length`) still hands over to decode, whose stream is relayed in full.
+    #[tokio::test]
+    async fn test_finished_prefill_stream_still_relays_decode() {
+        let (status, body, _, cancels) = run_prefill_stream(PREFILL_DONE_STREAM, 300, 0).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, TOKEN_STREAM);
+        assert_eq!(cancels, 0, "decode must not be cancelled");
+    }
 }
 
 /// A retry reuses the client's `rid`. When an attempt ends with the router
