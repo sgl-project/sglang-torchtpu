@@ -185,7 +185,8 @@ fn first_sse_event_is_error(buf: &[u8]) -> Option<bool> {
 #[derive(Clone, Copy, Debug)]
 enum PrefillStreamFailure {
     /// An `error` event: the engine rejected the request (e.g. a prompt over
-    /// `--context-length`) or hit an exception while streaming.
+    /// `--context-length`, or any `ValueError` while streaming), or an OpenAI
+    /// route reported an abort that carries a status.
     ErrorEvent,
     /// Every request in the stream finished with reason `abort` (e.g. the
     /// scheduler's KV-capacity check, or a KV transfer failure).
@@ -206,13 +207,17 @@ impl PrefillStreamFailure {
 /// A streaming engine commits 200 headers before it knows the outcome, so a
 /// failed prefill still answers 200 and reports the failure in its body. A
 /// prefill that finished normally in PD prefill mode ends with finish reason
-/// `length`, never `abort`, so neither shape below matches a success.
+/// `length`, never `abort`, so neither `PrefillStreamFailure` matches a success.
 ///
 /// Returns the failure and the HTTP status the engine reported for it
 /// (`error.code`, or the abort's `status_code`), or `None` if prefill
 /// succeeded. A batch stream counts as failed only when every request in it
 /// aborted: a partially aborted batch keeps today's behavior of relaying
 /// decode, which still serves the requests that did prefill.
+///
+/// Not recognized (decode is still awaited, as before): `/v1/responses`
+/// failures, reported as a `response.failed` event with a nested error, and
+/// OpenAI-route aborts without a status, sent as a normal chunk.
 fn prefill_stream_failure(body: &[u8]) -> Option<(PrefillStreamFailure, Option<u16>)> {
     // Final finish reason per request id: (aborted, reported status).
     let mut finishes: HashMap<String, (bool, Option<u16>)> = HashMap::new();
@@ -1126,11 +1131,11 @@ impl PDRouter {
         // except that the client gets prefill's stream unchanged, as it would
         // from a single engine.
         if context.is_stream {
-            if let Some((failure, reported_status, body)) =
+            if let Some((status, failure, reported_status, body)) =
                 prefill_result.as_ref().ok().and_then(|resp| {
                     let body = resp.body.as_ref().ok()?;
-                    let (failure, status) = prefill_stream_failure(body)?;
-                    Some((failure, status, body.clone()))
+                    let (failure, reported_status) = prefill_stream_failure(body)?;
+                    Some((resp.status(), failure, reported_status, body.clone()))
                 })
             {
                 warn!(
@@ -1140,20 +1145,18 @@ impl PDRouter {
                     decode.url(),
                     prefill.url()
                 );
-                // 4xx = client fault; a missing status counts as a worker fault.
-                // Don't record decode, as above.
-                prefill.record_outcome(reported_status.is_some_and(|s| (400..500).contains(&s)));
+                // Only a reported 5xx is a worker fault. Error events always
+                // carry a code; an abort without one is graceful (e.g.
+                // `/abort_request`), not a prefill fault. Don't record decode,
+                // as above.
+                prefill.record_outcome(reported_status.is_none_or(|s| s < 500));
                 let mut response = Response::new(Body::from(body));
-                *response.status_mut() = prefill_result
-                    .as_ref()
-                    .map_or(StatusCode::OK, PrefillResponse::status);
+                *response.status_mut() = status;
                 response
                     .headers_mut()
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                // No `CancelledRequestHoldsRid`: a 2xx response is never retried.
                 response.extensions_mut().insert(BreakerOutcomesRecorded);
-                if pins_rid {
-                    response.extensions_mut().insert(CancelledRequestHoldsRid);
-                }
                 return response;
             }
         }
