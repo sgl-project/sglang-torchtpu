@@ -1,17 +1,21 @@
 """Pure-JAX TPU tests for the context-parallel modes of the batched RPA kernel.
 
 The geometries mirror gpt-oss-120b decode context parallelism on one host: each
-rank keeps all of its KV heads over 1/cp of the positions and attends the
-group's gathered query heads. DCP2 is 16 query heads over 2 KV heads, DCP8 is 64
-over 8; head_dim 64, bf16, page size 256, sliding window 128.
+rank keeps all of its KV heads over its page stripe of the positions (page
+``p`` lives on rank ``p % cp``) and attends the group's gathered query heads.
+DCP2 is 16 query heads over 2 KV heads, DCP8 is 64 over 8; head_dim 64, bf16,
+page size 256, sliding window 128.
 
 Cases:
 
-* ``cache_only`` + ``return_lse`` on every rank's position-interleaved shard,
-  merged by LSE, equals a dense reference over the whole sequence -- with and
-  without the window, with and without the sink fold -- on a decode batch with
-  a sequence whose shard is empty on most ranks, and with k blocks small enough
-  that the global window skips whole blocks.
+* ``cache_only`` + ``return_lse`` on every rank's page stripe, merged by LSE,
+  equals a dense reference over the whole sequence -- with and without the
+  window, with and without the sink fold -- on a decode batch with a sequence
+  whose stripe is empty on most ranks, and with k blocks small enough that the
+  global window skips whole blocks.
+* The fused ``STRIPED`` decode: one launch per rank attends its stripe plus the
+  new token on the rank that owns its page and writes that token into the
+  stripe; the merged partials equal the dense reference over every token.
 * The same on an extend prefix pass in the MIXED range, including q blocks
   past the window that see no prefix key and a sequence with no prefix at all.
 * The extend two-pass merge: a cache-only prefix pass and a chunk-local pass
@@ -213,14 +217,24 @@ def _cp_kwargs(geo: Geometry, rank: int, kv_lens_global):
     )
 
 
-def _local_positions(length: int, rank: int, cp: int) -> np.ndarray:
-    """Global positions rank `rank` stores, in local key order."""
-    return np.arange(rank, length, cp)
+def _local_positions(
+    length: int, rank: int, cp: int, page_size: int = PAGE_SIZE
+) -> np.ndarray:
+    """Global positions rank `rank` stores, in local key order (page-striped)."""
+    positions = np.arange(length)
+    return positions[(positions // page_size) % cp == rank]
+
+
+def _local_len(length: int, rank: int, cp: int, page_size: int = PAGE_SIZE) -> int:
+    """``get_dcp_lens(interleave_size=page_size)`` for one length."""
+    cycle = cp * page_size
+    rem = min(max(length % cycle - rank * page_size, 0), page_size)
+    return (length // cycle) * page_size + rem
 
 
 def _pages_per_seq(lengths, cp: int, page_size: int = PAGE_SIZE) -> int:
-    """Pages per sequence on the rank with the longest shard (rank 0)."""
-    longest = max(-(-length // cp) for length in lengths)
+    """Pages per sequence on the rank with the longest stripe (rank 0)."""
+    longest = max(_local_len(length, 0, cp, page_size) for length in lengths)
     return max(1, -(-longest // page_size))
 
 
@@ -267,10 +281,17 @@ def _dense_attention(
 
 
 def _first_window_key(q_global: int, rank: int, cp: int) -> int:
-    """First local key j of `rank` inside the window of global query q_global."""
-    j = 0
-    while j * cp + rank <= q_global - SLIDING_WINDOW:
-        j += 1
+    """First local key j of `rank` inside the window of global query q_global.
+
+    Mirrors the schedule: the first local page at or after the window's first
+    global page, plus the in-page offset when that page is this rank's.
+    """
+    first_global = max(q_global - SLIDING_WINDOW + 1, 0)
+    first_page = first_global // PAGE_SIZE
+    first_local_page = max(first_page - rank + cp - 1, 0) // cp
+    j = first_local_page * PAGE_SIZE
+    if first_local_page * cp + rank == first_page:
+        j += first_global % PAGE_SIZE
     return j
 
 
@@ -315,7 +336,7 @@ class _CloseAssertions(unittest.TestCase):
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestBatchedRpaDcpDecode(_CloseAssertions):
-    """Interleaved shards of a decode batch merge back into the dense result."""
+    """Page stripes of a decode batch merge back into the dense result."""
 
     # Global KV lengths including the decoded token. Length 1 leaves every rank
     # but rank 0 empty; 2600 spans several one-page k blocks on every rank.
@@ -472,6 +493,125 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
 
 
 @unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestBatchedRpaDcpStripedDecode(_CloseAssertions):
+    """The fused ``STRIPED`` decode launch.
+
+    The cache holds the first ``n - 1`` tokens of every sequence, page-striped;
+    the decoded token arrives through the k/v operands. The rank owning its
+    page (``((n - 1) // page) % cp``) passes ``kv_lens = local_cache + 1`` and
+    attends and writes it; the others pass their stripe length. The merged
+    partials equal dense attention over all ``n`` tokens, with and without the
+    window, and the owner's stripe ends with the new token afterwards.
+    """
+
+    # 256 and 257 put the new token at the last slot of a page and at the first
+    # slot of the next (a different owner); 1 is a fresh sequence.
+    SEQ_LENS = (2600, 1, 173, 300, 256, 257, 512)
+    MAX_NUM_TOKENS = 8
+
+    def _data(self, geo: Geometry):
+        rng = np.random.default_rng(4321 + geo.cp)
+        kv_shape = (geo.num_kv_heads, HEAD_DIM)
+        full_k = [_random(rng, (n, *kv_shape)) for n in self.SEQ_LENS]
+        full_v = [_random(rng, (n, *kv_shape)) for n in self.SEQ_LENS]
+        queries = _random(rng, (self.MAX_NUM_TOKENS, geo.num_q_heads, HEAD_DIM))
+        return full_k, full_v, queries
+
+    def _run_rank(self, geo: Geometry, rank: int, window, blocks):
+        import jax.numpy as jnp
+
+        full_k, full_v, queries = self._data(geo)
+        cache_lens = [n - 1 for n in self.SEQ_LENS]
+        positions = [_local_positions(n, rank, geo.cp) for n in cache_lens]
+        pages = _pages_per_seq(self.SEQ_LENS, geo.cp)
+        shard = _paged_shard(
+            [k[p] for k, p in zip(full_k, positions)],
+            [v[p] for v, p in zip(full_v, positions)],
+            pages,
+            np.random.default_rng(100 + rank),
+            geo.num_kv_heads,
+        )
+        owns = [((n - 1) // PAGE_SIZE) % geo.cp == rank for n in self.SEQ_LENS]
+        kv_lens = [
+            _local_len(n - 1, rank, geo.cp) + int(own)
+            for n, own in zip(self.SEQ_LENS, owns)
+        ]
+        shard = shard._replace(kv_lens=kv_lens)
+        new_k = np.zeros((self.MAX_NUM_TOKENS, geo.num_kv_heads, HEAD_DIM), np.float32)
+        new_v = np.zeros_like(new_k)
+        for seq, n in enumerate(self.SEQ_LENS):
+            new_k[seq], new_v[seq] = full_k[seq][n - 1], full_v[seq][n - 1]
+        num_seqs = len(self.SEQ_LENS)
+        out, cache_after, lse = _run_kernel(
+            queries,
+            new_k,
+            new_v,
+            shard,
+            np.arange(num_seqs + 1),
+            [num_seqs] * 3,
+            sliding_window=window,
+            decode_block_sizes=blocks,
+            skip_kv_write=False,
+            return_lse=True,
+            cp_group_size=geo.cp,
+            cp_rank=jnp.asarray([rank], jnp.int32),
+            kv_lens_global=jnp.asarray(self.SEQ_LENS, jnp.int32),
+            attention_scope=3,  # STRIPED
+        )
+        return (out[:num_seqs], lse[:num_seqs]), cache_after, shard, owns, pages
+
+    def _reference(self, geo: Geometry, window):
+        full_k, full_v, queries = self._data(geo)
+        num_seqs = len(self.SEQ_LENS)
+        out = np.zeros((num_seqs, geo.num_q_heads, HEAD_DIM), np.float32)
+        lse = np.zeros((num_seqs, geo.num_q_heads), np.float32)
+        for seq, n in enumerate(self.SEQ_LENS):
+            o, l = _dense_attention(
+                queries[seq : seq + 1], full_k[seq], full_v[seq], np.asarray([n - 1]), window
+            )
+            out[seq], lse[seq] = o[0], l[0]
+        return out, lse
+
+    def test_merged_striped_partials_match_the_dense_reference(self):
+        for geo in (DCP2, DCP8):
+            for window in (None, SLIDING_WINDOW):
+                for blocks in (None, _small_decode_blocks()):
+                    if not full_matrix() and (window is None) != (blocks is None):
+                        continue
+                    label = f"{geo.name} window={window} blocks={blocks}"
+                    with self.subTest(label):
+                        partials = [
+                            self._run_rank(geo, rank, window, blocks)[0]
+                            for rank in range(geo.cp)
+                        ]
+                        out, lse = _merge_by_lse(partials)
+                        ref_out, ref_lse = self._reference(geo, window)
+                        self.assert_out_close(out, ref_out, label)
+                        self.assert_lse_close(lse, ref_lse, label)
+
+    def test_the_owner_writes_the_new_token_at_its_stripe_end(self):
+        for geo in (DCP2, DCP8):
+            full_k, full_v, _ = self._data(geo)
+            claimed = {}
+            for rank in range(geo.cp):
+                _, cache_after, shard, owns, pages = self._run_rank(geo, rank, None, None)
+                for seq, n in enumerate(self.SEQ_LENS):
+                    if not owns[seq]:
+                        continue
+                    self.assertNotIn(seq, claimed)
+                    claimed[seq] = rank
+                    j = _local_len(n - 1, rank, geo.cp)
+                    page = shard.page_indices[seq * pages + j // PAGE_SIZE]
+                    row = cache_after[page, j % PAGE_SIZE]
+                    row = row.reshape(-1, row.shape[-1])[: 2 * geo.num_kv_heads, :HEAD_DIM]
+                    row = row.reshape(geo.num_kv_heads, 2, HEAD_DIM)
+                    label = f"{geo.name} rank {rank} seq {seq}"
+                    self.assert_out_close(row[:, 0], full_k[seq][n - 1], label + " k")
+                    self.assert_out_close(row[:, 1], full_v[seq][n - 1], label + " v")
+            self.assertEqual(sorted(claimed), list(range(len(self.SEQ_LENS))))
+
+
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
 class TestBatchedRpaDcpExtendPrefixPass(_CloseAssertions):
     """cache_only with q_len > 1 in the MIXED range: every cached key precedes
     every query, and the window runs in global positions."""
@@ -559,18 +699,17 @@ class TestBatchedRpaDcpExtendPrefixPass(_CloseAssertions):
 class TestBatchedRpaDcpWindowStart(_CloseAssertions):
     """The schedule's global-window start on a rank > 0, with one-page k blocks.
 
-    The first local key j in the window of query q (j * cp + rank > q - window)
-    lands mid-block, exactly on a block boundary, or past the end of a short
-    shard. Each rank's partial output and LSE must equal dense attention over
+    The first local key j in the window of query q lands mid-block, exactly on
+    a block boundary, or past the end of a short stripe. Each rank's partial output and LSE must equal dense attention over
     that rank's own keys at their global positions.
     """
 
     # Decode global lengths per geometry and the checked ranks; their first
     # window keys fall exactly on a block boundary and inside a block.
-    DECODE = {DCP2: ((1152, 2600), (1,)), DCP8: ((2172, 2600), (3, 5))}
+    DECODE = {DCP2: ((896, 2600), (1,)), DCP8: ((2944, 1500), (3, 5))}
     # One extend: the queries of later q blocks are past the window of the
-    # whole 37-token prefix.
-    PREFIX, CHUNK = 37, 700
+    # whole 300-token prefix (rank 1 of DCP2 owns its positions 256..299).
+    PREFIX, CHUNK = 300, 700
 
     def _check_rank(self, geo, rank, partial, seq_k, seq_v, q, q_positions, label):
         positions = _local_positions(len(seq_k), rank, geo.cp)

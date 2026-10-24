@@ -20,8 +20,10 @@ Covered here:
 * Slot parity over ``TpuPagedTokenToKVPoolAllocator`` with a widened page:
   every token's location satisfies ``loc % dcp == position % dcp`` across
   ``alloc_extend`` (fresh, chunked and page-continuing) and ``alloc_decode``
-  sequences, which is what makes ``build_owner_write_spans`` claim each token on exactly
-  one rank at physical slot ``loc // dcp``.
+  sequences, so a logical (widened) page is position-aligned and
+  ``build_owner_write_spans`` can claim each token on exactly one rank -- the
+  one owning its ``page_size`` run -- at physical slot
+  ``(loc // (page_size * dcp)) * page_size + position % page_size``.
 
 Everything here is pure torch-CPU: the backend subclass skips the
 JAX-requiring kernel-op registration, as in ``test_pallas_rpa_batched_backend.py``.
@@ -151,8 +153,11 @@ def _build_meta(backend, fb, dcp: int, dcp_rank: int) -> PallasForwardMetadata:
         return backend._build_metadata(fb, backend._non_empty_batch_size(fb))
 
 
-def _local_lens(lens, dcp: int, rank: int) -> torch.Tensor:
-    return get_dcp_lens(torch.tensor(lens, dtype=torch.int32), dcp, rank)
+def _local_lens(lens, dcp: int, rank: int, page_size: int = 16) -> torch.Tensor:
+    # Page-striped: rank r owns page p iff p % dcp == r.
+    return get_dcp_lens(
+        torch.tensor(lens, dtype=torch.int32), dcp, rank, interleave_size=page_size
+    )
 
 
 @_requires_dcp_helpers
@@ -322,7 +327,11 @@ class TestPallasRpaDcpMetadataExtend(CustomTestCase):
         for rank in range(self.DCP):
             meta = self._meta(rank)
             chunk_local = [
-                sum(1 for p in range(s - e, s) if p % self.DCP == rank)
+                sum(
+                    1
+                    for p in range(s - e, s)
+                    if (p // self.PAGE_SIZE) % self.DCP == rank
+                )
                 for s, e in zip(self.SEQ_LENS, self.EXTEND_SEQ_LENS)
             ]
             total = meta.dcp_prefix_kv_lens.to(torch.int64) + torch.tensor(
@@ -372,14 +381,15 @@ class TestPallasRpaDcpCapacity(CustomTestCase):
         return _build_meta(backend, fb, self.DCP, rank)
 
     def test_sequence_longer_than_one_ranks_table_is_accepted(self):
-        # 100 global tokens exceed the 64-entry local table but shard to 50.
+        # 100 global tokens exceed the 64-entry local table but stripe to 52
+        # on rank 0 (three full 16-page runs plus 4 of the fourth).
         seq_len = 100
         self.assertGreater(seq_len, self.LOCAL_CAPACITY)
         meta = self._build(seq_len)
-        self.assertEqual(int(meta.kv_lens[0]), 50)
+        self.assertEqual(int(meta.kv_lens[0]), 52)
 
     def test_local_length_over_capacity_is_refused(self):
-        # 130 global tokens shard to 65 on rank 0 -- one past the local table.
+        # 130 global tokens stripe to 66 on rank 0 -- past the local table.
         with self.assertRaisesRegex(ValueError, "page-table capacity"):
             self._build(130, rank=0)
 
@@ -680,6 +690,13 @@ class TestOwnerWriteSpans(CustomTestCase):
         widened = self.PAGE * self.DCP
         return torch.tensor([widened + p for p in positions], dtype=torch.int64)
 
+    def _owns(self, position: int, rank: int) -> bool:
+        return (position // self.PAGE) % self.DCP == rank
+
+    def _slot(self, location: int, position: int) -> int:
+        widened = self.PAGE * self.DCP
+        return (location // widened) * self.PAGE + position % self.PAGE
+
     @staticmethod
     def _written(spans):
         """(compacted row -> physical slot) pairs the spans write, in order."""
@@ -699,28 +716,31 @@ class TestOwnerWriteSpans(CustomTestCase):
                 positions, locations, self.DCP, rank, self.PAGE, 32, 1
             )
             owned = [
-                i for i, p in enumerate(positions.tolist()) if p % self.DCP == rank
+                i for i, p in enumerate(positions.tolist()) if self._owns(p, rank)
             ]
             self.assertEqual(spans.index[: len(owned)].tolist(), owned)
             self.assertEqual(int(spans.lens.sum()), len(owned))
             for row, slot in self._written(spans):
                 token = owned[row]
-                self.assertEqual(slot, int(locations[token]) // self.DCP)
+                self.assertEqual(slot, self._slot(int(locations[token]), token))
                 self.assertNotIn(token, claimed)
                 claimed[token] = rank
         self.assertEqual(sorted(claimed), positions.tolist())
 
     def test_consecutive_owned_slots_share_one_span(self):
+        # Rank 1 owns the second 8-token page: positions 8..15, one run.
         positions = torch.arange(16, dtype=torch.int64)
         locations = self._locations(positions.tolist())
         spans = build_owner_write_spans(
             positions, locations, self.DCP, 1, self.PAGE, 16, 1
         )
-        self.assertEqual(spans.lens.tolist()[:2], [4, 0])
+        self.assertEqual(spans.lens.tolist()[:2], [8, 0])
+        self.assertEqual(spans.src.tolist()[0], 0)
+        self.assertEqual(spans.dst.tolist()[0], self.PAGE)
 
     def test_a_slot_jump_starts_a_new_span(self):
-        # Two requests whose pages are not adjacent: rank 0 owns positions 0
-        # and 4 of each, so it writes two runs of two.
+        # Two requests whose pages are not adjacent: rank 0 owns page 0 of
+        # each (positions 0..7), so it writes two runs of eight.
         positions = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7] * 2, dtype=torch.int64)
         widened = self.PAGE * self.DCP
         locations = torch.tensor(
@@ -730,9 +750,14 @@ class TestOwnerWriteSpans(CustomTestCase):
         spans = build_owner_write_spans(
             positions, locations, self.DCP, 0, self.PAGE, 16, 2
         )
-        self.assertEqual(spans.lens.tolist()[:3], [2, 2, 0])
-        self.assertEqual(spans.src.tolist()[:2], [0, 2])
+        self.assertEqual(spans.lens.tolist()[:3], [8, 8, 0])
+        self.assertEqual(spans.src.tolist()[:2], [0, 8])
         self.assertEqual(spans.dst.tolist()[:2], [self.PAGE, 3 * self.PAGE])
+        for rank in range(1, self.DCP):
+            spans = build_owner_write_spans(
+                positions, locations, self.DCP, rank, self.PAGE, 16, 2
+            )
+            self.assertEqual(int(spans.lens.sum()), 0)
 
     def test_padding_rows_go_to_the_dummy_slot(self):
         # Sync padding carries out_cache_loc 0 and position 0; only the rank

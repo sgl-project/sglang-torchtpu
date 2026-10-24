@@ -10,8 +10,8 @@ by log-sum-exp.
 This module holds the parts of that scheme that are independent of the backend
 object: the torch custom op for the CP-aware kernel (including the fused
 ``STRIPED`` decode scope), the fused-pool row layout and the owner-masked write
-used by extend, the cross-rank partial merge (one lane-dense all-gather) and
-the pure-torch merges of the extend path.
+used by extend, the query-head all-gather and the pure-torch merges
+(cross-rank log-sum-exp merge, sink fold, two-pass extend combine).
 
 ``attention_pallas_rpa_base`` drives them; the non-DCP path never calls in here.
 """
@@ -28,7 +28,6 @@ from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 __all__ = [
     "DCP_OP_NAME",
     "DcpWriteSpans",
-    "_dcp_merge_partials",
     "broadcast_own_kv_heads",
     "build_dcp_kernel_op",
     "build_owner_write_spans",
@@ -464,123 +463,27 @@ def gather_heads(
     world_size: int,
     rank_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``[T, H, D]`` of every rank as ``[T, H * world_size, D]``, rank-major."""
+    """``[T, H, D]`` of every rank as ``[T, H * world_size, D]``, rank-major.
+
+    One ``all_gather_into_tensor`` over the group. The zero-padded all-reduce
+    form (``_all_reduce_gather``) is kept for groups without an all-gather
+    (the CPU test doubles); on torch_tpu 0.2.0 / libtpu 0.0.50 a bf16
+    all-reduce of the queries inside the compiled forward deadlocks the
+    device on its first execute, while the all-gather runs.
+    """
     if world_size == 1:
         return x
-    if hasattr(group, "all_gather_into_tensor") and not getattr(
-        group, "_simulate_all_reduce_only", False
-    ):
-        num_tokens, heads, head_dim = x.shape
-        gathered = x.new_empty((world_size * num_tokens * heads, head_dim))
-        group.all_gather_into_tensor(gathered, x.contiguous().view(-1, head_dim))
-        return (
-            gathered.view(world_size, num_tokens, heads, head_dim)
-            .permute(1, 0, 2, 3)
-            .reshape(num_tokens, world_size * heads, head_dim)
-            .contiguous()
-        )
-    return _all_reduce_gather(x, group, world_size, rank_mask, dim=1)
-
-
-def _dcp_merge_partials(
-    gathered_partials: list[tuple[torch.Tensor, torch.Tensor]],
-    cp_group,
-    cp_size: int,
-    out_dtype: torch.dtype,
-    layer=None,
-    sinks: torch.Tensor | None = None,
-    local_partials: tuple[tuple[torch.Tensor, torch.Tensor], ...] = (),
-    return_lse: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Merge per-rank softmax partial states ``(out [T,H,D], lse [T,H])``.
-
-    With ``return_lse`` the merged f32 ``(out, lse)`` pair is returned and no
-    sink is folded in (the caller slices its own heads first; ``sinks`` is
-    per local head).
-
-    ``gathered_partials`` are all-gathered over the CP group (every rank holds
-    a different partial); ``local_partials`` are identical on every rank and
-    are merged once.
-
-    The payload is moved as lane-dense f32 rows of 128, concatenated along
-    8-aligned rows: [out (T*H rows) | lse (padded rows)]. Lane-dense f32 rows
-    gather cleanly without lowering issues or compiler hang.
-    """
-    if cp_size == 1 and not local_partials:
-        out0, lse0 = gathered_partials[0]
-        if return_lse:
-            return out0.to(torch.float32), lse0.to(torch.float32)
-        if sinks is None and layer is not None:
-            sinks = getattr(layer, "sinks", None)
-        if sinks is not None:
-            out0 = out0 * torch.sigmoid(lse0 - sinks.to(torch.float32))[..., None]
-        return out0.to(out_dtype)
-
-    out0, lse0 = gathered_partials[0]
-    num_tok, num_heads = lse0.shape[0], lse0.shape[1]
-    head_dim = out0.shape[-1]
-    n_lse = num_tok * num_heads
-    n_out = n_lse * head_dim
-    lanes = 128
-    # Both payloads are flattened and padded to whole (8, 128) tiles so the
-    # gather moves lane-dense f32 rows whatever the head dim.
-    tile = 8 * lanes
-    out_rows = -(-n_out // tile) * 8
-    lse_rows = -(-n_lse // tile) * 8
-    rows_per_partial = out_rows + lse_rows
-
-    def _pack(out, lse):
-        lse = torch.nan_to_num(lse.to(torch.float32), nan=-float("inf")).reshape(1, -1)
-        lse = torch.nn.functional.pad(lse, (0, lse_rows * lanes - n_lse)).reshape(lse_rows, lanes)
-        out = torch.nan_to_num(out.to(torch.float32), nan=0.0).reshape(1, -1)
-        out = torch.nn.functional.pad(out, (0, out_rows * lanes - n_out)).reshape(out_rows, lanes)
-        return torch.cat([out, lse], dim=0)
-
-    packed = torch.cat([_pack(o, l) for o, l in gathered_partials], dim=0).contiguous()
-    n_part = len(gathered_partials)
-    gathered = packed.new_empty((cp_size * packed.shape[0], lanes))
-    cp_group.all_gather_into_tensor(gathered, packed)
-    g = gathered.reshape(cp_size * n_part, rows_per_partial, lanes)
-    out_g = g[:, :out_rows, :].reshape(cp_size * n_part, -1)[:, :n_out]
-    outs = [out_g.reshape(-1, num_tok, num_heads, head_dim)]
-    lse_g = g[:, out_rows:, :].reshape(cp_size * n_part, -1)[:, :n_lse]
-    lses = [lse_g.reshape(-1, num_tok, num_heads)]
-    for out, lse in local_partials:
-        lses.append(torch.nan_to_num(lse.to(torch.float32), nan=-float("inf")).unsqueeze(0))
-        outs.append(torch.nan_to_num(out.to(torch.float32), nan=0.0).unsqueeze(0))
-
-    stacked_lses = torch.cat(lses, dim=0)
-    stacked_outs = torch.cat(outs, dim=0)
-    global_max_lse = torch.amax(stacked_lses, dim=0)
-    global_max_lse_safe = torch.where(
-        torch.isinf(global_max_lse), torch.zeros_like(global_max_lse), global_max_lse
+    if not hasattr(group, "all_gather_into_tensor"):
+        return _all_reduce_gather(x, group, world_size, rank_mask, dim=1)
+    num_tokens, heads, head_dim = x.shape
+    gathered = x.new_empty((world_size * num_tokens * heads, head_dim))
+    group.all_gather_into_tensor(gathered, x.contiguous().view(-1, head_dim))
+    return (
+        gathered.view(world_size, num_tokens, heads, head_dim)
+        .permute(1, 0, 2, 3)
+        .reshape(num_tokens, world_size * heads, head_dim)
+        .contiguous()
     )
-    # A partial with no tokens in scope reports lse = -inf; give it weight 0.
-    weights = torch.where(
-        torch.isinf(stacked_lses),
-        torch.zeros_like(stacked_lses),
-        torch.exp(stacked_lses - global_max_lse_safe.unsqueeze(0)),
-    )
-    sum_exp = torch.sum(weights, dim=0)
-    sum_exp_safe = torch.where(sum_exp == 0.0, torch.ones_like(sum_exp), sum_exp)
-    total_out = torch.sum(weights.unsqueeze(-1) * stacked_outs, dim=0)
-    merged_out = total_out / sum_exp_safe.unsqueeze(-1)
-
-    merged_lse = torch.where(
-        sum_exp == 0.0,
-        torch.full_like(sum_exp, -float("inf")),
-        torch.log(sum_exp_safe) + global_max_lse_safe,
-    )
-    if return_lse:
-        return merged_out, merged_lse
-
-    # Fold in attention sinks if present (e.g. GPT-OSS-120B)
-    if sinks is None and layer is not None:
-        sinks = getattr(layer, "sinks", None)
-    if sinks is not None:
-        merged_out = merged_out * torch.sigmoid(merged_lse - sinks.to(torch.float32))[..., None]
-
-    return merged_out.to(out_dtype)
 
 
 def merge_across_ranks(

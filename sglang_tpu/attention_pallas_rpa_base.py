@@ -49,7 +49,6 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang_tpu.attention_pallas_rpa_dcp import (
     DcpWriteSpans,
-    _dcp_merge_partials,
     broadcast_own_kv_heads,
     build_dcp_kernel_op,
     build_owner_write_spans,
@@ -1746,10 +1745,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         Decode is one fused ``STRIPED`` launch: the kernel attends this rank's
         page stripe with the whole group's query heads and, on the rank that
         owns the new token's page, also attends and writes the new token (its
-        slot is exactly the end of that rank's stripe). The per-rank partials
-        are then merged by ``_dcp_merge_partials`` (one lane-dense all-gather
-        and a local log-sum-exp merge, sink folded in once), and each rank
-        keeps its own heads.
+        slot is exactly the end of that rank's stripe). ``merge_across_ranks``
+        then merges the per-rank partial softmaxes and hands each rank back
+        its own heads; the sink is folded in once, after the merge.
 
         Extend writes the chunk's owned tokens with the span DMA first and
         takes two passes, because the chunk's own tokens are spread across the
@@ -1786,7 +1784,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 md.distribution,
                 md.dcp_kv_lens_global,
                 md.dcp_cp_rank,
-                None,  # attention_sink: folded in by _dcp_merge_partials
+                None,  # attention_sink: folded in after the merge
                 sm_scale,
                 sliding_window,
                 soft_cap,
@@ -1797,17 +1795,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 cp,  # cp_group_size
                 3,  # attention_scope: STRIPED
             )
-            merged, merged_lse = _dcp_merge_partials(
-                [(out_p, lse_p)], group, cp, torch.float32, return_lse=True
+            out, lse = merge_across_ranks(
+                out_p.float(),
+                lse_p,
+                group,
+                cp,
+                self._cp_rank_mask,
+                self._cp_rank_index,
             )
-            # Keep this rank's own heads; the sink (per local head) is folded
-            # in on them, once, after the merge.
-            heads = q.shape[1]
-            start = self._dcp_rank * heads
-            out = merged[:, start : start + heads, :]
             if sinks is not None:
-                out = sink_fold(out, merged_lse[:, start : start + heads], sinks)
-            return out.to(q.dtype).contiguous()
+                out = sink_fold(out, lse, sinks)
+            return out.to(q.dtype)
 
         write_owned_kv(
             self._kv_write_op, kv_cache, fused_kv_rows(k, v, kv_cache), spans
