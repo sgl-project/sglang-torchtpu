@@ -5,6 +5,7 @@ upstream session however a request ends."""
 import asyncio
 import contextlib
 import json
+import socket
 from types import SimpleNamespace
 
 import aiohttp
@@ -232,5 +233,169 @@ def test_affinity_connect_timeout_bounds_engine_requests(
                 for session in sessions
             )
             assert all(session.timeout.total == 1 for session in sessions)
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failing_role", ["prefill", "decode"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_affinity_refused_engine_returns_502(monkeypatch, failing_role, stream):
+    """A refused connection is attributed to its engine and returned as 502."""
+
+    async def run():
+        with socket.socket() as reserved:
+            reserved.bind(("127.0.0.1", 0))
+            dead = f"http://127.0.0.1:{reserved.getsockname()[1]}"
+            async with _engine() as healthy:
+                prefill, decode = (
+                    (dead, healthy) if failing_role == "prefill" else (healthy, dead)
+                )
+                balancer = _affinity_lb(prefill, decode)
+                monkeypatch.setattr(mini_lb, "lb", balancer)
+                response = await mini_lb._forward_to_backend(
+                    {"text": "hi", "stream": stream}, "generate", "s-1"
+                )
+                assert response.status_code == 502
+                assert json.loads(response.body)["error"]["message"].startswith(
+                    f"upstream unreachable: {dead}:"
+                )
+                assert not balancer.affinity_policy.loads.is_reachable(dead)
+                assert balancer.affinity_policy.loads.is_reachable(healthy)
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+def test_affinity_failed_dp_metadata_does_not_cache_partial_sizes(monkeypatch):
+    """A failed metadata query must not leave a half-initialized DP cache."""
+
+    async def run():
+        available = False
+
+        async def metadata(request):
+            if not available:
+                request.transport.close()
+                return web.Response()
+            return web.json_response({"internal_states": [{}]})
+
+        async with _engine() as prefill, _engine(info_handler=metadata) as decode:
+            balancer = _affinity_lb(prefill, decode)
+            balancer.test_external_dp_routing = True
+            monkeypatch.setattr(mini_lb, "lb", balancer)
+            failed = await mini_lb._forward_to_backend({"text": "hi"}, "generate", None)
+            assert failed.status_code == 502
+            assert balancer.prefill_dp_size is balancer.decode_dp_size is None
+            assert not balancer.affinity_policy.loads.is_reachable(decode)
+            available = True
+            async with aiohttp.ClientSession() as session:
+                await balancer._load_poller._poll(session=session, url=decode)
+            recovered = await mini_lb._forward_to_backend(
+                {"text": "hi"}, "generate", None
+            )
+            assert recovered.status_code == 200
+            assert balancer.prefill_dp_size == balancer.decode_dp_size == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stream", [False, True])
+def test_affinity_disconnect_cancels_peer_without_retry(monkeypatch, stream):
+    """An early disconnect must not leave its peer request waiting for headers."""
+
+    async def run():
+        peer_started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def peer(request):
+            calls.append("peer")
+            peer_started.set()
+            await release.wait()
+            return web.json_response({"text": "late"})
+
+        async def failing(request):
+            calls.append("failing")
+            await peer_started.wait()
+            request.transport.close()
+            return web.Response()
+
+        async with _engine(peer) as prefill, _engine(failing) as decode:
+            balancer = _affinity_lb(prefill, decode)
+            monkeypatch.setattr(mini_lb, "lb", balancer)
+            try:
+                response = await asyncio.wait_for(
+                    mini_lb._forward_to_backend({"stream": stream}, "generate", None),
+                    timeout=0.5,
+                )
+                assert response.status_code == 502
+                assert sorted(calls) == ["failing", "peer"]
+                assert balancer.affinity_policy.loads.is_reachable(prefill)
+                assert not balancer.affinity_policy.loads.is_reachable(decode)
+                assert not [
+                    task
+                    for task in asyncio.all_tasks()
+                    if task.get_coro().__qualname__
+                    == "MiniLoadBalancer._engine_request"
+                ]
+            finally:
+                release.set()
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failing_role", ["prefill", "decode"])
+def test_affinity_truncated_body_returns_502(monkeypatch, failing_role):
+    """Losing a JSON response body before client output is still a connection failure."""
+
+    async def truncated(request):
+        response = web.StreamResponse(
+            headers={"Content-Type": "application/json", "Content-Length": "100"}
+        )
+        await response.prepare(request)
+        await response.write(b'{"text":')
+        request.transport.close()
+        return response
+
+    async def run():
+        async with _engine() as healthy, _engine(truncated) as failing:
+            prefill, decode = (
+                (failing, healthy) if failing_role == "prefill" else (healthy, failing)
+            )
+            balancer = _affinity_lb(prefill, decode)
+            monkeypatch.setattr(mini_lb, "lb", balancer)
+            response = await mini_lb._forward_to_backend(
+                {"text": "hi", "return_logprob": True}, "generate", None
+            )
+            assert response.status_code == 502
+            assert not balancer.affinity_policy.loads.is_reachable(failing)
+            assert balancer.affinity_policy.loads.is_reachable(healthy)
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+def test_affinity_request_deadline_does_not_mark_engine_unreachable():
+    """A total request deadline does not establish a connection failure."""
+
+    async def run():
+        release = asyncio.Event()
+
+        async def slow(_request):
+            await release.wait()
+            return web.json_response({"text": "late"})
+
+        async with _engine() as prefill, _engine(slow) as decode:
+            balancer = _affinity_lb(prefill, decode)
+            balancer.timeout = 0.03
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await balancer.generate({"text": "hi"}, prefill, decode, "generate")
+                assert balancer.affinity_policy.loads.is_reachable(prefill)
+                assert balancer.affinity_policy.loads.is_reachable(decode)
+            finally:
+                release.set()
 
     asyncio.run(run())
