@@ -490,8 +490,13 @@ def _dcp_merge_partials(
     layer=None,
     sinks: torch.Tensor | None = None,
     local_partials: tuple[tuple[torch.Tensor, torch.Tensor], ...] = (),
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Merge per-rank softmax partial states ``(out [T,H,D], lse [T,H])``.
+
+    With ``return_lse`` the merged f32 ``(out, lse)`` pair is returned and no
+    sink is folded in (the caller slices its own heads first; ``sinks`` is
+    per local head).
 
     ``gathered_partials`` are all-gathered over the CP group (every rank holds
     a different partial); ``local_partials`` are identical on every rank and
@@ -503,6 +508,8 @@ def _dcp_merge_partials(
     """
     if cp_size == 1 and not local_partials:
         out0, lse0 = gathered_partials[0]
+        if return_lse:
+            return out0.to(torch.float32), lse0.to(torch.float32)
         if sinks is None and layer is not None:
             sinks = getattr(layer, "sinks", None)
         if sinks is not None:
@@ -559,11 +566,18 @@ def _dcp_merge_partials(
     total_out = torch.sum(weights.unsqueeze(-1) * stacked_outs, dim=0)
     merged_out = total_out / sum_exp_safe.unsqueeze(-1)
 
+    merged_lse = torch.where(
+        sum_exp == 0.0,
+        torch.full_like(sum_exp, -float("inf")),
+        torch.log(sum_exp_safe) + global_max_lse_safe,
+    )
+    if return_lse:
+        return merged_out, merged_lse
+
     # Fold in attention sinks if present (e.g. GPT-OSS-120B)
     if sinks is None and layer is not None:
         sinks = getattr(layer, "sinks", None)
     if sinks is not None:
-        merged_lse = torch.log(sum_exp_safe) + global_max_lse_safe
         merged_out = merged_out * torch.sigmoid(merged_lse - sinks.to(torch.float32))[..., None]
 
     return merged_out.to(out_dtype)

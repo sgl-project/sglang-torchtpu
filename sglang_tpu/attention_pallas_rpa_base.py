@@ -1797,12 +1797,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 cp,  # cp_group_size
                 3,  # attention_scope: STRIPED
             )
-            merged = _dcp_merge_partials(
-                [(out_p, lse_p)], group, cp, q.dtype, sinks=sinks
+            merged, merged_lse = _dcp_merge_partials(
+                [(out_p, lse_p)], group, cp, torch.float32, return_lse=True
             )
+            # Keep this rank's own heads; the sink (per local head) is folded
+            # in on them, once, after the merge.
             heads = q.shape[1]
             start = self._dcp_rank * heads
-            return merged[:, start : start + heads, :].contiguous()
+            out = merged[:, start : start + heads, :]
+            if sinks is not None:
+                out = sink_fold(out, merged_lse[:, start : start + heads], sinks)
+            return out.to(q.dtype).contiguous()
 
         write_owned_kv(
             self._kv_write_op, kv_cache, fused_kv_rows(k, v, kv_cache), spans
