@@ -65,7 +65,7 @@ Labels are required and come from `scripts/ci/tpu/support_matrix_vocab.json`; ad
 2. Run `pre-commit run --all-files`. It runs ruff, isort, codespell, and the TPU debt ratchet (see Architecture below).
 3. Review your own diff against [AGENTS.md](AGENTS.md). It is the checklist maintainers and their coding agents apply, including the plugin-migration rules; pointing your own agent at it before you open the PR catches placement problems earlier than CI does.
 4. Title with an area prefix: `[TPU]` backend code, `[TPU/CI]` CI and tooling, `[Docs]`, `[Upstream]` for a change also open against sgl-project/sglang (link it).
-5. Fill in the PR template. The description becomes the squash-merge commit message, so keep it accurate.
+5. Fill in the PR template as [REVIEW.md](REVIEW.md) describes. The description becomes the squash-merge commit message, so keep it accurate.
 6. Lint and CPU tests run automatically on every PR, from forks included, with no secrets involved.
 7. **TPU tests run on request**, because TPU capacity is limited and fork PRs cannot reach the TPU runners on their own. An authorized user adds the `run-ci` label after reading the diff and comments `/tag-and-rerun-ci` on the PR; that runs the TPU suite once for the current commit. A new push needs a new comment. `/rerun-failed-ci` reruns what failed. Only users listed in `.github/CI_PERMISSIONS.json` can run CI commands. A PR author can also rerun failed CI on their own PR with `/rerun-failed-ci`. Ask for the run in a PR comment once the CPU checks are green.
 8. CODEOWNERS assigns reviewers for TPU paths. One approval plus code-owner review, all threads resolved, then a maintainer squash-merges.
