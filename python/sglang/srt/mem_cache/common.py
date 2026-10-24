@@ -55,6 +55,34 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
+def pd_swa_transfer_window_start(
+    seq_len: int, sliding_window_size: int, page_size: int
+) -> int:
+    """First token of the sliding-window KV a P/D transfer moves for a prompt
+    of ``seq_len`` tokens. Prefill sends from here, decode allocates its SWA
+    tail from here, and the KV checksum covers the same range, so the three
+    must never drift apart.
+
+    The decode radix cache inserts a received request up to the page-aligned
+    boundary ``page_floor(seq_len)`` and the strict re-match after the insert
+    needs a full window of live SWA before that boundary, or the reused prefix
+    is rejected and the whole prompt is transferred again (#1391). Starting a
+    full window before the boundary, ``page_floor(page_floor(seq_len) - W)``,
+    guarantees that. It differs from ``page_floor(seq_len - W)`` only when the
+    window is not a page multiple and ``seq_len % P >= W % P``, where it moves
+    one page earlier. The window then spans at most ``ceil(W / P) + 1`` pages.
+    """
+    if seq_len <= 0:
+        return 0
+    boundary = page_align_floor(seq_len, page_size)
+    return max(0, page_align_floor(boundary - sliding_window_size, page_size))
+
+
+def pd_swa_transfer_max_pages(sliding_window_size: int, page_size: int) -> int:
+    """Largest page count ``pd_swa_transfer_window_start`` leaves in a window."""
+    return max(1, -(-sliding_window_size // page_size) + 1)
+
+
 def free_swa_out_of_window_slots(
     req: Req,
     pre_len: int,

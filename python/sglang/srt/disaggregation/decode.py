@@ -93,6 +93,7 @@ from sglang.srt.mem_cache.common import (
     dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
     page_align_floor,
+    pd_swa_transfer_window_start,
     release_kv_cache,
     restore_kv_cache,
 )
@@ -617,10 +618,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return seq_len
 
         # Match the window prefill sends: any longer tail would leave a page
-        # that the decode radix cache inserts but nothing writes.
+        # that the decode radix cache inserts but nothing writes, and a
+        # shorter one would fail _can_ignore_swa_kv_miss's re-match gate.
         page_size = self.token_to_kv_pool_allocator.page_size
-        window_start = max(0, seq_len - window_size)
-        window_start = (window_start // page_size) * page_size
+        window_start = pd_swa_transfer_window_start(seq_len, window_size, page_size)
         return seq_len - window_start
 
     def _swa_retractable_len(self, req: Req) -> int:
@@ -1699,8 +1700,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
-                window_start = max(total_prefix_len, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
+                window_start = pd_swa_transfer_window_start(
+                    seq_len, window_size, page_size
+                )
+                window_start = page_align_floor(
+                    max(total_prefix_len, window_start), page_size
+                )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]

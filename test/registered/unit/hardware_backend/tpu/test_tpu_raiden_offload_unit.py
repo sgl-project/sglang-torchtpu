@@ -41,6 +41,10 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import hicache_auto_size as sizing
+from sglang.srt.mem_cache.common import (
+    pd_swa_transfer_max_pages,
+    pd_swa_transfer_window_start,
+)
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.pool_host import base as host_base
 from sglang.srt.runtime_context import get_context
@@ -526,6 +530,51 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             {"SGLANG_RAIDEN_SWA_MAX_BLOCKS": "0"},
         ):
             self.assertEqual(mgr._swa_max_request_blocks(), 33)
+            # The transfer window starts a full window before the page-aligned
+            # end of the prompt, so it spans ceil(W / P) + 1 pages at most;
+            # a window one token past a page needs that extra page (#1391).
+            for window, page, expected in ((127, 64, 3), (65, 64, 3), (2047, 512, 5)):
+                mgr.kv_args = SimpleNamespace(
+                    page_size=page, sliding_window_size=window
+                )
+                self.assertEqual(mgr._swa_max_request_blocks(), expected)
+            # W % P in {0, 1, P-1}, W < P, P = 1, and the limit equals the
+            # helper every side sizes its window from.
+            for window, page in (
+                (128, 64),
+                (129, 64),
+                (191, 64),
+                (63, 64),
+                (1, 64),
+                (127, 1),
+                (1, 1),
+                (4096, 128),
+                (2047, 512),
+            ):
+                mgr.kv_args = SimpleNamespace(
+                    page_size=page, sliding_window_size=window
+                )
+                expected = pd_swa_transfer_max_pages(window, page)
+                self.assertEqual(mgr._swa_max_request_blocks(), expected)
+                self.assertEqual(expected, -(-window // page) + 1)
+                # Every prompt length fits: the window never needs more pages.
+                for seq_len in range(1, 4 * page + window):
+                    start = pd_swa_transfer_window_start(seq_len, window, page)
+                    pages = -(-seq_len // page) - start // page
+                    self.assertLessEqual(pages, expected)
+        # The override wins in both directions.
+        mgr.kv_args = SimpleNamespace(page_size=64, sliding_window_size=127)
+        with patch.dict(os.environ, {"SGLANG_RAIDEN_SWA_MAX_BLOCKS": "11"}):
+            self.assertEqual(mgr._swa_max_request_blocks(), 11)
+        with patch.dict(os.environ, {"SGLANG_RAIDEN_SWA_MAX_BLOCKS": "1"}):
+            self.assertEqual(mgr._swa_max_request_blocks(), 1)
+        with patch.dict(os.environ, {"SGLANG_RAIDEN_SWA_MAX_BLOCKS": "0"}):
+            mgr.kv_args = SimpleNamespace(page_size=64, sliding_window_size=0)
+            with self.assertRaises(RuntimeError):
+                mgr._swa_max_request_blocks()
+            mgr.kv_args = SimpleNamespace(page_size=64, sliding_window_size=None)
+            with self.assertRaises(RuntimeError):
+                mgr._swa_max_request_blocks()
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
@@ -778,6 +827,176 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertIn("SGLANG_RAIDEN_MAX_BLOCKS", reason)
         mgr._engine.start_read.assert_not_called()
         mgr._swa_engine.start_read.assert_not_called()
+
+    def test_hybrid_swa_decode_fails_a_prefill_with_an_older_window_start(self):
+        # A prefill running the pre-#1391 window start announces one page less
+        # than this decode allocated. Pairing would leave the decode's newest
+        # window page unwritten, so the room fails instead of transferring.
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=128,
+            swa_pages=33,
+        )
+        mgr._decode.remote_swa_blocks[room] = list(range(32))
+
+        self.assertFalse(mgr.maybe_start_pull(room))
+        reason = mgr.record_failure.call_args.args[1]
+        self.assertIn("announced 32 sliding-window pages", reason)
+        self.assertIn("decode allocated 33", reason)
+        self.assertIn("same sglang version", reason)
+        self.assertIn(str(room), mgr._failed)
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+
+    def test_swa_window_mismatch_reason_names_both_counts(self):
+        mgr = object.__new__(RaidenKVManager)
+        # fewer announced than allocated: a mismatch
+        reason = mgr._swa_window_mismatch(list(range(2)), list(range(3)))
+        self.assertIn("announced 2 sliding-window pages", reason)
+        self.assertIn("decode allocated 3", reason)
+        self.assertIn("same sglang version", reason)
+        self.assertIn("#1391", mgr._swa_window_mismatch.__doc__)
+        # zero announced while the decode allocated pages: a mismatch
+        reason = mgr._swa_window_mismatch([], [7])
+        self.assertIn("announced 0 sliding-window pages", reason)
+        self.assertIn("decode allocated 1", reason)
+        # equal and more (decode prefix hit) pair as before
+        self.assertIsNone(mgr._swa_window_mismatch(list(range(3)), list(range(3))))
+        self.assertIsNone(mgr._swa_window_mismatch(list(range(5)), list(range(3))))
+        # a full prefix hit holds no SWA pages: nothing to compare
+        self.assertIsNone(mgr._swa_window_mismatch([], []))
+        self.assertIsNone(mgr._swa_window_mismatch(list(range(3)), []))
+
+    def test_swa_window_mismatch_never_fires_between_same_version_peers(self):
+        # Both sides page the window from pd_swa_transfer_window_start, so the
+        # prefill announces exactly the pages the decode allocated, or more
+        # after a decode prefix hit. An old-formula prefill announces one page
+        # less exactly at the lengths the fix moved, and only there.
+        mgr = object.__new__(RaidenKVManager)
+        for window, page in (
+            (127, 64),
+            (65, 64),
+            (128, 64),
+            (2047, 512),
+            (1000, 512),
+            (50, 128),
+        ):
+            for seq_len in range(1, 6 * page + window):
+                start = pd_swa_transfer_window_start(seq_len, window, page)
+                pages = -(-seq_len // page) - start // page
+                decode = list(range(2000, 2000 + pages))
+                prefill = list(range(pages))
+                with self.subTest(window=window, page=page, seq=seq_len):
+                    self.assertIsNone(mgr._swa_window_mismatch(prefill, decode))
+                    # decode prefix hit: it allocated only the tail pages
+                    for hit in range(1, pages):
+                        self.assertIsNone(
+                            mgr._swa_window_mismatch(prefill, decode[hit:])
+                        )
+                    old_start = max(0, seq_len - window) // page * page
+                    old_pages = -(-seq_len // page) - old_start // page
+                    skewed = mgr._swa_window_mismatch(list(range(old_pages)), decode)
+                    if old_start != start:
+                        self.assertIsNotNone(skewed)
+                        self.assertIn(f"announced {old_pages} ", skewed)
+                        self.assertIn(f"allocated {pages}", skewed)
+                    else:
+                        self.assertIsNone(skewed)
+
+    def test_hybrid_swa_decode_fails_when_no_window_pages_are_announced(self):
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=128,
+            swa_pages=3,
+        )
+        mgr._decode.remote_swa_blocks[room] = []
+
+        self.assertFalse(mgr.maybe_start_pull(room))
+        reason = mgr.record_failure.call_args.args[1]
+        self.assertIn("announced 0 sliding-window pages", reason)
+        self.assertIn("decode allocated 3", reason)
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+
+    def test_hybrid_swa_decode_mismatch_retry_keeps_the_reason(self):
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=128,
+            swa_pages=33,
+        )
+        mgr._decode.remote_swa_blocks[room] = list(range(32))
+
+        self.assertFalse(mgr.maybe_start_pull(room))
+        first = mgr.record_failure.call_args.args[1]
+        # The scheduler polls again; the room stays failed with the same
+        # reason and still issues nothing.
+        self.assertFalse(mgr.maybe_start_pull(room))
+        self.assertEqual(mgr.record_failure.call_args.args[1], first)
+        self.assertEqual(mgr._failed, {str(room)})
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+
+    def test_hybrid_swa_decode_mismatch_on_a_released_room_records_nothing(self):
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=128,
+            swa_pages=33,
+        )
+        # The framework already dropped the room: only the log line remains.
+        del mgr._decode.local_blocks[room]
+        mgr._reject_swa_window_mismatch(room, "mismatch")
+        mgr.record_failure.assert_not_called()
+        self.assertEqual(mgr._failed, set())
+
+    def test_hybrid_swa_decode_full_prefix_hit_holds_no_window_pages(self):
+        # Every page is cached on the decode: both lists are empty, the guard
+        # has nothing to compare and the room completes without a read.
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=0,
+            swa_pages=0,
+        )
+        mgr._decode.remote_blocks[room] = list(range(128))
+        mgr._decode.remote_swa_blocks[room] = list(range(33))
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr.record_failure.assert_not_called()
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+        self.assertIn(str(room), mgr._completed_recv)
+        self.assertIn(mgr._swa_req_id(room), mgr._completed_recv)
+
+    def test_hybrid_swa_decode_accepts_equal_window_pages_at_the_limit(self):
+        # ceil(127/64) + 1 = 3 window pages on a gpt-oss-shaped decode.
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=128,
+            swa_pages=3,
+            swa_max_blocks=3,
+        )
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr.record_failure.assert_not_called()
+        mgr._swa_engine.start_read.assert_called_once_with(
+            mgr._swa_req_id(room),
+            room,
+            "127.0.0.1:31022",
+            list(range(3)),
+            list(range(2000, 2003)),
+        )
+
+    def test_hybrid_swa_decode_pairs_the_tail_after_a_prefix_hit(self):
+        # The decode legitimately holds fewer window pages than the prefill
+        # announces after a prefix hit; the tail pairs as before.
+        room, mgr = self._make_hybrid_swa_decode_manager(
+            full_pages=128,
+            swa_pages=32,
+        )
+        mgr._decode.remote_swa_blocks[room] = list(range(33))
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr.record_failure.assert_not_called()
+        mgr._swa_engine.start_read.assert_called_once_with(
+            mgr._swa_req_id(room),
+            room,
+            "127.0.0.1:31022",
+            list(range(1, 33)),
+            list(range(2000, 2032)),
+        )
 
     def test_hybrid_swa_decode_rejects_oversized_swa_pull(self):
         room, mgr = self._make_hybrid_swa_decode_manager(
@@ -1388,6 +1607,107 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertTrue(mgr.is_failed(room))
         self.assertIn("SGLANG_RAIDEN_MAX_BLOCKS", mgr.record_failure.call_args.args[1])
         self.assertIn("16 pages", mgr.record_failure.call_args.args[1])
+
+    def test_closing_read_fails_a_prefill_with_an_older_window_start(self):
+        # Chunked counterpart of the whole-pull check: the prefill announced
+        # one window page less than this decode allocated (#1391).
+        room = 45
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        mgr = self._decode(room, local, pool_pages=256)
+        mgr._swa_engine = Mock()
+        mgr._swa_engine_max_blocks = 3
+        mgr._decode.remote_swa_blocks = {room: [4, 5]}
+        mgr._decode.local_swa_blocks = {room: [7, 8, 9]}
+        mgr._decode.remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._decode.chunk_queue[room] = [
+            (
+                str(room),
+                room,
+                list(range(48, 48 + 16)),
+                remote[48:64],
+                "127.0.0.1:31020",
+            )
+        ]
+
+        self.assertFalse(mgr.maybe_start_pull(room))
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+        self.assertTrue(mgr.is_failed(room))
+        reason = mgr.record_failure.call_args.args[1]
+        self.assertIn("announced 2 sliding-window pages", reason)
+        self.assertIn("decode allocated 3", reason)
+
+    def _closing_read_decode(self, room, remote_swa, local_swa):
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        mgr = self._decode(room, local, pool_pages=256)
+        mgr._swa_engine = Mock()
+        mgr._swa_engine.start_read = Mock(return_value=0)
+        mgr._swa_engine_max_blocks = 3
+        mgr._decode.remote_swa_blocks = {room: remote_swa}
+        mgr._decode.local_swa_blocks = {room: local_swa}
+        mgr._decode.remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._decode.chunk_queue[room] = [
+            (
+                str(room),
+                room,
+                list(range(48, 48 + 16)),
+                remote[48:64],
+                "127.0.0.1:31020",
+            )
+        ]
+        return mgr
+
+    def test_closing_read_pairs_equal_or_more_announced_window_pages(self):
+        # Same version: the prefill announces the decode's count; after a
+        # decode prefix hit it announces more and the tail pairs.
+        for remote_swa, paired in (([4, 5, 6], [4, 5, 6]), ([3, 4, 5, 6], [4, 5, 6])):
+            room = 46
+            mgr = self._closing_read_decode(room, remote_swa, [7, 8, 9])
+            self.assertTrue(mgr.maybe_start_pull(room))
+            mgr.record_failure.assert_not_called()
+            mgr._swa_engine.start_read.assert_called_once_with(
+                mgr._swa_req_id(room),
+                room,
+                "127.0.0.1:31022",
+                paired,
+                [7, 8, 9],
+            )
+
+    def test_closing_read_fails_when_no_window_pages_are_announced(self):
+        room = 47
+        mgr = self._closing_read_decode(room, [], [7, 8, 9])
+        self.assertFalse(mgr.maybe_start_pull(room))
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+        self.assertTrue(mgr.is_failed(room))
+        reason = mgr.record_failure.call_args.args[1]
+        self.assertIn("announced 0 sliding-window pages", reason)
+        self.assertIn("decode allocated 3", reason)
+
+    def test_closing_read_with_no_local_window_pages_skips_the_guard(self):
+        # A decode that holds no SWA pages for the room pairs nothing: the
+        # guard does not fire and the closing read goes ahead. (The empty SWA
+        # read it still issues predates #1391 and is left as is.)
+        room = 48
+        mgr = self._closing_read_decode(room, [4, 5, 6], [])
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr.record_failure.assert_not_called()
+        mgr._engine.start_read.assert_called_once()
+        mgr._swa_engine.start_read.assert_called_once_with(
+            mgr._swa_req_id(room), room, "127.0.0.1:31022", [], []
+        )
+
+    def test_closing_read_mismatch_is_not_reported_as_oversized(self):
+        # Both the limit and the window guard would trip; the mismatch is the
+        # real cause and names the versions, not SGLANG_RAIDEN_SWA_MAX_BLOCKS.
+        room = 49
+        mgr = self._closing_read_decode(room, [4, 5], [6, 7, 8, 9])
+        self.assertFalse(mgr.maybe_start_pull(room))
+        reason = mgr.record_failure.call_args.args[1]
+        self.assertIn("announced 2 sliding-window pages", reason)
+        self.assertNotIn("SGLANG_RAIDEN_SWA_MAX_BLOCKS", reason)
 
     def test_closing_read_checks_the_sliding_window_pages_against_their_limit(self):
         room = 44
