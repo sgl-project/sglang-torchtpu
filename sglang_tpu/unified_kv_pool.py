@@ -624,6 +624,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         "swa_first",
         "timestamp_interleaved",
         "stale_swa_then_whole_branch",
+        "cost_benefit_weighted",
     )
 
     def __init__(
@@ -803,6 +804,11 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return (interleaved[0], interleaved[1])
         if active_policy == "stale_swa_then_whole_branch" and candidates:
             planned = self.plan_stale_swa_then_whole_branch_eviction(candidates, short)
+            if planned is None:
+                return None
+            return (planned[0], planned[1])
+        if active_policy == "cost_benefit_weighted" and candidates:
+            planned = self.plan_cost_benefit_eviction(candidates, short)
             if planned is None:
                 return None
             return (planned[0], planned[1])
@@ -998,6 +1004,107 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                     pid = parent_cand.parent_id
                 else:
                     break
+
+        if freed_phys < short_physical_pages:
+            return None
+        return (full_tokens_evicted, swa_tokens_evicted, chosen)
+
+    def score_eviction_candidate(
+        self,
+        cand: EvictionCandidate,
+        *,
+        swa_reclaimed: Optional[Set[Any]] = None,
+    ) -> float:
+        """Return ``recompute_cost / physical_pages_freed`` (lower score => evict first)."""
+        ps = self.page_size
+        ms = self._swa_groups
+        pages = max(1, max(0, int(cand.tokens)) // ps)
+        reclaimed = swa_reclaimed or set()
+        if cand.kind == "swa":
+            if cand.is_stale_swa and cand.num_children == 1:
+                return 0.0
+            phys_freed = pages * ms
+            fanout = max(1, cand.num_children)
+            depth = max(cand.tokens, cand.prefix_tokens)
+            recompute_work = float(depth) * float(depth) * float(fanout)
+            return recompute_work / float(phys_freed)
+        # Full candidate
+        has_swa = cand.has_coupled_swa and cand.node_id not in reclaimed
+        if not has_swa and cand.num_children == 0:
+            return 0.0
+        phys_freed = pages * (1 + ms if has_swa else 1)
+        depth = max(cand.tokens, cand.prefix_tokens)
+        # Quadratic prefill recompute cost proportional to N * depth
+        recompute_work = float(cand.tokens) * float(depth)
+        return recompute_work / float(phys_freed)
+
+    def plan_cost_benefit_eviction(
+        self,
+        candidates: Sequence[EvictionCandidate],
+        short_physical_pages: int,
+    ) -> Optional[Tuple[int, int, List[EvictionCandidate]]]:
+        """Evict candidates in ascending order of ``(recompute_cost / physical_pages_freed, last_access_time)``."""
+        if short_physical_pages <= 0:
+            return (0, 0, [])
+        ps = self.page_size
+        ms = self._swa_groups
+        swa_reclaimed: Set[Any] = set()
+        full_reclaimed: Set[Any] = set()
+        freed_phys = 0
+        full_tokens_evicted = 0
+        swa_tokens_evicted = 0
+        chosen: List[EvictionCandidate] = []
+
+        full_by_id: Dict[Any, EvictionCandidate] = {}
+        live_children: Dict[Any, int] = {}
+        for c in candidates:
+            if c.kind == "full":
+                full_by_id[c.node_id] = c
+                live_children[c.node_id] = c.num_children
+
+        remaining = list(candidates)
+        while remaining and freed_phys < short_physical_pages:
+            eligible = [
+                c
+                for c in remaining
+                if (
+                    (c.kind == "swa" and c.node_id not in swa_reclaimed and c.node_id not in full_reclaimed)
+                    or (
+                        c.kind == "full"
+                        and c.node_id not in full_reclaimed
+                        and live_children.get(c.node_id, c.num_children) == 0
+                    )
+                )
+                and max(0, int(c.tokens)) // ps > 0
+            ]
+            if not eligible:
+                break
+            eligible.sort(
+                key=lambda c: (
+                    self.score_eviction_candidate(c, swa_reclaimed=swa_reclaimed),
+                    c.last_access_time,
+                )
+            )
+            cand = eligible[0]
+            remaining.remove(cand)
+            pages = max(0, int(cand.tokens)) // ps
+            if cand.kind == "swa":
+                swa_reclaimed.add(cand.node_id)
+                freed_phys += pages * ms
+                swa_tokens_evicted += pages * ps
+                chosen.append(cand)
+            else:
+                full_reclaimed.add(cand.node_id)
+                has_swa = cand.has_coupled_swa and cand.node_id not in swa_reclaimed
+                if has_swa:
+                    swa_reclaimed.add(cand.node_id)
+                    freed_phys += pages * (1 + ms)
+                else:
+                    freed_phys += pages
+                full_tokens_evicted += pages * ps
+                chosen.append(cand)
+                if cand.parent_id in live_children:
+                    live_children[cand.parent_id] = max(0, live_children[cand.parent_id] - 1)
 
         if freed_phys < short_physical_pages:
             return None
