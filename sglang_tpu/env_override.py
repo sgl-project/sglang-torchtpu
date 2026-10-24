@@ -44,6 +44,11 @@ _ASSOCIATIVE_SCAN_OVERRIDES = (
     "--xla_tpu_use_associative_scan_emitter=false",
 )
 
+_EXECUTABLE_METADATA_OVERRIDES = (
+    # Original HLO is diagnostic state; serving uses the optimized executable.
+    "--xla_tpu_save_original_hlo_module=false",
+)
+
 _VMEM_PREFETCH_OVERRIDES = (
     # TODO: drop once the XLA:TPU memory-space-assignment scheduling issue is
     # fixed. With more than one outstanding VMEM prefetch, sufficiently large
@@ -127,7 +132,9 @@ def apply_tpu_env_overrides() -> None:
         )
 
     appended = _override_libtpu_flags(
-        _SPARSE_CORE_OFFLOAD_OVERRIDES + _ASSOCIATIVE_SCAN_OVERRIDES
+        _SPARSE_CORE_OFFLOAD_OVERRIDES
+        + _ASSOCIATIVE_SCAN_OVERRIDES
+        + _EXECUTABLE_METADATA_OVERRIDES
     )
     if appended:
         logger.info(

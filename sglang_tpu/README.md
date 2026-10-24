@@ -136,7 +136,7 @@ launches without a `/freeze_gc` request. Each host scans its files once per clea
 pass; all ranks finish before the handshake returns.
 
 The existing `/freeze_gc` request repeats file-cache release to cover files used
-or created by subsequent warmup, then collects garbage, freezes GC and trims freed
+or created by subsequent warmup, clears JAX tracing caches, then collects garbage, freezes GC and trims freed
 host heap pages. Python HTTP startup waits for this second pass before reporting
 readiness. Direct `Engine` callers can also call `freeze_gc()` after their own
 warmup.
@@ -147,7 +147,7 @@ because independently received freeze requests can deadlock with scheduling
 collectives. DWDP's independent scheduling is exempt from this check.
 
 `SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE=0` keeps target and draft checkpoint
-shards cached. `SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE=0` keeps the native compiler
+shards cached. `SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS=0` keeps the native compiler
 cache pages. Both releases default on. The compiler cache namespace comes from
 `TORCH_TPU_TIER2_COMPILATION_CACHE` (legacy:
 `TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE`); empty or unset selects `default`,
@@ -160,3 +160,7 @@ eviction starts at the scheduler-ready handshake. This can increase peak host
 memory relative to evicting immediately after weight loading. Reusing files
 after cleanup can require storage reads. After freeze cleanup, one rank per host
 logs cgroup `memory.current` in bytes; this diagnostic does not gate readiness.
+
+JAX cache clearing leaves loaded serving executables alive, but new shapes may
+need retracing. It runs independently of the file-cache and allocator-trim
+opt-outs so GC does not freeze obsolete tracing objects.

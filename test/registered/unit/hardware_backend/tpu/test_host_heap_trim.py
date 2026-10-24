@@ -98,6 +98,7 @@ class TestInstall(CustomTestCase):
 
         self.cls = Scheduler
         tpu.install(scheduler_cls=self.cls)
+        self.clear = self.enterContext(patch.object(tpu.CacheArtifactManager, "clear"))
 
     def tearDown(self):
         tpu._stop_periodic()
@@ -105,13 +106,37 @@ class TestInstall(CustomTestCase):
 
     def test_trims_after_the_handler_and_keeps_the_forward(self):
         scheduler = self.cls()
+        self.clear.side_effect = lambda: scheduler.calls.append("export records")
         with (
+            patch.object(
+                tpu.gc, "collect", side_effect=lambda: scheduler.calls.append("collect")
+            ),
             patch.object(tpu, "trim_host_heap", side_effect=scheduler.calls.append),
+            patch.object(
+                tpu.jax,
+                "clear_caches",
+                side_effect=lambda: scheduler.calls.append("clear JAX"),
+            ),
+            patch.object(
+                tpu,
+                "_release_cpu_backend",
+                side_effect=lambda: scheduler.calls.append("CPU backend"),
+            ),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.assertEqual(scheduler.handle_freeze_gc("req"), "forwarded")
-        self.assertEqual(scheduler.calls, ["req", "after warmup"])
+        self.assertEqual(
+            scheduler.calls,
+            [
+                "export records",
+                "clear JAX",
+                "CPU backend",
+                "collect",
+                "req",
+                "after warmup",
+            ],
+        )
         self.assertIsNone(tpu._periodic_thread)
 
     def test_collects_cycles_before_the_handler_freezes_them(self):
@@ -124,7 +149,7 @@ class TestInstall(CustomTestCase):
         del node
         with (
             patch.object(tpu, "trim_host_heap"),
-            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.cls().handle_freeze_gc("req")
@@ -138,6 +163,19 @@ class TestInstall(CustomTestCase):
         ):
             self.cls().handle_freeze_gc("req")
         trim.assert_not_called()
+        self.clear.assert_called_once_with()
+
+    def test_failed_cache_save_does_not_clear_records_or_freeze(self):
+        scheduler = self.cls()
+        with patch.object(
+            page_cache,
+            "resolve_compilations",
+            side_effect=RuntimeError("cache save failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cache save failed"):
+                scheduler.handle_freeze_gc("req")
+        self.clear.assert_not_called()
+        self.assertEqual(scheduler.calls, [])
 
     def test_install_wraps_once(self):
         wrapped = self.cls.handle_freeze_gc
@@ -171,6 +209,88 @@ class TestInstall(CustomTestCase):
             self.cls().handle_freeze_gc("req")
             self.assertTrue(trimmed.wait(2.0))
         self.assertIsNotNone(tpu._periodic_thread)
+
+
+class _Backend:
+    def __init__(self, platform):
+        self.platform = platform
+
+
+class TestCpuBackendRelease(CustomTestCase):
+    def setUp(self):
+        self.bridge = tpu.xla_bridge
+        self.tpu_backend = _Backend("tpu")
+        self.enterContext(
+            patch.object(
+                self.bridge,
+                "_backends",
+                {"cpu": _Backend("cpu"), "tpu": self.tpu_backend},
+            )
+        )
+        self.enterContext(
+            patch.object(self.bridge, "_default_backend", self.tpu_backend)
+        )
+        self.enterContext(
+            patch.object(
+                self.bridge, "_get_backend_uncached", tpu._jax_get_backend_uncached
+            )
+        )
+        self.enterContext(self.bridge.config.jax_platforms("tpu,cpu"))
+        self.init = self.enterContext(
+            patch.object(self.bridge, "_init_backend", side_effect=self.init_backend)
+        )
+        self.bridge.get_backend.cache_clear()
+        self.addCleanup(self.bridge.get_backend.cache_clear)
+
+    def init_backend(self, platform):
+        return self.tpu_backend if platform == "tpu" else _Backend(platform)
+
+    def test_release_preserves_tpu_and_recreates_cpu_once(self):
+        cpu_ref = weakref.ref(self.bridge.get_backend("cpu"))
+        self.assertTrue(tpu._release_cpu_backend())
+        gc.collect()
+        self.assertIsNone(cpu_ref())
+        self.assertIs(self.bridge.get_backend(), self.tpu_backend)
+        self.assertIs(self.bridge.get_backend("tpu"), self.tpu_backend)
+        self.assertIs(self.bridge.get_backend(self.tpu_backend), self.tpu_backend)
+        self.init.assert_not_called()
+
+        cpu = self.bridge.get_backend("cpu")
+        self.assertIs(self.bridge.get_backend("cpu"), cpu)
+        self.init.assert_called_once_with("cpu")
+        wrapper = self.bridge._get_backend_uncached
+        self.assertTrue(tpu._release_cpu_backend())
+        self.assertIs(self.bridge._get_backend_uncached, wrapper)
+        self.assertIsNot(self.bridge.get_backend("cpu"), cpu)
+        self.assertEqual(self.init.call_count, 2)
+
+    def test_default_or_absent_cpu_is_preserved_without_initialization(self):
+        wrapper = self.bridge._get_backend_uncached
+        self.bridge._default_backend = self.bridge._backends["cpu"]
+        self.assertFalse(tpu._release_cpu_backend())
+        self.assertIs(self.bridge._backends["cpu"], self.bridge._default_backend)
+        del self.bridge._backends["cpu"]
+        self.assertFalse(tpu._release_cpu_backend())
+        self.assertIs(self.bridge._get_backend_uncached, wrapper)
+        self.init.assert_not_called()
+
+    def test_empty_registry_uses_normal_backend_initialization(self):
+        tpu._release_cpu_backend()
+        self.bridge._backends.clear()
+        self.bridge._default_backend = None
+        self.bridge.get_backend.cache_clear()
+        cpu = self.bridge.get_backend("cpu")
+        self.assertIs(cpu, self.bridge._backends["cpu"])
+        self.assertIs(self.bridge.get_backend(), self.tpu_backend)
+        self.assertEqual(self.init.call_count, 2)
+
+    def test_cpu_initialization_failure_propagates_without_losing_tpu(self):
+        tpu._release_cpu_backend()
+        self.init.side_effect = RuntimeError("CPU initialization failed")
+        with self.assertRaisesRegex(RuntimeError, "CPU initialization failed"):
+            self.bridge.get_backend("cpu")
+        self.assertNotIn("cpu", self.bridge._backends)
+        self.assertIs(self.bridge.get_backend("tpu"), self.tpu_backend)
 
 
 if __name__ == "__main__":
