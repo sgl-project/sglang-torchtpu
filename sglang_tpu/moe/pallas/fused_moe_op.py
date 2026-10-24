@@ -733,6 +733,17 @@ def _fused_moe_jax(
             gather_end,
         )
     else:
+        if w1_scale is None and w1.shape[1] != hidden_size:
+            assert w1.shape[1] % 128 == 0, (
+                f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
+                "to a multiple of 128 at load time"
+            )
+            # Zero-pad activations to the load-padded weight's lane-aligned K
+            # before the gather so the pad runs on [m, :] instead of [m*topk, :]
+            # and the gather reads 128-lane-aligned rows.
+            hidden_states = jnp.pad(
+                hidden_states, ((0, 0), (0, w1.shape[1] - hidden_size))
+            )
         x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
 
     # Multi-token dense decode: route on local expert ids with a sort-free rank
@@ -800,10 +811,10 @@ def _fused_moe_jax(
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
             "to a multiple of 128 at load time"
         )
-        if w1.shape[1] != hidden_size:
+        if w1.shape[1] != x_sorted.shape[1]:
             # activations are born at model width; zero-pad K to the
             # load-padded weight's width (0 * w = 0, exact)
-            x_sorted = jnp.pad(x_sorted, ((0, 0), (0, w1.shape[1] - hidden_size)))
+            x_sorted = jnp.pad(x_sorted, ((0, 0), (0, w1.shape[1] - x_sorted.shape[1])))
     elif hidden_size % 128 != 0:
         raise NotImplementedError(
             f"Quantized MoE with non-lane-aligned hidden dim ({hidden_size}) "
@@ -887,7 +898,7 @@ def _fused_moe_jax(
             _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
         )
     )
-    gmm2_out = gmm_v2(
+    gmm2_raw = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
         group_sizes=group_sizes,
@@ -902,10 +913,8 @@ def _fused_moe_jax(
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_int4_in_vmem,
-    )[
-        :,
-        :hidden_size,
-    ]  # [m*topk, k]
+    )  # [m*topk, k_padded]
+    gmm2_out = gmm2_raw[:, :hidden_size]  # [m*topk, k]
 
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
@@ -984,24 +993,34 @@ def _fused_moe_jax(
         )
     else:
         # Gather on the TensorCore.
+        if not no_combine:
+            # Unroll the top-k gather + weighted sum so XLA fuses the per-slot
+            # gathers with the reduction in VMEM instead of materializing a
+            # [m, topk, hidden_size] intermediate tensor to HBM. Keep gmm2_raw
+            # at its lane-aligned width through the gather and slice to
+            # hidden_size once on the combined [m_orig, :] output.
+            unsort_2d = unsort_idx[: m_orig * topk].reshape(m_orig, topk)
+            w_2d = topk_weights[:m_orig].reshape(m_orig, topk).astype(jnp.float32)
+            acc = None
+            for k_idx in range(topk):
+                wk = w_2d[:, k_idx : k_idx + 1]
+                row_k = gmm2_raw[unsort_2d[:, k_idx]].astype(jnp.float32)
+                term = row_k * wk
+                acc = term if acc is None else (acc + term)
+            return acc[:, :hidden_size].astype(out_dtype)
         unsorted = gmm2_out[unsort_idx]
     unsorted = unsorted.reshape(m, topk, hidden_size)
     unsorted = unsorted[:m_orig].astype(out_dtype)
-    if no_combine:
-        # Zero the rows this rank did not compute (dropped and non-local slots),
-        # so a later post-norm + combine with the original router weights never
-        # reads them.
-        if use_group_offset:
-            valid_rows_mask = _valid_rows_mask(row_start, row_end, unsort_idx)[
-                : m_orig * topk
-            ].reshape(m_orig, topk, 1)
-        else:
-            valid_rows_mask = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
-        return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
-
-    weights = topk_weights[:m_orig].reshape(m_orig, topk, 1).astype(unsorted.dtype)
-    out = (unsorted * weights).sum(axis=1).astype(out_dtype)
-    return out
+    # no_combine: zero the rows this rank did not compute (dropped and
+    # non-local slots), so a later post-norm + combine with the original
+    # router weights never reads them.
+    if use_group_offset:
+        valid_rows_mask = _valid_rows_mask(row_start, row_end, unsort_idx)[
+            : m_orig * topk
+        ].reshape(m_orig, topk, 1)
+    else:
+        valid_rows_mask = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
+    return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
 
 
 def _build_fused_moe_op():
