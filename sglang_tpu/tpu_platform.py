@@ -166,11 +166,6 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
             f"{feature} requires --attention-backend pallas_tpu_rpa_batched, "
             f"got {backend!r}."
         )
-    if _uses_seq_along_lane_kv():
-        raise NotImplementedError(
-            f"{feature} writes K/V in the token-major fused layout; unset "
-            "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV."
-        )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(f"{feature} does not support speculative decoding.")
     if cfg.attn_dp_size > 1:

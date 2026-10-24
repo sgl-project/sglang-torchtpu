@@ -223,18 +223,36 @@ def build_dcp_kernel_op(spec):
 
 
 def fused_kv_rows(
-    k: torch.Tensor, v: torch.Tensor, kv_cache: torch.Tensor
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache: torch.Tensor,
+    *,
+    seq_along_lane: bool | None = None,
 ) -> torch.Tensor:
-    """Rows ``[T, packed, packing, padded_head_dim]`` of ``k``/``v`` (each
-    ``[T, heads, head_dim]``) in the fused pool layout of ``kv_cache``.
+    """Rows of ``k``/``v`` (each ``[T, heads, head_dim]``) in the pool layout of ``kv_cache``.
 
-    K and V are interleaved per head, the head axis is padded to the pool's
-    packing and the head dim to 128 -- the layout the kernel's own
-    ``prepare_inputs`` produces for its KV write.
+    Supports both ``SEQ_ACROSS_LANE`` (``[T, packed, packing, padded_head_dim]``)
+    and ``SEQ_ALONG_LANE`` (``[T, 2 * heads, hd_words, packing]``).
     """
     num_tokens, heads, head_dim = k.shape
-    packed, packing, padded_head_dim = kv_cache.shape[2:]
+    use_along = (
+        (
+            kv_cache.ndim == 5
+            and kv_cache.shape[1] == 2 * heads
+            and kv_cache.shape[4] >= 128
+            and kv_cache.shape[2] * kv_cache.shape[3] >= 64
+        )
+        if seq_along_lane is None
+        else seq_along_lane
+    )
     rows = torch.stack([k, v], dim=2).reshape(num_tokens, 2 * heads, head_dim)
+    if use_along:
+        _, kv_heads_x2, hd_words, packing, _ = kv_cache.shape
+        pad_dim = hd_words * packing - head_dim
+        if pad_dim:
+            rows = torch.nn.functional.pad(rows, (0, pad_dim))
+        return rows.reshape(num_tokens, kv_heads_x2, hd_words, packing)
+    packed, packing, padded_head_dim = kv_cache.shape[2:]
     pad_dim = padded_head_dim - head_dim
     pad_heads = packed * packing - 2 * heads
     if pad_dim or pad_heads:

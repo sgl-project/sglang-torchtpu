@@ -1075,6 +1075,43 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertEqual(d_alloc.full_attn_allocator.allocated_pages, 4)
         self.assertEqual(d_alloc.swa_attn_allocator.allocated_pages, 8)
 
+    def test_cp_and_dcp_seq_along_lane_separate_kv_pool(self):
+        from sglang_tpu.attention_pallas_rpa_dcp import (
+            fused_kv_rows as dcp_fused_kv_rows,
+        )
+        from sglang_tpu.cp_forward import (
+            fused_kv_rows as cp_fused_kv_rows,
+            scatter_seq_along_lane_rows,
+        )
+        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+
+        with patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind",
+            return_value="TPU v6e",
+        ):
+            pool = TpuSeqAlongLaneKVPool(
+                size=256,
+                page_size=128,
+                dtype=torch.bfloat16,
+                head_num=1,
+                head_dim=128,
+                layer_num=1,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+        kv_cache = pool.get_fused_kv_buffer(0)
+        # SEQ_ALONG_LANE shape: [num_blocks=3, head_num*2=2, hd_words=64, packing=2, page_size=128]
+        self.assertEqual(kv_cache.shape, (3, 2, 64, 2, 128))
+        k = torch.randn(4, 1, 128, dtype=torch.bfloat16)
+        v = torch.randn(4, 1, 128, dtype=torch.bfloat16)
+        cp_rows = cp_fused_kv_rows(k, v, kv_cache)
+        dcp_rows = dcp_fused_kv_rows(k, v, kv_cache)
+        self.assertEqual(cp_rows.shape, (4, 2, 64, 2))
+        self.assertTrue(torch.equal(cp_rows, dcp_rows))
+        slots = torch.tensor([128, 129, 130, 131], dtype=torch.long)
+        scatter_seq_along_lane_rows(kv_cache, cp_rows, slots)
+        self.assertTrue(torch.equal(kv_cache[1, :, :, :, :4].permute(3, 0, 1, 2), cp_rows))
+
 
 if __name__ == "__main__":
     unittest.main()
