@@ -483,14 +483,6 @@ def _resolve_unified_kv_pool(server_args) -> None:
             f"is not supported with --pipeline-parallel-size > 1 (got {cfg.pp_size}).",
         ),
         (
-            cfg.dcp_size > 1,
-            f"is not supported with --decode-context-parallel-size > 1 (got {cfg.dcp_size}).",
-        ),
-        (
-            cfg.attn_cp_size > 1 or cfg.enable_prefill_cp,
-            f"is not supported with prefill context parallelism (--attn-cp-size {cfg.attn_cp_size}).",
-        ),
-        (
             cfg.enable_hierarchical_cache and cfg.hicache_io_backend != "raiden",
             f"with --enable-hierarchical-cache requires --hicache-io-backend raiden, got {cfg.hicache_io_backend!r}.",
         ),

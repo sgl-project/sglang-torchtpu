@@ -61,6 +61,13 @@ def num_swa_groups(num_full_layers: int, num_swa_layers: int) -> int:
     return _cdiv(num_swa_layers, num_full_layers)
 
 
+def compute_cp_local_swa_window_size(sliding_window_size: int, cp_size: int) -> int:
+    """Return per-rank local SWA window size ``ceil(W / cp_size)`` under Context Parallelism."""
+    if sliding_window_size <= 0:
+        return 0
+    return _cdiv(int(sliding_window_size), max(1, int(cp_size)))
+
+
 def _fused_page_shape(
     page_size: int,
     head_num: int,
@@ -186,15 +193,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "does not support pipeline parallelism.",
         ),
         (
-            _ctx_attr(get_parallel, "attn_cp_size", 1) > 1,
-            "does not support prefill context parallelism.",
-        ),
-        (
-            getattr(kvc, "dcp_enabled", False)
-            or _ctx_attr(get_parallel, "attn_dcp_size", 1) > 1,
-            "does not support decode context parallelism.",
-        ),
-        (
             _ctx_attr(get_memory, "enable_hierarchical_cache", False)
             and hicache_backend != "raiden",
             f"with --enable-hierarchical-cache requires --hicache-io-backend raiden, got {hicache_backend!r}.",
@@ -229,16 +227,24 @@ def _unsupported_reason(kvc) -> Optional[str]:
             f"full ({n_full}) and SWA ({n_swa}) layers."
         )
     tp = _ctx_attr(get_parallel, "attn_tp_size", 1)
+    dcp_size = _ctx_attr(get_parallel, "attn_dcp_size", 1)
     mc = kvc.model_config
     head_dim = mc.head_dim
     swa_dim = getattr(mc, "swa_head_dim", None) or head_dim
+
+    def _kv_heads(getter) -> int:
+        try:
+            return getter(tp, dcp_size)
+        except TypeError:
+            return getter(tp)
+
     try:
         resolve_unified_page_shape(
             page_size=kvc.pool_page_size,
-            head_num=mc.get_num_kv_heads(tp),
+            head_num=_kv_heads(mc.get_num_kv_heads),
             head_dim=head_dim,
             v_head_dim=getattr(mc, "v_head_dim", None) or head_dim,
-            swa_head_num=mc.get_swa_num_kv_heads(tp),
+            swa_head_num=_kv_heads(mc.get_swa_num_kv_heads),
             swa_head_dim=swa_dim,
             swa_v_head_dim=getattr(mc, "swa_v_head_dim", None) or swa_dim,
             store_dtype=kvc.kv_cache_dtype,
@@ -830,6 +836,11 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 f"Unsupported eviction_policy={eviction_policy!r}; expected one of {self.SUPPORTED_EVICTION_POLICIES}."
             )
         assert isinstance(kvcache, TpuUnifiedSWAKVPool)
+        # Compared in pages: under Decode Context Parallelism (DCP), the allocator's
+        # size and page_size are widened by dcp_size while the shared pool keeps its physical size.
+        assert size // page_size == kvcache.size // kvcache.page_size, (
+            "the allocator hands out the whole shared pool"
+        )
         self.eviction_policy = eviction_policy
         self._page_store = _SharedPageStore()
         self._swa_groups = getattr(kvcache, "num_swa_groups", 1)
@@ -1730,6 +1741,65 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             int(seq_len),
             swa_tail_len,
         )
+
+    def translate_loc_to_all_swa_groups(
+        self, full_indices: torch.Tensor
+    ) -> List[torch.Tensor]:
+        """Translate ``full_indices`` into physical token slots for each of the ``M_swa`` SWA groups."""
+        ps = self.page_size
+        swa_g0 = self.translate_loc_from_full_to_swa(full_indices).to(torch.int64)
+        groups: List[torch.Tensor] = [swa_g0]
+        if self._swa_groups <= 1 or self._kvcache.swa_group_pages.numel() == 0:
+            return groups
+        g0_pages = (swa_g0 // ps).to(device=self._kvcache.swa_group_pages.device)
+        offsets = swa_g0 % ps
+        valid = swa_g0 > 0
+        for g in range(1, self._swa_groups):
+            g_pages = self._kvcache.swa_group_pages[g - 1, g0_pages].to(
+                device=swa_g0.device, dtype=torch.int64
+            )
+            g_slots = torch.where(valid, g_pages * ps + offsets, torch.zeros_like(swa_g0))
+            groups.append(g_slots)
+        return groups
+
+    def build_dcp_swa_group_write_spans(
+        self,
+        positions: torch.Tensor,
+        full_out_cache_loc: torch.Tensor,
+        *,
+        dcp_size: int,
+        rank: int,
+        num_tokens: Optional[int] = None,
+        num_seqs: int = 1,
+    ) -> Tuple[Any, List[Any]]:
+        """Build Decode Context Parallelism ``DcpWriteSpans`` for Full KV and all ``M_swa`` SWA groups."""
+        from sglang_tpu.attention_pallas_rpa_dcp import build_owner_write_spans
+
+        ps = self.page_size
+        n_tok = int(full_out_cache_loc.numel()) if num_tokens is None else int(num_tokens)
+        full_spans = build_owner_write_spans(
+            positions,
+            full_out_cache_loc,
+            dcp_size,
+            rank,
+            ps,
+            n_tok,
+            num_seqs,
+        )
+        swa_group_locs = self.translate_loc_to_all_swa_groups(full_out_cache_loc)
+        swa_spans = [
+            build_owner_write_spans(
+                positions,
+                g_loc,
+                dcp_size,
+                rank,
+                ps,
+                n_tok,
+                num_seqs,
+            )
+            for g_loc in swa_group_locs
+        ]
+        return full_spans, swa_spans
 
     def debug_print(self) -> str:
         return (
