@@ -1060,21 +1060,28 @@ class CompiledForwardShim:
         # raises.
         orig_prefill_only = forward_batch.is_prefill_only
         forward_batch.is_prefill_only = False
-        # Input (prompt) logprobs, when enabled. FULL capture is then presented
-        # on *every* extend, not only the batches asking for logprobs:
-        # capture_hidden_mode is part of the graph's guard, so two values would
-        # mean two extend variants (measured: 828s of precompile against 113s).
-        # That is precisely why this is opt-in -- returning every prefill row
-        # costs ~8% of prefill, and nobody who did not ask should pay it. With
-        # the flag off nothing below runs, the batch is never touched, and the
-        # extend graph is the NULL-capture one warmup has always compiled.
+        # Input (prompt) logprobs, when enabled. Dispatched dynamically per-request:
+        # standard prefill traffic retains CaptureHiddenMode.NULL and incurs 0% overhead,
+        # while requests requesting prompt logprobs are promoted to CaptureHiddenMode.FULL
+        # and execute the eager gather after the compiled forward. Warmup precompiles both
+        # NULL and FULL variants when prompt logprobs are enabled to prevent serving-time
+        # recompilations.
         wants_input_logprob = needs_input_logprob(forward_batch)
         if wants_input_logprob:
             rejection = self._prompt_logprob_rejection(self._prompt_logprob_enabled)
             if rejection is not None:
                 raise NotImplementedError(rejection)
         saved: dict[str, Any] = {}
-        if self._prompt_logprob_enabled and forward_batch.forward_mode.is_extend():
+        use_prompt_logprob_capture = (
+            self._prompt_logprob_enabled
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and (
+                wants_input_logprob
+                or forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            )
+        )
+        if use_prompt_logprob_capture:
             saved["capture_hidden_mode"] = forward_batch.capture_hidden_mode
             forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             # LogitsMetadata reads len(extend_logprob_start_lens_cpu), so the
@@ -1088,7 +1095,7 @@ class CompiledForwardShim:
                 forward_batch.seq_lens.shape[0]
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
-        if not self._prompt_logprob_enabled and hasattr(
+        if not use_prompt_logprob_capture and hasattr(
             forward_batch, "extend_logprob_start_lens_cpu"
         ):
             # Only the eager input-logprob gather reads these; keep them out of the guards.

@@ -1882,7 +1882,9 @@ class TestPrecompileLoops(_PolicyTestCase):
         self.assertEqual(modes, {CaptureHiddenMode.NULL})
 
     def test_extend_warms_full_capture_when_prompt_logprobs_enabled(self):
-        policy = _make_policy(_model_runner(), token_buckets=(8,), bs_buckets=(1, 4))
+        self.publish_config(enable_mixed_chunk=True)
+        policy = _make_policy(_model_runner(), token_buckets=(8, 16), bs_buckets=(4, 8))
+        policy.extend_bs = 4
         policy._run_one = MagicMock()
 
         with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
@@ -1896,12 +1898,80 @@ class TestPrecompileLoops(_PolicyTestCase):
             ):
                 policy._precompile_extend()
 
-        modes = {
-            call.kwargs["capture_hidden_mode"]
+        seen = [
+            (
+                call.kwargs["num_tokens"],
+                call.kwargs["bs"],
+                call.kwargs["mode"],
+                call.kwargs["logits_output_mode"],
+                call.kwargs["capture_hidden_mode"],
+            )
             for call in policy._run_one.call_args_list
-        }
-        # One variant, not two: FULL replaces NULL rather than joining it.
-        self.assertEqual(modes, {CaptureHiddenMode.FULL})
+        ]
+        # Dual-warmup across all compile_cases (EXTEND and MIXED):
+        # standard prefill uses NULL capture (0% overhead); prompt logprob uses
+        # FULL capture with FULL_VOCAB.
+        self.assertEqual(
+            seen,
+            [
+                (
+                    8,
+                    4,
+                    ForwardMode.EXTEND,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    16,
+                    4,
+                    ForwardMode.EXTEND,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    8,
+                    8,
+                    ForwardMode.MIXED,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    16,
+                    8,
+                    ForwardMode.MIXED,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    8,
+                    4,
+                    ForwardMode.EXTEND,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    16,
+                    4,
+                    ForwardMode.EXTEND,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    8,
+                    8,
+                    ForwardMode.MIXED,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    16,
+                    8,
+                    ForwardMode.MIXED,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                ),
+            ],
+        )
 
     def test_warmup_modes_follow_batch_size_cutoff(self):
         policy = _make_distributed_top_k_policy()
