@@ -1644,7 +1644,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             layer.layer_id, is_swa_layer=is_swa_layer
         )
         if swa_merged_heads is not None:
-            q, k, v = merge_swa_kv_heads(q, k, v)
+            target_heads = int(getattr(self.token_to_kv_pool, "head_num", 1))
+            q, k, v = merge_swa_kv_heads(q, k, v, target_kv_heads=target_heads)
 
         soft_cap = layer.logit_cap if getattr(layer, "logit_cap", 0) else None
         # Same rule as the other attention backends; DFlash draft layers are
@@ -1761,7 +1762,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # When qk == v this view+slice is a no-op reshape.
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)
         if swa_merged_heads is not None:
-            out = split_swa_output(out, swa_merged_heads)
+            target_heads = int(getattr(self.token_to_kv_pool, "head_num", 1))
+            out = split_swa_output(out, swa_merged_heads, target_kv_heads=target_heads)
         if pack > 1:
             out = _unpack_out_heads(out, pack, layer.qk_head_dim)
         out = out[..., : layer.v_head_dim]
