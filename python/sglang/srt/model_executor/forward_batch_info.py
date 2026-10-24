@@ -598,6 +598,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     dp_spec_prefill_coordination_applied: bool = False
     is_tpu_mm_extend_in_batch: bool = False
+    # DP-wide: the largest input-logprob gather of any DP rank, in rows.
+    max_input_logprob_rows: int = 0
     can_run_decode_cuda_graph: bool = False
     # Draft-only companion to the generic DP decode graph vote.
     can_run_dp_draft_cuda_graph: bool = False
@@ -1059,6 +1061,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_tpu_mm_extend_in_batch=getattr(
                 batch, "is_tpu_mm_extend_in_batch", False
             ),
+            max_input_logprob_rows=getattr(batch, "max_input_logprob_rows", 0),
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
             can_run_dp_draft_cuda_graph=batch.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
