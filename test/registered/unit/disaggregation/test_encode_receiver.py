@@ -9,6 +9,7 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 from fastapi import HTTPException
 
 from sglang.srt.disaggregation.encoder.receiver import (
@@ -20,6 +21,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     _ReceiveRegistrationRunner,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EncoderDispatchErrorReq
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -243,6 +245,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             tp_group=SimpleNamespace(cpu_group=object()),
             _drain_scheduler_embeddings=lambda: None,
             _sync_fail_info_across_tp=lambda request: None,
+            _hold_ready_requests=lambda statuses: False,
             create_req=lambda request: request,
         )
         dispatch_error = EncoderDispatchErrorReq(
@@ -391,6 +394,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             tp_group=SimpleNamespace(cpu_group=object()),
             _drain_scheduler_embeddings=lambda: None,
             _sync_fail_info_across_tp=lambda request: None,
+            _hold_ready_requests=lambda statuses: False,
             create_req=lambda request: request,
         )
 
@@ -428,6 +432,43 @@ class TestEncodeDispatchWithoutEncoder(CustomTestCase):
         obj, result = self._dispatch([])
         self.assertIsNone(result)
         self.assertFalse(obj.need_wait_for_mm_inputs)
+
+
+class TestHoldReadyRequests(CustomTestCase):
+    """Ready requests wait for pending batch-mates only while decode runs, and only for a bounded number of ticks."""
+
+    @staticmethod
+    def _hold(statuses, held_ticks, *, decoding=True, max_ticks=4):
+        receiver = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                running_batch=SimpleNamespace(is_empty=lambda: not decoding)
+            ),
+            waiting_list=[SimpleNamespace(held_ticks=t) for t in held_ticks],
+        )
+        with envs.SGLANG_ENCODER_RECEIVER_COALESCE_TICKS.override(max_ticks):
+            return MMReceiverBase._hold_ready_requests(
+                receiver, torch.tensor([int(x) for x in statuses], dtype=torch.int32)
+            )
+
+    def test_holds_ready_while_a_batch_mate_is_pending(self):
+        S = WaitingMMRequestStatus
+        self.assertTrue(self._hold([S.SUCCESS, S.PENDING], [0, 0]))
+
+    def test_releases_once_nothing_is_pending(self):
+        S = WaitingMMRequestStatus
+        self.assertFalse(self._hold([S.SUCCESS, S.SUCCESS], [2, 0]))
+
+    def test_releases_when_no_decode_would_be_interrupted(self):
+        S = WaitingMMRequestStatus
+        self.assertFalse(self._hold([S.SUCCESS, S.PENDING], [0, 0], decoding=False))
+
+    def test_releases_after_the_tick_budget(self):
+        S = WaitingMMRequestStatus
+        self.assertFalse(self._hold([S.SUCCESS, S.PENDING], [4, 0]))
+
+    def test_zero_ticks_disables_holding(self):
+        S = WaitingMMRequestStatus
+        self.assertFalse(self._hold([S.SUCCESS, S.PENDING], [0, 0], max_ticks=0))
 
 
 if __name__ == "__main__":
