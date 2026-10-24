@@ -494,7 +494,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ("is_draft_worker", True, ValueError),
                 ("pp_size", 2, ValueError),
                 ("dcp_enabled", True, ValueError),
-                ("kv_cache_dtype_str", "mxint8", NotImplementedError),
                 ("pool_page_size", 1, ValueError),
             ):
                 kvc = copy.copy(base)
@@ -504,6 +503,9 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             kvc_along = copy.copy(base)
             kvc_along.token_to_kv_pool_class = TpuSeqAlongLaneKVPool
             TpuUnifiedSWAPoolConfigurator(kvc_along)
+            kvc_mx = copy.copy(base)
+            kvc_mx.kv_cache_dtype_str = "mxint8"
+            TpuUnifiedSWAPoolConfigurator(kvc_mx)
 
         with patch(
             "sglang_tpu.unified_kv_pool.get_memory",
@@ -955,6 +957,33 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             pool_along.full_kv_pool.kv_buffer[0].numel() * 2,
             pool_across.full_kv_pool.kv_buffer[0].numel(),
         )
+
+    def test_quantized_kv_scale_buffers_mxint8_mxfp8_nvfp4(self):
+        from sglang_tpu.kv_mxint8 import EXPONENT_PAD_BYTE
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+        for fmt in ("mxint8", "mxfp8", "nvfp4"):
+            pool = TpuUnifiedSWAKVPool(
+                size=256,
+                page_size=128,
+                dtype=torch.int8 if fmt == "mxint8" else torch.float8_e4m3fn,
+                head_num=2,
+                head_dim=128,
+                swa_attention_layer_ids=[1, 2, 3, 4],
+                full_attention_layer_ids=[0, 5],
+                device="cpu",
+                quant_kv_format=fmt,
+            )
+            self.assertIsNotNone(pool.shared_kv_scale_buffer)
+            self.assertEqual(len(pool.shared_kv_scale_buffer), 2)
+            s0 = pool.get_kv_scale_buffer(0)
+            s1 = pool.get_kv_scale_buffer(1)
+            s3 = pool.get_kv_scale_buffer(3)
+            # SWA layer 1 (idx 0) and SWA layer 3 (idx 2) share slab 0's scale buffer with Full layer 0 (idx 0)!
+            self.assertEqual(s0.data_ptr(), s1.data_ptr())
+            self.assertEqual(s0.data_ptr(), s3.data_ptr())
+            self.assertEqual(s0.shape, (3, 32, 128))
+            self.assertTrue(bool((s0 == EXPONENT_PAD_BYTE).all()))
 
 
 if __name__ == "__main__":
