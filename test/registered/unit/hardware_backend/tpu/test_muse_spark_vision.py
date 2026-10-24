@@ -95,6 +95,7 @@ class TestMuseVision(unittest.TestCase):
                 rows=3,
                 hidden=8,
                 dtype=torch.float32,
+                slot="embeds",
             )
         to_host.assert_called_once_with(second)
         torch.testing.assert_close(placed[1], buffer[1])

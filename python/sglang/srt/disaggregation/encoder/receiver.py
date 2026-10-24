@@ -893,6 +893,8 @@ class WaitingMMRequestBase(ABC):
         self.rid = rid
         self.recv_req = recv_req
         self.mm_inputs = None
+        # Scheduler ticks spent ready but held back for pending batch-mates.
+        self.held_ticks = 0
         self.error = None
         self.thread = None
         self.mm_processor = mm_processor
@@ -2436,9 +2438,14 @@ class MMReceiverBase(ABC):
             group=self.tp_group.cpu_group,
         )
 
+        hold_ready = self._hold_ready_requests(local_status)
         new_waiting = []
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
+            if status_value == WaitingMMRequestStatus.SUCCESS and hold_ready:
+                waiting_req.held_ticks += 1
+                new_waiting.append(waiting_req)
+                continue
             if status_value == WaitingMMRequestStatus.SUCCESS:
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingMMRequestStatus.FAIL:
@@ -2476,6 +2483,32 @@ class MMReceiverBase(ABC):
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
+
+    def _hold_ready_requests(self, statuses: torch.Tensor) -> bool:
+        """Whether to keep ready requests back so pending batch-mates prefill with them.
+
+        Embeddings of one encoder batch reach the TP ranks over several ticks, and
+        each partial release would interrupt decode for its own prefill. Decided
+        from TP-reduced statuses and tick counts only, so every rank agrees.
+        """
+        max_ticks = envs.SGLANG_ENCODER_RECEIVER_COALESCE_TICKS.get()
+        if (
+            max_ticks <= 0
+            or self.scheduler is None
+            or self.scheduler.running_batch.is_empty()
+        ):
+            return False
+        ready = statuses == WaitingMMRequestStatus.SUCCESS
+        if not bool(ready.any()) or not bool(
+            (statuses == WaitingMMRequestStatus.PENDING).any()
+        ):
+            return False
+        oldest_held = max(
+            req.held_ticks
+            for req, is_ready in zip(self.waiting_list, ready.tolist())
+            if is_ready
+        )
+        return oldest_held < max_ticks
 
     def _run_encode_in_thread(
         self,
