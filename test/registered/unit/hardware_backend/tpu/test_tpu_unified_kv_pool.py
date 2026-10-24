@@ -670,6 +670,33 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertEqual(freed_phys, 4)
         self.assertEqual(alloc.validate_swa_prefix_window(idx, 128), 128)
 
+    def test_timestamp_interleaved_eviction_policy(self):
+        from sglang_tpu.unified_kv_pool import EvictionCandidate
+
+        _, alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=20, page_size=128
+        )
+        alloc.eviction_policy = "timestamp_interleaved"
+        # Candidate list:
+        # - Node A SWA window at t=10.0 (128 tokens = 1 page => frees M_swa=4 phys pages)
+        # - Node B Full leaf at t=20.0 (128 tokens = 1 page, coupled SWA => frees 1+4=5 phys pages)
+        # - Node A Full leaf at t=30.0 (128 tokens = 1 page, SWA already reclaimed at t=10.0 => frees 1 phys page)
+        cands = [
+            EvictionCandidate("node_B", "full", 128, last_access_time=20.0, has_coupled_swa=True),
+            EvictionCandidate("node_A", "swa", 128, last_access_time=10.0),
+            EvictionCandidate("node_A", "full", 128, last_access_time=30.0, has_coupled_swa=True),
+        ]
+        # Need 9 physical pages: t=10.0 (node_A SWA -> 4 phys) + t=20.0 (node_B Full+SWA -> 5 phys) = 9 phys!
+        res = alloc.plan_interleaved_eviction(cands, short_physical_pages=9)
+        self.assertIsNotNone(res)
+        f_tok, s_tok, chosen = res
+        self.assertEqual((f_tok, s_tok), (128, 128))
+        self.assertEqual([c.node_id for c in chosen], ["node_A", "node_B"])
+        # Need 10 physical pages: also pops node_A Full at t=30.0 (only 1 extra phys page since SWA already reclaimed)
+        res10 = alloc.plan_interleaved_eviction(cands, short_physical_pages=10)
+        self.assertIsNotNone(res10)
+        self.assertEqual((res10[0], res10[1]), (256, 128))
+
 
 if __name__ == "__main__":
     unittest.main()
