@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.distributed
 
@@ -46,6 +47,12 @@ _PP_PD_CONSENSUS_TAG = 0x5050
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang_tpu.pp_scheduler import PPDecodeTransferStatus
+
+
+class _PPLaunchedForward(msgspec.Struct, frozen=True):
+    """A launched PP forward as the KV read fence tracks it."""
+
+    copy_done: torch.Event
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -138,6 +145,8 @@ class SchedulerPPMixin:
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                if self.pp_kv_read_fence is not None:
+                    self.pp_kv_read_fence.retire_completed()
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.ingest_requests()
                 if not self.pp_group.is_last_rank:
@@ -160,6 +169,8 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy()
+                    if self.pp_kv_read_fence is not None:
+                        self.pp_kv_read_fence.on_batch_formed()
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -186,6 +197,11 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if self.pp_kv_read_fence is not None:
+                        # The launch event follows every KV write of this forward.
+                        self.pp_kv_read_fence.on_forward_launched(
+                            _PPLaunchedForward(copy_done=self.launch_event)
+                        )
                 if exchange_outputs_before_forward:
                     self._pp_send_deferred_output(next_first_rank_mb_id)
                 if not exchange_outputs_before_forward:

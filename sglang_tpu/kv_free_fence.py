@@ -22,6 +22,12 @@ DMA reads have the mirror hazard: a device-to-host backup issued while a forward
 is in flight can copy a slot that forward has not written yet, such as the last
 slot of a request that finished at N-1 and was inserted into the tree.
 ``after_in_flight`` runs a DMA read once the forwards formed so far are done.
+
+Pipeline parallelism has the read hazard without overlap: a stage forms a
+request's next chunk, inserting the chunk still running into the tree, before
+any result is processed. Its frees come from processed results, so its loop
+uses a fence with no allocator attached and retires forwards by polling their
+launch events (``retire_completed``).
 """
 
 from __future__ import annotations
@@ -151,6 +157,21 @@ class KVFreeFence:
         oldest = self._in_flight[0][0] if self._in_flight else self._formed + 1
         self._release(oldest - 1)
         self._maybe_log_stats()
+
+    def retire_completed(self) -> None:
+        """Retire the oldest launched forwards whose ``copy_done`` has
+        completed, without blocking. For loops that launch further forwards
+        before processing any result."""
+        retired = False
+        while self._in_flight:
+            _, _, result = self._in_flight[0]
+            if result is None or not result.copy_done.query():
+                break
+            self._in_flight.popleft()
+            retired = True
+        if retired:
+            oldest = self._in_flight[0][0] if self._in_flight else self._formed + 1
+            self._release(oldest - 1)
 
     def wait_for_in_flight(self) -> None:
         """Block until every in-flight forward finishes, then release the
