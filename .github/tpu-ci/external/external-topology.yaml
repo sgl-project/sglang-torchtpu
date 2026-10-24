@@ -23,7 +23,9 @@ weights:
   # node-local file cache; every subsequent read hits local disk. See README.
   mount_options: "implicit-dirs,file-cache:max-size-mb:102400,file-cache:cache-file-for-range-read:true"
   ephemeral_storage_limit: 120Gi
-  default_extra_args: "--weight-loader-disable-mmap"
+  # Loaders mmap the checkpoint (page cache, reclaimable). --weight-loader-disable-mmap copied
+  # every shard into anonymous RSS and OOM-killed 480B loads on the host.
+  default_extra_args: ""
 
 # Suite name -> slice shape. The suite fixes hosts/topology; `nodepool_vars` lists the repo
 # secrets holding this shape's interchangeable slices (a GKE multi-host nodepool IS one
