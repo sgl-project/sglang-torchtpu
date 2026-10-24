@@ -39,6 +39,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.platforms import current_platform
+from sglang.srt.plugins.oot_classes import oot_base_class
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -88,6 +89,14 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+
+
+def _uses_weight_loader_v2(quant_method, scheme) -> bool:
+    # Match the core class an OOT substitute stands in for, not the substitute.
+    core_cls = oot_base_class(type(quant_method))
+    if core_cls.__name__ in WEIGHT_LOADER_V2_SUPPORTED:
+        return True
+    return scheme is not None and scheme.requires_weight_loader_v2
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -390,12 +399,8 @@ class ColumnParallelLinear(LinearBase):
             skip_block_quant_check=skip_block_quant_check,
             weight_loader=(
                 self.weight_loader_v2
-                if (
-                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
-                    or (
-                        self.scheme is not None
-                        and self.scheme.requires_weight_loader_v2
-                    )
+                if _uses_weight_loader_v2(
+                    quant_method=self.quant_method, scheme=self.scheme
                 )
                 else self.weight_loader
             ),
@@ -1621,12 +1626,8 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if (
-                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
-                    or (
-                        self.scheme is not None
-                        and self.scheme.requires_weight_loader_v2
-                    )
+                if _uses_weight_loader_v2(
+                    quant_method=self.quant_method, scheme=self.scheme
                 )
                 else self.weight_loader
             ),

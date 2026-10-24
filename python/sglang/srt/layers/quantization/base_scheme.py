@@ -5,10 +5,12 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.plugins.oot_classes import OotReplaceable
+
 __all__ = ["BaseLinearScheme", "BaseMoEScheme"]
 
 
-class BaseLinearScheme(ABC):
+class BaseLinearScheme(OotReplaceable, ABC):
     """
     Abstract class used to describe the weight creation and forward pass
     of different quantization schemes.
@@ -53,7 +55,7 @@ class BaseLinearScheme(ABC):
         raise NotImplementedError
 
 
-class BaseMoEScheme(ABC):
+class BaseMoEScheme(OotReplaceable, ABC):
     """
     Abstract class used to describe the weight creation and forward pass
     of different quantization schemes.
