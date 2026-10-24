@@ -973,6 +973,70 @@ mod pd_early_stream_error_tests {
         p.abort();
         d.abort();
     }
+
+    // --- A streaming prefill that fails inside its 200 body (B1) ---
+
+    /// What a prefill engine streams when the scheduler aborts the request,
+    /// e.g. a prompt over its KV capacity (`prepare_abort` with 400).
+    const PREFILL_ABORT_STREAM: &str = "data: {\"text\":\"\",\"meta_info\":{\"id\":\"p\",\"finish_reason\":{\"type\":\"abort\",\"message\":\"Request exceeds the maximum number of tokens\",\"status_code\":400}}}\n\ndata: [DONE]\n\n";
+    /// What a prefill engine streams when it finished its part normally.
+    const PREFILL_DONE_STREAM: &str = "data: {\"text\":\"\",\"meta_info\":{\"id\":\"p\",\"finish_reason\":{\"type\":\"length\",\"length\":0}}}\n\ndata: [DONE]\n\n";
+    /// A decode waiting for KV produces nothing for this long.
+    const SLOW_DECODE_MS: u64 = 3000;
+
+    /// A prefill that rejects the request streams 200 plus an error event.
+    /// Decode would wait for KV that never comes, so the router must relay
+    /// prefill's error at once instead of waiting for decode.
+    #[tokio::test]
+    async fn test_in_band_prefill_stream_error_does_not_wait_for_decode() {
+        let (prefill_url, p) = spawn_decode(vec![ENGINE_ERROR_STREAM], 0).await;
+        let (decode_url, d) = spawn_decode(vec![TOKEN_STREAM], SLOW_DECODE_MS).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, elapsed) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, ENGINE_ERROR_STREAM, "client must get prefill's error");
+        assert!(
+            elapsed < EARLY_RETURN_BOUND,
+            "router waited {elapsed:?} for a decode that can never get KV (delay {SLOW_DECODE_MS}ms)"
+        );
+        p.abort();
+        d.abort();
+    }
+
+    /// Same for a prefill the scheduler aborted: its stream is a normal event
+    /// whose finish reason is `abort`.
+    #[tokio::test]
+    async fn test_aborted_prefill_stream_does_not_wait_for_decode() {
+        let (prefill_url, p) = spawn_decode(vec![PREFILL_ABORT_STREAM], 0).await;
+        let (decode_url, d) = spawn_decode(vec![TOKEN_STREAM], SLOW_DECODE_MS).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, elapsed) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body, PREFILL_ABORT_STREAM,
+            "client must get prefill's abort"
+        );
+        assert!(elapsed < EARLY_RETURN_BOUND, "router waited {elapsed:?}");
+        p.abort();
+        d.abort();
+    }
+
+    /// Regression guard: a prefill that finished normally (finish reason
+    /// `length`) still hands over to decode, whose stream is relayed.
+    #[tokio::test]
+    async fn test_finished_prefill_stream_still_relays_decode() {
+        let (prefill_url, p) = spawn_decode(vec![PREFILL_DONE_STREAM], 0).await;
+        let (decode_url, d) = spawn_decode(vec![TOKEN_STREAM], 300).await;
+        let router = make_router(prefill_url, decode_url, 0);
+
+        let (status, body, _) = stream_once(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, TOKEN_STREAM);
+        p.abort();
+        d.abort();
+    }
 }
 
 /// A retry reuses the client's `rid`. When an attempt ends with the router
