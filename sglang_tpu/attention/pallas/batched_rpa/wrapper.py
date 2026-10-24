@@ -395,6 +395,19 @@ def calculate_block_sizes(
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
+        # At high query-head counts (e.g., 64q/8kv under PP8 with TP=1), query
+        # and output buffers dominate VMEM so lockstep growth stops at
+        # bq_sz = bkv_sz = 256 with ~17 MiB of VMEM headroom remaining. Stepping
+        # bkv_sz by multiples of bq_sz (preserving causal block-boundary
+        # alignment bkv_sz % bq_sz == 0) uses that remaining VMEM for a wider KV
+        # tile (256, 512), halving Q re-reads and doubling PP schedule capacity.
+        while (
+            fixed_bq_sz is None
+            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz + bq_sz)
+            < capped_vmem_limit_bytes
+        ):
+            bkv_sz += bq_sz
+
         # Step 3: Given current tile size, calculate compute tile size.
         if fixed_bq_sz is not None:
             return configs.BlockSizes(

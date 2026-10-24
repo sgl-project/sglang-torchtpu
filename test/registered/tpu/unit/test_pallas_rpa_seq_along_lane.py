@@ -276,6 +276,17 @@ class TestPrefillBlockSizes(CustomTestCase):
             self._resolve(num_q_heads=12).bq_sz, self._resolve(num_q_heads=4).bq_sz
         )
 
+    def test_high_head_count_grows_bkv_past_bq(self):
+        """At 64q/8kv (PP8 with TP=1), bq_sz caps at 256 while bkv_sz grows to 512."""
+        blocks = self._resolve(num_q_heads=64, num_kv_heads=8, head_dim=64)
+        self.assertEqual(blocks.bq_sz, 256)
+        self.assertEqual(blocks.bkv_sz, 512)
+        self.assertEqual(blocks.bkv_sz % blocks.bq_sz, 0)
+        # Lower head counts (32q/4kv, 4q/1kv) remain square (bq_sz == bkv_sz).
+        tp2_blocks = self._resolve(num_q_heads=32, num_kv_heads=4, head_dim=64)
+        self.assertEqual(tp2_blocks.bq_sz, 512)
+        self.assertEqual(tp2_blocks.bkv_sz, 512)
+
     def test_override_pins_the_k_block(self):
         with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(4096):
             self.assertEqual(self._resolve().bkv_sz, 4096)
