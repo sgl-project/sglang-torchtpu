@@ -27,6 +27,14 @@ register_tpu_ci(
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "kimi-k3", "compile", "multimodal"],
 )
+# The single-host nightly runs it in plugin mode (mode B), and gives Kimi-K3 its
+# dashboard series.
+register_tpu_ci(
+    est_time=240,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "kimi-k3", "compile", "multimodal"],
+)
 
 TINY_MODEL = "inference-optimization/Kimi-K3-0.40B"
 TINY_MODEL_REVISION = "d853649387ffe8f48ce0198a29ac1a44205031f7"
