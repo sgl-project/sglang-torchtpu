@@ -114,6 +114,81 @@ def _response_failed(task: asyncio.Task) -> bool:
     return task.exception() is not None or task.result().status != 200
 
 
+def _sse_events(body: bytes):
+    """Yield the JSON payload of each `data:` line of an SSE body, skipping
+    `[DONE]` and non-JSON payloads."""
+    for line in body.split(b"\n"):
+        line = line.rstrip(b"\r")
+        if not line.startswith(b"data:"):
+            continue
+        try:
+            yield orjson.loads(line[len(b"data:") :].strip())
+        except orjson.JSONDecodeError:
+            continue
+
+
+def _prefill_stream_failure(body: bytes) -> Optional[str]:
+    """Classify a streaming prefill's body, which the engine sends with status
+    200 even when the request failed (#1706).
+
+    Returns "error_event" if the body has an `error` event (request rejected
+    before dispatch, e.g. longer than the context length), "aborted" if every
+    request in it (by `meta_info.id`, using its last non-null finish reason)
+    was aborted by the scheduler, and None otherwise. A prefill that finished
+    normally ends with finish reason `length`, never `abort`. A partially
+    aborted batch is not a failure, so decode still serves its other requests.
+    Same rule as `prefill_stream_failure` in the Rust PD router (#1704, PR
+    #1705).
+    """
+    aborted_by_id = {}
+    for event in _sse_events(body):
+        if not isinstance(event, dict):
+            continue
+        if "error" in event:
+            return "error_event"
+        meta_info = event.get("meta_info")
+        if not isinstance(meta_info, dict):
+            continue
+        finish_reason = meta_info.get("finish_reason")
+        if finish_reason is None:
+            continue
+        aborted_by_id[str(meta_info.get("id"))] = (
+            isinstance(finish_reason, dict) and finish_reason.get("type") == "abort"
+        )
+    if aborted_by_id and all(aborted_by_id.values()):
+        return "aborted"
+    return None
+
+
+async def _read_first_sse_event(content: aiohttp.StreamReader) -> bytes:
+    """Read lines up to and including the blank line that ends the first SSE
+    event (or until EOF), and return them unchanged."""
+    lines = []
+    while True:
+        line = await content.readline()
+        lines.append(line)
+        if not line or (not line.strip() and any(seen.strip() for seen in lines)):
+            return b"".join(lines)
+
+
+def _sse_event_ends_request(event_bytes: bytes) -> bool:
+    """True if a decode's first SSE event shows that decode already gave up on
+    the request: an `error` event (rejected before dispatch) or a finish reason
+    of type `abort`. Decode then never asks prefill for its KV."""
+    for event in _sse_events(event_bytes):
+        if not isinstance(event, dict):
+            continue
+        if "error" in event:
+            return True
+        meta_info = event.get("meta_info")
+        finish_reason = (
+            meta_info.get("finish_reason") if isinstance(meta_info, dict) else None
+        )
+        if isinstance(finish_reason, dict) and finish_reason.get("type") == "abort":
+            return True
+    return False
+
+
 async def _post_prefill_and_decode(
     *,
     prefill_request: Awaitable[aiohttp.ClientResponse],
@@ -560,24 +635,43 @@ class MiniLoadBalancer:
 
         session = aiohttp.ClientSession(timeout=self._client_timeout())
         responses = []
+        # Reads of the two upstream bodies, started once both have answered.
+        body_tasks = []
 
         async def close_upstreams():
+            for task in body_tasks:
+                task.cancel()
+            await asyncio.gather(*body_tasks, return_exceptions=True)
             for response in responses:
                 response.close()
             await session.close()
 
+        async def decode_lines():
+            # Decode's first event was read while racing prefill's body.
+            for line in (await decode_first_event).splitlines(keepends=True):
+                yield line
+            async for line in decode_response.content:
+                yield line
+
+        async def decode_chunks():
+            first_event = await decode_first_event
+            if first_event:
+                yield first_event
+            async for chunk in decode_response.content.iter_chunked(
+                AIOHTTP_STREAM_READ_CHUNK_SIZE
+            ):
+                yield chunk
+
         async def stream_results():
             try:
-                if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
-                    first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    )
-                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+                # prefill_body is None when decode failed first; relay it as is.
+                if (
+                    modified_request.get("return_logprob", False)
+                    and prefill_body is not None
+                ):
+                    first_prefill_chunk_json = next(_sse_events(prefill_body))
 
-                    async for chunk in decode_response.content:
+                    async for chunk in decode_lines():
                         # Note: This is inefficient
                         # merge prefill input_token_logprobs, output_token_logprobs to decode
                         decoded_chunk = chunk.decode("utf-8")
@@ -597,9 +691,7 @@ class MiniLoadBalancer:
                         else:
                             yield chunk
                 else:
-                    async for chunk in decode_response.content.iter_chunked(
-                        AIOHTTP_STREAM_READ_CHUNK_SIZE
-                    ):
+                    async for chunk in decode_chunks():
                         yield chunk
             finally:
                 await close_upstreams()
@@ -644,6 +736,63 @@ class MiniLoadBalancer:
                         status_code=response.status,
                         media_type=response.content_type,
                     )
+            # Both bodies report failures in-band with status 200. Race
+            # prefill's body (short in PD mode) against decode's first event:
+            # - A failed streaming prefill means decode would wait for KV that
+            #   never comes (#1706), so prefill's stream is returned instead.
+            # - A decode that gave up never asks prefill for its KV, so prefill
+            #   never finishes until its bootstrap timeout (#658); decode's
+            #   stream is relayed at once and prefill is closed when it ends.
+            # Otherwise decode can't produce a token before prefill's KV
+            # arrives, so waiting for prefill's body costs no real latency.
+            prefill_body_read = asyncio.create_task(
+                self._engine_request(prefill_server, prefill_response.read)
+            )
+            decode_first_event = asyncio.create_task(
+                self._engine_request(
+                    decode_server, _read_first_sse_event, decode_response.content
+                )
+            )
+            body_tasks.extend([prefill_body_read, decode_first_event])
+            await asyncio.wait(body_tasks, return_when=asyncio.FIRST_COMPLETED)
+            # Decode finished first only if prefill's body is still pending.
+            decode_ended_first = not prefill_body_read.done() and (
+                decode_first_event.exception() is not None
+                # EOF before any event: decode closed its stream.
+                or not decode_first_event.result().strip()
+                or _sse_event_ends_request(decode_first_event.result())
+            )
+            if decode_ended_first:
+                logger.warning(
+                    "Decode stream failed, relaying it without waiting for "
+                    "prefill decode_url=%s prefill_url=%s",
+                    decode_server,
+                    prefill_server,
+                )
+                prefill_body = None
+                streaming = True
+                return StreamingResponse(
+                    stream_results(),
+                    media_type="text/event-stream",
+                )
+            prefill_body = await prefill_body_read
+            failure = _prefill_stream_failure(prefill_body)
+            if failure is not None:
+                logger.warning(
+                    "Prefill stream failed (%s), aborting paired decode request "
+                    "decode_url=%s prefill_url=%s",
+                    failure,
+                    decode_server,
+                    prefill_server,
+                )
+                # Closing decode (in the finally below) disconnects it, which
+                # aborts its request. The client gets prefill's stream
+                # unchanged, as it would from a single engine.
+                return Response(
+                    content=prefill_body,
+                    status_code=prefill_response.status,
+                    media_type="text/event-stream",
+                )
             streaming = True
             return StreamingResponse(
                 stream_results(),
