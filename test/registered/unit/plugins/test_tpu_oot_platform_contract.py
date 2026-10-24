@@ -640,6 +640,32 @@ class TestTpuDebtRatchet(CustomTestCase):
         )
         self.assertEqual(self._count(tpu_debt.count_tpu_branches, source), 3)
 
+    def test_compares_against_the_tpu_string_are_counted(self):
+        source = (
+            "def f(x, cfg):\n"
+            "    if x.device.type == 'tpu':\n"
+            "        return cfg.device != 'tpu'\n"
+            "    return cfg.device == 'cuda'\n"
+        )
+        self.assertEqual(self._count(tpu_debt.count_tpu_branches, source), 2)
+
+    def test_branches_are_counted_across_python_sglang(self):
+        """Kernels and diffusion code branch on TPU too, not only srt."""
+        root = self._repo(
+            {
+                "python/sglang/kernels/ops/op.py": "if _is_tpu:\n    pass\n",
+                "python/sglang/multimodal_gen/layer.py": "on_tpu = device == 'tpu'\n",
+                "python/sglang/srt/platforms/interface.py": "if _is_tpu:\n    pass\n",
+            }
+        )
+        self.assertEqual(
+            tpu_debt.collect(root).branches,
+            {
+                "python/sglang/kernels/ops/op.py": 1,
+                "python/sglang/multimodal_gen/layer.py": 1,
+            },
+        )
+
     def test_plugin_imports_are_counted_at_any_scope(self):
         source = (
             "import sglang_tpu\n"
@@ -697,6 +723,43 @@ class TestTpuDebtRatchet(CustomTestCase):
             "run `python tools/plugin/check_tpu_branches.py --write-baseline`",
         )
 
+    def test_hook_targets_resolve_to_the_core_files_they_patch(self):
+        root = self._repo(
+            {
+                "sglang_tpu/hooks/__init__.py": (
+                    '"""sglang.srt.managers.c.run, named in prose."""\n'
+                    "HOOKS = [\n"
+                    "    ('sglang.srt.managers.a.Scheduler.run', None, None),\n"
+                    "    ('sglang.srt.layers.' 'pkg.func', None, None),\n"
+                    "    ('sglang_tpu.runner.Runner.__init__', None, None),\n"
+                    "]\n"
+                ),
+                "sglang_tpu/hooks/batch.py": "PREFIX = 'sglang.srt.managers.b.Batch.'\n",
+                "python/sglang/srt/managers/a.py": "",
+                "python/sglang/srt/managers/b.py": "",
+                "python/sglang/srt/managers/c.py": "",
+                "python/sglang/srt/layers/pkg/__init__.py": "",
+            }
+        )
+        self.assertEqual(
+            tpu_debt.collect_hook_targets(root),
+            [
+                "python/sglang/srt/layers/pkg/__init__.py",
+                "python/sglang/srt/managers/a.py",
+                "python/sglang/srt/managers/b.py",
+            ],
+        )
+
+    def test_hook_targets_are_recorded_but_never_ratcheted(self):
+        """They only widen the TPU PR gate; a new hook is not new debt."""
+        import json
+
+        root = self._repo({})
+        tpu_debt.write_baseline(root, tpu_debt.Debt(), ["python/sglang/srt/a.py"])
+        with open(os.path.join(root, tpu_debt.BASELINE_PATH), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["hook_targets"], ["python/sglang/srt/a.py"])
+        self.assertEqual(tpu_debt.load_baseline(root), tpu_debt.Debt())
+
     def _count(self, counter, source: str) -> int:
         import tempfile
 
@@ -707,6 +770,19 @@ class TestTpuDebtRatchet(CustomTestCase):
             return counter(path)
         finally:
             os.unlink(path)
+
+    def _repo(self, files: dict[str, str]) -> str:
+        """A throwaway repo root holding ``files``, keyed by repo-relative path."""
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for rel, source in files.items():
+            path = os.path.join(tmp.name, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(source)
+        return tmp.name
 
 
 # Attributes a patch creates on a core class rather than replaces.

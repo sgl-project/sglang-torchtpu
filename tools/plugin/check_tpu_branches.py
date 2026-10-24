@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ratchet on TPU debt in SGLang's shared core tree.
 
-Three per-file counters that may only go down: is_tpu / _is_tpu references in
-python/sglang/srt outside the platform package and the re-export shims; import
-statements naming sglang_tpu under python/sglang; TPU-named modules under
-python/sglang that are not shims. New TPU code belongs in sglang_tpu/ and
-reaches core through a platform method or a registration.
+Three per-file counters that may only go down: TPU branches (is_tpu / _is_tpu
+references and comparisons against "tpu") under python/sglang outside the
+platform package and the re-export shims; import statements naming sglang_tpu
+under python/sglang; TPU-named modules under python/sglang that are not shims.
+New TPU code belongs in sglang_tpu/ and reaches core through a platform method
+or a registration.
+
+The baseline also lists the core files that sglang_tpu/hooks/ patches by dotted
+path. They are not debt and never fail the check; the TPU PR gate
+(.github/workflows/pr-test-tpu.yml) reads them so a hooked file stays covered
+whatever its counts.
 
 Usage:
     python tools/plugin/check_tpu_branches.py                  # check against baseline
@@ -31,7 +37,7 @@ warnings.simplefilter("ignore", SyntaxWarning)
 BASELINE_PATH = os.path.join("tools", "plugin", "tpu_debt_baseline.json")
 
 #: Where TPU branches are counted.
-BRANCH_SCAN_ROOT = "python/sglang/srt"
+BRANCH_SCAN_ROOT = "python/sglang"
 
 #: Where TPU-named modules are looked for.
 MODULE_SCAN_ROOT = "python/sglang"
@@ -55,6 +61,15 @@ PLATFORM_PACKAGE = "python/sglang/srt/platforms/"
 #: Names whose appearance in shared core is the debt being tracked.
 _TPU_NAMES = frozenset({"is_tpu", "_is_tpu"})
 
+#: A comparison against this string is a TPU branch too: ``x.device.type == "tpu"``.
+_TPU_DEVICE = "tpu"
+
+#: Plugin modules whose "sglang.srt.*" strings name the core code they patch.
+HOOKS_ROOT = "sglang_tpu/hooks"
+
+#: A dotted hook target, or a prefix ending in "." that targets are built from.
+_HOOK_TARGET = re.compile(r"sglang\.srt(?:\.\w+)+\.?")
+
 #: "tpu" as a path component or a snake_case word, not the "tpu" inside "output".
 _TPU_IN_PATH = re.compile(r"(?:^|[/_.-])tpu(?:[/_.-]|$)", re.IGNORECASE)
 
@@ -63,7 +78,7 @@ class Debt(NamedTuple):
     """The tracked counts, keyed by file. NamedTuple, not msgspec.Struct: the
     pre-commit hook runs on the bare interpreter (standard library only)."""
 
-    #: path -> count of is_tpu / _is_tpu references in shared core
+    #: path -> count of TPU branches in shared core
     branches: dict[str, int] = {}
     #: path -> count of import statements naming the plugin package
     imports: dict[str, int] = {}
@@ -101,7 +116,8 @@ def _iter_python_files(root: str) -> Iterator[str]:
 
 
 def count_tpu_branches(path: str) -> int:
-    """References to ``is_tpu`` / ``_is_tpu``, ignoring imports and definitions."""
+    """References to ``is_tpu`` / ``_is_tpu``, ignoring imports and definitions,
+    plus comparisons against ``"tpu"``."""
     with open(path, "r", encoding="utf-8") as handle:
         source = handle.read()
     try:
@@ -119,6 +135,11 @@ def count_tpu_branches(path: str) -> int:
         if isinstance(node, ast.Name) and node.id in _TPU_NAMES:
             count += 1
         elif isinstance(node, ast.Attribute) and node.attr in _TPU_NAMES:
+            count += 1
+        elif isinstance(node, ast.Compare) and any(
+            isinstance(operand, ast.Constant) and operand.value == _TPU_DEVICE
+            for operand in (node.left, *node.comparators)
+        ):
             count += 1
     return count
 
@@ -183,6 +204,45 @@ def collect(repo_root: str, only: Optional[list[str]] = None) -> Debt:
     return Debt(branches=branches, imports=imports, modules=sorted(modules))
 
 
+def _module_file(repo_root: str, dotted: str) -> Optional[str]:
+    """The file of the longest module prefix of ``dotted``, the module
+    HookRegistry imports before it looks the rest up as attributes."""
+    import_root = os.path.dirname(MODULE_SCAN_ROOT)
+    parts = dotted.split(".")
+    for end in range(len(parts), 0, -1):
+        base = os.path.join(import_root, *parts[:end])
+        for candidate in (base + ".py", os.path.join(base, "__init__.py")):
+            if os.path.isfile(os.path.join(repo_root, candidate)):
+                return candidate.replace(os.sep, "/")
+    return None
+
+
+def collect_hook_targets(repo_root: str) -> list[str]:
+    """Core files that a plugin hook patches, from the dotted target strings in
+    sglang_tpu/hooks/. Not debt: they only widen the TPU PR gate."""
+    hooks_root = os.path.join(repo_root, HOOKS_ROOT)
+    if not os.path.isdir(hooks_root):
+        return []
+    targets: set[str] = set()
+    for path in _iter_python_files(hooks_root):
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError:  # pragma: no cover - CI lints syntax separately
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and _HOOK_TARGET.fullmatch(node.value)
+            ):
+                rel = _module_file(repo_root, node.value)
+                if rel is not None:
+                    targets.add(rel)
+    return sorted(targets)
+
+
 def load_baseline(repo_root: str) -> Debt:
     path = os.path.join(repo_root, BASELINE_PATH)
     if not os.path.exists(path):
@@ -196,13 +256,15 @@ def load_baseline(repo_root: str) -> Debt:
     )
 
 
-def write_baseline(repo_root: str, debt: Debt) -> str:
+def write_baseline(repo_root: str, debt: Debt, hook_targets: list[str]) -> str:
     path = os.path.join(repo_root, BASELINE_PATH)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "branches": dict(sorted(debt.branches.items())),
         "imports": dict(sorted(debt.imports.items())),
         "modules": sorted(debt.modules),
+        # Read only by the TPU PR gate; load_baseline() leaves it out of the ratchet.
+        "hook_targets": sorted(hook_targets),
     }
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -221,7 +283,7 @@ def compare(
         allowed = baseline.branches.get(rel, 0)
         if count > allowed:
             violations.append(
-                f"{rel}: {count} is_tpu reference(s), baseline {allowed}. "
+                f"{rel}: {count} TPU branch(es), baseline {allowed}. "
                 f"New TPU branches belong behind a platform method or a "
                 f"registration in sglang_tpu/."
             )
@@ -285,14 +347,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.write_baseline:
         debt = collect(repo_root)
-        path = write_baseline(repo_root, debt)
+        hook_targets = collect_hook_targets(repo_root)
+        path = write_baseline(repo_root, debt, hook_targets)
         total = sum(debt.branches.values())
         total_imports = sum(debt.imports.values())
         print(
-            f"wrote {_rel(path, repo_root)}: {total} is_tpu reference(s) in "
+            f"wrote {_rel(path, repo_root)}: {total} TPU branch(es) in "
             f"{len(debt.branches)} file(s), {total_imports} plugin import(s) in "
             f"{len(debt.imports)} file(s), {len(debt.modules)} TPU module(s) "
-            f"under python/sglang"
+            f"under python/sglang, {len(hook_targets)} hooked core file(s)"
         )
         return 0
 

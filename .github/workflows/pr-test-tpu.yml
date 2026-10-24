@@ -3,8 +3,10 @@
 # On demand only: a push never claims a slice. Each `/tag-and-rerun-ci` or
 # `/rerun-failed-ci` from a user listed in .github/CI_PERMISSIONS.json or the PR
 # author, or "Re-run failed jobs" from anyone with write access, runs the suite once
-# for the current head commit. A new push needs a new trigger. Applies when EITHER:
+# for the current head commit. A new push needs a new trigger. Applies when ANY of:
 #   * the PR touches a TPU-explicit path (auto), OR
+#   * the PR touches a shared file listed in tools/plugin/tpu_debt_baseline.json
+#     at the base commit, or that file itself (auto), OR
 #   * the PR carries the `tpu` label (manual opt-in -- for shared-code changes a
 #     maintainer judges need TPU coverage but that don't match those paths).
 #
@@ -30,8 +32,9 @@ jobs:
       github.event.action != 'labeled' ||
       github.event.label.name == 'tpu'
     runs-on: ubuntu-latest
-    # dorny/paths-filter lists the PR's changed files via the GitHub API (read);
-    # write lets the gate post its on-demand notice on the PR.
+    # dorny/paths-filter and the debt-file check list the PR's changed files and
+    # read the base commit's debt baseline via the GitHub API (read); write lets
+    # the gate post its on-demand notice on the PR.
     permissions:
       contents: read
       pull-requests: write
@@ -98,6 +101,46 @@ jobs:
               - '.github/workflows/feature-validation-tpu.yml'
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
+      # Shared files listed in the TPU debt baseline carry TPU code outside the
+      # paths above, or are patched by a sglang_tpu hook. Read the list from the
+      # base commit so a PR cannot drop its own files; a change to the list
+      # itself counts too.
+      - name: Detect changes to shared files that carry TPU code
+        id: debt
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const path = "tools/plugin/tpu_debt_baseline.json";
+            let baseline;
+            try {
+              const { data } = await github.rest.repos.getContent({
+                owner, repo, path, ref: context.payload.pull_request.base.sha,
+              });
+              baseline = JSON.parse(Buffer.from(data.content, "base64").toString());
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              core.warning(`The base commit has no ${path}; skipping this check.`);
+              core.setOutput("tpu", "false");
+              return;
+            }
+            const tracked = new Set([
+              path,
+              ...Object.keys(baseline.branches),
+              ...Object.keys(baseline.imports),
+              ...baseline.modules,
+              ...(baseline.hook_targets ?? []),
+            ]);
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: context.issue.number, per_page: 100,
+            });
+            // A rename reports the new path; previous_filename has the old one.
+            const hits = files
+              .flatMap(f => [f.filename, f.previous_filename])
+              .filter(f => f && tracked.has(f));
+            if (hits.length) core.info(`Shared files with TPU code: ${hits.join(", ")}`);
+            core.setOutput("tpu", hits.length > 0 ? "true" : "false");
+
       # A TPU-relevant first attempt FAILS here rather than skipping: a skip would
       # leave the required pr-test-tpu-finish green, and a failed decide is what
       # /tag-and-rerun-ci re-runs. Only that re-run (attempt > 1) claims a slice.
@@ -105,6 +148,7 @@ jobs:
         id: gate
         run: |
           if [[ "${{ steps.paths.outputs.tpu }}" != "true" && \
+                "${{ steps.debt.outputs.tpu }}" != "true" && \
                 "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" != "true" ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.run_attempt }}" == "1" ]]; then
