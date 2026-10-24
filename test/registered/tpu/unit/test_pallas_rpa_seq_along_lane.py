@@ -354,6 +354,8 @@ class TestKernelBlockSizes(CustomTestCase):
                 for blocks in block_sizes:
                     self.assertEqual(blocks.bkv_sz % page_size, 0)
                     self.assertGreaterEqual(blocks.bkv_sz, page_size)
+                    self.assertEqual(blocks.bq_sz % blocks.bq_c_sz, 0)
+                    self.assertEqual(blocks.bq_c_sz & (blocks.bq_c_sz - 1), 0)
                     self.assertGreaterEqual(blocks.batch_size, 1)
                     self.assertGreaterEqual(blocks.n_buffer, 1)
                 self.assertGreater(block_sizes[1].bq_sz, 1)
@@ -380,6 +382,16 @@ class TestKernelBlockSizes(CustomTestCase):
             self.assertGreater(prefill.bq_sz, 1, f"{vmem_mib} MiB")
             shrunk += prefill.bq_sz < 256
         self.assertGreater(shrunk, 0)  # some budget must exercise the shrinking
+        # When bkv_sz grows from 768 to page_size=1024 on 16q/2kv and bq_sz shrinks
+        # to 384, bq_c_sz re-evaluates the compute threshold against bkv_sz=1024
+        # (stepping down from 32 to 16) rather than keeping gcd(32, 384) == 32.
+        _, grown = self._block_sizes(
+            page_size=1024,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            dtype_kv=jnp.bfloat16,
+            geometry=(16, 2, 64, None),
+        )
+        self.assertEqual((grown.bq_sz, grown.bq_c_sz, grown.bkv_sz), (384, 16, 1024))
 
     def test_explicit_partial_page_k_block_is_refused(self):
         """An explicit k block must cover whole pages too when the call reads
