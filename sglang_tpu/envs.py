@@ -132,6 +132,9 @@ class TpuEnvs:
     SGLANG_TPU_FP4_DEQUANT_VIA_FP8 = EnvBool(False)
     # Tuning only: comma list of fused-RS row buckets to keep (the tile_m bucket always stays).
     SGLANG_TPU_FUSED_RS_M_BUCKETS = EnvStr(None)
+    # Fused-RS tiles (tile_m,k1,n1,k2,n2,w1_bufs,w2_bufs) for EP-layout prefill calls
+    # (>= 32768 routed rows), overriding the tuned table.
+    SGLANG_TPU_FUSED_RS_EP_PREFILL_TILES = EnvStr(None)
     # Fused-RS EP mode leaves each tile's output row writes in flight until its staging
     # slot is reused, as expert-TP mode does, instead of waiting for them after every tile.
     SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES = EnvBool(False)
