@@ -27,6 +27,8 @@ from sglang_router.router_args import MINI_LB_POLICY_CHOICES, RouterArgs
 
 logger = logging.getLogger(__name__)
 
+_CONNECT_TIMEOUT_SECS = 10.0
+
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
@@ -72,6 +74,15 @@ class MiniLoadBalancer:
             )
             if self.affinity_policy is not None
             else None
+        )
+
+    def _client_timeout(self) -> aiohttp.ClientTimeout:
+        affinity = self.affinity_policy is not None
+        return aiohttp.ClientTimeout(
+            total=self.timeout,
+            sock_read=self.timeout,
+            connect=_CONNECT_TIMEOUT_SECS if affinity else None,
+            sock_connect=_CONNECT_TIMEOUT_SECS if affinity else 300,
         )
 
     def _validate_router_args(self, router_args: RouterArgs):
@@ -120,7 +131,12 @@ class MiniLoadBalancer:
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
             return
-        async with aiohttp.ClientSession() as session:
+        session_args = (
+            {"timeout": self._client_timeout()}
+            if self.affinity_policy is not None
+            else {}
+        )
+        async with aiohttp.ClientSession(**session_args) as session:
             async with session.get(f"{self.prefill_urls[0]}/server_info") as resp:
                 info = await resp.json()
                 self.prefill_dp_size = len(info.get("internal_states", [1]))
@@ -218,13 +234,7 @@ class MiniLoadBalancer:
             prefill_req = modified_request
             decode_req = modified_request
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=self.timeout,
-                sock_read=self.timeout,
-                sock_connect=300,
-            )  # Add timeout for request reliability
-        ) as session:
+        async with aiohttp.ClientSession(timeout=self._client_timeout()) as session:
             tasks = [
                 session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
                 session.post(f"{decode_server}/{endpoint}", json=decode_req),
@@ -271,13 +281,7 @@ class MiniLoadBalancer:
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
-        session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=self.timeout,
-                sock_read=self.timeout,
-                sock_connect=300,
-            )  # Add timeout for request reliability
-        )
+        session = aiohttp.ClientSession(timeout=self._client_timeout())
         responses = []
 
         async def close_upstreams():
