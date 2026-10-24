@@ -27,6 +27,22 @@ from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
 
+def _graph_config(
+    *,
+    tpu_compile_tracer: str,
+    unsafe_save_torch_compile_bundle: str | None = None,
+    unsafe_load_torch_compile_bundle: str | None = None,
+):
+    graph = SimpleNamespace(
+        tpu_compile_tracer=tpu_compile_tracer,
+        unsafe_save_torch_compile_bundle=unsafe_save_torch_compile_bundle,
+        unsafe_load_torch_compile_bundle=unsafe_load_torch_compile_bundle,
+    )
+    return patch.object(
+        vit_runner, "get_exec", return_value=SimpleNamespace(graph=graph)
+    )
+
+
 @contextlib.contextmanager
 def _unset(field):
     """Run with ``field`` unset, restoring whatever was there before.
@@ -148,13 +164,6 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             nn.Identity(),
             owner=owner,
             compile_timing_recorder=recorder,
-            model_runner=SimpleNamespace(
-                server_args=SimpleNamespace(
-                    tpu_compile_tracer="direct",
-                    unsafe_save_torch_compile_bundle=None,
-                    unsafe_load_torch_compile_bundle=None,
-                )
-            ),
         )
         events = []
         clock = SimpleNamespace(now=0.0)
@@ -176,6 +185,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
         with (
             envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            _graph_config(tpu_compile_tracer="direct"),
             patch.object(vit_runner, "_precompiled_max_patch_count", None),
             patch.object(
                 vit_runner, "time", SimpleNamespace(perf_counter=lambda: clock.now)
@@ -208,12 +218,11 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             self.assertEqual(len(policy.compiled_fn.cache), 2)
 
     def test_default_policy_keeps_dynamo_with_async_enabled(self):
-        policy = _FakeVisionPolicy(
-            model_runner=SimpleNamespace(
-                server_args=SimpleNamespace(tpu_compile_tracer="direct")
-            )
-        )
-        with envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True):
+        policy = _FakeVisionPolicy()
+        with (
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            _graph_config(tpu_compile_tracer="direct"),
+        ):
             compiled = policy._compile_method(lambda x: x, use_bundle=False)
         self.assertNotIsInstance(compiled, direct_compile.CompiledFunction)
 

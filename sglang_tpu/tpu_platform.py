@@ -1432,7 +1432,9 @@ class TpuSRTPlatform(SRTPlatform):
         return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:
-        torch.accelerator.set_device_index(device)
+        # The PJRT bootstrap binds each worker to one chiplet at local index 0
+        # and torch_tpu cannot switch it, so sglang's gpu_id is only a label.
+        torch.accelerator.set_device_index(0)
 
     def get_device_name(self, device_id: int = 0) -> str:
         try:

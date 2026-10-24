@@ -43,6 +43,10 @@ from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention_flags,
 )
+from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -59,6 +63,8 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     resolve_encoder_media_processor_config,
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
+from sglang.srt.platforms import current_platform
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     assert_published,
     get_device,
@@ -77,6 +83,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket,
 )
+from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
 logger = logging.getLogger(__name__)
 
@@ -546,6 +553,9 @@ class MMEncoder:
         this instance's value, not a config change, so it travels as an
         argument."""
         assert_published(server_args, role="encoder")
+        # Encoder counterpart of the scheduler-worker bootstrap; must precede
+        # set_device and the distributed init. No-op off TPU.
+        initialize_torch_tpu_worker(server_args, rank)
         logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
         self.server_args = server_args
         configure_media_url_security(
@@ -583,7 +593,13 @@ class MMEncoder:
             gpu_id=self.gpu_id,
         )
 
-        torch.get_device_module(self.device).set_device(self.gpu_id)
+        # Through the platform: torch_tpu rejects torch.tpu.set_device when it was
+        # imported before the plugin, as it is in this (launcher) process.
+        current_platform.set_device(current_platform.get_device(self.gpu_id))
+        # As ModelRunner.load_model: an nproc-sized intra-op pool per TP rank
+        # starves the container's CPU quota.
+        if self.device != "cpu":
+            torch.set_num_threads(1)
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),
@@ -615,6 +631,7 @@ class MMEncoder:
         initialize_model_parallel()
         initialize_dp_attention_flags(server_args)
         init_dp_gathered_buffer(self.model_config)
+        self.init_moe_gemm_config()
 
         self.model = load_model(
             model_config=self.model_config,
@@ -918,6 +935,25 @@ class MMEncoder:
             async with cond:
                 cond.notify_all()
 
+    def init_moe_gemm_config(self) -> None:
+        """Resolve the MoE/GEMM backend globals before load, as Scheduler does.
+
+        Left unset, they are first assigned inside a torch.compile trace.
+        """
+        config_to_check = self.model_config.hf_text_config
+        moe_topk_attrs = (
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "top_k_experts",
+            "moe_top_k",
+            "moe_topk",
+        )
+        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+            initialize_moe_config()
+        initialize_fp8_gemm_config()
+        initialize_fp4_gemm_config()
+        initialize_bf16_gemm_config()
+
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""
         default = self.model_config.hidden_size
@@ -1024,21 +1060,34 @@ class MMEncoder:
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
         token_counts = preprocess_result.token_counts
-        mm_items = self._build_model_mm_items(
-            mm_feature, preprocess_result, indices, modality
-        )
-
         forward_start = time.perf_counter()
-        with torch.inference_mode():
-            new_embeddings = get_feature_fn(mm_items)
-            if new_embeddings.ndim != 2:
-                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+        new_embeddings = self.encode_indices(
+            mm_feature, preprocess_result, indices, modality, get_feature_fn
+        )
         if encoder_metrics_collector is not None:
             encoder_metrics_collector.observe_model_forward(
                 time.perf_counter() - forward_start, modality=modality.name.lower()
             )
 
         return self.slice_embedding(new_embeddings, (token_counts[i] for i in indices))
+
+    def encode_indices(
+        self,
+        mm_feature,
+        preprocess_result: EncoderPreprocessResult,
+        indices: List[int],
+        modality: Modality,
+        get_feature_fn: Callable[[List[MultimodalDataItem]], torch.Tensor],
+    ) -> torch.Tensor:
+        """Encode the items at indices into [num_tokens, hidden_size]; a platform hook point."""
+        mm_items = self._build_model_mm_items(
+            mm_feature, preprocess_result, indices, modality
+        )
+        with torch.inference_mode():
+            embedding = get_feature_fn(mm_items)
+        if embedding.ndim != 2:
+            embedding = embedding.reshape(-1, embedding.shape[-1])
+        return embedding
 
     def _build_model_mm_items(
         self,
@@ -1730,13 +1779,7 @@ class MMEncoder:
             mm_embedding = None
             mm_hash = None
 
-            mm_items = self._build_model_mm_items(
-                ctx.mm_feature,
-                ctx.preprocess_result,
-                list(range(ctx.num_items)),
-                modality,
-            )
-
+            all_indices = list(range(ctx.num_items))
             cache_hit = False
             # The prefix cache hashes the whole request; a fused multi-request
             # batch has no per-request key, so only N=1 contexts use it.
@@ -1747,6 +1790,9 @@ class MMEncoder:
                 and len(ctx.items_per_req) == 1
             )
             if use_mm_cache:
+                mm_items = self._build_model_mm_items(
+                    ctx.mm_feature, ctx.preprocess_result, all_indices, modality
+                )
                 for mm_item in mm_items:
                     mm_item.set_pad_value()
                 mm_hashes = [mm_item.hash for mm_item in mm_items]
@@ -1759,12 +1805,15 @@ class MMEncoder:
 
             if mm_embedding is None:
                 forward_start = time.perf_counter()
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
-                    if not keep_on_gpu:
-                        mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+                mm_embedding = self.encode_indices(
+                    ctx.mm_feature,
+                    ctx.preprocess_result,
+                    all_indices,
+                    modality,
+                    ctx.get_feature_fn,
+                )
+                if not keep_on_gpu:
+                    mm_embedding = mm_embedding.cpu()
                 if encoder_metrics_collector is not None and not ctx.is_health_check:
                     encoder_metrics_collector.observe_model_forward(
                         time.perf_counter() - forward_start, modality=modality_str
@@ -2507,6 +2556,8 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+    # Spawned, so plugin hooks are not inherited from the launcher.
+    load_plugins()
     publish(server_args, role="encoder")
     try:
         asyncio.run(run_encoder(server_args, schedule_path, dist_init_method, rank))

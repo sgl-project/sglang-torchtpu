@@ -24,6 +24,11 @@ from sglang_tpu.hooks.draft_kv_pool import (
     draft_mha_pool_class,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
+from sglang_tpu.hooks.encoder import (
+    encode_indices_within_patch_budget,
+    install_encoder_vision_compile,
+    reject_encoder_dp,
+)
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
@@ -88,6 +93,26 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
         initialize_dense_moe_config,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.init_moe_gemm_config",
+        initialize_dense_moe_config,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.__init__",
+        install_encoder_vision_compile,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.encode_indices",
+        encode_indices_within_patch_budget,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.runtime.launch_dp_runtime",
+        reject_encoder_dp,
+        HookType.BEFORE,
     ),
     (
         "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",
