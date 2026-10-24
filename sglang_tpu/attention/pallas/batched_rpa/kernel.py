@@ -170,8 +170,9 @@ def calculate_and_store_out(
             )
         if cfgs.model.has_attention_sink:
             batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
-        if cfgs.serve.cache_only:
-            # A row that attended no key keeps l == 0 and outputs 0.
+        if cfgs.serve.attention_scope.walks_cache_stripe:
+            # A row that attended no key (empty stripe) keeps l == 0 and
+            # outputs 0.
             batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
@@ -575,8 +576,10 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += f"-sw{cfgs.model.sliding_window}"
     if cfgs.model.has_attention_sink:
         name += "-sink"
-    if cfgs.serve.cache_only:
+    if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY:
         name += "-co"
+    elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
+        name += "-striped"
     if cfgs.serve.skip_kv_write:
         name += "-nowb"
     if cfgs.serve.return_lse:
