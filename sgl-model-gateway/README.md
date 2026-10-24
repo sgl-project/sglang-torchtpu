@@ -396,9 +396,9 @@ Configure the sample limits with the `PREFILL_SAMPLE_SIZE` and `DECODE_SAMPLE_SI
 Load metrics and guardrails are summed across DP ranks. Prefill rejects engines with more than 2,000,000 waiting uncached tokens. Decode rejects engines with more than 24 waiting requests across the entire engine, including preallocation, transfer, and retracted queues. These limits apply regardless of sample size or DP size.
 
 
-With session affinity, failed load connections and three consecutive load-poll timeouts exclude an engine until a successful poll restores it. Reachability transitions are logged once. If every engine in a pool is excluded, placement falls back to its configured engines and logs a warning. Default random routing and upstream forwarding stay unchanged.
+With session affinity, failed load connections and three consecutive load-poll timeouts exclude an engine until a successful poll restores it. Reachability transitions are logged once. If every engine in a pool is excluded, placement falls back to its configured engines and logs a warning. Default random routing keeps its existing forwarding behavior.
 
-The stacked follow-ups add request retries and pair failure tracking, then the stall watchdog and `/stalls` diagnostics.
+Session-affinity engine requests use a 10-second connection timeout, separate from `--request-timeout-secs`. Adjust the private `_CONNECT_TIMEOUT_SECS` constant in `mini_lb.py` to change it.
 
 ### Running Worker Servers
 Use upstream SGLang binaries to start dedicated worker processes.
