@@ -220,6 +220,11 @@ case "$BENCH_MODEL" in
         MAX_TOTAL_TOKENS_TP8=1572864
         MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
         MODEL_EXTRA_ARGS="--tpu-fp8-runtime channelwise"
+        # Without mmap each loader thread holds a whole ~10 GB shard: 8 threads x 8 ranks
+        # (~117 GB/rank) OOMs the host, so cap the threads there.
+        if [[ " ${EXTRA_ARGS:-} " == *" --weight-loader-disable-mmap "* ]]; then
+            MODEL_EXTRA_ARGS="$MODEL_EXTRA_ARGS --model-loader-extra-config {\"num_threads\":2}"
+        fi
         ;;
     *)
         echo "ERROR: unknown BENCH_MODEL='$BENCH_MODEL'" >&2
