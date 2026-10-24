@@ -37,7 +37,10 @@ from torch.compiler._cache import CacheArtifactManager
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.page_cache import release_startup_page_cache
+from sglang_tpu.page_cache import (
+    release_startup_page_cache,
+    start_checkpoint_page_cache_release,
+)
 
 logger = get_logger(__name__)
 
@@ -197,7 +200,7 @@ def _release_cpu_backend() -> bool:
 
 
 def _before_freeze() -> None:
-    release_startup_page_cache()
+    release_startup_page_cache(include_checkpoints=False)
     CacheArtifactManager.clear()
     # Serving executables are owned by TorchTPU; discard JAX tracing caches.
     jax.clear_caches()
@@ -223,6 +226,12 @@ def install(scheduler_cls: Optional[type] = None) -> None:
     if getattr(orig, "_tpu_host_heap_trim", False):
         return
 
+    init_graphs = scheduler_cls.init_all_cuda_graphs
+
+    def init_all_cuda_graphs(self, *args, **kwargs):
+        start_checkpoint_page_cache_release()
+        return init_graphs(self, *args, **kwargs)
+
     orig_get_init_info = scheduler_cls.get_init_info
 
     def get_init_info(self, *args, **kwargs):
@@ -243,5 +252,6 @@ def install(scheduler_cls: Optional[type] = None) -> None:
         return result
 
     handle_freeze_gc._tpu_host_heap_trim = True
+    scheduler_cls.init_all_cuda_graphs = init_all_cuda_graphs
     scheduler_cls.get_init_info = get_init_info
     scheduler_cls.handle_freeze_gc = handle_freeze_gc

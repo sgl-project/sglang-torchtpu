@@ -6,6 +6,7 @@ import os
 import threading
 import unittest
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -23,6 +24,10 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class _Scheduler:
     def __init__(self):
         self.calls = []
+
+    def init_all_cuda_graphs(self):
+        self.calls.append("graphs")
+        return "graphs initialized"
 
     def get_init_info(self):
         self.calls.append("ready")
@@ -84,11 +89,15 @@ class TestTrimHostHeap(CustomTestCase):
 class TestInstall(CustomTestCase):
     def setUp(self):
         directory = self.enterContext(TemporaryDirectory())
-        (Path(directory) / "weights.safetensors").write_bytes(b"payload")
+        self.directory = Path(directory)
+        (self.directory / "weights.safetensors").write_bytes(b"payload")
         self.enterContext(get_context().override_server_args(model_path=directory))
         self.group = MagicMock()
         self.enterContext(get_parallel().override(world_group=self.group))
-        self.enterContext(patch.object(page_cache, "resolve_compilations"))
+        self.join_writers = self.enterContext(
+            patch.object(page_cache, "resolve_compilations")
+        )
+        self.enterContext(patch.object(page_cache, "_checkpoint_release", None))
         self.advise = self.enterContext(patch.object(page_cache.os, "posix_fadvise"))
         self.enterContext(tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(False))
         self.enterContext(patch.dict(os.environ, {"LOCAL_RANK": "0"}))
@@ -180,15 +189,96 @@ class TestInstall(CustomTestCase):
     def test_install_wraps_once(self):
         wrapped = self.cls.handle_freeze_gc
         wrapped_init_info = self.cls.get_init_info
+        wrapped_graphs = self.cls.init_all_cuda_graphs
         tpu.install(scheduler_cls=self.cls)
         self.assertIs(self.cls.handle_freeze_gc, wrapped)
         self.assertIs(self.cls.get_init_info, wrapped_init_info)
+        self.assertIs(self.cls.init_all_cuda_graphs, wrapped_graphs)
 
     def test_startup_releases_files_without_a_freeze_request(self):
         scheduler = self.cls()
         self.assertEqual(scheduler.get_init_info(), {"status": "ready"})
         self.advise.assert_called_once()
         self.assertEqual(scheduler.calls, ["ready"])
+
+    def test_ready_then_freeze_releases_checkpoints_once_and_compiler_files_twice(self):
+        cache_root = self.directory / "compiler"
+        active = cache_root / "active"
+        active.mkdir(parents=True)
+        artifact = active / "graph.bin"
+        artifact.write_bytes(b"initial warmup")
+        checkpoint_inode = (self.directory / "weights.safetensors").stat().st_ino
+        for mode in ("serial", "overlap"):
+            with (
+                self.subTest(mode=mode),
+                get_context().override_server_args(
+                    model_path=str(self.directory), startup_weight_load_mode=mode
+                ),
+                tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(True),
+                tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
+                tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
+                patch.object(page_cache, "_CACHE_ROOT", cache_root),
+                patch.object(page_cache, "_filesystem_type", return_value="ext4"),
+                patch.dict(
+                    os.environ,
+                    {
+                        "TORCH_TPU_TIER2_COMPILATION_CACHE": "active",
+                        "TORCHINDUCTOR_CACHE_DIR": "",
+                        "JAX_COMPILATION_CACHE_DIR": "",
+                    },
+                ),
+            ):
+                advised = []
+                self.advise.side_effect = lambda fd, *_: advised.append(
+                    os.fstat(fd).st_ino
+                )
+                self.join_writers.reset_mock()
+                scheduler = self.cls()
+                self.assertEqual(scheduler.init_all_cuda_graphs(), "graphs initialized")
+                self.assertEqual(scheduler.get_init_info(), {"status": "ready"})
+                self.assertEqual(advised.count(checkpoint_inode), 1)
+                self.assertEqual(advised.count(artifact.stat().st_ino), 1)
+                artifact.write_bytes(b"HTTP warmup")
+                self.assertEqual(scheduler.handle_freeze_gc("req"), "forwarded")
+                self.assertEqual(advised.count(checkpoint_inode), 1)
+                self.assertEqual(advised.count(artifact.stat().st_ino), 2)
+                self.assertEqual(self.join_writers.call_count, 2)
+                self.assertEqual(scheduler.calls, ["graphs", "ready", "req"])
+                self.assertIsNone(page_cache._checkpoint_release)
+                gc.unfreeze()
+
+    def test_ready_waits_for_background_checkpoint_advice_and_propagates_errors(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                entered, release, joining = (threading.Event() for _ in range(3))
+
+                def advise(*_):
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                    if fail:
+                        raise OSError("checkpoint advice failed")
+
+                self.advise.side_effect = advise
+                self.join_writers.side_effect = lambda _: joining.set()
+                scheduler = self.cls()
+                scheduler.init_all_cuda_graphs()
+                self.assertTrue(entered.wait(5))
+                with ThreadPoolExecutor(1) as pool:
+                    ready = pool.submit(scheduler.get_init_info)
+                    try:
+                        self.assertTrue(joining.wait(5))
+                        self.assertFalse(ready.done())
+                        self.assertEqual(scheduler.calls, ["graphs"])
+                    finally:
+                        release.set()
+                    if fail:
+                        with self.assertRaisesRegex(
+                            OSError, "checkpoint advice failed"
+                        ):
+                            ready.result(timeout=5)
+                        self.assertEqual(scheduler.calls, ["graphs"])
+                    else:
+                        self.assertEqual(ready.result(timeout=5), {"status": "ready"})
 
     def test_startup_cleanup_failure_prevents_ready_handshake(self):
         scheduler = self.cls()
