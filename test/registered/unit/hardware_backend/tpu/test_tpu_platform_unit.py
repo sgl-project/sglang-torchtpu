@@ -537,6 +537,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             with (
                 self.subTest(algorithm=algorithm, enabled=enabled),
                 tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+                tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(enabled),
             ):
                 if error:
                     with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
