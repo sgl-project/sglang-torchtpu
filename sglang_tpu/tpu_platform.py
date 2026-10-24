@@ -500,10 +500,6 @@ def _resolve_unified_kv_pool(server_args) -> None:
             f"is not supported with --disaggregation-mode {cfg.disaggregation_mode!r}.",
         ),
         (
-            cfg.speculative_algorithm is not None,
-            f"is not supported with speculative decoding (--speculative-algorithm {cfg.speculative_algorithm!r}).",
-        ),
-        (
             cfg.enable_hierarchical_cache and cfg.hicache_io_backend != "raiden",
             f"with --enable-hierarchical-cache requires --hicache-io-backend raiden, got {cfg.hicache_io_backend!r}.",
         ),

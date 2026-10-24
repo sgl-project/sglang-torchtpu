@@ -491,7 +491,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ("is_hybrid_swa", False, ValueError),
                 ("use_mla_backend", True, ValueError),
                 ("is_hybrid_gdn", True, ValueError),
-                ("is_draft_worker", True, ValueError),
                 ("pp_size", 2, ValueError),
                 ("dcp_enabled", True, ValueError),
                 ("pool_page_size", 1, ValueError),
@@ -534,7 +533,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             dict(dcp_size=2),
             dict(attn_cp_size=2),
             dict(disaggregation_mode="prefill"),
-            dict(speculative_algorithm="EAGLE"),
             dict(enable_hierarchical_cache=True, hicache_io_backend="kernel"),
             dict(page_size=1),
         ):
@@ -994,6 +992,57 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertEqual(len(unique_bufs), 2)
         self.assertEqual(len(layer_to_slab), 8)
         self.assertEqual(len(swa_tables), 3)
+
+    def test_request_retraction_and_speculative_decoding_rollback(self):
+        from sglang_tpu.unified_kv_pool import should_use_unified_kv_pool_for_worker
+
+        _, alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=40, page_size=128
+        )
+        # Allocate 3 pages (384 tokens: 128 cached prefix + 256 new tokens)
+        idx = alloc.alloc_extend(
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([384], dtype=torch.int64),
+            torch.tensor([384], dtype=torch.int64),
+            torch.tensor([-1], dtype=torch.int64),
+            384,
+        )
+        self.assertIsNotNone(idx)
+        # Retract request keeping 128-token prefix: frees 2 suffix pages * (1 + 4) = 10 physical pages!
+        freed_retract = alloc.retract_request_pages(idx, matched_prefix_len=128)
+        self.assertEqual(freed_retract, 10)
+        self.assertEqual(alloc.full_attn_allocator.allocated_pages, 1)
+        self.assertEqual(alloc.swa_attn_allocator.allocated_pages, 4)
+
+        # Speculative decoding: extend from 128 to 260 tokens (crosses into page 2 and page 3: 3 pages total)
+        ext = alloc.alloc_extend(
+            torch.tensor([128], dtype=torch.int64),
+            torch.tensor([128], dtype=torch.int64),
+            torch.tensor([260], dtype=torch.int64),
+            torch.tensor([260], dtype=torch.int64),
+            idx[127:128],
+            132,
+        )
+        full_seq = torch.cat([idx[:128], ext])
+        # Target model accepts 4 draft tokens (final_seq_len = 132, stays inside page 2 [128..255]),
+        # rejecting the tail tokens [256..259] that crossed into page 3!
+        # Also sliding_window_size = 128, so final_seq_len=132 < 256 does NOT evict page 1's SWA window yet.
+        freed_spec = alloc.rollback_rejected_draft_tokens(
+            full_seq,
+            verified_seq_len=128,
+            num_draft_tokens=132,
+            num_accepted_tokens=4,
+            sliding_window_size=128,
+        )
+        # Page 3 (1 full + 4 SWA = 5 physical pages) is rolled back cleanly!
+        self.assertEqual(freed_spec, 5)
+        self.assertEqual(alloc.full_attn_allocator.allocated_pages, 2)
+        self.assertEqual(alloc.swa_attn_allocator.allocated_pages, 8)
+
+        # Non-hybrid draft worker falls back cleanly to False
+        draft_kvc = types.SimpleNamespace(is_draft_worker=True, is_hybrid_swa=False)
+        self.assertFalse(should_use_unified_kv_pool_for_worker(draft_kvc))
 
 
 if __name__ == "__main__":
