@@ -153,9 +153,8 @@ Every in-project job calls this workflow; its work is one shell step. In order:
    `tpu-cluster`. The step re-mints the one-hour cluster token itself every 40 minutes.
 2. **Kueue sync.** `reconcile_quota.py` creates any missing flavor, queue or LocalQueue
    and sets every CI queue's quota from the live Ready hosts (see Capacity). A multi-host
-   pool holding more than one slice gets no quota. It needs the `tpu-ci-kueue-sync` grant
-   (Enabling Kueue, step 3), and any error fails the job rather than carrying on with stale
-   quota.
+   pool holding more than one slice gets no quota. Any error fails the job rather than
+   carrying on with stale quota.
 3. **Render.** `render_jobset.py` fills `jobset-tpu.yaml` (or `jobset-tpu-pd.yaml` for
    P/D) for one of four modes:
    - **suite:** one host runs `run_suite.py --suite S`;
@@ -272,8 +271,8 @@ cluster's identities are repository secrets (`EXTERNAL_*`; see
 [`external/README.md`](external/README.md)).
 
 `tpu-ci@` needs `container.developer`, `artifactregistry.writer` and `logging.logWriter`
-in the project, the cluster-scoped `tpu-ci-kueue-sync` grant (Enabling Kueue, step 3), and a Workload Identity binding from the `github` WIF pool scoped to
-`sgl-project/sglang-torchtpu`. Test pods run in namespace `tpu-ci`.
+in the project, a cluster-scoped grant to manage Kueue objects, and a Workload Identity
+binding from the `github` WIF pool scoped to `sgl-project/sglang-torchtpu`. Test pods run in namespace `tpu-ci`.
 
 New CI node pools: `--machine-type=tpu7x-standard-4t`, `--reservation-affinity=specific`
 on the reservation, `--node-labels=ci-tpu-pool=<unique>`,
@@ -473,24 +472,14 @@ error anywhere. With only `jobset` enabled, that mistake cannot reach them.
 
 Then confirm nothing unexpected was caught: `kubectl get workloads -A`.
 
-**3. Let CI create and update its queues, then create them.** ClusterQueues and
-ResourceFlavors are cluster-scoped, which `container.developer` does not cover.
+**3. Create the queues.**
 
 ```bash
-kubectl create clusterrole tpu-ci-kueue-sync --verb=get,list,create,patch \
-  --resource=clusterqueues.kueue.x-k8s.io --resource=resourceflavors.kueue.x-k8s.io \
-  --resource=localqueues.kueue.x-k8s.io
-kubectl create clusterrolebinding tpu-ci-kueue-sync --clusterrole=tpu-ci-kueue-sync \
-  --user=tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
-kubectl auth can-i create clusterqueues \
-  --as=tpu-ci@sglang-torchtpu.iam.gserviceaccount.com   # yes
 python3 .github/tpu-ci/reconcile_quota.py --dry-run     # server-validated plan
 python3 .github/tpu-ci/reconcile_quota.py               # every CI job also runs this
 kubectl get clusterqueues -o wide                       # ACTIVE=True on each
 kubectl -n tpu-ci get localqueues
 ```
-
-Without that grant, every CI job fails at the Kueue sync with `Forbidden`.
 
 `ACTIVE=True` is necessary but not sufficient. A queue is Active as soon as its flavors
 resolve, even if it can never admit anything — so also check that a real workload reaches
