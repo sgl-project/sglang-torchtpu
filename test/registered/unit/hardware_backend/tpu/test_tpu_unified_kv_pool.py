@@ -714,6 +714,64 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertIsNotNone(res10)
         self.assertEqual((res10[0], res10[1]), (256, 128))
 
+    def test_stale_swa_then_whole_branch_protects_forks_and_sweeps_zombies(self):
+        from sglang_tpu.unified_kv_pool import EvictionCandidate
+
+        _, alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=20, page_size=128
+        )
+        alloc.eviction_policy = "stale_swa_then_whole_branch"
+        # Tree:
+        # - fork_root (num_children=2, is_stale_swa=True): branched fork point, MUST NOT be evicted in Phase 1!
+        # - mid_chain (parent=fork_root, num_children=1, is_stale_swa=True): unbranched interior stale SWA (128 tok -> 4 phys pages)
+        # - leaf_child (parent=mid_chain, num_children=0, has_coupled_swa=True): live leaf (128 tok -> 1+4=5 phys pages)
+        # When leaf_child is evicted in Phase 3, mid_chain (whose SWA was reclaimed in Phase 1) becomes a spotlight-less Zombie leaf and is swept automatically (+1 phys page)!
+        cands = [
+            EvictionCandidate(
+                "fork_root", "swa", 128, last_access_time=1.0, num_children=2, is_stale_swa=True
+            ),
+            EvictionCandidate(
+                "mid_chain",
+                "swa",
+                128,
+                last_access_time=5.0,
+                num_children=1,
+                is_stale_swa=True,
+            ),
+            EvictionCandidate(
+                "mid_chain",
+                "full",
+                128,
+                last_access_time=5.0,
+                has_coupled_swa=True,
+                num_children=1,
+                parent_id="fork_root",
+            ),
+            EvictionCandidate(
+                "leaf_child",
+                "full",
+                128,
+                last_access_time=15.0,
+                has_coupled_swa=True,
+                num_children=0,
+                parent_id="mid_chain",
+            ),
+        ]
+        # Shortfall = 4 physical pages: satisfied purely by mid_chain's unbranched stale SWA window; fork_root SWA is untouched!
+        res4 = alloc.plan_stale_swa_then_whole_branch_eviction(cands, short_physical_pages=4)
+        self.assertIsNotNone(res4)
+        self.assertEqual((res4[0], res4[1]), (0, 128))
+        self.assertEqual([ (c.node_id, c.kind) for c in res4[2] ], [("mid_chain", "swa")])
+
+        # Shortfall = 9 physical pages: Phase 1 reclaims mid_chain SWA (4 phys), Phase 3 evicts leaf_child (5 phys) AND sweeps mid_chain Zombie Full leaf (+1 phys = 10 phys total)!
+        res9 = alloc.plan_stale_swa_then_whole_branch_eviction(cands, short_physical_pages=9)
+        self.assertIsNotNone(res9)
+        self.assertEqual((res9[0], res9[1]), (256, 128))
+        self.assertEqual(
+            [(c.node_id, c.kind) for c in res9[2]],
+            [("mid_chain", "swa"), ("leaf_child", "full"), ("mid_chain", "full")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

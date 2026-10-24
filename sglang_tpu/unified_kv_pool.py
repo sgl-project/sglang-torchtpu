@@ -623,6 +623,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         "full_first",
         "swa_first",
         "timestamp_interleaved",
+        "stale_swa_then_whole_branch",
     )
 
     def __init__(
@@ -800,6 +801,11 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             if interleaved is None:
                 return None
             return (interleaved[0], interleaved[1])
+        if active_policy == "stale_swa_then_whole_branch" and candidates:
+            planned = self.plan_stale_swa_then_whole_branch_eviction(candidates, short)
+            if planned is None:
+                return None
+            return (planned[0], planned[1])
         max_f = min(
             self.full_attn_allocator.allocated_pages,
             max(0, int(full_evictable_tokens)) // ps,
@@ -872,6 +878,127 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                     freed_phys += pages
                 full_tokens_evicted += pages * ps
                 chosen.append(cand)
+        if freed_phys < short_physical_pages:
+            return None
+        return (full_tokens_evicted, swa_tokens_evicted, chosen)
+
+    def plan_stale_swa_then_whole_branch_eviction(
+        self,
+        candidates: Sequence[EvictionCandidate],
+        short_physical_pages: int,
+    ) -> Optional[Tuple[int, int, List[EvictionCandidate]]]:
+        """Evict unbranched stale SWA windows first, then zombie leaves, then whole branches with parent zombie sweep."""
+        if short_physical_pages <= 0:
+            return (0, 0, [])
+        ps = self.page_size
+        ms = self._swa_groups
+        swa_reclaimed: Set[Any] = set()
+        full_reclaimed: Set[Any] = set()
+        freed_phys = 0
+        full_tokens_evicted = 0
+        swa_tokens_evicted = 0
+        chosen: List[EvictionCandidate] = []
+
+        # Index full candidates and child counts for parent zombie sweep
+        full_by_id: Dict[Any, EvictionCandidate] = {}
+        live_children: Dict[Any, int] = {}
+        for c in candidates:
+            if c.kind == "full":
+                full_by_id[c.node_id] = c
+                live_children[c.node_id] = c.num_children
+
+        # Phase 1: Unbranched interior stale SWA windows (num_children == 1).
+        # Fork points (num_children > 1) are preserved so new prompts matching only the shared prefix still hit.
+        stale_swa_cands = sorted(
+            [
+                c
+                for c in candidates
+                if c.kind == "swa" and c.is_stale_swa and c.num_children == 1
+            ],
+            key=lambda c: c.last_access_time,
+        )
+        for cand in stale_swa_cands:
+            if freed_phys >= short_physical_pages:
+                break
+            pages = max(0, int(cand.tokens)) // ps
+            if pages <= 0 or cand.node_id in swa_reclaimed:
+                continue
+            swa_reclaimed.add(cand.node_id)
+            freed_phys += pages * ms
+            swa_tokens_evicted += pages * ps
+            chosen.append(cand)
+
+        # Phase 2: Spotlight-less "Zombie Full-KV" leaves (num_children == 0 and no live SWA window).
+        zombie_leaves = sorted(
+            [
+                c
+                for c in candidates
+                if c.kind == "full"
+                and live_children.get(c.node_id, c.num_children) == 0
+                and (not c.has_coupled_swa or c.node_id in swa_reclaimed)
+            ],
+            key=lambda c: c.last_access_time,
+        )
+        for cand in zombie_leaves:
+            if freed_phys >= short_physical_pages:
+                break
+            pages = max(0, int(cand.tokens)) // ps
+            if pages <= 0 or cand.node_id in full_reclaimed:
+                continue
+            full_reclaimed.add(cand.node_id)
+            freed_phys += pages
+            full_tokens_evicted += pages * ps
+            chosen.append(cand)
+            if cand.parent_id in live_children:
+                live_children[cand.parent_id] = max(0, live_children[cand.parent_id] - 1)
+
+        # Phase 3: Live leaves (coupled Full + SWA) with automatic parent zombie sweep.
+        live_leaves = sorted(
+            [
+                c
+                for c in candidates
+                if c.kind == "full"
+                and c.node_id not in full_reclaimed
+                and live_children.get(c.node_id, c.num_children) == 0
+            ],
+            key=lambda c: c.last_access_time,
+        )
+        for cand in live_leaves:
+            if freed_phys >= short_physical_pages:
+                break
+            pages = max(0, int(cand.tokens)) // ps
+            if pages <= 0 or cand.node_id in full_reclaimed:
+                continue
+            full_reclaimed.add(cand.node_id)
+            has_swa = cand.has_coupled_swa and cand.node_id not in swa_reclaimed
+            if has_swa:
+                swa_reclaimed.add(cand.node_id)
+                freed_phys += pages * (1 + ms)
+            else:
+                freed_phys += pages
+            full_tokens_evicted += pages * ps
+            chosen.append(cand)
+            # Walk up parent chain: if parent becomes a spotlight-less Zombie leaf, sweep it immediately!
+            pid = cand.parent_id
+            while pid is not None and pid in live_children:
+                live_children[pid] = max(0, live_children[pid] - 1)
+                parent_cand = full_by_id.get(pid)
+                if (
+                    live_children[pid] == 0
+                    and parent_cand is not None
+                    and pid not in full_reclaimed
+                    and (not parent_cand.has_coupled_swa or pid in swa_reclaimed)
+                ):
+                    p_pages = max(0, int(parent_cand.tokens)) // ps
+                    if p_pages > 0:
+                        full_reclaimed.add(pid)
+                        freed_phys += p_pages
+                        full_tokens_evicted += p_pages * ps
+                        chosen.append(parent_cand)
+                    pid = parent_cand.parent_id
+                else:
+                    break
+
         if freed_phys < short_physical_pages:
             return None
         return (full_tokens_evicted, swa_tokens_evicted, chosen)
