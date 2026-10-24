@@ -656,6 +656,9 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             group_pages=kvcache.swa_group_pages if self._swa_groups > 1 else None,
         )
+        self._pingpong_swa_windows: Dict[
+            object, Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]
+        ] = {}
         self.clear()
 
     def clear(self) -> None:
@@ -665,6 +668,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.free_group = None
         self.swa_free_group = []
         self.swa_page_ids_group = []
+        self._pingpong_swa_windows = {}
 
     def _free_page_count(self) -> int:
         return self._page_store.num_free_pages()
@@ -886,6 +890,123 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             else f"Unified FULL/SWA reclamation insufficient: needed=({full_tokens}, {swa_tokens})"
         )
 
+    def prealloc_fits_assumes_reclaim(self) -> bool:
+        return True
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool:
+        return self.can_reserve(full_tokens, swa_tokens, empty_pool=True)
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Price Full and SWA preallocation demand together against the single shared page store."""
+        full_evictable_tokens = (
+            tree_cache.full_evictable_size()
+            if tree_cache is not None and hasattr(tree_cache, "full_evictable_size")
+            else 0
+        )
+        swa_evictable_tokens = (
+            tree_cache.swa_evictable_size()
+            if tree_cache is not None and hasattr(tree_cache, "swa_evictable_size")
+            else 0
+        )
+        full_tokens += (
+            self.full_available_size() + full_evictable_tokens - full_budget_tokens
+        )
+        if swa_budget_tokens is not None:
+            swa_tokens += (
+                self.swa_available_size() + swa_evictable_tokens - swa_budget_tokens
+            )
+        return self.can_reserve(
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
+        )
+
+    def can_reserve_pingpong_prefill(
+        self,
+        extend_tokens: int,
+        sliding_window_size: int,
+        *,
+        has_prev_window: bool = False,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+    ) -> bool:
+        """Check if HBM can admit a prefill chunk using 2-window ping-pong SWA allocation."""
+        if extend_tokens < 0 or sliding_window_size <= 0:
+            return False
+        curr_swa_tail = min(extend_tokens, sliding_window_size)
+        prev_swa_tail = sliding_window_size if has_prev_window else 0
+        return self.can_reserve(
+            extend_tokens,
+            curr_swa_tail + prev_swa_tail,
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
+        )
+
+    def alloc_extend_pingpong_swa(
+        self,
+        req_id: object,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        sliding_window_size: int,
+    ) -> Optional[torch.Tensor]:
+        """Allocate Full KV for the whole prefill chunk and SWA KV only for the tail window,
+        ping-ponging at most 2 consecutive SWA tail windows across chunks."""
+        if sliding_window_size <= 0:
+            raise ValueError(f"sliding_window_size must be > 0, got {sliding_window_size}")
+        swa_tail_len = min(extend_num_tokens, sliding_window_size)
+        prev_win, curr_win = self._pingpong_swa_windows.get(req_id, (None, None))
+        if prev_win is not None:
+            self.free_swa(prev_win)
+            prev_win = None
+        alloc_full = self.alloc_extend_swa_tail(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            swa_tail_len,
+        )
+        if alloc_full is None:
+            self._pingpong_swa_windows[req_id] = (prev_win, curr_win)
+            return None
+        new_tail = alloc_full[-swa_tail_len:].detach().cpu() if swa_tail_len > 0 else None
+        self._pingpong_swa_windows[req_id] = (curr_win, new_tail)
+        return alloc_full
+
+    def advance_pingpong_swa_window(
+        self, req_id: object, *, release_all: bool = False
+    ) -> int:
+        """Release the older ping-pong SWA window after a chunk completes (or both if release_all)."""
+        prev_win, curr_win = self._pingpong_swa_windows.get(req_id, (None, None))
+        freed_tokens = 0
+        if prev_win is not None:
+            freed_tokens += int(prev_win.numel())
+            self.free_swa(prev_win)
+            prev_win = None
+        if release_all and curr_win is not None:
+            freed_tokens += int(curr_win.numel())
+            self.free_swa(curr_win)
+            curr_win = None
+        if prev_win is None and curr_win is None:
+            self._pingpong_swa_windows.pop(req_id, None)
+        else:
+            self._pingpong_swa_windows[req_id] = (prev_win, curr_win)
+        return freed_tokens
+
     def debug_print(self) -> str:
         return (
             f"#free-pages: {self._free_page_count()}, "
@@ -962,12 +1083,48 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
             swa_max_total_num_tokens=shared_tokens,
         )
 
+    def calculate_total_physical_pages(
+        self, available_bytes: int, page_size: int
+    ) -> int:
+        """Compute aligned physical page count directly from free HBM quota and Full layers."""
+        usable = max(0, available_bytes - self._reserved_bytes)
+        page_bytes = (
+            page_size * self._split._full_per_token * self._split._full_layers_num
+        )
+        raw_pages = usable // page_bytes if page_bytes > 0 else 0
+        return (raw_pages // self._align_pages) * self._align_pages
+
+    def max_request_tokens(self, shared_tokens: int, page_size: int) -> int:
+        """Return the maximum single-request context length that fits in ``shared_tokens``
+        (reserving ``M_swa`` groups only for the trailing sliding window, enabling 256K+ sessions)."""
+        window_overhead = (
+            self._num_swa_groups * (self._sliding_window_size + page_size)
+            if self._sliding_window_size is not None
+            else 0
+        )
+        return max(0, shared_tokens - window_overhead)
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        return self._unify(
-            self._split.calculate_pool_sizes(available_bytes, page_size), page_size
-        )
+        try:
+            return self._unify(
+                self._split.calculate_pool_sizes(available_bytes, page_size), page_size
+            )
+        except ValueError:
+            shared_tokens = (
+                self.calculate_total_physical_pages(available_bytes, page_size)
+                * page_size
+            )
+            max_req = self.max_request_tokens(shared_tokens, page_size)
+            return self._unify(
+                MemoryPoolConfig(
+                    max_total_num_tokens=max_req,
+                    full_max_total_num_tokens=shared_tokens,
+                    swa_max_total_num_tokens=0,
+                ),
+                page_size,
+            )
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
