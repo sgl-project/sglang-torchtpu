@@ -598,6 +598,14 @@ def compute_metadata(
         q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
 
         do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
+        if (
+            cfgs.serve.skip_out_of_window_swa_writeback
+            and cfgs.model.sliding_window is not None
+        ):
+            in_tail_window = (kv_len_start + cfgs.bkv_sz) > (
+                k_len - cfgs.model.sliding_window
+            )
+            do_writeback = jnp.where(in_tail_window, do_writeback, 0)
         if cfgs.serve.skip_kv_write:
             do_writeback = 0
         schedule.do_writeback[step, target_lane] = do_writeback

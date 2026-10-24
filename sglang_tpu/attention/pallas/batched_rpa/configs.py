@@ -83,6 +83,7 @@ class ServingConfigs:
     # Context-parallel modes; see `wrapper.ragged_paged_attention`.
     cache_only: bool = False
     skip_kv_write: bool = False
+    skip_out_of_window_swa_writeback: bool = False
     return_lse: bool = False
     cp_group_size: int | None = None
 
