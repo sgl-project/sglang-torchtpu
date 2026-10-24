@@ -32,6 +32,12 @@ from sglang.srt.model_executor.pool_configurator import (
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.kv_free_fence import HeldPages
+from sglang_tpu.kv_mxint8 import (
+    EXPONENT_PAD_BYTE,
+    GROUP_SIZE as MX_GROUP_SIZE,
+    ROW_ALIGNMENT as MX_ROW_ALIGNMENT,
+    scale_rows as mx_scale_rows,
+)
 from sglang_tpu.kv_pool import (
     GB,
     TpuFusedMHATokenToKVPool,
@@ -198,10 +204,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
             pool_cls is not None
             and pool_cls not in (TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool),
             f"requires a fused MHA KV pool, got {getattr(pool_cls, '__name__', pool_cls)}.",
-        ),
-        (
-            getattr(kvc, "kv_cache_dtype_str", None) == "mxint8",
-            "does not support mxint8 KV cache.",
         ),
         (
             getattr(kvc, "pool_page_size", 0) <= 1,
@@ -371,6 +373,8 @@ class _SeqAlongLaneSharedBufferView(_SharedBufferView, TpuSeqAlongLaneKVPool):
 class TpuUnifiedSWAKVPool(SWAKVPool):
     """Unified Hybrid Full/SWA KV pool backed by ``G = num_full_layers`` shared 5D buffers."""
 
+    SUPPORTED_QUANT_KV_FORMATS = ("mxint8", "mxfp8", "nvfp4")
+
     def __init__(
         self,
         size: int,
@@ -397,6 +401,16 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             kwargs.pop("seq_along_lane", False)
             or full_kv_pool_class is TpuSeqAlongLaneKVPool
         )
+        self.quant_kv_format: Optional[str] = kwargs.pop("quant_kv_format", None)
+        self.quant_group_size: int = int(kwargs.pop("quant_group_size", MX_GROUP_SIZE))
+        if (
+            self.quant_kv_format is not None
+            and self.quant_kv_format not in self.SUPPORTED_QUANT_KV_FORMATS
+        ):
+            raise ValueError(
+                f"Unsupported quant_kv_format={self.quant_kv_format!r}; "
+                f"expected one of {self.SUPPORTED_QUANT_KV_FORMATS}."
+            )
         self.size = size
         self.size_swa = size
         self.dtype = dtype
@@ -492,6 +506,23 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             self.layers_mapping[gid] = (j, True)
             self._swa_layer_group[gid] = j // G
 
+        self.shared_kv_scale_buffer: Optional[List[torch.Tensor]] = None
+        if self.quant_kv_format is not None:
+            raw_s_rows = mx_scale_rows(
+                head_num, self.full_kv_pool.padded_head_dim, self.quant_group_size
+            )
+            aligned_s_rows = _cdiv(raw_s_rows, MX_ROW_ALIGNMENT) * MX_ROW_ALIGNMENT
+            scale_shape = (num_blocks, aligned_s_rows, page_size)
+            self.shared_kv_scale_buffer = [
+                torch.full(
+                    scale_shape,
+                    EXPONENT_PAD_BYTE,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                for _ in range(G)
+            ]
+
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -507,6 +538,13 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
 
     def swa_page_group(self, layer_id: int) -> int:
         return self._swa_layer_group.get(layer_id, 0)
+
+    def get_kv_scale_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        """Return the co-indexed block-scale buffer ``[num_blocks, scale_rows, page_size]`` for ``layer_id``."""
+        if self.shared_kv_scale_buffer is None:
+            return None
+        idx, _ = self.layers_mapping[layer_id]
+        return self.shared_kv_scale_buffer[idx % self.num_shared_buffers]
 
     def get_state(self) -> list[torch.Tensor]:
         return self.full_kv_pool.get_state()
