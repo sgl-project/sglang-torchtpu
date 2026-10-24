@@ -68,6 +68,28 @@ def compute_cp_local_swa_window_size(sliding_window_size: int, cp_size: int) -> 
     return _cdiv(int(sliding_window_size), max(1, int(cp_size)))
 
 
+def slice_pp_stage_hybrid_layers(
+    full_attention_layer_ids: Sequence[int],
+    swa_attention_layer_ids: Sequence[int],
+    pp_start_layer: int,
+    pp_end_layer: int,
+) -> Tuple[List[int], List[int], int]:
+    """Filter global hybrid layer IDs to a Pipeline Parallel stage ``[pp_start_layer, pp_end_layer)``
+    and return ``(stage_full_layer_ids, stage_swa_layer_ids, stage_num_swa_groups)``."""
+    stage_full = [
+        int(lid)
+        for lid in full_attention_layer_ids
+        if pp_start_layer <= int(lid) < pp_end_layer
+    ]
+    stage_swa = [
+        int(lid)
+        for lid in swa_attention_layer_ids
+        if pp_start_layer <= int(lid) < pp_end_layer
+    ]
+    stage_m_swa = num_swa_groups(len(stage_full), len(stage_swa))
+    return stage_full, stage_swa, stage_m_swa
+
+
 def _fused_page_shape(
     page_size: int,
     head_num: int,
@@ -187,10 +209,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
             getattr(kvc, "is_hybrid_gdn", False)
             or getattr(kvc, "has_mamba_state", False),
             "does not support hybrid linear-attention or Mamba models.",
-        ),
-        (
-            _ctx_attr(get_parallel, "pp_size", 1) > 1 or getattr(kvc, "pp_size", 1) > 1,
-            "does not support pipeline parallelism.",
         ),
         (
             _ctx_attr(get_memory, "enable_hierarchical_cache", False)
@@ -1929,5 +1947,30 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
             ),
             page_size,
         )
+
+    @classmethod
+    def for_pp_stage(
+        cls,
+        kvc,
+        *,
+        pp_start_layer: int,
+        pp_end_layer: int,
+    ) -> "TpuUnifiedSWAPoolConfigurator":
+        """Build a stage-local ``TpuUnifiedSWAPoolConfigurator`` for Pipeline Parallel stage ``[pp_start_layer, pp_end_layer)``."""
+        import copy
+
+        stage_full, stage_swa, _ = slice_pp_stage_hybrid_layers(
+            kvc.layer_info.full_attention_layer_ids,
+            kvc.layer_info.swa_attention_layer_ids,
+            pp_start_layer,
+            pp_end_layer,
+        )
+        stage_kvc = copy.copy(kvc)
+        stage_layer_info = copy.copy(kvc.layer_info)
+        stage_layer_info.full_attention_layer_ids = stage_full
+        stage_layer_info.swa_attention_layer_ids = stage_swa
+        stage_kvc.layer_info = stage_layer_info
+        stage_kvc.pp_size = 1
+        return cls(stage_kvc)
 
 
