@@ -68,7 +68,10 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         pool_width=None,
         req_to_token_device="cpu",
         cache_metadata=True,
+        context_len=None,
+        torch_compile_max_bs=32,
     ):
+        context_len = self.CONTEXT_LEN if context_len is None else context_len
         pool_width = self.POOL_WIDTH if pool_width is None else pool_width
         override = get_context().override_server_args(
             speculative_num_draft_tokens=self.DRAFT_TOKENS,
@@ -76,6 +79,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             speculative_num_steps=None,
             speculative_eagle_topk=1,
             page_size=self.PAGE_SIZE,
+            torch_compile_max_bs=torch_compile_max_bs,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -89,7 +93,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         model_runner = SimpleNamespace(
             device=torch.device("cpu"),
             page_size=self.PAGE_SIZE,
-            model_config=SimpleNamespace(context_len=self.CONTEXT_LEN),
+            model_config=SimpleNamespace(context_len=context_len),
             server_args=server_args,
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.zeros(
@@ -272,6 +276,35 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             ValueError, "exceeds the request-to-token table width"
         ):
             self._make_backend(pool_width=self.CONTEXT_LEN)
+
+    def test_rejects_page_table_exceeding_scoped_smem_budget(self):
+        # The largest compiled bucket must fit the 1 MiB scoped SMEM page
+        # table; the message names the largest bs that does.
+        for context_len, over_bs, max_safe_bs, pass_bs in (
+            (131072, 128, 127, 127),
+            (262144, 64, 63, 63),
+            (1048576, 32, 15, 8),
+        ):
+            with self.subTest(context_len=context_len):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"above the 1 MiB scoped budget.*<= {max_safe_bs} at this "
+                    r"context length",
+                ):
+                    self._make_backend(
+                        context_len=context_len,
+                        pool_width=context_len * 2,
+                        req_to_token_device="meta",
+                        torch_compile_max_bs=over_bs,
+                    )
+                self.assertIsNotNone(
+                    self._make_backend(
+                        context_len=context_len,
+                        pool_width=context_len * 2,
+                        req_to_token_device="meta",
+                        torch_compile_max_bs=pass_bs,
+                    )
+                )
 
     def test_target_verify_bump_fits_rectangular_page_stride(self):
         backend = self._make_backend()

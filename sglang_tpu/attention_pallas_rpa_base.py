@@ -633,16 +633,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             pages_per_seq = _get_pages_per_seq(self.max_context_len, self._page_stride)
             table_bytes = _page_table_smem_bytes(max_bs, pages_per_seq)
             if table_bytes > _SCOPED_SMEM_BYTES:
-                logger.warning(
-                    "RPA page table for %d sequences x %d pages needs %.2f MiB of "
-                    "SMEM, above the %.0f MiB scoped budget; the kernel compile "
-                    "will fail. Lower --torch-compile-max-bs (<= %d at this "
-                    "context length) or raise --page-size.",
-                    max_bs,
-                    pages_per_seq,
-                    table_bytes / 2**20,
-                    _SCOPED_SMEM_BYTES / 2**20,
-                    max(1, (_SCOPED_SMEM_BYTES // 4 - 128) // pages_per_seq),
+                max_safe_bs = max(1, (_SCOPED_SMEM_BYTES // 4 - 128) // pages_per_seq)
+                raise ValueError(
+                    f"RPA page table for {max_bs} sequences x {pages_per_seq} "
+                    f"pages needs {table_bytes / 2**20:.2f} MiB of SMEM, above "
+                    f"the {_SCOPED_SMEM_BYTES / 2**20:.0f} MiB scoped budget; "
+                    "lower --max-running-requests (and --torch-compile-max-bs "
+                    f"if set) to <= {max_safe_bs} at this context length, or "
+                    "raise --page-size."
                 )
 
         # Hybrid-SWA models keep two KV sub-pools and need a

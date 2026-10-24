@@ -13,9 +13,13 @@ purpose:
 * `resolving_view` -- the view a resolution pass decides on -- still answers
   `None`, so a family's `if cfg.x is None` fires and its declaration lands.
   This is the half that carries the design: `model_overrides/inkling.py` and
-  `deepseek_v4.py` are the only `is None` readers of either declared field, and
-  both read this view. Pinned by the family-shaped test below rather than by
-  asserting the view directly, because the shape is what has to keep working.
+  `deepseek_v4.py` are the `is None` readers of the two ratio fields, and the
+  TPU branch of `memory_hook.handle_gpu_memory_settings` hands
+  `cfg.torch_compile_max_bs` to `reconcile_tpu_batch_limits`, whose `None`
+  branch derives the compile cap from `--max-running-requests`.
+  All of them read this view. Pinned by the reader-shaped tests below rather
+  than by asserting the view directly, because the shape is what has to keep
+  working.
   `resolved_view` is a separate class and is not pinned here -- nothing reads a
   declared field through it, and `with_fallback` is called from exactly one
   place (`resolution_result`), which is what makes both views answer `None`
@@ -91,6 +95,11 @@ class TestAFallbackIsWhatNobodySaid(CustomTestCase):
         self.assertIsNotNone(get_schedule().swa_full_tokens_ratio)
         self.assertIsNotNone(get_schedule().mamba_full_memory_ratio)
 
+    def test_torch_compile_max_bs_keeps_record_none_and_falls_back_to_32(self):
+        server_args = _resolved()
+        self.assertIsNone(server_args.torch_compile_max_bs)
+        self.assertEqual(resolution_result(server_args, "torch_compile_max_bs"), 32)
+
 
 class TestAPassDecidingStillSeesUnset(CustomTestCase):
     """The views are the Decision-over-Input surface, not the Effect surface.
@@ -108,6 +117,17 @@ class TestAPassDecidingStillSeesUnset(CustomTestCase):
         if cfg.swa_full_tokens_ratio is None:  # the family's exact shape
             declared["swa_full_tokens_ratio"] = 0.1
         self.assertEqual(declared, {"swa_full_tokens_ratio": 0.1})
+
+    def test_tpu_batch_limit_reconciliation_still_sees_unset(self):
+        # memory_hook's TPU branch hands the view's value to
+        # reconcile_tpu_batch_limits, whose `None` branch follows
+        # --max-running-requests. With 32 answered here that branch would be
+        # dead and --max-running-requests 8 would still compile bs=32.
+        server_args = _resolved(max_running_requests=8)
+        cfg = resolving_view(server_args)
+        explicit = [cfg.torch_compile_max_bs]  # the reconciler's exact shape
+        self.assertEqual([x for x in explicit if x is not None], [])
+        self.assertEqual(cfg.max_running_requests, 8)
 
 
 if __name__ == "__main__":
