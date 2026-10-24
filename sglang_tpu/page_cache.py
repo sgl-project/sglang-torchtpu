@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Release startup file-cache pages without removing persistent cache files."""
+"""Release startup file-cache pages and disposable tmpfs compiler files."""
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import re
@@ -104,6 +105,44 @@ def release_checkpoint_page_cache(model_paths: list[str]) -> None:
     )
 
 
+def _unlink_cache_file(path: Path) -> int:
+    try:
+        size = path.lstat().st_size
+        path.unlink()
+        return size
+    except FileNotFoundError:
+        return 0
+
+
+def _release_tmpfs_cache(root: Path, *, native: bool = False) -> None:
+    started = time.monotonic()
+    paths = _cache_files(root)
+    removed_bytes = 0
+    if native:
+        # A native compile future can resolve before its tier-2 write finishes.
+        # Lock entries even if their .bin has not been published yet. Keep locks
+        # and directories: the runtime creates its cache directories only once.
+        locks = {
+            path.with_suffix(".lock")
+            for path in paths
+            if path.suffix in (".bin", ".lock")
+        }
+        for lock in sorted(locks):
+            with lock.open("a+b") as cache_lock:
+                fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
+                removed_bytes += _unlink_cache_file(lock.with_suffix(".bin"))
+    else:
+        for path in paths:
+            if path.suffix != ".lock":
+                removed_bytes += _unlink_cache_file(path)
+    logger.info(
+        "Compile-cache tmpfs release: root=%s removed_gb=%.3f elapsed_s=%.1f",
+        root,
+        removed_bytes / 1e9,
+        time.monotonic() - started,
+    )
+
+
 def _release_native_cache() -> None:
     started = time.monotonic()
     cache_name = (
@@ -119,6 +158,7 @@ def _release_native_cache() -> None:
     if not root.exists():
         return
     if _filesystem_type(root) in ("tmpfs", "ramfs"):
+        _release_tmpfs_cache(root, native=True)
         return
     paths = _cache_files(root)
     size = _advise_files(paths)
@@ -130,9 +170,20 @@ def _release_native_cache() -> None:
     )
 
 
-def release_compile_page_cache() -> None:
-    if envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.get():
-        _release_native_cache()
+def release_compile_artifacts() -> None:
+    if not envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.get():
+        return
+    _release_native_cache()
+    # Only serialized TorchTPU/AOT and JAX caches are disposable. Inductor can
+    # also contain generated Python and shared libraries used during serving.
+    roots = []
+    if inductor := os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+        roots.append(Path(inductor) / "aotautograd")
+    if jax := os.environ.get("JAX_COMPILATION_CACHE_DIR"):
+        roots.append(Path(jax))
+    for root in roots:
+        if root.exists() and _filesystem_type(root) in ("tmpfs", "ramfs"):
+            _release_tmpfs_cache(root)
 
 
 def release_startup_page_cache() -> None:
@@ -145,4 +196,4 @@ def release_startup_page_cache() -> None:
     if draft_path := get_spec().speculative_draft_model_path:
         model_paths.append(draft_path)
     release_checkpoint_page_cache(model_paths)
-    release_compile_page_cache()
+    release_compile_artifacts()

@@ -51,12 +51,12 @@ def test_disk_cache_preserves_files_and_other_namespaces(
     monkeypatch.setattr(
         page_cache, "_advise_file", lambda p: advised.append(p) or p.stat().st_size
     )
-    page_cache.release_compile_page_cache()
+    page_cache.release_compile_artifacts()
     assert sorted(advised) == paths
     assert all(p.read_bytes() == b"payload" for p in paths)
-    monkeypatch.setenv("SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE", "0")
+    monkeypatch.setenv("SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS", "0")
     advised.clear()
-    page_cache.release_compile_page_cache()
+    page_cache.release_compile_artifacts()
     assert advised == []
 
 
@@ -108,7 +108,7 @@ def test_startup_discovers_files_only_on_the_host_leader(monkeypatch, tmp_path):
             model_path=str(target), speculative_draft_model_path=str(draft)
         ),
         get_parallel().override(world_group=group),
-        tpu_envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.override(False),
+        tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(False),
         patch.object(page_cache, "resolve_compilations") as join_writers,
         patch.object(
             page_cache.os,
@@ -143,7 +143,7 @@ def test_compile_cache_disabled_skips(monkeypatch, tmp_path, caplog, env_name):
         page_cache, "_filesystem_type", lambda _: pytest.fail("cache disabled")
     )
     with caplog.at_level(logging.INFO):
-        page_cache.release_compile_page_cache()
+        page_cache.release_compile_artifacts()
     assert not caplog.records
 
 
@@ -161,7 +161,7 @@ def test_disappeared_cache_paths_are_skipped(tmp_path):
     assert page_cache._advise_files(paths) == 0
 
 
-def test_tmpfs_mount_resolution_and_skip(monkeypatch, tmp_path):
+def test_tmpfs_mount_resolution_and_release(monkeypatch, tmp_path):
     if not Path("/dev/shm").is_dir():
         pytest.skip("requires /dev/shm")
     disk = tmp_path / "disk cache"
@@ -175,12 +175,13 @@ def test_tmpfs_mount_resolution_and_skip(monkeypatch, tmp_path):
         assert page_cache._filesystem_type(link) == page_cache._filesystem_type(disk)
 
         (root / "active").mkdir()
-        (root / "active/program").write_bytes(b"payload")
+        (root / "active/program.bin").write_bytes(b"payload")
         monkeypatch.setattr(page_cache, "_CACHE_ROOT", root)
         monkeypatch.setenv("TORCH_TPU_TIER2_COMPILATION_CACHE", "active")
         with patch.object(page_cache.os, "posix_fadvise") as advise:
-            page_cache.release_compile_page_cache()
+            page_cache.release_compile_artifacts()
         advise.assert_not_called()
+        assert not (root / "active/program.bin").exists()
 
 
 if __name__ == "__main__":

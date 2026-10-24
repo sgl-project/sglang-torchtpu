@@ -90,9 +90,7 @@ class TestInstall(CustomTestCase):
         self.enterContext(get_parallel().override(world_group=self.group))
         self.enterContext(patch.object(page_cache, "resolve_compilations"))
         self.advise = self.enterContext(patch.object(page_cache.os, "posix_fadvise"))
-        self.enterContext(
-            tpu_envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.override(False)
-        )
+        self.enterContext(tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(False))
         self.enterContext(patch.dict(os.environ, {"LOCAL_RANK": "0"}))
 
         class Scheduler(_Scheduler):
