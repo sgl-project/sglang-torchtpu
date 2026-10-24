@@ -345,6 +345,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         model_config = SimpleNamespace(
             num_hidden_layers=2,
             get_total_num_kv_heads=Mock(return_value=8),
+            get_total_swa_num_kv_heads=Mock(return_value=16),
         )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.transfer_backend = TransferBackend.RAIDEN
@@ -388,6 +389,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertEqual(kv_args.sliding_window_size, 4096)
         self.assertEqual(kv_args.kv_head_num, 4)
         self.assertEqual(kv_args.total_kv_head_num, 8)
+        self.assertEqual(kv_args.total_swa_kv_head_num, 16)
         self.assertEqual(
             captured["kv_caches"].full,
             [_KVPool.buffers[0], _DraftKVPool.buffers[0]],

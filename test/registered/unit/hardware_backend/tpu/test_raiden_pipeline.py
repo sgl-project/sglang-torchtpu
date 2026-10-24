@@ -87,6 +87,26 @@ class Fp8Buffer(Buffer):
         self.shape = (pages, 128, 4, 4, 128)
 
 
+class Bf16SixteenHeadBuffer(Bf16Buffer):
+    """Sixteen kv-heads, as a Gemma-4-style sliding-window pool beside four
+    full-attention heads."""
+
+    def __init__(self, pages=64):
+        self.shape = (pages, 128, 16, 2, 128)
+
+
+def unequal_groups(swa_buffer):
+    """Four full-attention kv-heads beside a sliding-window pool with more."""
+    return SimpleNamespace(
+        full=[Bf16FourHeadBuffer()],
+        swa=[swa_buffer()],
+        full_layer_ids=[6],
+        swa_layer_ids=[7],
+        num_draft_full=0,
+        num_draft_swa=0,
+    )
+
+
 def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
     return SimpleNamespace(
         full=[buffer(pages) for _ in (*full, *draft_full)],
@@ -126,7 +146,7 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
         failure_lock=threading.Lock(),
         failure_records={},
         update_status=Mock(),
-        kv_args=SimpleNamespace(total_kv_head_num=8),
+        kv_args=SimpleNamespace(total_kv_head_num=8, total_swa_kv_head_num=8),
         local_ip="10.0.0.2",
         rank_port=31000,
         pp_size=pp_size,
@@ -315,7 +335,9 @@ class TestLayerPools(unittest.TestCase):
     def test_head_slice_spans_route_one_slice_per_rank(self):
         layers = groups(full=(6,), swa=(7,), buffer=Bf16Buffer)
         pools = pool_manifest(layers)
-        spans = head_slice_spans(pools, layers.full + layers.swa, [20, 21], [30], 8, 8)
+        spans = head_slice_spans(
+            pools, layers.full + layers.swa, [20, 21], [30], 8, 8, 8
+        )
         self.assertEqual([len(entry.spans) for entry in spans], [16, 8])
         self.assertEqual(
             [entry.declared_bytes for entry in spans], [2 * 524288, 524288]
@@ -340,13 +362,48 @@ class TestLayerPools(unittest.TestCase):
         )
         self.assertEqual((span.count, spans[0].dst_space_version), (128, 1))
 
+    def test_swa_head_slices_use_the_swa_head_count(self):
+        """MiMo-V2 (4 full / 8 SWA kv-heads) and Gemma-4 (4 / 16): each rank
+        takes its own heads of each pool from the TP1 producer page."""
+        head = 2 * 128 * 2  # one kv-head's K+V in bf16
+        for swa_buffer, swa_heads in ((Bf16Buffer, 8), (Bf16SixteenHeadBuffer, 16)):
+            for dst_tp in (2, 4):
+                layers = unequal_groups(swa_buffer)
+                entries = head_slice_spans(
+                    pool_manifest(layers),
+                    layers.full + layers.swa,
+                    [20, 21],
+                    [30],
+                    dst_tp,
+                    4,
+                    swa_heads,
+                )
+                for entry, heads, pages in zip(entries, (4, swa_heads), (2, 1)):
+                    with self.subTest(tag=entry.tag, heads=heads, dst_tp=dst_tp):
+                        self.assertEqual(len(entry.spans), dst_tp * pages)
+                        width = heads // dst_tp * head
+                        for span in entry.spans:
+                            rank = span.dst_unit_ordinal
+                            self.assertEqual(
+                                (
+                                    span.src_offset_bytes,
+                                    span.size_bytes,
+                                    span.src_stride_bytes,
+                                ),
+                                (rank * width, width, heads * head),
+                            )
+                            self.assertEqual(
+                                (span.dst_offset_bytes, span.dst_stride_bytes),
+                                (span.src_block_ordinal * 128 * width, width),
+                            )
+
     def test_head_slice_spans_declare_every_replica_of_a_shared_head(self):
         """With fewer kv-heads than decode ranks each head lands on several
         ranks, and the registry requires declared_bytes to equal the span sum:
         three 262144-byte pages reach a TP8 decode as 1572864 bytes."""
         layers = groups(full=(6,), swa=(), buffer=Bf16FourHeadBuffer)
         (entry,) = head_slice_spans(
-            pool_manifest(layers), layers.full, [20, 21, 22], [], 8, 4
+            pool_manifest(layers), layers.full, [20, 21, 22], [], 8, 4, 4
         )
         self.assertEqual(entry.declared_bytes, 1572864)
         self.assertEqual(
@@ -369,7 +426,7 @@ class TestLayerPools(unittest.TestCase):
         heads_per_rank = 8 // 4
         rank_bytes = heads_per_rank * 2 * head_dim * tensor.element_size()
         (entry,) = head_slice_spans(
-            pool_manifest(layers), layers.full, [20, 21], [], 4, 8
+            pool_manifest(layers), layers.full, [20, 21], [], 4, 8, 8
         )
         self.assertEqual(len(entry.spans), 8)
         for span in entry.spans:
@@ -390,7 +447,7 @@ class TestLayerPools(unittest.TestCase):
     def test_partial_fp8_head_packs_are_rejected(self):
         layers = groups(full=(6,), swa=(), buffer=Fp8Buffer)
         with self.assertRaisesRegex(ValueError, "Partial FP8"):
-            head_slice_spans(pool_manifest(layers), layers.full, [20], [], 8, 8)
+            head_slice_spans(pool_manifest(layers), layers.full, [20], [], 8, 8, 8)
 
     def test_fingerprint_ignores_the_per_rank_head_count(self):
         getter = lambda tensor: ((4, 3, 2, 1, 0), ((8, 128),), 8)
@@ -602,6 +659,38 @@ class TestPipelineLifetimes(unittest.TestCase):
         frames = pipe._send.call_args.args[1]
         self.assertEqual(frames[0], MessageTag.PIPELINE_READY)
         self.assertEqual(json.loads(frames[2])["full"], 2)
+
+    def test_registration_slices_swa_pools_over_the_swa_head_count(self):
+        pipe = transfer(producer=True)
+        layers = unequal_groups(Bf16Buffer)
+        pipe.pools = pool_manifest(layers)
+        pipe.tensors = layers.full + layers.swa
+        pipe.manager.kv_args = SimpleNamespace(
+            total_kv_head_num=4, total_swa_kv_head_num=8
+        )
+        pipe.manager._prefill.send_blocks[7] = [20, 21]
+        pipe.manager._prefill.send_swa_blocks[7] = [30]
+        self.assertTrue(pipe.finalize_send(7, None))
+        request = [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000"]
+        pipe.on_message(request + [b'{"attn_tp_size": 4, "attn_tp_rank": 0}'])
+        full, swa = pipe.client.register_request_blocks.call_args.kwargs["pool_spans"]
+        # Rank 3 of 4: one of four full heads, two of eight SWA heads.
+        self.assertEqual(
+            {
+                (s.src_offset_bytes, s.size_bytes)
+                for s in full.spans
+                if s.dst_unit_ordinal == 3
+            },
+            {(3 * 512, 512)},
+        )
+        self.assertEqual(
+            {
+                (s.src_offset_bytes, s.size_bytes)
+                for s in swa.spans
+                if s.dst_unit_ordinal == 3
+            },
+            {(3 * 1024, 1024)},
+        )
 
     def test_failed_registration_fails_the_room_not_the_prefill_scheduler(self):
         """Registration runs on the prefill scheduler thread when the decode

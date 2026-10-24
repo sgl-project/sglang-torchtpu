@@ -82,6 +82,9 @@ class KVArgs:
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
+    # Global kv-head count of the sliding-window layers; differs from
+    # total_kv_head_num on e.g. MiMo-V2 and Gemma-4.
+    total_swa_kv_head_num: int
     page_size: int
     sliding_window_size: Optional[int]
     # for system dp

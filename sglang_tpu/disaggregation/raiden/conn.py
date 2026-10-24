@@ -341,16 +341,17 @@ class RaidenKVManager(
         the local fused KV tensor (the K+V head-pair granule matches on both
         sides) and the global kv-head count.
 
-        ``swa`` sizes it from the sliding-window sub-pool instead. Its layers
-        carry the same kv-head count as the full pool -- windowing bounds how
-        many tokens are kept, not how the heads are sharded -- so only the
-        head-pair granule is read from the other tensor, and the head-slice math
-        is identical. Taking it from the SWA tensor rather than assuming it
-        matches keeps the two pools free to differ in dtype or head_dim.
+        ``swa`` sizes it from the sliding-window sub-pool instead: the granule
+        from the SWA tensor and the head count from ``total_swa_kv_head_num``.
+        SWA layers may carry a different kv-head count than full attention
+        (MiMo-V2: 8 vs 4), and the SWA sub-pool is sized from that count. At
+        fp8 the count comes from ``swa_geometry_kv_heads``, which may keep the
+        full count or refuse.
         """
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
             head_pair_bytes,
+            swa_geometry_kv_heads,
         )
 
         tensors = self._swa_kv_caches if swa else self._kv_caches
@@ -362,9 +363,20 @@ class RaidenKVManager(
             )
         tensor = tensors[0]
         hp = head_pair_bytes(tensor)
-        # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
-        # set on both the prefill and decode KVArgs.
+        # Distinct model kv-head counts (model_config.get_total_num_kv_heads()
+        # and get_total_swa_num_kv_heads()), set on both the prefill and decode
+        # KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
+        if swa:
+            # Usually the SWA count; the full count where the fp8 granule
+            # offsets it. TODO(#829): drop with B1.
+            total_kv_heads = swa_geometry_kv_heads(
+                total_kv_heads,
+                int(self.kv_args.total_swa_kv_head_num),
+                int(tensor.shape[3]),
+                src_attn_tp,
+                dst_attn_tp,
+            )
         return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
 
     # ----- engine lifecycle -------------------------------------------------

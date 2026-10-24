@@ -78,12 +78,16 @@ def head_slice_spans(
     swa: list[int],
     dst_attn_tp: int,
     total_kv_heads: int,
+    total_swa_kv_heads: int,
 ) -> list[Any]:
     """Describe each destination rank's kv-head slice of every locally owned
-    page: one strided span per page and rank, routed to that rank only."""
+    page: one strided span per page and rank, routed to that rank only.
+    Sliding-window pools are sliced over ``total_swa_kv_heads``."""
     result = []
     for pool, tensor in zip(pools, tensors):
-        blocks = swa if is_swa_pool(pool["tag"]) else full
+        is_swa = is_swa_pool(pool["tag"])
+        blocks = swa if is_swa else full
+        heads = total_swa_kv_heads if is_swa else total_kv_heads
         if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             result.append(
                 _head_major_slice_spans(
@@ -91,7 +95,7 @@ def head_slice_spans(
                     tensor=tensor,
                     blocks=blocks,
                     dst_attn_tp=dst_attn_tp,
-                    total_kv_heads=total_kv_heads,
+                    total_kv_heads=heads,
                 )
             )
             continue
@@ -99,7 +103,7 @@ def head_slice_spans(
             src_tp=1,
             dst_tp=dst_attn_tp,
             hp_bytes=head_bytes(tensor),
-            total_kv_heads=total_kv_heads,
+            total_kv_heads=heads,
             kv_packing=int(tensor.shape[3]),
             element_size=tensor.element_size(),
         )
@@ -233,6 +237,7 @@ def part_spans(
     swa: list[int],
     dst_attn_tp: int,
     total_kv_heads: int,
+    total_swa_kv_heads: int,
     *,
     with_swa: bool,
 ) -> list[Any]:
@@ -247,7 +252,9 @@ def part_spans(
     tensors = [tensors[i] for i in keep]
     if dst_attn_tp == 1:
         return source_spans(pools, full, swa)
-    return head_slice_spans(pools, tensors, full, swa, dst_attn_tp, total_kv_heads)
+    return head_slice_spans(
+        pools, tensors, full, swa, dst_attn_tp, total_kv_heads, total_swa_kv_heads
+    )
 
 
 def part_destination_blocks(
