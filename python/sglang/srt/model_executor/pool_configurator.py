@@ -1150,6 +1150,13 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             window=kvc.sliding_window_size,
             attn_dp_size=kvc.attn_dp_size,
         )
+        # Align the cap up to the platform's page multiple so the later
+        # round-down cannot drop the pool below the cap.
+        self._swa_align_pages = current_platform.swa_pool_page_multiple()
+
+    def _swa_cap_tokens(self, page_size: int) -> int:
+        """The request cap aligned to the device's SWA pool page multiple."""
+        return ceil_align(self._swa_cap, page_size * self._swa_align_pages)
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
@@ -1169,7 +1176,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     ) -> MemoryPoolConfig:
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         available_bytes -= self._dummy_page_bytes(page_size)
-        swa_tokens = ceil_align(self._swa_cap, page_size)
+        swa_tokens = self._swa_cap_tokens(page_size)
         fixed_swa_bytes = swa_tokens * (
             self._swa_per_token * self._swa_layers_num
             + self._draft_swa_per_token * self._draft_swa_layers_num
@@ -1203,7 +1210,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         # Constrained max_total goes to the full pool; SWA stays at its cap.
-        swa_tokens = ceil_align(self._swa_cap, page_size)
+        swa_tokens = self._swa_cap_tokens(page_size)
         full_tokens = (max_total_num_tokens // page_size) * page_size
         return self._make_pool_config(
             full_tokens, min(swa_tokens, max_total_num_tokens)

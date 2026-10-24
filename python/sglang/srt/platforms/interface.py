@@ -155,6 +155,10 @@ class SRTPlatform(DeviceMixin):
         """Whether the eager runner shards a context-parallel extend itself."""
         return True
 
+    def swa_pool_page_multiple(self) -> int:
+        """Page multiple the sliding-window KV pool must be sized to (1 = none)."""
+        return 1
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
 

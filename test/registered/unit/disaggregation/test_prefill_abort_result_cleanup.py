@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
@@ -461,3 +462,32 @@ class TestPrefillCompleteResult(CustomTestCase):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_finished_prefill_frees_swa_beyond_window_on_raiden():
+    """A finished prefill waiting for the decode to pull keeps only its sliding
+    window on every Raiden transfer (not just pipeline parallel): the payload
+    reads the window only, and a whole retained chunk starves the next chunked
+    prefill's SWA continuation budget."""
+    for backend, expect_release in (
+        (TransferBackend.RAIDEN, True),
+        (TransferBackend.MOONCAKE, False),
+    ):
+        scheduler = _Scheduler()
+        scheduler.transfer_backend = backend
+        # Scheduler collaborators stubbed on the fake, like send_kv_chunk above.
+        scheduler.checkpoint_disagg_prefill = Mock()
+        scheduler._release_swa_beyond_window = Mock()
+        req = _Req(inflight_middle_chunks=0)
+        req.to_finish = None  # not aborted: the normal transfer path
+        req.time_stats = Mock()
+        req.extend_range = SimpleNamespace(end=len(req.origin_input_ids))
+
+        with get_context().override_server_args():
+            scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+        assert scheduler.disagg_prefill_inflight_queue == [req]
+        scheduler.checkpoint_disagg_prefill.assert_called_once_with(req)
+        assert scheduler._release_swa_beyond_window.called is expect_release, backend
+        # The request still owns its kv row while it waits for the decode.
+        assert req.kv.holds_kv

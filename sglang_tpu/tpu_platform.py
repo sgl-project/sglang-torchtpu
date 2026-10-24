@@ -1186,6 +1186,11 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuPagedTokenToKVPoolAllocator
 
+    def swa_pool_page_multiple(self) -> int:
+        from sglang_tpu.kv_pool import SWA_POOL_PAGE_MULTIPLE
+
+        return SWA_POOL_PAGE_MULTIPLE
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 

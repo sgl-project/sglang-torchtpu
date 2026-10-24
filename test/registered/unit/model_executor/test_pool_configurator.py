@@ -8,6 +8,11 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.model_executor import pool_configurator as pool_configurator_module
+from sglang.srt.model_executor.pool_configurator import (
+    SWAChunkCapPoolConfigurator,
+    create_memory_pool_configurator,
+)
 from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
@@ -29,6 +34,11 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
+        patch.object(
+            pool_configurator_module.current_platform,
+            "swa_pool_page_multiple",
+            return_value=1,
+        ),
         get_parallel().override(
             tp_size=tp_size,
             attn_tp_size=tp_size,
@@ -424,9 +434,14 @@ class TestHybridSWAConfigurator(CustomTestCase):
         configurator.model_config = mr.model_config
         configurator.is_hybrid_swa = True
         configurator.is_draft_worker = False
-        target = configurator._derive_pool_sizes(config=config)
-        configurator.is_draft_worker = True
-        draft = configurator._derive_pool_sizes(config=config)
+        with patch.object(
+            pool_configurator_module.current_platform,
+            "swa_pool_page_multiple",
+            return_value=1,
+        ):
+            target = configurator._derive_pool_sizes(config=config)
+            configurator.is_draft_worker = True
+            draft = configurator._derive_pool_sizes(config=config)
         self.assertEqual(
             target.unified_memory_pool_bytes, config.unified_memory_pool_bytes
         )
@@ -822,6 +837,57 @@ class TestHybridSWAConfigurator(CustomTestCase):
         # cap = 20 * max_running_requests(2) + 36 = 76.
         self.assertEqual(config.swa_max_total_num_tokens, 76)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
+
+    def test_chunk_cache_cap_tpu_aligns_up_to_eight_pages(self):
+        """On TPU the SWA pool must be a multiple of 8 pages; the chunk cap is
+        aligned *up* so the later round-down cannot eat its headroom (a chunked
+        prefill whose next-chunk budget hits 0 waits forever)."""
+        available, page_size = 1_000_000, 4
+        kwargs = dict(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+            disable_radix_cache=True,
+            chunked_prefill_size=16,
+            sliding_window_size=8,
+            page_size=page_size,
+            max_running_requests=2,
+            disaggregation_mode="prefill",
+            disable_overlap_schedule=False,
+        )
+        sizes = {}
+        for device, page_multiple in (("cpu", 1), ("tpu", 8)):
+            mr = _make_model_runner(self, **kwargs)
+            mr.device = device
+            with (
+                mock_cpu_env(),
+                patch.object(
+                    pool_configurator_module.current_platform,
+                    "swa_pool_page_multiple",
+                    return_value=page_multiple,
+                ),
+            ):
+                cfg = create_memory_pool_configurator(mr)
+                self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+                config = cfg.calculate_pool_sizes(available, page_size=page_size)
+                # --max-total-tokens takes the constrained path; same alignment.
+                constrained = cfg.calculate_pool_sizes_from_max_tokens(
+                    10_000, page_size=page_size
+                )
+            self.assertLessEqual(_actual_memory_used(mr, config), available)
+            self.assertEqual(
+                constrained.swa_max_total_num_tokens, config.swa_max_total_num_tokens
+            )
+            sizes[device] = config.swa_max_total_num_tokens
+
+        cap = 76  # see test_chunk_cache_cap_prefill_holds_window_plus_chunk
+        align = page_size * 8  # the TPU platform answers 8 pages
+        self.assertEqual(sizes["cpu"], cap)
+        self.assertEqual(sizes["tpu"], -(-cap // align) * align)  # 96
+        self.assertGreaterEqual(sizes["tpu"], cap)
+        self.assertEqual(sizes["tpu"] % align, 0)
 
     def test_chunk_cache_cap_holds_a_chunk_per_pipeline_slot(self):
         # Under pipeline parallelism a stage's scheduler has one micro-batch per
