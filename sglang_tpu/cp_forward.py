@@ -240,11 +240,27 @@ def pinned_extend_seq_lens_cpu(
 # ---------------------------------------------------------------------------
 
 
+def is_seq_along_lane_kv_cache(kv_cache: torch.Tensor, heads: int) -> bool:
+    """Return True if ``kv_cache`` uses ``SEQ_ALONG_LANE`` layout ``[B, 2*H, hd_words, packing, page_size]``."""
+    return (
+        kv_cache.ndim == 5
+        and kv_cache.shape[1] == 2 * heads
+        and kv_cache.shape[4] >= 128
+        and kv_cache.shape[2] * kv_cache.shape[3] >= 64
+    )
+
+
 def fused_kv_rows(
-    k: torch.Tensor, v: torch.Tensor, kv_cache: torch.Tensor
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache: torch.Tensor,
+    *,
+    seq_along_lane: bool | None = None,
 ) -> torch.Tensor:
-    """Rows ``[T, packed, packing, padded_head_dim]`` of ``k``/``v`` (each
-    ``[T, heads, head_dim]``) in the fused pool layout of ``kv_cache``.
+    """Rows of ``k``/``v`` (each ``[T, heads, head_dim]``) in the pool layout of ``kv_cache``.
+
+    - For ``SEQ_ACROSS_LANE`` (standard fused): ``[T, packed, packing, padded_head_dim]``
+    - For ``SEQ_ALONG_LANE``: ``[T, 2 * heads, hd_words, packing]``
 
     fp8 tensors are handled as their byte view so the interleave, padding and
     reshape run on uint8.
@@ -253,13 +269,38 @@ def fused_kv_rows(
         k = k.view(torch.uint8)
         v = v.view(torch.uint8)
     num_tokens, heads, head_dim = k.shape
-    packed, packing, padded_head_dim = kv_cache.shape[2:]
+    use_along = (
+        is_seq_along_lane_kv_cache(kv_cache, heads)
+        if seq_along_lane is None
+        else seq_along_lane
+    )
     rows = torch.stack([k, v], dim=2).reshape(num_tokens, 2 * heads, head_dim)
+    if use_along:
+        _, kv_heads_x2, hd_words, packing, _ = kv_cache.shape
+        padded_hd = hd_words * packing
+        pad_dim = padded_hd - head_dim
+        if pad_dim:
+            rows = torch.nn.functional.pad(rows, (0, pad_dim))
+        return rows.reshape(num_tokens, kv_heads_x2, hd_words, packing)
+    packed, packing, padded_head_dim = kv_cache.shape[2:]
     pad_dim = padded_head_dim - head_dim
     pad_heads = packed * packing - 2 * heads
     if pad_dim or pad_heads:
         rows = torch.nn.functional.pad(rows, (0, pad_dim, 0, pad_heads))
     return rows.reshape(num_tokens, packed, packing, padded_head_dim)
+
+
+def scatter_seq_along_lane_rows(
+    kv_cache: torch.Tensor,
+    rows: torch.Tensor,
+    slot_indices: torch.Tensor,
+) -> None:
+    """Write ``rows`` ``[T, 2*H, hd_words, packing]`` into ``SEQ_ALONG_LANE`` ``kv_cache`` at ``slot_indices``."""
+    page_size = kv_cache.shape[4]
+    slots = slot_indices.to(device=kv_cache.device, dtype=torch.long)
+    pages = slots // page_size
+    lanes = slots % page_size
+    kv_cache[pages, :, :, :, lanes] = rows.view(kv_cache.dtype).permute(0, 1, 2, 3)
 
 
 def all_gather_and_write_kv(
