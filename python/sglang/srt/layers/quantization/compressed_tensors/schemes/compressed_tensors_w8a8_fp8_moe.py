@@ -36,7 +36,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-__all__ = ["CompressedTensorsW8A8Fp8MoE"]
+__all__ = ["CompressedTensorsW8A8Fp8MoE", "TpuCompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -442,3 +442,54 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 a2_scale=layer.w2_input_scale,
             )
             return self.runner.run(dispatch_output, quant_info)
+
+
+class TpuCompressedTensorsW8A8Fp8MoE(CompressedTensorsW8A8Fp8MoE):
+    """TPU channelwise W8A8 FP8 MoE via the Pallas fused grouped-GEMM (gmm_v2).
+
+    Inherits channelwise weight creation from CompressedTensorsW8A8Fp8MoE; the
+    checkpoint scales are already per output channel, so they feed the same
+    runtime layout the block-FP8 checkpoints are requantized into.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.hardware_backend.tpu.fp8_moe import (
+            prepare_tpu_fp8_moe_weights,
+        )
+
+        # Loaded as [E, N, 1]; the gmm_v2 scale layout reads per-channel as [E, N].
+        layer.w13_weight_scale.data = layer.w13_weight_scale.data.squeeze(-1)
+        layer.w2_weight_scale.data = layer.w2_weight_scale.data.squeeze(-1)
+        prepare_tpu_fp8_moe_weights(
+            layer,
+            block_quant=False,
+            weight_block_size=None,
+            use_mxfp8=False,
+            is_fp4_expert=False,
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        # No MoeRunner backend: apply_weights dispatches directly to the
+        # Pallas fused grouped-GEMM bridge.
+        self.moe_runner_config = moe_runner_config
+        self.runner = None
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
+
+        cfg = self.moe_runner_config
+        return apply_tpu_fp8_moe(
+            layer=layer,
+            dispatch_output=dispatch_output,
+            activation=cfg.activation,
+            block_quant=False,
+            apply_router_weight_on_input=cfg.apply_router_weight_on_input,
+            no_combine=cfg.no_combine,
+            swiglu_limit=cfg.swiglu_limit,
+        )
