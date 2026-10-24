@@ -398,6 +398,11 @@ class RaidenKVManager(
                     "state yet; serve hybrid linear-attention models without "
                     "pipeline parallelism or SGLANG_RAIDEN_PIPELINE_TRANSFER."
                 )
+            if getattr(self, "is_dummy_cp_rank", False):
+                # Prefill CP rank 0 holds the whole sequence and is the only
+                # source the decode pulls from; the sender skips the others.
+                self.chunked_transfer = False
+                return
             from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
             pipeline = PipelineTransfer(self, kv_caches)
