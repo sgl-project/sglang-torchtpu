@@ -3133,6 +3133,30 @@ class SchedulerDisaggregationDecodeMixin:
             # Update last_batch
             self.last_batch = batch
 
+    def process_last_batch_before_retraction(self: Scheduler) -> bool:
+        """Process the in-flight decode result before a retraction backs up requests.
+
+        The overlap loop plans the next batch while the previous one is still
+        unprocessed. That forward has already advanced each request's
+        recurrent (Mamba / linear-attention) state by its input token, but the
+        token it sampled is not in ``output_ids`` yet, and for a retracted
+        request it is dropped. A backup taken then pairs that state with a KV
+        backup and a resume point one token behind it, so the resumed request
+        applies its last token to the state a second time. As the retract-mode
+        pause does, process the result first. Returns whether one was processed.
+        """
+        if not (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.enable_overlap
+            and self.result_queue
+        ):
+            return False
+        tmp_batch, tmp_result = self.result_queue.popleft()
+        self.process_batch_result(tmp_batch, tmp_result)
+        # Processed: the event loop must not process it again.
+        self.last_batch = None
+        return True
+
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:

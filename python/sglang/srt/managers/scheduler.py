@@ -4552,9 +4552,18 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
-        ):
+        kv_full_retract_flag = not batch.check_decode_mem()
+        test_retract = TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        if (
+            kv_full_retract_flag or test_retract
+        ) and self.process_last_batch_before_retraction():
+            # The processed step may have finished requests and freed their KV.
+            batch.filter_batch()
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+            kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag or test_retract:
             if self.decode_offload_manager is not None:
                 # Pending offload copies may still read the device KV that retraction frees.
                 self.decode_offload_manager.drain_before_retraction()

@@ -654,6 +654,77 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         retract_decode.assert_called_once_with(draft_kv_pools=draft_pools)
 
+    def test_overlap_decode_retract_processes_in_flight_result_first(self):
+        """An overlap P/D decode retraction must process the in-flight result before
+        it backs up requests: that forward already advanced their recurrent state by
+        its input token, so a backup without its sampled token resumes one token
+        behind the state and applies that token twice."""
+        for mode, overlap, processes in (
+            (DisaggregationMode.DECODE, True, True),
+            # Nothing is backed up: a retracted request is prefilled again.
+            (DisaggregationMode.NULL, True, False),
+            # The non-overlap loop has already processed every result.
+            (DisaggregationMode.DECODE, False, False),
+        ):
+            with self.subTest(mode=mode, overlap=overlap):
+                scheduler = self._new_scheduler()
+                scheduler.enable_overlap = overlap
+                scheduler.disaggregation_mode = mode
+                req = self._make_req("run")
+                req.output_ids.extend([4, 5])
+                in_flight = (MagicMock(), MagicMock())
+                scheduler.last_batch = in_flight[0]
+                scheduler.result_queue = deque([in_flight])
+                events = []
+
+                def process_result(batch, result, req=req, events=events):
+                    req.output_ids.append(6)
+                    events.append("process")
+
+                def retract_decode(batch, draft_kv_pools, events=events):
+                    events.append(("retract", list(batch.reqs[0].output_ids)))
+                    return [], 1.0, []
+
+                scheduler.process_batch_result = MagicMock(side_effect=process_result)
+                with patch.object(
+                    ScheduleBatch, "retract_decode", autospec=True
+                ) as patched:
+                    patched.side_effect = retract_decode
+                    self._retract_by_kv_full(scheduler, req)
+
+                if processes:
+                    scheduler.process_batch_result.assert_called_once_with(*in_flight)
+                    self.assertEqual(events, ["process", ("retract", [4, 5, 6])])
+                    self.assertFalse(scheduler.result_queue)
+                    # The event loop must not process the result again.
+                    self.assertIsNone(scheduler.last_batch)
+                else:
+                    scheduler.process_batch_result.assert_not_called()
+                    self.assertEqual(events, [("retract", [4, 5])])
+                    self.assertEqual(list(scheduler.result_queue), [in_flight])
+
+    def test_overlap_decode_retract_skips_requests_the_result_finishes(self):
+        """A request that the processed in-flight result finishes leaves the batch
+        instead of being retracted."""
+        scheduler = self._new_scheduler()
+        scheduler.enable_overlap = True
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        req = self._make_req("run")
+        in_flight = (MagicMock(), MagicMock())
+        scheduler.last_batch = in_flight[0]
+        scheduler.result_queue = deque([in_flight])
+        scheduler.process_batch_result = MagicMock(
+            side_effect=lambda batch, result: setattr(
+                req, "finished_reason", MagicMock()
+            )
+        )
+
+        with patch.object(ScheduleBatch, "retract_decode") as retract_decode:
+            self._retract_by_kv_full(scheduler, req)
+
+        retract_decode.assert_not_called()
+        self.assertFalse(scheduler.result_queue)
+
     def test_retraction_refused_while_any_rank_tracks_an_offload_copy(self):
         """Retraction must be refused on every rank, before any KV is freed, while any
         rank still tracks a device-to-host offload copy after the drain."""
