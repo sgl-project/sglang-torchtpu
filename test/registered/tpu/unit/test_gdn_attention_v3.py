@@ -16,7 +16,9 @@ Cases covered (kernel vs. reference, bf16-ish tolerance):
 Multi-tile state pipeline regressions, ported with vllm-project/vllm-torchtpu#1927
 (a later tile's state load must not overwrite an in-flight checkpoint store):
 
-* CPU interpret-mode DMA race detection (decode + prefill, and a W=8 verify)
+* CPU interpret-mode DMA race detection (decode + prefill, a W=8 verify, a KDA
+  W=8 verify, and radix snapshots with multi-tile prefills)
+* W=1 decode tiles fit an input and an output state slot per sequence in VMEM
 * multi-tile batched decode keeps every sequence's state (fp32 / bf16)
 * multi-tile W=8 verify windows write the right checkpoints
 
@@ -28,7 +30,7 @@ Plus two state-plumbing invariants:
   state, matching the equivalent single-shot prefill.
 
 The kernel is pure JAX/Pallas and requires a TPU device; tests are skipped
-otherwise, except the race test, which runs in CPU interpret mode. They do **not** depend on torch_tpu or the SGLang server runtime.
+otherwise, except the state pipeline tests, which run on CPU. They do **not** depend on torch_tpu or the SGLang server runtime.
 
 Adapted from vllm-torchtpu ``tests/kernels/test_gdn_attention_v3.py``.
 
@@ -40,9 +42,10 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=100, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
+from unittest import mock
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -944,34 +947,55 @@ class TestGDNAttentionV3(CustomTestCase):
 
 @unittest.skipIf(not _has_jax(), "Requires JAX")
 class TestGDNStatePipelineRace(CustomTestCase):
-    """CPU interpret-mode vector-clock race detection on the state pipeline."""
+    """CPU checks of the state pipeline: interpret-mode vector-clock race
+    detection and the W=1 decode tile size."""
 
-    def _races_per_call(self, num_spec_tokens: int) -> list[bool]:
+    NUM_DECODE = 6
+
+    def _races_per_call(
+        self,
+        num_spec_tokens: int,
+        *,
+        attention_mode=None,
+        prefill_lengths=(1, 1, 1),
+        track_indices=None,
+        track_end=None,
+    ) -> list[bool]:
         from jax.experimental.pallas import tpu as pltpu
         from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-        from sglang_tpu.attention.pallas.gdn import wrapper
+        from sglang_tpu.attention.pallas.gdn import config, wrapper
 
+        if attention_mode is None:
+            attention_mode = config.AttentionMode.GDN
+        is_kda = attention_mode == config.AttentionMode.KDA
         n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
         dim = 2 * n_kq * d_k + n_v * d_v
+        # KDA's gate is per-channel: d_k values per value head.
+        gate_dim = n_v * d_k if is_kda else n_v
         window = num_spec_tokens + 1
         # 6 decode/verify sequences at tile 2 (step 2 reuses step 0's slot),
-        # then 3 one-token PER_SEQ tiles that do the same.
-        num_decode, num_seqs = 6, 9
-        lengths = [window] * num_decode + [1] * (num_seqs - num_decode)
+        # then one PER_SEQ tile per prefill token; 3 one-token prefills do the
+        # same.
+        lengths = [window] * self.NUM_DECODE + list(prefill_lengths)
+        num_seqs = len(lengths)
         num_tokens = sum(lengths)
         num_blocks = num_seqs * window
+        if track_indices is not None:
+            num_blocks = max(num_blocks, int(np.max(track_indices)) + 1)
 
         cpu = jax.devices("cpu")[0]
         with jax.default_device(cpu):
             rngs = iter(jax.random.split(jax.random.key(0), 9))
             qkv = jax.random.normal(next(rngs), (num_tokens, dim), jnp.bfloat16)
             b = jax.random.normal(next(rngs), (num_tokens, n_v), jnp.bfloat16)
-            a = jax.random.normal(next(rngs), (num_tokens, n_v), jnp.bfloat16)
+            a = jax.random.normal(next(rngs), (num_tokens, gate_dim), jnp.bfloat16)
             conv_w = jax.random.normal(next(rngs), (dim, 1, kernel_size), jnp.bfloat16)
             conv_b = jax.random.normal(next(rngs), (dim,), jnp.bfloat16)
             a_log = jax.random.normal(next(rngs), (n_v,), jnp.float32)
-            dt_bias = jax.random.normal(next(rngs), (n_v,), jnp.float32)
+            dt_bias = jax.random.normal(
+                next(rngs), (n_v, d_k) if is_kda else (n_v,), jnp.float32
+            )
             init_conv = jax.random.normal(
                 next(rngs), (num_blocks, kernel_size - 1, dim), jnp.bfloat16
             )
@@ -984,6 +1008,9 @@ class TestGDNStatePipelineRace(CustomTestCase):
                 read_offsets = jnp.array(
                     [s % window for s in range(num_seqs)], jnp.int32
                 )
+            if track_indices is not None:
+                track_indices = jnp.asarray(track_indices, jnp.int32)
+                track_end = jnp.asarray(track_end, jnp.int32)
 
         # jax has no InterpretParams.on_race; read each pallas_call's verdict
         # before its clean-up barrier drops the shared state.
@@ -997,6 +1024,26 @@ class TestGDNStatePipelineRace(CustomTestCase):
                 races_per_call.append(bool(races.races_found))
             orig_clear()
 
+        # The detector also reports an empty slice as overlapping, and a
+        # prefill spanning several tiles issues empty state and snapshot DMAs;
+        # drop this once jax skips zero-length ranges.
+        race_state = sys.modules[mosaic_interpret.RaceDetectionState.__module__]
+        orig_overlap = race_state._ranges_overlap
+
+        def _is_empty(rng):
+            return any(
+                isinstance(r, slice)
+                and r.start is not None
+                and r.stop is not None
+                and int(r.stop) <= int(r.start)
+                for r in rng
+            )
+
+        def _ranges_overlap(range1, range2):
+            if _is_empty(range1) or _is_empty(range2):
+                return False
+            return orig_overlap(range1, range2)
+
         mesh = AbstractMesh(
             (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
         )
@@ -1006,6 +1053,7 @@ class TestGDNStatePipelineRace(CustomTestCase):
             with (
                 jax.default_device(cpu),
                 use_abstract_mesh(mesh),
+                mock.patch.object(race_state, "_ranges_overlap", _ranges_overlap),
                 pltpu.force_tpu_interpret_mode(
                     pltpu.InterpretParams(
                         detect_races=True,
@@ -1028,7 +1076,7 @@ class TestGDNStatePipelineRace(CustomTestCase):
                     query_start_loc=q_loc,
                     state_indices=jnp.arange(num_seqs, dtype=jnp.int32) * window,
                     distribution=jnp.array(
-                        [num_decode, num_seqs, num_seqs], dtype=jnp.int32
+                        [self.NUM_DECODE, num_seqs, num_seqs], dtype=jnp.int32
                     ),
                     seq_lens=jnp.full((num_seqs,), 11, dtype=jnp.int32),
                     read_offsets=read_offsets,
@@ -1037,10 +1085,13 @@ class TestGDNStatePipelineRace(CustomTestCase):
                     d_k=d_k,
                     d_v=d_v,
                     kernel_size=kernel_size,
+                    attention_mode=attention_mode,
                     num_spec_tokens=num_spec_tokens,
+                    track_indices=track_indices,
+                    track_end=track_end,
                     decode_tile_size=2,
                     # Interpret mode cannot reshape refs on the C > 1 chunked
-                    # path; one-token prefills run at C = 1.
+                    # path; prefills run one token per tile (C = 1).
                     mixed_tile_size=1,
                 )
                 jax.block_until_ready((conv_out, rec_out, out))
@@ -1056,6 +1107,127 @@ class TestGDNStatePipelineRace(CustomTestCase):
                 # One verdict per pallas_call: the batched and PER_SEQ kernels.
                 self.assertEqual(len(races), 2, races)
                 self.assertFalse(any(races), f"DMA race per pallas_call: {races}")
+
+    def test_kda_verify_has_no_dma_race(self):
+        """KDA W=8 verify windows run one sequence per tile (6 tiles here)."""
+        from sglang_tpu.attention.pallas.gdn import config
+
+        races = self._races_per_call(7, attention_mode=config.AttentionMode.KDA)
+        self.assertEqual(len(races), 2, races)
+        self.assertFalse(any(races), f"DMA race per pallas_call: {races}")
+
+    def test_radix_snapshot_has_no_dma_race(self):
+        """Radix snapshots ride the state output window of both kernels.
+
+        3-token prefills span 3 PER_SEQ tiles next to one-tile prefills; every
+        sequence snapshots its final state.
+        """
+        prefill_lengths = (3, 1, 3, 1, 3, 1)
+        ends = np.cumsum([1] * self.NUM_DECODE + list(prefill_lengths))
+        races = self._races_per_call(
+            0,
+            prefill_lengths=prefill_lengths,
+            # One snapshot slot per sequence, past the active ones.
+            track_indices=np.arange(ends.size, 2 * ends.size),
+            track_end=ends,
+        )
+        self.assertEqual(len(races), 2, races)
+        self.assertFalse(any(races), f"DMA race per pallas_call: {races}")
+
+    def _w1_decode_cfg(self, n_kq: int, n_v: int, decode_tile_size: int):
+        """Trace an 8-sequence W=1 decode for TPU7x without running it.
+
+        Returns the decode kernel's config and the VMEM capacity its tile was
+        sized against.
+        """
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+
+        from sglang_tpu.attention.pallas.gdn import config, wrapper
+
+        d_k, d_v, kernel_size, num_seqs = 128, 128, 4, 8
+        dim = 2 * n_kq * d_k + n_v * d_v
+
+        def sds(shape, dtype=jnp.float32):
+            return jax.ShapeDtypeStruct(shape, dtype)
+
+        inputs = dict(
+            qkv=sds((num_seqs, dim), jnp.bfloat16),
+            b=sds((num_seqs, n_v), jnp.bfloat16),
+            a=sds((num_seqs, n_v), jnp.bfloat16),
+            conv_state=sds((num_seqs + 1, kernel_size - 1, dim)),
+            recurrent_state=sds((num_seqs + 1, n_v, d_k, d_v)),
+            conv_weight=sds((dim, 1, kernel_size), jnp.bfloat16),
+            conv_bias=sds((dim,), jnp.bfloat16),
+            a_log=sds((n_v,)),
+            dt_bias=sds((n_v,)),
+            query_start_loc=sds((num_seqs + 1,), jnp.int32),
+            state_indices=sds((num_seqs,), jnp.int32),
+            distribution=sds((3,), jnp.int32),
+            seq_lens=sds((num_seqs,), jnp.int32),
+        )
+
+        def decode(kwargs):
+            # The unjitted body retraces on every call, so no kernel is missed.
+            return wrapper.fused_conv1d_gdn.__wrapped__(
+                **kwargs,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                batched_only=True,
+                decode_tile_size=decode_tile_size,
+            )
+
+        cfgs = []
+        outer_kernel = wrapper.outer_kernel
+
+        def record_cfg(*refs, cfg, **kwargs):
+            cfgs.append(cfg)
+            return outer_kernel(*refs, cfg=cfg, **kwargs)
+
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with (
+            jax.default_device(jax.devices("cpu")[0]),
+            use_abstract_mesh(mesh),
+            mock.patch.object(wrapper, "outer_kernel", record_cfg),
+        ):
+            # Tracing alone picks the tile; nothing is compiled or run.
+            jax.eval_shape(decode, inputs)
+            vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        (cfg,) = cfgs
+        self.assertEqual(cfg.mode, config.GDNMode.BATCHED)
+        return cfg, vmem_capacity_bytes
+
+    def test_w1_decode_tile_counts_split_state_slots(self):
+        """W=1 decode tiles fit 1 input + 1 output state slot per sequence.
+
+        On TPU7x the 4 MiB (n_v=64) and 2 MiB (n_v=32) fp32 states hold the
+        tile below the requested 4, which W=1 kept before the state windows
+        split; small states keep it.
+        """
+        decode_tile_size = 4
+        for n_kq, n_v in ((16, 64), (8, 32)):
+            with self.subTest(n_v=n_v):
+                cfg, vmem_capacity_bytes = self._w1_decode_cfg(
+                    n_kq, n_v, decode_tile_size
+                )
+                tile = cfg.seq_tile_size
+                self.assertGreaterEqual(tile, 1)
+                self.assertLess(tile, decode_tile_size)
+                state_bytes = cfg.num_v_heads * cfg.kq_head_dim * cfg.v_head_dim * 4
+                # Each buffer holds every sequence's input and output state;
+                # together they fit in half of VMEM.
+                self.assertLessEqual(
+                    tile * 2 * state_bytes * cfg.num_buffers,
+                    vmem_capacity_bytes / 2,
+                )
+        with self.subTest(n_v=8):
+            cfg, _ = self._w1_decode_cfg(2, 8, decode_tile_size)
+            self.assertEqual(cfg.seq_tile_size, decode_tile_size)
 
 
 if __name__ == "__main__":
