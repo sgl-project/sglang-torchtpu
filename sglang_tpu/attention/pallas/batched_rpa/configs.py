@@ -573,8 +573,3 @@ class RpaConfigs:
         if self.serve.attention_scope == AttentionScope.STRIPED:
             if self.mode != RpaCase.DECODE:
                 raise ValueError("AttentionScope.STRIPED is decode-only.")
-            if self.model.sliding_window is not None:
-                raise ValueError(
-                    "AttentionScope.STRIPED does not support sliding-window layers;"
-                    " use the CACHE_ONLY + NEW_TOKENS_ONLY pair."
-                )

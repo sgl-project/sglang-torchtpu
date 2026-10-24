@@ -276,7 +276,11 @@ def rpa_body(
         if global_q_k_gap is not None:
             kv_len_global = jnp.where(is_valid, kv_lens_global_ref[safe_s_idx], 0)
             q_global = kv_len_global - q_len + q_idx * cfgs.bq_sz
-            k_global = k_id * cfgs.serve.cp_group_size + cp_rank_ref[0]
+            # Page-striped cache: local key j holds global position
+            # j + (j // page_size) * (cp - 1) * page_size + rank * page_size. The
+            # mask adds the j-dependent stripe term per key; the scalar part of
+            # the gap is q_global - (k_id + rank * page_size).
+            k_global = k_id + cp_rank_ref[0] * cfgs.serve.page_size
             global_q_k_gap.append(q_global - k_global)
 
         # Stitching metadata

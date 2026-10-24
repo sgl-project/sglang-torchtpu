@@ -577,9 +577,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 f"required={self.max_context_len}, available={req_to_token_width}."
             )
         # Decode context parallelism (DCP): a group of ranks splits every
-        # sequence's KV by absolute position (pos % dcp == rank), and the
-        # allocator hands out slots from a pool widened by dcp, so one page
-        # spans page_size * dcp logical tokens over page_size physical slots.
+        # sequence's KV by page ((pos // page_size) % dcp == rank), and the
+        # allocator hands out slots from a pool widened by dcp, so one logical
+        # page spans page_size * dcp tokens over page_size physical slots per
+        # rank: rank r's physical page holds the r-th page_size run of it.
         parallel = get_parallel()
         self._dcp = parallel.attn_dcp_size
         self._dcp_rank = parallel.attn_dcp_rank if self._dcp > 1 else 0
@@ -713,12 +714,24 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         return forward_mode.is_extend(include_draft_extend_v2=True)
 
     def _dcp_local_kv_len(self, length: int) -> int:
-        """Scalar form of ``layers.dcp.layout.get_dcp_lens``; identity without DCP.
+        """Scalar form of ``layers.dcp.layout.get_dcp_lens`` with
+        ``interleave_size=page_size`` (page striping); identity without DCP.
 
         Monotone in ``length``, so the batch's longest sequence also holds the
         longest shard and the page-table capacity check can use it.
         """
-        return length // self._dcp + (self._dcp_rank < length % self._dcp)
+        if self._dcp == 1:
+            return length
+        page = self.page_size
+        full = (length // self._page_stride) * page
+        rem = min(max(length % self._page_stride - self._dcp_rank * page, 0), page)
+        return full + rem
+
+    def _dcp_lens(self, lens: torch.Tensor) -> torch.Tensor:
+        """This rank's page-striped share of each length in ``lens``."""
+        return self._get_dcp_lens(
+            lens, self._dcp, self._dcp_rank, interleave_size=self.page_size
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Land deferred HiCache reload commits into the KV buffers before any
@@ -1153,13 +1166,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 out[:live] = values.to(torch.int32)
                 return out.to(device, non_blocking=True)
 
-            kv_lens = _padded(
-                self._get_dcp_lens(seq_lens_host, self._dcp, self._dcp_rank)
-            )
+            kv_lens = _padded(self._dcp_lens(seq_lens_host))
             dcp_kv_lens_global = _padded(seq_lens_host)
-            dcp_prefix_kv_lens = _padded(
-                self._get_dcp_lens(prefix_host, self._dcp, self._dcp_rank)
-            )
+            dcp_prefix_kv_lens = _padded(self._dcp_lens(prefix_host))
             dcp_cp_rank = self._cp_rank_t
 
         req_pool_indices = forward_batch.req_pool_indices_cpu
@@ -1192,11 +1201,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         step_slots: torch.Tensor | None = None
         step_positions: torch.Tensor | None = None
         num_tokens = 0
-        if self._dcp > 1:
-            # The slots and positions of this step's tokens come from the host
-            # request-to-token table, so the owner-masked write targets are
-            # built here and shipped with the rest of the metadata, padded to
-            # the token bucket like the batch's own token fields.
+        if self._dcp > 1 and not forward_batch.forward_mode.is_decode():
+            # Extend only: the fused STRIPED decode launch writes the owned
+            # token itself. The slots and positions of this step's tokens come
+            # from the host request-to-token table, so the owner-masked write
+            # targets are built here and shipped with the rest of the metadata,
+            # padded to the token bucket like the batch's own token fields.
             starts = (seq_lens_host - ext_host).tolist()
             counts = ext_host.tolist()
             step_positions = torch.cat(
@@ -1238,7 +1248,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 ),
                 device=device,
             )
-            if self._dcp > 1:
+            if self._dcp > 1 and step_slots is not None:
                 # SWA layers write into the SWA sub-pool, whose slots the
                 # mapping gives for the same tokens.
                 swa_slots = full_to_swa[step_slots.to(full_to_swa.device)].to(
@@ -1731,18 +1741,23 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         k_scale: float | None,
         v_scale: float | None,
     ) -> torch.Tensor:
-        """One layer of attention over a position-sharded KV cache, ``[T, H, D]``.
+        """One layer of attention over a page-striped KV cache, ``[T, H, D]``.
 
-        The rank writes only the tokens it owns and the kernel is told to leave
-        the cache alone, so the step's K/V reaches exactly one shard. The kernel
-        then runs on this rank's shard with the whole group's query heads, and
-        ``merge_across_ranks`` merges the partial softmaxes and hands each rank
-        back its own heads.
+        Decode is one fused ``STRIPED`` launch: the kernel attends this rank's
+        page stripe with the whole group's query heads and, on the rank that
+        owns the new token's page, also attends and writes the new token (its
+        slot is exactly the end of that rank's stripe). The per-rank partials
+        are then merged by ``_dcp_merge_partials`` (one lane-dense all-gather
+        and a local log-sum-exp merge, sink folded in once), and each rank
+        keeps its own heads.
 
-        Extend takes a second pass because the chunk's own tokens are spread
-        across the group yet have to be attended causally: the chunk is attended
-        locally, uncached, and merged into the prefix result by log-sum-exp. The
-        sink belongs to whichever pass covers every key, so it is applied once.
+        Extend writes the chunk's owned tokens with the span DMA first and
+        takes two passes, because the chunk's own tokens are spread across the
+        group yet have to be attended causally: the cached prefix is attended
+        on this rank's stripe and merged across the group, the chunk is
+        attended locally, uncached, and merged into the prefix result by
+        log-sum-exp. The sink belongs to whichever pass covers every key, so it
+        is applied once.
 
         The cached passes hand the kernel the group's gathered query heads
         against the full replicated KV block. The chunk pass keeps this rank's
@@ -1755,79 +1770,39 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
         if forward_batch.forward_mode.is_decode():
-            # In decode mode:
-            # 1. Page-striped cache sharding: rank owns page iff page_idx % cp == rank.
-            # Local page table is sliced from the global page indices:
-            num_reqs = md.kv_lens.shape[0]
-            pages_per_seq = page_indices.shape[0] // num_reqs
-            pages_2d = page_indices.view(num_reqs, pages_per_seq)
-            owned_pages = pages_2d[:, self._dcp_rank::cp]
-            pad_len = pages_per_seq - owned_pages.shape[1]
-            if pad_len > 0:
-                striped_page_indices = torch.nn.functional.pad(
-                    owned_pages, (0, pad_len), value=0
-                ).reshape(-1)
-            else:
-                striped_page_indices = owned_pages.reshape(-1)
-
-            # Global cache length before adding current decode token:
-            # seq_lens has length including current decode token (k_len = seq_len).
-            # The token lives at position pos = seq_len - 1.
-            seq_lens = (
-                md.dcp_kv_lens_global
-                if md.dcp_kv_lens_global is not None
-                else forward_batch.seq_lens
-            )
-            cache_lens_global = torch.clamp(seq_lens - 1, min=0).to(torch.int32)
-            page_size = self.page_size
-            own = (
-                ((cache_lens_global // page_size) % cp == self._dcp_rank)
-                & (seq_lens > 0)
-            )
-            own_i32 = own.to(torch.int32)
-
-            from sglang_tpu.attention.pallas.batched_rpa.utils import cp_local_cache_len
-
-            local_cache_lens = cp_local_cache_len(
-                cache_lens_global, cp, self._dcp_rank, page_size
-            )
-            local_kv_lens = local_cache_lens + own_i32
-
+            # ``md.kv_lens`` is this rank's page-striped share of seq_len (the
+            # new token included iff this rank owns its page); the page table
+            # already lists one physical page per logical (widened) page, which
+            # is exactly the stripe. The kernel derives the ownership of the new
+            # token from the global lengths and the rank.
             out_p, lse_p = self._dcp_op(
                 q_all,
                 k,
                 v,
                 kv_cache,
-                local_kv_lens,
-                striped_page_indices,
+                md.kv_lens,
+                page_indices,
                 md.cu_q_lens,
                 md.distribution,
-                seq_lens.to(torch.int32),
+                md.dcp_kv_lens_global,
                 md.dcp_cp_rank,
-                None,  # attention_sink: folded in _dcp_merge_partials
+                None,  # attention_sink: folded in by _dcp_merge_partials
                 sm_scale,
                 sliding_window,
                 soft_cap,
                 k_scale,
                 v_scale,
                 False,  # cache_only
-                False,  # skip_kv_write (owner rank writes its token!)
+                False,  # skip_kv_write: the owner writes its token
                 cp,  # cp_group_size
                 3,  # attention_scope: STRIPED
             )
-            merged_out = _dcp_merge_partials(
-                [(out_p, lse_p)],
-                group,
-                cp,
-                q.dtype,
-                layer=None,
-                sinks=sinks,
+            merged = _dcp_merge_partials(
+                [(out_p, lse_p)], group, cp, q.dtype, sinks=sinks
             )
-            heads_all = q_all.shape[1]
-            heads_local = heads_all // cp
-            head_start = self._dcp_rank * heads_local
-            head_end = head_start + heads_local
-            return merged_out[:, head_start:head_end, :].contiguous()
+            heads = q.shape[1]
+            start = self._dcp_rank * heads
+            return merged[:, start : start + heads, :].contiguous()
 
         write_owned_kv(
             self._kv_write_op, kv_cache, fused_kv_rows(k, v, kv_cache), spans

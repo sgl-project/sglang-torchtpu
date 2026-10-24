@@ -2,14 +2,16 @@
 """Decode-context-parallel (DCP) pieces of the TPU Pallas batched RPA backend.
 
 Under DCP the KV of a sequence is split across the ranks of one DCP group by
-absolute position: rank ``r`` stores position ``p`` iff ``p % dcp == r``. Each
-rank therefore attends only its own shard, and the partial results are merged
-across the group by log-sum-exp.
+page: rank ``r`` stores page ``p = pos // page_size`` iff ``p % dcp == r``
+(tokens inside a page stay dense and contiguous). Each rank therefore attends
+only its own page stripe, and the partial results are merged across the group
+by log-sum-exp.
 
 This module holds the parts of that scheme that are independent of the backend
-object: the torch custom op for the CP-aware kernel, the fused-pool row layout
-and the owner-masked write that replaces the kernel's own KV write, and the
-pure-torch merges (cross-rank sink fold, two-pass extend combine).
+object: the torch custom op for the CP-aware kernel (including the fused
+``STRIPED`` decode scope), the fused-pool row layout and the owner-masked write
+used by extend, the cross-rank partial merge (one lane-dense all-gather) and
+the pure-torch merges of the extend path.
 
 ``attention_pallas_rpa_base`` drives them; the non-DCP path never calls in here.
 """
@@ -329,14 +331,21 @@ def build_owner_write_spans(
 ) -> DcpWriteSpans:
     """Compaction index and DMA spans that write this rank's rows of a step.
 
-    A token at position ``p`` with widened logical slot ``loc`` belongs to
-    rank ``p % dcp_size`` and lives in physical slot ``loc // dcp_size``.
+    The cache is page-striped: a token at position ``p`` belongs to rank
+    ``(p // page_size) % dcp_size``. The allocator hands out widened logical
+    slots (one logical page = ``page_size * dcp_size`` tokens, backed by one
+    physical page per rank), so the owned token lives in physical slot
+    ``(loc // (page_size * dcp_size)) * page_size + p % page_size`` -- the
+    same slot the fused decode kernel writes (local stripe index
+    ``local_cache_len``, whose page offset is ``p % page_size``).
     Consecutive owned tokens of one request share a page in consecutive
     physical slots, so a span ends only where the physical slot jumps.
     """
     loc = out_cache_loc.to(torch.int64)
-    owned = torch.nonzero(positions.to(torch.int64) % dcp_size == rank).flatten()
-    phys = loc[owned] // dcp_size
+    pos = positions.to(torch.int64)
+    stride = page_size * dcp_size
+    owned = torch.nonzero((pos // page_size) % dcp_size == rank).flatten()
+    phys = (loc[owned] // stride) * page_size + pos[owned] % page_size
     index = torch.zeros(num_tokens, dtype=torch.int64)
     index[: owned.numel()] = owned
     max_spans = max_write_spans(num_tokens, num_seqs, page_size)
@@ -504,16 +513,20 @@ def _dcp_merge_partials(
     num_tok, num_heads = lse0.shape[0], lse0.shape[1]
     head_dim = out0.shape[-1]
     n_lse = num_tok * num_heads
+    n_out = n_lse * head_dim
     lanes = 128
-    assert head_dim == lanes, f"head_dim must be {lanes}, got {head_dim}"
-    lse_rows = -(-n_lse // (lanes * 8)) * 8
-    out_rows = n_lse  # [T*H, D] rows
+    # Both payloads are flattened and padded to whole (8, 128) tiles so the
+    # gather moves lane-dense f32 rows whatever the head dim.
+    tile = 8 * lanes
+    out_rows = -(-n_out // tile) * 8
+    lse_rows = -(-n_lse // tile) * 8
     rows_per_partial = out_rows + lse_rows
 
     def _pack(out, lse):
         lse = torch.nan_to_num(lse.to(torch.float32), nan=-float("inf")).reshape(1, -1)
         lse = torch.nn.functional.pad(lse, (0, lse_rows * lanes - n_lse)).reshape(lse_rows, lanes)
-        out = torch.nan_to_num(out.to(torch.float32), nan=0.0).reshape(out_rows, lanes)
+        out = torch.nan_to_num(out.to(torch.float32), nan=0.0).reshape(1, -1)
+        out = torch.nn.functional.pad(out, (0, out_rows * lanes - n_out)).reshape(out_rows, lanes)
         return torch.cat([out, lse], dim=0)
 
     packed = torch.cat([_pack(o, l) for o, l in gathered_partials], dim=0).contiguous()
@@ -521,7 +534,8 @@ def _dcp_merge_partials(
     gathered = packed.new_empty((cp_size * packed.shape[0], lanes))
     cp_group.all_gather_into_tensor(gathered, packed)
     g = gathered.reshape(cp_size * n_part, rows_per_partial, lanes)
-    outs = [g[:, :out_rows, :].reshape(-1, num_tok, num_heads, head_dim)]
+    out_g = g[:, :out_rows, :].reshape(cp_size * n_part, -1)[:, :n_out]
+    outs = [out_g.reshape(-1, num_tok, num_heads, head_dim)]
     lse_g = g[:, out_rows:, :].reshape(cp_size * n_part, -1)[:, :n_lse]
     lses = [lse_g.reshape(-1, num_tok, num_heads)]
     for out, lse in local_partials:

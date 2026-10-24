@@ -720,21 +720,24 @@ def compute_metadata(
         start_k_idx = 0
         if (sliding_window := cfgs.model.sliding_window) is not None:
             if q_global_start is not None:
-                # First local key j inside the window of the block's first query;
-                # local key j holds global position j * cp_group_size + cp_rank.
+                # First local key inside the window of the block's first query.
+                # The cache is page-striped: local page l of this rank is
+                # global page l * cp_group_size + cp_rank, so the first local
+                # page at or after the window's first global page p0 is
+                # ceil((p0 - cp_rank) / cp_group_size); keys of that page before
+                # the window are masked by the kernel.
                 cp_group_size = cfgs.serve.cp_group_size
-                first_kv_idx = (
-                    jnp.maximum(
-                        q_global_start
-                        + q_idx * cfgs.bq_sz
-                        - sliding_window
-                        - cp_rank_ref[0]
-                        + cp_group_size,
-                        0,
-                    )
+                first_global = jnp.maximum(
+                    q_global_start + q_idx * cfgs.bq_sz - sliding_window + 1, 0
+                )
+                first_page = first_global >> cfgs.serve.page_size_log2
+                first_local_page = (
+                    jnp.maximum(first_page - cp_rank_ref[0] + cp_group_size - 1, 0)
                     // cp_group_size
                 )
-                start_k_idx = first_kv_idx // cfgs.bkv_sz
+                start_k_idx = (
+                    first_local_page << cfgs.serve.page_size_log2
+                ) // cfgs.bkv_sz
             elif cfgs.serve.cache_only:
                 sw_start_idx = k_len + q_idx * cfgs.bq_sz - sliding_window + 1
                 start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
