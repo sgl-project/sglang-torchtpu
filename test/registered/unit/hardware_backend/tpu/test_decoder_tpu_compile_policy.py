@@ -3614,6 +3614,44 @@ class TestDpSyncNumTokens(_SpecPolicyTestCase):
         self.assertEqual(counts, [8, 0])
         self.assertEqual(logprob_counts, [8, 0])
 
+    def test_dp_extend_counts_pad_to_the_shim_token_bucket(self):
+        """Ranks pad an extend to the shim's bucket, so no raw length reaches a program."""
+        policy = _make_policy()
+        cap = policy._extend_compile_cap()
+        raw = policy.t_bucketer.buckets[0] + 1
+        extend = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, is_extend_in_batch=True
+        )
+        # Idle ranks are relabeled DECODE before the MLP sync.
+        idle_prefill = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, is_extend_in_batch=True
+        )
+        decode = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, is_extend_in_batch=False
+        )
+        with _dp_attention(True):
+            for batch in (extend, idle_prefill):
+                counts, _ = policy.get_dp_padded_token_counts(
+                    batch,
+                    policy.model_runner,
+                    [raw, 0],
+                    [1, 0],
+                    attn_tp_size=1,
+                    cp_align_size=1,
+                )
+                self.assertEqual(
+                    counts, [policy.t_bucketer.next_bucket(max(raw, cap)), 0]
+                )
+            counts, _ = policy.get_dp_padded_token_counts(
+                decode,
+                policy.model_runner,
+                [3, 0],
+                [3, 0],
+                attn_tp_size=1,
+                cp_align_size=1,
+            )
+            self.assertEqual(counts, [3, 0])
+
     def test_fixed_width_spec_skips_generic_alignment_and_uses_shared_bucket(self):
         policy = _make_spec_policy(bs_buckets=(1, 4, 8, 16))
         forward_batch = SimpleNamespace(
