@@ -540,6 +540,7 @@ def calculate_block_sizes(
         "skip_kv_write",
         "return_lse",
         "cp_group_size",
+        "attention_scope",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
