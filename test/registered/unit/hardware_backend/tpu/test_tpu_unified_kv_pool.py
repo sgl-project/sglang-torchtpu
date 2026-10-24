@@ -772,6 +772,50 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             [("mid_chain", "swa"), ("leaf_child", "full"), ("mid_chain", "full")],
         )
 
+    def test_cost_benefit_weighted_eviction_protects_long_prompts(self):
+        from sglang_tpu.unified_kv_pool import EvictionCandidate
+
+        _, alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=40, page_size=128
+        )
+        alloc.eviction_policy = "cost_benefit_weighted"
+        # Compare:
+        # - long_prompt_32k: older (t=1.0), 4096 tokens at prefix depth 32768 (expensive quadratic recompute!)
+        # - short_prompt_1: newer (t=50.0), 256 tokens at prefix depth 256 (cheap recompute, frees 2*(1+4)=10 phys pages)
+        # - stale_swa_mid: t=100.0, unbranched stale SWA (128 tokens, 0 recompute cost, frees 4 phys pages)
+        cands = [
+            EvictionCandidate(
+                "long_prompt_32k",
+                "full",
+                4096,
+                last_access_time=1.0,
+                has_coupled_swa=True,
+                prefix_tokens=32768,
+            ),
+            EvictionCandidate(
+                "short_prompt_1",
+                "full",
+                256,
+                last_access_time=50.0,
+                has_coupled_swa=True,
+                prefix_tokens=256,
+            ),
+            EvictionCandidate(
+                "stale_swa_mid",
+                "swa",
+                128,
+                last_access_time=100.0,
+                num_children=1,
+                is_stale_swa=True,
+            ),
+        ]
+        # Need 14 physical pages: cost_benefit_weighted picks stale_swa_mid (score=0, 4 phys) + short_prompt_1 (10 phys)
+        # even though long_prompt_32k has the oldest timestamp (t=1.0)!
+        res = alloc.plan_cost_benefit_eviction(cands, short_physical_pages=14)
+        self.assertIsNotNone(res)
+        self.assertEqual((res[0], res[1]), (256, 128))
+        self.assertEqual([c.node_id for c in res[2]], ["stale_swa_mid", "short_prompt_1"])
+
 
 if __name__ == "__main__":
     unittest.main()
