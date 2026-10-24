@@ -343,7 +343,7 @@ class MuseMegakernel(torch.nn.Module):
         )
         for p in pools:
             if (
-                type(p) is not TpuFusedMHATokenToKVPool
+                not isinstance(p, TpuFusedMHATokenToKVPool)
                 or p.store_dtype != torch.bfloat16
             ):
                 raise NotImplementedError(
@@ -355,6 +355,33 @@ class MuseMegakernel(torch.nn.Module):
                     f"KV pool packs {p.kv_pack_heads} heads per row, but the Muse "
                     f"megakernel was built with kv_packed={self.kv_packed}"
                 )
+
+    @staticmethod
+    def extract_megakernel_kv_buffers_and_page_tables(
+        pool, md, n_layers: int
+    ) -> tuple[list[torch.Tensor], tuple[int, ...], tuple[torch.Tensor, ...]]:
+        """Return deduplicated physical KV buffers for XLA donation, per-layer slab mapping,
+        and per-SWA-group page tables for ``TpuUnifiedSWAKVPool`` or standard ``SWAKVPool``."""
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+        pf = md.page_indices
+        psw0 = md.swa_page_indices if md.swa_page_indices is not None else pf
+        if isinstance(pool, TpuUnifiedSWAKVPool):
+            unique_bufs = list(pool.get_state())
+            ptr_to_slab = {b.data_ptr(): idx for idx, b in enumerate(unique_bufs)}
+            layer_to_slab = tuple(
+                ptr_to_slab[pool.get_fused_kv_buffer(i).data_ptr()]
+                for i in range(n_layers)
+            )
+            swa_tables = [psw0]
+            if md.swa_group_page_indices is not None:
+                swa_tables.extend(
+                    md.swa_group_page_indices[g]
+                    for g in range(md.swa_group_page_indices.shape[0])
+                )
+            return unique_bufs, layer_to_slab, tuple(swa_tables)
+        kv = [pool.get_fused_kv_buffer(i) for i in range(n_layers)]
+        return kv, tuple(range(n_layers)), (psw0,)
 
     def callable_for(self, cfg: K.MKConfig):
         if cfg not in self._ops:

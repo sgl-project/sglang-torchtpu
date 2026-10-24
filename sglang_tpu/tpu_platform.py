@@ -481,12 +481,7 @@ def _resolve_unified_kv_pool(server_args) -> None:
             cfg.attention_backend is not None
             and cfg.attention_backend
             not in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"),
-            f"requires --attention-backend pallas_tpu_rpa_v3 or pallas_tpu_rpa_batched, got {cfg.attention_backend!r}.",
-        ),
-        (
-            cfg.attention_backend == "pallas_tpu_rpa_batched"
-            and _uses_seq_along_lane_kv(),
-            "is not supported with SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1.",
+            f"requires --attention-backend pallas_tpu_rpa_batched, got {cfg.attention_backend!r}.",
         ),
         (
             cfg.pp_size > 1,
@@ -521,11 +516,16 @@ def _resolve_unified_kv_pool(server_args) -> None:
     for bad, msg in checks:
         if bad:
             raise ValueError(f"--enable-unified-memory on TPU {msg}")
+    resolutions = dict(
+        enable_unified_memory=False,
+        tpu_unified_kv_pool=True,
+    )
+    if cfg.attention_backend in (None, "pallas_tpu_rpa_v3"):
+        resolutions["attention_backend"] = "pallas_tpu_rpa_batched"
     declare_resolution(
         server_args,
         "tpu.apply_server_args_defaults",
-        enable_unified_memory=False,
-        tpu_unified_kv_pool=True,
+        **resolutions,
     )
 
 
