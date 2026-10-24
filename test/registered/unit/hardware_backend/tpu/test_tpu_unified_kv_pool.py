@@ -532,7 +532,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             dict(pp_size=2),
             dict(dcp_size=2),
             dict(attn_cp_size=2),
-            dict(disaggregation_mode="prefill"),
             dict(enable_hierarchical_cache=True, hicache_io_backend="kernel"),
             dict(page_size=1),
         ):
@@ -1043,6 +1042,38 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         # Non-hybrid draft worker falls back cleanly to False
         draft_kvc = types.SimpleNamespace(is_draft_worker=True, is_hybrid_swa=False)
         self.assertFalse(should_use_unified_kv_pool_for_worker(draft_kvc))
+
+    def test_pd_disaggregation_transfer_descriptor_and_d_node_tail_allocation(self):
+        _, p_alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=40, page_size=128
+        )
+        _, d_alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=40, page_size=128
+        )
+        # P-node prefills 512 tokens (4 pages) with sliding_window_size = 256 (2 tail pages) using ping-pong SWA
+        p_idx = p_alloc.alloc_extend_pingpong_swa(
+            req_id="pd-req-1",
+            prefix_lens=torch.tensor([0], dtype=torch.int64),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([512], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([512], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64),
+            extend_num_tokens=512,
+            sliding_window_size=256,
+        )
+        self.assertIsNotNone(p_idx)
+        desc = p_alloc.build_pd_transfer_descriptor(p_idx, sliding_window_size=256)
+        self.assertEqual(desc.full_page_ids.shape, (4,))
+        self.assertEqual(desc.swa_tail_start_page, 2)
+        # SWA transfer includes all M_swa=4 groups for ONLY the 2 live tail pages (not all 4 pages)!
+        self.assertEqual(desc.swa_group_page_ids.shape, (4, 2))
+        self.assertTrue(bool((desc.swa_group_page_ids > 0).all()))
+
+        # D-node allocates destination: 4 Full pages + 2 * 4 = 8 SWA physical pages = 12 physical pages total!
+        d_idx = d_alloc.allocate_for_pd_receive(seq_len=512, sliding_window_size=256)
+        self.assertIsNotNone(d_idx)
+        self.assertEqual(d_alloc.full_attn_allocator.allocated_pages, 4)
+        self.assertEqual(d_alloc.swa_attn_allocator.allocated_pages, 8)
 
 
 if __name__ == "__main__":
