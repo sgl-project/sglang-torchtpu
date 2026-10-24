@@ -939,6 +939,62 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             self.assertEqual(s0.shape, (3, 32, 128))
             self.assertTrue(bool((s0 == EXPONENT_PAD_BYTE).all()))
 
+    def test_kernel_batched_rpa_upgrade_and_muse_megakernel_wiring(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.server_args import ServerArgs
+        from sglang_tpu.attention_pallas_rpa_base import PallasForwardMetadata
+        from sglang_tpu.muse_megakernel.ops import MuseMegakernel
+        from sglang_tpu.tpu_platform import _resolve_unified_kv_pool
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+        # 1. Obsolete pallas_tpu_rpa_v3 is automatically upgraded to pallas_tpu_rpa_batched
+        args = ServerArgs(
+            model_path="dummy",
+            enable_unified_memory=True,
+            attention_backend="pallas_tpu_rpa_v3",
+            page_size=128,
+        )
+        _resolve_unified_kv_pool(args)
+        view = resolving_view(args)
+        self.assertEqual(view.attention_backend, "pallas_tpu_rpa_batched")
+
+        # 2. MuseMegakernel accepts TpuUnifiedSWAKVPool (_SharedBufferView) and deduplicates donated slabs
+        pool = TpuUnifiedSWAKVPool(
+            size=256,
+            page_size=128,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=512,
+            swa_head_num=2,
+            swa_head_dim=256,
+            swa_attention_layer_ids=[0, 1, 2, 4, 5, 6],
+            full_attention_layer_ids=[3, 7],
+            device="cpu",
+        )
+        mk = object.__new__(MuseMegakernel)
+        mk.kv_packed = False
+        mk.check_kv_pools(pool)
+        md = PallasForwardMetadata(
+            kv_lens=torch.tensor([8], dtype=torch.int32),
+            page_indices=torch.tensor([1, 2], dtype=torch.int32),
+            cu_q_lens=torch.tensor([0, 8], dtype=torch.int32),
+            cu_kv_lens=torch.tensor([0, 8], dtype=torch.int32),
+            distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+            active_num_tokens=torch.tensor([8], dtype=torch.int32),
+            swa_page_indices=torch.tensor([3, 4], dtype=torch.int32),
+            swa_group_page_indices=torch.tensor(
+                [[13, 14], [23, 24]], dtype=torch.int32
+            ),
+        )
+        unique_bufs, layer_to_slab, swa_tables = (
+            MuseMegakernel.extract_megakernel_kv_buffers_and_page_tables(
+                pool, md, n_layers=8
+            )
+        )
+        self.assertEqual(len(unique_bufs), 2)
+        self.assertEqual(len(layer_to_slab), 8)
+        self.assertEqual(len(swa_tables), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
