@@ -182,11 +182,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "does not support hybrid linear-attention or Mamba models.",
         ),
         (
-            getattr(kvc, "is_draft_worker", False)
-            or (spec_algo is not None and not spec_algo.is_none()),
-            "does not support speculative decoding.",
-        ),
-        (
             _ctx_attr(get_parallel, "pp_size", 1) > 1 or getattr(kvc, "pp_size", 1) > 1,
             "does not support pipeline parallelism.",
         ),
@@ -272,6 +267,16 @@ def unified_kv_pool_enabled(kvc) -> bool:
         return False
     _raise_if_unsupported(kvc)
     return True
+
+
+def should_use_unified_kv_pool_for_worker(kvc) -> bool:
+    """Return False for non-hybrid speculative draft workers so they use standard MHA pool
+    while the hybrid target model uses ``TpuUnifiedSWAKVPool``."""
+    if getattr(kvc, "is_draft_worker", False) and not getattr(
+        kvc, "is_hybrid_swa", False
+    ):
+        return False
+    return unified_kv_pool_enabled(kvc)
 
 
 class _SharedBufferView(TpuFusedMHATokenToKVPool):
@@ -1594,6 +1599,54 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         else:
             self._pingpong_swa_windows[req_id] = (prev_win, curr_win)
         return freed_tokens
+
+    def retract_request_pages(
+        self,
+        req_indices: torch.Tensor,
+        matched_prefix_len: int = 0,
+        *,
+        req_id: object = None,
+    ) -> int:
+        """Release uncached suffix pages ``req_indices[matched_prefix_len:]`` on request retraction."""
+        if req_id is not None:
+            self.advance_pingpong_swa_window(req_id, release_all=True)
+        aligned_prefix = (max(0, int(matched_prefix_len)) // self.page_size) * self.page_size
+        suffix = req_indices[aligned_prefix:]
+        if suffix.numel() == 0:
+            return 0
+        before = self._free_page_count()
+        self.free(suffix)
+        return self._free_page_count() - before
+
+    def rollback_rejected_draft_tokens(
+        self,
+        req_indices: torch.Tensor,
+        *,
+        verified_seq_len: int,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        sliding_window_size: Optional[int] = None,
+    ) -> int:
+        """Roll back rejected speculative draft pages across Full + all ``M_swa`` SWA groups,
+        and commit out-of-window SWA eviction only up to the accepted sequence length."""
+        if num_accepted_tokens < 0 or num_accepted_tokens > num_draft_tokens:
+            raise ValueError(
+                f"Invalid num_accepted_tokens={num_accepted_tokens} for num_draft_tokens={num_draft_tokens}"
+            )
+        ps = self.page_size
+        final_seq_len = verified_seq_len + num_accepted_tokens
+        total_extended_len = verified_seq_len + num_draft_tokens
+        first_free_token = _cdiv(max(0, final_seq_len), ps) * ps
+        before = self._free_page_count()
+        if first_free_token < total_extended_len:
+            rejected_pages_slice = req_indices[first_free_token:total_extended_len]
+            if rejected_pages_slice.numel() > 0:
+                self.free(rejected_pages_slice)
+        if sliding_window_size is not None and sliding_window_size > 0:
+            evict_end = ((final_seq_len - sliding_window_size) // ps) * ps
+            if evict_end > 0:
+                self.free_swa(req_indices[:evict_end])
+        return self._free_page_count() - before
 
     def debug_print(self) -> str:
         return (
