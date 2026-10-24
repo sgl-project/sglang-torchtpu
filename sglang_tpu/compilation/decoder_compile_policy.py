@@ -71,6 +71,7 @@ from sglang_tpu.compilation.frame_stack import (
     call_with_reserved_frame_stack,
 )
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.pre_compile_hooks import run_pre_compile_hooks
 from sglang_tpu.cp_forward import (
     install_cp_logits_forward,
     prepare_tpu_cp_forward_batch,
@@ -634,6 +635,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.method_name,
             )
             return False
+
+        run_pre_compile_hooks(self.model_runner.model)
 
         server_args = self.model_runner.server_args
         is_draft_worker = self.model_runner.is_draft_worker

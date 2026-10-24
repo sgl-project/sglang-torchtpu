@@ -110,6 +110,11 @@ from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
     ReasoningParser,
 )
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    ResponseTemplateToolDetector,
+    configure_response_template_request,
+)
 from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
@@ -1330,7 +1335,38 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
+        if processed_messages.uses_response_template:
+            self._set_response_parser_context(request, adapted_request)
         return adapted_request, request
+
+    def _set_response_parser_context(
+        self,
+        request: ChatCompletionRequest,
+        adapted_request: GenerateReqInput,
+    ) -> None:
+        """Give response-template parsers the rendered assistant prefill."""
+        prefix = adapted_request.text
+        if not isinstance(prefix, str) and adapted_request.input_ids:
+            prefix = self.tokenizer_manager.tokenizer.decode(
+                adapted_request.input_ids,
+                skip_special_tokens=False,
+                spaces_between_special_tokens=False,
+            )
+        request._response_parser_prefix = prefix or ""
+
+    def _requires_response_template_detokenization(
+        self, request: ChatCompletionRequest
+    ) -> bool:
+        if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
+            return True
+
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        return (
+            request.tool_choice != "none"
+            and bool(self._effective_tools(request))
+            and tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+        )
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
@@ -1412,6 +1448,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_call_constraint is not None
                     and tool_call_constraint[0] == "structural_tag"
                     and self._reasoning_detector is not None
+                    # Template tags exclude their own field closers,
+                    # which can be the think literals (Beam's <|end|>).
+                    and not isinstance(parser.detector, ResponseTemplateToolDetector)
                 ):
                     # Same ownership rule: the reasoning parser handles think
                     # tokens, so the grammar must not forbid them in free text.
@@ -1471,6 +1510,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if tool_call_stop not in result.stop:
                 result.stop.append(tool_call_stop)
 
+        # Configured after rendering so the detokenization options never reach
+        # the chat template.
+        if self._requires_response_template_detokenization(request):
+            configure_response_template_request(request)
+            result.uses_response_template = True
         result.tool_call_constraint = tool_call_constraint
         result.require_reasoning = thinking_mode
         result.skip_special_tokens = request.skip_special_tokens
@@ -2420,6 +2464,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    request._response_parser_prefix,
+                    request._response_parser_tool_grammar,
                 )
 
             # Extract prompt_token_ids if requested
@@ -2599,6 +2645,8 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: dict[str, Any],
         tool_choice: str | ToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
+        response_parser_prefix: str = "",
+        constrained: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -2613,6 +2661,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_choice=tool_choice,
+                prefix=response_parser_prefix,
+                constrained=constrained,
             )
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
@@ -3067,6 +3117,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_choice=request.tool_choice,
+                        prefix=request._response_parser_prefix,
+                        constrained=request._response_parser_tool_grammar,
                     )
                     use_native_parser = probe.owns_tool_format()
                 if use_native_parser:
@@ -3078,6 +3130,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=effective_tools,
                     tool_call_parser=self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    prefix=request._response_parser_prefix,
+                    constrained=request._response_parser_tool_grammar,
                 )
 
         parser = parser_dict[index]

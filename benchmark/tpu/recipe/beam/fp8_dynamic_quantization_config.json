@@ -1,0 +1,28 @@
+{
+  "quant_method": "compressed-tensors",
+  "format": "float-quantized",
+  "quantization_status": "compressed",
+  "config_groups": {
+    "FP8_DYNAMIC": {
+      "format": "float-quantized",
+      "targets": ["Linear"],
+      "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": true,
+        "strategy": "channel",
+        "dynamic": false,
+        "observer": "memoryless_minmax"
+      },
+      "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": true,
+        "strategy": "token",
+        "dynamic": true
+      }
+    }
+  },
+  "ignore": ["lm_head", "model.embed_tokens", "re:.*mlp\\.gate$"],
+  "kv_cache_scheme": null
+}

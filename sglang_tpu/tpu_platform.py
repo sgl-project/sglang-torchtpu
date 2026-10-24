@@ -1034,17 +1034,19 @@ class TpuSRTPlatform(SRTPlatform):
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
         if quantization == "modelopt_fp4":
-            from sglang.srt.layers.quantization.modelopt_quant import (
-                TpuModelOptCompatibleFp4Config,
-            )
+            from sglang_tpu.modelopt_fp4 import TpuModelOptFp4Config
 
-            return TpuModelOptCompatibleFp4Config
+            return TpuModelOptFp4Config
         if quantization == "modelopt_mixed":
             from sglang.srt.layers.quantization.modelopt_quant import (
                 TpuModelOptMixedPrecisionConfig,
             )
 
             return TpuModelOptMixedPrecisionConfig
+        if quantization == "compressed-tensors":
+            from sglang_tpu.compressed_tensors_fp8 import TpuCompressedTensorsConfig
+
+            return TpuCompressedTensorsConfig
         return None
 
     def get_mha_kv_pool_cls(self) -> type:
@@ -1346,6 +1348,9 @@ class TpuSRTPlatform(SRTPlatform):
             from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
             register_fp8_linear_small_m_op()
+        from sglang_tpu.beam_kernels import register_beam_kernels
+
+        register_beam_kernels()
         # Set before registering: importing the model registry imports model_runner,
         # which calls init_backend again on the OOT path.
         self._backend_initialized = True

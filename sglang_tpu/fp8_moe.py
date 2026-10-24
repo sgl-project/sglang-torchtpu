@@ -152,6 +152,9 @@ def _to_tpu_fp8_moe_scale_layout(
     scale = scale.to(
         torch.float32 if envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get() else torch.bfloat16
     )
+    if scale.dim() == 3 and scale.shape[2] == 1:
+        # Compressed-tensors channelwise scales arrive as [E, N, 1].
+        scale = scale.squeeze(2)
     if scale.dim() == 1:
         scale = scale[:, None].expand(-1, out_size)
     elif scale.dim() == 2:
