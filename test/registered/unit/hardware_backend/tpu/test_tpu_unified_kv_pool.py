@@ -799,6 +799,37 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertEqual((res[0], res[1]), (256, 128))
         self.assertEqual([c.node_id for c in res[2]], ["stale_swa_mid", "short_prompt_1"])
 
+    def test_observability_metrics_physical_page_breakdown_and_hit_rates(self):
+        _, alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=20, page_size=128
+        )
+        # Allocate 2 pages (256 tokens): 2 Full physical pages + 2 * 4 = 8 SWA physical pages = 10 used, 10 free
+        alloc.alloc_extend(
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([256], dtype=torch.int64),
+            torch.tensor([256], dtype=torch.int64),
+            torch.tensor([-1], dtype=torch.int64),
+            256,
+        )
+        alloc.record_prefix_cache_lookup(384, 512, policy="full_first")
+        alloc.record_prefix_cache_lookup(480, 512, policy="cost_benefit_weighted")
+        metrics = alloc.get_observability_metrics(
+            full_evictable_tokens=128, swa_evictable_tokens=128
+        )
+        self.assertEqual(metrics.total_usable_physical_pages, 20)
+        self.assertEqual(metrics.full_locked_physical_pages, 1)
+        self.assertEqual(metrics.full_cached_evictable_physical_pages, 1)
+        self.assertEqual(metrics.swa_locked_physical_pages, 4)
+        self.assertEqual(metrics.swa_cached_evictable_physical_pages, 4)
+        self.assertEqual(metrics.fenced_physical_pages, 0)
+        self.assertEqual(metrics.free_physical_pages, 10)
+        self.assertAlmostEqual(metrics.kv_page_utilization_ratio, 0.5)
+        self.assertAlmostEqual(metrics.prefix_cache_hit_rate, 0.75)
+        self.assertAlmostEqual(
+            metrics.prefix_cache_hit_rates_by_policy["cost_benefit_weighted"], 0.9375
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

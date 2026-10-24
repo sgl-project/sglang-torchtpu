@@ -616,6 +616,23 @@ class EvictionCandidate:
     parent_id: Any = None
 
 
+@dataclass
+class UnifiedKVPoolMetrics:
+    """Observability snapshot for the Unified KV Pool physical page breakdown and hit rates."""
+
+    total_usable_physical_pages: int
+    full_locked_physical_pages: int
+    full_cached_evictable_physical_pages: int
+    swa_locked_physical_pages: int
+    swa_cached_evictable_physical_pages: int
+    fenced_physical_pages: int
+    free_physical_pages: int
+    kv_page_utilization_ratio: float
+    eviction_policy: str
+    prefix_cache_hit_rate: float
+    prefix_cache_hit_rates_by_policy: Dict[str, float]
+
+
 class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Logical-to-Physical Unified KV allocator for Full + SWA attention on TPU."""
 
@@ -689,6 +706,9 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self._pingpong_swa_windows: Dict[
             object, Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]
         ] = {}
+        self._prefix_hit_stats: Dict[str, List[int]] = {
+            p: [0, 0] for p in self.SUPPORTED_EVICTION_POLICIES
+        }
         self.clear()
 
     def clear(self) -> None:
@@ -1135,6 +1155,67 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             if bool((mapped[win_start:end] > 0).all()):
                 return end
         return 0
+
+    def record_prefix_cache_lookup(
+        self,
+        matched_tokens: int,
+        total_tokens: int,
+        *,
+        policy: Optional[str] = None,
+    ) -> None:
+        """Record prefix cache hit/lookup tokens under the active or specified eviction policy."""
+        if total_tokens <= 0:
+            return
+        pol = policy or self.eviction_policy
+        bucket = self._prefix_hit_stats.setdefault(pol, [0, 0])
+        bucket[0] += max(0, min(int(matched_tokens), int(total_tokens)))
+        bucket[1] += int(total_tokens)
+
+    def get_observability_metrics(
+        self,
+        tree_cache=None,
+        *,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+    ) -> UnifiedKVPoolMetrics:
+        """Return 6-way physical page breakdown, utilization ratio, and per-strategy hit rates."""
+        ps = self.page_size
+        ms = self._swa_groups
+        total_phys = self.size_full // ps
+        fenced_phys = int(self._page_store.held_pages.num_pages)
+        free_phys = int(self._page_store.unheld_free_pages())
+        if tree_cache is not None:
+            if hasattr(tree_cache, "full_evictable_size"):
+                full_evictable_tokens = int(tree_cache.full_evictable_size())
+            if hasattr(tree_cache, "swa_evictable_size"):
+                swa_evictable_tokens = int(tree_cache.swa_evictable_size())
+        full_alloc_phys = int(self.full_attn_allocator.allocated_pages)
+        swa_alloc_phys = int(self.swa_attn_allocator.allocated_pages)
+        full_cached_phys = min(full_alloc_phys, max(0, int(full_evictable_tokens)) // ps)
+        full_locked_phys = max(0, full_alloc_phys - full_cached_phys)
+        swa_cached_phys = min(
+            swa_alloc_phys, (max(0, int(swa_evictable_tokens)) // ps) * ms
+        )
+        swa_locked_phys = max(0, swa_alloc_phys - swa_cached_phys)
+        used_phys = max(0, total_phys - free_phys)
+        util = float(used_phys) / float(total_phys) if total_phys > 0 else 0.0
+        hit_rates: Dict[str, float] = {}
+        for pol, (hit_tok, tot_tok) in self._prefix_hit_stats.items():
+            hit_rates[pol] = float(hit_tok) / float(tot_tok) if tot_tok > 0 else 0.0
+        active_hit_rate = hit_rates.get(self.eviction_policy, 0.0)
+        return UnifiedKVPoolMetrics(
+            total_usable_physical_pages=total_phys,
+            full_locked_physical_pages=full_locked_phys,
+            full_cached_evictable_physical_pages=full_cached_phys,
+            swa_locked_physical_pages=swa_locked_phys,
+            swa_cached_evictable_physical_pages=swa_cached_phys,
+            fenced_physical_pages=fenced_phys,
+            free_physical_pages=free_phys,
+            kv_page_utilization_ratio=util,
+            eviction_policy=self.eviction_policy,
+            prefix_cache_hit_rate=active_hit_rate,
+            prefix_cache_hit_rates_by_policy=hit_rates,
+        )
 
     def can_reserve(
         self,
