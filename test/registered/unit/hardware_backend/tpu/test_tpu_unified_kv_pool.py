@@ -494,7 +494,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ("is_draft_worker", True, ValueError),
                 ("pp_size", 2, ValueError),
                 ("dcp_enabled", True, ValueError),
-                ("token_to_kv_pool_class", TpuSeqAlongLaneKVPool, ValueError),
                 ("kv_cache_dtype_str", "mxint8", NotImplementedError),
                 ("pool_page_size", 1, ValueError),
             ):
@@ -502,6 +501,9 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 setattr(kvc, attr, val)
                 with self.assertRaises(exc):
                     TpuUnifiedSWAPoolConfigurator(kvc)
+            kvc_along = copy.copy(base)
+            kvc_along.token_to_kv_pool_class = TpuSeqAlongLaneKVPool
+            TpuUnifiedSWAPoolConfigurator(kvc_along)
 
         with patch(
             "sglang_tpu.unified_kv_pool.get_memory",
@@ -828,6 +830,84 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         self.assertAlmostEqual(metrics.prefix_cache_hit_rate, 0.75)
         self.assertAlmostEqual(
             metrics.prefix_cache_hit_rates_by_policy["cost_benefit_weighted"], 0.9375
+        )
+
+    def test_kv_geometry_models_tp_shardings_and_seq_along_lane_fp8_savings(self):
+        from sglang_tpu.unified_kv_heads import merge_swa_kv_heads, split_swa_output
+        from sglang_tpu.unified_kv_pool import (
+            TpuUnifiedSWAKVPool,
+            resolve_unified_page_shape,
+        )
+
+        # 1. Muse Spark Open across TP=1,2,4,8 (full_dim=512, swa_dim=256, swa_heads = 2 * full_heads)
+        for full_heads, swa_heads in [(8, 16), (4, 8), (2, 4), (1, 2)]:
+            shape, merged = resolve_unified_page_shape(
+                page_size=128,
+                head_num=full_heads,
+                head_dim=512,
+                v_head_dim=512,
+                swa_head_num=swa_heads,
+                swa_head_dim=256,
+                swa_v_head_dim=256,
+                store_dtype=torch.bfloat16,
+            )
+            self.assertTrue(merged)
+            q = torch.randn(4, swa_heads * 2, 256)
+            k = torch.randn(4, swa_heads, 256)
+            v = torch.randn(4, swa_heads, 256)
+            qm, km, vm = merge_swa_kv_heads(q, k, v, target_kv_heads=full_heads)
+            self.assertEqual(km.shape, (4, full_heads, 512))
+            self.assertEqual(vm.shape, (4, full_heads, 512))
+            restored = split_swa_output(qm, swa_heads, target_kv_heads=full_heads)
+            self.assertTrue(torch.allclose(restored, q))
+
+        # 2. MiMo (asymmetric v_head_dim=128 < head_dim=192) & GPT-OSS-120B / Gemma
+        mimo_shape, mimo_merged = resolve_unified_page_shape(
+            page_size=128,
+            head_num=2,
+            head_dim=192,
+            v_head_dim=128,
+            swa_head_num=2,
+            swa_head_dim=192,
+            swa_v_head_dim=128,
+            store_dtype=torch.bfloat16,
+        )
+        self.assertFalse(mimo_merged)
+        self.assertEqual(mimo_shape, (128, 2, 2, 256))
+
+        # 3. SEQ_ALONG_LANE vs SEQ_ACROSS_LANE at 1 KV head per rank in fp8:
+        # SEQ_ACROSS_LANE rounds 2*1=2 up to kv_packing=4 (50% waste), whereas SEQ_ALONG_LANE uses 2*1=2 directly!
+        with patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind",
+            return_value="TPU v6e",
+        ):
+            pool_across = TpuUnifiedSWAKVPool(
+                size=256,
+                page_size=128,
+                dtype=torch.float8_e4m3fn,
+                head_num=1,
+                head_dim=128,
+                swa_attention_layer_ids=[1, 2],
+                full_attention_layer_ids=[0],
+                device="cpu",
+                seq_along_lane=False,
+            )
+            pool_along = TpuUnifiedSWAKVPool(
+                size=256,
+                page_size=128,
+                dtype=torch.float8_e4m3fn,
+                head_num=1,
+                head_dim=128,
+                swa_attention_layer_ids=[1, 2],
+                full_attention_layer_ids=[0],
+                device="cpu",
+                seq_along_lane=True,
+            )
+        # SEQ_ALONG_LANE buffer is [num_blocks=3, head_num*2=2, hd_words=32, packing=4, page_size=128]
+        # which is exactly 50% of SEQ_ACROSS_LANE [num_blocks=3, page_size=128, kv_heads_packed=1, packing=4, head_dim=128]!
+        self.assertEqual(
+            pool_along.full_kv_pool.kv_buffer[0].numel() * 2,
+            pool_across.full_kv_pool.kv_buffer[0].numel(),
         )
 
 
