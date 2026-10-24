@@ -128,6 +128,11 @@ class TpuEnvs:
     # Expert-TP fused-RS: skip zeroing the output buffer, which the per-row writes
     # cover exactly once.
     SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO = EnvBool(False)
+    # Fused-RS NVFP4 GMMs widen fp4 weights to bf16 through fp8 (bit-identical, fewer VPU ops).
+    SGLANG_TPU_FP4_DEQUANT_VIA_FP8 = EnvBool(False)
+    # Fused-RS EP mode leaves each tile's output row writes in flight until its staging
+    # slot is reused, as expert-TP mode does, instead of waiting for them after every tile.
+    SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES = EnvBool(False)
     # Expert-TP fused-RS with a post-expert norm: ep sum, norm and top-k combine in one Pallas
     # pass instead of three XLA fusions. Equal up to f32 summation order (bf16 casts kept).
     SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE = EnvBool(False)

@@ -11,6 +11,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.environ import envs
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
 
 # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 that causes
@@ -306,6 +307,15 @@ def inner_kernel(
     # LHS quant dtype before matmul so their per-block scales are not dropped.
     _resolved_gm_id = pl.program_id(0) if _gm_id is None else _gm_id
 
+    def _to_bf16(w):
+        # e2m1 values are exact in e4m3; fp4 -> fp8 -> bf16 takes fewer VPU ops than the
+        # direct widen (bit-identical).
+        if fp4_via_fp8 and w.dtype == jnp.float4_e2m1fn:
+            w = w.astype(jnp.float8_e4m3fn)
+        return w.astype(jnp.bfloat16)
+
+    fp4_via_fp8 = tpu_envs.SGLANG_TPU_FP4_DEQUANT_VIA_FP8.get()
+
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
         tiled_rhs = tiled_rhs_ref.get_weight()
@@ -444,14 +454,14 @@ def inner_kernel(
                             local_k_end = rhs_k_end - start_k
                             rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
                             block_rhs_slice = block_rhs[local_k_start:local_k_end]
-                            scaled_rhs_slice = block_rhs_slice.astype(
-                                jnp.bfloat16
+                            scaled_rhs_slice = _to_bf16(
+                                block_rhs_slice
                             ) * rhs_scale_slice.astype(jnp.bfloat16)
                             scaled_rhs_slices.append(scaled_rhs_slice)
                             rhs_k_start = rhs_k_end
                         block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
                     else:
-                        block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
+                        block_rhs_for_quant = _to_bf16(block_rhs)
 
                     if fp8_activation_quant:
                         block_lhs_for_matmul, lhs_scale = _online_quantize(

@@ -24,6 +24,8 @@ from jax import lax
 from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import envs as tpu_envs
+
 from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
     FusedDims,
@@ -2200,7 +2202,7 @@ def gmm_v2_fused_rs(
         ep_axis_name=ep_axis_name,
         top_k=top_k,
         pack_indices=pack_indices,
-        defer_writes=expert_tp,
+        defer_writes=expert_tp or tpu_envs.SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES.get(),
         skip_out_zero=skip_out_zero and expert_tp and not fp8_direct_write,
         row_loop_unroll=row_loop_unroll,
         staging_slots=staging_slots,
