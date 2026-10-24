@@ -492,7 +492,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ("use_mla_backend", True, ValueError),
                 ("is_hybrid_gdn", True, ValueError),
                 ("pp_size", 2, ValueError),
-                ("dcp_enabled", True, ValueError),
                 ("pool_page_size", 1, ValueError),
             ):
                 kvc = copy.copy(base)
@@ -530,8 +529,6 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         for kwargs in (
             dict(attention_backend="pallas_tpu_flash"),
             dict(pp_size=2),
-            dict(dcp_size=2),
-            dict(attn_cp_size=2),
             dict(enable_hierarchical_cache=True, hicache_io_backend="kernel"),
             dict(page_size=1),
         ):
@@ -1111,6 +1108,44 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
         slots = torch.tensor([128, 129, 130, 131], dtype=torch.long)
         scatter_seq_along_lane_rows(kv_cache, cp_rows, slots)
         self.assertTrue(torch.equal(kv_cache[1, :, :, :, :4].permute(3, 0, 1, 2), cp_rows))
+
+    def test_cp_and_dcp_unified_kv_pool_multi_group_write_spans(self):
+        from sglang_tpu.unified_kv_pool import compute_cp_local_swa_window_size
+
+        self.assertEqual(compute_cp_local_swa_window_size(1024, 4), 256)
+        _, alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=20, page_size=128
+        )
+        # Allocate 128 tokens (1 page: 1 Full physical page + M_swa=4 SWA physical pages)
+        idx = alloc.alloc_extend(
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([128], dtype=torch.int64),
+            torch.tensor([128], dtype=torch.int64),
+            torch.tensor([-1], dtype=torch.int64),
+            128,
+        )
+        self.assertIsNotNone(idx)
+        swa_group_locs = alloc.translate_loc_to_all_swa_groups(idx[:8])
+        self.assertEqual(len(swa_group_locs), 4)
+        # Each SWA group maps to a distinct physical page in the shared slab!
+        group_pages = [int(loc[0].item()) // 128 for loc in swa_group_locs]
+        self.assertEqual(len(set(group_pages)), 4)
+
+        positions = torch.arange(8, dtype=torch.int64)
+        full_spans, swa_spans = alloc.build_dcp_swa_group_write_spans(
+            positions,
+            idx[:8],
+            dcp_size=2,
+            rank=1,
+            num_tokens=8,
+            num_seqs=1,
+        )
+        self.assertEqual(len(swa_spans), 4)
+        # Rank 1 owns odd positions [1, 3, 5, 7] (4 tokens total)
+        self.assertEqual(int(full_spans.lens.sum().item()), 4)
+        for sp in swa_spans:
+            self.assertEqual(int(sp.lens.sum().item()), 4)
 
 
 if __name__ == "__main__":
