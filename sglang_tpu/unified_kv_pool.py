@@ -10,9 +10,10 @@ fragmentation. Physical page 0 is reserved as the dummy-write sink for padded to
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -600,10 +601,29 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
         self.allocated_pages = 0
 
 
+@dataclass
+class EvictionCandidate:
+    """Candidate RadixCache node/window for Unified KV Pool eviction."""
+
+    node_id: Any
+    kind: str  # "full" (leaf) or "swa" (window)
+    tokens: int
+    last_access_time: float
+    has_coupled_swa: bool = True
+    num_children: int = 0
+    prefix_tokens: int = 0
+    is_stale_swa: bool = False
+    parent_id: Any = None
+
+
 class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Logical-to-Physical Unified KV allocator for Full + SWA attention on TPU."""
 
-    SUPPORTED_EVICTION_POLICIES = ("full_first", "swa_first")
+    SUPPORTED_EVICTION_POLICIES = (
+        "full_first",
+        "swa_first",
+        "timestamp_interleaved",
+    )
 
     def __init__(
         self,
@@ -758,6 +778,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         empty_pool: bool = False,
         credit_swa_cascade: bool = False,
         policy: Optional[str] = None,
+        candidates: Optional[Sequence[EvictionCandidate]] = None,
     ) -> Optional[Tuple[int, int]]:
         if full_tokens < 0 or swa_tokens < 0:
             return None
@@ -774,6 +795,11 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return (0, 0)
         short = need - free
         ms = self._swa_groups
+        if active_policy == "timestamp_interleaved" and candidates:
+            interleaved = self.plan_interleaved_eviction(candidates, short)
+            if interleaved is None:
+                return None
+            return (interleaved[0], interleaved[1])
         max_f = min(
             self.full_attn_allocator.allocated_pages,
             max(0, int(full_evictable_tokens)) // ps,
@@ -789,7 +815,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             rem = max(0, short - s_reclaim * ms)
             f_reclaim = min(max_f, rem)
             return (f_reclaim * ps, s_reclaim * ps)
-        if credit_swa_cascade:
+        if credit_swa_cascade or active_policy == "timestamp_interleaved":
             coupled = min(max_f, max_s)
             coupled_take = min(coupled, _cdiv(short, 1 + ms))
             rem = max(0, short - coupled_take * (1 + ms))
@@ -800,6 +826,55 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         f_reclaim = min(max_f, short)
         rem = short - f_reclaim
         return (f_reclaim * ps, (_cdiv(rem, ms) if rem > 0 else 0) * ps)
+
+    def plan_interleaved_eviction(
+        self,
+        candidates: Sequence[EvictionCandidate],
+        short_physical_pages: int,
+    ) -> Optional[Tuple[int, int, List[EvictionCandidate]]]:
+        """Interleave Full leaf and SWA window candidates by oldest ``last_access_time``."""
+        if short_physical_pages <= 0:
+            return (0, 0, [])
+        ps = self.page_size
+        ms = self._swa_groups
+        ordered = sorted(
+            candidates,
+            key=lambda c: (c.last_access_time, 0 if c.kind == "swa" else 1),
+        )
+        swa_reclaimed_nodes: Set[Any] = set()
+        full_reclaimed_nodes: Set[Any] = set()
+        freed_phys = 0
+        full_tokens_evicted = 0
+        swa_tokens_evicted = 0
+        chosen: List[EvictionCandidate] = []
+        for cand in ordered:
+            if freed_phys >= short_physical_pages:
+                break
+            pages = max(0, int(cand.tokens)) // ps
+            if pages <= 0:
+                continue
+            if cand.kind == "swa":
+                if cand.node_id in swa_reclaimed_nodes or cand.node_id in full_reclaimed_nodes:
+                    continue
+                swa_reclaimed_nodes.add(cand.node_id)
+                freed_phys += pages * ms
+                swa_tokens_evicted += pages * ps
+                chosen.append(cand)
+            elif cand.kind == "full":
+                if cand.node_id in full_reclaimed_nodes:
+                    continue
+                full_reclaimed_nodes.add(cand.node_id)
+                has_swa = cand.has_coupled_swa and cand.node_id not in swa_reclaimed_nodes
+                if has_swa:
+                    swa_reclaimed_nodes.add(cand.node_id)
+                    freed_phys += pages * (1 + ms)
+                else:
+                    freed_phys += pages
+                full_tokens_evicted += pages * ps
+                chosen.append(cand)
+        if freed_phys < short_physical_pages:
+            return None
+        return (full_tokens_evicted, swa_tokens_evicted, chosen)
 
     def tombstone_swa_pages(self, full_indices: torch.Tensor) -> int:
         """Evict SWA pages for ``full_indices`` while keeping Full KV pages intact (tombstoning)."""
