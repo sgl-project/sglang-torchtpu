@@ -581,6 +581,55 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
             torch.equal(backend._layer_page_indices(4, is_swa_layer=True)[0], sg[1])
         )
 
+    def test_pingpong_two_window_swa_prefill_and_admission(self):
+        with self._cfg_patches():
+            kvc = self._make_mock_kvc()
+            conf = TpuUnifiedSWAPoolConfigurator(kvc)
+            budget = 256 * 1024**2
+            phys_pages = conf.calculate_total_physical_pages(budget, page_size=128)
+            self.assertGreater(phys_pages, 0)
+            self.assertEqual(phys_pages % 8, 0)
+
+        _, alloc = TestTpuUnifiedSWAKVPoolAllocator()._make_pool_and_allocator(
+            total_pages=64, page_size=128
+        )
+        self.assertTrue(
+            alloc.can_reserve_pingpong_prefill(
+                extend_tokens=1024, sliding_window_size=256, has_prev_window=False
+            )
+        )
+        # 3 consecutive 512-token chunks with W = 256 (2 pages per window, M_swa = 4 => 8 phys pages per window)
+        last_loc = torch.tensor([-1], dtype=torch.int64)
+        for chunk_idx in range(3):
+            prefix_len = chunk_idx * 512
+            seq_len = (chunk_idx + 1) * 512
+            out = alloc.alloc_extend_pingpong_swa(
+                req_id="req-pingpong",
+                prefix_lens=torch.tensor([prefix_len], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                seq_lens=torch.tensor([seq_len], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=512,
+                sliding_window_size=256,
+            )
+            self.assertIsNotNone(out)
+            self.assertEqual(out.numel(), 512)
+            # Out-of-window first 256 tokens of the chunk map to dummy page 0
+            mapped_head = alloc.translate_loc_from_full_to_swa(out[:256])
+            mapped_tail = alloc.translate_loc_from_full_to_swa(out[256:])
+            self.assertTrue(bool((mapped_head == 0).all()))
+            self.assertTrue(bool((mapped_tail > 0).all()))
+            # At most 2 windows (2 * 2 pages * M_swa=4 = 16 physical pages) of SWA are ever live
+            self.assertLessEqual(alloc.swa_attn_allocator.allocated_pages, 16)
+            last_loc = out[-1:]
+        freed = alloc.advance_pingpong_swa_window("req-pingpong")
+        self.assertEqual(freed, 256)
+        # After advancing, only 1 window (2 pages * M_swa=4 = 8 physical pages) remains
+        self.assertEqual(alloc.swa_attn_allocator.allocated_pages, 8)
+        alloc.advance_pingpong_swa_window("req-pingpong", release_all=True)
+        self.assertEqual(alloc.swa_attn_allocator.allocated_pages, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
