@@ -130,6 +130,8 @@ class TpuEnvs:
     SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO = EnvBool(False)
     # Fused-RS NVFP4 GMMs widen fp4 weights to bf16 through fp8 (bit-identical, fewer VPU ops).
     SGLANG_TPU_FP4_DEQUANT_VIA_FP8 = EnvBool(False)
+    # Tuning only: comma list of fused-RS row buckets to keep (the tile_m bucket always stays).
+    SGLANG_TPU_FUSED_RS_M_BUCKETS = EnvStr(None)
     # Fused-RS EP mode leaves each tile's output row writes in flight until its staging
     # slot is reused, as expert-TP mode does, instead of waiting for them after every tile.
     SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES = EnvBool(False)

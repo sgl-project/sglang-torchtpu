@@ -979,6 +979,11 @@ def kernel_main_fused_rs(
     # prod decode dtype) anyway, so only bucket when the weights are fp4.
     _w_qdt = cfgs1.rhs_cfgs.quant_dtype
     _weight_is_fp4 = _w_qdt is not None and jax.dtypes.itemsize_bits(_w_qdt) <= 4
+    if (only := tpu_envs.SGLANG_TPU_FUSED_RS_M_BUCKETS.get()) is not None:
+        # every bucket variant is a full copy of the GMM code; fewer keeps it in
+        # instruction memory
+        keep = {int(b) for b in only.split(",") if b}
+        M_BUCKETS = [b for b in M_BUCKETS if b in keep or b == tile_m]
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
 
     # --- Main padded gm loop ---
