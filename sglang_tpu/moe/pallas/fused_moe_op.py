@@ -134,15 +134,16 @@ def _drop_invalid_slots(
     topk_ids: "jax.Array",
     topk_weights: "jax.Array",
     num_route_experts: int,
-    zero_dropped_tokens: bool,
+    one_hot_permute: bool,
 ) -> tuple["jax.Array", "jax.Array", "jax.Array"]:
     """Route slots with an id outside ``[0, num_route_experts)`` to
     ``num_route_experts`` with zero weight (TopK marks padded tokens -1).
 
     That id sorts after every real row, has no group in ``group_sizes`` and
     lies outside the EP row window, so no GMM computes the slot.
-    ``zero_dropped_tokens`` zeroes tokens with no live slot for the one-hot
-    permute matmul, which reads every row (``0 * NaN`` would reach real rows).
+    ``one_hot_permute`` is set when the permute is a one-hot matmul over every
+    token, where ``0 * NaN`` from one token reaches every row. It zeroes tokens
+    with no live slot and non-finite hidden states of live tokens.
     """
     import jax.numpy as jnp
 
@@ -150,9 +151,11 @@ def _drop_invalid_slots(
     dropped = (topk_ids < 0) | (topk_ids >= num_route_experts)
     topk_ids = jnp.where(dropped, num_route_experts, topk_ids)
     topk_weights = jnp.where(dropped, 0, topk_weights)
-    if zero_dropped_tokens:
+    if one_hot_permute:
         token_dropped = jnp.all(dropped, axis=1, keepdims=True)
-        hidden_states = jnp.where(token_dropped, 0, hidden_states)
+        hidden_states = jnp.where(
+            token_dropped | ~jnp.isfinite(hidden_states), 0, hidden_states
+        )
     return hidden_states, topk_ids, topk_weights
 
 
@@ -661,7 +664,7 @@ def _fused_moe_jax(
         topk_ids,
         topk_weights,
         max(global_num_experts, num_experts),
-        zero_dropped_tokens=m < permute_dense_threshold,
+        one_hot_permute=m < permute_dense_threshold,
     )
 
     # Routing: build a permutation that puts rows of hidden_states in

@@ -335,6 +335,35 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
             with self.subTest(route=route_name, m=20, ep=ep, sc=1):
                 self._check("bf16", route_name, 20, ep=ep, dense=False, sc=1)
 
+    def test_non_finite_live_token_stays_in_its_own_row(self):
+        """The one-hot permute is a matmul over every token, so one live token
+        with a NaN/inf hidden state (0 * NaN) turned every token's output NaN."""
+        m, poisoned = 5, 2
+        others = [i for i in range(m) if i != poisoned]
+        for route_name, ep in itertools.product(ROUTES, (True, False)):
+            recipe_thr = ROUTES[route_name][4]
+            run = self._fn("bf16", route_name, ep, False, recipe_thr, 0, False)
+            rng = np.random.default_rng(7)
+            ids, w = _routing(m, ROUTES[route_name], ep, rng)
+            hidden = rng.standard_normal((m, H)).astype(np.float32)
+            clean = run(hidden, ids, w)
+            bad_h, bad_w = hidden.copy(), w.copy()
+            bad_h[poisoned] = np.nan
+            bad_h[poisoned, ::5] = np.inf
+            # The router derives the weights from the same hidden state, so in
+            # serving they are NaN too; poisoning them alone isolates the combine.
+            bad_w[poisoned] = np.nan
+            inputs = {
+                "hidden": (bad_h, w),
+                "hidden+weights": (bad_h, bad_w),
+                "weights": (hidden, bad_w),
+            }
+            for poison, (h, tw) in inputs.items():
+                with self.subTest(route=route_name, ep=ep, poison=poison):
+                    bad = run(h, ids, tw)
+                    self.assertTrue(np.all(np.isfinite(bad[others])))
+                    np.testing.assert_array_equal(bad[others], clean[others])
+
     def test_dense_permute_with_gather_unpermute(self):
         # m < threshold <= m * topk: one-hot permute, gather combine.
         for ep in (True, False):
