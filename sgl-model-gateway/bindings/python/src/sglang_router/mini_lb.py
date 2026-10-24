@@ -38,6 +38,52 @@ def _response_failed(task: asyncio.Task) -> bool:
     return task.exception() is not None or task.result().status != 200
 
 
+def _sse_events(body: bytes):
+    """Yield the JSON payload of each `data:` line of an SSE body, skipping
+    `[DONE]` and non-JSON payloads."""
+    for line in body.split(b"\n"):
+        line = line.rstrip(b"\r")
+        if not line.startswith(b"data:"):
+            continue
+        try:
+            yield orjson.loads(line[len(b"data:") :].strip())
+        except orjson.JSONDecodeError:
+            continue
+
+
+def _prefill_stream_failure(body: bytes) -> Optional[str]:
+    """Classify a streaming prefill's body, which the engine sends with status
+    200 even when the request failed (#1706).
+
+    Returns "error_event" if the body has an `error` event (request rejected
+    before dispatch, e.g. longer than the context length), "aborted" if every
+    request in it (by `meta_info.id`, using its last non-null finish reason)
+    was aborted by the scheduler, and None otherwise. A prefill that finished
+    normally ends with finish reason `length`, never `abort`. A partially
+    aborted batch is not a failure, so decode still serves its other requests.
+    Same rule as `prefill_stream_failure` in the Rust PD router (#1704, PR
+    #1705).
+    """
+    aborted_by_id = {}
+    for event in _sse_events(body):
+        if not isinstance(event, dict):
+            continue
+        if "error" in event:
+            return "error_event"
+        meta_info = event.get("meta_info")
+        if not isinstance(meta_info, dict):
+            continue
+        finish_reason = meta_info.get("finish_reason")
+        if finish_reason is None:
+            continue
+        aborted_by_id[str(meta_info.get("id"))] = (
+            isinstance(finish_reason, dict) and finish_reason.get("type") == "abort"
+        )
+    if aborted_by_id and all(aborted_by_id.values()):
+        return "aborted"
+    return None
+
+
 async def _post_prefill_and_decode(
     *,
     session: aiohttp.ClientSession,
@@ -287,13 +333,7 @@ class MiniLoadBalancer:
         async def stream_results():
             try:
                 if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
-                    first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    )
-                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+                    first_prefill_chunk_json = next(_sse_events(prefill_body))
 
                     async for chunk in decode_response.content:
                         # Note: This is inefficient
@@ -349,6 +389,29 @@ class MiniLoadBalancer:
                         status_code=response.status,
                         media_type=response.content_type,
                     )
+            # A streaming prefill that fails still answers 200 and reports the
+            # failure in its body; decode would then wait for KV that never
+            # comes (#1706). Prefill's body is short in PD mode, and decode
+            # can't produce a token before prefill's KV arrives, so reading it
+            # here first costs no real latency.
+            prefill_body = await prefill_response.read()
+            failure = _prefill_stream_failure(prefill_body)
+            if failure is not None:
+                logger.warning(
+                    "Prefill stream failed (%s), aborting paired decode request "
+                    "decode_url=%s prefill_url=%s",
+                    failure,
+                    decode_server,
+                    prefill_server,
+                )
+                # Closing decode (in the finally below) disconnects it, which
+                # aborts its request. The client gets prefill's stream
+                # unchanged, as it would from a single engine.
+                return Response(
+                    content=prefill_body,
+                    status_code=prefill_response.status,
+                    media_type="text/event-stream",
+                )
             streaming = True
             return StreamingResponse(
                 stream_results(),
