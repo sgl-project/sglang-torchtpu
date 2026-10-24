@@ -377,6 +377,7 @@ class MuseMegakernel(torch.nn.Module):
             kv_packed=self.kv_packed and not kv_sal,
             kv_sal=kv_sal,
             kv_sal_fp8=kv_sal_fp8,
+            kv_write_pipelined=kv_sal and tpu_envs.SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED.get(),
             sal_fp8_dot=tpu_envs.SGLANG_TPU_MK_SAL_FP8_DOT.get() if kv_sal_fp8 else 0,
             scale_fp8=self.scale_fp8,
             # measured a loss at 32 rows, where the expert loop is compute-bound

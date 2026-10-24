@@ -222,6 +222,10 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # peer order of a round's sends: "ring" (me+1, me+2, ...) or "xor" (me^1, me^2, ...; ring
     # unless tp is a power of two)
     coll_order: str = "xor"
+    # SEQ_ALONG_LANE KV write: one load of every layer's new rows, every live request's page
+    # read-modify-write in flight per layer, and a layer's write-backs overlapping the next
+    # layer's reads (two slot banks). Same bytes and order of updates per page.
+    kv_write_pipelined: bool = False
     vmem_limit_bytes: int = 60 * 2**20
 
     @property
@@ -3298,6 +3302,100 @@ def newkv_shape(cfg: MKConfig):
     return (cfg.n_layers, cfg.rows, *cfg.kv_block)
 
 
+def _kv_write_sal_pipelined_call(cfg: MKConfig):
+    """``_kv_write_sal_call`` with the DMAs overlapped: requests' page RMWs per layer in flight
+    together, layer l's writes behind layer l + 1's reads."""
+    L, R, ps, q, J = cfg.n_layers, cfg.rows, cfg.page_size, cfg.rows_per_req, cfg.n_req
+    gl = set(cfg.global_layers)
+    nw = cfg.sal_words
+    S = 2 * J  # page slots per layer: a request's first and last page
+
+    def kernel(meta_ref, pos_ref, pf_ref, psw_ref, newkv, *rest):
+        kv_out = rest[L : 2 * L]
+        blk, new_v, nsem, rsem, wsem = rest[2 * L : 2 * L + 5]
+        n_live = meta_ref[0]
+        lane = jax.lax.broadcasted_iota(jnp.int32, (1, ps), 1)
+        load = pltpu.make_async_copy(newkv, new_v, nsem.at[0])
+        load.start()
+
+        def slots(l):
+            """(slot, request, side, active, page) of layer l's page RMWs."""
+            tab = pf_ref if l in gl else psw_ref
+            out = []
+            for j in range(J):
+                first, last = pos_ref[j * q] // ps, pos_ref[j * q + q - 1] // ps
+                for side in range(2):
+                    pg_no = first if side == 0 else last
+                    active = (j * q < n_live) & ((side == 0) | (last != first))
+                    ent = jnp.minimum(
+                        j * cfg.pages_per_seq + pg_no, cfg.n_pages_entries - 1
+                    )
+                    out.append((2 * j + side, j, pg_no, active, _page(tab, ent, cfg.packed_pages)))
+            return out
+
+        def write(l, s, page):
+            return pltpu.make_async_copy(
+                blk.at[l % 2, s], kv_out[l].at[page], wsem.at[l % 2, s]
+            )
+
+        load.wait()
+        for l in range(L):
+            cur = slots(l)
+            if l >= 2:  # the bank's slots are free once layer l - 2's writes land
+                for s, _, _, active, page in slots(l - 2):
+                    pl.when(active)(write(l - 2, s, page).wait)
+            reads = [
+                pltpu.make_async_copy(
+                    kv_out[l].at[page], blk.at[l % 2, s], rsem.at[l % 2, s]
+                )
+                for s, _, _, _, page in cur
+            ]
+            for (s, _, _, active, _), rd in zip(cur, reads):
+                pl.when(active)(rd.start)
+            nv = new_v[l]
+            for (s, j, pg_no, active, page), rd in zip(cur, reads):
+
+                @pl.when(active)
+                def _(s=s, j=j, pg_no=pg_no, page=page, rd=rd):
+                    rd.wait()
+                    words = blk.at[l % 2, s].bitcast(jnp.uint32).reshape(nw, ps)
+                    w = words[...]
+                    for t in range(q):
+                        r = j * q + t
+                        p = pos_ref[r]
+                        hit = (lane == p % ps) & (p // ps == pg_no) & (r < n_live)
+                        w = jnp.where(hit, nv[:, r : r + 1], w)
+                    words[...] = w
+                    write(l, s, page).start()
+
+        for l in range(max(0, L - 2), L):
+            for s, _, _, active, page in slots(l):
+                pl.when(active)(write(l, s, page).wait)
+
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    def call(meta, pos, pages_full, pages_swa, newkv, *kv):
+        return pl.pallas_call(
+            kernel,
+            out_shape=[jax.ShapeDtypeStruct(k.shape, k.dtype) for k in kv],
+            in_specs=[smem] * 4 + [hbm] * (1 + L),
+            out_specs=[hbm] * L,
+            scratch_shapes=[
+                pltpu.VMEM((2, S, *cfg.kv_block), cfg.kv_dtype),
+                pltpu.VMEM((L, nw, R), jnp.uint32),
+                pltpu.SemaphoreType.DMA((1,)),
+                pltpu.SemaphoreType.DMA((2, S)),
+                pltpu.SemaphoreType.DMA((2, S)),
+            ],
+            input_output_aliases={5 + i: i for i in range(L)},
+            compiler_params=pltpu.CompilerParams(),
+            name=f"muse_kv_write_salp_r{R}",
+        )(meta, pos, pages_full, pages_swa, newkv, *kv)
+
+    return call
+
+
 def _kv_write_sal_call(cfg: MKConfig):
     """SEQ_ALONG_LANE pools: a token is one lane column of its page block, so each live request
     read-modify-writes the (at most two) pages its consecutive rows land in, per layer."""
@@ -3376,6 +3474,8 @@ def _kv_write_sal_call(cfg: MKConfig):
 def kv_write_call(cfg: MKConfig):
     """``f(meta, pos, pages_full, pages_swa, newkv, *kv) -> kv``: scatter this step's K/V rows
     into every layer's pool in place (no remote DMA, so XLA aliases the pools without a copy)."""
+    if cfg.kv_sal and cfg.kv_write_pipelined:
+        return _kv_write_sal_pipelined_call(cfg)
     if cfg.kv_sal:
         return _kv_write_sal_call(cfg)
     L, R, ps, q = cfg.n_layers, cfg.rows, cfg.page_size, cfg.rows_per_req

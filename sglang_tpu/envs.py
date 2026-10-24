@@ -115,6 +115,9 @@ class TpuEnvs:
     # Muse megakernel: fold the f / o all-gathers into the next qkvg and the pool + router
     # matvecs (not bit-exact: the matvec input rounding moves; verify steps only).
     SGLANG_TPU_MUSE_MK_FOLD = EnvBool(True)
+    # Megakernel KV write on SEQ_ALONG_LANE pools: all page read-modify-writes of a layer in
+    # flight together, overlapped with the next layer's (MKConfig.kv_write_pipelined; exact).
+    SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED = EnvBool(False)
     # Raiden HiCache transfers move each run of pages that is consecutive on both the
     # device and the host as one segment instead of one segment per page.
     SGLANG_TPU_RAIDEN_COALESCE_PAGES = EnvBool(False)
