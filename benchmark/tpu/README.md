@@ -255,6 +255,12 @@ above the profiled full-step time.
 - Every knob is an env var — see each script's header comment for the full list.
 - `bench_serving.sh` writes JSONL summaries under `./results/<model-slug>-tpu/`
   (gitignored).
+- `compile_cache_host_ram_probe.py` measures the host RAM a new prompt length
+  costs: it sends prompts of increasing length and samples the RSS of every
+  `sglang::scheduler*` process, since each TP rank keeps its own copy of every
+  compiled executable (#1429). Serve with `SGLANG_TPU_CHECK_RECOMPILATION=1` to
+  get the same numbers, plus each compile's peak host memory, from inside the
+  ranks (`[recompilation checker]` log lines).
 
 ## Reproducibility metadata (for the CI dashboard)
 

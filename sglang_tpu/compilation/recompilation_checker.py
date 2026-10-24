@@ -9,6 +9,11 @@ loads are counted separately because their load times are unavailable.
 Periodic summaries report cumulative compile durations relative to elapsed
 wall time, helping identify the cost of repeated small compilations.
 
+Every report also carries this rank's host memory: the RSS change since the
+previous report and the peak host memory the new programs took to compile.
+Each TP rank process keeps its own copy of every executable, so a host pays
+that growth once per rank (#1429).
+
 Enable with ``SGLANG_TPU_CHECK_RECOMPILATION=1``. Add
 ``SGLANG_TPU_CHECK_RECOMPILATION_SITES=1`` to also attribute eager compiles on
 the scheduler thread to sglang source lines, at a per-op dispatch cost.
@@ -29,10 +34,13 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
 from sglang_tpu._logging import get_logger
+from sglang_tpu.host_heap_trim import rss_bytes
 
 logger = get_logger(__name__)
 
 _ONE_MICROSECOND = datetime.timedelta(microseconds=1)
+_MIB = float(1 << 20)
+_GIB = float(1 << 30)
 # A forward runs in tens to hundreds of ms, so 100 ms of compile inside one is
 # a visible stall.
 _FORWARD_COMPILE_WARN_MS = 100
@@ -56,17 +64,45 @@ class RecompileEvent(msgspec.Struct, frozen=True):
     heavy: bool
     # None when site tracing is off.
     sites: _Sites | None = None
+    # This rank's RSS change since the previous report, and the largest peak
+    # host memory one of the new programs took while compiling. 0 when the
+    # reading is unavailable. Each TP rank process holds its own copy of every
+    # executable, so a host pays the growth once per rank (#1429).
+    host_rss_delta_bytes: int = 0
+    peak_compile_host_bytes: int = 0
+
+
+# (compile duration in microseconds, peak compile host memory in bytes)
+_EntryKey = tuple[int, int]
+
+
+def _entry_key(entry: Any) -> _EntryKey:
+    # Microseconds are the pybind's native unit. Older torch_tpu wheels report
+    # no peak host memory; that leaves the key duration-only.
+    try:
+        peak = int(getattr(entry, "peak_compilation_host_memory_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        peak = 0
+    return (entry.compilation_duration // _ONE_MICROSECOND, peak)
 
 
 def _duration_multiset(stats: Any) -> collections.Counter:
-    # Keyed by microseconds, the pybind's native unit. The cache key is not
-    # bound and entry order is unstable, so the multiset is the identity. That
-    # makes matching approximate: an evicted entry replaced by one of the same
-    # duration is invisible, which needs an upstream stable entry id to fix.
+    # The cache key is not bound and entry order is unstable, so the multiset
+    # of (duration, peak host memory) is the identity. That makes matching
+    # approximate: an evicted entry replaced by one with the same key is
+    # invisible, which needs an upstream stable entry id to fix.
     counter: collections.Counter = collections.Counter()
     for entry in stats.per_entry_stats:
-        counter[entry.compilation_duration // _ONE_MICROSECOND] += 1
+        counter[_entry_key(entry)] += 1
     return counter
+
+
+def _program_count(multiset: collections.Counter) -> int:
+    return sum(multiset.values())
+
+
+def _compile_seconds(multiset: collections.Counter) -> float:
+    return sum(us * n for (us, _), n in multiset.items()) / 1e6
 
 
 def _build_event(
@@ -75,6 +111,8 @@ def _build_event(
     context: str,
     warn_ms: int,
     sites: _Sites | None = None,
+    host_rss_delta_bytes: int = 0,
+    peak_compile_host_bytes: int = 0,
 ) -> RecompileEvent:
     new_us = tuple(new_us)
     durations_ms = tuple(
@@ -89,6 +127,8 @@ def _build_event(
         # One heavy compile or several adding up both stall the step.
         heavy=total_ms >= warn_ms,
         sites=sites,
+        host_rss_delta_bytes=host_rss_delta_bytes,
+        peak_compile_host_bytes=peak_compile_host_bytes,
     )
 
 
@@ -104,7 +144,38 @@ def _format_sites(sites: _Sites | None) -> str:
 
 
 def _format_event(event: RecompileEvent, *, warn_ms: int) -> str:
-    return _format_compiles(event, warn_ms=warn_ms) + _format_sites(event.sites)
+    return (
+        _format_compiles(event, warn_ms=warn_ms)
+        + _format_host_memory(event)
+        + _format_sites(event.sites)
+    )
+
+
+def _format_host_memory(event: RecompileEvent) -> str:
+    """Host memory the new programs cost this rank; "" when nothing was read."""
+    if not event.host_rss_delta_bytes and not event.peak_compile_host_bytes:
+        return ""
+    programs = len(event.durations_ms) + event.load_count
+    parts = []
+    if event.host_rss_delta_bytes:
+        per_program = (
+            f", {event.host_rss_delta_bytes / programs / _MIB:.1f} MiB per program"
+            if programs and event.host_rss_delta_bytes > 0
+            else ""
+        )
+        parts.append(
+            f"host RSS {event.host_rss_delta_bytes / _MIB:+.1f} MiB since the "
+            f"previous report{per_program}"
+        )
+    if event.peak_compile_host_bytes:
+        parts.append(
+            f"peak compile host memory {event.peak_compile_host_bytes / _MIB:.0f} MiB"
+        )
+    return (
+        " This rank: "
+        + "; ".join(parts)
+        + ". Each TP rank process holds its own copy of every executable."
+    )
 
 
 def _format_compiles(event: RecompileEvent, *, warn_ms: int) -> str:
@@ -211,12 +282,17 @@ class RecompilationChecker:
         sync_device: Callable[[], None],
         warn_ms: int,
         clock: Callable[[], float] = time.monotonic,
+        read_rss: Callable[[], int] = rss_bytes,
     ) -> None:
         self._read_misses = read_misses
         self._read_stats = read_stats
         self._sync_device = sync_device
         self._warn_ms = warn_ms
         self._clock = clock
+        # This rank's RSS in bytes, 0 when unreadable.
+        self._read_rss = read_rss
+        self._baseline_rss = 0
+        self._last_rss = 0
         self._baseline: collections.Counter | None = None
         self._seen_misses: int | None = None
         self._window_start = clock()
@@ -227,6 +303,9 @@ class RecompilationChecker:
         self.serving_compiles: int = 0
         self.serving_compile_ms: int = 0
         self.worst_compile_ms: int = 0
+        # Compiled plus loaded from the persistent cache: every program that
+        # entered this rank's in-memory cache since serving started.
+        self.serving_programs: int = 0
         self._site_tracer: _CompileSiteTracer | None = None
         self._pending_sites: collections.Counter[str] = collections.Counter()
 
@@ -254,15 +333,18 @@ class RecompilationChecker:
         self._sync_device()
         self._baseline = _duration_multiset(self._read_stats())
         self._seen_misses = self._read_misses()
+        self._baseline_rss = self._last_rss = self._read_rss()
         self._window_start = self._clock()
         self._window_events = 0
         self._window_compile_ms = 0
         logger.info(
             "[recompilation checker] XLA graph baseline: %d cached programs, "
-            "%.1fs total compile time, %d tier-1 misses.",
-            sum(self._baseline.values()),
-            sum(us * n for us, n in self._baseline.items()) / 1e6,
+            "%.1fs total compile time, %d tier-1 misses, host RSS %.2f GiB "
+            "(this rank; each TP rank process holds its own executables).",
+            _program_count(self._baseline),
+            _compile_seconds(self._baseline),
             self._seen_misses,
+            self._baseline_rss / _GIB,
         )
 
     def check(self, *, context_fn: Callable[[], str]) -> RecompileEvent | None:
@@ -291,11 +373,19 @@ class RecompilationChecker:
         self._baseline = current
         if not new:
             return None
+        # Read after the sync, so the new executables are resident. The delta
+        # spans every forward since the previous report, not just this one.
+        rss = self._read_rss()
+        rss_delta = rss - self._last_rss if rss and self._last_rss else 0
+        if rss:
+            self._last_rss = rss
         event = _build_event(
-            new_us=new.elements(),
+            new_us=(us for us, _ in new.elements()),
             context=context_fn(),
             warn_ms=self._warn_ms,
             sites=sites,
+            host_rss_delta_bytes=rss_delta,
+            peak_compile_host_bytes=max(peak for _, peak in new.elements()),
         )
         self._record_event(event)
         log = logger.warning if event.heavy else logger.info
@@ -314,6 +404,7 @@ class RecompilationChecker:
         self._window_compile_ms += event.total_ms
         self.serving_compiles += len(event.durations_ms)
         self.serving_compile_ms += event.total_ms
+        self.serving_programs += len(event.durations_ms) + event.load_count
         if event.durations_ms:
             self.worst_compile_ms = max(self.worst_compile_ms, event.durations_ms[0])
 
@@ -326,7 +417,7 @@ class RecompilationChecker:
             logger.info(
                 "[recompilation checker] last %.0fs: %d forward(s) compiled, "
                 "%d ms of compile time (%.1f%% of wall), %d program(s) and %d "
-                "ms since serving started, worst %d ms.",
+                "ms since serving started, worst %d ms.%s",
                 elapsed,
                 self._window_events,
                 self._window_compile_ms,
@@ -334,11 +425,29 @@ class RecompilationChecker:
                 self.serving_compiles,
                 self.serving_compile_ms,
                 self.worst_compile_ms,
+                self._format_host_growth(),
             )
         # Reset even with no events, so the next burst is measured from here.
         self._window_start = self._clock()
         self._window_events = 0
         self._window_compile_ms = 0
+
+    def _format_host_growth(self) -> str:
+        """This rank's RSS growth since the baseline, per program it added."""
+        rss = self._read_rss()
+        if not rss or not self._baseline_rss:
+            return ""
+        growth = rss - self._baseline_rss
+        per_program = (
+            f" ({growth / self.serving_programs / _MIB:.1f} MiB per program)"
+            if self.serving_programs and growth > 0
+            else ""
+        )
+        return (
+            f" Host RSS of this rank {growth / _MIB:+.0f} MiB since the baseline "
+            f"for {self.serving_programs} program(s){per_program}; each TP rank "
+            "process holds its own copy of every executable."
+        )
 
 
 @functools.lru_cache(maxsize=1)
