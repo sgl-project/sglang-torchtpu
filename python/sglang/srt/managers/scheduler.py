@@ -150,6 +150,7 @@ from sglang.srt.managers.io_struct import (
     FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
+    FreezeGCReqOutput,
     GetInternalStateReq,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -2303,7 +2304,14 @@ class Scheduler(
         if recv_reqs:
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
-        self.process_input_requests(recv_reqs)
+        # PP relays requests after ingestion. Freeze may synchronize all stages,
+        # so PP loops dispatch it only after forwarding this iteration's work.
+        requests_to_process = recv_reqs
+        if get_parallel().pp_size > 1:
+            requests_to_process = [
+                req for req in recv_reqs if not isinstance(req, FreezeGCReq)
+            ]
+        self.process_input_requests(requests_to_process)
         return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
@@ -6174,7 +6182,7 @@ class Scheduler(
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
         freeze_gc("Scheduler")
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
-        return None
+        return FreezeGCReqOutput()
 
     def handle_shutdown(self, recv_req: ShutdownReq):
         # Break the event loop; the finally in run_scheduler_process releases resources.

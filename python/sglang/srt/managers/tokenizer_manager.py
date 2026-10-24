@@ -2324,8 +2324,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
-        """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self._dispatch_to_scheduler(FreezeGCReq())
+        """Wait for scheduler cleanup before freezing the tokenizer GC."""
+        self.auto_create_handle_loop()
+        await self.freeze_gc_communicator(FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
 

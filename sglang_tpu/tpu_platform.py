@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
+from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
@@ -31,6 +32,32 @@ logger = get_logger(__name__)
 # Platform discovery runs before worker bootstrap configures torch_tpu.
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
+# The resolving view imports the platform registry, which is still discovering us.
+_resolving_view = LazyImport("sglang.srt.arg_groups.overrides", "resolving_view")
+
+
+@register_resolution_hook("handle_other_validations")
+def _validate_startup_cleanup_control(server_args, previous):
+    previous(server_args)
+    cfg = _resolving_view(server_args)
+    if (
+        cfg.device == "tpu"
+        and cfg.dwdp_size <= 1
+        and (
+            cfg.ep_join_mode == "scale"
+            or (
+                cfg.attn_dp_size > 1 and cfg.enable_dp_attention_local_control_broadcast
+            )
+        )
+    ):
+        # Independent control polling can put one DP group in the cleanup
+        # barrier while another enters an MLP scheduling collective. DWDP skips
+        # those shared scheduling collectives.
+        raise ValueError(
+            "TPU startup cleanup requires global control broadcasts with attention DP. "
+            "Disable --enable-dp-attention-local-control-broadcast and elastic EP "
+            "scaling, which can enable local control automatically."
+        )
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.

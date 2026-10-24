@@ -127,3 +127,36 @@ prepares patches. Live check:
 [`test_tpu_muse_spark_mm_pd_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_mm_pd_multihost.py)
 (images and video over P/D), with `SGLANG_TPU_USE_LIVE_SERVER=1` and
 `BASE_URL` pointing at the router.
+
+## Startup cleanup
+
+Before the scheduler-ready handshake, all ranks join pending compilation saves
+and release startup file-cache pages. This also covers direct `Engine` and Rust
+launches without a `/freeze_gc` request. Each host scans its files once per cleanup
+pass; all ranks finish before the handshake returns.
+
+The existing `/freeze_gc` request repeats file-cache release to cover files used
+or created by subsequent warmup, then collects garbage, freezes GC and trims freed
+host heap pages. Python HTTP startup waits for this second pass before reporting
+readiness. Direct `Engine` callers can also call `freeze_gc()` after their own
+warmup.
+
+Attention DP with shared MLP scheduling requires global control broadcasts:
+`--enable-dp-attention-local-control-broadcast` and elastic EP scaling are rejected
+because independently received freeze requests can deadlock with scheduling
+collectives. DWDP's independent scheduling is exempt from this check.
+
+`SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE=0` keeps target and draft checkpoint
+shards cached. `SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE=0` keeps the native compiler
+cache pages. Both releases default on. The compiler cache namespace comes from
+`TORCH_TPU_TIER2_COMPILATION_CACHE` (legacy:
+`TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE`); empty or unset selects `default`,
+and `disabled` skips it. Other namespaces are untouched. Disk-backed files are
+advised with `POSIX_FADV_DONTNEED` and remain on disk; tmpfs/ramfs are skipped.
+Advice is not a measurement of resident memory freed.
+
+Checkpoint pages remain eligible for kernel reclaim during startup, but explicit
+eviction starts at the scheduler-ready handshake. This can increase peak host
+memory relative to evicting immediately after weight loading. Reusing files
+after cleanup can require storage reads. After freeze cleanup, one rank per host
+logs cgroup `memory.current` in bytes; this diagnostic does not gate readiness.

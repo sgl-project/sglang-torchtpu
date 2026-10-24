@@ -13,13 +13,19 @@ from unittest.mock import patch
 import torch
 import torch.compiler.config as compiler_config
 
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
+from sglang.srt.arg_groups.resolution_hooks import run_hook
+from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
+    CudaGraphConfig,
     default_cuda_graph_config,
 )
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -30,6 +36,82 @@ from sglang_tpu.tpu_platform import (
 
 # CPU suite: mocks torch_tpu, so it runs on the CPU runners -- never a TPU node.
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestTpuStartupCleanupValidation(CustomTestCase):
+    def test_control_broadcast_compatibility(self):
+        for fields, rejected in (
+            ({}, False),
+            ({"attn_dp_size": 2}, False),
+            ({"enable_dp_attention_local_control_broadcast": True}, False),
+            (
+                {
+                    "attn_dp_size": 2,
+                    "enable_dp_attention_local_control_broadcast": True,
+                },
+                True,
+            ),
+            ({"attn_dp_size": 2, "ep_join_mode": "scale"}, True),
+            ({"attn_dp_size": 1, "ep_join_mode": "scale"}, True),
+            (
+                {
+                    "attn_dp_size": 2,
+                    "dwdp_size": 2,
+                    "enable_dp_attention_local_control_broadcast": True,
+                },
+                False,
+            ),
+            (
+                {
+                    "device": "cuda",
+                    "attn_dp_size": 2,
+                    "enable_dp_attention_local_control_broadcast": True,
+                },
+                False,
+            ),
+        ):
+            with self.subTest(fields=fields):
+                args = ServerArgs(model_path="dummy", **{"device": "tpu", **fields})
+                if rejected:
+                    with self.assertRaisesRegex(
+                        ValueError, "global control broadcasts"
+                    ):
+                        run_hook(handle_other_validations, args)
+                else:
+                    run_hook(handle_other_validations, args)
+
+        args = ServerArgs(model_path="dummy", default_chat_template_kwargs=[])
+        with self.assertRaisesRegex(ValueError, "must decode to a JSON object"):
+            run_hook(handle_other_validations, args)
+
+    def test_rejects_automatically_enabled_local_control(self):
+        args = ServerArgs(
+            model_path="dummy",
+            device="tpu",
+            tp_size=2,
+            attn_dp_size=2,
+            ep_size=2,
+            enable_dp_lm_head=True,
+            elastic_ep_backend="mooncake",
+            max_ep_size=4,
+            moe_a2a_backend="nixl",
+            load_balance_method="round_robin",
+            cuda_graph_config=CudaGraphConfig.from_dict(
+                {
+                    "decode": {"backend": Backend.DISABLED},
+                    "prefill": {"backend": Backend.DISABLED},
+                }
+            ),
+        )
+        self.assertFalse(
+            resolving_view(args).enable_dp_attention_local_control_broadcast
+        )
+        run_hook(handle_elastic_ep, args)
+        self.assertTrue(
+            resolving_view(args).enable_dp_attention_local_control_broadcast
+        )
+        with self.assertRaisesRegex(ValueError, "elastic EP"):
+            run_hook(handle_other_validations, args)
 
 
 class TestTpuPlatformIdentity(CustomTestCase):
