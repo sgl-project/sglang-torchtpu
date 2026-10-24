@@ -496,10 +496,6 @@ def _resolve_unified_kv_pool(server_args) -> None:
             f"is not supported with prefill context parallelism (--attn-cp-size {cfg.attn_cp_size}).",
         ),
         (
-            cfg.disaggregation_mode != "null",
-            f"is not supported with --disaggregation-mode {cfg.disaggregation_mode!r}.",
-        ),
-        (
             cfg.enable_hierarchical_cache and cfg.hicache_io_backend != "raiden",
             f"with --enable-hierarchical-cache requires --hicache-io-backend raiden, got {cfg.hicache_io_backend!r}.",
         ),

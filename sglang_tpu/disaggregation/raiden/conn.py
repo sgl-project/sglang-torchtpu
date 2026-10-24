@@ -43,6 +43,8 @@ from typing import (
 
 import numpy as np
 
+import msgspec
+
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -152,6 +154,13 @@ class RaidenKVManager(
     _state_engine_max_blocks = 0
     _committed_state_row: Optional[Callable[[int], int]] = None
     state_raiden_endpoint: Optional[str] = None
+    # Block ids of the sliding-window pages, swa_groups per page; see
+    # RaidenKVCacheGroups.swa_block_ids. None moves one block per page.
+    _swa_block_ids = None
+    _swa_groups = 1
+    # The SWA transfer layout a peer must match (PullReq.swa_layout); unset
+    # for per-layer sliding-window tensors.
+    _swa_layout = msgspec.UNSET
 
     def __init__(
         self,
@@ -379,6 +388,12 @@ class RaidenKVManager(
         if self._state_kv_caches and self._committed_state_row is None:
             raise RuntimeError("Raiden GDN state tensors need a committed-row mapping")
         if self._pipeline_enabled:
+            # Its per-layer pools would receive every SWA group into group 0's rows.
+            if kv_caches.swa_buffers is not None:
+                raise RuntimeError(
+                    "Raiden's pipeline transfer cannot move the unified KV pool's "
+                    "sliding-window pages"
+                )
             if self._state_kv_caches:
                 raise NotImplementedError(
                     "Raiden pipeline transfer does not move GDN (linear-attention) "
@@ -397,6 +412,11 @@ class RaidenKVManager(
                     pipeline.on_message(message)
                 self._pipeline_messages.clear()
             return
+        if kv_caches.swa_buffers is not None:
+            self._swa_kv_caches = list(kv_caches.swa_buffers)
+            self._swa_block_ids = kv_caches.swa_block_ids
+            self._swa_groups = kv_caches.swa_groups
+            self._swa_layout = (len(self._swa_kv_caches), self._swa_groups)
         # Full-attention KV moves piece by piece during the prefill. A hybrid
         # model's sliding-window pool holds only the last window, which is
         # settled when the prefill ends, so it rides on the closing read, as
@@ -520,6 +540,10 @@ class RaidenKVManager(
         return max(1, math.ceil(max_len / self.kv_args.page_size))
 
     def _swa_max_request_blocks(self) -> int:
+        # A sliding-window page moves as _swa_groups blocks.
+        return self._swa_max_request_pages() * self._swa_groups
+
+    def _swa_max_request_pages(self) -> int:
         override = int(os.environ.get("SGLANG_RAIDEN_SWA_MAX_BLOCKS", "0"))
         if override > 0:
             return override
@@ -1091,7 +1115,10 @@ class RaidenKVManager(
             or state_indices[index] is None
         ):
             raise RuntimeError("Raiden SWA transfer is missing its page indices")
-        return [int(x) for x in state_indices[index]]
+        pages = [int(x) for x in state_indices[index]]
+        if self._swa_block_ids is not None:
+            return self._swa_block_ids(pages)
+        return pages
 
     def _state_rows_from_state_indices(
         self, state_indices: Optional[List]

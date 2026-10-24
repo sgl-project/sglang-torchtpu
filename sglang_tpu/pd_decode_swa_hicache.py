@@ -336,15 +336,17 @@ class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
     """
 
     def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
-        # Same pool check as upstream's SWA strategy.
+        # Same pool check as upstream's SWA strategy: on the base class, since
+        # plugins may rebind swa_memory_pool.SWAKVPool to a subclass that pools
+        # subclassing the original do not inherit.
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4TokenToKVPool,
         )
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         return (
             _is_building_full_only_host_cache
-            and isinstance(kvcache, SWAKVPool)
+            and isinstance(kvcache, BaseSWAKVPool)
             and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
             and components == {ComponentType.FULL, ComponentType.SWA}
         )

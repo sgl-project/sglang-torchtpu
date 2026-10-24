@@ -195,10 +195,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "does not support decode context parallelism.",
         ),
         (
-            disagg_mode != "null",
-            f"does not support PD disaggregation (disaggregation_mode={disagg_mode!r}).",
-        ),
-        (
             _ctx_attr(get_memory, "enable_hierarchical_cache", False)
             and hicache_backend != "raiden",
             f"with --enable-hierarchical-cache requires --hicache-io-backend raiden, got {hicache_backend!r}.",
@@ -587,6 +583,20 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
     def swa_page_group(self, layer_id: int) -> int:
         return self._swa_layer_group.get(layer_id, 0)
 
+    def swa_transfer_buffers(self) -> List[torch.Tensor]:
+        """Return the unique shared backing buffers used by SWA layers in buffer order."""
+        return list(self.full_kv_pool.kv_buffer)
+
+    def swa_transfer_pages(self, page_ids: Sequence[int]) -> List[int]:
+        """Return physical page IDs for SWA group-0 ``page_ids`` ordered page-by-page across all ``M_swa`` groups:
+        ``[p0_g0, ..., p0_g{M-1}, p1_g0, ...]`` so a prefix-cache tail slice stays page-aligned."""
+        ids = torch.as_tensor(page_ids, dtype=torch.int64).reshape(1, -1)
+        if ids.numel() == 0:
+            return []
+        if self.num_swa_groups > 1 and self.swa_group_pages.numel() > 0:
+            ids = torch.cat([ids, self.swa_group_pages[:, ids[0]].to(torch.int64)], dim=0)
+        return ids.t().reshape(-1).tolist()
+
     def get_kv_scale_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
         """Return the co-indexed block-scale buffer ``[num_blocks, scale_rows, page_size]`` for ``layer_id``."""
         if self.shared_kv_scale_buffer is None:
@@ -751,6 +761,22 @@ class EvictionCandidate:
     prefix_tokens: int = 0
     is_stale_swa: bool = False
     parent_id: Any = None
+
+
+@dataclass
+class PDUnifiedTransferDescriptor:
+    """P/D disaggregation transfer descriptor for ``TpuUnifiedSWAKVPool``.
+
+    Transfers Full physical pages for the entire sequence ``[0, seq_len)`` and
+    SWA physical pages across all ``M_swa`` groups ONLY for the live trailing
+    window ``[max(0, seq_len - sliding_window_size), seq_len)``.
+    """
+
+    seq_len: int
+    sliding_window_size: int
+    full_page_ids: torch.Tensor  # [num_full_pages]
+    swa_tail_start_page: int
+    swa_group_page_ids: torch.Tensor  # [M_swa, num_swa_tail_pages]
 
 
 @dataclass
@@ -1647,6 +1673,63 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             if evict_end > 0:
                 self.free_swa(req_indices[:evict_end])
         return self._free_page_count() - before
+
+    def build_pd_transfer_descriptor(
+        self,
+        req_indices: torch.Tensor,
+        sliding_window_size: int,
+    ) -> PDUnifiedTransferDescriptor:
+        """Build P-node -> D-node transfer descriptor containing all Full pages and only live tail SWA pages."""
+        ps = self.page_size
+        seq_len = int(req_indices.numel())
+        if seq_len == 0:
+            empty = torch.empty((0,), dtype=torch.int32)
+            empty_swa = torch.empty((self._swa_groups, 0), dtype=torch.int32)
+            return PDUnifiedTransferDescriptor(0, sliding_window_size, empty, 0, empty_swa)
+        req_cpu = req_indices.to(device="cpu", dtype=torch.long)
+        full_pages = (req_cpu[::ps] // ps).to(torch.int32)
+        num_full_pages = int(full_pages.numel())
+        tail_tokens = min(seq_len, max(0, int(sliding_window_size)))
+        tail_pages = _cdiv(tail_tokens, ps)
+        swa_start_page = max(0, num_full_pages - tail_pages)
+        tail_token_indices = req_cpu[swa_start_page * ps :: ps]
+        swa_group0_tokens = self.translate_loc_from_full_to_swa(tail_token_indices).to(
+            device="cpu", dtype=torch.long
+        )
+        swa_group0_pages = (swa_group0_tokens // ps).to(torch.int32)
+        if self._swa_groups == 1 or self._kvcache.swa_group_pages.numel() == 0:
+            swa_all_groups = swa_group0_pages.unsqueeze(0)
+        else:
+            extra_groups = self._kvcache.swa_group_pages[
+                :, swa_group0_pages.long()
+            ].to(torch.int32)
+            swa_all_groups = torch.cat(
+                [swa_group0_pages.unsqueeze(0), extra_groups], dim=0
+            )
+        return PDUnifiedTransferDescriptor(
+            seq_len=seq_len,
+            sliding_window_size=sliding_window_size,
+            full_page_ids=full_pages,
+            swa_tail_start_page=swa_start_page,
+            swa_group_page_ids=swa_all_groups,
+        )
+
+    def allocate_for_pd_receive(
+        self,
+        seq_len: int,
+        sliding_window_size: int,
+    ) -> Optional[torch.Tensor]:
+        """Allocate D-node destination pages: Full KV for ``[0, seq_len)`` and SWA KV only for the tail window."""
+        swa_tail_len = min(int(seq_len), max(0, int(sliding_window_size)))
+        return self.alloc_extend_swa_tail(
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([seq_len], dtype=torch.int64),
+            torch.tensor([seq_len], dtype=torch.int64),
+            torch.tensor([-1], dtype=torch.int64),
+            int(seq_len),
+            swa_tail_len,
+        )
 
     def debug_print(self) -> str:
         return (
