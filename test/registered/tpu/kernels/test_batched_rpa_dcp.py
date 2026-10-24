@@ -463,15 +463,17 @@ class TestBatchedRpaDcpDecode(_CloseAssertions):
 
     def test_empty_shard_row_returns_zero_output_and_minus_inf_lse(self):
         # Sequence 1 has one global token, which rank 0 owns: on the last rank
-        # its shard is empty and its q_len (1) exceeds its kv_len (0).
+        # its stripe is empty and its q_len (1) exceeds its kv_len (0). So is
+        # sequence 2's (173 tokens, all on page 0); sequence 0 (2600 tokens)
+        # reaches every rank's stripe and must still be attended.
         for geo in (DCP2, DCP8):
             with self.subTest(geo.name):
-                out, lse = self._partials(geo, SLIDING_WINDOW, None)[geo.cp - 1]
-                self.assertTrue(np.all(out[1] == 0.0), out[1])
-                self.assertTrue(np.all(np.isneginf(lse[1])), lse[1])
-                # The sequence after the empty one must still be attended.
-                self.assertTrue(np.all(np.isfinite(lse[2])))
-                self.assertGreater(float(np.abs(out[2]).max()), 0.0)
+                out, lse = self._partials(geo, None, None)[geo.cp - 1]
+                for seq in (1, 2):
+                    self.assertTrue(np.all(out[seq] == 0.0), out[seq])
+                    self.assertTrue(np.all(np.isneginf(lse[seq])), lse[seq])
+                self.assertTrue(np.all(np.isfinite(lse[0])))
+                self.assertGreater(float(np.abs(out[0]).max()), 0.0)
 
     def test_sink_in_a_cache_only_pass_joins_every_row(self):
         # A sink is one more key with a zero value: lse = logaddexp(sink, lse)
