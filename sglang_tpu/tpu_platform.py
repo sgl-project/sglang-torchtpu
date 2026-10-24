@@ -74,6 +74,13 @@ def _sync_weight_stream(weights):
 # each KV fetch into many tiny DMAs, which is fine for GPU kernels and wasteful
 # here.
 _DEFAULT_PAGE_SIZE = 64
+# Attention backends whose kernels take the shared RPA page table as an SMEM
+# scalar-prefetch operand (see attention_pallas_rpa_base).
+_RPA_PAGE_TABLE_BACKENDS = (
+    "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_batched",
+    "pallas_tpu_mla",
+)
 
 
 def _rpa_kernel_spec(backend: str | None):
@@ -526,6 +533,150 @@ def _validate_dsa(server_args) -> None:
         raise ValueError(
             "DSA on TPU needs --tpu-compile-tracer dynamo, got "
             f"{cfg.tpu_compile_tracer!r}."
+        )
+
+
+def _load_model_config(server_args):
+    """The model's ModelConfig, or None when it cannot be built here.
+
+    A model that cannot be loaded at argument time fails later with its real
+    error, so the checks that need it are skipped instead.
+    """
+    from sglang.srt.configs.model_config import ModelConfig
+
+    try:
+        return ModelConfig.from_server_args(server_args)
+    except Exception:
+        return None
+
+
+def _resolve_model_serving_args(server_args, platform) -> None:
+    """Resolve or reject, before any weight loads, the per-model setups TPU
+    would otherwise refuse only after the load -- for a Kimi-K3 that is the
+    better part of an hour -- or serve differently than asked."""
+    model_config = _load_model_config(server_args)
+    if model_config is None:
+        return
+    from sglang.srt.arg_groups.overrides import (
+        declare_resolution,
+        resolving_view,
+    )
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.mem_cache.kv_cache_builder import uses_ssm_state
+
+    cfg = resolving_view(server_args)
+    disaggregated = cfg.disaggregation_mode not in (None, "null")
+    has_state = uses_ssm_state(model_config)
+
+    if has_state:
+        # TpuMambaPool keeps conv and recurrent state in float32 whatever the
+        # flag says, and sizes the pool for it.
+        if cfg.mamba_ssm_dtype not in (None, "float32"):
+            logger.warning(
+                "TPU keeps linear-attention (GDN / KDA) state in float32; "
+                "ignoring --mamba-ssm-dtype %s.",
+                cfg.mamba_ssm_dtype,
+            )
+            declare_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                mamba_ssm_dtype="float32",
+            )
+        # The scheduler refuses the tree only after the load, when the pool
+        # and the Mamba strategy are already sized for prefix checkpoints.
+        if not cfg.disable_radix_cache and not platform.supports_mamba_prefix_cache(
+            model_config
+        ):
+            if cfg.disaggregation_decode_enable_radix_cache:
+                raise ValueError(
+                    "TPU has no prefix checkpoints for this model's "
+                    "linear-attention backend (KDA); drop "
+                    "--disaggregation-decode-enable-radix-cache."
+                )
+            logger.warning(
+                "TPU has no prefix checkpoints for this model's linear-attention "
+                "backend (KDA) yet; serving with the radix cache disabled."
+            )
+            declare_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                disable_radix_cache=True,
+            )
+        if disaggregated and cfg.disaggregation_transfer_backend == "raiden":
+            pipeline_transfer = cfg.pp_size > 1 or (
+                cfg.disaggregation_mode == "decode"
+                and envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+            )
+            if pipeline_transfer:
+                raise ValueError(
+                    "Raiden pipeline transfer does not move linear-attention "
+                    "state yet; serve this model disaggregated without pipeline "
+                    "parallelism or SGLANG_RAIDEN_PIPELINE_TRANSFER."
+                )
+
+    if (
+        disaggregated
+        and cfg.disaggregation_transfer_backend == "tpu"
+        and model_config.attention_arch == AttentionArch.MLA
+    ):
+        raise ValueError(
+            "The tpu disaggregation transfer backend does not support MLA models; "
+            "use --disaggregation-transfer-backend raiden."
+        )
+
+    architectures = getattr(model_config.hf_config, "architectures", None) or []
+    if (
+        "KimiK3ForConditionalGeneration" in architectures
+        and cfg.attn_dp_size > 1
+        and cfg.enable_torch_compile
+    ):
+        from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+        # Mirrors the TPU decoder compile policy, which refuses this at
+        # graph-runner init.
+        if not getattr(KimiK3ForConditionalGeneration, "serves_dp_attention", False):
+            raise ValueError(
+                "TPU decoder compilation of Kimi-K3's multimodal model does not "
+                "support DP attention yet; drop --enable-dp-attention or "
+                "--enable-torch-compile."
+            )
+
+    _validate_rpa_page_table(server_args, model_config.context_len)
+
+
+def _validate_rpa_page_table(server_args, context_len: int) -> None:
+    """Reject a compiled batch whose RPA page table cannot fit in SMEM.
+
+    The attention backend sizes the table for ``--torch-compile-max-bs``
+    sequences of the full context; past the scoped SMEM budget the kernel
+    compile fails after the load. The headroom counted here is the least the
+    backend adds to the context, so only a table that cannot fit is refused.
+    """
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang_tpu.rpa_page_table import (
+        SCOPED_SMEM_BYTES,
+        max_seqs_in_smem,
+        page_table_smem_bytes,
+        pages_per_seq,
+    )
+
+    cfg = resolving_view(server_args)
+    max_bs = cfg.torch_compile_max_bs
+    if not cfg.enable_torch_compile or not max_bs:
+        return
+    if cfg.attention_backend not in _RPA_PAGE_TABLE_BACKENDS:
+        return
+    headroom = 4 + (cfg.speculative_num_draft_tokens or 0)
+    pages = pages_per_seq(context_len + headroom, cfg.page_size * cfg.dcp_size)
+    table_bytes = page_table_smem_bytes(max_bs, pages)
+    if table_bytes > SCOPED_SMEM_BYTES:
+        raise ValueError(
+            f"The RPA page table for --torch-compile-max-bs {max_bs} sequences of "
+            f"{pages} pages (context {context_len}, --page-size {cfg.page_size}) "
+            f"needs {table_bytes / 2**20:.2f} MiB of SMEM, above the "
+            f"{SCOPED_SMEM_BYTES / 2**20:.0f} MiB a kernel can use; lower "
+            f"--torch-compile-max-bs (<= {max_seqs_in_smem(pages)} here), "
+            "--context-length, or raise --page-size."
         )
 
 
@@ -997,6 +1148,8 @@ class TpuSRTPlatform(SRTPlatform):
         _apply_page_size_default(server_args)
         # After the page-size default: the DCP chunk check reads the page size.
         _validate_decode_context_parallel(server_args)
+        # After the backend and page-size defaults, which the page-table check reads.
+        _resolve_model_serving_args(server_args, self)
         _apply_kv_cache_dtype_default(server_args)
 
     # ------------------------------------------------------------------

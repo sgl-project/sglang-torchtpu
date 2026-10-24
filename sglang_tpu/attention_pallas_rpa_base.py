@@ -73,6 +73,12 @@ from sglang_tpu.kv_row_write import (
     write_run_bound,
 )
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+from sglang_tpu.rpa_page_table import (
+    SCOPED_SMEM_BYTES,
+    max_seqs_in_smem,
+    page_table_smem_bytes,
+    pages_per_seq,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -81,22 +87,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_pages_per_seq(max_context_len: int, page_size: int) -> int:
-    return (max_context_len + page_size - 1) // page_size
-
-
-# Scoped SMEM available to one Pallas kernel invocation on TPU.
-_SCOPED_SMEM_BYTES = 1 << 20
-
-
-def _page_table_smem_bytes(max_num_seqs: int, pages_per_seq: int) -> int:
-    """Bytes of SMEM the kernel's page table occupies for ``max_num_seqs``.
-
-    The page table is a scalar-prefetch operand: ``max_num_seqs * pages_per_seq``
-    int32 entries, padded to a multiple of 128 entries.
-    """
-    entries = max_num_seqs * pages_per_seq
-    return ((entries + 127) // 128) * 128 * 4
+_get_pages_per_seq = pages_per_seq
+_SCOPED_SMEM_BYTES = SCOPED_SMEM_BYTES
+_page_table_smem_bytes = page_table_smem_bytes
 
 
 def _validate_kv_len_capacity(max_kv_len: int, capacity: int) -> None:
@@ -642,7 +635,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     pages_per_seq,
                     table_bytes / 2**20,
                     _SCOPED_SMEM_BYTES / 2**20,
-                    max(1, (_SCOPED_SMEM_BYTES // 4 - 128) // pages_per_seq),
+                    max_seqs_in_smem(pages_per_seq),
                 )
 
         # Hybrid-SWA models keep two KV sub-pools and need a

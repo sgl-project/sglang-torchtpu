@@ -23,6 +23,9 @@ CONFIG["server_args"].update(
         # The draft is a dense MHA model; without this it inherits the target's
         # MLA backend.
         "speculative_draft_attention_backend": "pallas_tpu_rpa_v3",
+        # One request at a time (see above). The server refuses latent_up static
+        # fp8 with a speculative algorithm unless this is 1.
+        "max_running_requests": 1,
         # One KDA state slot per running request.
         "max_mamba_cache_size": 1,
     }
