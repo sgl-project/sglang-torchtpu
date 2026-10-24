@@ -22,7 +22,7 @@ import os
 import sys
 import unittest
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -98,6 +98,27 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     def test_still_reports_as_tpu(self):
         """The core tree's is_tpu() sites must keep seeing True."""
         self.assertTrue(self.platform.is_tpu())
+
+    def test_post_load_prepares_then_binds_kimi_k3_only(self):
+        import torch
+
+        from sglang.srt.models.kimi_k3 import KimiK3LinearForCausalLM
+
+        calls = MagicMock()
+        with (
+            patch(
+                "sglang_tpu.hooks.attn_residual.prepare_attn_residual_kernel",
+                calls.prepare,
+            ),
+            patch("sglang_tpu.kimi_k3.static_fp8.bind_static_fp8", calls.bind),
+        ):
+            self.platform.process_model_after_loading(torch.nn.Linear(1, 1))
+            self.assertEqual(calls.mock_calls, [])
+            model = KimiK3LinearForCausalLM.__new__(KimiK3LinearForCausalLM)
+            self.platform.process_model_after_loading(model)
+        # The fp8 binder releases weights, so it runs last.
+        self.assertEqual([c[0] for c in calls.mock_calls], ["prepare", "bind"])
+        self.assertTrue(all(c.args == (model,) for c in calls.mock_calls))
         self.assertFalse(self.platform.is_cuda())
         self.assertFalse(self.platform.is_cpu())
 
@@ -338,10 +359,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     def test_scheduler_initialization_hook_is_declared(self):
         from sglang.srt.plugins.hook_registry import HookType
         from sglang_tpu.hooks import HOOKS
-        from sglang_tpu.hooks.attn_residual import (
-            prepare_attn_residual_kernel,
-            register_attn_residual_ops,
-        )
+        from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
         from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
         from sglang_tpu.hooks.moe_topk import (
             biased_grouped_topk,
@@ -353,7 +371,6 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             skip_spec_op_precompile_without_draft,
         )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
-        from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
         from sglang_tpu.hooks.twolevel_allreduce import (
             all_reduce as twolevel_all_reduce,
         )
@@ -437,24 +454,8 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
         self.assertIn(
             (
-                "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-                bind_kimi_k3_static_fp8,
-                HookType.AFTER,
-            ),
-            HOOKS,
-        )
-        self.assertIn(
-            (
                 "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",
                 register_attn_residual_ops,
-                HookType.AFTER,
-            ),
-            HOOKS,
-        )
-        self.assertIn(
-            (
-                "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-                prepare_attn_residual_kernel,
                 HookType.AFTER,
             ),
             HOOKS,

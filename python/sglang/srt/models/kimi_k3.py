@@ -122,6 +122,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -3749,6 +3750,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
+
+        current_platform.process_model_after_loading(self)
 
 
 class KimiK3ForConditionalGeneration(nn.Module):

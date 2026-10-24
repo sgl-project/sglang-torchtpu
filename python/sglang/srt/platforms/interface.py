@@ -276,6 +276,14 @@ class SRTPlatform(DeviceMixin):
         """One-time backend initialization.  Called in each worker."""
         pass
 
+    def process_model_after_loading(self, model: torch.nn.Module) -> None:
+        """Called at the end of a model's ``post_load_weights``, after its own
+        post-load fixups and before graph capture or torch.compile. Platforms
+        bind kernel-specific weights here. It can run more than once per model
+        (from ``load_weights``, a multimodal wrapper or a weight update), so
+        implementations must be idempotent."""
+        pass
+
     def on_warmup_complete(self) -> None:
         """Called once on the scheduler thread, the first time it goes idle after
         a forward (the server warmup request has drained). Platforms that

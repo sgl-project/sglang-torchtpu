@@ -1427,6 +1427,17 @@ class TpuSRTPlatform(SRTPlatform):
         # to True once torch_tpu exposes real multi-stream execution.
         return False
 
+    def process_model_after_loading(self, model: torch.nn.Module) -> None:
+        from sglang.srt.models.kimi_k3 import KimiK3LinearForCausalLM
+
+        if not isinstance(model, KimiK3LinearForCausalLM):
+            return
+        from sglang_tpu.hooks.attn_residual import prepare_attn_residual_kernel
+        from sglang_tpu.kimi_k3.static_fp8 import bind_static_fp8
+
+        prepare_attn_residual_kernel(model)
+        bind_static_fp8(model)
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
