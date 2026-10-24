@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from array import array
 from collections import defaultdict
 from enum import Enum, auto
@@ -123,6 +124,9 @@ class UnifiedTreeNode:
             ComponentData() for _ in range(_NUM_COMPONENT_TYPES)
         ]
         self.last_access_time = get_and_increase_time_counter()
+        # Wall-clock twins of last_access_time and of each LRU slot's MRU move,
+        # for observers that report how long evicted entries went unused.
+        self.last_access_wall = time.monotonic()
         self.creation_time = get_and_increase_time_counter()
         # Last insert or lock release on this node: a forward formed after
         # it cannot write the node's device values.
@@ -141,6 +145,9 @@ class UnifiedTreeNode:
             _NUM_COMPONENT_TYPES * 2
         )
         self.lru_next: list[UnifiedTreeNode | None] = [None] * (
+            _NUM_COMPONENT_TYPES * 2
+        )
+        self.lru_wall: list[float] = [self.last_access_wall] * (
             _NUM_COMPONENT_TYPES * 2
         )
         self.id = UnifiedTreeNode.counter
@@ -268,22 +275,26 @@ class UnifiedLRUList:
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node(node)
+        node.lru_wall[self._pt] = time.monotonic()
 
     def insert_after(self, prev_node: UnifiedTreeNode, node: UnifiedTreeNode):
         assert prev_node.id in self.cache
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node_after(prev_node, node)
+        node.lru_wall[self._pt] = prev_node.lru_wall[self._pt]
 
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
         del self.cache[node.id]
         self._remove_node(node)
 
-    def reset_node_mru(self, node: UnifiedTreeNode):
+    def reset_node_mru(self, node: UnifiedTreeNode, *, is_use: bool = True):
         assert node.id in self.cache
         self._remove_node(node)
         self._add_node(node)
+        if is_use:
+            node.lru_wall[self._pt] = time.monotonic()
 
     def reset_node_lru(self, node: UnifiedTreeNode) -> None:
         """Make ``node`` the next eviction victim; session-referenced nodes stay put."""
@@ -326,6 +337,7 @@ class UnifiedLRUList:
         is_referenced = self._is_referenced
         prev_ref = self.head
         prev_unref = self.head if self.mid is None else self.mid
+        now = time.monotonic()
         while node != root_node:
             if should_include(node):
                 assert node.id in self.cache
@@ -337,6 +349,7 @@ class UnifiedLRUList:
                 else:
                     self._add_node_after(prev_unref, node)
                     prev_unref = node
+                node.lru_wall[self._pt] = now
             node = node.parent
 
     def reset_node_and_window_ancestors_mru(
@@ -349,6 +362,7 @@ class UnifiedLRUList:
         is_referenced = self._is_referenced
         prev_ref = self.head
         prev_unref = self.head if self.mid is None else self.mid
+        now = time.monotonic()
         accumulated = 0
         while node != root_node and accumulated < window_size:
             if should_include(node):
@@ -361,6 +375,7 @@ class UnifiedLRUList:
                 else:
                     self._add_node_after(prev_unref, node)
                     prev_unref = node
+                node.lru_wall[self._pt] = now
             accumulated += len(node.key)
             node = node.parent
 
@@ -1049,8 +1064,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
+        now = time.monotonic()
         while node_update:
             node_update.last_access_time = cur_time
+            node_update.last_access_wall = now
             cur_time -= 0.00001
             node_update = node_update.parent
 
@@ -1119,6 +1136,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
+        node.last_access_wall = time.monotonic()
         if node != self.root_node:
             for comp in self.components:
                 if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1478,6 +1496,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> tuple[UnifiedTreeNode, Optional[CacheAction | ComponentAction]]:
         new_node = self._new_node(priority=child.priority)
+        # The prefix holds the child's data; slots the split re-inserts are restamped.
+        new_node.lru_wall = list(child.lru_wall)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
@@ -1532,6 +1552,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             skip_existing=True,
         )
         child.last_access_time = get_and_increase_time_counter()
+        child.last_access_wall = time.monotonic()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
