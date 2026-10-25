@@ -136,6 +136,54 @@ class TpuFp8LinearMethod:
         return out.reshape(*x.shape[:-1], self.out_features)
 
 
+class TpuSharedKMajorLinearMethod:
+    """``quant_method`` reading one layer's columns of a stacked K-major weight another module
+    owns (the Muse megakernel's dense copies), so the linear needs no weight of its own.
+
+    ``stack`` is ``[L, K, N]``; an fp8 stack is dequantized by per-output-column scales at
+    ``scales[index, scale_row, :N]``. Every call runs an XLA dot, at any row count.
+    """
+
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        *,
+        stack: torch.Tensor,
+        index: int,
+        col_start: int,
+        col_stop: int,
+        scales: Optional[torch.Tensor] = None,
+        scale_row: int = 0,
+    ) -> None:
+        if (stack.dtype == torch.float8_e4m3fn) != (scales is not None):
+            raise ValueError("an fp8 stack needs its scales, a bf16 stack none")
+        # The whole stacks, not per-layer views: a view bound into the compiled graph is
+        # re-materialized every step; aliases of one tensor share one graph input.
+        layer.register_buffer("shared_kmajor", stack, persistent=False)
+        if scales is not None:
+            layer.register_buffer("shared_kmajor_scales", scales, persistent=False)
+        self._index = index
+        self._cols = (col_start, col_stop)
+        self._scale_row = scale_row
+        self._scaled = scales is not None
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        c0, c1 = self._cols
+        w = layer.shared_kmajor[self._index, :, c0:c1]
+        out = torch.matmul(x, w.to(x.dtype))
+        if self._scaled:
+            scale = layer.shared_kmajor_scales[self._index, self._scale_row, c0:c1]
+            out = (out.float() * scale).to(x.dtype)
+        if bias is not None:
+            out = out + bias
+        return out
+
+
 def install_fp8_linears(module: torch.nn.Module) -> int:
     """Swap every unquantized linear under ``module`` to fp8 weight-only; returns the count."""
     count = 0

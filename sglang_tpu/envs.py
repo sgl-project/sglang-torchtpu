@@ -64,6 +64,10 @@ class TpuEnvs:
     # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
     SGLANG_TPU_MUSE_MEGAKERNEL = EnvBool(False)
+    # With the megakernel: prefill and other native-path steps run the dense linears and routers
+    # on the kernel's fp8 K-major copies (per-column scales, as in decode) and the bf16
+    # weights are freed for the KV pool.
+    SGLANG_TPU_MUSE_SHARED_DENSE = EnvBool(False)
     # Largest megakernel step in rows (running requests x verify tokens, padded to the
     # TP size); larger steps run the native decoder. Steps above 32 rows use the
     # large-step paths (ops._BASE_STEP_MAX_ROWS).

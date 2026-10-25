@@ -23,6 +23,7 @@ from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.fp8_weight_linear import TpuSharedKMajorLinearMethod
 from sglang_tpu.kv_pool import (
     TpuFusedMHATokenToKVPool,
     TpuSeqAlongLaneKVPool,
@@ -294,6 +295,49 @@ class MuseMegakernel(torch.nn.Module):
         _INSTANCE[:] = [mk]
         _register_op()
         return mk
+
+    def share_dense_weights(self, decoder) -> int:
+        """Run the native path's dense linears and routers on the kernel's K-major copies and
+        drop their own weights; returns the bytes dropped per device."""
+        S = K.SMALL
+        dropped = 0
+        for i, layer in enumerate(decoder.layers):
+            attn, moe = layer.self_attn, layer.mlp
+            qkv_cols = attn.qkv_proj.weight.shape[0]
+            gate_cols = attn.gate_proj.weight.shape[0]
+            plan = (
+                (attn.qkv_proj, self.w_wqkvg, 0, qkv_cols, "wqkvg_s"),
+                (attn.gate_proj, self.w_wqkvg, qkv_cols, qkv_cols + gate_cols, "wqkvg_s"),
+                (attn.o_proj, self.w_wo, 0, attn.o_proj.weight.shape[0], "wo_s"),
+                (
+                    moe.pre_expert_proj,
+                    self.w_wpool,
+                    0,
+                    moe.pre_expert_proj.weight.shape[0],
+                    "wpool_s",
+                ),
+                (
+                    moe.post_expert_proj,
+                    self.w_wunpool,
+                    0,
+                    moe.post_expert_proj.weight.shape[0],
+                    "wunpool_s",
+                ),
+                (moe.gate, self.w_wrouter, 0, self.geo.n_experts, None),
+            )
+            for linear, stack, c0, c1, scale_name in plan:
+                dropped += linear.weight.numel() * linear.weight.element_size()
+                linear.quant_method = TpuSharedKMajorLinearMethod(
+                    linear,
+                    stack=stack,
+                    index=i,
+                    col_start=c0,
+                    col_stop=c1,
+                    scales=None if scale_name is None else self.w_smalls,
+                    scale_row=0 if scale_name is None else S[scale_name],
+                )
+                linear.weight = None
+        return dropped
 
     # ------------------------------------------------------------------ op building
     def config(
