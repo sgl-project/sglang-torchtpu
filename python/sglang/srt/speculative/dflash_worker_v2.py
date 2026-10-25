@@ -3308,7 +3308,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Sliced inputs are cloned: the compiled draft helpers guard on storage offsets.
         bonus_in = batch.input_ids[n_pf_tok : n_pf_tok + n_tail].clone()
         committed = batch.seq_lens[n_p:] - w
+        # With the running part's device-accept plan the host holds only the schedule-time
+        # committed base (the overlap resolve did not wait for the in-flight step).
+        plan = batch.mix_tail_spec_info
+        if plan is not None and plan.tpu_verify_cache_candidates is None:
+            plan = None
         tail_view = SimpleNamespace(
+            req_to_token_pool=batch.req_to_token_pool,
             req_pool_indices=batch.req_pool_indices[n_p:].clone(),
             req_pool_indices_cpu=torch.as_tensor(batch.req_pool_indices_cpu)[n_p:].clone(),
             sampling_info=_tail_sampling_info(
@@ -3316,10 +3322,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             seq_lens=committed,
             seq_lens_cpu=(
-                batch.seq_lens_cpu[n_p:] - w if batch.seq_lens_cpu is not None else None
+                batch.mix_tail_committed_cpu
+                if plan is not None
+                else batch.seq_lens_cpu[n_p:] - w
+                if batch.seq_lens_cpu is not None
+                else None
             ),
         )
         tail_input = make_draft_input_v2(bonus_tokens=bonus_in, new_seq_lens=committed)
+        if plan is not None:
+            tail_input.tpu_verify_cache_candidates = plan.tpu_verify_cache_candidates
+            tail_input.tpu_committed_lens = plan.tpu_committed_lens
+            tail_input.tpu_host_seq_lens_is_committed = True
         ctx = self._draft_verify_block(tail_view, tail_input)
 
         # --- target forward: prefill rows, then each tail's block (bonus + drafts).
@@ -3333,6 +3347,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             return_hidden_states_before_norm=False,
         )
+        # The tails' positions and slots come from the drafted block, which addresses the
+        # published committed lengths; the batch's host prefix lengths may lag them.
+        tail_rows = slice(n_pf_tok, n_pf_tok + n_tail * w)
+        positions = forward_batch.positions.clone()
+        positions[tail_rows] = ctx.positions.to(positions.dtype)
+        forward_batch.positions = positions
+        if forward_batch.out_cache_loc.device == ctx.verify_out_cache_loc.device:
+            out_cache_loc = forward_batch.out_cache_loc.clone()
+            out_cache_loc[tail_rows] = ctx.verify_out_cache_loc.to(out_cache_loc.dtype)
+            forward_batch.out_cache_loc = out_cache_loc
         target_out = self.target_worker.forward_batch_generation(
             batch=None, forward_batch=forward_batch, is_verify=True
         )

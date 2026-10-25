@@ -214,3 +214,45 @@ def resolve_device_accept_seq_lens_tpu(
         return False
     batch.seq_lens = future_map.new_seq_lens_buf[batch.spec_info.future_indices]
     return True
+
+
+def resolve_mixed_spec_tails_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool:
+    """Rebind a mixed-verify batch's tails on device when its running part carries the
+    decode device-accept plan (verify window candidates from the committed base).
+
+    The block's slots come from the candidates at the published length, so the host
+    never waits on the in-flight step; the host lengths stay upper bounds (committed
+    base + the block + one block of slack), as for decode. The worker sets the tails'
+    positions from the drafted block. False leaves the synchronizing resolve to the
+    caller.
+    """
+    info = batch.mix_tail_spec_info
+    if (
+        not batch.mix_verify_tails
+        or info is None
+        or info.tpu_verify_cache_candidates is None
+    ):
+        return False
+    idx = batch.mix_running_indices
+    n = int(idx.shape[0])
+    width = batch.extend_lens[-1]
+    fresh = future_map.new_seq_lens_buf[idx].to(torch.int64)
+    seq_lens = batch.seq_lens.clone()
+    seq_lens[-n:] = (fresh + width).to(seq_lens.dtype)
+    batch.seq_lens = seq_lens
+    if batch.out_cache_loc.device == fresh.device:
+        offsets = torch.arange(width, device=fresh.device, dtype=torch.int64)
+        cols = (fresh - info.tpu_committed_lens)[:, None] + offsets[None, :]
+        out_cache_loc = batch.out_cache_loc.clone()
+        out_cache_loc[-n * width :] = (
+            torch.gather(info.tpu_verify_cache_candidates, 1, cols)
+            .reshape(-1)
+            .to(out_cache_loc.dtype)
+        )
+        batch.out_cache_loc = out_cache_loc
+    if batch.seq_lens_cpu is not None:
+        seq_lens_cpu = batch.seq_lens_cpu.clone()
+        seq_lens_cpu[-n:] = batch.mix_tail_committed_cpu + 2 * width
+        batch.seq_lens_cpu = seq_lens_cpu
+        batch.seq_lens_sum = int(seq_lens_cpu.sum())
+    return True

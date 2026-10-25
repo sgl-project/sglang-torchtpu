@@ -2484,6 +2484,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.
     mix_running_indices_cpu: Optional[torch.Tensor] = None
+    # Mixed verify: the running part's draft input after prepare_for_decode, and the
+    # tails' committed lengths as the host knew them at schedule time.
+    mix_tail_spec_info: Optional[SpecInput] = None
+    mix_tail_committed_cpu: Optional[torch.Tensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -3263,11 +3267,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if not self.spec_algorithm.is_none():
             # Spec keeps no per-step out_cache_loc on the running batch; gather
             # each tail's bonus slot at the committed length (rebound under overlap).
-            tail_base = torch.tensor(
-                [r.seqlen - 1 for r in running_batch.reqs],
-                dtype=torch.int64,
-                device=self.seq_lens.device,
+            tail_base_cpu = torch.tensor(
+                [r.seqlen - 1 for r in running_batch.reqs], dtype=torch.int64
             )
+            tail_base = tail_base_cpu.to(self.seq_lens.device)
+            if tail_width > 1:
+                self.mix_tail_spec_info = running_batch.spec_info
+                self.mix_tail_committed_cpu = tail_base_cpu
             # Gather on the table's device (host-resident on some backends). The
             # verify window lies inside the 2-block reservation prepare_for_decode made.
             req_to_token = self.req_to_token_pool.req_to_token
