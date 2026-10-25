@@ -218,7 +218,7 @@ case "$BENCH_MODEL" in
         # MEM_FRACTION_STATIC.
         # Scaled by TP below (per-rank bytes stay constant).
         MAX_TOTAL_TOKENS_TP8=1572864
-        MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.87}
+        MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.9}
         MODEL_EXTRA_ARGS="--tpu-fp8-runtime channelwise --sampling-defaults openai"
         ;;
     *)
