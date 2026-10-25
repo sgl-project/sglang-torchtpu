@@ -217,6 +217,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    mixed_tail_width,
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -4281,7 +4282,11 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            (
+                running_bs * mixed_tail_width(self.spec_algorithm)
+                if self.is_mixed_chunk
+                else 0
+            ),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,

@@ -15,12 +15,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    _extend_batch_cap,
     _restore_forward_batch_inputs,
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
@@ -94,6 +95,48 @@ class BaseSpecDecodeCompilePolicyMixin:
             pending += self._precompile_target_verify()
         if disagg_mode != "decode":
             pending += self._precompile_extend_full()
+            pending += self._precompile_mixed_verify()
+        return pending
+
+    def _precompile_mixed_verify(self) -> list[PendingCall]:
+        """Compile MIXED batches whose decoding requests carry whole DFLASH verify
+        blocks (SGLANG_DFLASH_MIXED_VERIFY): FULL capture, verify-width logits rows."""
+        from sglang.srt.managers.schedule_batch import mixed_tail_width
+
+        if not get_schedule().enable_mixed_chunk:
+            return []
+        width = mixed_tail_width(self.model_runner.spec_algorithm)
+        if width <= 1:
+            return []
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.b_bucketer.max_val)
+        shapes = [
+            (t, has_spec_info, variant)
+            for t in self.t_bucketer.buckets
+            if t >= bs
+            for has_spec_info in (False, True)
+            for variant in self._extend_input_variants()
+        ]
+        logger.info(
+            "[spec compile policy] MIXED verify (FULL, width %d): %d shapes (bs=%d)",
+            width,
+            len(shapes),
+            bs,
+        )
+        pending = []
+        for num_tokens, has_spec_info, variant in shapes:
+            warmup = self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=ForwardMode.MIXED,
+                variant=variant,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                spec_info=self.make_null_spec_info() if has_spec_info else None,
+                mix_verify_width=width,
+            )
+            if warmup is not None:
+                pending.append(warmup)
         return pending
 
     def _precompile_target_verify(self) -> list[PendingCall]:

@@ -176,6 +176,14 @@ ReturnHiddenStatesMode = Union[bool, Literal["last"]]
 SamplingLogprobsMode = Literal["selected", "support"]
 
 
+def mixed_tail_width(spec_algorithm) -> int:
+    """Rows a decoding request takes in a MIXED batch: its DFLASH verify block under
+    SGLANG_DFLASH_MIXED_VERIFY, else one decode token."""
+    if spec_algorithm.is_dflash() and envs.SGLANG_DFLASH_MIXED_VERIFY.get():
+        return int(get_spec().speculative_num_draft_tokens)
+    return 1
+
+
 def get_return_hidden_states_mode(
     return_hidden_states: ReturnHiddenStatesMode,
 ) -> CaptureHiddenMode:
@@ -2471,6 +2479,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Mixed-batch decode tokens are not included in this CPU prefix.
     mm_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
+    # Number of trailing rows of a MIXED batch that carry a whole DFLASH verify block.
+    mix_verify_tails: int = 0
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.
     mix_running_indices_cpu: Optional[torch.Tensor] = None
@@ -3228,6 +3238,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
+        # DFLASH mixed verify: each tail is its verify block (bonus + drafts), drafted
+        # by the worker before the target forward; otherwise a 1-token decode.
+        tail_width = mixed_tail_width(self.spec_algorithm)
+        self.mix_verify_tails = running_bs if tail_width > 1 else 0
 
         # Same invariant as convert_decode_to_extend: the caller ran
         # prepare_for_decode, so a tail's prefix is its row length - 1.
@@ -3254,10 +3268,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.seq_lens.device,
             )
-            running_out_cache_loc = self.req_to_token_pool.req_to_token[
-                running_batch.req_pool_indices.long(),
-                tail_base,
-            ].to(self.out_cache_loc.dtype)
+            # The verify window lies inside the 2-block reservation prepare_for_decode made.
+            tail_cols = tail_base[:, None] + torch.arange(
+                tail_width, dtype=torch.int64, device=tail_base.device
+            )
+            running_out_cache_loc = (
+                self.req_to_token_pool.req_to_token[
+                    running_batch.req_pool_indices.long()[:, None],
+                    tail_cols,
+                ]
+                .reshape(-1)
+                .to(self.out_cache_loc.dtype)
+            )
             # The spec relay is unresolved at schedule time, so merge_batch
             # would null seq_lens_cpu; rebuild the tails from request state.
             running_seq_lens_cpu = torch.tensor(
@@ -3285,13 +3307,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Spec seq_lens sit at the committed base (bonus token pending);
             # this step commits it, so tails carry base + 1 or attention drops the row.
             merged = self.seq_lens.clone()
-            merged[-running_bs:] = tail_base + 1
+            merged[-running_bs:] = tail_base + tail_width
             self.seq_lens = merged
+            if self.seq_lens_cpu is not None and tail_width > 1:
+                merged_cpu = self.seq_lens_cpu.clone()
+                merged_cpu[-running_bs:] = merged_cpu[-running_bs:] + (tail_width - 1)
+                self.seq_lens_cpu = merged_cpu
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens = self.prefix_lens + running_prefix_lens
-        self.extend_lens = self.extend_lens + [1] * running_bs
-        self.extend_num_tokens = self.extend_num_tokens + running_bs
+        self.extend_lens = self.extend_lens + [tail_width] * running_bs
+        self.extend_num_tokens = self.extend_num_tokens + tail_width * running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens = (
             self.extend_logprob_start_lens + [0] * running_bs
@@ -3952,6 +3978,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=self.return_hidden_states,
             return_hidden_states_mode=self.return_hidden_states_mode,
             decoding_reqs=self.decoding_reqs,
+            mix_verify_tails=self.mix_verify_tails,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,

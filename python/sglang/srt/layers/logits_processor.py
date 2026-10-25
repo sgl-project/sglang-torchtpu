@@ -397,6 +397,8 @@ class LogitsMetadata:
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
+    # See ForwardBatch.mix_verify_width.
+    mix_verify_width: int = 1
 
     @classmethod
     def from_forward_batch(
@@ -490,6 +492,7 @@ class LogitsMetadata:
             ),
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            mix_verify_width=forward_batch.mix_verify_width,
         )
 
     def compute_dp_attention_metadata(self):
@@ -851,6 +854,18 @@ class LogitsProcessor(nn.Module):
                 )
             else:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            if logits_metadata.mix_verify_width > 1:
+                # Last w rows of every sequence ([bs * w], sequence-major): a verify
+                # tail's whole block; a prefill sequence's last row comes last.
+                w = logits_metadata.mix_verify_width
+                back = torch.arange(
+                    w - 1, -1, -1, dtype=last_index.dtype, device=last_index.device
+                )
+                start = last_index + 1 - logits_metadata.extend_seq_lens.to(
+                    last_index.dtype
+                )
+                rows = torch.maximum(last_index[:, None] - back[None, :], start[:, None])
+                last_index = rows.clamp(0, hidden_states.shape[0] - 1).reshape(-1)
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]

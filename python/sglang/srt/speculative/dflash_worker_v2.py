@@ -1,5 +1,6 @@
 import contextlib
 import logging
+from types import SimpleNamespace
 import math
 import os
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
@@ -2853,159 +2854,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
-    def forward_batch_generation(
-        self,
-        batch: ScheduleBatch,
-        on_publish=None,
-        grammar_barrier=None,
-        pp_proxy_tensors=None,
-    ) -> GenerationBatchResult:
-        self._validate_phase1_sampling_support(batch)
-
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill: capture DFlash aux hidden states for prompt tokens.
-            batch_output = self.target_worker.forward_batch_generation(
-                batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-            )
-
-            logits_output, next_token_ids = (
-                batch_output.logits_output,
-                batch_output.next_token_ids,
-            )
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
-            new_seq_lens = batch.seq_lens
-            batch_output.new_seq_lens = new_seq_lens
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-
-            # An idle DP rank runs the empty target prefill above to stay in
-            # the DP collective, but must skip the draft KV materialization,
-            # which needs per-request extend info.
-            if batch.forward_mode.is_idle():
-                batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
-                    device=self.device
-                )
-                return batch_output
-
-            target_hidden = logits_output.hidden_states
-            if target_hidden is None:
-                raise RuntimeError(
-                    "DFLASH requires target aux hidden capture for prefill, but got None. "
-                    "Make sure the target model has DFlash layers-to-capture configured."
-                )
-
-            if batch.extend_lens is None or batch.prefix_lens is None:
-                raise RuntimeError(
-                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
-                    "but got None."
-                )
-
-            # Materialize prompt tokens into the draft KV cache immediately. This is required
-            # for radix cache safety (the scheduler may update radix after prefill returns).
-            device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
-
-            if batch.out_cache_loc is None:
-                raise RuntimeError(
-                    "DFLASH prefill expected out_cache_loc, but got None."
-                )
-            positions, _ = compute_position(
-                self.model_runner.prefill_attention_backend_str,
-                draft_seq_lens,
-                ctx_lens,
-                int(sum(batch.extend_lens)),
-            )
-            draft_kv_write_tail = self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=target_hidden,
-                cache_loc=batch.out_cache_loc,
-                swa_cache_loc=(
-                    self._extend_swa_cache_loc(
-                        batch=batch, num_tokens=int(batch.out_cache_loc.numel())
-                    )
-                    if self._draft_kv_is_swa
-                    else None
-                ),
-                positions=positions,
-                extend_lens=ctx_lens,
-            )
-
-            # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-            logits_output.hidden_states = None
-
-            batch_output.next_draft_input = self._make_next_draft_input_prefill(
-                bonus_tokens=next_token_ids,
-                seq_lens=new_seq_lens,
-            )
-            batch_output.next_draft_input.draft_kv_write_tail = draft_kv_write_tail
-            return batch_output
-
-        # Decode / target-verify stage.
-        if batch.spec_info is None:
-            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
-
-        draft_input = batch.spec_info
-        if not isinstance(draft_input, DFlashDraftInputV2):
-            raise RuntimeError(
-                "DFLASH spec-v2 expected DFlashDraftInputV2 state on the running batch."
-            )
-
-        if batch.forward_mode.is_idle():
-            # Under dp attention an idle DP rank must still run the target
-            # verify forward (IDLE mode) so its cross-DP collectives stay in
-            # lockstep with the active DP group; the draft block's
-            # collectives are within-rank and skipped.
-            if get_parallel().attn_dp_enabled:
-                idle_verify_input = DFlashVerifyInput(
-                    draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
-                    positions=torch.empty((0,), dtype=torch.int64, device=self.device),
-                    draft_token_num=int(self.block_size),
-                    custom_mask=None,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                )
-                idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
-                    batch, self._target_worker
-                )
-                # Force eager: the active ranks run eager verify when any DP
-                # rank is idle (see the idle-guard below); a graph-replaying
-                # idle rank would disagree with them on DP-gather segment
-                # offsets (padded bucket vs raw counts).
-                idle_verify_forward_batch.can_run_decode_cuda_graph = False
-                self._target_worker.forward_batch_generation(
-                    batch=None,
-                    forward_batch=idle_verify_forward_batch,
-                    is_verify=True,
-                    skip_attn_backend_init=True,
-                )
-            empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
-            empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
-            next_draft_input = self._make_next_draft_input_decode(
-                bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
-                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
-            )
-            if on_publish is not None:
-                on_publish(next_draft_input.new_seq_lens)
-            return GenerationBatchResult(
-                logits_output=None,
-                next_token_ids=empty_ids,
-                accept_lens=empty_lens,
-                next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
-                speculative_num_draft_tokens=int(self.block_size),
-                new_seq_lens=next_draft_input.new_seq_lens,
-            )
-
-        # `seq_lens` is carried over from the previous overlap iteration and may have been
-        # produced on another stream.
-        if not _is_tpu:
-            batch.seq_lens.record_stream(
-                torch.get_device_module(self.device).current_stream()
-            )
-
+    def _draft_verify_block(self, batch, draft_input) -> SimpleNamespace:
+        """Draft one verify block per request: block ids, positions and KV slots of
+        the block, and the drafted tokens (bonus first)."""
         bs = len(batch.seq_lens)
         device = self.device
 
@@ -3399,6 +3250,347 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = verify_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        return SimpleNamespace(
+            bs=bs,
+            device=device,
+            block_size=block_size,
+            prefix_lens=prefix_lens,
+            host_len_slack=host_len_slack,
+            positions=positions,
+            verify_out_cache_loc=verify_out_cache_loc,
+            verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+            verify_swa_loc_2d=verify_swa_loc_2d,
+            draft_tokens=draft_tokens,
+        )
+
+    def _forward_mixed_verify(
+        self, batch: ScheduleBatch, on_publish=None
+    ) -> GenerationBatchResult:
+        """A MIXED batch whose last ``mix_verify_tails`` requests are decoding: draft
+        their verify blocks, run the blocks with the prefill rows in one target
+        forward, then accept the blocks and write both the prompt rows and the
+        committed block rows into the draft KV.
+
+        Output layout is the spec decode one, per request: ``block_size`` token slots
+        and an accept length (1 for a prefill request, whose token is in slot 0).
+        """
+        n_tail = int(batch.mix_verify_tails)
+        w = int(self.block_size)
+        n_req = len(batch.reqs)
+        n_p = n_req - n_tail
+        n_pf_tok = int(sum(batch.extend_lens[:n_p]))
+        device = self.device
+
+        # Until drafted, each tail holds one row: its pending bonus token.
+        bonus_in = batch.input_ids[n_pf_tok : n_pf_tok + n_tail]
+        committed = batch.seq_lens[n_p:] - w
+        tail_view = SimpleNamespace(
+            req_pool_indices=batch.req_pool_indices[n_p:],
+            req_pool_indices_cpu=torch.as_tensor(batch.req_pool_indices_cpu)[n_p:],
+            sampling_info=batch.sampling_info,
+            seq_lens=committed,
+            seq_lens_cpu=(
+                batch.seq_lens_cpu[n_p:] - w if batch.seq_lens_cpu is not None else None
+            ),
+        )
+        tail_input = make_draft_input_v2(bonus_tokens=bonus_in, new_seq_lens=committed)
+        ctx = self._draft_verify_block(tail_view, tail_input)
+
+        # --- target forward: prefill rows, then each tail's block (bonus + drafts).
+        batch.input_ids = torch.cat(
+            [batch.input_ids[:n_pf_tok], ctx.draft_tokens.reshape(-1)]
+        )
+        self.target_worker.set_hicache_consumer(batch.hicache_consumer_index)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.target_worker.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
+        target_out = self.target_worker.forward_batch_generation(
+            batch=None, forward_batch=forward_batch, is_verify=True
+        )
+        logits_output = target_out.logits_output
+        # mix_verify_width rows per request, request-major.
+        rows = logits_output.next_token_logits.view(n_req, w, -1)
+        target_hidden = logits_output.hidden_states
+
+        # --- prefill requests: sample from their last row (the sampler wants one row
+        # per request; a tail's row here is unused).
+        logits_output.next_token_logits = rows[:, -1, :].contiguous()
+        sampled = self.target_worker.model_runner.sample(logits_output, forward_batch)
+        prefill_next = sampled[:n_p].to(torch.int64)
+
+        # --- tails: accept the drafted blocks.
+        candidates = ctx.draft_tokens
+        tail_logits = rows[n_p:].reshape(n_tail * w, -1)
+        (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_tail_lens,
+            target_predict,
+        ) = self._accept_block(
+            candidates=candidates,
+            next_token_logits=tail_logits,
+            sampling_info=batch.sampling_info if n_p == 0 else None,
+            draft_input=tail_input,
+            prefix_lens=committed,
+        )
+        if SIMULATE_ACC_LEN > 0:
+            if target_predict is None:
+                target_predict = torch.argmax(tail_logits, dim=-1).view(n_tail, w)
+            apply_dflash_simulated_acceptance(
+                candidates=candidates[:n_tail],
+                target_predict=target_predict,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
+            new_tail_lens = None
+        if new_tail_lens is None:
+            new_tail_lens = committed + commit_lens.to(committed.dtype)
+
+        new_seq_lens = torch.cat(
+            [batch.seq_lens[:n_p], new_tail_lens.to(batch.seq_lens.dtype)]
+        )
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        # --- draft KV: every prompt row, then each tail's committed block rows.
+        write_tail = None
+        if n_p > 0:
+            ctx_lens = torch.tensor(batch.extend_lens[:n_p], dtype=torch.int32, device=device)
+            pf_positions, _ = compute_position(
+                self.model_runner.prefill_attention_backend_str,
+                torch.tensor(batch.prefix_lens[:n_p], dtype=torch.int32, device=device),
+                ctx_lens,
+                n_pf_tok,
+            )
+            pf_view = SimpleNamespace(
+                req_to_token_pool=batch.req_to_token_pool,
+                out_cache_loc=batch.out_cache_loc[:n_pf_tok],
+                req_pool_indices_cpu=torch.as_tensor(batch.req_pool_indices_cpu)[:n_p],
+                prefix_lens=batch.prefix_lens[:n_p],
+                extend_lens=batch.extend_lens[:n_p],
+            )
+            write_tail = self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=target_hidden[:n_pf_tok],
+                cache_loc=batch.out_cache_loc[:n_pf_tok],
+                swa_cache_loc=(
+                    self._extend_swa_cache_loc(batch=pf_view, num_tokens=n_pf_tok)
+                    if self._draft_kv_is_swa
+                    else None
+                ),
+                positions=pf_positions,
+                extend_lens=ctx_lens,
+            )
+        tail_write = self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=target_hidden[n_pf_tok : n_pf_tok + n_tail * w],
+            cache_loc=ctx.verify_out_cache_loc,
+            cache_loc_2d=ctx.verify_out_cache_loc_2d,
+            swa_cache_loc_2d=ctx.verify_swa_loc_2d,
+            positions=ctx.positions,
+            commit_lens=commit_lens,
+        )
+        write_tail = tail_write if tail_write is not None else write_tail
+        logits_output.hidden_states = None
+
+        tokens = torch.zeros((n_req, w), dtype=torch.int64, device=device)
+        tokens[:n_p, 0] = prefill_next
+        tokens[n_p:] = out_tokens[:n_tail].to(torch.int64)
+        accept_lens = torch.cat(
+            [
+                torch.ones((n_p,), dtype=commit_lens.dtype, device=device),
+                commit_lens[:n_tail],
+            ]
+        )
+        next_draft_input = make_draft_input_v2(
+            bonus_tokens=torch.cat([prefill_next, bonus[:n_tail].to(torch.int64)]),
+            new_seq_lens=new_seq_lens,
+        )
+        next_draft_input.draft_kv_write_tail = write_tail
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=tokens.reshape(-1),
+            accept_lens=accept_lens,
+            can_run_cuda_graph=target_out.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=w,
+            new_seq_lens=new_seq_lens,
+            routed_experts_output=target_out.routed_experts_output,
+            indexer_topk_output=target_out.indexer_topk_output,
+        )
+
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
+    ) -> GenerationBatchResult:
+        self._validate_phase1_sampling_support(batch)
+
+        if batch.forward_mode.is_mixed() and batch.mix_verify_tails:
+            return self._forward_mixed_verify(batch, on_publish=on_publish)
+
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # Target prefill: capture DFlash aux hidden states for prompt tokens.
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+
+            logits_output, next_token_ids = (
+                batch_output.logits_output,
+                batch_output.next_token_ids,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
+            new_seq_lens = batch.seq_lens
+            batch_output.new_seq_lens = new_seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+
+            # An idle DP rank runs the empty target prefill above to stay in
+            # the DP collective, but must skip the draft KV materialization,
+            # which needs per-request extend info.
+            if batch.forward_mode.is_idle():
+                batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
+                    device=self.device
+                )
+                return batch_output
+
+            target_hidden = logits_output.hidden_states
+            if target_hidden is None:
+                raise RuntimeError(
+                    "DFLASH requires target aux hidden capture for prefill, but got None. "
+                    "Make sure the target model has DFlash layers-to-capture configured."
+                )
+
+            if batch.extend_lens is None or batch.prefix_lens is None:
+                raise RuntimeError(
+                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
+                    "but got None."
+                )
+
+            # Materialize prompt tokens into the draft KV cache immediately. This is required
+            # for radix cache safety (the scheduler may update radix after prefill returns).
+            device = next_token_ids.device
+            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+            draft_seq_lens = torch.tensor(
+                batch.prefix_lens, dtype=torch.int32, device=device
+            )
+
+            if batch.out_cache_loc is None:
+                raise RuntimeError(
+                    "DFLASH prefill expected out_cache_loc, but got None."
+                )
+            positions, _ = compute_position(
+                self.model_runner.prefill_attention_backend_str,
+                draft_seq_lens,
+                ctx_lens,
+                int(sum(batch.extend_lens)),
+            )
+            draft_kv_write_tail = self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=target_hidden,
+                cache_loc=batch.out_cache_loc,
+                swa_cache_loc=(
+                    self._extend_swa_cache_loc(
+                        batch=batch, num_tokens=int(batch.out_cache_loc.numel())
+                    )
+                    if self._draft_kv_is_swa
+                    else None
+                ),
+                positions=positions,
+                extend_lens=ctx_lens,
+            )
+
+            # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+            logits_output.hidden_states = None
+
+            batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                bonus_tokens=next_token_ids,
+                seq_lens=new_seq_lens,
+            )
+            batch_output.next_draft_input.draft_kv_write_tail = draft_kv_write_tail
+            return batch_output
+
+        # Decode / target-verify stage.
+        if batch.spec_info is None:
+            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
+
+        draft_input = batch.spec_info
+        if not isinstance(draft_input, DFlashDraftInputV2):
+            raise RuntimeError(
+                "DFLASH spec-v2 expected DFlashDraftInputV2 state on the running batch."
+            )
+
+        if batch.forward_mode.is_idle():
+            # Under dp attention an idle DP rank must still run the target
+            # verify forward (IDLE mode) so its cross-DP collectives stay in
+            # lockstep with the active DP group; the draft block's
+            # collectives are within-rank and skipped.
+            if get_parallel().attn_dp_enabled:
+                idle_verify_input = DFlashVerifyInput(
+                    draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
+                    positions=torch.empty((0,), dtype=torch.int64, device=self.device),
+                    draft_token_num=int(self.block_size),
+                    custom_mask=None,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
+                    batch, self._target_worker
+                )
+                # Force eager: the active ranks run eager verify when any DP
+                # rank is idle (see the idle-guard below); a graph-replaying
+                # idle rank would disagree with them on DP-gather segment
+                # offsets (padded bucket vs raw counts).
+                idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                self._target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=idle_verify_forward_batch,
+                    is_verify=True,
+                    skip_attn_backend_init=True,
+                )
+            empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
+            empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
+            next_draft_input = self._make_next_draft_input_decode(
+                bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
+                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
+            )
+            if on_publish is not None:
+                on_publish(next_draft_input.new_seq_lens)
+            return GenerationBatchResult(
+                logits_output=None,
+                next_token_ids=empty_ids,
+                accept_lens=empty_lens,
+                next_draft_input=next_draft_input,
+                can_run_cuda_graph=False,
+                speculative_num_draft_tokens=int(self.block_size),
+                new_seq_lens=next_draft_input.new_seq_lens,
+            )
+
+        # `seq_lens` is carried over from the previous overlap iteration and may have been
+        # produced on another stream.
+        if not _is_tpu:
+            batch.seq_lens.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+
+        # --- 1) Draft a fixed block with the draft model.
+        ctx = self._draft_verify_block(batch, draft_input)
+        bs, device, block_size = ctx.bs, ctx.device, ctx.block_size
+        prefix_lens, host_len_slack = ctx.prefix_lens, ctx.host_len_slack
+        positions, verify_out_cache_loc = ctx.positions, ctx.verify_out_cache_loc
+        verify_out_cache_loc_2d = ctx.verify_out_cache_loc_2d
+        verify_swa_loc_2d = ctx.verify_swa_loc_2d
+        draft_tokens = ctx.draft_tokens
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (

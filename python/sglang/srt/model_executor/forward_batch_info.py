@@ -586,6 +586,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_logprob: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    # MIXED batch with DFLASH verify tails: logits for the last this-many rows of
+    # every sequence (a tail's whole verify block), not only the last row.
+    mix_verify_width: int = 1
     # Selected before a TPU model forward; full vocabulary is the safe default.
     logits_output_mode: LogitsOutputMode = LogitsOutputMode.FULL_VOCAB
     spec_algorithm: SpeculativeAlgorithm = None
@@ -1065,6 +1068,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            # batches built outside the scheduler may not carry mix_verify_tails
+            mix_verify_width=(
+                int(batch.extend_lens[-1])
+                if getattr(batch, "mix_verify_tails", 0)
+                else 1
+            ),
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,

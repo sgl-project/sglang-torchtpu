@@ -222,7 +222,8 @@ def _unpad_decoder_outputs(
         return out
 
     if isinstance(out, LogitsProcessorOutput):
-        out.trim_next_token_outputs(real_b)
+        # A mixed-verify batch carries mix_verify_width logits rows per sequence.
+        out.trim_next_token_outputs(real_b * forward_batch.mix_verify_width)
         if (
             out.hidden_states is not None
             and isinstance(out.hidden_states, torch.Tensor)
@@ -1603,6 +1604,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        mix_verify_width: int = 1,
     ) -> PendingCall | float | None:
         """Run one warmup, defer async execution, or time synchronous profiling."""
         self._compiled_extend_variants.add(variant)
@@ -1617,6 +1619,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch = (
             kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         )
+        forward_batch.mix_verify_width = mix_verify_width
         prepared_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
         if prepared_batch is not forward_batch:
             if "forward_batch" in kwargs:
