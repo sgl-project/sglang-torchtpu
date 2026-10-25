@@ -96,37 +96,48 @@ def _invoke_batched_kernel(
     # cu_kv_lens is not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
     # the argument the shared shell passes for kernels that do is
-    # discarded here. The base never widens decode for this kernel
-    # (``supports_decode_query_size`` is off), so the width is always 1.
+    # discarded here.
     del cu_kv_lens
-    block_options = {}
-    if decode_query_size > 1:
-        distribution, block_options["prefill_block_sizes"] = _verify_as_mixed(
-            distribution,
-            decode_query_size=decode_query_size,
+
+    def run(kv_cache, dist, prefill_block_sizes=None):
+        return jax_rpa(
+            queries,
+            keys,
+            values,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            dist,
+            attention_sink=attention_sink,
+            sm_scale=sm_scale,
             sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            use_causal_mask=True,
+            # The kernel owns the KV write; the backend never writes out of band.
+            skip_kv_update=False,
+            kv_layout=kv_layout(),
+            prefill_block_sizes=prefill_block_sizes,
         )
-    return jax_rpa(
-        queries,
-        keys,
-        values,
+
+    if decode_query_size == 1:
+        return run(kv_cache_fused, distribution)
+    # The DECODE range [0, distribution[0]) holds the width-wide sequences (a verify
+    # batch, or a mixed-verify extend's tails, ordered first). The kernel's DECODE pass
+    # takes one row per sequence, so they run as MIXED with verify-sized q blocks; the
+    # remaining sequences then run as MIXED with the prefill blocks.
+    import jax.numpy as jnp
+
+    out_verify, kv_cache_fused = run(
         kv_cache_fused,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        attention_sink=attention_sink,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        use_causal_mask=True,
-        # The kernel owns the KV write; the backend never writes out of band.
-        skip_kv_update=False,
-        kv_layout=kv_layout(),
-        **block_options,
+        jnp.zeros_like(distribution).at[2].set(distribution[0]),
+        _verify_blocks(decode_query_size=decode_query_size, sliding_window=sliding_window),
     )
+    out_rest, kv_cache_fused = run(kv_cache_fused, distribution.at[0].set(0))
+    verify_rows = jnp.arange(queries.shape[0]) < cu_q_lens[distribution[0]]
+    return jnp.where(verify_rows[:, None, None], out_verify, out_rest), kv_cache_fused
 
 
 # k block for verify-as-MIXED, measured on v7 at head_dim 64, 2 KV heads, fp8, 16-32 x 8 rows
@@ -134,16 +145,9 @@ def _invoke_batched_kernel(
 _VERIFY_BKV = 4096
 
 
-def _verify_as_mixed(
-    distribution, *, decode_query_size: int, sliding_window: int | None
-):
-    """Rerun a uniform-width DECODE batch as MIXED with a q block of that width.
-
-    The kernel's DECODE range takes one query row per sequence, so verify rows must
-    go through MIXED, whose default block search sizes q blocks for prefill chunks.
-    """
-    import jax.numpy as jnp
-
+def _verify_blocks(*, decode_query_size: int, sliding_window: int | None):
+    """MIXED-mode blocks for width-wide verify sequences: a q block of that width (the
+    default block search sizes q blocks for prefill chunks)."""
     from sglang_tpu.attention.pallas.batched_rpa import configs
 
     page = _MIN_PAGE_SIZE
@@ -151,14 +155,13 @@ def _verify_as_mixed(
     if sliding_window:
         bkv = min(bkv, max(page, -(-sliding_window // page) * page))
     # One lane: more lanes help at 16 sequences (-8%) but are 9x slower at 32.
-    blocks = configs.BlockSizes(
+    return configs.BlockSizes(
         bq_sz=decode_query_size,
         bq_c_sz=decode_query_size,
         bkv_sz=bkv,
         batch_size=1,
         n_buffer=3,
     )
-    return jnp.zeros_like(distribution).at[2].set(distribution[2]), blocks
 
 
 # SEQ_ALONG_LANE tiles the page axis onto lanes, so a page has to be a multiple
@@ -187,10 +190,16 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         super().__init__(model_runner, speculative_step_id)
         from sglang.srt.runtime_context import get_parallel
 
+        from sglang.srt.managers.schedule_batch import mixed_tail_width
+
         parallel = get_parallel()
-        if tpu_envs.SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS.get():
-            # Verify batches then reach the kernel as uniform-width DECODE, which
-            # _invoke_batched_kernel reruns as MIXED with verify-sized blocks.
+        if (
+            tpu_envs.SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS.get()
+            or mixed_tail_width(model_runner.spec_algorithm) > 1
+        ):
+            # Verify batches (and mixed-verify tails) then reach the kernel as
+            # uniform-width DECODE, which _invoke_batched_kernel runs as MIXED with
+            # verify-sized blocks.
             self.decode_query_size = _resolve_decode_query_size(
                 supports_decode_query_size=True,
                 spec_enabled=not model_runner.spec_algorithm.is_none(),
