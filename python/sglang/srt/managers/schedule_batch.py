@@ -3703,6 +3703,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        # A mixed batch that became the running batch decodes without tails.
+        self.mix_verify_tails = 0
+        self.mix_tail_spec_info = None
+        self.mix_tail_committed_cpu = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:

@@ -1072,6 +1072,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mix_verify_width=(
                 int(batch.extend_lens[-1])
                 if getattr(batch, "mix_verify_tails", 0)
+                and batch.forward_mode.is_mixed()
                 else 1
             ),
             spec_algorithm=batch.spec_algorithm,
