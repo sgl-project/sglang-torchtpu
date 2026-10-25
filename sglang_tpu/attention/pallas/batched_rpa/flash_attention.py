@@ -157,7 +157,12 @@ def flash_attention_qk_softmax(
         qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
 
-    m_curr = jnp.max(qk, axis=-1, keepdims=True)
+    if cfgs.serve.no_max:
+        # A zero max: m is -inf at a q block's first k block (alpha clears l and acc)
+        # and 0 after, so p is exp(s) and no row-max barrier sits between QK and exp.
+        m_curr = jnp.zeros(qk.shape[:-1] + (1,), qk.dtype)
+    else:
+        m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
     alpha_list = []
     m_next_list = []
@@ -172,7 +177,10 @@ def flash_attention_qk_softmax(
 
     m_next = jnp.stack(m_next_list, axis=0)
     # m is an f32 carry; the scores and p stay in the output dtype.
-    p = exp_fn(qk - utils.broadcast_minor(m_next, qk.shape).astype(qk.dtype))
+    if cfgs.serve.no_max:
+        p = exp_fn(qk)
+    else:
+        p = exp_fn(qk - utils.broadcast_minor(m_next, qk.shape).astype(qk.dtype))
     if kv_len_left is not None:
         # A row with no key in range keeps l == 0 rather than weighting masked
         # keys by exp(mask_value - mask_value).

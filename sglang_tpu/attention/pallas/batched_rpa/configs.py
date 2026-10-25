@@ -93,6 +93,9 @@ class ServingConfigs:
     # q scale; row sums from ones rows appended to V (l rides in the accumulator).
     exp2_softmax: bool = False
     ones_v: bool = False
+    # Softmax without the running row max (env-gated in the wrapper): scores must be
+    # bounded so exp cannot overflow, e.g. QK-normed models.
+    no_max: bool = False
     # Prefill tiles with transposed scores and fp8 q (see transposed.py);
     # env-gated in the wrapper, applied where `use_transposed` holds.
     transposed: bool = False

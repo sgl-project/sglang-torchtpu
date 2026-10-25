@@ -323,9 +323,29 @@ def rpa_body(
     k_b = []
     v_b = []
 
-    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        stitch_results = []
+    # Multi-row q blocks stitch only lanes whose block holds new tokens: a block read
+    # wholly from the cache stitches to itself (verify blocks: all but the last).
+    guard_stitch = (
+        cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE and cfgs.bq_sz > 1
+    )
+    if guard_stitch:
         for b_idx in range(cfgs.batch_size):
+
+            @pl.when(bkv_sz_frm_cache_list[b_idx] < cfgs.bkv_sz)
+            def _(b_idx=b_idx):
+                res = stitch_utils.stitch_new_kv_lane(
+                    kv_in_vref,
+                    b_idx,
+                    bkv_sz_frm_cache_list[b_idx],
+                    new_kv_len_start_list[b_idx],
+                    cfgs=cfgs,
+                )
+                stitch_utils.store_new_kv_lane(kv_in_vref, b_idx, res, cfgs=cfgs)
+
+    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        n_unguarded = 0 if guard_stitch else cfgs.batch_size
+        stitch_results = []
+        for b_idx in range(n_unguarded):
             res = stitch_utils.stitch_new_kv_lane(
                 kv_in_vref,
                 b_idx,
@@ -334,7 +354,7 @@ def rpa_body(
                 cfgs=cfgs,
             )
             stitch_results.append(res)
-        for b_idx in range(cfgs.batch_size):
+        for b_idx in range(n_unguarded):
             stitch_utils.store_new_kv_lane(
                 kv_in_vref,
                 b_idx,

@@ -712,6 +712,12 @@ def ragged_paged_attention(
         return_lse=return_lse,
         cp_group_size=cp_group_size,
         skip_full_tile_mask=tpu_envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
+        # The sink term and the LSE read the running max.
+        no_max=(
+            tpu_envs.SGLANG_TPU_RPA_NO_MAX.get()
+            and attention_sink is None
+            and not return_lse
+        ),
         # Base-2 m and l would reach the soft cap, the sink term and the LSE.
         exp2_softmax=(
             tpu_envs.SGLANG_TPU_RPA_EXP2_SOFTMAX.get()

@@ -177,6 +177,10 @@ class TpuEnvs:
     # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
     # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
     SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
+    # Batched RPA (non-transposed tiles, e.g. verify blocks): softmax without the running
+    # row max. Only for bounded scores: Muse's weightless per-head RMS-normed q and k keep
+    # |s| <= ~44, so exp(s) fits; rounding differs from the max-subtracted form.
+    SGLANG_TPU_RPA_NO_MAX = EnvBool(False)
     # Batched RPA prefill softmax (the per-score vector chain, not the MXU, sets the
     # time): exp2 with log2e folded into the q scale, one VALU op per score fewer.
     # Off with an attention sink or an LSE output, which would see base-2 m and l;
