@@ -1373,11 +1373,18 @@ def kernel_main_fused_rs(
                 wait_staging_slot_writes(stg_id)
 
             with jax.named_scope("reshape_gmm2_output"):
-                scatter_staging_3x_ref[stg_id] = tiled_out_2x_ref[sem_id][...].reshape(
-                    tile_m,
-                    scatter_staging_3x_ref.shape[2],
-                    scatter_staging_3x_ref.shape[3],
-                )
+                # Only the bucket's rows: the rows sent below all lie under it, and the
+                # packed-row relayout costs ~1 us per 256 rows.
+                def _relayout(m_rows):
+                    scatter_staging_3x_ref[stg_id, pl.ds(0, m_rows)] = tiled_out_2x_ref[
+                        sem_id, pl.ds(0, m_rows)
+                    ].reshape(
+                        m_rows,
+                        scatter_staging_3x_ref.shape[2],
+                        scatter_staging_3x_ref.shape[3],
+                    )
+
+                _dispatch(_relayout)
 
             # Step 10: Direct-write — single pass over valid rows only.
             # Each row either ICI-sends (remote) or DMA-copies (local) to
