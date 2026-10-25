@@ -2029,7 +2029,8 @@ class Envs:
     # budget. Escape hatch for a shape or a chip where that derivation is
     # wrong: too large and the kernel fails to allocate at startup, too small
     # and the step runs more blocks than it needs. Rounded up to a page
-    # multiple. Unset (None) means the wrapper's own search decides.
+    # multiple. Unset (None) means the wrapper's own search decides. Ignored
+    # when SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS pins the whole tile.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
     # Enable prefill and decode co-location on the same single- or multi-host
     # TPU slice by assigning half the chips to prefill and half to decode.

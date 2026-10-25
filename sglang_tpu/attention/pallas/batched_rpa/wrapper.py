@@ -44,6 +44,7 @@ from sglang_tpu.attention.pallas.batched_rpa import (
     schedule,
     utils,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 
 def prepare_inputs(
@@ -214,6 +215,36 @@ def get_kv_cache_shape(
         kv_packing,
         utils.align_to(actual_head_dim, num_lanes),
     )
+
+
+def _pinned_prefill_block_sizes(*, page_size: int) -> configs.BlockSizes | None:
+    """The SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS tile, or None when it is unset."""
+    fields = tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS.get()
+    if not fields:
+        return None
+    names = [field.name for field in dataclasses.fields(configs.BlockSizes)]
+    prefix = f"SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS={','.join(fields)!r}"
+    try:
+        sizes = [int(field) for field in fields]
+    except ValueError:
+        sizes = []
+    if len(sizes) != len(names):
+        raise ValueError(f"{prefix}: expected integers {','.join(names)}")
+    if min(sizes) < 1:
+        raise ValueError(f"{prefix}: every size must be positive")
+    blocks = configs.BlockSizes(**dict(zip(names, sizes)))
+    # The schedule treats a one-token q block as a decode block.
+    if blocks.bq_sz < 2:
+        raise ValueError(f"{prefix}: a prefill bq_sz must be at least 2")
+    if blocks.bq_sz % blocks.bq_c_sz:
+        raise ValueError(f"{prefix}: bq_c_sz must divide bq_sz")
+    # Measured on v7x: a prefill call with a single-buffered tile never completes.
+    if blocks.n_buffer < 2:
+        raise ValueError(f"{prefix}: n_buffer must be at least 2; one buffer hangs")
+    # The schedule and the kernel agree on cached key positions only for whole pages.
+    if blocks.bkv_sz % page_size:
+        raise ValueError(f"{prefix}: bkv_sz must be a multiple of {page_size=}")
+    return blocks
 
 
 def calculate_block_sizes(
@@ -500,6 +531,10 @@ def calculate_block_sizes(
     decode_block_sizes = cover_whole_pages(
         find_best_block_sizes(decode_batch_size, n_buffer, 1)
     )
+    # A pinned prefill tile replaces both the search and the k-block override below.
+    pinned_prefill = _pinned_prefill_block_sizes(page_size=serve_cfgs.page_size)
+    if pinned_prefill is not None:
+        return decode_block_sizes, pinned_prefill
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     # Operator escape hatch. The search above works from a VMEM estimate that

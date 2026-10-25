@@ -143,6 +143,13 @@ class TpuEnvs:
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
 
+    # Batched RPA prefill tile (see attention/pallas/batched_rpa/wrapper.py).
+    # "bq_sz,bq_c_sz,bkv_sz,batch_size,n_buffer" pins the whole prefill/MIXED
+    # tile in place of the VMEM search and SGLANG_TPU_FORCE_RPA_PREFILL_BKV, for a
+    # shape whose searched tile does not compile or does not complete. The
+    # compiler, not the search's estimate, rejects a pin that does not fit VMEM.
+    SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS = EnvTuple(())
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

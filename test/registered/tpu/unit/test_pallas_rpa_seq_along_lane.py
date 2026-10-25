@@ -25,6 +25,7 @@ from sglang_tpu.attention_pallas_rpa_batched import (
     RPA_BATCHED_SPEC,
     kv_layout,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 
 class TestKvLayoutSelection(CustomTestCase):
@@ -498,6 +499,113 @@ class TestKernelBlockSizes(CustomTestCase):
                         geometry=(4, 1, 128, None),
                         vmem_limit_bytes=vmem_limit_bytes,
                     )
+
+
+class TestPinnedPrefillTile(CustomTestCase):
+    """SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS pins the whole prefill tile."""
+
+    # 128 query heads over 8 KV heads, head_dim 128, page 512: on v7x the search
+    # picks one buffer (bq 128, bkv 512), which does not complete; this tile runs.
+    PIN = "128,16,512,1,2"
+
+    def _resolve(self, vmem_limit_bytes=64 << 20):
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        model = configs.ModelConfigs(
+            num_q_heads=128,
+            num_kv_heads=8,
+            head_dim=128,
+            mask_value=float("-inf"),
+        )
+        with tpu_info_for_cpu_export():
+            serve = configs.ServingConfigs(
+                num_seqs=8,
+                num_page_indices=8 * 64,
+                total_q_tokens=8192,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.bfloat16,
+                dtype_out=jnp.bfloat16,
+                page_size=512,
+            )
+            return wrapper.calculate_block_sizes(model, serve, vmem_limit_bytes)
+
+    @staticmethod
+    def _tile(blocks):
+        return (
+            blocks.bq_sz,
+            blocks.bq_c_sz,
+            blocks.bkv_sz,
+            blocks.batch_size,
+            blocks.n_buffer,
+        )
+
+    def test_pin_replaces_the_searched_prefill_tile(self):
+        searched_decode, _ = self._resolve()
+        with tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS.override(self.PIN):
+            decode, prefill = self._resolve()
+        self.assertEqual(self._tile(prefill), (128, 16, 512, 1, 2))
+        self.assertEqual(decode, searched_decode)
+
+    def test_pin_takes_precedence_over_the_k_block_override(self):
+        with (
+            envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(1024),
+            tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS.override(self.PIN),
+        ):
+            _, prefill = self._resolve()
+        self.assertEqual(self._tile(prefill), (128, 16, 512, 1, 2))
+
+    def test_pin_does_not_depend_on_the_prefill_search(self):
+        # At 32 MiB the search fits no prefill tile for this shape.
+        with tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS.override(self.PIN):
+            _, prefill = self._resolve(vmem_limit_bytes=32 << 20)
+        self.assertEqual(self._tile(prefill), (128, 16, 512, 1, 2))
+
+    def test_pipeline_schedule_capacity_uses_the_pinned_tile(self):
+        from sglang_tpu import pp_attention_capacity as capacity
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        capacity._capacity_for_shape.cache_clear()
+        self.addCleanup(capacity._capacity_for_shape.cache_clear)
+        with tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS.override(self.PIN):
+            _, bq_sz, bkv_sz = capacity._capacity_for_shape(
+                "mixed",
+                128,
+                8,
+                128,
+                8,
+                8192,
+                64,
+                512,
+                "bfloat16",
+                "bfloat16",
+                configs.KVLayout.HEAD_ALONG_SUBLANE,
+            )
+        self.assertEqual((bq_sz, bkv_sz), (128, 512))
+
+    def test_malformed_pin_is_refused(self):
+        for value, message in (
+            ("128,16,512,1", "expected integers bq_sz,bq_c_sz,bkv_sz,batch_size"),
+            ("128,16,512,1,two", "expected integers"),
+            ("128,16,512,1,0", "must be positive"),
+            ("1,1,512,1,2", "bq_sz must be at least 2"),
+            ("128,48,512,1,2", "bq_c_sz must divide bq_sz"),
+            ("128,16,512,1,1", "n_buffer must be at least 2"),
+            ("128,16,768,1,2", "multiple of page_size=512"),
+        ):
+            with (
+                self.subTest(value=value),
+                tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS.override(value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self._resolve()
+
+    def test_empty_pin_leaves_the_search_in_charge(self):
+        searched = self._resolve()
+        with tpu_envs.SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS.override(""):
+            self.assertEqual(self._resolve(), searched)
 
 
 if __name__ == "__main__":
