@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Callable
+from typing import NamedTuple
 
 import msgspec
 import torch
@@ -23,16 +24,32 @@ DraftSampler = Callable[[torch.Tensor, int], torch.Tensor]
 DraftLattice = tuple[torch.Tensor, torch.Tensor]
 
 
-class DraftSampling(msgspec.Struct, frozen=True):
-    """Per-row draft sampling params and the TP sync of sampled drafts.
+class SampledDrafts(NamedTuple):
+    """Sampled [pbs, gamma] drafts and the q they were drawn from.
 
-    Called as a DraftSampler it samples one dense step; DFlash2 reads the fields to walk
-    its whole lattice in one compiled program instead.
+    q is either dense draft_logits [pbs, gamma, V] or draft_candidates (ids,
+    logits) [pbs, gamma, K]; verify_tokens is set when the sampler built them.
+    """
+
+    draft_tokens: torch.Tensor
+    draft_logits: torch.Tensor | None
+    verify_tokens: torch.Tensor | None
+    draft_candidates: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+class DraftSampling(msgspec.Struct, frozen=True):
+    """Per-row draft sampling params, the TP sync and the hash_uniforms step.
+
+    Called as a DraftSampler it samples one dense step from the TPU generator and
+    syncs it; DFlash2 instead walks its whole lattice on rng_step, unsynced.
     """
 
     temperatures: torch.Tensor
     top_ks: torch.Tensor
     sync: Callable[[torch.Tensor], torch.Tensor]
+    rng_step: torch.Tensor
+    # BucketState.target_candidates: the verify accepts a q on candidates.
+    target_candidates: bool
 
     def __call__(self, step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
         del step_idx
@@ -66,7 +83,7 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         bonus_tokens: torch.Tensor,
         draft_lattice: DraftLattice | None,
         sampler: DraftSampler,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> SampledDrafts:
         """Sampled [pbs, gamma] drafts and the [pbs, gamma, V] logits q was drawn from.
 
         block_hidden is the [pbs, block_width, H] draft block output. The greedy

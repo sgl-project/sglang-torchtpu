@@ -58,7 +58,7 @@ from sglang_tpu.experimental.speculative.mtp.mtp_draft_worker import (
     TpuMtpDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
-    accept_drafts_target_only,
+    accept_target_only_step,
     build_chain_block_inputs,
     build_verify_tokens,
     finalize_accept,
@@ -608,7 +608,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         with torch.no_grad():
             for padded_bs in self._b_bucketer().buckets:
                 warmup_compiled_op(
-                    accept_drafts_target_only,
+                    accept_target_only_step,
                     torch.zeros(
                         (padded_bs * self.num_verify_rows, vocab_size),
                         dtype=torch.float32,
@@ -623,6 +623,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
                     *self._sampling_param_warmup_args(padded_bs),
                     self._accept_threshold_single,
                     self._accept_threshold_acc,
+                    self._device_zeros(padded_bs),
+                    torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+                    self._rng_step,
                 )
 
     def _warmup_multimodal_prefill(self) -> None:

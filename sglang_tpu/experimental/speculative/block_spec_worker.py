@@ -45,6 +45,7 @@ from sglang_tpu.experimental.speculative.base_spec_worker import (
 from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftLattice,
     DraftSampling,
+    SampledDrafts,
     TpuBlockDraftWorker,
 )
 from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
@@ -55,7 +56,10 @@ from sglang_tpu.experimental.speculative.draft_forward import forward_draft_rows
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
-from sglang_tpu.experimental.speculative.spec_ops import build_draft_block_inputs
+from sglang_tpu.experimental.speculative.spec_ops import (
+    TARGET_CANDIDATES,
+    build_draft_block_inputs,
+)
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
@@ -66,6 +70,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
 )
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows, prompt_positions
+from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
     SpeculativeAlgorithm.DFLASH: TpuDflashDraftWorker,
@@ -143,13 +148,20 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 draft_logits=None,
                 num_verify_drafts=num_verify_drafts,
             )
-        draft_tokens, draft_logits = self._sample_draft_block(
-            block_hidden, state.bonus_tokens, draft_lattice, temperatures, top_ks
+        sampled = self._sample_draft_block(
+            block_hidden,
+            state.bonus_tokens,
+            draft_lattice,
+            temperatures,
+            top_ks,
+            target_candidates=bucket.target_candidates,
         )
         return DraftResult(
-            draft_tokens=draft_tokens,
-            draft_logits=draft_logits,
+            draft_tokens=sampled.draft_tokens,
+            draft_logits=sampled.draft_logits,
             num_verify_drafts=num_verify_drafts,
+            verify_tokens=sampled.verify_tokens,
+            draft_candidates=sampled.draft_candidates,
         )
 
     def _sample_draft_block(
@@ -159,7 +171,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         draft_lattice: DraftLattice | None,
         temperatures: torch.Tensor,
         top_ks: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        target_candidates: bool,
+    ) -> SampledDrafts:
         """Sampled [pbs, gamma] drafts and their logits from the [pbs, width, H] block."""
         sampling = DraftSampling(
             temperatures=temperatures,
@@ -167,6 +181,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             sync=functools.partial(
                 self._tp_sync.sync, SpecTpSyncSite.SPEC_DRAFT_SAMPLE
             ),
+            rng_step=self._rng_step,
+            target_candidates=target_candidates,
         )
         return self._block_draft_worker.sample_drafts(
             block_hidden=block_hidden,
@@ -248,6 +264,17 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         next_draft_input.kv_fence_tail = kv_fence_tail
         result.next_draft_input = next_draft_input
         return result
+
+    def verify_top_k_width(self) -> int | None:
+        # Negotiates on every TP rank here, at init, never inside a compiled verify.
+        width = distributed_top_k_candidate_width_for_model(
+            self._target_worker.model_runner.model
+        )
+        if width is not None and width != TARGET_CANDIDATES:
+            raise ValueError(
+                f"distributed top-k width {width} != TARGET_CANDIDATES {TARGET_CANDIDATES}"
+            )
+        return width
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
@@ -378,16 +405,31 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 draft_lattice = self._block_draft_worker.warmup_draft_lattice(
                     block_hidden=block_hidden, bonus_tokens=bonus_tokens
                 )
-                draft_tokens, draft_logits = self._sample_draft_block(
-                    block_hidden,
-                    bonus_tokens,
-                    draft_lattice,
-                    torch.ones((padded_bs,), dtype=torch.float32).to(self.device),
-                    torch.ones((padded_bs,), dtype=torch.int32).to(self.device),
+                temperatures = torch.ones((padded_bs,), dtype=torch.float32).to(
+                    self.device
                 )
-                draft_logits.float().cpu()
-                torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
-                self._warmup_sampled_accept(padded_bs, draft_tokens, draft_logits)
+                top_ks = torch.ones((padded_bs,), dtype=torch.int32).to(self.device)
+                for target_candidates in (False, True):
+                    sampled = self._sample_draft_block(
+                        block_hidden,
+                        bonus_tokens,
+                        draft_lattice,
+                        temperatures,
+                        top_ks,
+                        target_candidates=target_candidates,
+                    )
+                    torch.cat(
+                        [bonus_tokens[:, None], sampled.draft_tokens], dim=1
+                    ).cpu()
+                    if sampled.draft_logits is not None:
+                        sampled.draft_logits.float().cpu()
+                        self._warmup_sampled_accept(
+                            padded_bs, sampled.draft_tokens, sampled.draft_logits
+                        )
+                    if sampled.draft_candidates is not None:
+                        self._warmup_candidates_accept(
+                            padded_bs, sampled.draft_tokens, sampled.draft_candidates
+                        )
 
     def _warmup_extend_draft_inputs(self) -> None:
         """extend's draft positions / cache_loc uploads at every token bucket."""

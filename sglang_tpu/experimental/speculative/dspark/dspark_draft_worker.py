@@ -26,6 +26,7 @@ from sglang_tpu.experimental.compilation.block_compile_policy import block_draft
 from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftLattice,
     DraftSampler,
+    SampledDrafts,
     TpuBlockDraftWorker,
 )
 
@@ -66,7 +67,7 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
         bonus_tokens: torch.Tensor,
         draft_lattice: DraftLattice | None,
         sampler: DraftSampler,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> SampledDrafts:
         del draft_lattice
         # Anchor drafts read all gamma rows; the rest drop the anchor row, so
         # draft_hidden[:, j - 1] predicts d_j at position n + j.
@@ -79,13 +80,14 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
             base_logits, _ = draft_model.compute_base_logits(
                 draft_hidden.reshape(bs * self.num_drafts, -1)
             )
-        return draft_model.markov_head.sample_block(
+        draft_tokens, draft_logits = draft_model.markov_head.sample_block(
             base_logits.view(bs, self.num_drafts, -1),
             first_prev_tokens=bonus_tokens,
             hidden_states=draft_hidden,
             sampler=sampler,
             collect_corrected=True,
         )
+        return SampledDrafts(draft_tokens, draft_logits, None)
 
 
 def _attach_target_vocab(

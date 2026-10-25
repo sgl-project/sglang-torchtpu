@@ -41,6 +41,7 @@ from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftLattice,
     DraftSampler,
     DraftSampling,
+    SampledDrafts,
     TpuBlockDraftWorker,
 )
 
@@ -86,7 +87,7 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
         bonus_tokens: torch.Tensor,
         draft_lattice: DraftLattice | None,
         sampler: DraftSampler,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> SampledDrafts:
         # Row 0 is the root; draft_hidden[:, j - 1] predicts d_j at position n + j.
         lm_head = self._dflash_model.lm_head
         assert lm_head is not None
@@ -97,13 +98,22 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
                 )
             if draft_lattice is None:
                 raise ValueError("DFlash2 samples from the draft graph's lattice")
-            return sample_dflash2_drafts(
-                draft_lattice=draft_lattice,
-                vocab_size=int(lm_head.org_vocab_size),
-                temperatures=sampler.temperatures,
-                top_ks=sampler.top_ks,
-                sync=sampler.sync,
+            candidate_ids, scores = draft_lattice
+            draft_tokens, q_logits, verify_tokens = sample_dflash2_drafts(
+                candidate_ids,
+                scores,
+                bonus_tokens,
+                sampler.temperatures,
+                sampler.top_ks,
+                sampler.rng_step,
+                int(lm_head.org_vocab_size),
+                dense=not sampler.target_candidates,
             )
+            if sampler.target_candidates:
+                return SampledDrafts(
+                    draft_tokens, None, verify_tokens, (candidate_ids, q_logits)
+                )
+            return SampledDrafts(draft_tokens, q_logits, verify_tokens)
         bs = block_hidden.shape[0]
         draft_hidden = block_hidden[:, 1:].reshape(bs * self.num_drafts, -1)
         with torch.no_grad():
@@ -113,7 +123,7 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
         draft_tokens = torch.stack(
             [sampler(draft_logits[:, j], j) for j in range(self.num_drafts)], dim=1
         )
-        return draft_tokens, draft_logits
+        return SampledDrafts(draft_tokens, draft_logits, None)
 
     def warmup_draft_lattice(
         self, *, block_hidden: torch.Tensor, bonus_tokens: torch.Tensor
