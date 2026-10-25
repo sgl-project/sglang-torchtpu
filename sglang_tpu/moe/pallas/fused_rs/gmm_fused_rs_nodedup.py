@@ -1196,6 +1196,17 @@ def kernel_main_fused_rs(
             # for gm>0, tiles were prefetched during previous gm's GMM2).
             total_w1_steps = num_n1 * num_k1
             total_w2_steps = num_n2 * num_k2
+            # Expert ping-pong: W1 and W2 of expert e live in buffer e % 2, and the next
+            # expert's are fetched at the start of this tile unless it shares the parity
+            # (an expert without rows in between), when they follow the matmuls instead.
+            pingpong = (
+                tpu_envs.SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG.get()
+                and total_w1_steps == 1
+                and total_w2_steps == 1
+                and num_w1_bufs >= 2
+                and num_w2_bufs >= 2
+            )
+            wbuf = expert_id % 2
 
             # ---- Same-expert weight caching (Idea 1) ----
             # When num_w*_bufs >= total_w*_steps, ALL of the current expert's
@@ -1225,16 +1236,42 @@ def kernel_main_fused_rs(
                 jnp.logical_not(is_new_expert), jnp.bool_(can_cache_w2)
             )
 
-            @pl.when(gm_id == 0)
-            def _():
-                for _i in range(min(num_w1_bufs, total_w1_steps)):
-                    start_w1_dma(_i, expert_id, _i // num_k1, _i % num_k1)
+            def _next_expert_fetch(fetch, *, same_parity):
+                # fetch(next_e) when the next tile starts a new expert whose parity
+                # matches this one's exactly when ``same_parity``.
+                @pl.when(gm_id + 1 < local_num_gm)
+                def _():
+                    next_e = metadata_ref.gm_id_to_group_id[gm_id + 1]
+                    parity_match = (next_e % 2 == wbuf) == same_parity
 
-            # Early w2 prefetch — skip if cache hit (same expert as prev gm).
-            @pl.when(jnp.logical_not(is_same_w2))
-            def _():
-                for _i in range(min(num_w2_bufs, total_w2_steps)):
-                    start_w2_dma(_i, expert_id, _i // num_k2, _i % num_k2)
+                    @pl.when(jnp.logical_and(next_e != expert_id, parity_match))
+                    def _():
+                        fetch(next_e)
+
+            if pingpong:
+
+                @pl.when(gm_id == 0)
+                def _():
+                    start_w1_dma(wbuf, expert_id, 0, 0)
+                    start_w2_dma(wbuf, expert_id, 0, 0)
+
+                def _fetch_both(next_e):
+                    start_w1_dma(1 - wbuf, next_e, 0, 0)
+                    start_w2_dma(1 - wbuf, next_e, 0, 0)
+
+                _next_expert_fetch(_fetch_both, same_parity=False)
+            else:
+
+                @pl.when(gm_id == 0)
+                def _():
+                    for _i in range(min(num_w1_bufs, total_w1_steps)):
+                        start_w1_dma(_i, expert_id, _i // num_k1, _i % num_k1)
+
+                # Early w2 prefetch — skip if cache hit (same expert as prev gm).
+                @pl.when(jnp.logical_not(is_same_w2))
+                def _():
+                    for _i in range(min(num_w2_bufs, total_w2_steps)):
+                        start_w2_dma(_i, expert_id, _i // num_k2, _i % num_k2)
 
             # Wait for gather (weight DMAs running in parallel).
             dma_gather_gm_wait(
@@ -1280,7 +1317,7 @@ def kernel_main_fused_rs(
             for step in range(total_w1_steps):
                 _n1 = step // num_k1
                 _k1 = step % num_k1
-                buf_id = step % num_w1_bufs
+                buf_id = wbuf if pingpong else step % num_w1_bufs
 
                 # Skip wait if W1 was cached from previous gm tile
                 # (same expert + all tiles fit in buffers).
@@ -1296,7 +1333,12 @@ def kernel_main_fused_rs(
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
-                if step == 0 and can_cache_w1:
+                if pingpong:
+                    _next_expert_fetch(
+                        lambda next_e: start_w1_dma(wbuf, next_e, 0, 0),
+                        same_parity=True,
+                    )
+                elif step == 0 and can_cache_w1:
 
                     @pl.when(gm_id + 1 < local_num_gm)
                     def _():
@@ -1351,7 +1393,7 @@ def kernel_main_fused_rs(
             for step in range(total_w2_steps):
                 _n2 = step // num_k2
                 _k2 = step % num_k2
-                buf_id = step % num_w2_bufs
+                buf_id = wbuf if pingpong else step % num_w2_bufs
 
                 # Skip wait if W2 was cached (same expert as prev + buffers fit all).
                 @pl.when(jnp.logical_not(is_same_w2))
@@ -1363,6 +1405,11 @@ def kernel_main_fused_rs(
                 if step + num_w2_bufs < total_w2_steps:
                     ns = step + num_w2_bufs
                     start_w2_dma(ns % num_w2_bufs, expert_id, ns // num_k2, ns % num_k2)
+                if pingpong:
+                    _next_expert_fetch(
+                        lambda next_e: start_w2_dma(wbuf, next_e, 0, 0),
+                        same_parity=True,
+                    )
 
             m_st = metadata_ref.gm_id_to_m_offset[gm_id]
             m_en = metadata_ref.gm_id_to_m_offset[gm_id + 1]

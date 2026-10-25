@@ -157,6 +157,10 @@ class TpuEnvs:
     # across (VMEM: slots x tile_m x hidden x 2 B). Measured on the Muse Spark expert-TP
     # call: 6 slots -1.5% per layer vs 3, 8 slots -2%.
     SGLANG_TPU_FUSED_RS_STAGING_SLOTS = EnvInt(3)
+    # Fused-RS: when an expert's W1 and W2 each fit one DMA, they alternate between the two
+    # weight buffers by expert parity and the next expert's are fetched at the start of a tile,
+    # behind its whole compute, instead of one buffer refilled between matmuls (exact).
+    SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG = EnvBool(False)
     # Expert-TP fused-RS: the two cores of a chip add their partials on-chip and send one
     # pair sum per row to another chip's owner, halving off-chip bytes (one extra bf16 rounding).
     SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE = EnvBool(False)
