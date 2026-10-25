@@ -109,6 +109,9 @@ class TpuEnvs:
     SGLANG_TPU_MK_LARGE_STEP_VMEM_LIMIT_MB = EnvFloat(None)
     # Tuning only: force the 16-bit packed page tables on (1) or off (0); unset = by table size.
     SGLANG_TPU_MK_PACK_PAGE_TABLES = EnvInt(None)
+    # Fixed batch shape of MIXED (mixed-chunk) batches; unset = the largest bs bucket. Raise it
+    # when more requests decode inside mixed chunks than any decode bucket holds.
+    SGLANG_TPU_MIXED_MAX_BS = EnvInt(None)
     # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
     # scaling every score (exact).
     SGLANG_TPU_MK_FOLD_ATTN_SCALE = EnvBool(False)

@@ -125,11 +125,22 @@ def _extend_batch_cap(
     configured_cap: int | None = None,
 ) -> int:
     """Return the largest reachable fixed batch shape for EXTEND."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    # Mixed batches run as EXTEND (eager runner) and also hold the decoding requests.
+    if mixed_cap := tpu_envs.SGLANG_TPU_MIXED_MAX_BS.get():
+        return min(t_bucketer.max_val, mixed_cap)
     return min(
         t_bucketer.max_val,
         b_bucketer.max_val,
         configured_cap or b_bucketer.max_val,
     )
+
+
+def _mixed_batch_cap(t_bucketer: Bucketer, b_bucketer: Bucketer) -> int:
+    """Fixed batch shape of a MIXED forward mode batch (NPU and context parallel
+    keep the mode; elsewhere a mixed batch runs as EXTEND)."""
+    return _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
 
 
 def _static_default_kwargs(fn: Callable[..., Any]) -> dict[str, Any]:
@@ -630,7 +641,7 @@ def _pad_forward_batch_inputs(
         real_q_out, real_b_out = real_q, real_b
     elif forward_batch.forward_mode.is_mixed():
         extend_cap = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
-        mixed_cap = _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
+        mixed_cap = _mixed_batch_cap(t_bucketer, b_bucketer)
         pad_b = extend_cap if real_b <= extend_cap else mixed_cap
         if real_b > pad_b:
             raise ValueError(

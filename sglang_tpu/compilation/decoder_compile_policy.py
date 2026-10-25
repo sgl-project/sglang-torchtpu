@@ -58,6 +58,7 @@ from sglang_tpu.compilation.compiled_forward_shim import (
     _TOKEN_FIELDS,
     CompiledForwardShim,
     _extend_batch_cap,
+    _mixed_batch_cap,
     _pad_forward_batch_inputs,
     _restore_forward_batch_inputs,
     build_bucketers,
@@ -559,11 +560,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             mode_caps.append(
                 (
                     ForwardMode.MIXED,
-                    _extend_batch_cap(
-                        self.t_bucketer,
-                        self.b_bucketer,
-                        self.b_bucketer.max_val,
-                    ),
+                    _mixed_batch_cap(self.t_bucketer, self.b_bucketer),
                 )
             )
 
@@ -901,6 +898,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             input_ids.shape[0],
             logits_output_mode,
         )
+        if forward_batch.mix_verify_width > 1:
+            # Selects verify-width logits rows per sequence: a distinct graph.
+            key = (*key, forward_batch.mix_verify_width)
         return key
 
     def _compiles_logits_processor(self) -> bool:

@@ -21,7 +21,6 @@ from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
-    _extend_batch_cap,
     _restore_forward_batch_inputs,
 )
 from sglang_tpu.compilation.decoder_compile_policy import (
@@ -99,8 +98,9 @@ class BaseSpecDecodeCompilePolicyMixin:
         return pending
 
     def _precompile_mixed_verify(self) -> list[PendingCall]:
-        """Compile MIXED batches whose decoding requests carry whole DFLASH verify
-        blocks (SGLANG_DFLASH_MIXED_VERIFY): FULL capture, verify-width logits rows."""
+        """Compile mixed batches whose decoding requests carry whole DFLASH verify
+        blocks (SGLANG_DFLASH_MIXED_VERIFY): FULL capture, verify-width logits rows.
+        The eager runner runs a mixed batch as EXTEND, so the graph is an EXTEND one."""
         from sglang.srt.managers.schedule_batch import mixed_tail_width
 
         if not get_schedule().enable_mixed_chunk:
@@ -110,7 +110,7 @@ class BaseSpecDecodeCompilePolicyMixin:
             return []
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
-        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.b_bucketer.max_val)
+        bs = self._extend_compile_cap()
         shapes = [
             (t, has_spec_info, variant)
             for t in self.t_bucketer.buckets
@@ -119,7 +119,7 @@ class BaseSpecDecodeCompilePolicyMixin:
             for variant in self._extend_input_variants()
         ]
         logger.info(
-            "[spec compile policy] MIXED verify (FULL, width %d): %d shapes (bs=%d)",
+            "[spec compile policy] EXTEND mixed verify (FULL, width %d): %d shapes (bs=%d)",
             width,
             len(shapes),
             bs,
@@ -129,7 +129,7 @@ class BaseSpecDecodeCompilePolicyMixin:
             warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
-                mode=ForwardMode.MIXED,
+                mode=ForwardMode.EXTEND,
                 variant=variant,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self.make_null_spec_info() if has_spec_info else None,
