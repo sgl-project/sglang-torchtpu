@@ -3268,17 +3268,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.seq_lens.device,
             )
-            # The verify window lies inside the 2-block reservation prepare_for_decode made.
-            tail_cols = tail_base[:, None] + torch.arange(
-                tail_width, dtype=torch.int64, device=tail_base.device
+            # Gather on the table's device (host-resident on some backends). The
+            # verify window lies inside the 2-block reservation prepare_for_decode made.
+            req_to_token = self.req_to_token_pool.req_to_token
+            rows = (
+                torch.as_tensor(running_batch.req_pool_indices_cpu)
+                if req_to_token.device.type == "cpu"
+                else running_batch.req_pool_indices
+            ).long()
+            tail_cols = tail_base.to(req_to_token.device)[:, None] + torch.arange(
+                tail_width, dtype=torch.int64, device=req_to_token.device
             )
             running_out_cache_loc = (
-                self.req_to_token_pool.req_to_token[
-                    running_batch.req_pool_indices.long()[:, None],
-                    tail_cols,
-                ]
+                req_to_token[rows[:, None], tail_cols]
                 .reshape(-1)
-                .to(self.out_cache_loc.dtype)
+                .to(self.out_cache_loc.device, dtype=self.out_cache_loc.dtype)
             )
             # The spec relay is unresolved at schedule time, so merge_batch
             # would null seq_lens_cpu; rebuild the tails from request state.

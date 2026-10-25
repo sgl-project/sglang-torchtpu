@@ -558,22 +558,10 @@ class FutureMap:
                 self.publish_ready.wait()
         fresh = self.new_seq_lens_buf[idx]
         # A mixed-verify tail spans its whole verify block, else one decode row.
-        width = (
-            batch.extend_lens[-1] if batch.mix_verify_tails else 1
-        )
+        width = batch.extend_lens[-1] if batch.mix_verify_tails else 1
         seq_lens = batch.seq_lens.clone()
         seq_lens[-n:] = fresh + width
         batch.seq_lens = seq_lens
-        out_cache_loc = batch.out_cache_loc.clone()
-        cols = fresh.long()[:, None] + torch.arange(
-            width, dtype=torch.int64, device=fresh.device
-        )
-        out_cache_loc[-n * width :] = (
-            self.req_to_token[idx.long()[:, None], cols]
-            .reshape(-1)
-            .to(out_cache_loc.dtype)
-        )
-        batch.out_cache_loc = out_cache_loc
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             fresh_cpu = fresh.cpu()  # bootstrap / non-CUDA
@@ -587,6 +575,19 @@ class FutureMap:
                 )
             self.fwd_prepare_d2h_stream.synchronize()
             fresh_cpu = self.new_seq_lens_cpu_pinned[batch.mix_running_indices_cpu]
+
+        # Gather on the table's device (host-resident on some backends).
+        on_host = self.req_to_token.device.type == "cpu"
+        rows = (torch.as_tensor(batch.mix_running_indices_cpu) if on_host else idx).long()
+        base = (fresh_cpu if on_host else fresh).long()
+        cols = base[:, None] + torch.arange(width, dtype=torch.int64, device=base.device)
+        out_cache_loc = batch.out_cache_loc.clone()
+        out_cache_loc[-n * width :] = (
+            self.req_to_token[rows[:, None], cols]
+            .reshape(-1)
+            .to(out_cache_loc.device, dtype=out_cache_loc.dtype)
+        )
+        batch.out_cache_loc = out_cache_loc
         if batch.seq_lens_cpu is not None:
             seq_lens_cpu = batch.seq_lens_cpu.clone()
             seq_lens_cpu[-n:] = fresh_cpu + width
