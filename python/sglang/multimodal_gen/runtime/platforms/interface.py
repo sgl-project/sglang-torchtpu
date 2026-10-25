@@ -151,6 +151,10 @@ class Platform:
         """Return backend-specific options for a diffusion module."""
         return None
 
+    def get_compile_dynamic(self) -> bool | None:
+        """Return the torch.compile dynamic-shape policy; None uses auto detection."""
+        return None
+
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.
 
