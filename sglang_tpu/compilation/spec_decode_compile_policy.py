@@ -344,6 +344,8 @@ class BaseSpecDecodeCompilePolicyMixin:
         if next_token_logits is not None and real_b < next_token_logits.shape[0]:
             if is_verify:
                 logit_rows = real_q
+            elif forward_batch.mix_verify_width > 1:
+                logit_rows = real_b * forward_batch.mix_verify_width
             elif host_padded:
                 # HOST_PADDED sampling rows are padded to the batch bucket; sample at that shape.
                 logit_rows = sampling_info.temperatures.shape[0]

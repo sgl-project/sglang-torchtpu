@@ -259,6 +259,11 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
+def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """A fresh ``rows``-row copy of ``t``, zero past its own rows."""
+    return torch.cat([t, t.new_zeros((rows - t.shape[0], *t.shape[1:]))])
+
+
 def _resolve_dflash_embedding_module(draft_model, target_model):
     if getattr(draft_model, "is_nemotron_35_draft", False):
         embed_module = draft_model.get_input_embeddings()
@@ -3282,11 +3287,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         device = self.device
 
         # Until drafted, each tail holds one row: its pending bonus token.
-        bonus_in = batch.input_ids[n_pf_tok : n_pf_tok + n_tail]
+        # Sliced inputs are cloned: the compiled draft helpers guard on storage offsets.
+        bonus_in = batch.input_ids[n_pf_tok : n_pf_tok + n_tail].clone()
         committed = batch.seq_lens[n_p:] - w
         tail_view = SimpleNamespace(
-            req_pool_indices=batch.req_pool_indices[n_p:],
-            req_pool_indices_cpu=torch.as_tensor(batch.req_pool_indices_cpu)[n_p:],
+            req_pool_indices=batch.req_pool_indices[n_p:].clone(),
+            req_pool_indices_cpu=torch.as_tensor(batch.req_pool_indices_cpu)[n_p:].clone(),
             sampling_info=batch.sampling_info,
             seq_lens=committed,
             seq_lens_cpu=(
@@ -3321,23 +3327,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampled = self.target_worker.model_runner.sample(logits_output, forward_batch)
         prefill_next = sampled[:n_p].to(torch.int64)
 
-        # --- tails: accept the drafted blocks.
-        candidates = ctx.draft_tokens
-        tail_logits = rows[n_p:].reshape(n_tail * w, -1)
-        (
-            accept_len,
-            commit_lens,
-            bonus,
-            out_tokens,
-            new_tail_lens,
-            target_predict,
-        ) = self._accept_block(
+        # --- tails: accept the drafted blocks on bucket rows, which the greedy accept
+        # ops are warmed on (as in decode), then trim back to the tails.
+        n_bucket = self._maybe_pad_draft_bs(n_tail)
+        candidates = _pad_rows(ctx.draft_tokens, n_bucket)
+        tail_logits = _pad_rows(rows[n_p:].reshape(n_tail * w, -1), n_bucket * w)
+        accepted = self._accept_block(
             candidates=candidates,
             next_token_logits=tail_logits,
-            sampling_info=batch.sampling_info if n_p == 0 else None,
+            sampling_info=None,
             draft_input=tail_input,
-            prefix_lens=committed,
+            prefix_lens=_pad_rows(committed, n_bucket),
         )
+        accept_len, commit_lens, bonus, out_tokens, new_tail_lens, target_predict = (
+            None if t is None else t[:n_tail] for t in accepted
+        )
+        candidates = ctx.draft_tokens
+        tail_logits = tail_logits[: n_tail * w]
         if SIMULATE_ACC_LEN > 0:
             if target_predict is None:
                 target_predict = torch.argmax(tail_logits, dim=-1).view(n_tail, w)
@@ -3391,7 +3397,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 extend_lens=ctx_lens,
             )
         tail_write = self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=target_hidden[n_pf_tok : n_pf_tok + n_tail * w],
+            target_hidden=target_hidden[n_pf_tok : n_pf_tok + n_tail * w].clone(),
             cache_loc=ctx.verify_out_cache_loc,
             cache_loc_2d=ctx.verify_out_cache_loc_2d,
             swa_cache_loc_2d=ctx.verify_swa_loc_2d,
