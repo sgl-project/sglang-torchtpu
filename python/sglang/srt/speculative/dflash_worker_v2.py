@@ -1,8 +1,9 @@
 import contextlib
+import dataclasses
 import logging
-from types import SimpleNamespace
 import math
 import os
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -259,9 +260,26 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
-def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
-    """A fresh ``rows``-row copy of ``t``, zero past its own rows."""
-    return torch.cat([t, t.new_zeros((rows - t.shape[0], *t.shape[1:]))])
+def _pad_rows(t: torch.Tensor, rows: int, fill: float = 0) -> torch.Tensor:
+    """A fresh ``rows``-row copy of ``t``, ``fill`` past its own rows."""
+    return torch.cat([t, t.new_full((rows - t.shape[0], *t.shape[1:]), fill)])
+
+
+def _tail_sampling_info(info, *, reqs, start: int, rows: int):
+    """Sampling state of requests ``start:`` of a mixed batch, padded to ``rows`` with
+    filler requests (temperature 1, top-k 1, top-p 1, as a padded verify widens it)."""
+    fields = {"is_all_greedy": all(r.sampling_params.top_k <= 1 for r in reqs[start:])}
+    for name, fill in (
+        ("temperatures", 1.0),
+        ("top_ks", 1),
+        ("top_ps", 1.0),
+        ("min_ps", 0.0),
+        ("sampling_seed", 0),
+    ):
+        value = getattr(info, name)
+        if value is not None:
+            fields[name] = _pad_rows(value[start:], rows, fill)
+    return dataclasses.replace(info, **fields)
 
 
 def _resolve_dflash_embedding_module(draft_model, target_model):
@@ -3293,7 +3311,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         tail_view = SimpleNamespace(
             req_pool_indices=batch.req_pool_indices[n_p:].clone(),
             req_pool_indices_cpu=torch.as_tensor(batch.req_pool_indices_cpu)[n_p:].clone(),
-            sampling_info=batch.sampling_info,
+            sampling_info=_tail_sampling_info(
+                batch.sampling_info, reqs=batch.reqs, start=n_p, rows=n_tail
+            ),
             seq_lens=committed,
             seq_lens_cpu=(
                 batch.seq_lens_cpu[n_p:] - w if batch.seq_lens_cpu is not None else None
@@ -3327,15 +3347,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampled = self.target_worker.model_runner.sample(logits_output, forward_batch)
         prefill_next = sampled[:n_p].to(torch.int64)
 
-        # --- tails: accept the drafted blocks on bucket rows, which the greedy accept
-        # ops are warmed on (as in decode), then trim back to the tails.
+        # --- tails: accept the drafted blocks on bucket rows, as decode does (the accept
+        # ops are warmed there), then trim back to the tails.
         n_bucket = self._maybe_pad_draft_bs(n_tail)
         candidates = _pad_rows(ctx.draft_tokens, n_bucket)
         tail_logits = _pad_rows(rows[n_p:].reshape(n_tail * w, -1), n_bucket * w)
         accepted = self._accept_block(
             candidates=candidates,
             next_token_logits=tail_logits,
-            sampling_info=None,
+            sampling_info=_tail_sampling_info(
+                batch.sampling_info, reqs=batch.reqs, start=n_p, rows=n_bucket
+            ),
             draft_input=tail_input,
             prefix_lens=_pad_rows(committed, n_bucket),
         )
