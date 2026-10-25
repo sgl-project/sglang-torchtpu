@@ -218,8 +218,12 @@ case "$BENCH_MODEL" in
         # MEM_FRACTION_STATIC.
         # Scaled by TP below (per-rank bytes stay constant).
         MAX_TOTAL_TOKENS_TP8=1572864
-        MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
-        MODEL_EXTRA_ARGS="--tpu-fp8-runtime channelwise"
+        # 56.4 GB weights of 94.7 GB/rank: 0.8 profiles only ~657k tokens, so
+        # the long4 legs retract and time out; 0.87 reaches the 1.5M pool.
+        MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.87}
+        # generation_config sets repetition_penalty=1.05, which the TPU spec
+        # worker rejects; OpenAI defaults keep every recipe on the same sampling.
+        MODEL_EXTRA_ARGS="--tpu-fp8-runtime channelwise --sampling-defaults openai"
         ;;
     *)
         echo "ERROR: unknown BENCH_MODEL='$BENCH_MODEL'" >&2
