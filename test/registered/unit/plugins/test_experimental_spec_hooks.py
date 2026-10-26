@@ -30,7 +30,10 @@ from sglang_tpu.experimental.speculative.block_info import (
 )
 from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
-from sglang_tpu.experimental.speculative.spec_types import DraftResult
+from sglang_tpu.experimental.speculative.spec_types import (
+    DraftResult,
+    TpuSpecVerifyInput,
+)
 from sglang_tpu.hooks.experimental_spec import (
     alloc_extend,
     hook_specs,
@@ -1292,7 +1295,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         allocations = []
         spec = SimpleNamespace(
-            speculative_num_draft_tokens=num_draft_tokens,
+            speculative_num_draft_tokens=2,
             speculative_draft_window_size=None,
         )
         draft = HostPaddedBlockDraftInput(
@@ -1303,6 +1306,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         with (
             patch.object(draft_info, "get_spec", return_value=spec),
             patch.object(draft_info, "get_server_args", return_value=server_args),
+            patch.object(
+                draft_info,
+                "max_speculative_num_draft_tokens",
+                return_value=num_draft_tokens,
+            ),
             patch.object(
                 draft_info,
                 "allocate_and_assign_decode_cache",
@@ -1325,6 +1333,14 @@ class TestExperimentalSpecHooks(CustomTestCase):
             )
             self.assertEqual(draft.tpu_committed_lens.tolist(), [5, 10])
             self.assertEqual(draft.tpu_req_pool_indices.tolist(), [1, 2])
+
+            # A shorter active step still trails a preceding full-width commit.
+            batch.spec_info = draft
+            plan = TpuSpecVerifyInput.from_batch(batch, num_verify_rows=2, padded_bs=4)
+            self.assertEqual(plan.host_len_slack, num_draft_tokens)
+            self.assertEqual(plan.verify_cache_candidates.shape, (4, 6))
+            with self.assertRaisesRegex(ValueError, "reserved KV window"):
+                TpuSpecVerifyInput.from_batch(batch, num_verify_rows=4, padded_bs=4)
 
             # Request validation and KV planning use the selected worker's
             # capability, including an input constructed outside the worker.

@@ -29,7 +29,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -64,6 +64,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     mamba_track_grid,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -297,15 +298,29 @@ class TpuSpecWorker(BaseSpecWorker):
         torch.accelerator.synchronize()
         snapshot_recompilation_baseline()
 
-    def _warmup_logical_bs_ops(self) -> None:
+    def _warmup_logical_bs_ops(
+        self,
+        *,
+        num_drafts: int | None = None,
+        batch_sizes: Sequence[int] | None = None,
+    ) -> None:
         # torch_tpu compiles one program per shape even for a plain H2D copy.
         max_bs = min(
             self.target_worker.model_runner.max_running_requests,
             self._b_bucketer().max_val,
         )
-        live_sizes = range(1, max_bs + 1)
+        live_sizes = range(1, max_bs + 1) if batch_sizes is None else batch_sizes
+        num_drafts = self.num_drafts if num_drafts is None else num_drafts
+        num_verify_rows = num_drafts + 1
         # Every bucket: DP attention can run any bucket above a rank's own.
-        bucket_sizes = list(self._b_bucketer().buckets)
+        bucket_sizes = (
+            list(self._b_bucketer().buckets)
+            if batch_sizes is None
+            else sorted(
+                {pbs for bs in live_sizes for pbs in self._decode_buckets_for(bs)}
+            )
+        )
+        window_rows = int(max_speculative_num_draft_tokens())
         # Live bs: HOST_PADDED req_pool_indices re-uploaded after filter/merge.
         # Bucket: host-padded sampling params and the plan's padded verify window.
         h2d_shapes = (
@@ -316,7 +331,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 for dtype in (torch.int64, torch.int32, torch.float32)
             ]
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
-            + [((pbs, 2 * self.num_verify_rows), torch.int64) for pbs in bucket_sizes]
+            + [((pbs, 2 * window_rows), torch.int64) for pbs in bucket_sizes]
         )
         with torch.no_grad(), eager_warmup() as materialize:
             for bs in live_sizes:
@@ -339,17 +354,21 @@ class TpuSpecWorker(BaseSpecWorker):
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0
                 )
                 # Eager ops compile per input layout, so bump finalize_accept's output.
-                next_seq_lens = self._warmup_accept(pbs).next_seq_lens
-                materialize((next_seq_lens + self.num_verify_rows).to(torch.int32))
+                next_seq_lens = self._warmup_accept(
+                    pbs, num_drafts=num_drafts
+                ).next_seq_lens
+                materialize((next_seq_lens + num_verify_rows).to(torch.int32))
 
-    def _warmup_accept(self, padded_bs: int) -> AcceptResult:
+    def _warmup_accept(
+        self, padded_bs: int, *, num_drafts: int | None = None
+    ) -> AcceptResult:
         """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
 
         def zeros(*shape: int) -> torch.Tensor:
             return torch.zeros(shape, dtype=torch.int64, device=self.device)
 
         return finalize_accept(
-            zeros(padded_bs, self.num_drafts),
+            zeros(padded_bs, self.num_drafts if num_drafts is None else num_drafts),
             zeros(padded_bs),
             zeros(padded_bs),
             zeros(padded_bs),
@@ -663,6 +682,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.verify_cache_candidates,
             verify_input.committed_lens,
             bucket.state.seq_lens,
+            self.num_verify_rows,
         )
         committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
         next_state = committed.state
@@ -776,6 +796,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.verify_cache_candidates,
             verify_input.committed_lens,
             state.seq_lens,
+            self.num_verify_rows,
         )
         # The forwards' preparation writes these; the idle batch must stay idle.
         with overridden_fields(

@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
-from sglang.srt.runtime_context import get_server_args, get_spec
+from sglang.srt.runtime_context import (
+    get_server_args,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import allocate_and_assign_decode_cache
 from sglang_tpu.dflash_utils_tpu import gather_dflash_candidate_window
@@ -54,7 +58,9 @@ class HostPaddedDraftInput(SpecInput):
             raise RuntimeError("TpuSpecWorker needs a host-resident req_to_token pool.")
         batch.maybe_evict_swa()
 
-        num_verify_rows = int(get_spec().speculative_num_draft_tokens)
+        # The previous, not-yet-copied commit may be wider than the next step.
+        # Reserve both windows at capacity so either adaptive transition fits.
+        num_verify_rows = int(max_speculative_num_draft_tokens())
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
             batch.reqs,
             reserve=2 * num_verify_rows,

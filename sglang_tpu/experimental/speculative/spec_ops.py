@@ -66,9 +66,11 @@ def select_verify_rows(
     verify_cache_candidates: torch.Tensor,
     committed_lens: torch.Tensor,
     seq_lens: torch.Tensor,
+    num_rows: int | None = None,
 ) -> VerifyRows:
-    """Positions and KV slots of the verify rows; candidates [pbs, 2 * (N + 1)], rest [pbs]."""
-    num_rows = verify_cache_candidates.shape[1] // 2
+    """Select active verify rows from a window reserved at draft capacity."""
+    if num_rows is None:
+        num_rows = verify_cache_candidates.shape[1] // 2
     cache_locs = select_dflash_verify_cache_locs_tpu(
         verify_cache_candidates, seq_lens, committed_lens, num_rows
     )
@@ -461,12 +463,13 @@ def _accept_warmup_args(
 
 def _verify_rows_warmup_args(
     ctx: SpecOpWarmupContext,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     bs, rows = ctx.physical_bs, ctx.num_verify_tokens
     return (
         torch.zeros((bs, 2 * rows), dtype=torch.int64, device=ctx.device),
         torch.zeros((bs,), dtype=torch.int64, device=ctx.device),
         torch.zeros((bs,), dtype=torch.int64, device=ctx.device),
+        rows,
     )
 
 
