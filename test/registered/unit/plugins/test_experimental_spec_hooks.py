@@ -1250,6 +1250,22 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._bsearch_filtering = True
         check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
 
+        penalized = batch(top_k=1 << 30, top_p=0.9)
+        penalized.sampling_info.acc_additive_penalties = torch.full((2, 32), -0.5)
+        with self.assertRaisesRegex(NotImplementedError, "penalties"):
+            check(batch=penalized, pp_proxy_tensors=None)
+        worker.supports_additive_penalties = True
+        check(batch=penalized, pp_proxy_tensors=None)
+        for name, value in (
+            ("acc_scaling_penalties", torch.ones(2, 32)),
+            ("logit_bias", torch.zeros(2, 32)),
+            ("penalizer_orchestrator", SimpleNamespace(is_required=True)),
+        ):
+            with self.subTest(unsupported=name):
+                with patch.object(penalized.sampling_info, name, value):
+                    with self.assertRaisesRegex(NotImplementedError, "penalties"):
+                        check(batch=penalized, pp_proxy_tensors=None)
+
     def test_block_draft_input_relays_through_the_future_map(self):
         """RelayPayload.from_draft_input reads the EAGLE seed slots of every draft
         input; the block input left them out and every DFlash/DSpark startup died."""

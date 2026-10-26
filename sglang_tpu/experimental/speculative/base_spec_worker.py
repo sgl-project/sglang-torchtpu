@@ -168,6 +168,9 @@ class TpuSpecWorker(BaseSpecWorker):
     """
 
     supports_logprobs = False
+    # Opt in only when verification applies the scheduler's additive snapshot
+    # at the padded batch size. Live penalizer state is still unsupported.
+    supports_additive_penalties = False
 
     def __init__(
         self,
@@ -1355,7 +1358,7 @@ class TpuSpecWorker(BaseSpecWorker):
             # prepare_for_verify leaves TPU attention metadata to the runner.
             skip_attn_backend_init=False,
         )
-        # Custom logit processors, penalties and logit bias are rejected up front.
+        # Algorithm-specific verifiers own any supported logits adjustments.
         return target_out.logits_output
 
     @staticmethod
@@ -1447,7 +1450,10 @@ class TpuSpecWorker(BaseSpecWorker):
         # would compile per batch-size pair.
         if (
             sampling_info.logit_bias is not None
-            or sampling_info.acc_additive_penalties is not None
+            or (
+                sampling_info.acc_additive_penalties is not None
+                and not self.supports_additive_penalties
+            )
             or sampling_info.acc_scaling_penalties is not None
             or (
                 sampling_info.penalizer_orchestrator is not None
