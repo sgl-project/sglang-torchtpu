@@ -45,10 +45,12 @@ from sglang.srt.layers.dp_attention import (
     get_dp_hidden_size,
 )
 from sglang.srt.layers.logprob_processor import (
+    LOGPROB_GRID_ROWS,
     InputLogprobProcessor,
     LogprobStage,
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
+    logprob_grid_cuts,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
@@ -375,6 +377,8 @@ class LogitsMetadata:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
+    # SGLANG_TPU_LOGPROB_GRID_ROWS: pruned-row offsets where the logprob chunking must cut.
+    input_logprob_grid_cuts_cpu: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # logits and logprobs post processing
@@ -967,6 +971,18 @@ class LogitsProcessor(nn.Module):
 
             logits_metadata.sample_indices_cpu = sample_indices
             logits_metadata.input_logprob_indices_cpu = input_logprob_indices
+            if LOGPROB_GRID_ROWS > 0:
+                logits_metadata.input_logprob_grid_cuts_cpu = logprob_grid_cuts(
+                    [
+                        start - 1 if start == extend else start
+                        for start, extend in zip(
+                            logits_metadata.extend_logprob_start_lens_cpu,
+                            logits_metadata.extend_seq_lens_cpu,
+                        )
+                    ],
+                    logits_metadata.extend_seq_lens_cpu,
+                    LOGPROB_GRID_ROWS,
+                )
             # Build the index tensors via pinned host memory + non-blocking H2D
             # so the small copy doesn't drain the stream.
             sample_indices = torch.tensor(
