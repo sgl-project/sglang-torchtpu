@@ -521,10 +521,12 @@ _VISION_LOCAL_OPS: dict[float, object] = {}
 
 
 def _vision_local_block_sizes(seq_len: int) -> tuple[int, int]:
-    """Splash (block_q, block_kv) for a sequence: the largest of 2048 / 1024 dividing it.
+    """Splash (block_q, block_kv): the largest of 2048..128 (q) and 1024..128 (kv) dividing seq_len.
 
     Large blocks keep the per-grid-step cost low; at 16,384 tokens with 1,024-token
-    segments, (2048, 1024) measured fastest of the sizes that fit a 24 MiB scoped VMEM.
+    segments, (2048, 1024) measured fastest of the sizes that fit a 24 MiB scoped VMEM,
+    and a 4,096-token q block does not compile under that limit. Callers pad seq_len to a
+    multiple of 128.
     """
     block_q = next(b for b in (2048, 1024, 512, 256, 128) if seq_len % b == 0)
     block_kv = next(b for b in (1024, 512, 256, 128) if seq_len % b == 0)
@@ -596,12 +598,15 @@ def _vision_local_attention(q, k, v, segment_ids, *, sm_scale: float, interpret=
 
 
 def _get_vision_local_op(sm_scale: float):
-    """Return a cached pallas op for segment-local vision attention with block skipping.
+    """Return a cached pallas op for segment-ID vision attention with block skipping.
 
     For segments much shorter than the sequence (local windows or tiles), the
     segment-ID op above computes every query-key block and masks most of them. This
     op skips the blocks whose segments cannot meet, so with each segment contiguous
-    its cost scales with the segment lengths rather than ``seq_len**2``.
+    its cost scales with the segment lengths rather than ``seq_len**2``. With one long
+    segment and a padding tail (full attention over a padded sequence) it runs dense
+    over the real tokens; its KV blocks keep the VMEM footprint fixed, where the
+    segment-ID op's single KV step outgrows a 24 MiB scoped limit above ~16k keys.
     """
     key = float(sm_scale)
     op = _VISION_LOCAL_OPS.get(key)

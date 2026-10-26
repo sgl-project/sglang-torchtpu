@@ -5,7 +5,8 @@
   KV-head expansion work, and bad inputs are rejected.
 * On the JAX CPU device: the block map marks every block pair that holds a same-segment
   query-key pair (and only overlapping ones), and the op's JAX body, splash in
-  interpret mode, equals the reference for contiguous and interleaved segments.
+  interpret mode, equals the reference for contiguous and interleaved segments and
+  for full attention over a padded sequence (real tokens, then a pad tail).
 * On the TPU in bf16, the registered op through ``VisionTpuLocalAttention``, eager and
   compiled, against an fp32 CPU reference: tiles of a grid that is not a multiple of
   the tile size, in tile order and in row-major order, with pad tokens.
@@ -100,6 +101,10 @@ class TestVisionTpuLocalAttentionCpu(CustomTestCase):
     def test_contiguous_segments(self):
         self._check(_segments([128, 100, 28, 256]))
 
+    def test_full_attention_with_a_pad_tail(self):
+        # A full-attention layer: one segment for the real tokens, one for the pads.
+        self._check(_segments([400, 112]), seed=7)
+
     def test_interleaved_segments(self):
         self._check(_tiles(32, 32, 16), seed=1)
 
@@ -173,6 +178,7 @@ class TestVisionLocalJax(CustomTestCase):
         for name, seg in (
             ("contiguous", _segments([700, 300, 1024, 50, 998, 1024])),
             ("interleaved", _tiles(64, 64, 32)),
+            ("real and pad", _segments([3500, 596])),
         ):
             with self.subTest(order=name):
                 mask, nxt = self._block_map(seg, 1024, 512)
@@ -221,6 +227,12 @@ class TestVisionLocalJax(CustomTestCase):
 
     def test_splash_body_interleaved_segments(self):
         self._check_body(_tiles(64, 64, 32), h=1, d=16, seed=6)
+
+    def test_splash_body_full_attention_with_a_pad_tail(self):
+        # Dense: the 3,500 real tokens reach into every q and kv block (2 x 4 live).
+        mask, _ = self._block_map(_segments([3500, 596]), 2048, 1024)
+        self.assertEqual(int((mask > 0).sum()), 2 * 4)
+        self._check_body(_segments([3500, 596]), h=2, d=16, seed=8)
 
 
 def _tpu_available() -> bool:

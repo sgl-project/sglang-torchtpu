@@ -9,7 +9,10 @@ full attention. ``VisionTpuLocalAttention`` additionally takes
 attention with a block map that skips every query-key block whose segments
 cannot meet (``_get_vision_local_op``). The result is exact for any token
 order; it is fast when each segment is contiguous, so callers should order the
-tokens segment by segment (and undo the order after the encoder).
+tokens segment by segment (and undo the order after the encoder). Full-attention
+layers over a padded sequence (one segment for the real tokens, one for the pad
+tail) can use it too: it then runs dense over the real tokens, and unlike the
+segment-ID op it fits a 24 MiB scoped VMEM at long sequences.
 
 ``_register_attention_backends`` installs it as the ``"tpu"`` vision attention
 backend; without ``local_segment_ids=`` it is ``VisionTpuAttention`` unchanged.
