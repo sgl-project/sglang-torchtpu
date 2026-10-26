@@ -8,9 +8,11 @@ from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
+from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.speculative.verify_sampling import (
+    tree_speculative_sampling_target_only,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -20,15 +22,23 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
+<<<<<<< HEAD
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_tpu
+=======
+from sglang.srt.utils import is_npu
+>>>>>>> upstream/main
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
 
+<<<<<<< HEAD
 _is_tpu = is_tpu()
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[int | None, int], dict[str, Any]] = {}
+=======
+_DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+>>>>>>> upstream/main
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
         "FlashInferAttnBackend",
@@ -42,41 +52,10 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda():
-    from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-    from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-
-    from sglang.kernels.ops.speculative.sampling import (
-        tree_speculative_sampling_target_only,
-    )
-
-    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
-elif is_musa():
-    try:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
-        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
-    except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
-        tree_speculative_sampling_target_only = None
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-
-    tree_speculative_sampling_target_only = None
-else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
-    tree_speculative_sampling_target_only = None
+# DFlash does not run sampling verify on NPU, even where the op exists.
+_DFLASH_SAMPLING_VERIFY_AVAILABLE = (
+    tree_speculative_sampling_target_only is not None and not is_npu()
+)
 
 
 def is_dflash_sampling_verify_available() -> bool:
@@ -207,8 +186,20 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     backend = attn_backend
     for _ in range(4):
+        if isinstance(backend, HybridAttnBackend):
+            # Resolve wrappers down to the backend that runs TARGET_VERIFY
+            backend = backend._select_backend(ForwardMode.TARGET_VERIFY)
+            continue
+        if isinstance(backend, TboAttnBackend):
+            # primary and children come from the same creator.
+            backend = backend.primary
+            continue
         full_backend = getattr(backend, "full_attn_backend", None)
         if full_backend is None:
             break
@@ -867,6 +858,7 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> tuple[bool, str]:
     return True, ""
 
 
+<<<<<<< HEAD
 @triton.jit
 def _fused_correct_drafts_and_bonus_kernel(
     candidates_ptr,
@@ -955,6 +947,8 @@ def compute_dflash_correct_drafts_and_bonus(
     return correct_len.to(torch.int32), bonus.to(torch.int64)
 
 
+=======
+>>>>>>> upstream/main
 def apply_dflash_simulated_acceptance(
     *,
     candidates: torch.Tensor,
@@ -966,10 +960,15 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_len: float,
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
+    next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
 ) -> None:
-    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
-    block_size = candidates.shape[1]
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
+    ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
+    bs, block_size = candidates.shape
+    if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
+        # The sampling-verify branch does not materialize the target argmax.
+        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
@@ -1212,83 +1211,3 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> str | None:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
     return None
-
-
-@triton.jit
-def _table_qk_norm_rope_kernel(
-    qkv_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    cos_sin_ptr,
-    pos_ptr,
-    row_stride,
-    q_size,
-    NHQ: tl.constexpr,
-    D: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    t = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1)
-    pos = tl.load(pos_ptr + t).to(tl.int64)
-
-    HALF: tl.constexpr = D // 2
-    half_ar = tl.arange(0, HALF)
-    d_ar = tl.arange(0, D)
-    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
-    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
-
-    is_q = h < NHQ
-    col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
-    w_ptr = tl.where(is_q, q_weight_ptr.to(tl.int64), k_weight_ptr.to(tl.int64)).to(
-        tl.pointer_type(tl.bfloat16)
-    )
-
-    row = qkv_ptr + t * row_stride + col0
-    x = tl.load(row + d_ar).to(tl.float32)
-    ms = tl.sum(x * x, 0) / D
-    inv = 1.0 / tl.sqrt(ms + EPS)
-    w1 = tl.load(w_ptr + half_ar).to(tl.float32)
-    w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
-    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
-    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
-    x1 = x1.to(tl.bfloat16).to(tl.float32)
-    x2 = x2.to(tl.bfloat16).to(tl.float32)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    tl.store(row + half_ar, o1.to(tl.bfloat16))
-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
-
-
-def table_qk_norm_rope_(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    num_q_heads: int,
-    num_k_heads: int,
-    head_dim: int,
-    eps: float,
-) -> None:
-    """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
-
-    Reads cos/sin from the SAME rotary table as the unfused path, so there is
-    no large-position angle drift (unlike theta-recompute kernels). V columns
-    are untouched.
-    """
-    T = qkv.shape[0]
-    if T == 0:
-        return
-    grid = (T, num_q_heads + num_k_heads)
-    _table_qk_norm_rope_kernel[grid](
-        qkv,
-        q_weight,
-        k_weight,
-        cos_sin_cache,
-        positions,
-        qkv.stride(0),
-        num_q_heads * head_dim,
-        NHQ=num_q_heads,
-        D=head_dim,
-        EPS=eps,
-    )

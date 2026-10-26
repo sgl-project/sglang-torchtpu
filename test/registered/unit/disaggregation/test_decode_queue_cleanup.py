@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -14,6 +15,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
+<<<<<<< HEAD
 from sglang.srt.disaggregation.fake.conn import (
     FakeKVManager,
 )
@@ -22,16 +24,17 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
+=======
+from sglang.srt.runtime_context import publish, reset_context
+>>>>>>> upstream/main
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.separate_buffer_allocator_double import (
-    bind_separate_buffer_capacity,
-)
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
+<<<<<<< HEAD
 class FakeReceiver:
     def __init__(self):
         self.clear_called = False
@@ -47,6 +50,14 @@ class FakeReceiver:
 
     def failure_exception(self):
         return None
+=======
+def _run_as_single_rank(test: unittest.TestCase) -> None:
+    # The transfer queue sizes its release collectives from the gloo group;
+    # these tests have no process group, so answer as one rank.
+    world_size = patch("torch.distributed.get_world_size", return_value=1)
+    world_size.start()
+    test.addCleanup(world_size.stop)
+>>>>>>> upstream/main
 
 
 class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
@@ -101,11 +112,13 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
 
 class TestDecodeQueueCleanup(CustomTestCase):
     def setUp(self):
+        _run_as_single_rank(self)
         # The code under test reads its config from the bags.
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
+<<<<<<< HEAD
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_prealloc_waiting_row_still_enters_tp_cp_vote(self, reduce):
         tp_group, cp_group = object(), object()
@@ -672,6 +685,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [req], req.return_logprob
         )
 
+=======
+>>>>>>> upstream/main
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
         # A req whose kv_receiver was already cleared must not crash on .abort().
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -736,97 +751,125 @@ class TestDecodeQueueCleanup(CustomTestCase):
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
 
+
+class _GateReceiver:
+    def __init__(self, poll):
+        self._poll = poll
+        self.require_staging = False
+
+    def poll(self):
+        return self._poll
+
+    def clear(self):
+        pass
+
+    def failure_exception(self):
+        raise KVTransferError(
+            7, "Failed due to an unknown reason from another rank", True
+        )
+
+
+def _gated_decode_req(poll, restore_status):
+    return SimpleNamespace(
+        req=SimpleNamespace(rid="r", bootstrap_room=7, return_logprob=False),
+        kv_receiver=_GateReceiver(poll),
+        metadata_buffer_index=3,
+        hicache_restore_status=restore_status,
+    )
+
+
+class TestDecodeHiCacheRestoreGate(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        _run_as_single_rank(self)
+
+    def test_gate_folds_restore_outcome_into_terminal_poll_only(self):
+        cases = [
+            (KVPoll.Success, HiCacheRestoreResult.READY, KVPoll.Success),
+            (KVPoll.Success, HiCacheRestoreResult.PENDING, KVPoll.Transferring),
+            (KVPoll.Success, HiCacheRestoreResult.FAILED, KVPoll.Failed),
+            (KVPoll.Transferring, HiCacheRestoreResult.FAILED, KVPoll.Transferring),
+            (
+                KVPoll.WaitingForInput,
+                HiCacheRestoreResult.FAILED,
+                KVPoll.WaitingForInput,
+            ),
+            (KVPoll.Failed, HiCacheRestoreResult.PENDING, KVPoll.Failed),
+        ]
+        for poll, status, expected in cases:
+            with self.subTest(poll=poll, status=status):
+                gated = HiCacheRestoreGatedKVReceiver(_gated_decode_req(poll, status))
+                self.assertEqual(gated.poll(), expected)
+
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
-    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
-    def test_transfer_failure_cleanup_respects_deferred_release_gates(
-        self, mock_poll, mock_prepare_abort, mock_release_kv_cache
+    def test_pop_transferred_branches_on_reduced_poll_only(
+        self, mock_prepare_abort, mock_release_kv_cache
     ):
-        receiver = FakeReceiver()
-        req = SimpleNamespace(
-            rid="failed-transfer",
-            bootstrap_room=7,
-            return_logprob=False,
-        )
-        decode_req = SimpleNamespace(
-            req=req,
-            kv_receiver=receiver,
-            metadata_buffer_index=3,
-            hicache_restore_status=HiCacheRestoreResult.READY,
-        )
+        def make_queue(decode_req, peer_poll):
+            queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+            queue.queue = [decode_req]
+            queue.enable_staging = False
+            queue.enable_host_receive = False
+            queue.enable_deferred_kv_release = False
+            queue.gloo_group = MagicMock()
+            queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+            queue.tp_rank = 0
+            queue.tree_cache = MagicMock()
+            queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+            queue.metadata_buffers.clear_slot = lambda idx: (
+                queue.metadata_buffers.bootstrap_room.__setitem__(idx, 0)
+            )
+            queue._clean_hicache_prefetch_resources = MagicMock()
+            queue._commit_transfer_to_req = MagicMock()
+            queue._record_transfer_failure = MagicMock()
+            scheduler = MagicMock()
+            scheduler.enable_decode_hicache = True
+            scheduler.enable_hisparse = False
+            scheduler.metrics_reporter.enable_metrics = False
+            queue.scheduler = scheduler
 
-        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        queue.queue = [decode_req]
-        queue.enable_staging = False
-        queue.enable_deferred_kv_release = False
-        queue.gloo_group = MagicMock()
-        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
-        queue.tp_rank = 0
-        queue.tree_cache = MagicMock()
-        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
-        queue.spec_algorithm = MagicMock()
-        queue.spec_algorithm.is_none.return_value = True
-        queue._clean_hicache_prefetch_resources = MagicMock()
+            def reduce_with_peer(
+                pollers, group, decode_reqs=None, metadata_buffers=None
+            ):
+                return [min(int(p.poll()), int(peer_poll)) for p in pollers]
 
-        scheduler = MagicMock()
-        scheduler.enable_decode_hicache = False
-        scheduler.enable_hisparse = False
-        scheduler.output_streamer = MagicMock()
-        scheduler.metrics_reporter.enable_metrics = False
-        queue.scheduler = scheduler
+            patcher = patch(
+                "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+                side_effect=reduce_with_peer,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            return queue
 
-        mock_poll.return_value = [KVPoll.Failed]
-
-        transferred = queue.pop_transferred()
-
-        self.assertEqual(transferred, [])
+        decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.FAILED)
+        queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
+        self.assertEqual(queue.pop_transferred(), [])
         self.assertEqual(queue.queue, [])
-        self.assertTrue(receiver.clear_called)
-        self.assertIsNone(decode_req.kv_receiver)
-        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
-        scheduler.output_streamer.stream_output.assert_called_once_with(
-            [req], req.return_logprob
+        queue._commit_transfer_to_req.assert_not_called()
+        queue._record_transfer_failure.assert_called_once_with("HiCache restore failed")
+        mock_prepare_abort.assert_called_once()
+
+        mock_prepare_abort.reset_mock()
+        decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.READY)
+        queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
+        self.assertEqual(queue.pop_transferred(), [])
+        queue._commit_transfer_to_req.assert_not_called()
+        queue._record_transfer_failure.assert_called_once_with(
+            "Failed due to an unknown reason from another rank"
         )
         mock_prepare_abort.assert_called_once()
-        mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
-        )
 
-        receiver = FakeReceiver()
-        receiver.kv_mgr = FakeKVManager.__new__(FakeKVManager)
-        decode_req.kv_receiver = receiver
-        queue.queue = [decode_req]
-        queue.enable_deferred_kv_release = True
-        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
+        mock_prepare_abort.reset_mock()
         mock_release_kv_cache.reset_mock()
-
-        transferred = queue.pop_transferred()
-
-        self.assertEqual(transferred, [])
-        self.assertEqual(queue.queue, [])
-        self.assertTrue(receiver.clear_called)
-        self.assertIsNone(decode_req.kv_receiver)
-        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
-        mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
-        )
-
-        receiver = MagicMock()
-        decode_req.kv_receiver = receiver
-        decode_req.host_staged = True
-        queue.enable_host_receive = True
-        queue.enable_deferred_kv_release = False
-        queue._defer_release = MagicMock()
-        queue.queue = [decode_req]
-        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
-        mock_release_kv_cache.reset_mock()
+        decode_req = _gated_decode_req(KVPoll.Transferring, HiCacheRestoreResult.FAILED)
+        queue = make_queue(decode_req, peer_poll=KVPoll.Success)
         self.assertEqual(queue.pop_transferred(), [])
-        receiver.abort.assert_called_once_with()
-        queue._defer_release.assert_called_once_with(decode_req)
-        receiver.clear.assert_not_called()
-        queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+        self.assertEqual(queue.queue, [decode_req])
+        mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
 
+<<<<<<< HEAD
         queue.queue = [decode_req]
         decode_req.req.finished_reason = FINISH_ABORT("cancelled")
         with (
@@ -921,6 +964,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertFalse(scheduler.is_fully_idle())
 
+=======
+>>>>>>> upstream/main
 
 if __name__ == "__main__":
     unittest.main()

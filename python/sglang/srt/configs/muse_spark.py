@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +16,11 @@
 """Hugging Face configuration for Muse Spark (``muse_spark`` checkpoints)."""
 
 from transformers import PretrainedConfig
+=======
+"""Native nested Hugging Face configuration for Muse Spark."""
+
+from transformers import CONFIG_MAPPING, PretrainedConfig
+>>>>>>> upstream/main
 
 
 class MuseSparkTextConfig(PretrainedConfig):
@@ -254,3 +260,23 @@ class MuseSparkConfig(PretrainedConfig):
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.audio_token_id = audio_token_id
+<<<<<<< HEAD
+=======
+
+
+def should_skip_weight_loading(name, config):
+    if "rotary_emb" in name or "num_tokens_per_expert" in name:
+        return True
+    if name.endswith(".mlp.norm_weight") or "embed_norm.weight" in name:
+        return True
+    return config.tie_word_embeddings and name == "lm_head.weight"
+
+
+for _config_class in (
+    MuseSparkTextConfig,
+    MuseSparkVisionConfig,
+    MuseSparkAudioConfig,
+    MuseSparkConfig,
+):
+    CONFIG_MAPPING.register(_config_class.model_type, _config_class, exist_ok=True)
+>>>>>>> upstream/main

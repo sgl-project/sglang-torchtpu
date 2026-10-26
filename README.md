@@ -20,11 +20,24 @@ SGLang-TorchTPU brings [SGLang](https://github.com/sgl-project/sglang) to Google
   <a href="https://docs.sglang.io/docs/hardware-platforms/tpu#sglang-torchtpu">Documentation</a>
 </p>
 
+<<<<<<< HEAD
 ## Highlights
+=======
+SGLang is an open-source inference framework for large language, vision-language, and diffusion models, optimized for agentic workloads, large-scale serving, and RL rollouts. [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion) is its built-in image and video generation engine, included in this repository and the `sglang` Python package.
+>>>>>>> upstream/main
 
 **PyTorch-native TPU serving.** Develop with familiar PyTorch workflows and deploy on TPU7x (Ironwood), with `torch.compile` and direct compilation. Tensor, expert, data, pipeline, and context parallelism cover a range of serving configurations.
 
+<<<<<<< HEAD
 **Efficient inference at scale.** Combine prefix caching, HiCache KV offload to host memory, and disaggregated prefill/decode with TP resharding. Low-precision inference includes FP8, MXFP4, INT4 W4A16, and FP8 KV cache.
+=======
+> **[SGLang Summit 2026: Meet the builders of open AI](https://www.sglang.io/summit)**<br>
+> **Our flagship annual gathering · November 12–13 · San Francisco**
+>
+> Go deep on inference, training, and AI hardware through technical talks, live demos, and hands-on workshops. Bring your deployment challenges and meet the engineers and researchers building the stack.
+
+## Get Started
+>>>>>>> upstream/main
 
 **Speculative decoding.** Explore EAGLE3, DFlash, DFlash2, DSPark, and MTP for supported model configurations. The speculative decoding developer guide below covers worker selection and model-specific requirements.
 
@@ -94,13 +107,29 @@ Development and testing focus on **TPU7x (Ironwood)**, from a single host to mul
 
 | Deployment | Topology |
 | --- | --- |
+<<<<<<< HEAD
 | Single host | 4 chips, 8 TensorCores; TP up to 8 |
 | Multi-host | 2 hosts; TP 16 |
 | Disaggregated serving | 4 hosts; 2 prefill + 2 decode |
+=======
+| [NVIDIA](https://docs.sglang.io/docs/hardware-platforms/nvidia-gpus) | B200/B300/GB200/GB300; H100/H200/H800/H20; A100; RTX 30/40/50 series, RTX 6000 Ada / PRO 6000; DGX Spark, Jetson Orin |
+| [AMD](https://docs.sglang.io/docs/hardware-platforms/amd_gpu) | Instinct MI300X, MI325X, MI350X, MI355X |
+| [Google TPU](https://docs.sglang.io/docs/hardware-platforms/tpu) | v6e, v7; [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) / [SGL-JAX](https://github.com/sgl-project/sglang-jax) |
+| Intel ([GPU](https://docs.sglang.io/docs/hardware-platforms/xpu) / [CPU](https://docs.sglang.io/docs/hardware-platforms/cpu_server)) | Arc / Arc Pro B-Series GPUs, Xeon CPUs |
+| [Apple Silicon](https://docs.sglang.io/docs/hardware-platforms/apple_metal) | Macs via Metal / MLX |
+| [Huawei Ascend](https://docs.sglang.io/docs/hardware-platforms/ascend-npus/getting-started/installation) | A2, A3, 950PR/DT NPUs |
+| [Moore Threads](https://docs.sglang.io/docs/hardware-platforms/mthreads_gpu) | MTT S5000 GPUs |
+>>>>>>> upstream/main
 
 ## Models and features
 
+<<<<<<< HEAD
 Selected model integrations include the following. Recipe availability and test coverage vary by model; experimental integrations are included.
+=======
+SGLang-TorchTPU brings the SGLang serving engine to Google TPUs through PyTorch, torch_tpu, and Pallas kernels. It supports LLM and vision-language serving on TPU7x (Ironwood), including tensor and expert parallelism across hosts. SGL-JAX provides the JAX-based TPU serving path.
+
+See the [Cookbook](https://cookbook.sglang.io/) and platform guides for model compatibility and setup.
+>>>>>>> upstream/main
 
 | Model | Available recipes and tests |
 | --- | --- |
@@ -112,7 +141,18 @@ Selected model integrations include the following. Recipe availability and test 
 | GPT-OSS (20B, 120B) | 20B recipes, 120B recipes |
 | Gemma 4 (31B, 26B-A4B) | 31B recipes, 26B-A4B recipes |
 
+<<<<<<< HEAD
 See the [full support guide](SUPPORT.md) for support tiers, model-specific requirements, and experimental capabilities.
+=======
+| Area | Projects | Purpose |
+| --- | --- | --- |
+| Diffusion | [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion/installation) | Built into SGLang for image and video generation with diffusion models. |
+| Audio | [SGLang Omni](https://github.com/sgl-project/sglang-omni) | Audio model serving for text-to-speech (TTS) and automatic speech recognition (ASR). |
+| Speculative Decoding | [SpecForge](https://github.com/sgl-project/SpecForge) | Train draft models for speculative decoding and deploy them with SGLang. |
+| RL and Post-Training | [Miles](https://github.com/radixark/miles), [slime](https://github.com/THUDM/slime), [AReaL](https://github.com/inclusionAI/AReaL), [Tunix](https://github.com/google/tunix), [verl](https://github.com/volcengine/verl) | Training frameworks that integrate SGLang for rollout generation. |
+| Deployment and Orchestration | [SMG](https://github.com/smg-project/smg), [RBG](https://github.com/sgl-project/rbg), [llm-d](https://llm-d.ai/docs/dev/operations/disaggregation/sglang), [Ray Serve](https://docs.ray.io/en/latest/serve/llm/user-guides/sglang.html), [NVIDIA Dynamo](https://docs.nvidia.com/dynamo/backends/sg-lang/reference-guide) | Deploy and scale SGLang inference services with routing, load balancing, and cluster orchestration. |
+| Education | [Mini-SGLang](https://github.com/sgl-project/mini-sglang), [zero-to-sglang](https://github.com/datawhalechina/zero-to-sglang), [DeepLearning.AI course](https://www.deeplearning.ai/short-courses/efficient-inference-with-sglang-text-and-image-generation/) | Learn inference engine design and efficient text and image generation through code and hands-on courses. |
+>>>>>>> upstream/main
 
 Explore [model recipes](benchmark/tpu/recipe/README.md), [TPU benchmarks](benchmark/tpu/README.md), and the [CI support matrix](SUPPORT_MATRIX.md) for configurations and test coverage.
 

@@ -4,6 +4,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+<<<<<<< HEAD
+=======
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_draft_cache_locs_contiguous_func,
+)
+>>>>>>> upstream/main
 from sglang.kernels.ops.speculative.eagle import (
     build_chain_tree,
     prepare_draft_extend_layout,
@@ -55,12 +61,11 @@ if _is_tpu:
         prepare_draft_cache_locs_tpu,
     )
 
-if _is_cpu:
-    from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -127,7 +132,10 @@ def prepare_for_draft_extend(
     return_hidden_states_before_norm: bool,
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
+    kv_loc_plan: Optional[KVLocPlan] = None,
 ):
+    """``kv_loc_plan``: the iteration's plan, whose window the draft extend
+    writes again (the verify window); a widened window plans its own."""
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
     # rows below the boundary. Locs/positions arrive precomputed; token/hidden
@@ -215,6 +223,7 @@ def prepare_for_draft_extend(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
         extend_position_info=extend_position_info,
+        kv_loc_plan=None if widen else kv_loc_plan,
     )
     if device_lens_only and not forward_batch.forward_mode.is_idle():
         # The query width is known without reading seq_lens back from the device.
@@ -258,15 +267,23 @@ def prepare_for_draft(
     draft_model_runner: ModelRunner,
     topk: int,
     num_steps: int,
-):
-
+    *,
+    target_translator: Optional[KVIndexTranslator] = None,
+    num_draft_tokens: Optional[int] = None,
+) -> tuple[ForwardBatch, bool, Optional[KVLocPlan]]:
+    """The draft-decode batch. With ``target_translator``, a chain draft plans
+    the iteration's whole write window (the ``num_draft_tokens`` slots past
+    ``seq_lens`` that verify and draft extend also write) and writes its first
+    ``num_steps`` columns; that plan is returned, else None."""
     prepared_positions = None
     prepared_mrope_positions = None
+    kv_loc_plan = None
     if not batch.forward_mode.is_idle():
         bs = len(batch.seq_lens)
 
         # Assign cache locations (draft-write targets).
         page_size = batch.token_to_kv_pool_allocator.page_size
+<<<<<<< HEAD
         if _is_tpu and prepare_draft_cache_locs_tpu(
             batch,
             draft_input,
@@ -278,11 +295,25 @@ def prepare_for_draft(
         ):
             pass
         elif page_size == 1 or topk == 1:
+=======
+        plans_window = (
+            target_translator is not None
+            and topk == 1
+            and num_draft_tokens is not None
+            and num_draft_tokens > num_steps
+            and not _is_cpu
+        )
+        # A chain draft's slots lead the iteration's window: gather the whole
+        # window in the same launch.
+        window_cols = num_draft_tokens if plans_window else num_steps
+        if page_size == 1 or topk == 1:
+>>>>>>> upstream/main
             batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
+                (bs * topk * window_cols,),
                 dtype=torch.int64,
                 device=batch.device,
             )
+<<<<<<< HEAD
             if _is_cpu:
                 assign_draft_cache_locs_contiguous_cpu(
                     batch.req_pool_indices,
@@ -314,6 +345,34 @@ def prepare_for_draft(
                     host_seq_lens=batch.seq_lens_cpu,
                     positions=prepared_positions,
                     mrope=prepared_mrope_positions,
+=======
+            if batch.seq_lens.is_cuda and topk == 1:
+                prepared_positions = torch.empty_like(batch.seq_lens)
+                if draft_model_runner.model_config.model_is_mrope and all(
+                    x is None for x in batch.multimodal_inputs
+                ):
+                    prepared_mrope_positions = torch.empty(
+                        (3, bs), dtype=torch.int64, device=batch.device
+                    )
+            # TODO(lsyin): align with the default code path
+            assign_draft_cache_locs_contiguous_func(
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                topk,
+                window_cols,
+                positions=prepared_positions,
+                mrope=prepared_mrope_positions,
+            )
+            if plans_window:
+                kv_loc_plan = target_translator.plan(
+                    req_pool_indices=batch.req_pool_indices,
+                    seq_lens=batch.seq_lens,
+                    seq_lens_cpu=batch.seq_lens_cpu,
+                    write_virtual=batch.out_cache_loc,
+                    read_extent=num_draft_tokens,
+>>>>>>> upstream/main
                 )
         else:
             # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
@@ -375,6 +434,8 @@ def prepare_for_draft(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
         spec_mrope_positions=prepared_mrope_positions,
+        kv_loc_plan=kv_loc_plan,
+        write_cols=None if kv_loc_plan is None else slice(0, num_steps),
     )
     # Evaluate graph eligibility on the normalized physical DP shape.
     if forward_batch.forward_mode.is_idle():
@@ -382,7 +443,7 @@ def prepare_for_draft(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    return forward_batch, can_run_decode_cuda_graph
+    return forward_batch, can_run_decode_cuda_graph, kv_loc_plan
 
 
 def build_eagle_verify_input(
@@ -714,9 +775,28 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+<<<<<<< HEAD
     # Match scheduler inputs to any padded target logits.
     verify_padding = target_compile_policy.prepare_spec_verify(
         batch, verify_input, logits_output.next_token_logits
+=======
+    (
+        predict,
+        accept_lens,
+        accept_index,
+    ) = eagle_sample(
+        verify_input,
+        batch,
+        logits_output,
+        grammar_mask,
+        uno_target_max_top_k=uno_target_max_top_k,
+        watermark_state=target_worker.model_runner.watermark_state,
+        watermark_full_mask=(
+            target_worker.model_runner.attn_backend.verify_mask is None
+            or target_worker.model_runner.attn_backend.verify_mask.mode
+            == TreeMaskMode.FULL_MASK
+        ),
+>>>>>>> upstream/main
     )
     # CUDA fuses the commit bookkeeping (and a chain's next draft-extend inputs)
     # into one post-sampling kernel, replacing the generic bookkeeping below.
@@ -776,7 +856,16 @@ def run_eagle_verify(
             predict, accept_index, accept_lens, batch.seq_lens
         )
     else:
+<<<<<<< HEAD
         new_seq_lens, bonus_tokens = verify_bookkeeping_result
+=======
+        new_seq_lens = batch.seq_lens + accept_lens
+    if batch.hisparse_coordinator is not None:
+        batch.hisparse_coordinator.commit_spec_accept_tokens(
+            batch=batch,
+            accept_indices=accept_index,
+        )
+>>>>>>> upstream/main
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
@@ -800,6 +889,33 @@ def run_eagle_verify(
         prepared_step_indices=prepared_commit_steps,
     )
 
+<<<<<<< HEAD
+=======
+    if not fused_commit_outputs and not batch.forward_mode.is_idle():
+        accept_tokens = predict[accept_index]
+        if (
+            target_worker.model_runner.watermark_state is not None
+            and batch.sampling_info.has_watermark_candidates
+        ):
+            target_worker.model_runner.watermark_state.append_speculative(
+                batch.req_pool_indices,
+                accept_tokens,
+                accept_lens,
+            )
+        bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+        # stride = accept_tokens per-req width = accept_index.shape[1]
+        # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
+        fill_bonus_tokens_func(
+            accept_tokens,
+            accept_lens,
+            bonus_tokens,
+            accept_index.shape[1],
+            bs,
+        )
+    elif batch.forward_mode.is_idle():
+        bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
+
+>>>>>>> upstream/main
     if batch.return_logprob and not batch.forward_mode.is_idle():
         compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
 

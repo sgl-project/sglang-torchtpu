@@ -116,8 +116,16 @@ class MultiModalStaticCache(MultimodalCache):
             self.mm_cache.move_to_end(mm_hash)
             return True
         tensor = embedding.embedding
+<<<<<<< HEAD
         storage_size = embedding.storage_size()
         data_size = embedding.cache_size()
+=======
+        storage_size = _get_tensor_size(tensor)
+        data_size = min(storage_size, tensor.element_size() * tensor.numel())
+        # An uncacheable video must not evict useful entries on every chunk.
+        if data_size > self.max_size:
+            return False
+>>>>>>> upstream/main
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False

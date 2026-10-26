@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+<<<<<<< HEAD
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
@@ -13,11 +14,12 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+=======
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+>>>>>>> upstream/main
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.base_prefix_cache import (
-    CacheRequestHandle,
-    CacheRequestOutcome,
-)
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,12 +43,13 @@ class _Req:
         self.disagg_kv_sender = Mock()
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
+        self.discard_output_reason = None
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
         self.output_ids = []
         self.origin_input_ids = list(range(100))
-        self.extend_range = None
+        self.extend_end = None
         self.time_stats = SimpleNamespace(
             set_prefill_finished_time=Mock(),
             set_last_chunked_prefill_finish_time=Mock(),
@@ -125,13 +128,14 @@ def _result():
     return GenerationBatchResult(next_token_ids=torch.tensor([11]))
 
 
-def _free_req(req, _tree_cache, *, is_insert):
-    assert is_insert is False
+def _free_req(req, _tree_cache, *, checkpoint):
+    assert checkpoint is False
     req.kv.req_pool_idx = None
     req.kv.mark_kv_released()
     req.kv.mamba_pool_idx = None
 
 
+<<<<<<< HEAD
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
 @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
 def test_aborted_final_result_releases_hybrid_cache(
@@ -390,6 +394,8 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     scheduler.send_kv_chunk.assert_not_called()
 
 
+=======
+>>>>>>> upstream/main
 class TestPrefillCompleteResult(CustomTestCase):
     def setUp(self):
         super().setUp()

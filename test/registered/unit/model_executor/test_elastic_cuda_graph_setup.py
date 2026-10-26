@@ -12,6 +12,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestElasticCudaGraphSetup(unittest.TestCase):
+<<<<<<< HEAD
     def test_deferred_capture_skips_distributed_setup(self):
         model_runner = SimpleNamespace(is_draft_worker=False, device="cuda")
         eager_runner = Mock()
@@ -45,6 +46,8 @@ class TestElasticCudaGraphSetup(unittest.TestCase):
         finalize.assert_not_called()
         self.assertIs(capture.decode.runner, eager_runner)
 
+=======
+>>>>>>> upstream/main
     def test_recapture_repeats_warmup_after_rendezvous(self):
         model_runner = SimpleNamespace(_kernel_warmed_up=True)
         eager_runner = Mock()

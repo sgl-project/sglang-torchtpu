@@ -26,18 +26,27 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
+    prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+<<<<<<< HEAD
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_bool_env_var, is_hip, is_tpu
+=======
+from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu
+>>>>>>> upstream/main
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+<<<<<<< HEAD
 _is_tpu = is_tpu()
+=======
+_is_xpu = is_xpu()
+>>>>>>> upstream/main
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -249,6 +258,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 output_dtype=getattr(layer, "orig_dtype", None),
                 weight_shape=layer.weight.shape,
             )
+            if _is_xpu:
+                scale_reordered = prepare_xpu_block_scale_for_scaled_mm(
+                    layer.weight_scale.data,
+                    self.weight_block_size,
+                    self.w8a8_block_fp8_linear,
+                )
+                if scale_reordered is not layer.weight_scale.data:
+                    with torch.no_grad():
+                        layer.weight_scale.set_(scale_reordered)
 
             if _is_tpu and _get_tpu_fp8_runtime() == "channelwise":
                 logger.warning_once(

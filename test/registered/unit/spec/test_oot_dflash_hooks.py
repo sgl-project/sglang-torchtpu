@@ -1,7 +1,6 @@
 import unittest
-from unittest.mock import Mock, patch, sentinel
+from unittest.mock import Mock, patch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dflash,
@@ -20,7 +19,6 @@ HOOK_MODULE = "sglang.srt.arg_groups.speculative_hook"
 def _platform(
     default_backend: str = "custom_backend",
     supported_backends: set[str] | None = None,
-    cache_result=None,
 ) -> Mock:
     supported_backends = supported_backends or {"custom_backend"}
     platform = Mock(spec=SRTPlatform)
@@ -33,9 +31,6 @@ def _platform(
     )
     platform.get_default_speculative_draft_attention_backend.return_value = (
         default_backend
-    )
-    platform.get_speculative_cache_locs_fn.return_value = (
-        None if cache_result is None else lambda **_: cache_result
     )
     return platform
 
@@ -110,6 +105,7 @@ class TestOOTDFlashHooks(CustomTestCase):
             ):
                 self._resolve_backend(None, platform)
 
+<<<<<<< HEAD
     def test_dp_attention_needs_npu_or_a_platform_opt_in(self):
         for device, opts_in, error in (
             ("custom", False, "does not support dp attention"),
@@ -141,6 +137,8 @@ class TestOOTDFlashHooks(CustomTestCase):
                 )
             self.assertIs(result, expected)
 
+=======
+>>>>>>> upstream/main
 
 if __name__ == "__main__":
     unittest.main()
