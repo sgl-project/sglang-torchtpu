@@ -483,10 +483,8 @@ def _gather_sc_banked(words, scales, records):
                         word_buf[slot, stream] = jnp.zeros((lanes, 128), jnp.int32)
                         scale_buf[slot, stream] = jnp.zeros((lanes,), jnp.float32)
                     for bank in range(len(words)):
-                        own = (selected >= 0) & (
-                            selected >= split if bank else selected < split
-                        )
                         local = selected - split if bank else selected
+                        own = (local >= 0) & (local < word_refs[bank].shape[0])
                         indexed = plsc.Indices(
                             jnp.where(own, local, -1), ignored_value=-1
                         )
