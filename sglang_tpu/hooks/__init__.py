@@ -31,6 +31,7 @@ from sglang_tpu.hooks.encoder import (
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
+    flush_glm_flash_megakernel_request,
     route_glm_flash_megakernel,
 )
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
@@ -232,6 +233,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.mem_cache.memory_pool.ReqToTokenPool.free_rows",
         drop_freed_glm_flash_megakernel_request,
+        HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
+        flush_glm_flash_megakernel_request,
         HookType.BEFORE,
     ),
     (

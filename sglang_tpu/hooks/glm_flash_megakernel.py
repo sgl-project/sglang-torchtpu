@@ -5,8 +5,10 @@ Why: SGLANG_TPU_GLM_FLASH_MEGAKERNEL runs single-request decode steps (the
      MTP verify) as one Pallas call per device.
 How: AFTER TpuGraphRunner.__init__ builds the kernel on the target model and
      wraps the compiled model.forward, routing the steps it handles to the kernel
-     and flushing its state before any other step; BEFORE
-     ReqToTokenPool.free_rows drops a freed request.
+     and flushing its state before any other step; the MTP commit also takes the
+     radix snapshot from the kernel. BEFORE UnifiedRadixCache.checkpoint flushes
+     the request the tree is about to read; BEFORE ReqToTokenPool.free_rows drops
+     a freed request.
 Upstream PR or issue: none (TPU-only kernel).
 Remove when: the megakernel is a seam of the model, or dropped.
 """
@@ -14,6 +16,8 @@ Remove when: the megakernel is a seam of the model, or dropped.
 from __future__ import annotations
 
 from typing import Any
+
+import torch
 
 _KERNELS: list = []
 
@@ -30,11 +34,6 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
     from sglang_tpu.envs import envs as tpu_envs
 
     args = runner.model_runner.server_args
-    # The kernel holds the KDA state until flush, so radix snapshots would go stale.
-    if not args.disable_radix_cache:
-        raise ValueError(
-            "SGLANG_TPU_GLM_FLASH_MEGAKERNEL requires --disable-radix-cache."
-        )
     n_query = (
         (args.speculative_num_draft_tokens or 1) if args.speculative_algorithm else 1
     )
@@ -66,6 +65,11 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
         def update_mamba_state_after_mtp_verify(*args, **kwargs):
             if mk.active:
                 mk.record_commit(kwargs["last_correct_step_indices"])
+                # Radix snapshots of an accepted checkpoint come from the kernel.
+                if kwargs.get("mamba_track_indices") is not None:
+                    mk.snapshot(
+                        kwargs["mamba_track_indices"], kwargs["mamba_steps_to_track"]
+                    )
             else:
                 commit(*args, **kwargs)
 
@@ -92,4 +96,15 @@ def drop_freed_glm_flash_megakernel_request(
     for mk in _KERNELS:
         if mk.req is not None and mk.req in indices:
             mk.invalidate()
+    return None
+
+
+def flush_glm_flash_megakernel_request(cache: Any, req: Any, *args, **kwargs) -> None:
+    """BEFORE UnifiedRadixCache.checkpoint: the tree (and a HiCache backup) reads
+    the request's pages and state slot, which lag the kernel until flush."""
+    for mk in _KERNELS:
+        if mk.holds(req.kv.req_pool_idx):
+            mk.flush()
+            # Raiden backups are not ordered against device writes.
+            torch.get_device_module(mk.dsa_caches[0].device).synchronize()
     return None

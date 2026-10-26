@@ -10,6 +10,4 @@ from benchmark.tpu.recipe.configs.glm_5_3_flash.server import CONFIG as BASE_CON
 
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"]["max_running_requests"] = 1
-CONFIG["server_args"]["max_mamba_cache_size"] = 3
-CONFIG["server_args"]["disable_radix_cache"] = True
 CONFIG["runtime_env"]["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"] = "1"
