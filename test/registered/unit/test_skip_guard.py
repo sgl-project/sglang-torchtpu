@@ -206,6 +206,32 @@ class TestSkipGuard(CustomTestCase):
                     completed.returncode, expected, completed.stdout + completed.stderr
                 )
 
+    def test_skipped_subtests_without_failfast_are_not_whole_test_skips(self):
+        # Without -f every skipped subtest lands in result.skipped (three here),
+        # which must not cancel the test that ran.
+        path = self._write("test_case_file.py", _UNITTEST_SKIPPED_SUBTESTS)
+        command = skip_guard.command_for_test_file(path, fail_on_all_skipped=True)
+        command[0] = sys.executable
+        command.remove("-f")
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("skipped=3", completed.stderr)
+
+    def test_relative_path_is_resolved(self):
+        self._write("test_case_file.py", _UNITTEST_ALL_SKIPPED)
+        command = skip_guard.command_for_test_file(
+            "test_case_file.py", fail_on_all_skipped=True
+        )
+        command[0] = sys.executable
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=120, cwd=self._dir
+        )
+        self.assertEqual(completed.returncode, skip_guard.NO_TESTS_EXECUTED_EXIT_CODE)
+        self.assertIn(
+            f"[skip_guard] {self._dir.resolve() / 'test_case_file.py'}:",
+            completed.stderr,
+        )
+
     def test_message_names_the_file_and_the_ways_out(self):
         completed = self._run(_UNITTEST_ALL_SKIPPED, guard=True)
         self.assertIn("[skip_guard]", completed.stderr)

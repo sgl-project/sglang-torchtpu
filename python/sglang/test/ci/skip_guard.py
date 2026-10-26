@@ -50,7 +50,11 @@ def _unittest_executed(result: unittest.TestResult) -> int:
     # result.skipped also holds skipped subtests (one test can have many) and
     # _ErrorHolder entries for a SkipTest raised in setUpClass/setUpModule
     # (never counted in testsRun). Only a whole test method skipped by its
-    # decorator or a skipTest() call cancels one unit of testsRun.
+    # decorator or a skipTest() call cancels one unit of testsRun. Skipped
+    # subtests arrive as unittest's private _SubTest, a TestCase subclass:
+    # without excluding them, one passing test plus a test that skips three
+    # subtests reads as -1 executed. (With -f, unittest stops a subtest loop at
+    # its first skip, so only one entry appears.)
     whole_test_skips = sum(
         1
         for test, _ in result.skipped
@@ -119,9 +123,12 @@ def _exit_code(code) -> int:
 def run_test_file(path: str, args: Sequence[str]) -> int:
     """Run ``path`` as ``__main__`` and return its exit code, failing it when
     a test run inside it executed no test."""
+    # Suite runners may pass a relative path; resolve it once so the message
+    # and sys.path do not depend on the working directory.
+    path = os.path.abspath(path)
     sys.argv = [path, *args]
     # Match ``python3 <path>``: tests import helper modules next to them.
-    sys.path[0] = os.path.dirname(os.path.abspath(path))
+    sys.path[0] = os.path.dirname(path)
     tally = _Tally()
     with _recording(tally):
         try:
