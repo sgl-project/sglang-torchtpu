@@ -9,7 +9,7 @@ from __future__ import annotations
 import ctypes
 import enum
 import struct
-from typing import ClassVar, List
+from typing import ClassVar, List, Optional
 
 import msgspec
 
@@ -45,6 +45,11 @@ class MessageTag(bytes, enum.Enum):
 
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
 
+    # Host-backed victims offered by prefill to the decode that served them.
+    VICTIM_PUSH = b"RAIDEN_VICTIM_PUSH"
+    VICTIM_ACK = b"RAIDEN_VICTIM_ACK"
+    VICTIM_DONE = b"RAIDEN_VICTIM_DONE"
+
     # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
@@ -77,6 +82,49 @@ class PullReq(WireMessage):
         require_non_negative(self.decode_pages, "decode_pages")
         require_non_negative(self.decode_swa_pages, "decode_swa_pages")
         _require_port(self.decode_port)
+
+
+class VictimPush(WireMessage):
+    """A host-resident session the prefill is about to evict.
+
+    ``tokens`` are the session's first ``len(blocks) * page_size`` token ids
+    and ``blocks`` the host page ids holding their full KV on this rank;
+    ``prefill`` and ``seq`` are the same on every rank of the prefill engine.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_PUSH
+    prefill: str
+    seq: int
+    ack_endpoint: str
+    tokens: list[int]
+    blocks: list[int]
+    # Page-aligned trailing SWA window in its independent host pool.
+    swa_blocks: list[int] = msgspec.field(default_factory=list)
+    # The registered producer UUID and control endpoints of its host pools.
+    uuid: int = 0
+    address: str = ""
+    swa_address: str = ""
+    source: str = "host"
+    extra_key: Optional[str] = None
+    cache_salt: Optional[str] = None
+    is_eagle: bool = False
+
+
+class VictimAck(WireMessage):
+    """Whether decode admitted the offered host reads into both host pools."""
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_ACK
+    seq: int
+    stored: bool
+
+
+class VictimDone(WireMessage):
+    """All producer host reads settled successfully (``ok``) or failed."""
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_DONE
+    prefill: str
+    seq: int
+    ok: bool
 
 
 class Blocks(WireMessage):

@@ -16,12 +16,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
-
+import zmq
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
+
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.sender import ROOM_SCOPED_SEND_ERRNOS
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -32,8 +34,12 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
     RoomFailed,
+    VictimAck,
+    VictimDone,
+    VictimPush,
     write_aux_blob,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -299,6 +305,49 @@ class RaidenReceiverMixin:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
             self._send_multipart_locked(endpoint, payload)
 
+    def _on_victim_push(self, msg: List[bytes]) -> None:
+        push = VictimPush.from_frames(msg)
+        with self._state_lock:
+            self._decode.victim_pushes[(push.prefill, push.seq)] = push
+
+    def _on_victim_done(self, msg: List[bytes]) -> None:
+        done = VictimDone.from_frames(msg)
+        with self._state_lock:
+            self._decode.victim_dones[(done.prefill, done.seq)] = done
+
+    def victim_pushes(self) -> Dict[Tuple[str, int], VictimPush]:
+        """Pushes received and not yet taken, by (prefill, seq)."""
+        with self._state_lock:
+            return dict(self._decode.victim_pushes)
+
+    def take_victim_push(self, key: Tuple[str, int]) -> Optional[VictimPush]:
+        with self._state_lock:
+            return self._decode.victim_pushes.pop(key, None)
+
+    def victim_dones(self) -> Dict[Tuple[str, int], VictimDone]:
+        """Done notices received and not yet taken, by (prefill, seq)."""
+        with self._state_lock:
+            return dict(self._decode.victim_dones)
+
+    def take_victim_done(self, key: Tuple[str, int]) -> Optional[VictimDone]:
+        with self._state_lock:
+            return self._decode.victim_dones.pop(key, None)
+
+    def send_victim_ack(self, *, endpoint: str, ack: VictimAck) -> None:
+        try:
+            self._send_multipart_locked(endpoint, ack.to_frames())
+        except zmq.ZMQError as exc:
+            if exc.errno not in ROOM_SCOPED_SEND_ERRNOS:
+                raise
+            logger.warning(
+                "RaidenKVManager rank%d: victim acknowledgement to %s failed "
+                "(errno %s): %s",
+                self.attn_tp_rank,
+                endpoint,
+                exc.errno,
+                exc,
+            )
+
     @staticmethod
     def _pair_blocks(
         remote: List[int], local: List[int]
@@ -404,7 +453,7 @@ class RaidenReceiverMixin:
     def _start_read_or_fail(
         self,
         *,
-        room: int,
+        room: Optional[int],
         engine: Any,
         req_id: str,
         uuid: int,
@@ -430,7 +479,9 @@ class RaidenReceiverMixin:
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
                 self._native_failed.update((req_id, *unissued))
-                self._fail_room_locked(room, reason)
+                # A read of no room (a pushed session's) fails nothing else.
+                if room is not None:
+                    self._fail_room_locked(room, reason)
                 self._release_pull_slots_locked()
             return False
         logger.debug(
@@ -1360,6 +1411,21 @@ class RaidenKVReceiver(CommonKVReceiver):
     ):
         if self.conclude_state == KVPoll.Failed:
             return
+        peer = getattr(self, "prefill_info", None)
+        if peer is not None and tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
+            matching_geometry = (
+                peer.attn_tp_size == self.kv_mgr.attn_tp_size
+                and peer.attn_cp_size == self.kv_mgr.attn_cp_size
+                and peer.pp_size == self.kv_mgr.pp_size == 1
+            )
+            if not matching_geometry:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "Victim prefix caching requires matching P/D attention TP/CP sizes and PP=1",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return
         self.kv_mgr.register_decode_request(
             self.bootstrap_room,
             [int(x) for x in kv_indices],

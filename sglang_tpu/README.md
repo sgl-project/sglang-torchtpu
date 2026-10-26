@@ -111,6 +111,34 @@ input of `_tpu-test.yml`), so each test runs in one mode only: the PR gate
 (stage-a, stage-b) and the single-host nightly (`nightly-tpu-4-v7`) run mode B;
 the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
 
+## P/D victim prefix cache: FULL-only DRAM spill
+
+Prefill stays the primary prefix cache. Before host pressure discards a cold
+cached branch, prefill registers the branch's FULL KV host pages for a native
+host read and offers them to the decode that served the branch. The decode
+pulls them straight into its HiCache host pool and inserts the victim as a
+host-only prefix; no HBM or staging slot is involved on either side. Every
+rank agrees on the branch, namespace, length and outcome before pages move.
+Source pins and destination pages stay reserved until the native transfer
+reports completion, also for refused or expired offers, and a cache reset
+waits for those reads to drain.
+
+Enable HiCache on both roles with `--enable-hierarchical-cache
+--hicache-io-backend raiden`, decode radix caching with
+`--disaggregation-decode-enable-radix-cache`, and
+`SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1` on both roles. The flag defaults to off.
+
+This milestone covers FULL-only models; hybrid SWA storage and reverse recall
+into prefill follow. It requires the Python unified radix tree, matching P/D
+attention TP/CP geometry, PP=1 and no GDN/Mamba state.
+
+Both roles need matching tpu-sync Python and native artifacts from the pinned
+[`ram2ram` fork branch](https://github.com/alisachen-google/h2h/tree/ram2ram),
+whose host-pool manager opens a control port for host reads. The native
+session deadline does not interrupt blocked TCP I/O, so also set positive
+native socket read, write and ACK timeouts on both roles; even after a timeout,
+pages are reused only once the native transfer has completed.
+
 ## Muse Spark multimodal
 
 `models/muse_spark.py` is the text decoder; `models/muse_spark_omni.py` adds the

@@ -44,7 +44,6 @@ from typing import (
 )
 
 import numpy as np
-
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -54,6 +53,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
+
 from sglang_tpu.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
@@ -92,6 +92,9 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
     RoomFailed,
+    VictimAck,
+    VictimDone,
+    VictimPush,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang_tpu.envs import envs as tpu_envs
@@ -199,6 +202,9 @@ class RaidenKVManager(
             ReshardChunk.TAG: self._on_reshard_chunk,
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
+            VictimPush.TAG: self._on_victim_push,
+            VictimAck.TAG: self._on_victim_ack,
+            VictimDone.TAG: self._on_victim_done,
         }
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
@@ -1158,6 +1164,54 @@ class RaidenKVManager(
         super().register_to_bootstrap()
 
     # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
+
+    @property
+    def victim_push_active(self) -> bool:
+        """Host-victim transfer readiness; recall is added in a later milestone."""
+        return (
+            tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get()
+            and not self._pipeline_enabled
+            and self.pp_size == 1
+            and self._kv_caches is not None
+            and not self._state_kv_caches
+            and (
+                not self._swa_kv_caches
+                or (self._swa_engine is not None and int(self.kv_args.page_size) > 1)
+            )
+            and not self.server_args.disable_radix_cache
+        )
+
+    def create_decode_prefix_puller(self, scheduler):
+        """Build the prefill's independent host-victim lifecycle controller."""
+        if self._prefill is None or not tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
+            return None
+        if not self.victim_push_active:
+            raise ValueError(
+                "Victim prefix caching requires Raiden, radix caching, PP=1, and no GDN/Mamba state"
+            )
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        from sglang_tpu.pd_victim_push import VictimPrefixPuller
+
+        if not (
+            isinstance(scheduler.tree_cache, UnifiedRadixCache)
+            and isinstance(scheduler.tree_cache.tree_core, UnifiedTreeCore)
+        ):
+            raise ValueError(
+                "Victim prefix caching requires the Python unified radix tree"
+            )
+        if scheduler.tree_cache.cache_controller is None:
+            raise ValueError(
+                "Victim prefix caching requires --enable-hierarchical-cache on both roles"
+            )
+        return VictimPrefixPuller(
+            kv_manager=self,
+            scheduler=scheduler,
+            swa_window=self.kv_args.sliding_window_size
+            if self._swa_kv_caches
+            else None,
+        )
 
     def _listen(self) -> None:
         while True:

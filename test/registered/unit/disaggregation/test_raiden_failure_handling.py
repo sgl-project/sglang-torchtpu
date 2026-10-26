@@ -734,6 +734,7 @@ class TestBootstrapQueueAdmission(unittest.TestCase):
             token_to_kv_pool_allocator=SimpleNamespace(page_size=32),
         )
         queue.ensure_metadata_buffer = Mock(return_value=True)
+        queue.decode_prefix_puller = None
         queue.queue = list(reqs)
         return queue
 

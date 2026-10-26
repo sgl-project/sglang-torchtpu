@@ -15,6 +15,7 @@ from collections.abc import Sequence
 
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
@@ -910,6 +911,22 @@ def _patch_hicache_write_back_copy_ahead() -> None:
     hicache_write_back_copy_ahead.install()
 
 
+def _patch_pd_victim_push() -> None:
+    """Make decode RAM the cache tier below prefill RAM.
+
+    Why: core has no disaggregation queue/cache lifecycle extension yet.
+    How: install the small wrappers listed in pd_victim_push._patch_targets.
+    Upstream PR or issue: none yet; tracked with the victim module.
+    Remove when: equivalent lifecycle callbacks are available upstream.
+    """
+    # Off: not even the module's imports.
+    if not tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
+        return
+    from sglang_tpu import pd_victim_push
+
+    pd_victim_push.install()
+
+
 def _patch_pd_decode_async_prefill_info() -> None:
     """Fetch PD prefill parallel info off the decode scheduler thread.
 
@@ -1030,6 +1047,7 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _install_hybrid_linear_hicache()
     _patch_hicache_write_back_copy_ahead()
+    _patch_pd_victim_push()
     _patch_pd_decode_async_prefill_info()
     from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
 

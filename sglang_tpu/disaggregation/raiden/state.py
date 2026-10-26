@@ -6,7 +6,7 @@ manager because they can survive protocol-state cleanup.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 
 @dataclass
@@ -69,6 +69,10 @@ class PrefillState:
     reshard_replied_at: Dict[int, float] = field(default_factory=dict)
     reshard_pushed: Set[int] = field(default_factory=set)
 
+    # Host-victim offers awaiting the decode, and its answers, by sequence.
+    victim_open: Set[int] = field(default_factory=set)
+    victim_acks: Dict[int, Any] = field(default_factory=dict)
+
 
 @dataclass
 class DecodeState:
@@ -117,3 +121,7 @@ class DecodeState:
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
+
+    # Host-victim offers and completion notices, by producer incarnation/sequence.
+    victim_pushes: Dict[Tuple[str, int], Any] = field(default_factory=dict)
+    victim_dones: Dict[Tuple[str, int], Any] = field(default_factory=dict)

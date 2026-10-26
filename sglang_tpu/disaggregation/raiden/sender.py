@@ -14,14 +14,14 @@ import errno
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
 import zmq
-
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
+
 from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
@@ -37,6 +37,9 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
     RoomFailed,
+    VictimAck,
+    VictimDone,
+    VictimPush,
     decode_text,
     read_aux_blob,
 )
@@ -465,6 +468,80 @@ class RaidenSenderMixin:
             if self.request_status.get(room) == KVPoll.Bootstrapping:
                 self.update_status(room, KVPoll.WaitingForInput)
             return True
+
+    def decode_peer(self, room: int) -> Optional[Tuple[str, int]]:
+        """(ip, port) of the decode rank whose PULL_REQ named the room."""
+        with self._state_lock:
+            return self._prefill.decode_addr.get(room)
+
+    def send_victim_push(
+        self,
+        *,
+        decode: Tuple[str, int],
+        seq: int,
+        tokens: List[int],
+        blocks: List[int],
+        swa_blocks: Optional[List[int]] = None,
+        uuid: int,
+        address: str,
+        swa_address: str = "",
+        extra_key=None,
+        cache_salt=None,
+        is_eagle=False,
+    ) -> bool:
+        """Offer registered host pages for decode to pull into its host pools."""
+        if not blocks:
+            return False
+        with self._state_lock:
+            self._prefill.victim_open.add(seq)
+        try:
+            self._send_multipart_locked(
+                _tcp_endpoint(ip=decode[0], port=decode[1]),
+                VictimPush(
+                    prefill=self.victim_namespace,
+                    seq=seq,
+                    ack_endpoint=_tcp_endpoint(ip=self.local_ip, port=self.rank_port),
+                    tokens=tokens,
+                    blocks=blocks,
+                    swa_blocks=list(swa_blocks or []),
+                    uuid=uuid,
+                    address=address,
+                    swa_address=swa_address,
+                    extra_key=extra_key,
+                    cache_salt=cache_salt,
+                    is_eagle=is_eagle,
+                ).to_frames(),
+            )
+        except Exception as exc:  # noqa: BLE001 - a lost offer is a declined push
+            logger.warning("Raiden victim push %d failed to send: %s", seq, exc)
+            return False
+        return True
+
+    def send_victim_done(self, *, decode: Tuple[str, int], seq: int, ok: bool) -> None:
+        """Report the all-rank outcome after the producer's native reads settle."""
+        try:
+            self._send_multipart_locked(
+                _tcp_endpoint(ip=decode[0], port=decode[1]),
+                VictimDone(prefill=self.victim_namespace, seq=seq, ok=ok).to_frames(),
+            )
+        except Exception as exc:  # noqa: BLE001 - the landing expires on its own
+            logger.warning("Raiden victim done %d failed to send: %s", seq, exc)
+
+    def _on_victim_ack(self, msg: List[bytes]) -> None:
+        ack = VictimAck.from_frames(msg)
+        with self._state_lock:
+            if ack.seq in self._prefill.victim_open:
+                self._prefill.victim_acks[ack.seq] = ack
+
+    def take_victim_ack(self, seq: int) -> Optional[VictimAck]:
+        """The decode's answer to push ``seq`` on this rank, handed out once."""
+        with self._state_lock:
+            return self._prefill.victim_acks.pop(seq, None)
+
+    def forget_victim(self, seq: int) -> None:
+        with self._state_lock:
+            self._prefill.victim_open.discard(seq)
+            self._prefill.victim_acks.pop(seq, None)
 
     def awaiting_decode_since(self, room: int, since: float) -> Optional[float]:
         """When the prefill started waiting on the decode for ``room``.

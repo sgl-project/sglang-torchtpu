@@ -496,6 +496,8 @@ class TpuEnvs:
     # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
     # Empty: round-robin owners.
     SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
+    # Export cold prefill host-cache branches to the same P/D pair's decode.
+    SGLANG_DISAGG_PREFIX_VICTIM_PUSH = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

@@ -158,6 +158,16 @@ class BaseKVManager(ABC):
         """PP prefill, last stage: the deferred output send copied slot
         ``mb_id``'s sampled tokens to the host."""
 
+    def create_decode_prefix_puller(self, scheduler):
+        """Prefill side: the backend helper that manages cached-prefix transfers
+        and their deferred ownership, or None when unsupported.
+
+        The helper also drains deferred ownership in rank-synchronous scheduler
+        ticks through resolve_deferred_releases(). Its idle query,
+        has_pending_deferred_releases(), must not perform collectives.
+        """
+        return None
+
 
 class BaseKVSender(ABC):
     @abstractmethod

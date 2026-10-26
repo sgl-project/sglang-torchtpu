@@ -229,6 +229,11 @@ class PrefillBootstrapQueue:
                     "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
                 )
         self.kv_manager = self._init_kv_manager()
+        # Drives backend-owned cached-prefix transfers and their ownership;
+        # None unless the transfer backend supports it.
+        self.decode_prefix_puller = self.kv_manager.create_decode_prefix_puller(
+            scheduler
+        )
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
@@ -504,6 +509,11 @@ class PrefillBootstrapQueue:
         failed_reqs = []
         indices_to_remove = set()
 
+        if self.decode_prefix_puller is not None:
+            self.decode_prefix_puller.advance(
+                self.queue, waiting_reqs=self.scheduler.waiting_queue
+            )
+
         if len(self.queue) == 0:
             if return_failed_reqs is False:
                 return []
@@ -539,6 +549,8 @@ class PrefillBootstrapQueue:
                 continue
 
             if poll == KVPoll.Failed:
+                if self.decode_prefix_puller is not None:
+                    self.decode_prefix_puller.release(req)
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
@@ -559,6 +571,9 @@ class PrefillBootstrapQueue:
                 ):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
+                    if self.decode_prefix_puller is not None:
+                        # Notify the backend before this request leaves the queue.
+                        self.decode_prefix_puller.release(req)
                     req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
@@ -567,6 +582,10 @@ class PrefillBootstrapQueue:
                         self.scheduler.processed_tokens_counter
                     )
             elif poll == KVPoll.WaitingForInput:
+                if self.decode_prefix_puller is not None:
+                    # Every rank reached this state; record the request's peer
+                    # in the same scheduler step on all of them.
+                    self.decode_prefix_puller.commit(req)
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
@@ -591,7 +610,14 @@ class PrefillBootstrapQueue:
         else:
             return bootstrapped_reqs, failed_reqs
 
+    def resolve_deferred_prefix_releases(self) -> None:
+        """Drain cached-prefix transfers without admitting requests while paused."""
+        if self.decode_prefix_puller is not None:
+            self.decode_prefix_puller.resolve_deferred_releases()
+
     def release_memory_occupation(self):
+        if self.decode_prefix_puller is not None:
+            self.decode_prefix_puller.release_all()
         self.queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
@@ -728,6 +754,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
+                self.disagg_prefill_bootstrap_queue.resolve_deferred_prefix_releases()
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
@@ -820,6 +847,7 @@ class SchedulerDisaggregationPrefillMixin:
                 stop_at_pause=waiting_for_batch_result
             )
             if self._engine_paused:
+                self.disagg_prefill_bootstrap_queue.resolve_deferred_prefix_releases()
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
