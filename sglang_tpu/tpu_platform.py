@@ -837,6 +837,10 @@ def _register_attention_backends() -> None:
     def create_tpu_dsv4_backend(runner):
         from sglang_tpu.dsv4 import DSV4TPUAttnBackend
 
+        if any(ratio in (1, 2) for ratio in runner.model_config.compress_ratios):
+            from sglang_tpu.dsv41.attention_backend import DSV41TPUAttnBackend
+
+            return DSV41TPUAttnBackend(runner)
         return DSV4TPUAttnBackend(runner)
 
     # Vision: opt in to block-skipping splash for the "tpu" backend.
@@ -853,8 +857,10 @@ def _register_models() -> None:
     """Add the model implementations that only this package provides to the registry."""
     from sglang.srt.models.registry import ModelRegistry
 
-    # Preserve the external-model fast path without importing unused catalogs.
-    ModelRegistry.register_lazy("sglang_tpu.models")
+    # V4.1 shares the normalized V4 architecture. The plugin entry dispatches
+    # ordinary V4 configs back to the core implementation; registration stays
+    # lazy so unused catalogs are not imported at startup.
+    ModelRegistry.register_lazy("sglang_tpu.models", overwrite=True)
 
 
 def _resolve_num_hidden_layers(server_args) -> int:

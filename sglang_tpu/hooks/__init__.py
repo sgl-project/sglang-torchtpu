@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks import dsv41, engram
 from sglang_tpu.hooks.all_gather_via_all_reduce import (
     gather_and_crop_vocab,
     gather_attn_tp_logits,
@@ -361,6 +362,8 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+HOOKS.extend(engram.hook_specs())
+HOOKS.extend(dsv41.hook_specs())
 
 _registered = False
 

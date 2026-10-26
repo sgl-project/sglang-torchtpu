@@ -520,6 +520,17 @@ class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         indexer_bytes = 4 * indexer_head_dim * 4
         return state_rows * (core_bytes + indexer_bytes) * num_c4_layers
 
+    def __new__(cls, *args, **kwargs):
+        # The core configurator already selects this TPU class. Keep that seam
+        # and dispatch its physical storage from the existing model ratios.
+        if cls is DSV4TPUTokenToKVPool and any(
+            ratio in (1, 2) for ratio in kwargs.get("compression_ratios", ())
+        ):
+            from sglang_tpu.dsv41.memory_pool import DSV41TPUTokenToKVPool
+
+            return object.__new__(DSV41TPUTokenToKVPool)
+        return object.__new__(cls)
+
     def __init__(self, *args, **kwargs):
         if (
             kwargs.get("start_layer") is None
