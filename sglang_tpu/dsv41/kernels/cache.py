@@ -241,22 +241,23 @@ def scatter_index_keys(
     cache: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
     values: jax.Array,
+    *,
+    page_records: int,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """Index-only half-plane RMW, retaining the existing aliased pool writer."""
-    from sglang_tpu.kernels.index_selection.key_layout import merge_record_rows
+    """Quantize new index K and update packed FP8 pages in their aliased owners."""
+    from sglang_tpu.kernels.index_selection.packed_fp8_cache import (
+        PackedFP8Layout,
+        write_fp8_records,
+    )
 
-    if isinstance(cache, tuple):
-        boundary = cache[0].shape[0] * 2
-        return (
-            scatter_index_keys(
-                cache[0], jnp.where(records < boundary, records, -1), values
-            ),
-            scatter_index_keys(
-                cache[1], jnp.where(records >= boundary, records - boundary, -1), values
-            ),
-        )
-    rows, words = merge_record_rows(cache, records, values)
-    return scatter_cache_values(cache, rows, words)
+    banks = cache if isinstance(cache, tuple) else (cache,)
+    page_rows = (33 * page_records + 127) // 128
+    layout = PackedFP8Layout(
+        sum(bank.shape[0] for bank in banks) // page_rows,
+        page_size=page_records,
+    )
+    updated = write_fp8_records(banks, records, values, layout)
+    return updated if isinstance(cache, tuple) else updated[0]
 
 
 # BF16 sliding-window pages
