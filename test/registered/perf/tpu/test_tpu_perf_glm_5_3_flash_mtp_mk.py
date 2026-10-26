@@ -1,9 +1,9 @@
-"""Throughput for GLM-5.3-Flash with the decode megakernel, 8k1k at c1, tp8 / one host.
+"""Throughput for GLM-5.3-Flash MTP with the decode megakernel, 8k1k at c1, tp8 / one host.
 
 The megakernel decodes one request at a time, so this series has a single c1 point.
 
-Serving config lives in recipe/configs/glm_5_3_flash/perf_mk.py, which derives
-from server_mk.py next to it.
+Serving config lives in recipe/configs/glm_5_3_flash/perf_mtp_mk.py, which derives
+from mtp_mk.py next to it.
 """
 
 import os
@@ -19,12 +19,12 @@ from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 # then the sweep takes 30 s.
 register_tpu_ci(
     est_time=1800,
-    suite="nightly-tpu-perf-glm-5-3-flash-mk",
+    suite="nightly-tpu-perf-glm-5-3-flash-mtp-mk",
     nightly=True,
-    labels=["singlehost", "glm-5.3-flash", "perf"],
+    labels=["singlehost", "glm-5.3-flash", "spec", "perf"],
 )
 
-LAUNCH_CONFIG_MODULE = "recipe/configs/glm_5_3_flash/perf_mk.py"
+LAUNCH_CONFIG_MODULE = "recipe/configs/glm_5_3_flash/perf_mtp_mk.py"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 # Weight load measured 905-1113 s in CI, then the graph compiles.
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
@@ -40,12 +40,12 @@ WEIGHTS = "/weights/GLM-5.3-Flash"
 
 MODEL_CONFIG = {
     "model": MODEL,
-    "test_name": "glm-5-3-flash-mk",
+    "test_name": "glm-5-3-flash-mtp-mk",
     # The dashboard's series join key: never renamed, never shown. A forced
     # rename is recorded in .github/tpu-ci/dashboard_aliases.json instead.
-    "id": "perf-glm-5-3-flash-mk",
+    "id": "perf-glm-5-3-flash-mtp-mk",
     "display_name": "GLM-5.3-Flash",
-    "variant": "TP8-DSA-FP8KV-Megakernel",
+    "variant": "TP8-DSA-FP8KV-MTP3-Megakernel",
     "gates": [
         {
             "dataset": "bench_serving",
@@ -74,12 +74,12 @@ MODEL_CONFIG = {
 }
 
 
-class TestGlm53FlashMegakernelPerfSingleHost(TPULauncherTestCase):
+class TestGlm53FlashMtpMegakernelPerfSingleHost(TPULauncherTestCase):
     config_module = LAUNCH_CONFIG_MODULE
     base_url = BASE_URL
     health_timeout = HEALTH_TIMEOUT
     health_endpoint = "/health_generate"
-    tag = "perf-glm-5-3-flash-mk"
+    tag = "perf-glm-5-3-flash-mtp-mk"
     runtime_envs: ClassVar[dict[str, str | None]] = {
         # Drop an inherited MODEL so the config's own checkpoint path wins.
         "MODEL": None,
