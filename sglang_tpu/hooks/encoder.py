@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU adaptations of the EPD encode server (--encoder-only).
 
-Why: the encode server has no ModelRunner, so TpuGraphRunner never installs the
-     vision compile policies, and its batches can exceed the largest
-     precompiled patch bucket.
-How: AFTER MMEncoder.__init__ installs and warms the vision policies; AROUND
+Why: the encode server has no Scheduler or ModelRunner, so it skips the torch_tpu
+     worker bootstrap, TpuGraphRunner never installs the vision compile
+     policies, and its batches can exceed the largest precompiled patch bucket.
+How: BEFORE MMEncoder.__init__ bootstraps the torch_tpu worker and requires
+     --enable-torch-compile; AFTER it installs and warms the vision policies; AROUND
      MMEncoder.encode_indices splits a batch to the patch budget; AFTER
      MMEncoder.init_moe_gemm_config resolves the dense MoE flags; BEFORE
      launch_dp_runtime rejects encoder DP.
@@ -21,17 +22,32 @@ import torch
 from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessResult
 from sglang.srt.disaggregation.encoder.server import MMEncoder
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import ServerArgs
-from sglang_tpu.compilation.encoder_compile_policy import (
-    install_vision_compile_policies,
-)
-from sglang_tpu.graph_runner.vit_tpu_compile_runner import precompiled_max_patch_count
+from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
+
+
+def bootstrap_encoder_worker(
+    encoder: MMEncoder,
+    server_args: ServerArgs,
+    schedule_path=None,
+    dist_init_method=None,
+    rank: int = 0,
+    gpu_id: int | None = None,
+):
+    # Uncompiled, the ViT recompiles per image shape.
+    if not server_args.enable_torch_compile:
+        raise ValueError("The TPU encode server requires --enable-torch-compile.")
+    # Must precede set_device and the distributed init in MMEncoder.__init__.
+    initialize_torch_tpu_worker(server_args, rank)
 
 
 def install_encoder_vision_compile(result, encoder: MMEncoder, *args, **kwargs):
-    if get_exec().graph.enable_torch_compile:
-        install_vision_compile_policies(encoder.model)
+    # Deferred: torch_tpu is absent on the CPU hosts that also import these hooks.
+    from sglang_tpu.compilation.encoder_compile_policy import (
+        install_vision_compile_policies,
+    )
+
+    install_vision_compile_policies(encoder.model)
     return result
 
 
@@ -69,6 +85,10 @@ def encode_indices_within_patch_budget(
         return original(
             encoder, mm_feature, preprocess_result, indices, modality, get_feature_fn
         )
+    from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
+        precompiled_max_patch_count,
+    )
+
     # Split grid rows, not items: the aggregate processor path packs every image
     # of a request into one item with a [num_images, 3] grid.
     patch_counts = [

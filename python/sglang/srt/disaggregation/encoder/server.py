@@ -83,7 +83,6 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket,
 )
-from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
 logger = logging.getLogger(__name__)
 
@@ -553,9 +552,6 @@ class MMEncoder:
         this instance's value, not a config change, so it travels as an
         argument."""
         assert_published(server_args, role="encoder")
-        # Encoder counterpart of the scheduler-worker bootstrap; must precede
-        # set_device and the distributed init. No-op off TPU.
-        initialize_torch_tpu_worker(server_args, rank)
         logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
         self.server_args = server_args
         configure_media_url_security(

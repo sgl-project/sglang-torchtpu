@@ -13,6 +13,7 @@ from sglang_tpu import hooks
 from sglang_tpu.compilation.encoder_compile_policy import (
     install_vision_compile_policies,
 )
+from sglang_tpu.graph_runner import vit_tpu_compile_runner
 from sglang_tpu.hooks import encoder as encoder_hooks
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
@@ -56,7 +57,7 @@ class TestEncoderPatchBudget(unittest.TestCase):
             return torch.full((len(group), 1, 2), float(group[0]))
 
         with patch.object(
-            encoder_hooks, "precompiled_max_patch_count", return_value=300
+            vit_tpu_compile_runner, "precompiled_max_patch_count", return_value=300
         ):
             output = encoder_hooks.encode_indices_within_patch_budget(
                 None,
@@ -96,6 +97,21 @@ class TestEncoderCompileInstall(unittest.TestCase):
                 continue
             obj_path, attr = target.rsplit(".", 1)
             self.assertTrue(hasattr(pkgutil.resolve_name(obj_path), attr), target)
+
+    def test_bootstrap_rejects_uncompiled_encoder(self):
+        server_args = SimpleNamespace(enable_torch_compile=False)
+        with (
+            patch.object(encoder_hooks, "initialize_torch_tpu_worker") as bootstrap,
+            self.assertRaisesRegex(ValueError, "--enable-torch-compile"),
+        ):
+            encoder_hooks.bootstrap_encoder_worker(None, server_args, rank=1)
+        bootstrap.assert_not_called()
+
+    def test_bootstrap_initializes_the_encoder_rank(self):
+        server_args = SimpleNamespace(enable_torch_compile=True)
+        with patch.object(encoder_hooks, "initialize_torch_tpu_worker") as bootstrap:
+            encoder_hooks.bootstrap_encoder_worker(None, server_args, None, None, 3)
+        bootstrap.assert_called_once_with(server_args, 3)
 
 
 class TestTpuSetDevice(unittest.TestCase):

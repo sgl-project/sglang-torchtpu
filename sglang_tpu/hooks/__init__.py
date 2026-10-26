@@ -25,6 +25,7 @@ from sglang_tpu.hooks.draft_kv_pool import (
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.encoder import (
+    bootstrap_encoder_worker,
     encode_indices_within_patch_budget,
     install_encoder_vision_compile,
     reject_encoder_dp,
@@ -98,6 +99,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.disaggregation.encoder.server.MMEncoder.init_moe_gemm_config",
         initialize_dense_moe_config,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.disaggregation.encoder.server.MMEncoder.__init__",
+        bootstrap_encoder_worker,
+        HookType.BEFORE,
     ),
     (
         "sglang.srt.disaggregation.encoder.server.MMEncoder.__init__",

@@ -2235,8 +2235,8 @@ class MMReceiverBase(ABC):
             encode_thread.start()
             return scheduler_dispatch_ready
         elif mm_data:
-            # A language-only server warms no vision path, so encoding locally
-            # would recompile (or run eager) instead of failing visibly.
+            # A language-only server does not warm its vision tower, so encoding
+            # locally would compile per image shape instead of failing visibly.
             logger.warning(
                 f"No encoder URLs available for request {obj.rid}; "
                 "rejecting instead of encoding locally."
