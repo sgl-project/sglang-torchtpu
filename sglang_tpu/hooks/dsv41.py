@@ -13,8 +13,15 @@ Remove when: the configurator queries pool storage sizes and shifted mHC uses Mh
 def cache_bytes(result, configurator):
     if not configurator._is_tpu_dsv4:
         return result
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
+
+    # Match PackedFP8IndexPool: feature-major E4M3 plus one FP32 scale,
+    # rounded to complete int32[128] owner rows per physical core page.
+    # 64 records need 17 rows (136 B/record); 128 need 33 (132 B/record).
+    page_rows = (33 * DSV41_INDEX_PAGE_SIZE + 127) // 128
+    index_bytes = page_rows * 512 / DSV41_INDEX_PAGE_SIZE
     return result + sum(
-        (configurator.attn_head_dim + 4 + 2 * configurator.indexer_head_dim)
+        (configurator.attn_head_dim + 4 + index_bytes)
         * len(configurator.stage_owner_layers.get(ratio, ()))
         / ratio
         for ratio in (1, 2)
