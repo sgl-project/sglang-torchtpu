@@ -6,7 +6,7 @@ Upstream PR or issue: none yet; queue/cache lifecycle seams need upstreaming.
 Remove when: core supplies equivalent checkpoint and decode-queue callbacks.
 
 SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1 enables host-victim storage on both roles.
-The following milestones add SWA preservation and reverse prefix recall.
+Reverse prefix recall is introduced in the following milestone.
 
 The bytes move RAM to RAM: the prefill's HiCache host pool pushes straight
 into pages the decode's HiCache host pool allocated, through the host pool's
@@ -27,9 +27,9 @@ back, no staging slot on either side.
   Native receive completion and VICTIM_DONE gate host-only insertion.
 
 TP/CP ranks agree on identity, content and outcome before changing a tree.
-This milestone stores FULL-attention victims. Hybrid models are declined
-until the next milestone adds matching SWA-window storage. Reverse recall
-is introduced after storage support.
+Hybrid models transfer full-attention KV and the page-aligned trailing SWA
+window through their separate host pools. A later milestone adds reverse
+recall so Prefill can resume from these stored victims.
 """
 
 from __future__ import annotations
@@ -49,8 +49,14 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.serde import VictimAck
@@ -59,11 +65,13 @@ from sglang_tpu.envs import envs as tpu_envs
 logger = logging.getLogger(__name__)
 
 _FULL = ComponentType.FULL
+_SWA = ComponentType.SWA
 
 # Arbitrary: bounds the host pages a prefill pins and a decode holds at once.
 _MAX_INFLIGHT = 4
 # Arbitrary: push once the host pool could take only about two more sessions.
 _PUSH_FULL_FREE_TOKENS = 65536
+_PUSH_SWA_FREE_WINDOWS = 4
 # Arbitrary, well past one RAM-to-RAM push of a session.
 _ACK_TIMEOUT_S = 60.0
 # Arbitrary: report a granted landing with no VICTIM_DONE after this.
@@ -179,6 +187,19 @@ def _host_pages(
     return [int(p) for segment in reversed(segments) for p in segment]
 
 
+def _swa_host_pool(cache: Any) -> Any:
+    if not cache.supports_swa():
+        return None
+    return cache.host_pool_group.get_pool(PoolName.SWA)
+
+
+def _window_tokens(cache: Any, page_size: int) -> int:
+    if not cache.supports_swa():
+        return 0
+    window = cache.components[_SWA].sliding_window_size
+    return -(-window // page_size) * page_size
+
+
 def _page_hashes(tokens: List[int], page_size: int) -> List[str]:
     try:
         from sglang.srt.mem_cache.utils import get_hash_str
@@ -226,6 +247,7 @@ class _Push(msgspec.Struct):
     sent_at: float = 0.0
     # Refused or timed-out offers still drain their native registrations.
     state: str = "offered"
+    swa_pages: List[int] = []
     uuid: int = 0
     ok: Optional[bool] = None
     offered: bool = False
@@ -248,13 +270,11 @@ class PrefillPusher:
     def __init__(self, puller: VictimPrefixPuller) -> None:
         self._mgr = puller._mgr
         self._cache = puller._tree_cache
-        if self._cache.supports_swa():
-            raise ValueError(
-                "Victim spill currently supports FULL-attention models only"
-            )
         self._page_size = puller._page_size
         self._groups = list(puller._groups)
         self._host_pool = _anchor_host_pool(self._cache)
+        self._swa_host_pool = _swa_host_pool(self._cache)
+        self._window_tokens = _window_tokens(self._cache, self._page_size)
         # Incarnation shared by this prefill's ranks: independent prefills and
         # restarts cannot alias push labels on one decode.
         epoch = _all_ranks_reduce(
@@ -382,12 +402,17 @@ class PrefillPusher:
 
     def _register_push(self, push: _Push) -> bool:
         try:
-            req_id = _transfer_id(self._mgr.victim_namespace, push.seq, "full")
-            # Even False can leave a native completion that must be drained.
-            self._host_pool.transfer.register_read(
-                req_id, push.uuid, push.pages, source="host"
-            )
-            push.transfers.append((self._host_pool.transfer, req_id))
+            for component, pool, pages in (
+                ("full", self._host_pool, push.pages),
+                ("swa", self._swa_host_pool, push.swa_pages),
+            ):
+                if not pages:
+                    continue
+                req_id = _transfer_id(self._mgr.victim_namespace, push.seq, component)
+                # False can mean an early pull already completed. The native
+                # terminal report, rather than the return value, releases pins.
+                pool.transfer.register_read(req_id, push.uuid, pages, source="host")
+                push.transfers.append((pool.transfer, req_id))
             return True
         except Exception as exc:  # noqa: BLE001 - drain accepted registrations
             logger.warning("Cannot register victim %d: %s", push.seq, exc)
@@ -432,9 +457,12 @@ class PrefillPusher:
 
     def _under_host_pressure(self) -> bool:
         controller = self._cache.cache_controller
-        return (
-            controller is not None
-            and controller.mem_pool_host.available_size() < _PUSH_FULL_FREE_TOKENS
+        if controller is None:
+            return False
+        return controller.mem_pool_host.available_size() < _PUSH_FULL_FREE_TOKENS or (
+            self._swa_host_pool is not None
+            and self._swa_host_pool.available_size()
+            < _PUSH_SWA_FREE_WINDOWS * self._window_tokens
         )
 
     def _maybe_start(self) -> None:
@@ -455,11 +483,25 @@ class PrefillPusher:
         _, decode, leaf = picked
         num_tokens = _depth(leaf, tree_core.root_node)
         pages = _host_pages(tree_core.root_node, self._host_pool, leaf)
+        swa_pages = []
+        if self._window_tokens:
+            swa_pages = (
+                _host_pages(
+                    tree_core.root_node,
+                    self._swa_host_pool,
+                    leaf,
+                    component=_SWA,
+                    tail_tokens=min(num_tokens, self._window_tokens),
+                )
+                if self._swa_host_pool is not None
+                else None
+            )
         shape = [
             num_tokens,
             -1 if pages is None else len(pages),
+            -1 if swa_pages is None else len(swa_pages),
         ]
-        if not _agree(self._groups, shape) or pages is None:
+        if not _agree(self._groups, shape) or pages is None or swa_pages is None:
             # Not whole on host everywhere: not again at this length.
             self._pushed_len[leaf] = num_tokens
             return
@@ -470,6 +512,7 @@ class PrefillPusher:
             decode=decode,
             tokens=path[: num_tokens + int(tree_core.is_eagle)],
             pages=pages,
+            swa_pages=swa_pages,
             path_len=num_tokens,
             anchor_id=leaf.id,
             host_receipt=self._cache.inc_host_lock_ref(leaf.id).to_dec_params(),
@@ -495,8 +538,14 @@ class PrefillPusher:
             seq=seq,
             tokens=push.tokens,
             blocks=pages,
+            swa_blocks=swa_pages,
             uuid=push.uuid,
             address=self._host_pool.transfer.host_control_address(self._mgr.local_ip),
+            swa_address=(
+                self._swa_host_pool.transfer.host_control_address(self._mgr.local_ip)
+                if swa_pages
+                else ""
+            ),
             extra_key=push.extra_key,
             cache_salt=push.cache_salt,
             is_eagle=push.is_eagle,
@@ -540,6 +589,7 @@ class _Landing(msgspec.Struct):
     push: Any
     indices: Any
     granted_at: float
+    swa_indices: Any = None
     timed_out: bool = False
     transfers: List[Tuple[Any, str]] = []
     failed: bool = False
@@ -554,6 +604,8 @@ class DecodeReceiver:
         self._cache = queue.tree_cache
         self._page_size = int(scheduler.token_to_kv_pool_allocator.page_size)
         self._host_pool = _anchor_host_pool(self._cache)
+        self._swa_host_pool = _swa_host_pool(self._cache)
+        self._window_tokens = _window_tokens(self._cache, self._page_size)
         self._groups = _cpu_groups(scheduler)
         self._iterations = 0
         self._rounds = 0
@@ -649,67 +701,109 @@ class DecodeReceiver:
     def _grant(self, key: Tuple[str, int], push: Any) -> bool:
         num_tokens = len(push.tokens) - int(push.is_eagle)
         valid = (
-            not self._cache.supports_swa()
-            and not push.swa_blocks
-            and num_tokens > 0
+            num_tokens > 0
             and num_tokens == len(push.blocks) * self._page_size
             and push.is_eagle == self._cache.tree_core.is_eagle
+            and len(push.swa_blocks) * self._page_size
+            == min(num_tokens, self._window_tokens)
+            and (not self._window_tokens or self._swa_host_pool is not None)
             and push.uuid > 0
             and bool(push.address)
+            and (not push.swa_blocks or bool(push.swa_address))
             and push.source == "host"
         )
         valid = _all_ranks_reduce(self._groups, [[int(valid)]], dist.ReduceOp.MIN)[0][0]
         if not valid:
             return False
         indices = self._alloc_host(num_tokens)
+        swa_indices = (
+            self._alloc_host(len(push.swa_blocks) * self._page_size, swa=True)
+            if push.swa_blocks
+            else None
+        )
         allocated = _all_ranks_reduce(
-            self._groups, [[int(indices is not None)]], dist.ReduceOp.MIN
+            self._groups,
+            [
+                [
+                    int(
+                        indices is not None
+                        and (not push.swa_blocks or swa_indices is not None)
+                    )
+                ]
+            ],
+            dist.ReduceOp.MIN,
         )[0][0]
         if not allocated:
             if indices is not None:
                 self._host_pool.free(indices)
+            if swa_indices is not None:
+                self._swa_host_pool.free(swa_indices)
             return False
-        landing = _Landing(push=push, indices=indices, granted_at=time.monotonic())
+        landing = _Landing(
+            push=push,
+            indices=indices,
+            swa_indices=swa_indices,
+            granted_at=time.monotonic(),
+        )
         started = True
         try:
-            req_id = _transfer_id(push.prefill, push.seq, "full")
-            self._host_pool.transfer.start_read(
-                req_id,
-                push.uuid,
-                push.address,
-                list(push.blocks),
-                None,
-                local_host_block_ids=[
-                    int(p) for p in self._host_pool._to_page_ids(indices)
-                ],
-                destination="host",
-            )
-            landing.transfers.append((self._host_pool.transfer, req_id))
+            for component, pool, blocks, local_indices, address in (
+                ("full", self._host_pool, push.blocks, indices, push.address),
+                (
+                    "swa",
+                    self._swa_host_pool,
+                    push.swa_blocks,
+                    swa_indices,
+                    push.swa_address,
+                ),
+            ):
+                if not blocks:
+                    continue
+                req_id = _transfer_id(push.prefill, push.seq, component)
+                pool.transfer.start_read(
+                    req_id,
+                    push.uuid,
+                    address,
+                    list(blocks),
+                    None,
+                    local_host_block_ids=[
+                        int(p) for p in pool._to_page_ids(local_indices)
+                    ],
+                    destination="host",
+                )
+                landing.transfers.append((pool.transfer, req_id))
         except Exception as exc:
             logger.warning("Cannot start victim landing %s: %s", key, exc)
             started = False
         started = _all_ranks_reduce(self._groups, [[int(started)]], dist.ReduceOp.MIN)[
             0
         ][0]
-        # All ranks keep their allocations until accepted native reads settle.
+        # A failure after FULL started cannot release its live destination.
+        # All ranks keep their allocations until their accepted reads settle.
         landing.failed = not bool(started)
         self._landings[key] = landing
         self.stats["granted"] += 1
         self._mgr.send_victim_ack(
             endpoint=push.ack_endpoint,
-            ack=VictimAck(seq=push.seq, stored=bool(started)),
+            ack=VictimAck(
+                seq=push.seq,
+                stored=bool(started),
+            ),
         )
         return True
 
-    def _alloc_host(self, num_tokens: int) -> Optional[torch.Tensor]:
+    def _alloc_host(
+        self, num_tokens: int, *, swa: bool = False
+    ) -> Optional[torch.Tensor]:
+        pool = self._swa_host_pool if swa else self._host_pool
         short = _all_ranks_reduce(
             self._groups,
-            [[max(0, num_tokens - self._host_pool.available_size())]],
+            [[max(0, num_tokens - pool.available_size())]],
             dist.ReduceOp.MAX,
         )[0][0]
         if short > 0:
-            self._cache.evict_host(short, _FULL)
-        return self._host_pool.alloc(num_tokens)
+            self._cache.evict_host(short, _SWA if swa else _FULL)
+        return pool.alloc(num_tokens)
 
     def _finish_agreed(self) -> None:
         dones = self._mgr.victim_dones()
@@ -778,6 +872,8 @@ class DecodeReceiver:
     def _free_landing(self, landing: _Landing) -> None:
         self._forget_landing(landing)
         self._host_pool.free(landing.indices)
+        if landing.swa_indices is not None:
+            self._swa_host_pool.free(landing.swa_indices)
 
     def _insert(self, landing: _Landing) -> None:
         self._forget_landing(landing)
@@ -803,6 +899,28 @@ class DecodeReceiver:
         # Pages the tree already held for the shared prefix are duplicates.
         if result.prefix_len > 0:
             self._host_pool.free(landing.indices[: result.prefix_len])
+        if landing.swa_indices is not None:
+            # Use the existing prefetch commit: it splits the window boundary,
+            # fills SWA tombstones and releases duplicate window slices.
+            actions = []
+            core.commit_hicache_transfers(
+                core.root_node.id,
+                CacheTransferPhase.PREFETCH,
+                {
+                    _SWA: [
+                        PoolTransfer(
+                            name=PoolName.SWA, host_indices=landing.swa_indices
+                        )
+                    ]
+                },
+                cache_actions=actions,
+                insert_result=result,
+                pool_storage_result=PoolTransferResult(
+                    kv_hit_pages=len(push.blocks),
+                    extra_pool_hit_pages={PoolName.SWA: len(push.swa_blocks)},
+                ),
+            )
+            self._cache._apply_cache_actions(actions)
         self.stats["landed"] += 1
         self.stats["landed_tokens"] += num_tokens - result.prefix_len
 
@@ -876,9 +994,12 @@ def _decode_add(
                 raise ValueError(
                     "Victim prefix caching requires --enable-hierarchical-cache on both roles"
                 )
-            if queue.tree_cache.supports_swa():
+            if (
+                queue.tree_cache.supports_swa()
+                and not queue.tree_cache.tree_core.has_swa_host_pool
+            ):
                 raise ValueError(
-                    "Victim spill currently supports FULL-attention models only"
+                    "Victim SWA prefix caching requires SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS > 0"
                 )
             req.skip_radix_cache_insert = True
     return upstream(queue, req, *args, **kwargs)

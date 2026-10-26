@@ -18,12 +18,14 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -230,6 +232,46 @@ def full_cache(*, kv_size=64, host_capacity=64):
     cache.tree_core.is_write_back = True
     cache.is_write_back = True
     cache._write_back_copy_ahead = None
+    return cache, allocator
+
+
+def hybrid_cache(*, is_eagle=False, window=128):
+    """Real paged FULL+SWA tree; mock only the device allocator/transport."""
+    allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
+    allocator.device = torch.device("cpu")
+    allocator.page_size = 64
+    allocator._swa_req_ring = False
+    allocator.translate_loc_from_full_to_swa.side_effect = lambda indices: indices
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=MagicMock(spec=ReqToTokenPool),
+            token_to_kv_pool_allocator=allocator,
+            page_size=64,
+            sliding_window_size=window,
+            is_eagle=is_eagle,
+            tree_components=(FULL, ComponentType.SWA),
+            tree_core_backend="python",
+        )
+    )
+    controller = _FakeRaidenController(host_capacity=4096)
+    controller.host.page_size = 64
+    swa = _FakeHostPool(1024, page_size=64)
+    cache.cache_controller = controller
+    # No asynchronous host users in this fixture: release duplicate pages now.
+    controller.append_host_mem_release = lambda *, extra_pools: [
+        swa.free(xfer.host_indices) for xfer in extra_pools
+    ]
+    cache.components[FULL]._full_kv_pool_host = controller.host
+    cache.components[ComponentType.SWA]._swa_kv_pool_host = swa
+    pools = {PoolName.KV: controller.host, PoolName.SWA: swa}
+    cache.host_pool_group = SimpleNamespace(
+        get_pool=pools.get,
+        free=lambda indices, pool=PoolName.KV: pools[pool].free(indices),
+    )
+    cache.tree_core.set_hicache_enabled()
+    cache.tree_core.has_swa_host_pool = True
+    cache.tree_core.is_write_back = cache.is_write_back = True
     return cache, allocator
 
 
@@ -580,6 +622,256 @@ class TestDecodeReceiver(CustomTestCase):
         self.host.transfer.complete("failed")
         self.receiver.drain()
         self.assertEqual(self.host.used, 0)
+
+
+class TestHybridVictims(CustomTestCase):
+    def make_receiver(self, *, is_eagle=False, window=128):
+        cache, allocator = hybrid_cache(is_eagle=is_eagle, window=window)
+        mgr = MagicMock()
+        mgr.local_ip = "10.0.0.5"
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            attn_tp_cpu_group=None,
+            attn_cp_cpu_group=None,
+        )
+        receiver = victim_push.DecodeReceiver(
+            queue=SimpleNamespace(scheduler=scheduler, tree_cache=cache), mgr=mgr
+        )
+        return receiver, mgr
+
+    def push(self, count, seq=1, *, is_eagle=False, window=128):
+        return VictimPush(
+            prefill="hybrid",
+            seq=seq,
+            ack_endpoint="tcp://p",
+            tokens=list(range(count + int(is_eagle))),
+            blocks=list(range(count // 64)),
+            swa_blocks=list(range(min(count, -(-window // 64) * 64) // 64)),
+            is_eagle=is_eagle,
+            uuid=seq + 9,
+            address="full:9000",
+            swa_address="swa:9001",
+            source="host",
+        )
+
+    def complete(self, receiver, *, full="received", swa="received"):
+        receiver._host_pool.transfer.complete(full)
+        receiver._swa_host_pool.transfer.complete(swa)
+
+    def seeded_pusher(self):
+        receiver, _ = self.make_receiver()
+        offer = self.push(256)
+        key = (offer.prefill, offer.seq)
+        self.assertTrue(receiver._grant(key, offer))
+        self.complete(receiver)
+        receiver._insert(receiver._landings.pop(key))
+        mgr = MagicMock()
+        mgr.local_ip = "10.0.0.5"
+        acks = {}
+        mgr.decode_peer.return_value = ("10.0.0.1", 5001)
+        mgr.take_victim_ack.side_effect = lambda seq: acks.pop(seq, None)
+        pusher = victim_push.PrefillPusher(
+            SimpleNamespace(
+                _mgr=mgr, _tree_cache=receiver._cache, _page_size=64, _groups=[]
+            )
+        )
+        pusher.record(SimpleNamespace(bootstrap_room=1, origin_input_ids=offer.tokens))
+        return receiver, pusher, mgr, acks
+
+    def test_window_roundtrip_splits_and_duplicate_pages_are_freed(self):
+        """A window inside a FULL node and a duplicate FULL still preserve SWA."""
+        for count, window, eagle in (
+            (64, 128, False),
+            (256, 128, False),
+            (256, 65, True),
+        ):
+            with self.subTest(count=count, window=window, eagle=eagle):
+                receiver, mgr = self.make_receiver(is_eagle=eagle, window=window)
+                core = receiver._cache.tree_core
+                for seq in (1, 2, 3):
+                    push = self.push(count, seq, is_eagle=eagle, window=window)
+                    key = (push.prefill, seq)
+                    self.assertTrue(receiver._grant(key, push))
+                    self.assertTrue(mgr.send_victim_ack.call_args.kwargs["ack"].stored)
+                    read = next(
+                        reversed(receiver._swa_host_pool.transfer.reads.values())
+                    )
+                    landing = receiver._landings.pop(key)
+                    self.complete(receiver)
+                    receiver._insert(landing)
+                    self.assertEqual(receiver._host_pool.used, count)
+                    self.assertEqual(
+                        receiver._swa_host_pool.used, len(push.swa_blocks) * 64
+                    )
+                    leaf = core.node_by_id(
+                        core.insert_host(
+                            core.root_node.id,
+                            RadixKey(array("q", push.tokens), is_bigram=eagle),
+                            landing.indices,
+                            [""] * len(push.blocks),
+                        ).inserted_host_node
+                    )
+                    actual_swa = victim_push._host_pages(
+                        core.root_node,
+                        receiver._swa_host_pool,
+                        leaf,
+                        component=ComponentType.SWA,
+                        tail_tokens=min(count, receiver._window_tokens),
+                    )
+                    if seq < 3:
+                        self.assertEqual(actual_swa, read["local_host_block_ids"])
+                        retained_swa = actual_swa
+                    else:
+                        self.assertEqual(actual_swa, retained_swa)
+                    if seq == 1:
+                        receiver._cache.evict_host(4096, ComponentType.SWA)
+                        self.assertEqual(receiver._swa_host_pool.used, 0)
+                receiver._cache.evict_host(4096, FULL)
+                self.assertEqual(receiver._host_pool.used, 0)
+                self.assertEqual(receiver._swa_host_pool.used, 0)
+
+    def test_prefill_exports_host_window_and_locks_both_until_terminal(self):
+        receiver, pusher, mgr, acks = self.seeded_pusher()
+        pusher.step()
+        offered = mgr.send_victim_push.call_args.kwargs
+        self.assertEqual(len(offered["blocks"]), 4)
+        self.assertEqual(len(offered["swa_blocks"]), 2)
+        self.assertEqual(len(receiver._host_pool.transfer.registrations), 1)
+        self.assertEqual(len(receiver._swa_host_pool.transfer.registrations), 1)
+        self.assertEqual(receiver._cache.evict_host(4096, FULL), 0)
+        self.assertEqual(receiver._cache.evict_host(4096, ComponentType.SWA), 0)
+        self.complete(receiver, full="failed", swa="failed")
+        pusher.release_all()
+        receiver._cache.evict_host(4096, ComponentType.SWA)
+        self.assertEqual(receiver._swa_host_pool.used, 0)
+        pusher._pushed_len.clear()
+        mgr.send_victim_push.reset_mock()
+        pusher.step()
+        mgr.send_victim_push.assert_not_called()
+
+    def test_partial_allocation_and_failed_transfer_release_both_pools(self):
+        receiver, _ = self.make_receiver()
+        push = self.push(256)
+        key = (push.prefill, push.seq)
+        receiver._swa_host_pool.capacity = 64
+        self.assertFalse(receiver._grant(key, push))
+        self.assertEqual(receiver._host_pool.used, 0)
+        receiver._swa_host_pool.capacity = 1024
+        self.assertTrue(receiver._grant(key, push))
+        self.complete(receiver, swa="failed")
+        receiver._mgr.victim_dones.return_value = {
+            key: VictimDone(prefill=push.prefill, seq=1, ok=False)
+        }
+        receiver._finish_agreed()
+        self.assertEqual(receiver._host_pool.used, 0)
+        self.assertEqual(receiver._swa_host_pool.used, 0)
+
+    def test_swa_start_failure_retains_full_landing_until_native_drains(self):
+        receiver, mgr = self.make_receiver()
+        push = self.push(256)
+        key = (push.prefill, push.seq)
+        receiver._swa_host_pool.transfer.read_error = RuntimeError("cannot start SWA")
+        self.assertTrue(receiver._grant(key, push))
+        self.assertFalse(mgr.send_victim_ack.call_args.kwargs["ack"].stored)
+        receiver._finish_agreed()
+        self.assertTrue(receiver.holds_pages())
+        self.assertEqual(receiver._host_pool.used, 256)
+        receiver._host_pool.transfer.complete("failed")
+        receiver._finish_agreed()
+        self.assertFalse(receiver.holds_pages())
+        self.assertEqual(receiver._host_pool.used, 0)
+        self.assertEqual(receiver._swa_host_pool.used, 0)
+
+    def test_timeout_retains_both_until_native_received_and_done(self):
+        receiver, _ = self.make_receiver()
+        push = self.push(256)
+        key = (push.prefill, push.seq)
+        self.assertTrue(receiver._grant(key, push))
+        receiver._mgr.victim_dones.return_value = {}
+        with patch.object(victim_push, "_LANDING_TIMEOUT_S", -1):
+            receiver._finish_agreed()
+            receiver._finish_agreed()
+        self.assertEqual(receiver._host_pool.used, 256)
+        self.assertEqual(receiver._swa_host_pool.used, 128)
+        self.assertEqual(receiver.stats["timed_out"], 1)
+        self.complete(receiver)
+        receiver._mgr.victim_dones.return_value = {
+            key: VictimDone(prefill=push.prefill, seq=1, ok=True)
+        }
+        receiver._finish_agreed()
+        self.assertFalse(receiver.holds_pages())
+        self.assertEqual(receiver.stats["landed"], 1)
+
+    def test_missing_or_wrong_window_is_declined(self):
+        receiver, _ = self.make_receiver()
+        push = self.push(256)
+        for pages in ([], [1], [1, 2, 3]):
+            push.swa_blocks = pages
+            self.assertFalse(receiver._grant((push.prefill, push.seq), push))
+        self.assertEqual(receiver._host_pool.used, 0)
+
+    def test_full_received_and_done_cannot_publish_without_swa_received(self):
+        receiver, _ = self.make_receiver()
+        push = self.push(256)
+        key = (push.prefill, push.seq)
+        self.assertTrue(receiver._grant(key, push))
+        receiver._mgr.victim_dones.return_value = {
+            key: VictimDone(prefill=push.prefill, seq=push.seq, ok=True)
+        }
+        receiver._host_pool.transfer.complete("received")
+        receiver._finish_agreed()
+        self.assertTrue(receiver.holds_pages())
+        self.assertEqual(host_hit(receiver._cache, push.tokens), 0)
+        receiver._swa_host_pool.transfer.complete("received")
+        receiver._finish_agreed()
+        self.assertFalse(receiver.holds_pages())
+        self.assertEqual(host_hit(receiver._cache, push.tokens), 256)
+
+    def test_success_is_published_only_after_both_native_sends(self):
+        receiver, pusher, mgr, acks = self.seeded_pusher()
+        pusher.step()
+        seq = mgr.send_victim_push.call_args.kwargs["seq"]
+        acks[seq] = VictimAck(seq=seq, stored=True)
+        receiver._host_pool.transfer.complete("sent")
+        pusher.step()
+        self.assertEqual(receiver._cache.evict_host(4096, FULL), 0)
+        self.assertEqual(receiver._cache.evict_host(4096, ComponentType.SWA), 0)
+        mgr.send_victim_done.assert_not_called()
+        receiver._swa_host_pool.transfer.complete("sent")
+        pusher.step()
+        mgr.send_victim_done.assert_called_once_with(
+            decode=("10.0.0.1", 5001), seq=seq, ok=True
+        )
+        self.assertEqual(pusher.stats["stored"], 1)
+
+    def test_partial_source_registration_stays_pinned_until_full_failed(self):
+        receiver, pusher, mgr, _ = self.seeded_pusher()
+        receiver._swa_host_pool.transfer.registration_error = RuntimeError(
+            "cannot register SWA"
+        )
+        pusher.step()
+        mgr.send_victim_push.assert_not_called()
+        self.assertEqual(receiver._cache.evict_host(4096, FULL), 0)
+        self.assertEqual(receiver._cache.evict_host(4096, ComponentType.SWA), 0)
+        receiver._host_pool.transfer.complete("failed")
+        pusher.step()
+        receiver._cache.evict_host(4096, FULL)
+        self.assertEqual(receiver._host_pool.used, 0)
+        self.assertEqual(receiver._swa_host_pool.used, 0)
+
+    def test_swa_native_failure_waits_for_full_terminal_before_source_release(self):
+        receiver, pusher, mgr, acks = self.seeded_pusher()
+        pusher.step()
+        seq = mgr.send_victim_push.call_args.kwargs["seq"]
+        acks[seq] = VictimAck(seq=seq, stored=True)
+        receiver._swa_host_pool.transfer.complete("failed")
+        pusher.step()
+        self.assertEqual(receiver._cache.evict_host(4096, FULL), 0)
+        mgr.send_victim_done.assert_not_called()
+        receiver._host_pool.transfer.complete("sent")
+        pusher.step()
+        self.assertFalse(mgr.send_victim_done.call_args.kwargs["ok"])
+        self.assertEqual(pusher.stats["stored"], 0)
 
 
 if __name__ == "__main__":
