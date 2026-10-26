@@ -21,7 +21,6 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
@@ -61,7 +60,6 @@ def _ordered_bits(keys: jax.Array) -> jax.Array:
         "block_size",
         "reconstruct_threshold",
         "exclude_neg_inf",
-        "scheduling_group_id",
     ),
 )
 def streaming_topk(
@@ -72,9 +70,6 @@ def streaming_topk(
     block_size: int = 8192,
     reconstruct_threshold: int = 8192,
     exclude_neg_inf: bool = False,
-    logical_blocks: jax.Array | None = None,
-    start_request: jax.Array | None = None,
-    scheduling_group_id: int | None = None,
 ) -> jax.Array:
     """Return Top-K IDs for 2-D score rows, ascending then -1 padded.
 
@@ -84,12 +79,6 @@ def streaming_topk(
     permutation per invocation. NaNs are unsupported. Negative infinity is
     eligible unless exclude_neg_inf is set. Lengths are clipped to [0, N].
     Scores have shape [rows, N] in request-major order.
-
-    Optional int32 logical_blocks [all_requests, blocks] maps compact slots
-    to token IDs. It requires request/query valid_lengths and a block count dividing N.
-    Valid blocks must be increasing, padded blocks must have ineligible scores,
-    and mapped IDs must fit int32. start_request addresses a valid request
-    window in that metadata (default zero). Only final winners are mapped.
     """
     if scores.ndim != 2 or scores.dtype != jnp.float32:
         raise ValueError("scores must be a rank-2 float32 array")
@@ -105,31 +94,6 @@ def streaming_topk(
     valid_width = width
     # HBM arrays retain TensorCore tiling when SparseCore consumes them.
     hbm_alignment = pltpu.get_tpu_info().num_lanes
-    mapped = logical_blocks is not None
-    mapping_width = 0
-    if logical_blocks is not None:
-        if (
-            valid_lengths is None
-            or valid_lengths.ndim != 2
-            or logical_blocks.ndim != 2
-            or logical_blocks.dtype != jnp.int32
-            or logical_blocks.shape[0] < valid_lengths.shape[0]
-            or not logical_blocks.shape[1]
-            or valid_width % logical_blocks.shape[1]
-        ):
-            raise ValueError(
-                "logical_blocks must be int32 [requests, blocks] covering "
-                "the request/query length window, with blocks dividing N"
-            )
-        assert valid_lengths is not None
-        queries = valid_lengths.shape[1]
-        records_per_block = valid_width // logical_blocks.shape[1]
-        mapping_width = pl.cdiv(logical_blocks.shape[1], hbm_alignment) * hbm_alignment
-        logical_blocks = jnp.pad(
-            logical_blocks,
-            ((0, 0), (0, mapping_width - logical_blocks.shape[1])),
-            constant_values=-1,
-        )
     input_alignment = hbm_alignment if block_size % hbm_alignment == 0 else block_size
     padding = -width % input_alignment
     if padding:
@@ -167,7 +131,7 @@ def streaming_topk(
     )
     histogram_size = RADIX_BUCKETS
     id_digits = max(1, pl.cdiv((valid_width - 1).bit_length(), RADIX_BITS))
-    id_capacity = max(capacity, output_width + mapping_width)
+    id_capacity = capacity
     score_bytes, id_bytes = scores.dtype.itemsize, jnp.dtype(jnp.int32).itemsize
     resident_bytes = score_bytes * (capacity + k) + id_bytes * (id_capacity + k)
     resident_bytes += id_bytes * (histogram_size + lanes + order_width)
@@ -214,7 +178,7 @@ def streaming_topk(
         name="streaming_topk",
     )
     def kernel(scores_ref, lengths_ref, order_ref, *refs):
-        out_indices_ref, *scratch = refs[2:] if mapped else refs
+        out_indices_ref, *scratch = refs
         (
             blocks,
             candidate_banks,
@@ -231,10 +195,6 @@ def streaming_topk(
         candidate_ids = id_banks.at[pl.ds(0, id_capacity)]
         lane_ids = jnp.arange(lanes, dtype=jnp.int32)
         pltpu.async_copy(order_ref, visit_order, sem).wait()
-        if mapped:
-            logical_blocks_ref, start_ref = refs[:2]
-            pltpu.async_copy(start_ref, row_length, sem).wait()
-            request_start = row_length[...][0]
 
         def store_candidates(count, keys, ids, mask):
             plsc.store_compressed(candidates.at[pl.ds(count, lanes)], keys, mask=mask)
@@ -301,7 +261,7 @@ def streaming_topk(
                 selected_ids[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
 
             def cond(state):
-                digit, remaining, found, bank = state
+                digit, remaining, found, _bank = state
                 return (digit >= 0) & (remaining > k - found)
 
             def radix_pass(state, *, by_id):
@@ -750,47 +710,14 @@ def streaming_topk(
             )
             if bootstrap_width < valid_width:
                 jax.lax.fori_loop(0, row_blocks, scan_block, (seed, position, block_id))
-            if mapped:
-                # Selection is finished: reuse the ID tail for metadata.
-                # Sorting touches only the first k entries and overlaps this DMA.
-                mapping_copy = pltpu.make_async_copy(
-                    logical_blocks_ref.at[request_start + row // queries],
-                    candidate_ids.at[pl.ds(output_width, mapping_width)],
-                    sem,
-                )
-                mapping_copy.start()
-                sort_selected()
-                mapping_copy.wait()
-
-                @plsc.parallel_loop(0, k, lanes)
-                def map_selected(i):
-                    slots = candidate_ids[pl.ds(i, lanes)]
-                    blocks = plsc.load_gather(
-                        candidate_ids,
-                        [output_width + jnp.maximum(slots, 0) // records_per_block],
-                    )
-                    logical = blocks * records_per_block + slots % records_per_block
-                    candidate_ids[pl.ds(i, lanes)] = jnp.where(slots >= 0, logical, -1)
-            else:
-                sort_selected()
+            sort_selected()
             pltpu.async_copy(
                 candidate_ids.at[:output_width], out_indices_ref.at[row], sem
             ).wait()
 
-    if logical_blocks is not None:
-        start = jnp.broadcast_to(
-            jnp.asarray(0 if start_request is None else start_request, jnp.int32),
-            (lanes,),
-        )
-        result = kernel(scores, lengths, block_order, logical_blocks, start)
-    else:
-        result = kernel(scores, lengths, block_order)
+    result = kernel(scores, lengths, block_order)
     if output_width != k:
         result = result[:, :k]
-    if scheduling_group_id is not None:
-        result = xla_metadata.set_xla_metadata(
-            result, _scheduling_group_id=scheduling_group_id
-        )
     return result
 
 
