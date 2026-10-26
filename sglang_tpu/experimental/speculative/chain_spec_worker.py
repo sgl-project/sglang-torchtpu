@@ -544,7 +544,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
 
         width = self.num_verify_rows
         seq_lens = upload(pbs)
-        rows = select_verify_rows(upload(pbs, 2 * width), upload(pbs), seq_lens)
+        rows = select_verify_rows(upload(pbs, 2 * width), upload(pbs), seq_lens, width)
         state = SpecState(
             bonus_tokens=upload(pbs), seq_lens=seq_lens, req_pool_indices=upload(pbs)
         )
@@ -615,7 +615,10 @@ class TpuChainSpecWorker(TpuSpecWorker):
             for padded_bs in self._b_bucketer().buckets:
                 # make_verify_input hands over select_verify_rows' flat positions.
                 rows = select_verify_rows(
-                    upload(padded_bs, 2 * width), upload(padded_bs), upload(padded_bs)
+                    upload(padded_bs, 2 * width),
+                    upload(padded_bs),
+                    upload(padded_bs),
+                    width,
                 )
                 positions = rows.flat_positions.view(padded_bs, -1)
                 positions.flatten().unsqueeze(0).repeat(3, 1).cpu()
