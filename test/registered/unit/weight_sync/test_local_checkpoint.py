@@ -27,7 +27,11 @@ def _write_safetensors(path: str, tensors: dict, metadata: dict | None = None) -
     header, offset, blobs = {}, 0, []
     for name, data in tensors.items():
         raw = np.ascontiguousarray(data).view(np.uint8).reshape(-1).tobytes()
-        header[name] = {"dtype": "U8", "shape": [len(raw)], "data_offsets": [offset, offset + len(raw)]}
+        header[name] = {
+            "dtype": "U8",
+            "shape": [len(raw)],
+            "data_offsets": [offset, offset + len(raw)],
+        }
         offset += len(raw)
         blobs.append(raw)
     if metadata:
@@ -46,7 +50,9 @@ def _read_safetensors(path: str) -> dict:
         header = json.loads(f.read(header_len))
         data = f.read()
     return {
-        name: np.frombuffer(data[info["data_offsets"][0] : info["data_offsets"][1]], dtype=np.uint8)
+        name: np.frombuffer(
+            data[info["data_offsets"][0] : info["data_offsets"][1]], dtype=np.uint8
+        )
         for name, info in header.items()
         if name != "__metadata__"
     }
@@ -62,7 +68,11 @@ def _encode(encoding: str, old: np.ndarray, new: np.ndarray) -> bytes:
         payload = (old ^ new).tobytes()
     else:  # overwrite: changed count (u4), positions (u4 each), then the new bytes
         positions = np.flatnonzero(old != new).astype("<u4")
-        payload = struct.pack("<I", positions.size) + positions.tobytes() + new[positions].tobytes()
+        payload = (
+            struct.pack("<I", positions.size)
+            + positions.tobytes()
+            + new[positions].tobytes()
+        )
     return zstandard.ZstdCompressor().compress(payload)
 
 
@@ -98,7 +108,9 @@ class TestLocalCheckpointPull(CustomTestCase):
         os.makedirs(path, exist_ok=True)
         return path
 
-    def _publish_delta(self, version: int, encoding: str, corrupt: str | None = None) -> None:
+    def _publish_delta(
+        self, version: int, encoding: str, corrupt: str | None = None
+    ) -> None:
         """Change a few bytes of a.weight and c.weight; publish them as one delta version."""
         delta, checksums = {}, {}
         for fname, tensors in self.state.items():
@@ -113,7 +125,9 @@ class TestLocalCheckpointPull(CustomTestCase):
                 checksums[name] = "00000000" if name == corrupt else _adler32(new)
                 tensors[name] = new
         vdir = self._version_dir(version)
-        _write_safetensors(os.path.join(vdir, "model-00000-of-00001.safetensors"), delta, checksums)
+        _write_safetensors(
+            os.path.join(vdir, "model-00000-of-00001.safetensors"), delta, checksums
+        )
         index = {
             "metadata": {
                 "version": f"{version:06d}",
@@ -132,7 +146,9 @@ class TestLocalCheckpointPull(CustomTestCase):
         vdir = self._version_dir(version)
         for fname, tensors in self.state.items():
             for name in tensors:
-                tensors[name] = self.rng.integers(0, 256, tensors[name].size, dtype=np.uint8)
+                tensors[name] = self.rng.integers(
+                    0, 256, tensors[name].size, dtype=np.uint8
+                )
             _write_safetensors(os.path.join(vdir, fname), tensors)
 
     def _pull(self, version: int) -> None:
@@ -147,7 +163,9 @@ class TestLocalCheckpointPull(CustomTestCase):
         for fname, tensors in self.state.items():
             local = _read_safetensors(os.path.join(self.local_dir, fname))
             for name, expected in tensors.items():
-                np.testing.assert_array_equal(local[name], expected, err_msg=f"{fname}:{name}")
+                np.testing.assert_array_equal(
+                    local[name], expected, err_msg=f"{fname}:{name}"
+                )
 
     def _applied_version(self):
         return local_checkpoint._read_applied_version(self.local_dir)
@@ -170,7 +188,8 @@ class TestLocalCheckpointPull(CustomTestCase):
     def test_fresh_host_pulls_a_delta_chain_from_the_base(self):
         self._publish_delta(1, "overwrite")
         self._publish_delta(2, "overwrite")
-        self._pull(2)  # no local checkpoint yet: seeds from base_dir, then applies both deltas
+        # no local checkpoint yet: seeds from base_dir, then applies both deltas
+        self._pull(2)
         self.assertEqual(self._applied_version(), 2)
         self._assert_local_matches_state()
 
