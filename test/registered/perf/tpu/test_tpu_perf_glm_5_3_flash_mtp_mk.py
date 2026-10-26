@@ -15,8 +15,6 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import run_model_config
 from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
-# Healthy 371 s on tpu7x with weights in page cache (CI loads them in 905-1113 s),
-# then the sweep takes 19 s.
 register_tpu_ci(
     est_time=1800,
     suite="nightly-tpu-perf-glm-5-3-flash-mtp-mk",
