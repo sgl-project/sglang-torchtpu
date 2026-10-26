@@ -706,6 +706,20 @@ GPT_OSS_120B = {
     "config_module": "recipe/configs/gpt_oss_120b/accuracy.py",
 }
 
+MUSE_SPARK = {
+    "served_model_name": "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
+    "display_name": "Muse Spark Open 816B-A42B NVFP4",
+    "variant": "TP8+EP1-NVFP4-BF16-KV",
+    "config_module": "recipe/configs/muse_spark/accuracy.py",
+    "sampling": {
+        "max_tokens": 65536,
+        "num_threads": 8,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "chat_template_kwargs": {"reasoning_effort": "xhigh"},
+    },
+}
+
 # Shared by the entries below that differ only in checkpoint and recipe.
 _GEMMA4_SAMPLING = {
     "max_tokens": 32768,
