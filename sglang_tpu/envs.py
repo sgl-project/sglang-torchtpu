@@ -168,6 +168,11 @@ class TpuEnvs:
     # image buckets halted the TPU during warmup.
     SGLANG_TPU_VISION_FLASH_BLOCK_Q = EnvInt(0)
     SGLANG_TPU_VISION_FLASH_BLOCK_Q_MAX_SEQ = EnvInt(4096)
+    # Vision encoder flash attention: compute only the key chunks whose segments
+    # meet each query block (band-skip kernel). Byte-identical to the dense
+    # kernel at the shapes it covers (kv_len 3072-12288 at a 256-row q tile,
+    # 16384 at the default 128); other shapes keep the dense kernel.
+    SGLANG_TPU_VISION_FLASH_BAND_SKIP = EnvBool(False)
 
     # Raiden PD disaggregation
     # Base control port. Each local rank reserves consecutive control/data
