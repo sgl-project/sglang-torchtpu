@@ -1,7 +1,6 @@
 """Throughput for GLM-5.3-Flash with the decode megakernel, 8k1k at c1, tp8 / one host.
 
-The megakernel decodes one request at a time, so this series has a single c1
-point; test_tpu_perf_glm_5_3_flash.py measures the same shape without it.
+The megakernel decodes one request at a time, so this series has a single c1 point.
 
 Serving config lives in recipe/configs/glm_5_3_flash/perf_mk.py, which derives
 from server_mk.py next to it.
