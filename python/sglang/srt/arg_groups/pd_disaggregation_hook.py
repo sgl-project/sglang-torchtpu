@@ -81,17 +81,19 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
         # Fake transfer moves no KV and is only used for synthetic decode
-        # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
+        # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL;
+        # raiden reshards the pages into the decode's DCP layout itself.
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
             "ascend",
+            "raiden",
             "fake",
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, ascend, or fake for synthetic benchmarking, got "
-                f"{cfg.disaggregation_transfer_backend!r}."
+                "mooncake, nixl, ascend, raiden, or fake for synthetic "
+                f"benchmarking, got {cfg.disaggregation_transfer_backend!r}."
             )
 
     if cfg.disaggregation_mode == "decode":

@@ -40,18 +40,20 @@ class PrefillState:
         default_factory=dict
     )
 
-    # Pages requested by RESHARD_READY for the closing push.
-    reshard_ready_pages: Dict[int, List[int]] = field(default_factory=dict)
+    # Pages each decode peer requested by RESHARD_READY for its closing push.
+    reshard_ready_pages: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
 
-    # Rooms whose closing reshard push has completed.
-    reshard_final_pushed: Set[int] = field(default_factory=set)
+    # Decode peers whose closing reshard push has completed.
+    reshard_final_pushed: Dict[int, Set[int]] = field(default_factory=dict)
 
     # Committed pages waiting to reach the chunk announcement threshold.
     pending_offer: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
     chunk_seq: Dict[int, int] = field(default_factory=dict)
 
-    # Decode metadata received in RESHARD_REQ.
-    reshard_req: Dict[int, dict] = field(default_factory=dict)
+    # Decode metadata received in RESHARD_REQ, by room and decode peer: the
+    # one decode rank a room pushes to, or every rank of its decode-context-
+    # parallel group, keyed by DCP rank.
+    reshard_req: Dict[int, Dict[int, dict]] = field(default_factory=dict)
 
     # Rooms whose send accumulation is complete.
     reshard_finalized: Set[int] = field(default_factory=set)
@@ -59,15 +61,16 @@ class PrefillState:
     # Only acknowledged chunks leave the closing transfer.
     reshard_chunk_acked: Dict[int, Set[int]] = field(default_factory=dict)
 
-    # Rooms whose RESHARD_BLOCKS reply has been sent.
-    reshard_replied: Set[int] = field(default_factory=set)
+    # Decode peers whose RESHARD_BLOCKS reply has been sent.
+    reshard_replied: Dict[int, Set[int]] = field(default_factory=dict)
 
-    # Rooms cleared by the decode to push.
-    reshard_ready: Set[int] = field(default_factory=set)
+    # Decode peers that cleared the room to push.
+    reshard_ready: Dict[int, Set[int]] = field(default_factory=dict)
 
     # Time of the RESHARD_BLOCKS reply, used to detect decode silence.
     reshard_replied_at: Dict[int, float] = field(default_factory=dict)
-    reshard_pushed: Set[int] = field(default_factory=set)
+    # Decode peers whose closing push has been submitted.
+    reshard_pushed: Dict[int, Set[int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -117,3 +120,5 @@ class DecodeState:
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
+    # Rooms whose closing plan found no host staging; they ask again on poll.
+    reshard_waiting: Set[int] = field(default_factory=set)

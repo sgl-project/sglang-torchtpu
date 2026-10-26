@@ -338,8 +338,8 @@ class RaidenKVManager(
 
     def _make_geometry(self, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False):
         """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer, sized from
-        the local fused KV tensor (the K+V head-pair granule matches on both
-        sides) and the global kv-head count.
+        the local KV tensor (the per-head granule matches on both sides) and
+        the global kv-head count.
 
         ``swa`` sizes it from the sliding-window sub-pool instead. Its layers
         carry the same kv-head count as the full pool -- windowing bounds how
@@ -347,10 +347,16 @@ class RaidenKVManager(
         head-pair granule is read from the other tensor, and the head-slice math
         is identical. Taking it from the SWA tensor rather than assuming it
         matches keeps the two pools free to differ in dtype or head_dim.
+
+        A head-major (rank-4 RPA-seq) tensor gets the per-page geometry; its
+        head axis is checked against the kv heads this side must hold, which
+        also refuses pools whose pages carry more than the K/V rows.
         """
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
+            head_major_run_bytes,
             head_pair_bytes,
+            is_head_major,
         )
 
         tensors = self._swa_kv_caches if swa else self._kv_caches
@@ -361,11 +367,79 @@ class RaidenKVManager(
                 + " KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
-        hp = head_pair_bytes(tensor)
+        # A push moves page_size tokens of every page it names, so the pool
+        # must page at the transfer page: a sub-pool paged differently (a
+        # window pool widened by the DCP size, say) would take wrong bytes.
+        page_tokens = int(tensor.shape[3] if is_head_major(tensor) else tensor.shape[1])
+        if page_tokens != int(self.kv_args.page_size):
+            raise RuntimeError(
+                "Raiden reshard needs the "
+                + ("sliding-window" if swa else "full-attention")
+                + f" KV pool paged at the transfer page {self.kv_args.page_size}, "
+                f"got {page_tokens}-token pages (layer tensor shape "
+                f"{tuple(tensor.shape)})"
+            )
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+        if not is_head_major(tensor):
+            hp = head_pair_bytes(tensor)
+            return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+        local_tp = src_attn_tp if self._prefill is not None else dst_attn_tp
+        local_heads = max(1, total_kv_heads // local_tp)
+        if int(tensor.shape[1]) != 2 * local_heads:
+            raise RuntimeError(
+                "Raiden head-major KV reshard expects "
+                f"{2 * local_heads} K/V rows per page for {local_heads} kv heads "
+                f"at attention TP {local_tp}, got a layer tensor of shape "
+                f"{tuple(tensor.shape)}"
+            )
+        element_size = tensor.element_size()
+        return ReshardGeometry(
+            src_attn_tp,
+            dst_attn_tp,
+            head_major_run_bytes(tensor),
+            total_kv_heads,
+            kv_packing=4 // element_size,
+            element_size=element_size,
+            page_tokens=int(tensor.shape[3]),
+        )
+
+    @staticmethod
+    def _reshard_closing_id(room: int, dcp_size: int, dcp_rank: int) -> str:
+        """Transfer id of a room's closing reshard push: the room's own id,
+        or one per decode-context-parallel rank, since the prefill pushes to
+        each rank of the group and settles each push on its own."""
+        return str(room) if dcp_size == 1 else f"{room}#dcp{dcp_rank}"
+
+    def supports_dcp_decode(self) -> bool:
+        # The reshard push lands each decode-context-parallel rank's share of
+        # a request's pages, see RaidenReceiverMixin._register_reshard_request.
+        return True
+
+    def _resolve_rank_mapping(self, info) -> None:
+        super()._resolve_rank_mapping(info)
+        if self.dcp_size == 1:
+            return
+        # A decode-context-parallel decode keeps the prefill's attention TP:
+        # rank u takes its DCP group's kv heads from the prefill ranks holding
+        # them, u // dcp_size * dcp_size onward, for the pages it owns; its
+        # sliding-window pages come from prefill rank u alone (target_tp_rank).
+        if info.attn_tp_size != self.attn_tp_size:
+            raise RuntimeError(
+                "Raiden decode context parallelism requires equal attention TP "
+                f"on prefill and decode, got prefill={info.attn_tp_size}, "
+                f"decode={self.attn_tp_size}"
+            )
+        if self.attn_tp_size % self.dcp_size:
+            raise RuntimeError(
+                f"attention TP {self.attn_tp_size} is not a multiple of the "
+                f"decode context parallel size {self.dcp_size}"
+            )
+        group = (self.kv_args.engine_rank % self.attn_tp_size) // self.dcp_size
+        info.target_tp_ranks = [
+            group * self.dcp_size + rank for rank in range(self.dcp_size)
+        ]
 
     # ----- engine lifecycle -------------------------------------------------
 
@@ -419,6 +493,14 @@ class RaidenKVManager(
             raise RuntimeError(
                 "Raiden requires at least one full-attention KV cache tensor"
             )
+        if self.dcp_size > 1 and self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Fail at startup, not at the first request, when the pools are
+            # not the page-interleaved DCP layout the reshard push fills:
+            # the DCP group's kv heads per full-attention page, one head per
+            # rank on the sliding-window pool.
+            self._make_geometry(self.attn_tp_size, self.attn_tp_size // self.dcp_size)
+            if self._swa_kv_caches:
+                self._make_geometry(self.attn_tp_size, self.attn_tp_size, swa=True)
         self._build_engine()
 
     def _build_engine(self) -> None:
@@ -1278,15 +1360,15 @@ class RaidenKVManager(
                     self._prefill.send_aux,
                     self._prefill.decode_addr,
                     self._prefill.reshard_req,
+                    self._prefill.reshard_final_pushed,
+                    self._prefill.reshard_replied,
+                    self._prefill.reshard_ready,
+                    self._prefill.reshard_pushed,
                 ):
                     table.pop(room, None)
                 for table in (
                     self._prefill.replied,
-                    self._prefill.reshard_final_pushed,
                     self._prefill.reshard_finalized,
-                    self._prefill.reshard_replied,
-                    self._prefill.reshard_ready,
-                    self._prefill.reshard_pushed,
                 ):
                     table.discard(room)
             if self._decode is not None:
@@ -1317,6 +1399,7 @@ class RaidenKVManager(
                 for table in (
                     self._decode.final_seen,
                     self._decode.reshard_registered,
+                    self._decode.reshard_waiting,
                 ):
                     table.discard(room)
             if clear_failure_record:

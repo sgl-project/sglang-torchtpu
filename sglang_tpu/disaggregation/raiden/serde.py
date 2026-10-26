@@ -124,6 +124,11 @@ class ReshardReq(WireMessage):
     dst_attn_tp: int
     decode_swa_blocks: list[int]
     swa_push_endpoint: str
+    # A decode-context-parallel decode: ``decode_blocks`` are the request's
+    # logical pages, of which this rank places ``dcp_page_split``'s share, and
+    # ``dst_attn_tp`` is the attention TP per DCP rank (``attn_tp // dcp_size``).
+    dcp_size: int = 1
+    dcp_rank: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -131,6 +136,10 @@ class ReshardReq(WireMessage):
         if self.dst_attn_tp < 1:
             raise ValueError(
                 f"invalid dst_attn_tp: expected >= 1, got {self.dst_attn_tp}"
+            )
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError(
+                f"invalid dcp_rank/dcp_size: got {self.dcp_rank}/{self.dcp_size}"
             )
 
 
@@ -155,9 +164,15 @@ class ReshardReady(WireMessage):
     TAG: ClassVar[bytes] = MessageTag.RESHARD_READY
     room: int
     pages: list[int] = msgspec.field(default_factory=list)
+    # The decode-context-parallel rank answering; its closing plan's native
+    # transfer id, or 0 for the room id.
+    dcp_rank: int = 0
+    uuid: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
+        require_non_negative(self.dcp_rank, "dcp_rank")
+        require_non_negative(self.uuid, "uuid")
 
 
 class ReshardChunk(WireMessage):

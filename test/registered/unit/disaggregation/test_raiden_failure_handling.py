@@ -791,11 +791,11 @@ class TestReshardHandshakeWindow(unittest.TestCase):
         self.assertIsNone(mgr.awaiting_decode_since(ROOM, start))
 
         # Blocks announced: the decode now owes RESHARD_READY, timed from here.
-        mgr._prefill.reshard_replied.add(ROOM)
+        mgr._prefill.reshard_replied[ROOM] = {0}
         mgr._prefill.reshard_replied_at[ROOM] = 1500.0
         self.assertEqual(mgr.awaiting_decode_since(ROOM, start), 1500.0)
 
-        mgr._prefill.reshard_ready.add(ROOM)
+        mgr._prefill.reshard_ready[ROOM] = {0}
         self.assertIsNone(mgr.awaiting_decode_since(ROOM, start))
 
     def test_pull_request_closes_the_window(self):
@@ -990,7 +990,7 @@ class TestPrefillTellsDecodeRoomFailed(unittest.TestCase):
     def test_reshard_push_failure_tells_the_reply_endpoint(self):
         mgr = _gate_manager()
         sender = _gate_sender(mgr, ROOM)
-        mgr._prefill.reshard_req[ROOM] = dict(reply_addr=("10.0.0.2", 5555))
+        mgr._prefill.reshard_req[ROOM] = {0: dict(reply_addr=("10.0.0.2", 5555))}
         mgr._run_reshard_push = Mock(side_effect=RuntimeError("push broke"))
         mgr._do_reshard_push(ROOM)
 
@@ -1042,7 +1042,7 @@ class TestPrefillTellsDecodeRoomFailed(unittest.TestCase):
         mgr.bootstrap_timeout = 1
         sender = _gate_sender(mgr, ROOM)
         # The decode asked to reshard, got its blocks, and went quiet.
-        mgr._prefill.reshard_req[ROOM] = dict(reply_addr=("10.0.0.2", 5555))
+        mgr._prefill.reshard_req[ROOM] = {0: dict(reply_addr=("10.0.0.2", 5555))}
         mgr._prefill.reshard_replied_at[ROOM] = time.time() - 10
 
         self.assertEqual(sender.poll(), KVPoll.Failed)
