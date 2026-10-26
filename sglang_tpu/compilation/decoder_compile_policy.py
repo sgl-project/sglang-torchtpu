@@ -1057,6 +1057,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self._upload_host_inputs(forward_batch)
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
+        host_engram = getattr(self.model_runner, "host_engram", None)
+        if host_engram is not None:
+            host_engram.begin_step(forward_batch.input_ids.shape[0])
         spec_info = forward_batch.spec_info
         if spec_info is not None:
             spec_info.record_padding(
