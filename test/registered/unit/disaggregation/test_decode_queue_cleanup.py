@@ -72,6 +72,41 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
 
         self.assertFalse(wrapper.group_failure_requires_drain)
 
+    def test_group_failure_reason_hooks_follow_the_inner_receiver(self):
+        inner = SimpleNamespace(
+            group_failure_reason=MagicMock(return_value="refused"),
+            adopt_group_failure_reason=MagicMock(),
+        )
+        wrapper = HiCacheRestoreGatedKVReceiver(SimpleNamespace(kv_receiver=inner))
+
+        self.assertEqual(wrapper.group_failure_reason(), "refused")
+        wrapper.adopt_group_failure_reason("peer reason")
+        inner.adopt_group_failure_reason.assert_called_once_with("peer reason")
+
+        bare = HiCacheRestoreGatedKVReceiver(
+            SimpleNamespace(kv_receiver=SimpleNamespace())
+        )
+        self.assertFalse(hasattr(bare, "group_failure_reason"))
+        self.assertFalse(hasattr(bare, "adopt_group_failure_reason"))
+
+    def test_wrapper_getattr_only_forwards_the_two_hooks(self):
+        inner = SimpleNamespace(
+            group_failure_reason=MagicMock(return_value=None),
+            adopt_group_failure_reason=MagicMock(),
+            something_else="inner attr",
+        )
+        wrapper = HiCacheRestoreGatedKVReceiver(SimpleNamespace(kv_receiver=inner))
+
+        self.assertTrue(hasattr(wrapper, "decode_req"))
+        self.assertFalse(hasattr(wrapper, "something_else"))
+        with self.assertRaises(AttributeError):
+            wrapper.no_such_attribute
+        # Before decode_req exists (e.g. __new__ without __init__), lookups
+        # still terminate instead of recursing.
+        bare = HiCacheRestoreGatedKVReceiver.__new__(HiCacheRestoreGatedKVReceiver)
+        self.assertFalse(hasattr(bare, "decode_req"))
+        self.assertFalse(hasattr(bare, "group_failure_reason"))
+
     def test_decode_poll_keeps_hicache_gate_and_reduces_tp_then_cp(self):
         tp_group, cp_group = object(), object()
         inner = SimpleNamespace(group_failure_requires_drain=True)

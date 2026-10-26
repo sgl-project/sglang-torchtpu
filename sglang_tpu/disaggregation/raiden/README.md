@@ -33,6 +33,9 @@ Cross-rank status first reduces to the minimum
 over the complete attention-TP/CP group. If any rank fails, every Raiden poller
 tombstones the room before a second reduction confirms that accepted native
 I/O has drained on every rank; only then can the framework release KV pages.
+Ranks that did not fail the room themselves record a placeholder reason; the
+same gate gathers the reason of the rank that failed first and hands it to
+them, so the HTTP body (written by scheduler rank 0) names the real cause.
 Page ids come from `kv_to_page_indices` in token order and are raiden block ids
 directly.
 

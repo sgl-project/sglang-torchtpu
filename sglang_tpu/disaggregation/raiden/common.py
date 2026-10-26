@@ -48,6 +48,10 @@ STATE_PORT_OFFSET = 4
 # uvicorn then dies with EADDRINUSE and takes the server down before any
 # transfer is attempted.
 DEFAULT_KV_PORT = 31000
+# Reason a rank records for a room that a peer of its attention TP/CP group
+# failed first. The drain gate replaces it with the peer's reason
+# (``RaidenKVManager.adopt_group_failure_reason``).
+GROUP_FAILURE_PLACEHOLDER = "Raiden transfer failed on another attention TP/CP rank."
 
 
 def _tcp_endpoint(ip: str, port: int) -> str:

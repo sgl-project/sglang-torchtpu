@@ -26,7 +26,11 @@ from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
 )
-from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.common import (
+    GROUP_FAILURE_PLACEHOLDER,
+    _tcp_endpoint,
+    logger,
+)
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -1239,6 +1243,8 @@ class RaidenKVSender(CommonKVSender):
         )
         self._last_chunk = False
         self._started = False
+        # Set when the room's reason came from a peer rank (drain gate).
+        self._reason_from_another_rank = False
         self._transfer_start_time: Optional[float] = None
         # Raiden's finish time for this room (perf_counter seconds), set on Success.
         self.transfer_finish_time: Optional[float] = None
@@ -1382,8 +1388,7 @@ class RaidenKVSender(CommonKVSender):
         with self.kv_mgr._state_lock:
             self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
             self.kv_mgr._fail_room_unless_failed_locked(
-                self.bootstrap_room,
-                "Raiden transfer failed on another attention TP/CP rank.",
+                self.bootstrap_room, GROUP_FAILURE_PLACEHOLDER
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         # A local Success may have been cached before a peer contributed the
@@ -1392,6 +1397,16 @@ class RaidenKVSender(CommonKVSender):
         # State that could admit new work is discarded, while the leases added
         # for already accepted reads/stages/pushes intentionally survive.
         self.kv_mgr._drop_room_state(self.bootstrap_room)
+
+    def group_failure_reason(self) -> Optional[str]:
+        """This rank's own reason for the room, None if it only holds the
+        placeholder (see ``_share_group_failure_reason``)."""
+        return self.kv_mgr.group_failure_reason(self.bootstrap_room)
+
+    def adopt_group_failure_reason(self, reason: str) -> None:
+        """Take the reason of the rank that failed the room first."""
+        if self.kv_mgr.adopt_group_failure_reason(self.bootstrap_room, reason):
+            self._reason_from_another_rank = True
 
     def abort(self) -> None:
         """Seal a local abort, but do not conclude it over retained source KV.
@@ -1431,7 +1446,14 @@ class RaidenKVSender(CommonKVSender):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
         self.clear()
-        raise KVTransferError(self.bootstrap_room, reason)
+        # A reason adopted from a peer, or the placeholder a peer failure
+        # leaves behind, was already logged by the rank that failed first.
+        raise KVTransferError(
+            self.bootstrap_room,
+            reason,
+            is_from_another_rank=getattr(self, "_reason_from_another_rank", False)
+            or reason == GROUP_FAILURE_PLACEHOLDER,
+        )
 
     def clear(self) -> None:
         super().clear()
