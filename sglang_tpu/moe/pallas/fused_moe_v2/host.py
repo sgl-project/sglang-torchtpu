@@ -187,7 +187,12 @@ def align_up(v, m):
 
 def token_gather_window_rows(tile_m):
     """Int32 rows in one aligned HBM-to-SMEM token-gather window."""
-    return TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT
+    # Keep the DMA window tiled even when the compute tile is below 128 rows.
+    # Layer padding and SMEM sizing use this same overfetch extent.
+    return align_up(
+        TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT,
+        TOKEN_GATHER_DMA_ALIGNMENT,
+    )
 
 
 def token_gather_smem_bytes(tile_m):
