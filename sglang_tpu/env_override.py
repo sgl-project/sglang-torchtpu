@@ -70,9 +70,12 @@ _PREFILL_CP_SPARSE_CORE_OVERRIDES = (
 _DECODE_CP_SPARSE_CORE_OVERRIDES = (
     # TODO(yinlin09): drop once libtpu is fixed. With decode context parallelism
     # the SparseCore all-gather offload returns a wrong first token after long
-    # prompts (libtpu 0.0.47, 8192-token prefill bucket); every validated DCP run
-    # also kept the SparseCore gather offload off.
-    "--xla_tpu_offload_gather_to_sparsecore=false",
+    # prompts (libtpu 0.0.47, 8192-token prefill bucket). The SparseCore GATHER
+    # offload keeps the libtpu default: turning it off moved an SBD sampler's
+    # embedding-row gather onto the TensorCore (+0.7 ms per decode step at 8K
+    # with 16 requests, +0.4 ms at 256K) and the offload was never implicated
+    # (the validated DCP runs only happened to run with it off; a DCP2 P/D decode
+    # with it on is token-identical at 8K and recalls every needle to 1M).
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
 )
 

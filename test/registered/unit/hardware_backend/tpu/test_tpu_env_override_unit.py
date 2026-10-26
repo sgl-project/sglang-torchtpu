@@ -98,6 +98,17 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
                     args = os.environ["LIBTPU_INIT_ARGS"].split()
                 for flag in _DECODE_CP_SPARSE_CORE_OVERRIDES:
                     self.assertEqual(flag in args, expected)
+                # The gather offload stays at the libtpu default either way.
+                self.assertFalse(
+                    any(
+                        a.startswith("--xla_tpu_offload_gather_to_sparsecore")
+                        for a in args
+                    )
+                )
+        self.assertIn(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+            _DECODE_CP_SPARSE_CORE_OVERRIDES,
+        )
 
 
 if __name__ == "__main__":
