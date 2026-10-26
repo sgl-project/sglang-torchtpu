@@ -15,7 +15,13 @@ from sglang_tpu.dsv41.kernels.cache import (
 )
 from sglang_tpu.dsv41.kernels.csa2 import csa2, csa2_gather_chunk_size, csa2_pipeline
 from sglang_tpu.dsv41.kernels.o_projection import wo_a_projection
-from sglang_tpu.dsv41.kernels.selection import index_selection
+from sglang_tpu.kernels.index_selection.packed_fp8_cache import PackedFP8Layout
+from sglang_tpu.kernels.index_selection.selection import (
+    RequestCandidates,
+    prepare_selection,
+    select_dense,
+    select_prepared,
+)
 
 
 def inverse_rope(cos_sin, positions):
@@ -30,6 +36,20 @@ def inverse_rope(cos_sin, positions):
     return jnp.stack((cos, sin), 1)
 
 
+def index_geometry(words, pages, page_records, storage_records):
+    """Expand scheduler pages to the allocator's physical FP8 page geometry."""
+    if page_records % storage_records:
+        raise ValueError("Scheduler index pages must contain whole storage pages")
+    parts = page_records // storage_records
+    physical = jnp.where(
+        pages[..., None] >= 0,
+        pages[..., None] * parts + jnp.arange(parts, dtype=jnp.int32),
+        -1,
+    ).reshape(pages.shape[0], -1)
+    rows = (33 * storage_records + 127) // 128
+    return physical, PackedFP8Layout(words.shape[0] // rows, page_size=storage_records)
+
+
 def select(
     q: jax.Array,
     weights: jax.Array,
@@ -39,30 +59,85 @@ def select(
     lengths: jax.Array,
     candidates: jax.Array,
     page_records: int,
+    storage_records: int,
     topk: int,
     block_size: int,
     publish: bool,
-    consume: bool,
     layer_id: int,
 ) -> tuple[jax.Array, jax.Array]:
-    # The static layer ID separates export-cache entries. Each layer then
-    # reserves its own scheduling groups, even when tensor shapes match.
-    # Reusing one exported group across dependent layers creates a group
-    # with gaps in the merged TorchTPU graph.
     del layer_id
-    return index_selection(
+    physical, layout = index_geometry(words, pages, page_records, storage_records)
+    return select_dense(
         q,
         weights,
-        words,
-        pages,
+        (words,),
+        physical,
         requests,
         lengths,
         candidates,
-        page_records=page_records,
+        layout=layout,
+        score_width=pages.shape[1] * page_records,
         topk=topk,
         block_size=block_size,
         publish=publish,
-        consume=consume,
+    )
+
+
+def prepare_index(
+    words: jax.Array,
+    pages: jax.Array,
+    requests: jax.Array,
+    lengths: jax.Array,
+    candidates: jax.Array,
+    page_records: int,
+    storage_records: int,
+    topk: int,
+    block_size: int,
+    max_queries: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    physical, layout = index_geometry(words, pages, page_records, storage_records)
+    return tuple(
+        prepare_selection(
+            (words,),
+            physical,
+            requests,
+            lengths,
+            candidates,
+            layout=layout,
+            score_width=pages.shape[1] * page_records,
+            topk=topk,
+            block_size=block_size,
+            max_queries_per_request=max_queries,
+        )
+    )
+
+
+def select_index_prepared(
+    q: jax.Array,
+    weights: jax.Array,
+    lengths: jax.Array,
+    keys: jax.Array,
+    block_ids: jax.Array,
+    pages: jax.Array,
+    requests: jax.Array,
+    candidates: jax.Array,
+    valid: jax.Array,
+    bypass: jax.Array,
+    score_width: int,
+    topk: int,
+    block_size: int,
+    layer_id: int,
+) -> jax.Array:
+    # Keep operands flat: cpu_export_jax_op does not map nested torch inputs.
+    del layer_id
+    return select_prepared(
+        q,
+        weights,
+        lengths,
+        RequestCandidates(keys, block_ids, pages, requests, candidates, valid, bypass),
+        score_width=score_width,
+        topk=topk,
+        block_size=block_size,
     )
 
 
@@ -200,6 +275,8 @@ def project(x: jax.Array, weight: jax.Array, scales: jax.Array) -> jax.Array:
 
 class AttentionOps(NamedTuple):
     select: object
+    prepare_index: object
+    select_prepared: object
     metadata: object
     gather: object
     attend: object
@@ -234,16 +311,69 @@ def register_ops():
         lengths,
         candidates,
         page_records,
+        storage_records,
         topk,
         block_size,
         publish,
-        consume,
         layer_id,
     ):
         return lengths.new_empty((q.shape[0], topk)), torch.empty_like(candidates)
 
+    def fake_prepare(
+        words,
+        pages,
+        requests,
+        lengths,
+        candidates,
+        page_records,
+        storage_records,
+        topk,
+        block_size,
+        max_queries,
+    ):
+        width = pages.shape[1] * page_records
+        blocks = (width + block_size - 1) // block_size
+        prefix = (min(topk, width) + block_size - 1) // block_size
+        capacity = min(
+            blocks, min(requests.numel(), max_queries) * candidates.shape[1] + prefix
+        )
+        alignment = 128 // block_size
+        capacity = (max(1, capacity) + alignment - 1) // alignment * alignment
+        groups = pages.shape[0]
+        compact_pages = capacity * block_size // 128
+        key_rows = groups * compact_pages * 33 if groups and requests.numel() else 33
+        return (
+            words.new_empty((key_rows, 128)),
+            requests.new_empty((groups, capacity)),
+            pages.new_empty((groups, compact_pages)),
+            torch.empty_like(requests),
+            torch.empty_like(candidates),
+            requests.new_empty(requests.shape, dtype=torch.bool),
+            requests.new_empty((), dtype=torch.bool),
+        )
+
+    def fake_prepared(
+        q,
+        weights,
+        lengths,
+        keys,
+        block_ids,
+        pages,
+        requests,
+        candidates,
+        valid,
+        bypass,
+        score_width,
+        topk,
+        block_size,
+        layer_id,
+    ):
+        return lengths.new_empty((q.shape[0], topk))
+
     definitions = (
         ("select", select, fake_select),
+        ("prepare_index", prepare_index, fake_prepare),
+        ("select_prepared", select_index_prepared, fake_prepared),
         ("metadata", metadata, fake_metadata),
         ("gather", gather_attend, fake_gather),
         ("attend", attend, lambda q, *_: torch.empty_like(q)),
@@ -290,9 +420,10 @@ def register_cache_ops():
         records: jax.Array,
         values: jax.Array,
         after: jax.Array,
+        page_records: int,
     ) -> jax.Array:
         words, _ = jax.lax.optimization_barrier((words, after))
-        return scatter_index_keys(words, records, values)
+        return scatter_index_keys(words, records, values, page_records=page_records)
 
     def swa(
         words: jax.Array,
@@ -329,4 +460,6 @@ def publish_source(ops, pool, layer_id, records, latent, key, after):
     words.copy_(new_words)
     scales.copy_(new_scales)
     index = pool.low_ratio_cache(layer_id, index=True)
-    index.copy_(ops.index(index, records, key, after))
+    index.copy_(
+        ops.index(index, records, key, after, pool.index_page_records(layer_id))
+    )

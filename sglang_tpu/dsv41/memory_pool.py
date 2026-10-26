@@ -55,12 +55,12 @@ class SWAWordPool(DeepSeekV4SingleKVPool):
         return sum(t.nbytes for t in self.k_buffer), 0
 
 
-class BF16IndexHalfplanePool:
+class PackedFP8IndexPool:
     def __init__(
         self, size, page_size, head_dim, layer_num, device, *, record_alignment
     ):
-        if head_dim != 128 or page_size % 2:
-            raise ValueError("V4.1 index storage requires D128 and even pages")
+        if head_dim != 128 or page_size < 1 or page_size & (page_size - 1):
+            raise ValueError("V4.1 index storage requires D128 and power-of-two pages")
         if record_alignment < page_size or record_alignment % page_size:
             raise ValueError("Index allocation alignment must contain whole pages")
         self.size, self.page_size = size, page_size
@@ -73,9 +73,11 @@ class BF16IndexHalfplanePool:
             // pages_per_alignment
             * pages_per_alignment
         )
+        # Feature-major E4M3 bytes plus an in-page FP32 scale per record.
+        self.page_rows = (33 * page_size + 127) // 128
         self.k_buffer = [
             torch.zeros(
-                (self.num_pages * page_size // 2, head_dim),
+                (self.num_pages * self.page_rows, head_dim),
                 dtype=torch.int32,
                 device=device,
             )
@@ -144,26 +146,20 @@ class DSV41TPUTokenToKVPool(DSV4TPUTokenToKVPool):
         force_fp4=False,
         global_page_size=None,
     ):
-        if force_fp4:
-            return BF16IndexHalfplanePool(
-                size,
-                page_size,
-                index_head_dim,
-                layer_num,
-                device,
-                record_alignment=self.page_size,
-            )
-        return super()._make_indexer_pool(
+        # force_fp4 is the core's low-ratio index-pool selector, not our dtype.
+        # Those calls omit global_page_size and use DSV41_INDEX_PAGE_SIZE.
+        return PackedFP8IndexPool(
             size,
             page_size,
-            dtype,
             index_head_dim,
             layer_num,
             device,
-            enable_memory_saver,
-            force_fp4,
-            global_page_size,
+            record_alignment=global_page_size or self.page_size,
         )
+
+    def index_page_records(self, layer_id):
+        item = self.layer_mapping[layer_id]
+        return self.index_pools[item.compress_ratio].page_size
 
     def low_ratio_cache(self, layer_id, *, index=False):
         self.wait_layer_transfer(layer_id)
