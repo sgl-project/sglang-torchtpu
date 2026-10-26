@@ -424,6 +424,41 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
 _DP_COUNT_FIELDS = ("global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu")
 
 
+def warmup_context_lens(attn_backend: Any) -> tuple[int, ...]:
+    """Context lengths an attention backend asks every decode / verify warmup
+    to run at, besides the dummy batch's own (``warmup_context_lens`` on the
+    backend; empty for backends whose compiled graph does not depend on the
+    context, the default)."""
+    return tuple(getattr(attn_backend, "warmup_context_lens", ()) or ())
+
+
+def warmup_metadata_backend(attn_backend: Any, mode: ForwardMode) -> Any:
+    """The backend that builds a ``mode`` warm-up's metadata, so the one its
+    context questions go to: a hybrid wrapper's child for that mode (the
+    wrapper delegates ``init_forward_metadata`` by forward mode and declares
+    nothing itself), otherwise the backend."""
+    select = getattr(attn_backend, "_select_backend", None)
+    return attn_backend if select is None else select(mode)
+
+
+def set_warmup_context(forward_batch: ForwardBatch, context_len: int) -> None:
+    """Give the dummy decode / verify batch ``context_len`` cached tokens per
+    request (device and host lengths), the way serving presents a batch of
+    that context; the page table it reads stays the reserved rows'."""
+    bs = forward_batch.batch_size
+    forward_batch.seq_lens = torch.full_like(forward_batch.seq_lens, context_len)
+    if forward_batch.orig_seq_lens is not None:
+        forward_batch.orig_seq_lens = torch.full_like(
+            forward_batch.orig_seq_lens, context_len
+        )
+    if forward_batch.seq_lens_cpu is not None:
+        forward_batch.seq_lens_cpu = torch.full_like(
+            forward_batch.seq_lens_cpu, context_len
+        )
+    if forward_batch.seq_lens_sum is not None:
+        forward_batch.seq_lens_sum = bs * context_len
+
+
 class EagerLogitsCase(msgspec.Struct, frozen=True):
     """One shape of the eager outer-model logits that follows a compiled decoder forward."""
 
@@ -943,7 +978,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             input_ids.shape[0],
             logits_output_mode,
         )
-        return key
+        # The attention metadata's own static facts (``compile_key``).
+        return (*key, *getattr(attention_metadata, "compile_key", ()))
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
@@ -1645,8 +1681,42 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        context_len: int | None = None,
     ) -> PendingCall | float | None:
-        """Run one warmup, defer async execution, or time synchronous profiling."""
+        """Run one warmup, defer async execution, or time synchronous profiling.
+
+        ``context_len`` None runs the dummy batch as built, plus one more pass
+        per context length the attention backend asks for
+        (``warmup_context_lens``: a backend whose compiled graph is keyed by
+        the context must have every bucket compiled before serving); the
+        backend sees the pass's length as ``warmup_context_len`` while it
+        builds the batch's metadata.
+        """
+        if context_len is None and profile_prefix is None:
+            extra = warmup_context_lens(
+                warmup_metadata_backend(
+                    attn_backend or self.model_runner.attn_backend, mode
+                )
+            )
+            if extra:
+                passes = [
+                    self._run_one(
+                        num_tokens=num_tokens,
+                        bs=bs,
+                        mode=mode,
+                        variant=variant,
+                        logits_output_mode=logits_output_mode,
+                        capture_hidden_mode=capture_hidden_mode,
+                        spec_info=spec_info,
+                        attn_backend=attn_backend,
+                        context_len=length,
+                    )
+                    for length in (0, *extra)
+                ]
+                pending = [call for call in passes if isinstance(call, PendingCall)]
+                if not pending:
+                    return None
+                return PendingCall(lambda: [call.wait() for call in pending])
         self._compiled_extend_variants.add(variant)
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
@@ -1694,7 +1764,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch.logits_output_mode = logits_output_mode
 
         forward_attn_backend = attn_backend or self.model_runner.attn_backend
-        forward_attn_backend.init_forward_metadata(forward_batch)
+        # The pass's context goes to the backend that builds the metadata (a
+        # hybrid wrapper's child for this mode); the build itself goes through
+        # the wrapper, which activates that child for the forward.
+        metadata_backend = warmup_metadata_backend(forward_attn_backend, mode)
+        if context_len:
+            set_warmup_context(forward_batch, context_len)
+        if hasattr(metadata_backend, "warmup_context_len"):
+            metadata_backend.warmup_context_len = context_len or None
+        try:
+            forward_attn_backend.init_forward_metadata(forward_batch)
+        finally:
+            if hasattr(metadata_backend, "warmup_context_len"):
+                metadata_backend.warmup_context_len = None
 
         # The compiled forward resolves its attention backend from the forward
         # context (upstream moved attn_backend off ForwardBatch into a
@@ -2184,7 +2266,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
-        return key
+        return (*key, *getattr(attention_metadata, "compile_key", ()))
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode / verify raw ``input_ids``, skipping embed.

@@ -165,6 +165,10 @@ class PallasForwardMetadata:
     # The same targets in the SWA sub-pool's slot space, set only for
     # hybrid-SWA models.
     dcp_swa_write: DcpWriteSpans | None = None
+    # Static facts a backend adds to the compiled forward's specialization
+    # (the decoder compile policy appends them to its key): e.g. a context
+    # bucket that selects a kernel tile. Static leaves, not graph inputs.
+    compile_key: tuple[int, ...] = ()
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
