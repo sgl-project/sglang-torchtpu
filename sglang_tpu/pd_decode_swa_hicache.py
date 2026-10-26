@@ -9,8 +9,7 @@ to host RAM:
 - Decode cache hits stop where the SWA window starts, so prefill always sends
   the window and the new tokens.
 - With SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS > 0, RAM also keeps the last SWA
-  window of each cached path for host victim storage. Prefix recall is added
-  separately.
+  window of each cached path; prefix offers restore it before remote reads.
 - With a draft (EAGLE3, DFlash, or DSpark on the experimental worker), the draft
   KV goes to RAM together with the full-attention KV.
 - With SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP, a PD prefill's RAM also
@@ -937,6 +936,9 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
     Callers look these functions up on their module at call time, so replacing
     the module attribute reaches all of them.
     """
+    # Imported here: the window restore module builds on this one.
+    from sglang_tpu import pd_decode_window_restore
+
     return (
         # Upstream rejects decode SWA radix + HiCache at startup. Build the
         # full-only RAM cache instead.
@@ -987,6 +989,7 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
         ),
         # Record the device pages each restore fills, for the hold above.
         (TpuDMAHybridCacheController, "load", _controller_load),
+        *pd_decode_window_restore.patch_targets(),
     )
 
 

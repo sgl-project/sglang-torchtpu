@@ -126,6 +126,7 @@ def _decode_manager():
     mgr._failed = set()
     mgr._native_failed = set()
     mgr._completed_recv = set()
+    mgr._send_reads = {}
     mgr.chunked_transfer = False
     mgr.waiting_timeout = 300
     mgr._message_handlers = {RoomFailed.TAG: mgr._on_room_failed}
@@ -368,6 +369,7 @@ def _decode_manager_stub(**overrides):
         _prefill=None,
         _failed=set(),
         _native_failed=set(),
+        _send_reads={},
         room_has_active_io=lambda room: False,
         # _check_waiting_timeout takes the manager's connection lock.
         connection_lock=threading.Lock(),
@@ -581,6 +583,9 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         )
         mgr.finish_bootstrap_if_decode_requested = types.MethodType(
             RaidenKVManager.finish_bootstrap_if_decode_requested, mgr
+        )
+        mgr._prefix_pull_open_locked = types.MethodType(
+            RaidenKVManager._prefix_pull_open_locked, mgr
         )
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr

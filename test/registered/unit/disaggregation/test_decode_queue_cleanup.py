@@ -752,6 +752,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             req=req,
             kv_receiver=receiver,
             metadata_buffer_index=3,
+            prefix_offer_sent=True,
+            prefix_offer_lock=None,
             hicache_restore_status=HiCacheRestoreResult.READY,
         )
 
@@ -868,6 +870,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             req=req,
             kv_receiver=receiver,
             metadata_buffer_index=3,
+            prefix_offer_sent=True,
+            prefix_offer_lock=None,
             hicache_restore_status=HiCacheRestoreResult.READY,
         )
 

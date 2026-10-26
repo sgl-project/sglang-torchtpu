@@ -922,6 +922,10 @@ def _patch_pd_victim_push() -> None:
     # Off: not even the module's imports.
     if not tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
         return
+    if not tpu_envs.SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX.get():
+        raise ValueError(
+            "Victim prefix caching requires SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1"
+        )
     from sglang_tpu import pd_victim_push
 
     pd_victim_push.install()

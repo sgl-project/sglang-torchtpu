@@ -1,12 +1,12 @@
 """Victim push: the decode's RAM is the cache tier below the prefill's RAM.
 
 Why: core has no per-request disaggregation cache policy or queue extension.
-How: backend host-export controller, plus small lifecycle wrappers listed below.
+How: backend puller subclass, plus small lifecycle wrappers listed below.
 Upstream PR or issue: none yet; queue/cache lifecycle seams need upstreaming.
 Remove when: core supplies equivalent checkpoint and decode-queue callbacks.
 
-SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1 enables host-victim storage on both roles.
-Reverse prefix recall is introduced in the following milestone.
+SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1 on both roles, with the decode-held prefix
+pull (SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX) on.
 
 The bytes move RAM to RAM: the prefill's HiCache host pool pushes straight
 into pages the decode's HiCache host pool allocated, through the host pool's
@@ -26,10 +26,10 @@ back, no staging slot on either side.
   offers all of them received, allocate host pages and start host reads.
   Native receive completion and VICTIM_DONE gate host-only insertion.
 
-TP/CP ranks agree on identity, content and outcome before changing a tree.
-Hybrid models transfer full-attention KV and the page-aligned trailing SWA
-window through their separate host pools. A later milestone adds reverse
-recall so Prefill can resume from these stored victims.
+Sticky routing sends the session's next turn to the same decode, whose prefix
+offer lets the prefill pull it back. TP/CP ranks agree on identity, content
+and outcome before changing a tree. Hybrid models transfer full-attention KV
+and the page-aligned trailing SWA window through their separate host pools.
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+from sglang_tpu.disaggregation.raiden.prefix_pull import DecodePrefixPuller
 from sglang_tpu.disaggregation.raiden.serde import VictimAck
 from sglang_tpu.envs import envs as tpu_envs
 
@@ -267,7 +268,7 @@ def _transfer_uuid(prefill: str, seq: int) -> int:
 class PrefillPusher:
     """Pushes host-backed sessions near eviction to their decodes."""
 
-    def __init__(self, puller: VictimPrefixPuller) -> None:
+    def __init__(self, puller: DecodePrefixPuller) -> None:
         self._mgr = puller._mgr
         self._cache = puller._tree_cache
         self._page_size = puller._page_size
@@ -925,46 +926,32 @@ class DecodeReceiver:
         self.stats["landed_tokens"] += num_tokens - result.prefix_len
 
 
-class VictimPrefixPuller:
-    """Prefill host-export lifecycle selected by Raiden's backend factory.
+class VictimPrefixPuller(DecodePrefixPuller):
+    """Prefill orchestration selected by Raiden's existing backend factory."""
 
-    This milestone stores victims independently of reverse prefix reads.
-    The bootstrap queue supplies rank-synchronous normal and paused ticks.
-    """
-
-    def __init__(
-        self,
-        *,
-        kv_manager: RaidenKVManager,
-        scheduler: Any,
-        swa_window: Optional[int] = None,
-    ) -> None:
-        self._mgr = kv_manager
-        self._tree_cache = scheduler.tree_cache
-        self._allocator = scheduler.token_to_kv_pool_allocator
-        self._page_size = int(self._allocator.page_size)
-        self._groups = _cpu_groups(scheduler)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.pusher = PrefillPusher(self)
 
-    def commit(self, req: Any) -> None:
+    def commit(self, req):
+        super().commit(req)
         self.pusher.record(req)
 
-    def advance(self, reqs: Sequence[Any], *, waiting_reqs: Sequence[Any] = ()) -> None:
+    def advance(self, reqs, *, waiting_reqs=()):
+        super().advance(reqs, waiting_reqs=waiting_reqs)
         self.pusher.step()
 
-    def release(self, req: Any) -> None:
-        # No per-request destinations exist until reverse recall is introduced.
-        pass
-
     def has_pending_deferred_releases(self) -> bool:
-        return bool(self.pusher._pushes)
+        return super().has_pending_deferred_releases() or bool(self.pusher._pushes)
 
     def resolve_deferred_releases(self) -> None:
-        # Paused and empty control ticks retire existing exports only.
+        super().resolve_deferred_releases()
+        # Paused and empty control ticks must retire existing exports too.
         self.pusher._settle()
 
-    def release_all(self) -> None:
+    def release_all(self):
         self.pusher.release_all()
+        super().release_all()
 
 
 # ---------------------------------------------------------------------------
@@ -984,7 +971,7 @@ def _decode_add(
     """Wraps ``DecodePreallocQueue.add``: the decode caches only pushed sessions."""
     if (
         isinstance(queue.kv_manager, RaidenKVManager)
-        and queue.kv_manager.victim_push_active
+        and queue.kv_manager.prefix_pull_active
         and isinstance(queue.tree_cache, UnifiedRadixCache)
     ):
         from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
@@ -1011,7 +998,7 @@ def _receiver(queue: DecodeTransferQueue) -> Optional[DecodeReceiver]:
         mgr = queue.scheduler.disagg_decode_prealloc_queue.kv_manager
         if (
             not isinstance(mgr, RaidenKVManager)
-            or not mgr.victim_push_active
+            or not mgr.prefix_pull_active
             or not isinstance(queue.tree_cache, UnifiedRadixCache)
         ):
             return None

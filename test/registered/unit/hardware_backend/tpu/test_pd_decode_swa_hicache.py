@@ -2,8 +2,8 @@
 
 Decode backs up and restores full-attention KV through host RAM, and a
 request's SWA window always comes from the prefill transfer. With host SWA
-windows, RAM also keeps the last window of each path for victim storage.
-Recall-specific offer restoration is added separately. Each wrapper is called
+windows, RAM also keeps the last window of each path, which only the prefix
+offer restore (pd_decode_window_restore) loads back. Each wrapper is called
 with the real upstream function (or a fake where upstream needs a full server),
 so the tests pin both this behavior and the pass-through to upstream for every
 other cache, except the restore hold, which every raiden PD decode cache gets.
@@ -30,6 +30,7 @@ from sglang.srt.disaggregation import decode
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeRequest,
+    DecodeTransferQueue,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
@@ -69,6 +70,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_swa_hicache as tpu
+from sglang_tpu import pd_decode_window_restore as restore
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
@@ -1209,6 +1211,226 @@ class TestPathEndSwaBackup(CustomTestCase):
         # Once the split part is in RAM only the leaf is left.
         split.component_data[ComponentType.SWA].host_value = torch.arange(64)
         self.assertEqual(self.collect(leaf), [leaf])
+
+
+class TestPlanWindowRestore(CustomTestCase):
+    @staticmethod
+    def node(*, parent, num_tokens, evicted):
+        full = SimpleNamespace(host_value=torch.arange(num_tokens) if evicted else None)
+        return SimpleNamespace(
+            key=[0] * num_tokens,
+            parent=parent,
+            evicted=evicted,
+            component_data={ComponentType.FULL: full},
+        )
+
+    def plan(self, *, on_device, prompt_len=300):
+        root = SimpleNamespace()
+        resident = self.node(parent=root, num_tokens=128, evicted=False)
+        in_ram = self.node(parent=resident, num_tokens=128, evicted=True)
+        cache = MagicMock()
+        cache.tree_core.root_node = root
+        cache.tree_core.is_eagle = False
+        cache.tree_core.node_by_id.return_value = in_ram
+        flags = []
+
+        def match_prefix(params):
+            flags.append(tpu._swa_window_restore)
+            self.assertEqual(len(params.key), 256)
+            return SimpleNamespace(best_match_node=5, swa_host_hit_length=128)
+
+        cache.match_prefix.side_effect = match_prefix
+        req = SimpleNamespace(
+            origin_input_ids=list(range(prompt_len)), extra_key=None, cache_salt=None
+        )
+        with patch.object(
+            restore, "deepest_device_window_prefix", return_value=on_device
+        ):
+            plan = restore._plan_restore(
+                cache=cache, req=req, window_size=128, page_size=64
+            )
+        return plan, flags
+
+    def test_loads_only_a_window_deeper_than_the_device_one(self):
+        # The strict match ends 256 tokens in, the last 128 of them in RAM.
+        plan, flags = self.plan(on_device=128)
+        self.assertEqual((plan.node, plan.full_tokens, plan.swa_tokens), (5, 128, 128))
+        self.assertEqual(flags, [True])
+        self.assertIsNone(self.plan(on_device=256)[0])
+
+    def test_prompt_shorter_than_a_page_needs_no_match(self):
+        plan, flags = self.plan(on_device=0, prompt_len=64)
+        self.assertIsNone(plan)
+        self.assertEqual(flags, [])
+
+
+class TestOfferWindowRestore(CustomTestCase):
+    """The offer restore state machine and its lock pairing, on every rank alike."""
+
+    def setUp(self):
+        self.events = []
+        self.load_ok = True
+        self.cache = cache = MagicMock()
+        mark_window(cache)
+        cache.ongoing_load_back = {}
+        cache.has_free_load_back_slot.return_value = True
+        cache.full_evictable_size.return_value = 0
+        cache.swa_evictable_size.return_value = 0
+        cache.load_back.side_effect = self.load_back
+        cache.inc_lock_ref.side_effect = self.lock
+        cache.dec_lock_ref.side_effect = lambda node, receipt: self.events.append(
+            ("unlock", node, receipt)
+        )
+        self.allocator = MagicMock(page_size=64)
+        self.allocator.full_available_size.return_value = 10**6
+        self.allocator.swa_available_size.return_value = 10**6
+        self.queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        self.queue.tree_cache = cache
+        self.queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=True,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=128,
+        )
+        self.plans = {}
+        patcher = patch.object(
+            restore,
+            "_plan_restore",
+            side_effect=lambda *, cache, req, window_size, page_size: self.plans[
+                req.rid
+            ],
+        )
+        self.plan_restore = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def load_back(self, node):
+        # SWA load-back runs only under the flag.
+        self.assertTrue(tpu._swa_window_restore)
+        self.events.append(("load", node))
+        if self.load_ok:
+            self.cache.ongoing_load_back[node] = object()
+        return self.load_ok
+
+    def lock(self, node):
+        self.events.append(("lock", node))
+        return MagicMock(to_dec_params=MagicMock(return_value=("receipt", node)))
+
+    def request(self, rid, *, node=None, status=HiCacheRestoreResult.READY):
+        req = make_req()
+        req.rid = rid
+        self.plans[rid] = (
+            None
+            if node is None
+            else restore._RestorePlan(node=node, full_tokens=256, swa_tokens=128)
+        )
+        return DecodeRequest(
+            req=req,
+            kv_receiver=MagicMock(prefix_offer_pending=True),
+            prefix_match=DecodePrefixMatch(torch.arange(64), 0, 0, 1),
+            hicache_restore_status=status,
+        )
+
+    def offer(self, decode_reqs):
+        """One scheduler step, returns the rids offered in it."""
+        offered = []
+
+        def upstream(queue, reqs):
+            for decode_req in reqs:
+                # Upstream waits for the request's own restore.
+                if (
+                    decode_req.prefix_offer_sent
+                    or decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
+                ):
+                    continue
+                self.events.append(("offer", decode_req.req.rid))
+                decode_req.prefix_offer_sent = True
+                offered.append(decode_req.req.rid)
+
+        restore._offer_resident_prefixes(upstream, self.queue, decode_reqs)
+        return offered
+
+    def unlocks(self):
+        return [event for event in self.events if event[0] == "unlock"]
+
+    def test_offer_waits_for_the_load_then_takes_over_its_lock(self):
+        decode_req = self.request("a", node=7)
+        self.assertEqual(self.offer([decode_req]), [])
+        self.assertEqual(self.events, [("load", 7), ("lock", 7)])
+        self.cache.ready_to_load_host_cache.assert_called_once()
+        # Still loading on some rank: no offer, no second load.
+        self.assertEqual(self.offer([decode_req]), [])
+        self.assertEqual(len(self.events), 2)
+        # loading_check reaped the ack on every rank.
+        del self.cache.ongoing_load_back[7]
+        self.assertEqual(self.offer([decode_req]), ["a"])
+        # The restore lock goes in the step the offer locks the path.
+        self.assertEqual(
+            self.events[2:], [("offer", "a"), ("unlock", 7, ("receipt", 7))]
+        )
+        self.offer([decode_req])
+        restore._release_prefix_offer_lock(MagicMock(), self.queue, decode_req)
+        self.assertEqual(len(self.unlocks()), 1)
+        self.cache.ready_to_load_host_cache.assert_called_once()
+
+    def test_nothing_to_restore_offers_at_once(self):
+        # The device already holds the deepest window.
+        self.assertEqual(self.offer([self.request("a")]), ["a"])
+        # The request's own restore goes first: no window restore meanwhile.
+        pending = self.request("b", node=7, status=HiCacheRestoreResult.PENDING)
+        self.assertEqual(self.offer([pending]), [])
+        self.assertEqual(self.events, [("offer", "a")])
+        self.cache.ready_to_load_host_cache.assert_not_called()
+
+    def test_declined_or_unfitting_load_offers_the_device_prefix(self):
+        self.load_ok = False
+        self.assertEqual(self.offer([self.request("a", node=7)]), ["a"])
+        self.assertEqual(self.events, [("load", 7), ("offer", "a")])
+        self.load_ok = True
+        # A whole window must fit the SWA pool, free or evictable.
+        self.allocator.swa_available_size.return_value = 64
+        self.assertEqual(self.offer([self.request("b", node=8)]), ["b"])
+        self.assertEqual(self.events[2:], [("offer", "b")])
+        self.assertNotIn("lock", [event[0] for event in self.events])
+        self.cache.ready_to_load_host_cache.assert_not_called()
+
+    def loads(self):
+        return [event for event in self.events if event[0] == "load"]
+
+    def test_loads_are_capped(self):
+        reqs = [self.request(rid, node=node) for rid, node in zip("abc", (7, 8, 9))]
+        # The third waits for a loading restore to land, not offered shallower.
+        self.assertEqual(self.offer(reqs), [])
+        self.assertEqual(self.loads(), [("load", 7), ("load", 8)])
+        del self.cache.ongoing_load_back[7]
+        self.assertEqual(self.offer(reqs), ["a"])
+        self.assertEqual(self.loads()[2:], [("load", 9)])
+
+    def test_load_waits_for_a_free_slot(self):
+        # The slot count agrees on every rank, acks are reaped in lockstep.
+        self.cache.has_free_load_back_slot.return_value = False
+        decode_req = self.request("a", node=7)
+        self.assertEqual(self.offer([decode_req]), [])
+        self.assertEqual(self.loads(), [])
+        self.cache.has_free_load_back_slot.return_value = True
+        self.assertEqual(self.offer([decode_req]), [])
+        self.assertEqual(self.loads(), [("load", 7)])
+
+    def test_queue_exit_releases_a_loading_restore_once(self):
+        decode_req = self.request("a", node=7)
+        self.offer([decode_req])
+        release = MagicMock()
+        restore._release_prefix_offer_lock(release, self.queue, decode_req)
+        release.assert_called_once_with(self.queue, decode_req)
+        self.assertEqual(self.unlocks(), [("unlock", 7, ("receipt", 7))])
+        restore._release_prefix_offer_lock(release, self.queue, decode_req)
+        self.assertEqual(len(self.unlocks()), 1)
+
+    def test_caches_without_host_windows_keep_upstream_offer(self):
+        self.queue.tree_cache = full_only_cache()
+        upstream = MagicMock()
+        reqs = [self.request("a", node=7)]
+        restore._offer_resident_prefixes(upstream, self.queue, reqs)
+        upstream.assert_called_once_with(self.queue, reqs)
+        self.plan_restore.assert_not_called()
 
 
 class TestInstall(CustomTestCase):

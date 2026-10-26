@@ -44,6 +44,7 @@ from typing import (
 )
 
 import numpy as np
+
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -53,7 +54,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
-
 from sglang_tpu.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
@@ -85,6 +85,9 @@ from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
     MessageTag,
+    PrefixOffer,
+    PrefixPull,
+    PrefixReady,
     PullReq,
     ReshardBlocks,
     ReshardChunk,
@@ -124,15 +127,15 @@ def _describe_failure(
     """Why raiden failed ``transfer``, in raiden's field names, leaving out the
     fields it did not report."""
     parts = [f"Raiden {side} failed: req_id={transfer.req_id}"]
-    if transfer.code is not None:
+    if getattr(transfer, "code", None) is not None:
         parts.append(f"code={transfer.code}")
-    if transfer.phase is not None:
+    if getattr(transfer, "phase", None) is not None:
         parts.append(f"phase={transfer.phase}")
-    if transfer.peer is not None:
+    if getattr(transfer, "peer", None) is not None:
         parts.append(f"peer={transfer.peer}")
-    if transfer.elapsed_ns is not None:
+    if getattr(transfer, "elapsed_ns", None) is not None:
         parts.append(f"elapsed_ms={transfer.elapsed_ns / 1e6:.1f}")
-    if transfer.reason is not None:
+    if getattr(transfer, "reason", None) is not None:
         parts.append(f"reason={transfer.reason}")
     return " ".join(parts)
 
@@ -202,6 +205,9 @@ class RaidenKVManager(
             ReshardChunk.TAG: self._on_reshard_chunk,
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
+            PrefixOffer.TAG: self._on_prefix_offer,
+            PrefixPull.TAG: self._on_prefix_pull,
+            PrefixReady.TAG: self._on_prefix_ready,
             VictimPush.TAG: self._on_victim_push,
             VictimAck.TAG: self._on_victim_ack,
             VictimDone.TAG: self._on_victim_done,
@@ -222,6 +228,12 @@ class RaidenKVManager(
         )
         self._pipeline_init_lock = threading.Lock()
         self._pipeline_messages = []
+        # Decode-held prefix pull (prefix_pull.py): the decode offers the
+        # prompt prefix it holds and the prefill pulls what it lacks.
+        self.prefix_pull_enabled = (
+            tpu_envs.SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX.get()
+            and not self._pipeline_enabled
+        )
         # Each rank reserves control+data ports for full KV, SWA KV and GDN
         # state. The
         # rank counts every worker on the node -- attention-TP ranks of every
@@ -781,6 +793,35 @@ class RaidenKVManager(
     def _state_req_id(room: int) -> str:
         return f"state:{room}"
 
+    @staticmethod
+    def _prefix_req_id(room: int) -> str:
+        """Id of the prefill's read of the decode-held prefix; shaped like a
+        chunk id so the room bookkeeping covers it."""
+        return f"{room}#px"
+
+    @staticmethod
+    def _prefix_swa_req_id(room: int) -> str:
+        """Id of the prefix pull's sliding-window read, on the SWA engines."""
+        return f"{room}#pxs"
+
+    @staticmethod
+    def _is_prefix_pull_read(key: str) -> bool:
+        return key.endswith(("#px", "#pxs"))
+
+    def _drop_stale_prefix_completions_locked(self) -> None:
+        """Forget served prefix reads of rooms that were already cleared; the
+        room's own cleanup ran before the completion arrived."""
+        stale = [k for k in self._completed_send if self._is_prefix_pull_read(k)]
+        if not stale:
+            return
+        with self._status_lock:
+            live = set(self.request_status)
+        for key in stale:
+            room = self._room_of(key)
+            if room is not None and room not in live:
+                self._completed_send.discard(key)
+                self._send_done_at.pop(key, None)
+
     @classmethod
     def _room_of(cls, rid: str) -> Optional[int]:
         """The room of a whole ("<room>"), sliding-window ("swa:<room>"), GDN
@@ -859,12 +900,20 @@ class RaidenKVManager(
                     real_failed = norm_failed - superseded
                     superseded -= norm_failed
                     self._native_failed.update(real_failed)
-                    self._failed.update(real_failed)
+                    # A failed prefix pull costs the prefill a recompute and
+                    # the decode nothing, so it fails neither room.
+                    room_failed = {
+                        k for k in real_failed if not self._is_prefix_pull_read(k)
+                    }
+                    self._failed.update(room_failed)
                     failures, later_failures = self._record_native_failures_locked(
-                        t for t in failed if self._norm_req_id(t.req_id) in real_failed
+                        t for t in failed if self._norm_req_id(t.req_id) in room_failed
                     )
+                    for key in real_failed - room_failed:
+                        later_failures.append(f"prefix pull {key} failed natively")
                     self._release_pull_slots_locked()
                     self._settle_sender_reads_locked()
+                    self._drop_stale_prefix_completions_locked()
                     settled_plans = self._settled_cleared_plans_locked()
                 for uuid in settled_plans:
                     self._unregister_plan(uuid)
@@ -1163,15 +1212,14 @@ class RaidenKVManager(
         # new bootstrap fields (its endpoint rides in the per-request reply).
         super().register_to_bootstrap()
 
-    # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
-
     @property
-    def victim_push_active(self) -> bool:
-        """Host-victim transfer readiness; recall is added in a later milestone."""
+    def prefix_pull_active(self) -> bool:
+        """Whether this engine takes part in the decode-held prefix pull: the
+        pull is enabled, the engine is up, there is no GDN state engine, a
+        sliding-window pool (paged) has its own engine up, and a radix cache
+        is kept."""
         return (
-            tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get()
-            and not self._pipeline_enabled
-            and self.pp_size == 1
+            self.prefix_pull_enabled
             and self._kv_caches is not None
             and not self._state_kv_caches
             and (
@@ -1182,36 +1230,52 @@ class RaidenKVManager(
         )
 
     def create_decode_prefix_puller(self, scheduler):
-        """Build the prefill's independent host-victim lifecycle controller."""
-        if self._prefill is None or not tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
-            return None
-        if not self.victim_push_active:
-            raise ValueError(
-                "Victim prefix caching requires Raiden, radix caching, PP=1, and no GDN/Mamba state"
-            )
-        from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-        from sglang_tpu.pd_victim_push import VictimPrefixPuller
-
-        if not (
-            isinstance(scheduler.tree_cache, UnifiedRadixCache)
-            and isinstance(scheduler.tree_cache.tree_core, UnifiedTreeCore)
+        victim_push = tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get()
+        if (
+            self._prefill is not None
+            and victim_push
+            and (not self.prefix_pull_active or self.pp_size != 1)
         ):
             raise ValueError(
-                "Victim prefix caching requires the Python unified radix tree"
+                "Victim prefix caching requires enabled Raiden prefix pull, radix caching, PP=1, and no GDN/Mamba state"
             )
-        if scheduler.tree_cache.cache_controller is None:
-            raise ValueError(
-                "Victim prefix caching requires --enable-hierarchical-cache on both roles"
+        if (
+            self._prefill is None
+            or not self.prefix_pull_active
+            or scheduler.tree_cache is None
+        ):
+            return None
+        from sglang_tpu.disaggregation.raiden.prefix_pull import DecodePrefixPuller
+
+        puller_cls = DecodePrefixPuller
+        if victim_push:
+            from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+                UnifiedTreeCore,
             )
-        return VictimPrefixPuller(
+            from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+            from sglang_tpu.pd_victim_push import VictimPrefixPuller
+
+            if not (
+                isinstance(scheduler.tree_cache, UnifiedRadixCache)
+                and isinstance(scheduler.tree_cache.tree_core, UnifiedTreeCore)
+            ):
+                raise ValueError(
+                    "Victim prefix caching requires the Python unified radix tree"
+                )
+            if scheduler.tree_cache.cache_controller is None:
+                raise ValueError(
+                    "Victim prefix caching requires --enable-hierarchical-cache on both roles"
+                )
+            puller_cls = VictimPrefixPuller
+        return puller_cls(
             kv_manager=self,
             scheduler=scheduler,
             swa_window=self.kv_args.sliding_window_size
             if self._swa_kv_caches
             else None,
         )
+
+    # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
 
     def _listen(self) -> None:
         while True:
@@ -1386,6 +1450,10 @@ class RaidenKVManager(
         if self._pipeline is not None:
             return self._pipeline.active(room)
         with self._state_lock:
+            # A decode serving its prefix pages to the prefill holds a read
+            # lease on them like a prefill does on a chunk.
+            if self._send_reads.get(room):
+                return True
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if self._is_room_transfer(
@@ -1476,6 +1544,13 @@ class RaidenKVManager(
                     self._prefill.send_aux,
                     self._prefill.decode_addr,
                     self._prefill.reshard_req,
+                    self._prefill.prefix_offer_since,
+                    self._prefill.prefix_offers,
+                    self._prefill.prefix_pull_asked,
+                    self._prefill.prefix_ready,
+                    self._prefill.prefix_pull_reads,
+                    self._prefill.prefix_swa_offers,
+                    self._prefill.prefix_swa_ready,
                 ):
                     table.pop(room, None)
                 for table in (
@@ -1485,6 +1560,8 @@ class RaidenKVManager(
                     self._prefill.reshard_replied,
                     self._prefill.reshard_ready,
                     self._prefill.reshard_pushed,
+                    self._prefill.prefix_offer_taken,
+                    self._prefill.prefix_resolved,
                 ):
                     table.discard(room)
             if self._decode is not None:
@@ -1510,11 +1587,16 @@ class RaidenKVManager(
                     self._decode.reshard_meta,
                     self._decode.reshard_sources,
                     self._decode.reshard_swa_sources,
+                    self._decode.prefix_tokens,
+                    self._decode.prefix_blocks,
+                    self._decode.prefill_addr,
+                    self._decode.prefix_swa_blocks,
                 ):
                     table.pop(room, None)
                 for table in (
                     self._decode.final_seen,
                     self._decode.reshard_registered,
+                    self._decode.prefix_offer_pending,
                 ):
                     table.discard(room)
             if clear_failure_record:

@@ -5508,7 +5508,7 @@ class Scheduler(
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
                 puller = self.disagg_prefill_bootstrap_queue.decode_prefix_puller
                 if puller is not None:
-                    # Native exports can still own cached prefix pages.
+                    # Dropped reverse reads can still write reserved KV pages.
                     idle &= not puller.has_pending_deferred_releases()
                 # Aborted senders may still own KV pages. Keep polling them
                 # before idle pool checks, sleep, or cache flush.

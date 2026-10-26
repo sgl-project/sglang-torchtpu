@@ -111,37 +111,89 @@ input of `_tpu-test.yml`), so each test runs in one mode only: the PR gate
 (stage-a, stage-b) and the single-host nightly (`nightly-tpu-4-v7`) run mode B;
 the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
 
-## P/D victim prefix cache: FULL + SWA DRAM spill
+## P/D victim prefix cache
 
 Prefill stays the primary prefix cache. Before host pressure discards a cold
-cached branch, prefill registers the branch's FULL KV host pages for a native
-host read and offers them to the decode that served the branch. The decode
-pulls them straight into its HiCache host pool and inserts the victim as a
-host-only prefix; no HBM or staging slot is involved on either side. Every
-rank agrees on the branch, namespace, length and outcome before pages move.
-Source pins and destination pages stay reserved until the native transfer
-reports completion, also for refused or expired offers, and a cache reset
-waits for those reads to drain.
+cached branch, prefill exports its FULL KV and ending SWA window to the decode
+that served the branch; the decode keeps pushed victims and does not cache its
+own generation requests. When the branch returns and misses on prefill, prefill
+pulls it back through the Raiden prefix exchange. Branches of a shared system
+prompt, cache salts and adapter namespaces keep independent ownership.
 
 Enable HiCache on both roles with `--enable-hierarchical-cache
---hicache-io-backend raiden`, decode radix caching with
-`--disaggregation-decode-enable-radix-cache`, and
-`SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1` on both roles. The flag defaults to off.
+--hicache-io-backend raiden` and decode radix caching with
+`--disaggregation-decode-enable-radix-cache`, then set on both roles:
 
-This milestone covers FULL-only and hybrid SWA victims. For hybrid models set
-`SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS` to a positive window count on decode
-and `SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP=1` on prefill; FULL KV
-and the branch's ending SWA window then move through their own host pools, and
-a victim is published only once both copies settled on every rank. Reverse
-recall into prefill follows. It requires the Python unified radix tree, matching P/D
-attention TP/CP geometry, PP=1 and no GDN/Mamba state.
+```bash
+SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1
+SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1
+```
+
+For hybrid SWA models also set `SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP=1`
+on prefill and `SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS=128` on decode (a window
+count, sized together with the decode's full-KV host budget; zero keeps the
+full-only host tier). Requirements: the Python unified radix tree, matching P/D
+attention-TP and context-parallel geometry, equal page sizes and layouts, no
+pipeline or GDN/Mamba state transfer, and session affinity when several
+decodes serve one prefill.
+
+A spill moves RAM to RAM through the HiCache host-pool managers: prefill
+registers its pinned host pages for a native host read and offers them; the
+decode reserves host pages, reads into them and inserts the victim as a
+host-only node. No HBM or staging slot is used, and at most four victims per
+engine are in flight. Every rank agrees on branch, namespace, length and
+outcome before allocation or insertion, and offers carry a per-prefill
+incarnation so restarts cannot alias. Source pins and destination pages stay
+reserved until the native transfer reports completion (bounded by
+`SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S`), also after a refused or expired
+offer; a cache reset or memory release waits for accepted reads to drain and
+can be retried.
+
+The native session deadline does not interrupt a blocked TCP operation and the
+socket I/O timeouts default to disabled, so set them on both roles (either role
+sends KV). This keeps existing values and otherwise gives each I/O 60 seconds:
+
+```bash
+for raiden_io_timeout in \
+  TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S \
+  TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S \
+  TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S \
+  TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S \
+  TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S \
+  TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S \
+  TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S \
+  TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S \
+  TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S
+do
+  export "${raiden_io_timeout}=${!raiden_io_timeout:-60}"
+done
+```
+
+These bound single stalled calls, not a slow transfer that keeps progressing.
+Pages are reused only after native completion, and memory-release APIs must
+wait until all native reads have drained and the scheduler is idle.
 
 Both roles need matching tpu-sync Python and native artifacts from the pinned
-[`ram2ram` fork branch](https://github.com/alisachen-google/h2h/tree/ram2ram),
-whose host-pool manager opens a control port for host reads. The native
-session deadline does not interrupt blocked TCP I/O, so also set positive
-native socket read, write and ACK timeouts on both roles; even after a timeout,
-pages are reused only once the native transfer has completed.
+[`ram2ram` fork branch](https://github.com/alisachen-google/h2h/tree/ram2ram)
+(see its [build instructions](https://github.com/alisachen-google/h2h/blob/ram2ram/README.md#option-2-building-from-source);
+`./build.sh torch` against the installed `torch_tpu` ABI). Select the checkout
+on both roles and check the API:
+
+```bash
+export TPU_SYNC_SRC=/path/to/tpu-sync
+export PYTHONPATH="$TPU_SYNC_SRC${PYTHONPATH:+:$PYTHONPATH}"
+python - <<'PY'
+import inspect
+from tpu_sync.api.torch import kv_cache_manager as k
+assert "source" in inspect.signature(k.KVCacheManager.register_read).parameters
+assert "destination" in inspect.signature(k.KVCacheManager.start_read).parameters
+assert "local_host_block_ids" in inspect.signature(k.KVCacheManager.start_read).parameters
+PY
+```
+
+The native extension must come from the same build. Each victim-enabled
+host-pool manager opens a control port (port zero means cache-only), and offers
+publish that control endpoint rather than the block-data endpoint.
 
 ## Muse Spark multimodal
 

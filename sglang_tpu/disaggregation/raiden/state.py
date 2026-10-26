@@ -69,7 +69,26 @@ class PrefillState:
     reshard_replied_at: Dict[int, float] = field(default_factory=dict)
     reshard_pushed: Set[int] = field(default_factory=set)
 
-    # Host-victim offers awaiting the decode, and its answers, by sequence.
+    # Decode-held prefix pull (prefix_pull.py). When the decode's PULL_REQ
+    # promised an offer; offers received (empty blocks withdraw) and handed to
+    # the puller; the range asked for; READY replies; the read in flight; and
+    # rooms whose pull is settled either way.
+    prefix_offer_since: Dict[int, float] = field(default_factory=dict)
+    prefix_offers: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
+    prefix_offer_taken: Set[int] = field(default_factory=set)
+    prefix_pull_asked: Dict[int, Tuple[int, int]] = field(default_factory=dict)
+    prefix_ready: Dict[int, Tuple[str, int, str, int, int]] = field(
+        default_factory=dict
+    )
+    prefix_pull_reads: Dict[int, str] = field(default_factory=dict)
+    prefix_resolved: Set[int] = field(default_factory=set)
+    # Hybrid sliding-window models: the offer's (swa_first_page, window page
+    # ids) and READY's (swa_req_id, swa_uuid, swa_endpoint, first, pages).
+    prefix_swa_offers: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
+    prefix_swa_ready: Dict[int, Tuple[str, int, str, int, int]] = field(
+        default_factory=dict
+    )
+    # Victim push: offers awaiting the decode, and its answers, by push seq.
     victim_open: Set[int] = field(default_factory=set)
     victim_acks: Dict[int, Any] = field(default_factory=dict)
 
@@ -122,6 +141,15 @@ class DecodeState:
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
 
-    # Host-victim offers and completion notices, by producer incarnation/sequence.
+    # Decode-held prefix pull: tokens promised in PULL_REQ, rooms whose offer
+    # is still owed, the offered page ids, and the prefill rank to answer.
+    prefix_tokens: Dict[int, int] = field(default_factory=dict)
+    prefix_offer_pending: Set[int] = field(default_factory=set)
+    prefix_blocks: Dict[int, List[int]] = field(default_factory=dict)
+    prefill_addr: Dict[int, str] = field(default_factory=dict)
+    # Hybrid sliding-window models: (swa_first_page, window page ids) offered.
+    prefix_swa_blocks: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
+    # Victim push: offers and done notices received and not yet taken,
+    # by (prefill, seq).
     victim_pushes: Dict[Tuple[str, int], Any] = field(default_factory=dict)
     victim_dones: Dict[Tuple[str, int], Any] = field(default_factory=dict)

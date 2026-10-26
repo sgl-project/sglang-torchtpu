@@ -229,8 +229,8 @@ class PrefillBootstrapQueue:
                     "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
                 )
         self.kv_manager = self._init_kv_manager()
-        # Drives backend-owned cached-prefix transfers and their ownership;
-        # None unless the transfer backend supports it.
+        # Pulls prompt KV the decode already holds before the prefill computes
+        # it; None unless the transfer backend supports it.
         self.decode_prefix_puller = self.kv_manager.create_decode_prefix_puller(
             scheduler
         )
@@ -572,7 +572,7 @@ class PrefillBootstrapQueue:
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     if self.decode_prefix_puller is not None:
-                        # Notify the backend before this request leaves the queue.
+                        # Leaving early to compute: a pull in flight is dropped.
                         self.decode_prefix_puller.release(req)
                     req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
@@ -583,8 +583,8 @@ class PrefillBootstrapQueue:
                     )
             elif poll == KVPoll.WaitingForInput:
                 if self.decode_prefix_puller is not None:
-                    # Every rank reached this state; record the request's peer
-                    # in the same scheduler step on all of them.
+                    # Every rank reached this state, so the tree insert below
+                    # runs in the same step on all of them.
                     self.decode_prefix_puller.commit(req)
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
@@ -611,7 +611,7 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs, failed_reqs
 
     def resolve_deferred_prefix_releases(self) -> None:
-        """Drain cached-prefix transfers without admitting requests while paused."""
+        """Drain prefix reads without admitting requests while generation is paused."""
         if self.decode_prefix_puller is not None:
             self.decode_prefix_puller.resolve_deferred_releases()
 
