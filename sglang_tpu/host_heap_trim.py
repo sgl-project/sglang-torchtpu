@@ -198,13 +198,13 @@ def _release_cpu_backend() -> bool:
 
 def _before_freeze() -> None:
     release_startup_page_cache()
-    CacheArtifactManager.clear()
-    # Serving executables are owned by TorchTPU; discard JAX tracing caches.
-    jax.clear_caches()
-    _release_cpu_backend()
-    # gc.freeze() keeps any cycle it sees forever, so collect first even if
-    # returning allocator pages is disabled.
-    gc.collect()
+    if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
+        CacheArtifactManager.clear()
+        # Serving executables are owned by TorchTPU; discard JAX tracing caches.
+        jax.clear_caches()
+        _release_cpu_backend()
+        # gc.freeze() keeps any cycle it sees forever, so collect first.
+        gc.collect()
 
 
 def _after_freeze() -> None:

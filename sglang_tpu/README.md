@@ -164,5 +164,7 @@ after cleanup can require storage reads. After freeze cleanup, one rank per host
 logs cgroup `memory.current` in bytes; this diagnostic does not gate readiness.
 
 JAX cache clearing leaves loaded serving executables alive, but new shapes may
-need retracing. It runs independently of the file-cache and allocator-trim
-opt-outs so GC does not freeze obsolete tracing objects.
+need retracing. `SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED=0` skips export-record
+clearing, JAX cache clearing, CPU-backend release, garbage collection before
+freezing and startup heap trimming. File-cache release retains its separate
+opt-outs.

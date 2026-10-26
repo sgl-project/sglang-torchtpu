@@ -149,21 +149,28 @@ class TestInstall(CustomTestCase):
         del node
         with (
             patch.object(tpu, "trim_host_heap"),
-            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
+            tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(True),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.cls().handle_freeze_gc("req")
         self.assertIsNone(alive())
 
-    def test_env_turns_the_startup_trim_off(self):
+    def test_env_turns_startup_compiler_cleanup_and_trim_off(self):
         with (
             patch.object(tpu, "trim_host_heap") as trim,
+            patch.object(tpu.jax, "clear_caches") as clear_jax,
+            patch.object(tpu, "_release_cpu_backend") as release_cpu,
+            patch.object(tpu.gc, "collect") as collect,
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.override(False),
             tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.override(0),
         ):
             self.cls().handle_freeze_gc("req")
         trim.assert_not_called()
-        self.clear.assert_called_once_with()
+        self.clear.assert_not_called()
+        clear_jax.assert_not_called()
+        release_cpu.assert_not_called()
+        collect.assert_not_called()
+        self.advise.assert_called_once()
 
     def test_failed_cache_save_does_not_clear_records_or_freeze(self):
         scheduler = self.cls()
