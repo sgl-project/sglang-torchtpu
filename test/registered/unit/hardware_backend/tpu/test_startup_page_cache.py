@@ -113,7 +113,7 @@ def test_startup_discovers_files_only_on_the_host_leader(tmp_path):
         ),
         get_parallel().override(world_group=group),
         tpu_envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.override(False),
-        patch.object(page_cache, "resolve_compilations") as join_writers,
+        patch.object(page_cache, "resolve_compilations", Mock()) as join_writers,
         patch.object(
             page_cache.os,
             "posix_fadvise",

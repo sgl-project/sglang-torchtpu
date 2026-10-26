@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu import host_heap_trim as tpu
 from sglang_tpu import page_cache
 from sglang_tpu.envs import envs as tpu_envs
@@ -83,17 +83,17 @@ class TestTrimHostHeap(CustomTestCase):
 
 class TestInstall(CustomTestCase):
     def setUp(self):
-        directory = self.enterContext(TemporaryDirectory())
+        directory = enter_scope(self, TemporaryDirectory())
         (Path(directory) / "weights.safetensors").write_bytes(b"payload")
-        self.enterContext(get_context().override_server_args(model_path=directory))
+        enter_scope(self, get_context().override_server_args(model_path=directory))
         self.group = MagicMock(local_rank=0)
-        self.enterContext(get_parallel().override(world_group=self.group))
-        self.enterContext(patch.object(page_cache, "resolve_compilations"))
-        self.advise = self.enterContext(patch.object(page_cache.os, "posix_fadvise"))
-        self.enterContext(
-            tpu_envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.override(False)
+        enter_scope(self, get_parallel().override(world_group=self.group))
+        enter_scope(self, patch.object(page_cache, "resolve_compilations", MagicMock()))
+        self.advise = enter_scope(self, patch.object(page_cache.os, "posix_fadvise"))
+        enter_scope(
+            self, tpu_envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.override(False)
         )
-        self.enterContext(patch.dict(os.environ, {"LOCAL_RANK": "0"}))
+        enter_scope(self, patch.dict(os.environ, {"LOCAL_RANK": "0"}))
 
         class Scheduler(_Scheduler):
             pass

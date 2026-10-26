@@ -14,6 +14,7 @@ from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import FreezeGCReqOutput
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -100,14 +101,16 @@ class _FreezeServerError:
 
 class TestFreezeGcAfterWarmup(unittest.TestCase):
     def setUp(self):
-        self.server_args = self.enterContext(
+        self.server_args = enter_scope(
+            self,
             get_context().override_server_args(
                 host="127.0.0.1", port=30000, skip_server_warmup=True, api_key="k"
-            )
+            ),
         )
         self.calls = []
-        self.enterContext(patch.object(http_server.time, "sleep"))
-        self.enterContext(
+        enter_scope(self, patch.object(http_server.time, "sleep"))
+        enter_scope(
+            self,
             patch.object(
                 http_server,
                 "_global_state",
@@ -116,7 +119,7 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
                     template_manager=None,
                     scheduler_info={},
                 ),
-            )
+            ),
         )
 
     def _post(self, outcomes):
