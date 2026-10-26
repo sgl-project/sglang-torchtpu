@@ -241,7 +241,7 @@ class TestTpuPlatformInitialization(CustomTestCase):
         hook does this) must not register the TPU models a second time."""
         registered = []
 
-        def register(package_name):
+        def register(package_name, **kwargs):
             registered.append(package_name)
             if len(registered) == 1:
                 self.platform.init_backend()
