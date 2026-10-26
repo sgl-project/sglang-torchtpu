@@ -1183,8 +1183,6 @@ def _build_fused_ep_moe_kernel(
             )
             return dma_base, shift
 
-        # Repeat the proven alignment inside each conditional branch: JAX
-        # 0.10.2 lowering does not carry it through the captured branch operand.
         def issue_gather_window(logical_base, slot):
             """Start one fixed token-index window in SMEM slot ``slot``."""
             dma_base, _ = gather_dma_coords(logical_base)
@@ -1192,12 +1190,7 @@ def _build_fused_ep_moe_kernel(
             @pl.when(slot == 0)
             def _():
                 pltpu.make_async_copy(
-                    token_gather_hbm.at[
-                        pl.ds(
-                            pl.multiple_of(dma_base, host.TOKEN_GATHER_DMA_ALIGNMENT),
-                            gather_window_rows,
-                        )
-                    ],
+                    token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
                     token_gather_sm0,
                     token_gather_sem0,
                 ).start(priority=0)
@@ -1205,12 +1198,7 @@ def _build_fused_ep_moe_kernel(
             @pl.when(slot == 1)
             def _():
                 pltpu.make_async_copy(
-                    token_gather_hbm.at[
-                        pl.ds(
-                            pl.multiple_of(dma_base, host.TOKEN_GATHER_DMA_ALIGNMENT),
-                            gather_window_rows,
-                        )
-                    ],
+                    token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
                     token_gather_sm1,
                     token_gather_sem1,
                 ).start(priority=0)
@@ -1222,12 +1210,7 @@ def _build_fused_ep_moe_kernel(
             @pl.when(slot == 0)
             def _():
                 pltpu.make_async_copy(
-                    token_gather_hbm.at[
-                        pl.ds(
-                            pl.multiple_of(dma_base, host.TOKEN_GATHER_DMA_ALIGNMENT),
-                            gather_window_rows,
-                        )
-                    ],
+                    token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
                     token_gather_sm0,
                     token_gather_sem0,
                 ).wait()
@@ -1235,12 +1218,7 @@ def _build_fused_ep_moe_kernel(
             @pl.when(slot == 1)
             def _():
                 pltpu.make_async_copy(
-                    token_gather_hbm.at[
-                        pl.ds(
-                            pl.multiple_of(dma_base, host.TOKEN_GATHER_DMA_ALIGNMENT),
-                            gather_window_rows,
-                        )
-                    ],
+                    token_gather_hbm.at[pl.ds(dma_base, gather_window_rows)],
                     token_gather_sm1,
                     token_gather_sem1,
                 ).wait()
