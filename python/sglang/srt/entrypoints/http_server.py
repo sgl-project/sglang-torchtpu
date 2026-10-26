@@ -2450,6 +2450,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 # Arbitrary margin: the server listens within a second of the warmup thread starting.
 # A retry window for connecting; scheduler cleanup uses the warmup timeout.
 _FREEZE_GC_RETRY_SECS = 30.0
+_FREEZE_GC_TIMEOUT_SECS = 600
 
 
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
@@ -2468,7 +2469,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
             res = requests.post(
                 server_args.url() + "/freeze_gc",
                 headers=freeze_headers,
-                timeout=timeout if timeout > 0 else 600,
+                timeout=timeout if timeout > 0 else _FREEZE_GC_TIMEOUT_SECS,
                 verify=ssl_verify_of(server_args),
             )
             res.raise_for_status()

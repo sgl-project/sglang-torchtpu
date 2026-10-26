@@ -49,7 +49,9 @@ def test_disk_cache_preserves_files_and_other_namespaces(
             monkeypatch.setenv(key, value)
     advised = []
     monkeypatch.setattr(
-        page_cache, "_advise_file", lambda p: advised.append(p) or p.stat().st_size
+        page_cache,
+        "_advise_drop_file_cache",
+        lambda p: advised.append(p) or p.stat().st_size,
     )
     page_cache.release_compile_page_cache()
     assert sorted(advised) == paths
@@ -67,7 +69,9 @@ def test_checkpoint_paths_are_deduplicated_and_do_not_recurse(monkeypatch, tmp_p
     draft.mkdir()
     (draft / "b.safetensors").touch()
     advised = []
-    monkeypatch.setattr(page_cache, "_advise_file", lambda p: advised.append(p) or 0)
+    monkeypatch.setattr(
+        page_cache, "_advise_drop_file_cache", lambda p: advised.append(p) or 0
+    )
     page_cache.release_checkpoint_page_cache([str(tmp_path), str(tmp_path)])
     assert advised == [tmp_path / "a.safetensors"]
     advised.clear()
@@ -95,7 +99,7 @@ def test_advice_errors_propagate_and_close_files(monkeypatch, tmp_path):
         os.fstat(descriptors[0])
 
 
-def test_startup_discovers_files_only_on_the_host_leader(monkeypatch, tmp_path):
+def test_startup_discovers_files_only_on_the_host_leader(tmp_path):
     target = tmp_path / "target"
     draft = tmp_path / "draft"
     for directory in (target, draft):
@@ -116,10 +120,10 @@ def test_startup_discovers_files_only_on_the_host_leader(monkeypatch, tmp_path):
             side_effect=lambda fd, *_: advised.append(os.fstat(fd).st_ino),
         ),
     ):
-        monkeypatch.setenv("LOCAL_RANK", "1")
+        group.local_rank = 1
         page_cache.release_startup_page_cache()
         assert advised == []
-        monkeypatch.setenv("LOCAL_RANK", "0")
+        group.local_rank = 0
         page_cache.release_startup_page_cache()
     assert sorted(advised) == sorted(
         (directory / "weights.safetensors").stat().st_ino

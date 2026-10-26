@@ -2324,7 +2324,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
-        """Wait for scheduler cleanup before freezing the tokenizer GC."""
+        """Wait for scheduler GC freeze and its backend cleanup hooks, then
+        freeze the tokenizer GC. Detokenizer GC is not acknowledged.
+        """
         self.auto_create_handle_loop()
         await self.freeze_gc_communicator(FreezeGCReq())
         freeze_gc("Tokenizer Manager")

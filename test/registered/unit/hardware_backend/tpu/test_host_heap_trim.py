@@ -86,7 +86,7 @@ class TestInstall(CustomTestCase):
         directory = self.enterContext(TemporaryDirectory())
         (Path(directory) / "weights.safetensors").write_bytes(b"payload")
         self.enterContext(get_context().override_server_args(model_path=directory))
-        self.group = MagicMock()
+        self.group = MagicMock(local_rank=0)
         self.enterContext(get_parallel().override(world_group=self.group))
         self.enterContext(patch.object(page_cache, "resolve_compilations"))
         self.advise = self.enterContext(patch.object(page_cache.os, "posix_fadvise"))

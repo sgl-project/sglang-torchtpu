@@ -64,7 +64,7 @@ def _cache_files(root: Path) -> list[Path]:
     return sorted(paths)
 
 
-def _advise_file(path: Path) -> int:
+def _advise_drop_file_cache(path: Path) -> int:
     try:
         cache_file = path.open("rb")
     except FileNotFoundError:
@@ -80,7 +80,7 @@ def _advise_files(paths: list[Path]) -> int:
     with ThreadPoolExecutor(
         max_workers=int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     ) as pool:
-        return sum(pool.map(_advise_file, paths))
+        return sum(pool.map(_advise_drop_file_cache, paths))
 
 
 def release_checkpoint_page_cache(model_paths: list[str]) -> None:
@@ -104,7 +104,9 @@ def release_checkpoint_page_cache(model_paths: list[str]) -> None:
     )
 
 
-def _release_native_cache() -> None:
+def release_compile_page_cache() -> None:
+    if not envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.get():
+        return
     started = time.monotonic()
     cache_name = (
         os.environ.get(
@@ -130,16 +132,11 @@ def _release_native_cache() -> None:
     )
 
 
-def release_compile_page_cache() -> None:
-    if envs.SGLANG_TPU_RELEASE_COMPILE_PAGE_CACHE.get():
-        _release_native_cache()
-
-
 def release_startup_page_cache() -> None:
     """Join cache writers, then release startup files once per host."""
     resolve_compilations([])
     get_parallel().world_group.barrier()
-    if int(os.environ["LOCAL_RANK"]) != 0:
+    if get_parallel().world_group.local_rank != 0:
         return
     model_paths = [get_model().model_path]
     if draft_path := get_spec().speculative_draft_model_path:

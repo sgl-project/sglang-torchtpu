@@ -139,7 +139,9 @@ The existing `/freeze_gc` request repeats file-cache release to cover files used
 or created by subsequent warmup, then collects garbage, freezes GC and trims freed
 host heap pages. Python HTTP startup waits for this second pass before reporting
 readiness. Direct `Engine` callers can also call `freeze_gc()` after their own
-warmup.
+warmup. Keeping cleanup in this lifecycle ensures temporary objects are collected
+before `gc.freeze()` retains the remaining objects. Explicit `/freeze_gc` calls
+also run the cleanup hooks.
 
 Attention DP with shared MLP scheduling requires global control broadcasts:
 `--enable-dp-attention-local-control-broadcast` and elastic EP scaling are rejected
