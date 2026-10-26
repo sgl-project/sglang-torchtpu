@@ -120,6 +120,8 @@ jobs:
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
           uv pip install --no-deps -e .
+          # Startup cleanup tests exercise JAX cache and CPU backend release.
+          uv pip install "jax[cpu]"
 
       # Hosted runners are ephemeral, so models are re-fetched every run and the
       # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache

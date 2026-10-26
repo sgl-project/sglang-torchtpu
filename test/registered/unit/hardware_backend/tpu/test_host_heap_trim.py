@@ -98,7 +98,7 @@ class TestInstall(CustomTestCase):
 
         self.cls = Scheduler
         tpu.install(scheduler_cls=self.cls)
-        self.clear = self.enterContext(patch.object(tpu.CacheArtifactManager, "clear"))
+        self.clear = enter_scope(self, patch.object(tpu.CacheArtifactManager, "clear"))
 
     def tearDown(self):
         tpu._stop_periodic()
@@ -227,24 +227,27 @@ class TestCpuBackendRelease(CustomTestCase):
     def setUp(self):
         self.bridge = tpu.xla_bridge
         self.tpu_backend = _Backend("tpu")
-        self.enterContext(
+        enter_scope(
+            self,
             patch.object(
                 self.bridge,
                 "_backends",
                 {"cpu": _Backend("cpu"), "tpu": self.tpu_backend},
-            )
+            ),
         )
-        self.enterContext(
-            patch.object(self.bridge, "_default_backend", self.tpu_backend)
+        enter_scope(
+            self, patch.object(self.bridge, "_default_backend", self.tpu_backend)
         )
-        self.enterContext(
+        enter_scope(
+            self,
             patch.object(
                 self.bridge, "_get_backend_uncached", tpu._jax_get_backend_uncached
-            )
+            ),
         )
-        self.enterContext(self.bridge.config.jax_platforms("tpu,cpu"))
-        self.init = self.enterContext(
-            patch.object(self.bridge, "_init_backend", side_effect=self.init_backend)
+        enter_scope(self, self.bridge.config.jax_platforms("tpu,cpu"))
+        self.init = enter_scope(
+            self,
+            patch.object(self.bridge, "_init_backend", side_effect=self.init_backend),
         )
         self.bridge.get_backend.cache_clear()
         self.addCleanup(self.bridge.get_backend.cache_clear)
