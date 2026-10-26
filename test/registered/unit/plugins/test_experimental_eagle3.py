@@ -20,7 +20,11 @@ from sglang_tpu.experimental.compilation.chain_compile_policy import (
     _hidden_only_logits,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
-from sglang_tpu.experimental.speculative import spec_ops
+from sglang_tpu.experimental.speculative import (
+    base_spec_worker,
+    chain_spec_worker,
+    spec_ops,
+)
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
 from sglang_tpu.experimental.speculative.chain_spec_worker import (
@@ -41,7 +45,11 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_target_only,
     finalize_accept,
 )
-from sglang_tpu.experimental.speculative.spec_types import SpecState
+from sglang_tpu.experimental.speculative.spec_types import (
+    DraftResult,
+    SpecState,
+    TpuSpecVerifyInput,
+)
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows
 from sglang_tpu.hooks.experimental_spec import (
     keep_host_padded_extend_outputs,
@@ -54,6 +62,11 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _OptionalCarry(NamedTuple):
     hidden_states: torch.Tensor
     optional: torch.Tensor | None = None
+
+
+class _AdaptiveWarmupWorker(TpuChainSpecWorker):
+    def verify_widths(self):
+        return (2, 4)
 
 
 def _chain_worker() -> TpuChainSpecWorker:
@@ -86,6 +99,77 @@ def _unfiltered(rows: int) -> dict[str, torch.Tensor]:
 
 
 class TestExperimentalEagle3(CustomTestCase):
+    def test_verify_warmups_keep_capacity_across_active_widths(self):
+        worker = object.__new__(_AdaptiveWarmupWorker)
+        worker.device = "cpu"
+        worker.num_drafts = 3
+        worker.num_verify_rows = 4
+        worker._dp_attention = False
+        worker._sampled_drafts = False
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(max_running_requests=2)
+        )
+        worker._chain_draft_worker = SimpleNamespace(
+            carry_size=3, carry=torch.zeros((3, 3))
+        )
+        worker._draft_runner = SimpleNamespace(dtype=torch.float32)
+        buckets = SimpleNamespace(buckets=[1, 2], max_val=2, next_bucket=lambda bs: bs)
+        selections = []
+        drafts = []
+
+        def select(candidates, committed, seq_lens, width):
+            selections.append((tuple(candidates.shape), width))
+            self.assertIsNot(committed, seq_lens)
+            return spec_ops.select_verify_rows(candidates, committed, seq_lens, width)
+
+        def warmup(op, *args):
+            return select(*args) if op is spec_ops.select_verify_rows else op(*args)
+
+        def draft(**kwargs):
+            rows = kwargs["rows"]
+            bs, width = rows.positions.shape
+            drafts.append((bs, width))
+            self.assertEqual(kwargs["seq_lens_cpu"].tolist(), [width] * bs)
+            return DraftResult(
+                torch.zeros((bs, width - 1), dtype=torch.int64),
+                None,
+                torch.full((bs,), width - 1, dtype=torch.int32),
+            )
+
+        expected = {((bs, 8), width) for bs in (1, 2) for width in (2, 4)}
+        with (
+            patch.object(torch, "tpu", create=True) as tpu,
+            patch.object(
+                base_spec_worker, "max_speculative_num_draft_tokens", return_value=4
+            ),
+            patch.object(worker, "_b_bucketer", return_value=buckets),
+            patch.object(base_spec_worker, "warmup_compiled_op", side_effect=warmup),
+            patch.object(chain_spec_worker, "warmup_compiled_op", side_effect=warmup),
+            patch.object(chain_spec_worker, "select_verify_rows", side_effect=select),
+            patch.object(worker, "_draft_chain", side_effect=draft),
+        ):
+            self.assertEqual(worker.verify_window_rows, 4)
+            for run in (
+                worker._warmup_logical_bs_ops,
+                worker._warmup_draft_ops,
+                worker._warmup_verify_mrope,
+            ):
+                selections.clear()
+                run()
+                self.assertEqual(set(selections), expected)
+                self.assertEqual(len(selections), len(expected))
+            idle = TpuSpecVerifyInput.idle(
+                verify_window_rows=worker.verify_window_rows, padded_bs=2, device="cpu"
+            )
+        tpu.current_stream.assert_called_once_with()
+        tpu.current_stream.return_value.synchronize.assert_called_once_with()
+        self.assertEqual(idle.verify_cache_candidates.shape, (2, 8))
+        self.assertEqual(
+            set(drafts), {(bs, width) for bs in (1, 2) for width in (2, 4)}
+        )
+        self.assertEqual((worker.num_drafts, worker.num_verify_rows), (3, 4))
+        self.assertEqual(_chain_worker().verify_widths(), (3,))
+
     def test_flag_routes_eagle3_and_leaves_other_algorithms_alone(self):
         with (
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),

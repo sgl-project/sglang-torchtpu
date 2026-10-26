@@ -227,7 +227,8 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
                 "TpuSpecWorker needs the verify window (overlap schedule, "
                 "host-resident req_to_token, no grammar/logprob/LoRA)."
             )
-        if not 0 < num_verify_rows <= candidates.shape[1] // 2:
+        verify_window_rows = candidates.shape[1] // 2
+        if not 0 < num_verify_rows <= verify_window_rows:
             raise ValueError("Active verification width exceeds the reserved KV window")
         req_pool_indices_cpu = batch.req_pool_indices_cpu
         seq_lens_cpu = batch.seq_lens_cpu
@@ -252,16 +253,14 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
             req_pool_indices_cpu=pad_rows(req_pool_indices_cpu, padded_bs),
             seq_lens_cpu=seq_lens_cpu,
             host_len_slack=(
-                candidates.shape[1] // 2
-                if draft_input.tpu_host_seq_lens_is_committed
-                else 0
+                verify_window_rows if draft_input.tpu_host_seq_lens_is_committed else 0
             ),
             future_indices=draft_input.future_indices,
         )
 
     @classmethod
     def idle(
-        cls, *, num_verify_rows: int, padded_bs: int, device: str
+        cls, *, verify_window_rows: int, padded_bs: int, device: str
     ) -> TpuSpecVerifyInput:
         """All-padding addressing for a DP-attention rank with no requests.
 
@@ -270,7 +269,7 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         zeros = torch.zeros((padded_bs,), dtype=torch.int64)
         return cls(
             verify_cache_candidates=torch.zeros(
-                (padded_bs, 2 * num_verify_rows), dtype=torch.int64
+                (padded_bs, 2 * verify_window_rows), dtype=torch.int64
             ).to(device, non_blocking=True),
             committed_lens=zeros.to(device, non_blocking=True),
             req_pool_indices=zeros.to(device, non_blocking=True),

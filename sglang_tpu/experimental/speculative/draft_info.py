@@ -60,10 +60,10 @@ class HostPaddedDraftInput(SpecInput):
 
         # The previous, not-yet-copied commit may be wider than the next step.
         # Reserve both windows at capacity so either adaptive transition fits.
-        num_verify_rows = int(max_speculative_num_draft_tokens())
+        verify_window_rows = int(max_speculative_num_draft_tokens())
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
             batch.reqs,
-            reserve=2 * num_verify_rows,
+            reserve=2 * verify_window_rows,
             page_size=batch.token_to_kv_pool_allocator.page_size,
         )
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32)
@@ -95,7 +95,7 @@ class HostPaddedDraftInput(SpecInput):
         self._plan_verify_window(
             batch,
             bs=bs,
-            block_size=num_verify_rows,
+            block_size=verify_window_rows,
             committed_lens_cpu=committed_lens_cpu,
         )
 

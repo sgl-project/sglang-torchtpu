@@ -298,11 +298,17 @@ class TpuSpecWorker(BaseSpecWorker):
         torch.accelerator.synchronize()
         snapshot_recompilation_baseline()
 
+    @property
+    def verify_window_rows(self) -> int:
+        """Capacity for both the preceding commit and the next verification."""
+        return int(max_speculative_num_draft_tokens())
+
+    def verify_widths(self) -> Sequence[int]:
+        """Active widths to warm; adaptive workers override with every reachable width."""
+        return (self.num_verify_rows,)
+
     def _warmup_logical_bs_ops(
-        self,
-        *,
-        num_drafts: int | None = None,
-        batch_sizes: Sequence[int] | None = None,
+        self, *, batch_sizes: Sequence[int] | None = None
     ) -> None:
         # torch_tpu compiles one program per shape even for a plain H2D copy.
         max_bs = min(
@@ -310,8 +316,6 @@ class TpuSpecWorker(BaseSpecWorker):
             self._b_bucketer().max_val,
         )
         live_sizes = range(1, max_bs + 1) if batch_sizes is None else batch_sizes
-        num_drafts = self.num_drafts if num_drafts is None else num_drafts
-        num_verify_rows = num_drafts + 1
         # Every bucket: DP attention can run any bucket above a rank's own.
         bucket_sizes = (
             list(self._b_bucketer().buckets)
@@ -320,7 +324,6 @@ class TpuSpecWorker(BaseSpecWorker):
                 {pbs for bs in live_sizes for pbs in self._decode_buckets_for(bs)}
             )
         )
-        window_rows = int(max_speculative_num_draft_tokens())
         # Live bs: HOST_PADDED req_pool_indices re-uploaded after filter/merge.
         # Bucket: host-padded sampling params and the plan's padded verify window.
         h2d_shapes = (
@@ -331,7 +334,10 @@ class TpuSpecWorker(BaseSpecWorker):
                 for dtype in (torch.int64, torch.int32, torch.float32)
             ]
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
-            + [((pbs, 2 * window_rows), torch.int64) for pbs in bucket_sizes]
+            + [
+                ((pbs, 2 * self.verify_window_rows), torch.int64)
+                for pbs in bucket_sizes
+            ]
         )
         with torch.no_grad(), eager_warmup() as materialize:
             for bs in live_sizes:
@@ -353,22 +359,32 @@ class TpuSpecWorker(BaseSpecWorker):
                 materialize(
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0
                 )
+            for width, pbs in itertools.product(self.verify_widths(), bucket_sizes):
+                # The generic spec-op context only knows the active width. The
+                # worker owns the full-capacity candidate shape used in serving.
+                warmup_compiled_op(
+                    select_verify_rows,
+                    torch.zeros(
+                        (pbs, 2 * self.verify_window_rows),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    torch.zeros((pbs,), dtype=torch.int64, device=self.device),
+                    torch.zeros((pbs,), dtype=torch.int64, device=self.device),
+                    width,
+                )
                 # Eager ops compile per input layout, so bump finalize_accept's output.
-                next_seq_lens = self._warmup_accept(
-                    pbs, num_drafts=num_drafts
-                ).next_seq_lens
-                materialize((next_seq_lens + num_verify_rows).to(torch.int32))
+                next_seq_lens = self._warmup_accept(pbs, width).next_seq_lens
+                materialize((next_seq_lens + width).to(torch.int32))
 
-    def _warmup_accept(
-        self, padded_bs: int, *, num_drafts: int | None = None
-    ) -> AcceptResult:
+    def _warmup_accept(self, padded_bs: int, width: int) -> AcceptResult:
         """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
 
         def zeros(*shape: int) -> torch.Tensor:
             return torch.zeros(shape, dtype=torch.int64, device=self.device)
 
         return finalize_accept(
-            zeros(padded_bs, self.num_drafts if num_drafts is None else num_drafts),
+            zeros(padded_bs, width - 1),
             zeros(padded_bs),
             zeros(padded_bs),
             zeros(padded_bs),
@@ -780,7 +796,7 @@ class TpuSpecWorker(BaseSpecWorker):
         """
         padded_bs = self._decode_bucket(batch, 0)
         verify_input = TpuSpecVerifyInput.idle(
-            num_verify_rows=self.num_verify_rows,
+            verify_window_rows=self.verify_window_rows,
             padded_bs=padded_bs,
             device=self.device,
         )
@@ -884,20 +900,24 @@ class TpuSpecWorker(BaseSpecWorker):
         """Target-only acceptance, target filter included, per batch bucket."""
         vocab_size = self.target_worker.model_runner.model_config.vocab_size
         with torch.no_grad():
-            for padded_bs in self._b_bucketer().buckets:
+            for width, padded_bs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
                 warmup_compiled_op(
                     accept_drafts_target_only,
                     torch.zeros(
-                        (padded_bs * self.num_verify_rows, vocab_size),
+                        (padded_bs * width, vocab_size),
                         dtype=torch.float32,
                         device=self.device,
                     ),
                     torch.zeros(
-                        (padded_bs, self.num_drafts),
+                        (padded_bs, width - 1),
                         dtype=torch.int64,
                         device=self.device,
                     ),
-                    self._all_drafts[padded_bs],
+                    torch.full(
+                        (padded_bs,), width - 1, dtype=torch.int32, device=self.device
+                    ),
                     *self._sampling_param_warmup_args(padded_bs),
                     self._accept_threshold_single,
                     self._accept_threshold_acc,
@@ -1024,8 +1044,9 @@ class TpuSpecWorker(BaseSpecWorker):
         self, padded_bs: int, draft_tokens: torch.Tensor, draft_logits: torch.Tensor
     ) -> None:
         """verify's sampled acceptance at padded_bs, with and without target filters."""
+        width = draft_tokens.shape[1] + 1
         target_logits = torch.zeros(
-            (padded_bs * self.num_verify_rows, draft_logits.shape[-1]),
+            (padded_bs * width, draft_logits.shape[-1]),
             dtype=torch.float32,
             device=self.device,
         )
@@ -1035,7 +1056,7 @@ class TpuSpecWorker(BaseSpecWorker):
         args = (
             target_logits,
             draft_tokens,
-            self._all_drafts[padded_bs],
+            torch.full((padded_bs,), width - 1, dtype=torch.int32, device=self.device),
             draft_logits.float(),
             temperatures,
             top_ks,
@@ -1058,8 +1079,10 @@ class TpuSpecWorker(BaseSpecWorker):
                 # Decode relays [:bs] views of finalize_accept's outputs at each bucket
                 # the rank can run; extend relays a compact seq_lens upload.
                 relays = []
-                for padded_bs in self._decode_buckets_for(bs):
-                    accept = self._warmup_accept(padded_bs)
+                for width, padded_bs in itertools.product(
+                    self.verify_widths(), self._decode_buckets_for(bs)
+                ):
+                    accept = self._warmup_accept(padded_bs, width)
                     relays.append(
                         (
                             accept.bonus_tokens[:bs],
@@ -1109,13 +1132,15 @@ class TpuSpecWorker(BaseSpecWorker):
                     ):
                         if tensor is not None:
                             tensor.cpu()
-                for padded_bs in self._decode_buckets_for(bs):
+                for width, padded_bs in itertools.product(
+                    self.verify_widths(), self._decode_buckets_for(bs)
+                ):
                     if padded_bs != bs:
                         # _pack_decode_result's rows.
                         warmup_compiled_op(
                             live_result_rows,
                             torch.zeros(
-                                (padded_bs, self.num_verify_rows),
+                                (padded_bs, width),
                                 dtype=torch.int64,
                                 device=self.device,
                             ),
@@ -1125,10 +1150,12 @@ class TpuSpecWorker(BaseSpecWorker):
                             bs,
                         )
             if self._dp_attention:
-                for padded_bs in self._b_bucketer().buckets:
+                for width, padded_bs in itertools.product(
+                    self.verify_widths(), self._b_bucketer().buckets
+                ):
                     # _forward_idle_step's all-padding drafts.
                     torch.zeros(
-                        (padded_bs, self.num_drafts),
+                        (padded_bs, width - 1),
                         dtype=torch.int64,
                         device=self.device,
                     ).cpu()

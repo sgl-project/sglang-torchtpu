@@ -12,6 +12,8 @@ extend: target forward on new prompt tokens, inject every row's target feature
 
 from __future__ import annotations
 
+import itertools
+
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
@@ -342,8 +344,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     def _warmup_draft_block_inputs(self) -> None:
         # Width and mask token come from the draft config, so the shared spec-op grid cannot warm it.
         with torch.no_grad():
-            for padded_bs in self._bucket_sizes():
-                block_shape = (padded_bs, self.num_verify_rows)
+            for width, padded_bs in itertools.product(
+                self.verify_widths(), self._bucket_sizes()
+            ):
+                block_shape = (padded_bs, width)
                 warmup_compiled_op(
                     build_draft_block_inputs,
                     torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
@@ -355,12 +359,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                             block_shape, dtype=torch.int64, device=self.device
                         ),
                         flat_positions=torch.zeros(
-                            (padded_bs * self.num_verify_rows,),
+                            (padded_bs * width,),
                             dtype=torch.int64,
                             device=self.device,
                         ),
                         flat_cache_locs=torch.zeros(
-                            (padded_bs * self.num_verify_rows,),
+                            (padded_bs * width,),
                             dtype=torch.int64,
                             device=self.device,
                         ),
