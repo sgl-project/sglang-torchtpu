@@ -44,9 +44,23 @@ class TestGlmFlashMegakernelHooks(CustomTestCase):
             mk.dsa_caches = [torch.zeros(1)]
         req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=3))
         with mock.patch.object(hook, "_KERNELS", [holder, other]):
-            hook.flush_glm_flash_megakernel_request(object(), req, up_to=8)
+            hook.flush_glm_flash_megakernel_request(
+                SimpleNamespace(disable=False), req, up_to=8
+            )
         holder.flush.assert_called_once()
         other.flush.assert_not_called()
+
+    def test_disabled_cache_never_flushes(self):
+        """With the radix cache off the tree reads nothing, so a finished request
+        must not pay a flush and device sync."""
+        holder = mock.MagicMock()
+        holder.holds.return_value = True
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=3))
+        with mock.patch.object(hook, "_KERNELS", [holder]):
+            hook.flush_glm_flash_megakernel_request(
+                SimpleNamespace(disable=True), req, up_to=8
+            )
+        holder.flush.assert_not_called()
 
 
 class TestGlmFlashMegakernelSnapshot(CustomTestCase):
@@ -58,6 +72,7 @@ class TestGlmFlashMegakernelSnapshot(CustomTestCase):
 
         mk = object.__new__(GlmFlashMegakernel)
         mk.Q, mk.spec = q, SimpleNamespace(kda_layers=[0])
+        mk.radix_snapshots = True
         shape = (q,) if q > 1 else ()
         mk.kda_caches = (
             [torch.arange(1.0, 1.0 + max(q, 1)).reshape(*shape, 1, 1) * 10],

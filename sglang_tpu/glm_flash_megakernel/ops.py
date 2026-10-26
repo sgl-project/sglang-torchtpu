@@ -207,6 +207,8 @@ class GlmFlashMegakernel:
             donate=tuple(range(4 + nw, 4 + nw + nd)),
         )
         self.req, self.prev_pos, self.last_steps = None, None, None
+        # Set when the radix cache is on: only then does serving snapshot KDA state.
+        self.radix_snapshots = False
         self.slot: Optional[torch.Tensor] = None
         self.req_rows: Optional[torch.Tensor] = None
 
@@ -423,7 +425,12 @@ class GlmFlashMegakernel:
         self.dsa_caches, self.kda_caches = caches[:nd], caches[nd:]
         # A decode step on a radix track boundary snapshots the state it produced.
         mask = forward_batch.mamba_track_mask
-        if self.Q == 1 and mask is not None and bool(mask.reshape(-1)[0]):
+        if (
+            self.radix_snapshots
+            and self.Q == 1
+            and mask is not None
+            and bool(mask.reshape(-1)[0])
+        ):
             self.snapshot(forward_batch.mamba_track_indices)
         logits = tensor_model_parallel_all_gather(logits, dim=-1)[:, : self.vocab]
         return LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden)

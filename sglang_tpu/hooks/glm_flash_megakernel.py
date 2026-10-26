@@ -44,6 +44,7 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
         or runner.model_runner.model_config.context_len,
         n_query,
     )
+    mk.radix_snapshots = not args.disable_radix_cache
     model._tpu_glm_flash_mk = mk
     _KERNELS.append(mk)
     compiled = model.forward
@@ -66,7 +67,7 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
             if mk.active:
                 mk.record_commit(kwargs["last_correct_step_indices"])
                 # Radix snapshots of an accepted checkpoint come from the kernel.
-                if kwargs.get("mamba_track_indices") is not None:
+                if mk.radix_snapshots and kwargs.get("mamba_track_indices") is not None:
                     mk.snapshot(
                         kwargs["mamba_track_indices"], kwargs["mamba_steps_to_track"]
                     )
@@ -102,6 +103,8 @@ def drop_freed_glm_flash_megakernel_request(
 def flush_glm_flash_megakernel_request(cache: Any, req: Any, *args, **kwargs) -> None:
     """BEFORE UnifiedRadixCache.checkpoint: the tree (and a HiCache backup) reads
     the request's pages and state slot, which lag the kernel until flush."""
+    if cache.disable:
+        return None
     for mk in _KERNELS:
         if mk.holds(req.kv.req_pool_idx):
             mk.flush()
