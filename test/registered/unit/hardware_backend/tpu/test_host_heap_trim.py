@@ -90,9 +90,7 @@ class TestInstall(CustomTestCase):
         enter_scope(self, get_parallel().override(world_group=self.group))
         enter_scope(self, patch.object(page_cache, "resolve_compilations", MagicMock()))
         self.advise = enter_scope(self, patch.object(page_cache.os, "posix_fadvise"))
-        enter_scope(
-            self, tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(False)
-        )
+        enter_scope(self, tpu_envs.SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS.override(False))
         enter_scope(self, patch.dict(os.environ, {"LOCAL_RANK": "0"}))
 
         class Scheduler(_Scheduler):

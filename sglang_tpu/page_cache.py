@@ -111,14 +111,17 @@ def _unlink_cache_file(path: Path) -> int:
         path.unlink()
         return size
     except FileNotFoundError:
+        # Retained native locks can outlive their .bin files; other cache files
+        # can also disappear between discovery and removal.
+        logger.debug("Compile-cache file already absent during cleanup: %s", path)
         return 0
 
 
-def _release_tmpfs_cache(root: Path, *, native: bool = False) -> None:
+def _release_tmpfs_cache(root: Path, *, native_tier2_cache: bool = False) -> None:
     started = time.monotonic()
     paths = _cache_files(root)
     removed_bytes = 0
-    if native:
+    if native_tier2_cache:
         # A native compile future can resolve before its tier-2 write finishes.
         # Lock entries even if their .bin has not been published yet. Keep locks
         # and directories: the runtime creates its cache directories only once.
@@ -158,7 +161,7 @@ def _release_native_cache() -> None:
     if not root.exists():
         return
     if _filesystem_type(root) in ("tmpfs", "ramfs"):
-        _release_tmpfs_cache(root, native=True)
+        _release_tmpfs_cache(root, native_tier2_cache=True)
         return
     paths = _cache_files(root)
     size = _advise_files(paths)
