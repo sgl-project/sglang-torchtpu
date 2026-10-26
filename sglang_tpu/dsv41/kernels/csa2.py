@@ -59,6 +59,30 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.dsv41.kernels.cache import gather_csa2_kv_sc
 
+
+# JAX 0.10.2 uses explicit MRB addresses, not ACC memory refs.
+# Each BF16 [rows,256] matmul consumes rows/4 of the 256 MRB address
+# units ON ONE MXU. Slots are disjoint within each phase; SWA QK pops all
+# slots before CSA/PV reuses address zero. Every pop zeroes its accumulator.
+def _accumulator(mxu, slot, rows):
+    address = slot * (rows // 4)
+    if rows % 16 or address + rows // 4 > 256:
+        raise ValueError(f"MRB slot exceeds MXU capacity: {mxu=}, {slot=}, {rows=}")
+    return address, rows, mxu
+
+
+def _accumulate(acc, lhs, *, load_staged_rhs=None):
+    address, rows, mxu = acc
+    if lhs.shape != (rows, 256):
+        raise ValueError(f"MRB operand shape {lhs.shape} does not match {(rows, 256)}")
+    pltpu.matmul_acc_lhs(address, lhs, mxu_index=mxu, load_staged_rhs=load_staged_rhs)
+
+
+def _pop(acc):
+    address, rows, mxu = acc
+    return pltpu.matmul_pop(address, (rows, 256), jnp.float32, mxu_index=mxu)
+
+
 # Full groups interleave this many Qs per step (first that fits).
 INTERLEAVE = (6, 3, 2)
 
@@ -498,23 +522,22 @@ def main_kernel(
                     for i in range(bq):
                         lhs = q_ref[i, :, ks]
                         lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
-                        pltpu.matmul_acc_lhs(
+                        _accumulate(
                             accumulators[k * bq + i],
                             lhs,
                             load_staged_rhs=0 if i == 0 else None,
                         )
                 for i in range(bq):
                     swa_score_ref[i] = (
-                        pltpu.matmul_pop(accumulators[i])[:num_heads]
-                        + pltpu.matmul_pop(accumulators[bq + i])[:num_heads]
+                        _pop(accumulators[i])[:num_heads]
+                        + _pop(accumulators[bq + i])[:num_heads]
                     )
 
-            pl.run_scoped(
-                compute_swa_qk_split,
+            compute_swa_qk_split(
                 *(
-                    pltpu.ACC(mxu)((mxu_heads, 256), jnp.float32)
+                    _accumulator(mxu, slot, mxu_heads)
                     for mxu in range(2)
-                    for _ in range(bq)
+                    for slot in range(bq)
                 ),
             )
         else:
@@ -538,7 +561,7 @@ def main_kernel(
                         for i in range(bq):
                             lhs = q_ref[i, pl.ds(head_start, heads), ks]
                             lhs = jnp.pad(lhs, ((0, rows - heads), (0, 0)))
-                            pltpu.matmul_acc_lhs(
+                            _accumulate(
                                 accumulators[mxu * bq + i],
                                 lhs,
                                 load_staged_rhs=0 if i == 0 else None,
@@ -546,16 +569,15 @@ def main_kernel(
                 for i in range(bq):
                     for mxu, head_start, heads in partitions:
                         rows = pl.cdiv(heads, 16) * 16
-                        swa_score_ref[i, pl.ds(head_start, heads), :] = (
-                            pltpu.matmul_pop(accumulators[mxu * bq + i])[:heads]
-                        )
+                        swa_score_ref[i, pl.ds(head_start, heads), :] = _pop(
+                            accumulators[mxu * bq + i]
+                        )[:heads]
 
-            pl.run_scoped(
-                compute_swa_qk,
+            compute_swa_qk(
                 *(
-                    pltpu.ACC(mxu)((pl.cdiv(heads, 16) * 16, 256), jnp.float32)
+                    _accumulator(mxu, slot, pl.cdiv(heads, 16) * 16)
                     for mxu, _, heads in partitions
-                    for _ in range(bq)
+                    for slot in range(bq)
                 ),
             )
 
@@ -584,9 +606,7 @@ def main_kernel(
                             rhs, staging_register=0, mxu_index=mxu, transpose=not pv
                         )
                         lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
-                        pltpu.matmul_acc_lhs(
-                            accumulator(mxu, addr), lhs, load_staged_rhs=0
-                        )
+                        _accumulate(accumulator(mxu, addr), lhs, load_staged_rhs=0)
 
             def csa_pop(i, addr, *, pv):
                 if interpret:
@@ -601,10 +621,7 @@ def main_kernel(
                         )
                     return result
                 return jnp.concatenate(
-                    tuple(
-                        pltpu.matmul_pop(accumulator(mxu, addr))[:num_heads]
-                        for mxu in range(2)
-                    ),
+                    tuple(_pop(accumulator(mxu, addr))[:num_heads] for mxu in range(2)),
                     axis=1,
                 )
 
@@ -768,7 +785,7 @@ def main_kernel(
                                 mxu_index=mxu,
                             )
                             for r in range(k):
-                                pltpu.matmul_acc_lhs(
+                                _accumulate(
                                     accumulator(
                                         mxu,
                                         (pv_base + k * (step % 2) + r) * mrb_stride,
@@ -831,12 +848,11 @@ def main_kernel(
         if interpret:
             compute_main()
         else:
-            pl.run_scoped(
-                compute_main,
+            compute_main(
                 *(
-                    pltpu.ACC(mxu)((mxu_heads, 256), jnp.float32)
+                    _accumulator(mxu, slot, mxu_heads)
                     for mxu in range(2)
-                    for _ in range(accumulator_slots)
+                    for slot in range(accumulator_slots)
                 ),
             )
 
