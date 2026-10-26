@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks import checkpoint, dsv41, engram
 from sglang_tpu.hooks.all_gather_via_all_reduce import all_gather_into_tensor
-from sglang_tpu.hooks import dsv41, engram
 from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
@@ -358,6 +358,7 @@ HOOKS.extend(padded_logits_sampling_hooks())
 HOOKS.extend(logprob_grid_hooks())
 HOOKS.extend(engram.hook_specs())
 HOOKS.extend(dsv41.hook_specs())
+HOOKS.extend(checkpoint.hook_specs())
 
 _registered = False
 
