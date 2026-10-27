@@ -171,35 +171,16 @@ opt-outs.
 
 ## Fixed-cohort benchmark gate
 
-Set `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` to enable the opt-in gate for unified
-or P/D decode scheduling. Zero (the default) preserves ordinary scheduling.
-Send a native batch with base ID `hourly-batch:<unique-cohort>`; native batch
-normalization appends `_0` through `_N-1`. When using a router that overrides
-IDs, supply the same base ID in its `x-rid` header. Startup/health requests
-without the tag do not activate the gate.
-
-P/D keeps preallocation, transfer polling, and prebuilt result processing active.
-Each first token is emitted as soon as it is ready, preserving client TTFT.
-Decode waits until the complete KV-ready batch has emitted its first tokens.
-Unified keeps its chunked-prefill planner with decode mixing disabled and holds
-decode until every request has produced its prefill token. The first decode
-forward must contain the whole batch.
-
-One scheduler `perf_counter` start before the first decode forward and existing
-request completion timestamps define the timing window. No per-token completion
-hook or finish-time map is needed. `/server_info` internal state exposes the
-completed batch's summary under `benchmark_batch_gate`, including its cohort ID,
-decode duration, decoder output tokens, gate wait duration, and TPOT. Output
-throughput excludes the token supplied by prefill. Output counts use the tokens
-emitted through the stop boundary, allowing SBD to overshoot internally. A later
-metadata read does not extend the measurement interval.
-
-The gate requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and
-full request capacity. Mixed cohorts, retraction, invalid completion, or a
-600-second prefill/KV wait invalidate the benchmark (override
-`SGLANG_TPU_BENCHMARK_TIMEOUT_SEC`).
-
-Host tests: `PYTHONPATH=.:python pytest -q
- test/registered/unit/plugins/test_benchmark_batch_gate.py`.
-TPU serving and trace validation remain required before enabling scheduled
-workloads. A scheduler policy seam should eventually replace these wrappers.
+- Enable with `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` (default: `0`, disabled).
+- Send a native batch with base request ID `hourly-batch:<unique-cohort>`;
+  normalization appends `_0` through `_N-1`. Use `x-rid` if the router overrides
+  request IDs. Untagged requests bypass the gate.
+- Unified and P/D emit first tokens as ready. Decode waits for all first tokens
+  and, for P/D, KV transfers. Unified disables decode mixing during prefill.
+- Decode timing runs from the first decode forward to the last request completion.
+  Token counts exclude the prefill token and clip SBD output at the stop boundary.
+- `/server_info` exposes `benchmark_batch_gate`: cohort ID, decode duration,
+  decode output tokens, gate wait duration, and TPOT.
+- Requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and capacity for
+  the full batch. Mixed cohorts, retraction, invalid completion, or timeout fail
+  the benchmark. `SGLANG_TPU_BENCHMARK_TIMEOUT_SEC` defaults to `600`.
