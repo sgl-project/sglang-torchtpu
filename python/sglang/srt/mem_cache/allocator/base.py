@@ -322,6 +322,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         for free_index, start_pos in self._page_disjoint(segments):
             self.free_full_segment(free_index, start_pos=start_pos)
 
+    def free_swa_beyond_owned(self, row: torch.Tensor, owned_p: int, end_p: int):
+        """Give back the SWA side of row positions ``[owned_p, end_p)``: what a
+        finished request still holds past its owned rows inside the page the
+        full side was freed at. Only an SWA side paged finer than ``page_size``
+        holds anything there (SWATokenToKVPoolAllocator); nothing here."""
+
     def _page_disjoint(self, segments):
         ps = self.page_size
         prev_end = None

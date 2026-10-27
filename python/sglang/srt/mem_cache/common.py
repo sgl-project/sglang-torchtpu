@@ -371,7 +371,18 @@ def _release_overallocated_kv_indices(
     # a boundary aligned only to the kernel page could free a widened page whose
     # head rows are still live.
     if page_size > 1:
+        owned_p = start_p
         start_p = ceil_align(start_p, page_size)
+        # An SWA side paged finer than the allocator (the unsplit SWA sub-pool
+        # under DCP) still holds pages between the owned rows and that
+        # alignment; their full page went back with the owned rows.
+        swa_end_p = min(start_p, end_p)
+        if swa_end_p > owned_p:
+            allocator.free_swa_beyond_owned(
+                tree_cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx],
+                owned_p,
+                swa_end_p,
+            )
 
     if start_p < end_p:
         # start_p is aligned to the allocator's page above, so it never shares a
