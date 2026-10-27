@@ -175,6 +175,9 @@ def monkey_patch_torch_tpu_env(
         physical_device = cfg.base_gpu_id + local_rank * cfg.gpu_id_step
         # Assign an individual TPU device to each rank.
         os.environ["TPU_VISIBLE_DEVICES"] = str(physical_device)
+        # torch_tpu ignores TPU_VISIBLE_DEVICES and pins TPU_VISIBLE_CHIPS to
+        # LOCAL_RANK, so the offset must ride on LOCAL_RANK to move off chiplet 0.
+        os.environ["LOCAL_RANK"] = str(physical_device)
 
     # Multihost: every rank must rendezvous at rank-0's node. TPU_WORKER_HOSTNAMES
     # is ordered by TPU_WORKER_ID (physical slice order), so hosts[0] is where
