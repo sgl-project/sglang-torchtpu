@@ -40,11 +40,12 @@ def _load_npu_graph_runner():
         module = importlib.import_module(
             "sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner"
         )
-    return module.ViTNpuGraphRunner
+    return module
 
 
 def test_npu_vit_graph_keys_include_attention_boundaries():
-    runner_cls = _load_npu_graph_runner()
+    graph_runner_module = _load_npu_graph_runner()
+    runner_cls = graph_runner_module.ViTNpuGraphRunner
     vit = SimpleNamespace(
         blocks=[_Block()],
         merger=lambda x: x,
@@ -70,10 +71,9 @@ def test_npu_vit_graph_keys_include_attention_boundaries():
     first_layout = torch.tensor([0, 4, 8], dtype=torch.int32)
     second_layout = torch.tensor([0, 2, 8], dtype=torch.int32)
 
-    with patch(
-        "sglang.srt.hardware_backend.npu.graph_runner."
-        "vit_npu_graph_runner.set_graph_pool_id"
-    ):
+    # Keep the loaded module: resolving its import path again would require
+    # torch_npu after the temporary dependency stub has been removed.
+    with patch.object(graph_runner_module, "set_graph_pool_id"):
         runner.run(
             x,
             first_layout,

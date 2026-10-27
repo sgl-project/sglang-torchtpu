@@ -2,9 +2,8 @@
 
 Pure tile-sizing math, no TPU: ``_dividing_tile_k`` only reads ``dims.size_k``
 and ``rhs_cfgs``, so the wrapped tile fn is driven with hand-built dataclasses.
-Registered on both lanes and skipped gracefully where JAX / the pallas import
-chain is unavailable: the CPU agents have no JAX, so the TPU lane is the one
-that actually executes these assertions.
+Registered on both lanes; importing the Pallas bridge requires both JAX and
+TorchTPU, so CPU agents without TorchTPU skip these assertions.
 
 The regression under test: ``calculate_tiling`` rejects a ``tile_k`` that
 straddles rhs quantization blocks, but the tuned-lookup and pinned tile paths
@@ -16,26 +15,24 @@ returns ``tile_k`` values (e.g. 1280 for ``size_k=5120``) that are neither a
 multiple nor a divisor of the 512 block size.
 """
 
+import importlib.util
+import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
-import unittest
-
-from sglang.test.test_utils import CustomTestCase
-
 try:
     import jax.numpy as jnp
 
-    _HAS_GMM = True
+    _HAS_GMM = importlib.util.find_spec("torch_tpu") is not None
 except ImportError:  # pragma: no cover - JAX is absent on some CPU CI agents
     _HAS_GMM = False
 
-# Deliberately outside the try: once JAX is present, a failure to import the
-# pallas chain is a real breakage and must surface, not silently skip the suite.
+# Once both dependencies are present, an import failure is a real breakage.
 if _HAS_GMM:
     from sglang_tpu.moe.pallas import gmm_v2
     from sglang_tpu.moe.pallas.fused_moe_op import (
@@ -46,7 +43,7 @@ if _HAS_GMM:
         _vmem_safe_packed_tile_n,
     )
 
-_SKIP_REASON = "Requires JAX"
+_SKIP_REASON = "Requires JAX and TorchTPU"
 
 # NVFP4 block size on the TPU path (TPU_NVFP4_GROUP_SIZE).
 _NVFP4_BLOCK = 512
