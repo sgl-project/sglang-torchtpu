@@ -1,12 +1,13 @@
 """Validate one-token vmem-fp8 EP routing and the explicit channel-scale arguments."""
 
+import importlib.util
 import unittest
 from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# The CPU lane has no JAX and skips; the TPU lane runs it.
+# The TPU bridge requires TorchTPU even when the kernel calls are mocked.
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -20,7 +21,9 @@ except ImportError:
     _HAS_JAX = False
 
 
-@unittest.skipUnless(_HAS_JAX, "requires JAX")
+@unittest.skipUnless(
+    _HAS_JAX and importlib.util.find_spec("torch_tpu"), "requires JAX and TorchTPU"
+)
 class TestInt4Fp8Dispatch(CustomTestCase):
     def test_bs1_ep_window_and_padding(self):
         from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
