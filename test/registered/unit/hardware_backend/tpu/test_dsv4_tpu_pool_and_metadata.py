@@ -544,6 +544,88 @@ class TestDSV4TPUPatches(CustomTestCase):
             self.assertEqual(mock_rope.call_count, 2)  # Both Q and KV use plain rope
             self.assertTrue(torch.equal(q_out, q_no_norm))
 
+    def test_dsv4_tpu_pool_sizing_and_hooks(self):
+        from unittest.mock import MagicMock
+
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+        from sglang_tpu.hooks import HOOKS
+        from sglang_tpu.hooks.dsv4 import (
+            build_tpu_dsv4_kv_pool,
+            get_tpu_dsv4_bytes_per_full_token,
+            get_tpu_dsv4_bytes_per_swa_token,
+            get_tpu_dsv4_c128_state_fixed_bytes,
+            get_tpu_dsv4_fixed_c4_state_bytes,
+            hook_specs,
+        )
+
+        for spec in hook_specs():
+            self.assertIn(spec, HOOKS)
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.num_layers_total = 6
+        cfg._unified = False
+        cfg.swa_cap_tokens = None
+        cfg.swa_ratio = 0.1
+        cfg.c4_shrink_factor = 1
+        cfg.stage_owner_layers = {4: [3, 5], 128: [2, 4]}
+        cfg.attn_head_dim = 512
+        cfg.indexer_head_dim = 128
+        cfg.disaggregation_mode = "null"
+        cfg.disaggregation_decode_extra_slots = 0
+
+        swa_bpt = get_tpu_dsv4_bytes_per_swa_token(None, cfg)
+        self.assertEqual(swa_bpt, 1024.0 * 6)
+        cfg.bytes_per_swa_token = swa_bpt
+
+        full_bpt = get_tpu_dsv4_bytes_per_full_token(None, cfg)
+        expected_full_bpt = (
+            0.1 * (1024.0 * 6)
+            + (1.0 / 4) * 640 * 2
+            + (1.0 / 128) * 1024 * 2
+            + (1.0 / 4) * 256 * 2
+        )
+        self.assertAlmostEqual(full_bpt, expected_full_bpt)
+
+        # Verify state fixed byte formulas match actual allocated TPUCompressStatePool bytes
+        pool = _make_dsv4_tpu_pool(self, num_req_slots=5)
+        c128_bytes = get_tpu_dsv4_c128_state_fixed_bytes(None, cfg, 4)
+        actual_c128_bytes = sum(
+            p.get_kv_size_bytes()[0]
+            for p in pool.compress_state_pools
+            if p is not None and p.ratio == 128
+        )
+        self.assertEqual(c128_bytes, actual_c128_bytes)
+
+        c4_bytes = get_tpu_dsv4_fixed_c4_state_bytes(None, cfg, 4)
+        actual_c4_bytes = sum(
+            p.get_kv_size_bytes()[0]
+            for p in pool.compress_state_pools
+            if p is not None and p.ratio == 4
+        ) + sum(
+            p.get_kv_size_bytes()[0]
+            for p in pool.indexer_compress_state_pools
+            if p is not None
+        )
+        self.assertEqual(c4_bytes, actual_c4_bytes)
+
+        # Verify build_tpu_dsv4_kv_pool patches DeepSeekV4TokenToKVPool and registers C4 state reset
+        req_to_token_pool = MagicMock()
+        kvc_stub = SimpleNamespace(is_draft_worker=False)
+
+        def fake_original(kvc_arg, **kw):
+            import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+
+            self.assertIs(kvc_mod.DeepSeekV4TokenToKVPool, DSV4TPUTokenToKVPool)
+            return pool
+
+        built = build_tpu_dsv4_kv_pool(
+            fake_original, kvc_stub, req_to_token_pool=req_to_token_pool
+        )
+        self.assertIs(built, pool)
+        req_to_token_pool.register_on_alloc_rows.assert_called_once_with(
+            pool.clear_c4_req_states
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

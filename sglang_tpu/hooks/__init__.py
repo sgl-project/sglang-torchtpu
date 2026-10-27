@@ -22,6 +22,13 @@ from sglang_tpu.hooks.draft_kv_pool import (
     draft_mha_pool_class,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
+from sglang_tpu.hooks.dsv4 import (
+    build_tpu_dsv4_kv_pool,
+    get_tpu_dsv4_bytes_per_full_token,
+    get_tpu_dsv4_bytes_per_swa_token,
+    get_tpu_dsv4_c128_state_fixed_bytes,
+    get_tpu_dsv4_fixed_c4_state_bytes,
+)
 from sglang_tpu.hooks.encoder import (
     bootstrap_encoder_worker,
     encode_indices_within_patch_budget,
@@ -288,6 +295,31 @@ HOOKS: list[tuple] = [
         "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
         size_tpu_dsa_kv_pool,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_dsv4_kv_pool",
+        build_tpu_dsv4_kv_pool,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator._get_bytes_per_swa_token",
+        get_tpu_dsv4_bytes_per_swa_token,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator._get_bytes_per_full_token",
+        get_tpu_dsv4_bytes_per_full_token,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator._get_c128_state_fixed_bytes",
+        get_tpu_dsv4_c128_state_fixed_bytes,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator._fixed_c4_state_bytes",
+        get_tpu_dsv4_fixed_c4_state_bytes,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.speculative.dflash_utils.dflash_draft_cell_size_per_token",
