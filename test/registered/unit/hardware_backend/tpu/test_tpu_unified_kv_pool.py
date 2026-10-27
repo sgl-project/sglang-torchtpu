@@ -92,6 +92,36 @@ class _RankFourPool(TpuFusedMHATokenToKVPool):
         self._refresh_descriptors()
 
 
+class _FormatPool(_RankFourPool):
+    """A pool class a backend extension may build its KV format with: the
+    format kwargs it is built with set its page shape."""
+
+    # Page rows of each (opaque) format, 128 lanes wide.
+    PAGE_ROWS = {"fmt-a": 3, "fmt-b": 4}
+
+    def __init__(
+        self, *args, kv_cache_dtype_str=None, kv_group_size=32, kv_layout="fmt-a", **kw
+    ):
+        assert kv_cache_dtype_str == "mxint8"
+        self.kv_group_size = kv_group_size
+        self.kv_layout = kv_layout
+        super().__init__(*args, **kw)
+
+    def kv_bytes_per_token_per_layer(self, **_):
+        return self.PAGE_ROWS[self.kv_layout] * 128 // self.page_size
+
+    def _create_buffers(self):
+        shape = (self.num_blocks, self.PAGE_ROWS[self.kv_layout], 128)
+        self.kv_buffer = [
+            torch.zeros(shape, dtype=torch.int8) for _ in range(self.layer_num)
+        ]
+        self._refresh_descriptors()
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        # Which format each layer's copy would read.
+        return [self.kv_layout] * self.layer_num
+
+
 def _make_pool(
     *,
     full_layer_ids=(0,),
@@ -128,9 +158,11 @@ def _hybrid_kvc(
     head_dim=128,
     swa_kv_heads=1,
     swa_head_dim=128,
+    pool_cls=TpuFusedMHATokenToKVPool,
 ):
     """KV-cache config of a bf16 hybrid model whose full-attention layers have
-    one KV head; by default head_dim 128, 512 bytes per token and layer."""
+    one KV head; by default head_dim 128, 512 bytes per token and layer. Its
+    pools are built from ``pool_cls``."""
     model_config = SimpleNamespace(
         attention_arch=AttentionArch.MHA,
         head_dim=head_dim,
@@ -158,15 +190,7 @@ def _hybrid_kvc(
         sliding_window_size=sliding_window_size,
         page_size=page_size,
         attn_dp_size=1,
-    )
-
-
-def _fused_rpa_platform(pool_cls=TpuFusedMHATokenToKVPool):
-    """The platform as the unified pool sees it under an RPA attention backend
-    whose MHA pool class is ``pool_cls``."""
-    return patch(
-        "sglang_tpu.unified_kv_pool.current_platform",
-        SimpleNamespace(get_mha_kv_pool_cls=lambda: pool_cls),
+        _tpu_mha_pool_class=lambda: pool_cls,
     )
 
 
@@ -316,6 +340,38 @@ class TestUnifiedPoolStorage(CustomTestCase):
                 TpuSRTPlatform().get_mha_kv_pool_host_cls(pool.swa_kv_pool),
                 TpuRaidenUnifiedHostKVCache,
             )
+
+    def test_mxint8_sliding_window_layers_take_the_full_attention_format(self):
+        """With mxint8 both kinds are built with the full-attention layers'
+        pool format, so a sliding-window page is a full-attention page."""
+        pool = TpuUnifiedSWAKVPool(
+            size=POOL_TOKENS,
+            page_size=PAGE_SIZE,
+            dtype=torch.int8,
+            head_num=1,
+            head_dim=128,
+            swa_head_num=1,
+            swa_head_dim=128,
+            swa_v_head_dim=128,
+            swa_attention_layer_ids=[1, 2, 3],
+            full_attention_layer_ids=[0],
+            device="cpu",
+            start_layer=0,
+            token_to_kv_pool_class=_FormatPool,
+            pool_kwargs=dict(
+                kv_cache_dtype_str="mxint8", kv_group_size=32, kv_layout="fmt-b"
+            ),
+        )
+        (buf,) = pool.get_state()
+        self.assertEqual(tuple(buf.shape), (NUM_PAGES + 1, 4, 128))
+        for view in (pool.full_kv_pool, pool.swa_kv_pool):
+            self.assertEqual(view.kv_layout, "fmt-b")
+            self.assertEqual(view.kv_group_size, 32)
+            self.assertIs(view.kv_buffer[0], buf)
+        # Each further group's layers read their pages through views of the
+        # same format (the retraction copy here).
+        formats = pool.swa_kv_pool.get_cpu_copy(torch.arange(PAGE_SIZE, 2 * PAGE_SIZE))
+        self.assertEqual(formats, ["fmt-b"] * 3)
 
     def test_sliding_window_layers_beyond_the_full_count_form_groups(self):
         # Five sliding-window layers over two full ones form ceil(5 / 2) = 3
@@ -1338,7 +1394,6 @@ class TestUnifiedPoolEnabled(CustomTestCase):
         # pool would mirror one view's buffers.
         def enabled_with(io_backend):
             with (
-                _fused_rpa_platform(),
                 get_context().override_server_args(
                     tpu_unified_kv_pool=True,
                     enable_hierarchical_cache=True,
@@ -1365,18 +1420,19 @@ class TestUnifiedPoolEnabled(CustomTestCase):
             get_context().override_server_args(tpu_unified_kv_pool=True),
             get_parallel().override(attn_tp_size=1),
         ):
-            with _fused_rpa_platform(supported):
-                self.assertTrue(unified_kv_pool_enabled(_hybrid_kvc()))
-                # The merge the fused layout allows is refused for this one.
-                with self.assertRaisesRegex(
-                    ValueError, "other than the full-attention"
-                ):
-                    unified_kv_pool_enabled(
-                        _hybrid_kvc(head_dim=256, swa_kv_heads=2, swa_head_dim=128)
+            self.assertTrue(unified_kv_pool_enabled(_hybrid_kvc(pool_cls=supported)))
+            # The merge the fused layout allows is refused for this one.
+            with self.assertRaisesRegex(ValueError, "other than the full-attention"):
+                unified_kv_pool_enabled(
+                    _hybrid_kvc(
+                        head_dim=256,
+                        swa_kv_heads=2,
+                        swa_head_dim=128,
+                        pool_cls=supported,
                     )
-            with _fused_rpa_platform(TpuSeqAlongLaneKVPool):
-                with self.assertRaisesRegex(ValueError, "TpuSeqAlongLaneKVPool"):
-                    unified_kv_pool_enabled(_hybrid_kvc())
+                )
+            with self.assertRaisesRegex(ValueError, "TpuSeqAlongLaneKVPool"):
+                unified_kv_pool_enabled(_hybrid_kvc(pool_cls=TpuSeqAlongLaneKVPool))
 
     def test_sliding_window_pages_must_match_or_merge_into_full_ones(self):
         # Sliding-window layers beyond the full count form groups, and two
@@ -1384,7 +1440,6 @@ class TestUnifiedPoolEnabled(CustomTestCase):
         # head of 128 cannot hold them. In fp8 the full head's page pads its K
         # and V to four rows of 256, twice the sliding-window page's bytes.
         with (
-            _fused_rpa_platform(),
             get_context().override_server_args(tpu_unified_kv_pool=True),
             get_parallel().override(attn_tp_size=1),
         ):
@@ -1405,6 +1460,28 @@ class TestUnifiedPoolEnabled(CustomTestCase):
             fp8.kv_cache_dtype = torch.float8_e4m3fn
             with self.assertRaisesRegex(ValueError, "nor fit as one full-attention"):
                 unified_kv_pool_enabled(fp8)
+
+    def test_mxint8_needs_the_full_attention_heads_on_both_kinds(self):
+        # Both kinds take the full-attention layers' mxint8 page, so the
+        # sliding-window layers need the same heads; the merge of two heads
+        # into one full head is a fused-layout shape.
+        def mxint8(**kwargs):
+            kvc = _hybrid_kvc(page_size=256, **kwargs)
+            kvc.kv_cache_dtype_str = "mxint8"
+            kvc.kv_cache_dtype = torch.int8
+            return kvc
+
+        with (
+            get_context().override_server_args(tpu_unified_kv_pool=True),
+            get_parallel().override(attn_tp_size=1),
+        ):
+            self.assertTrue(
+                unified_kv_pool_enabled(mxint8(head_dim=64, swa_head_dim=64))
+            )
+            with self.assertRaisesRegex(ValueError, "with the mxint8 KV cache"):
+                unified_kv_pool_enabled(
+                    mxint8(head_dim=256, swa_kv_heads=2, swa_head_dim=128)
+                )
 
 
 class TestUnifiedHostPool(CustomTestCase):
@@ -1570,7 +1647,6 @@ class TestUnifiedPoolSizing(CustomTestCase):
             )
         )
         stack.enter_context(get_parallel().override(attn_tp_size=1))
-        stack.enter_context(_fused_rpa_platform())
         return TpuUnifiedSWAPoolConfigurator(kvc)
 
     @staticmethod
@@ -1607,6 +1683,17 @@ class TestUnifiedPoolSizing(CustomTestCase):
         )
         config = configurator.calculate_pool_sizes(1280 * 1000, PAGE_SIZE)
         self.assertEqual(self._sizes(config), (1000, 2496, 2496))
+
+    def test_a_costlier_static_sliding_window_page_lends_its_bytes(self):
+        # A KV format can price a static sliding-window page above a
+        # full-attention one (here 640 against 512 bytes per token and layer),
+        # while shared rows keep the full-attention price: 1024 full + 512 SWA
+        # tokens are 2 * 1024 * 512 + 2 * 512 * 640 bytes, 1664 shared tokens
+        # (counting tokens would give 1536).
+        configurator = self._configurator(_hybrid_kvc())
+        configurator._static._swa_per_token = 640
+        config = configurator.calculate_pool_sizes_from_max_tokens(1024, PAGE_SIZE)
+        self.assertEqual(self._sizes(config), (1024, 1664, 1664))
 
     def test_token_cap_keeps_counting_full_attention_tokens(self):
         # gpt-oss at page 64 and ratio 0.8: --max-total-tokens 16400 caps the
@@ -1676,7 +1763,6 @@ class TestUnifiedPoolDispatch(CustomTestCase):
     def test_configurator_follows_the_tpu_field(self):
         hybrid_model = _hybrid_kvc()
         with (
-            _fused_rpa_platform(),
             patch(
                 "sglang.srt.model_executor.pool_configurator.current_platform",
                 TpuSRTPlatform(),
@@ -1716,6 +1802,7 @@ class TestUnifiedPoolDispatch(CustomTestCase):
             KVCacheConfigurator._tpu_unified_kv_pool_enabled(kvc)
         )
         kvc._tpu_mha_pool_class = lambda: _RankFourPool
+        kvc._mxint8_pool_kwargs = lambda: KVCacheConfigurator._mxint8_pool_kwargs(kvc)
         # A unified config reports fewer full-attention tokens than it shares;
         # the allocator must take the shared size.
         sizes = SimpleNamespace(
@@ -1724,7 +1811,6 @@ class TestUnifiedPoolDispatch(CustomTestCase):
             swa_max_total_num_tokens=POOL_TOKENS,
         )
         with (
-            _fused_rpa_platform(_RankFourPool),
             patch(
                 "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
                 TpuSRTPlatform(),
@@ -1753,6 +1839,40 @@ class TestUnifiedPoolDispatch(CustomTestCase):
         self.assertIsInstance(allocator, TpuUnifiedSWATokenToKVPoolAllocator)
         # Either side alone can take every page of the shared pool.
         self.assertEqual(allocator.full_available_size(), pool.size)
+
+    def test_mxint8_builds_both_kinds_with_the_full_attention_format(self):
+        # The configurator's mxint8 format reaches the shared buffers and both
+        # views; the sliding-window view takes the full-attention format.
+        kvc = _hybrid_kvc(pool_cls=_FormatPool)
+        kvc.kv_cache_dtype_str = "mxint8"
+        kvc.kv_cache_dtype = torch.int8
+        kvc.device = "cpu"
+        kvc.pool_page_size = PAGE_SIZE
+        kvc.kv_group_size = 32
+        kvc.kv_full_layout = "fmt-b"
+        kvc._tpu_unified_kv_pool_enabled = lambda: (
+            KVCacheConfigurator._tpu_unified_kv_pool_enabled(kvc)
+        )
+        kvc._mxint8_pool_kwargs = lambda: KVCacheConfigurator._mxint8_pool_kwargs(kvc)
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                TpuSRTPlatform(),
+            ),
+            get_context().override_server_args(
+                tpu_unified_kv_pool=True, page_size=PAGE_SIZE
+            ),
+            get_parallel().override(attn_tp_size=1, attn_dcp_size=1),
+        ):
+            pool = KVCacheConfigurator._build_tpu_swa_kv_pool(
+                kvc,
+                full_max_total_num_tokens=POOL_TOKENS,
+                swa_max_total_num_tokens=POOL_TOKENS,
+            )
+        self.assertIsInstance(pool, TpuUnifiedSWAKVPool)
+        self.assertIsInstance(pool.full_kv_pool.backing, _FormatPool)
+        for view in (pool.full_kv_pool.backing, pool.full_kv_pool, pool.swa_kv_pool):
+            self.assertEqual(view.kv_layout, "fmt-b")
 
 
 if __name__ == "__main__":
