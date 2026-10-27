@@ -69,20 +69,26 @@ def load_revision(root, revision, output):
     return load_candidate(root, source=output / "kpool_compress.py")
 
 
-def inputs(pages, tokens, decode, batch=1, query_len=1, raw=None):
+def inputs(pages, tokens, decode, batch=1, query_len=1, raw=None, page_size=128):
     """Fragmented request pages and an already updated raw cache."""
-    if pages < max(17, (tokens + 127) // 128 + 1):
+    if pages < max(17, (tokens + page_size - 1) // page_size + 1):
         raise ValueError("Insufficient pages for the requested token bucket")
     if raw is None:
         raw = jax.jit(
-            lambda key: jax.random.normal(key, (pages, 128, 256), jnp.bfloat16)
+            lambda key: jax.random.normal(key, (pages, page_size, 256), jnp.bfloat16)
         )(jax.random.key(42))
     page_count = (pages - 1) // batch * batch
     page_map = np.random.default_rng(42).permutation(np.arange(1, page_count + 1))
     starts = (
-        np.full(batch, 131, np.int32)
+        np.full(batch, page_size + 3, np.int32)
         if query_len == 1
-        else np.resize(np.array([131, 127, 511, 130], np.int32), batch)
+        else np.resize(
+            np.array(
+                [page_size + 3, page_size - 1, 4 * page_size - 1, page_size + 2],
+                np.int32,
+            ),
+            batch,
+        )
     )
     tail = (
         jnp.zeros((4, 128), jnp.float32),
@@ -109,6 +115,7 @@ def benchmark_case(
     raw=None,
     baseline=None,
     comparisons=None,
+    page_size=128,
 ):
     name = f"{'decode' if decode else 'prefill'}_p{pages}_t{tokens}"
     if batch != 1:
@@ -116,7 +123,7 @@ def benchmark_case(
     if query_len != 1 or not decode:
         name += f"_q{query_len}"
     print("CASE_START", name, flush=True)
-    raw, tail = inputs(pages, tokens, decode, batch, query_len, raw)
+    raw, tail = inputs(pages, tokens, decode, batch, query_len, raw, page_size)
     variants = {"reference": reference.computation}
     compared = dict(comparisons or {})
     if baseline is not None:
@@ -138,7 +145,7 @@ def benchmark_case(
                 return _fn(*args)
 
             entry.__name__ = f"kpool_{name}_{label}"
-            cache = jnp.zeros((pages, 32, 4, 256), jnp.uint8)
+            cache = jnp.zeros((pages, page_size // 4, 4, 256), jnp.uint8)
             cache.block_until_ready()
             compiled = (
                 jax.jit(entry, static_argnums=(7, 8), donate_argnums=(1,))
@@ -189,6 +196,7 @@ def benchmark_case(
         result = {
             "name": name,
             "pages": pages,
+            "page_size": page_size,
             "token_bucket": tokens,
             "batch": batch,
             "query_length": query_len,
@@ -260,6 +268,12 @@ def main():
         help="Add a named revision to the same alternating capture",
     )
     parser.add_argument(
+        "--page-size",
+        type=int,
+        default=128,
+        help="Raw page size P (a multiple of 16); 14,849 pages are allocated at any P",
+    )
+    parser.add_argument(
         "--queries", nargs="+", type=int, help="Filter the declared matrix by Q"
     )
     parser.add_argument(
@@ -272,6 +286,8 @@ def main():
         parser.error("Require 0 <= matrix_start < matrix_stop")
     if opts.warmup < 1 or opts.repeats < 2:
         parser.error("Require warmup >= 1 and repeats >= 2")
+    if opts.page_size < 16 or opts.page_size % 16:
+        parser.error("Require a page size that is a positive multiple of 16")
     root = Path(__file__).resolve().parents[3]
     opts.output.mkdir(parents=True, exist_ok=True)
     result = {
@@ -281,6 +297,7 @@ def main():
         "timing": "compile/input/warmup excluded; warm cache; donated output; no host timing",
         "warmup": opts.warmup,
         "repeats": opts.repeats,
+        "page_size": opts.page_size,
         "cases": [],
     }
     try:
@@ -342,7 +359,7 @@ def main():
             raise ValueError("Empty matrix selection")
         result["matrix"] = matrix
         with jax.default_device(jax.devices()[0]):
-            shared_raw, _ = inputs(14849, 32, True)
+            shared_raw, _ = inputs(14849, 32, True, page_size=opts.page_size)
             for case in matrix:
                 result["cases"].append(
                     benchmark_case(
@@ -357,6 +374,7 @@ def main():
                         shared_raw,
                         baseline=baseline,
                         comparisons=comparisons,
+                        page_size=opts.page_size,
                     )
                 )
                 (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))

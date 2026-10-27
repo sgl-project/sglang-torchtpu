@@ -46,6 +46,8 @@ The capture covers 301 shapes at K=4, D=128, raw page=128 and BF16 raw data:
 - Decode/verify: Q=1..32, B=1/2/4/8/16/32/64, T=B*Q.
 - Prefill: Q=1/2/4/.../8192, the same B values, B*Q<=8192, T=max(64,B*Q).
 
+Use `--page-size P` (a multiple of 16, default 128) to capture another raw
+page size; the pooled cache becomes `[pages, P//4, 4, 256]`.
 Use `--matrix-section decode` or `prefill` to select a mode, and
 `--matrix-start` / `--matrix-stop` to select a slice. `--queries` and `--batches`
 filter the fixed matrix. Each case uses 14,849 raw
@@ -80,5 +82,7 @@ inactive requests, page boundaries, shared destination quads and zero/tiny/
 nonfinite data. It compares the entire pooled cache, including untouched bytes,
 and exits nonzero on a mismatch. `accuracy.json` records each case.
 
+Use `--page-size P` to run the same matrix at another raw page size; starts
+and page-boundary edges scale with P (page edge P-1/P, pooled page edge 4P-1/4P).
 Use `--conservative-bound` to validate the API without `max_query_length`.
 The same `--queries` and `--batches` filters can restrict this additional check.
