@@ -309,9 +309,8 @@ class MuseMegakernel(torch.nn.Module):
         kv_sal_fp8: bool = False,
     ) -> K.MKConfig:
         g = self.geo
-        sal_chunk_pages = max(
-            1, tpu_envs.SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS.get() // page_size
-        )
+        # SAL chunks are one expert w13 slot row of tokens (the ring is a view of those slots)
+        sal_chunk_pages = 2 * g.inter_local // page_size
         swa_chunk_pages = (
             tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.get() // page_size
             if kv_sal
@@ -320,10 +319,18 @@ class MuseMegakernel(torch.nn.Module):
         if swa_chunk_pages >= sal_chunk_pages:
             swa_chunk_pages = 0
         kv_chunk_tokens = sal_chunk_pages * page_size if kv_sal else 512
-        # a 4096-token ring at 512- and 1024-token chunks; two-stream needs an even group
-        kv_group = max(2, 2048 // kv_chunk_tokens) if kv_sal else 4
-        if rows > _LARGE_STEP_ROWS:
-            kv_group = 2
+        kv_group = 2 if rows > _LARGE_STEP_ROWS else 4
+        # q and k are RMS-normalized per head: the score bound allows exp without a max
+        unshifted = (
+            1.1 * g.scale_query_by * g.head_dim * g.attn_scale <= K.UNSHIFTED_MAX
+        )
+        attn_pipe = unshifted and kv_sal and rows <= _BASE_STEP_MAX_ROWS
+        # few-row steps (decode) gather their rows in one round and have nothing to fold
+        fold = (
+            tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
+            and n_req * q > 2
+            and rows <= _BASE_STEP_MAX_ROWS
+        )
         y_early = tpu_envs.SGLANG_TPU_MK_Y_EARLY.get() and rows <= 16
         cfg = K.MKConfig(
             hidden=g.hidden,
@@ -355,18 +362,18 @@ class MuseMegakernel(torch.nn.Module):
             n_req=n_req,
             capture_layers=capture,
             compact_rows=4 if rows <= _COMPACT4_MAX_ROWS else 8,
+            topk_iter=8 < rows <= _BASE_STEP_MAX_ROWS,
+            fold_f=fold,
+            fold_o=fold,
             # SEQ_ALONG_LANE pages are >= 256 tokens
             chunk_pages=sal_chunk_pages if kv_sal else self.chunk_pages,
             swa_chunk_pages=swa_chunk_pages,
             attn_skip_idle_streams=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE.get(),
             attn_col_mask=bool(swa_chunk_pages)
             and tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_COL_MASK.get(),
-            attn_fixed_max=(
-                # 1.125: margin over validate()'s fp8-rounding factor of 1.1
-                1.125 * g.scale_query_by * g.head_dim * g.attn_scale
-                if tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_FIXED_MAX.get()
-                else 0.0
-            ),
+            attn_unshifted=unshifted,
+            attn_pipe=attn_pipe,
+            attn_streams=_PIPE_STREAMS[kv_sal_fp8] if attn_pipe else 2,
             kv_packed=self.kv_packed and not kv_sal,
             kv_sal=kv_sal,
             kv_sal_fp8=kv_sal_fp8,
@@ -405,9 +412,12 @@ class MuseMegakernel(torch.nn.Module):
             cand = msgspec.structs.replace(
                 cand, ring_slots=slots, stream_depth=slots - 1
             )
+            if fold and not K.fold_fits(cand):
+                cand = msgspec.structs.replace(cand, fold_f=False, fold_o=False)
             if K.scratch_vmem_bytes(cand) <= _scratch_budget(rows, kv_chunk_tokens) - (
-                # the page-block unpack's temporaries; measured 1.2 MiB over at 32 rows
-                _SAL_VMEM_HEADROOM if kv_sal else 0
+                # the larger steps' SAL attention temporaries; measured 1.2 MiB over at 32 rows
+                # with page-block unpacks (steps up to 32 rows now unpack whole ring chunks)
+                _SAL_VMEM_HEADROOM if kv_sal and rows > _BASE_STEP_MAX_ROWS else 0
             ):
                 return cand
         raise ValueError(
@@ -574,6 +584,8 @@ def _register_op() -> None:
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
 _SCRATCH_VMEM_BUDGET = 48 * 2**20
 _SAL_VMEM_HEADROOM = 2 * 2**20
+# Pipelined attention, chunks per loop iteration by fp8 SAL (measured at 500k context)
+_PIPE_STREAMS = {False: 4, True: 8}
 _DEPTH_RING_PREFERENCE = ((3, K.MAX_RING_SLOTS), (3, 4), (1, 4), (1, 2))
 # Past 64 rows Mosaic's own temporaries grow ~0.1 MiB per row: 96 rows of 4 overflowed the
 # 64 MiB VMEM by 2.5 MiB at 41.5 MiB declared (39.5 + SAL headroom), so the declared budget

@@ -71,15 +71,9 @@ class TpuEnvs:
     # DFlash: verify only the first WIDTH tokens of each draft block once the decode batch
     # reaches MIN_BS requests (dflash_adaptive_verify.py); "" verifies the full block.
     SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY = EnvStr("")
-    # Megakernel attention over SEQ_ALONG_LANE pools: tokens per KV chunk, a multiple of the page.
-    # Larger chunks shorten the per-chunk softmax chain at long context.
-    SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS = EnvInt(512)
-    # > 0: sliding-window layers use this chunk size instead (a divisor of the above); their
-    # 2048-token window gains nothing from long chunks.
+    # > 0: megakernel sliding-window layers on SEQ_ALONG_LANE pools use KV chunks of this many
+    # tokens (a divisor of the 2 * inter_local-token chunk); their 2048-token window gains nothing.
     SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS = EnvInt(0)
-    # Megakernel attention exponentiates against a fixed max (MKConfig.attn_fixed_max) instead
-    # of a running row max; exact for Muse's per-head RMS-normalized q and k.
-    SGLANG_TPU_MUSE_MK_ATTN_FIXED_MAX = EnvBool(False)
     # Megakernel attention: a softmax stream past the request's last chunk skips its iteration
     # (MKConfig.attn_skip_idle_streams); and, with SWA chunks set, a full-attention layer's last
     # chunk is masked by key column only (MKConfig.attn_col_mask).
@@ -101,7 +95,7 @@ class TpuEnvs:
     # Megakernel MoE: run the experts owner block by owner block and send each block of
     # reduce-scatter rows to its owner as one DMA while the remaining experts run
     # (MKConfig.y_block_send; exact). Ignored where SGLANG_TPU_MK_Y_EARLY applies.
-    SGLANG_TPU_MK_Y_BLOCK_SEND = EnvBool(False)
+    SGLANG_TPU_MK_Y_BLOCK_SEND = EnvBool(True)
     # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
     # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
     # (exact; measured at 32 rows / 100K context: 1 is -1.8%, 2 is +1% slower than 0).
@@ -118,6 +112,9 @@ class TpuEnvs:
     # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
     # scaling every score (exact).
     SGLANG_TPU_MK_FOLD_ATTN_SCALE = EnvBool(False)
+    # Muse megakernel: fold the f / o all-gathers into the next qkvg and the pool + router
+    # matvecs (not bit-exact: the matvec input rounding moves; verify steps only).
+    SGLANG_TPU_MUSE_MK_FOLD = EnvBool(True)
     # Raiden HiCache transfers move each run of pages that is consecutive on both the
     # device and the host as one segment instead of one segment per page.
     SGLANG_TPU_RAIDEN_COALESCE_PAGES = EnvBool(False)

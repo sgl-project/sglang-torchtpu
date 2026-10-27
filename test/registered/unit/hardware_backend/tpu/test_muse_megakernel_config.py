@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.muse_megakernel import kernel as K
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.muse_megakernel import kernel as K
 from sglang_tpu.muse_megakernel import ops
 
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
@@ -77,9 +77,7 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
 
     def test_sal_attention_flags(self):
-        # The cc=1 verify step on fp8 SEQ_ALONG_LANE pages, with and without the flags.
-        from sglang_tpu.envs import envs as tpu_envs
-
+        # The cc=1 verify step on fp8 SEQ_ALONG_LANE pages.
         def cfg():
             return ops.MuseMegakernel.config(
                 _megakernel(),
@@ -94,30 +92,44 @@ class TestMuseMegakernelConfig(CustomTestCase):
             ).validate()
 
         default = cfg()
-        self.assertEqual((default.chunk_pages, default.kv_group), (2, 4))
-        self.assertEqual(default.attn_fixed_max, 0.0)
-        with tpu_envs.SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS.override(
-            1024
-        ), tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_FIXED_MAX.override(True):
-            tuned = cfg()
-        self.assertEqual((tuned.chunk_pages, tuned.kv_group), (4, 2))
+        # 1024-token chunks: one expert w13 slot row, the ring a view of those slots
+        self.assertEqual((default.chunk_pages, default.kv_ring), (4, 32))
+        self.assertTrue(default.attn_unshifted and default.attn_pipe)
+        self.assertEqual(default.attn_streams, 8)
         bound = _GEOMETRY.scale_query_by * _GEOMETRY.head_dim * _GEOMETRY.attn_scale
-        self.assertGreaterEqual(tuned.attn_fixed_max, 1.1 * bound)
-        self.assertLessEqual(
-            K.scratch_vmem_bytes(tuned),
-            ops._SCRATCH_VMEM_BUDGET - ops._SAL_VMEM_HEADROOM,
-        )
+        self.assertLessEqual(1.1 * bound, K.UNSHIFTED_MAX)
+        self.assertLessEqual(K.scratch_vmem_bytes(default), ops._SCRATCH_VMEM_BUDGET)
         # SWA layers' short chunks are sub-slots of the full-attention ring: same VMEM, no overrun
-        with tpu_envs.SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS.override(
-            2048
-        ), tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.override(512):
+        with tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.override(512):
             split = cfg()
-        self.assertEqual((split.chunk_pages, split.swa_chunk_pages), (8, 2))
+        self.assertEqual((split.chunk_pages, split.swa_chunk_pages), (4, 2))
         self.assertEqual(
             2 * split.swa_kv_group * split.swa_chunk_pages,
             split.kv_ring * split.chunk_pages,
         )
         self.assertEqual(split.swa_kv_group % split.attn_streams, 0)
+
+    def test_verify_steps_fold_and_decode_steps_do_not(self):
+        for q, n_req, fold in (
+            (8, 1, True),
+            (8, 2, True),
+            (1, 1, False),
+            (1, 2, False),
+        ):
+            with self.subTest(q=q, n_req=n_req):
+                cfg = ops.MuseMegakernel.config(
+                    _megakernel(),
+                    rows=-(-q * n_req // 8) * 8,
+                    q=q,
+                    n_req=n_req,
+                    n_page_entries=n_req * 2048,
+                    page_size=256,
+                    capture=(1, 16, 30, 44, 59),
+                    kv_sal=True,
+                    kv_sal_fp8=True,
+                ).validate()
+                self.assertEqual((cfg.fold_f, cfg.fold_o), (fold, fold))
+                self.assertEqual(cfg.ring_slots, 10)
 
     def test_48_row_shapes_fit_the_scratch_budget(self):
         # SGLANG_TPU_MUSE_MK_MAX_ROWS=48: 12 requests x 4 verify tokens and 6 x 8, on the
@@ -196,7 +208,8 @@ class TestMuseMegakernelConfig(CustomTestCase):
                 kv_sal_fp8=True,
             )
 
-        self.assertFalse(config(32, 8).y_block_send)
+        with tpu_envs.SGLANG_TPU_MK_Y_BLOCK_SEND.override(False):
+            self.assertFalse(config(32, 8).y_block_send)
         with tpu_envs.SGLANG_TPU_MK_Y_BLOCK_SEND.override(True):
             self.assertTrue(config(32, 8).y_block_send)
             self.assertTrue(config(64, 16).y_block_send)
