@@ -499,6 +499,435 @@ class TestSharedChecker(CustomTestCase):
             self.assertEqual(event.durations_ms, (25,))
             self.assertIsNone(checker.check(context_fn=_context))
 
+    def test_arm_and_get_recompilation_counters_flush(self):
+        from sglang_tpu.compilation.recompilation_checker import (
+            MAX_RECORDED_EVENTS,
+            arm_recompilation_checker,
+            get_recompilation_counters,
+        )
+
+        cache = _FakeCache([500])
+        checker = _checker(cache)
+        with patch.object(
+            recompilation_checker,
+            "_shared_recompilation_checker",
+            return_value=checker,
+        ):
+            # Before baseline, counters are all zero.
+            self.assertEqual(
+                get_recompilation_counters(flush=True)["tpu_serving_compiles"], 0
+            )
+            self.assertEqual(
+                get_recompilation_counters(flush=True)["tpu_heavy_serving_compiles"], 0
+            )
+            self.assertEqual(
+                get_recompilation_counters(flush=True)["tpu_eager_serving_compiles"], 0
+            )
+            armed = arm_recompilation_checker(reset_counters=True)
+            self.assertIs(armed, checker)
+            cache.compile(0, 120, 45)
+            # Without flush, counters have not yet read the new misses.
+            self.assertEqual(
+                get_recompilation_counters(flush=False)["tpu_serving_compiles"], 0
+            )
+            snapshot = get_recompilation_counters(
+                flush=True, context="Model EXTEND real=q9,b1 pad=q16,b64"
+            )
+            self.assertEqual(snapshot["tpu_serving_compiles"], 2)
+            # Event total_ms is 165 < warn_ms (1000 in _checker), so heavy is False.
+            self.assertEqual(snapshot["tpu_heavy_serving_compiles"], 0)
+            self.assertEqual(snapshot["tpu_eager_serving_compiles"], 2)
+            self.assertEqual(snapshot["tpu_serving_cache_loads"], 1)
+            self.assertEqual(snapshot["tpu_serving_compile_ms"], 165)
+            self.assertEqual(snapshot["tpu_worst_compile_ms"], 120)
+            self.assertEqual(len(snapshot["tpu_recompile_events"]), 1)
+            self.assertEqual(
+                snapshot["tpu_recompile_events"][0]["context"],
+                "Model EXTEND real=q9,b1 pad=q16,b64",
+            )
+            self.assertEqual(
+                snapshot["tpu_recompile_events"][0]["durations_ms"], [120, 45]
+            )
+            self.assertEqual(snapshot["tpu_recompile_events"][0]["load_count"], 1)
+
+            # Multiple cheap compiles whose sum >= warn_ms (600 + 600 >= 1000)
+            # mark event.heavy=True for logging, and increment tpu_eager_serving_compiles
+            # (4 total) while per-program tpu_heavy_serving_compiles stays 0.
+            cache.compile(600, 600)
+            ev = checker.check(context_fn=_context)
+            self.assertTrue(ev.heavy)
+            self.assertEqual(
+                get_recompilation_counters(flush=False)["tpu_serving_compiles"], 4
+            )
+            self.assertEqual(
+                get_recompilation_counters(flush=False)["tpu_heavy_serving_compiles"], 0
+            )
+            self.assertEqual(
+                get_recompilation_counters(flush=False)["tpu_eager_serving_compiles"], 4
+            )
+
+            # An individual compile >= warn_ms=1000 increments tpu_heavy_serving_compiles.
+            cache.compile(1500)
+            checker.check(context_fn=_context)
+            self.assertEqual(
+                get_recompilation_counters(flush=False)["tpu_heavy_serving_compiles"], 1
+            )
+            self.assertEqual(
+                get_recompilation_counters(flush=False)["tpu_eager_serving_compiles"], 4
+            )
+
+            # overwrite_baseline=False preserves existing baseline and counters.
+            arm_recompilation_checker(reset_counters=False, overwrite_baseline=False)
+            self.assertEqual(
+                get_recompilation_counters(flush=False)["tpu_serving_compiles"], 5
+            )
+
+            # Bounded events list caps at MAX_RECORDED_EVENTS.
+            for _ in range(MAX_RECORDED_EVENTS + 10):
+                cache.compile(10)
+                checker.check(context_fn=_context)
+            self.assertEqual(len(checker.events), MAX_RECORDED_EVENTS)
+
+            # reset_counters clears all serving totals and events.
+            checker.reset_counters()
+            self.assertEqual(checker.serving_compiles, 0)
+            self.assertEqual(checker.heavy_serving_compiles, 0)
+            self.assertEqual(checker.eager_serving_compiles, 0)
+            self.assertEqual(checker.serving_cache_loads, 0)
+            self.assertEqual(checker.serving_compile_ms, 0)
+            self.assertEqual(checker.worst_compile_ms, 0)
+            self.assertEqual(checker.events, [])
+
+
+class TestRecompilationGateHelpers(CustomTestCase):
+    def test_extract_and_diff_snapshots(self):
+        from sglang.test.recompilation_gate import (
+            diff_recompilation_snapshots,
+            extract_recompilation_states,
+        )
+
+        before_payload = {
+            "internal_state": [
+                {
+                    "tpu_serving_compiles": 1,
+                    "tpu_heavy_serving_compiles": 0,
+                    "tpu_eager_serving_compiles": 1,
+                    "tpu_serving_cache_loads": 0,
+                    "tpu_serving_compile_ms": 50,
+                    "tpu_worst_compile_ms": 50,
+                    "tpu_recompile_events": [
+                        {
+                            "context": "warmup",
+                            "compile_count": 1,
+                            "load_count": 0,
+                            "durations_ms": [50],
+                        }
+                    ],
+                }
+            ]
+        }
+        after_payload = {
+            "internal_state": [
+                {
+                    "tpu_serving_compiles": 4,
+                    "tpu_heavy_serving_compiles": 2,
+                    "tpu_eager_serving_compiles": 2,
+                    "tpu_serving_cache_loads": 1,
+                    "tpu_serving_compile_ms": 365,
+                    "tpu_worst_compile_ms": 200,
+                    "tpu_recompile_events": [
+                        {
+                            "context": "warmup",
+                            "compile_count": 1,
+                            "load_count": 0,
+                            "durations_ms": [50],
+                        },
+                        {
+                            "context": "Model DECODE pad=q4,b4",
+                            "compile_count": 3,
+                            "load_count": 1,
+                            "durations_ms": [200, 100, 15],
+                        },
+                    ],
+                }
+            ]
+        }
+        before = extract_recompilation_states(before_payload)
+        after = extract_recompilation_states(after_payload)
+        deltas = diff_recompilation_snapshots(before, after)
+        self.assertEqual(len(deltas), 1)
+        self.assertEqual(deltas[0]["tpu_serving_compiles"], 3)
+        self.assertEqual(deltas[0]["tpu_heavy_serving_compiles"], 2)
+        self.assertEqual(deltas[0]["tpu_eager_serving_compiles"], 1)
+        self.assertEqual(deltas[0]["tpu_serving_cache_loads"], 1)
+        self.assertEqual(deltas[0]["tpu_serving_compile_ms"], 315)
+        self.assertEqual(deltas[0]["tpu_worst_compile_ms"], 200)
+        self.assertEqual(len(deltas[0]["tpu_recompile_events"]), 1)
+        self.assertEqual(
+            deltas[0]["tpu_recompile_events"][0]["context"],
+            "Model DECODE pad=q4,b4",
+        )
+
+    def test_assert_no_serving_recompilation_and_gate_runner(self):
+        from sglang.test import recompilation_gate
+        from sglang.test.recompilation_gate import (
+            assert_no_serving_recompilation,
+            recompilation_gate_runner,
+        )
+
+        clean_state = {
+            "internal_state": [
+                {
+                    "tpu_serving_compiles": 0,
+                    "tpu_heavy_serving_compiles": 0,
+                    "tpu_eager_serving_compiles": 0,
+                    "tpu_serving_cache_loads": 0,
+                    "tpu_serving_compile_ms": 0,
+                    "tpu_worst_compile_ms": 0,
+                    "tpu_recompile_events": [],
+                }
+            ]
+        }
+        eager_only_state = {
+            "internal_state": [
+                {
+                    "tpu_serving_compiles": 1,
+                    "tpu_heavy_serving_compiles": 0,
+                    "tpu_eager_serving_compiles": 1,
+                    "tpu_serving_cache_loads": 0,
+                    "tpu_serving_compile_ms": 8,
+                    "tpu_worst_compile_ms": 8,
+                    "tpu_recompile_events": [
+                        {
+                            "context": "Model DECODE pad=q4,b4",
+                            "compile_count": 1,
+                            "load_count": 0,
+                            "durations_ms": [8],
+                            "heavy": False,
+                            "sites": [
+                                {
+                                    "site": "aten.slice.Tensor((4, 10):float32) @ sglang_tpu/sampler.py:42",
+                                    "count": 1,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+        dirty_state = {
+            "internal_state": [
+                {
+                    "tpu_serving_compiles": 1,
+                    "tpu_heavy_serving_compiles": 1,
+                    "tpu_eager_serving_compiles": 0,
+                    "tpu_serving_cache_loads": 0,
+                    "tpu_serving_compile_ms": 1400,
+                    "tpu_worst_compile_ms": 1400,
+                    "tpu_recompile_events": [
+                        {
+                            "context": "Model EXTEND pad=q128,b1",
+                            "compile_count": 1,
+                            "load_count": 0,
+                            "durations_ms": [1400],
+                            "heavy": True,
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with patch.object(recompilation_gate, "_get_json", return_value=clean_state):
+            assert_no_serving_recompilation("http://127.0.0.1:30000")
+            runner = recompilation_gate_runner(run_workload=False)
+            res = runner("http://127.0.0.1:30000")
+            self.assertTrue(res["_passed"])
+            self.assertEqual(res["score"], 1.0)
+
+        with patch.object(
+            recompilation_gate, "_get_json", return_value=eager_only_state
+        ):
+            # Default only_heavy=False fails on eager op recompilations and surfaces sites.
+            with self.assertRaisesRegex(
+                AssertionError,
+                r"tpu_eager_serving_compiles=1.*sites=\[1x aten\.slice\.Tensor",
+            ):
+                assert_no_serving_recompilation("http://127.0.0.1:30000")
+            runner = recompilation_gate_runner(run_workload=False)
+            res = runner("http://127.0.0.1:30000")
+            self.assertFalse(res["_passed"])
+            self.assertEqual(res["score"], 0.0)
+            self.assertTrue(
+                any("tpu_eager_serving_compiles=1" in f for f in res["_failures"])
+            )
+            # Explicit only_heavy=True opt-in ignores sub-threshold eager compiles.
+            assert_no_serving_recompilation("http://127.0.0.1:30000", only_heavy=True)
+
+        with patch.object(recompilation_gate, "_get_json", return_value=dirty_state):
+            with self.assertRaisesRegex(AssertionError, "Model EXTEND pad=q128,b1"):
+                assert_no_serving_recompilation("http://127.0.0.1:30000")
+            with self.assertRaisesRegex(AssertionError, "tpu_heavy_serving_compiles=1"):
+                assert_no_serving_recompilation(
+                    "http://127.0.0.1:30000", only_heavy=True
+                )
+            runner = recompilation_gate_runner(run_workload=False)
+            res = runner("http://127.0.0.1:30000")
+            self.assertFalse(res["_passed"])
+            self.assertEqual(res["score"], 0.0)
+            self.assertTrue(
+                any("tpu_serving_compiles=1" in f for f in res["_failures"])
+            )
+
+    def test_model_config_builds_fail_on_recompile_gate(self):
+        from sglang.test.tpu.evals.model_config import build_gates
+
+        gates = build_gates(
+            {
+                "model": "openai/gpt-oss-120b",
+                "test_name": "gpt-oss-120b",
+                "gates": [
+                    {
+                        "dataset": "gsm8k",
+                        "baseline": 0.8,
+                        "atol": 0.03,
+                        "fail_on_recompile": True,
+                    }
+                ],
+            }
+        )
+        self.assertEqual(len(gates), 1)
+        self.assertTrue(gates[0].fail_on_recompile)
+
+    def test_platform_and_internal_state_expose_recompilation_counters(self):
+        from sglang.srt.managers.io_struct import GetInternalStateReq
+        from sglang.srt.managers.scheduler_components.internal_state import (
+            SchedulerInternalStateController,
+        )
+        from sglang.srt.runtime_context import get_context
+        from sglang_tpu.compilation.recompilation_checker import (
+            arm_recompilation_checker,
+        )
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        cache = _FakeCache([400])
+        checker = _checker(cache)
+
+        scheduler = SimpleNamespace(
+            metrics_reporter=SimpleNamespace(
+                last_gen_throughput=1.0,
+                spec_total_num_forward_ct=0,
+                spec_total_num_accept_tokens=0,
+                step_time_dict={},
+            ),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(weight_load_mem_usage=1.0, device="tpu"),
+                graph_memory_usage=None,
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: SimpleNamespace(mem_usage=3.0)
+            ),
+            startup_available_gpu_memory_gb=4.0,
+            startup_time=1.0,
+            max_total_num_tokens=100,
+            swa_tokens_per_layer=None,
+            max_running_requests=8,
+            spec_algorithm=SimpleNamespace(
+                is_none=lambda: True,
+                is_dspark=lambda: False,
+            ),
+            draft_worker=None,
+            rust_server=None,
+        )
+        controller = SchedulerInternalStateController(scheduler, record_step_time=False)
+        tpu_platform = TpuSRTPlatform()
+
+        with (
+            patch.object(
+                recompilation_checker,
+                "_shared_recompilation_checker",
+                return_value=checker,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.internal_state.current_platform",
+                tpu_platform,
+            ),
+            patch("sglang_tpu.tpu_platform.torch.compiler.set_stance"),
+            get_context().override_server_args(
+                enable_torch_compile=True, speculative_algorithm=None
+            ) as server_args,
+        ):
+            scheduler.server_args = server_args
+            arm_recompilation_checker(reset_counters=True, overwrite_baseline=True)
+            # on_warmup_complete must not overwrite an existing baseline.
+            tpu_platform.on_warmup_complete()
+            cache.compile(1250)
+            # Bracketed forward check records the serving compile.
+            checker.check(context_fn=_context)
+            # Post-forward unbracketed eager op (e.g. TpuSampler or FutureMap after
+            # the final forward step) is flushed when /get_internal_state is queried.
+            cache.compile(15)
+            with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True):
+                state = controller.get_internal_state(
+                    recv_req=GetInternalStateReq()
+                ).internal_state
+            self.assertEqual(state["tpu_serving_compiles"], 2)
+            self.assertEqual(state["tpu_heavy_serving_compiles"], 1)
+            self.assertEqual(state["tpu_eager_serving_compiles"], 1)
+            self.assertEqual(state["tpu_serving_cache_loads"], 0)
+            self.assertEqual(state["tpu_serving_compile_ms"], 1265)
+            self.assertEqual(state["tpu_worst_compile_ms"], 1250)
+            self.assertEqual(len(state["tpu_recompile_events"]), 2)
+            self.assertEqual(
+                state["tpu_recompile_events"][1]["context"], "get_internal_state"
+            )
+            self.assertEqual(state["tpu_recompile_events"][1]["durations_ms"], [15])
+
+            cache.compile(1500)
+            with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False):
+                state_flushed = controller.get_internal_state(
+                    recv_req=GetInternalStateReq()
+                ).internal_state
+            self.assertEqual(state_flushed["tpu_serving_compiles"], 3)
+            self.assertEqual(state_flushed["tpu_heavy_serving_compiles"], 2)
+            self.assertEqual(state_flushed["tpu_eager_serving_compiles"], 1)
+
+    def test_accuracy_test_runner_fail_on_recompile(self):
+        import contextlib
+
+        from sglang.test.accuracy_test_runner import (
+            AccuracyTestParams,
+            run_accuracy_test,
+        )
+
+        params = AccuracyTestParams(
+            dataset="gsm8k",
+            baseline_accuracy=0.80,
+            atol=0.03,
+            fail_on_recompile=True,
+            runner=lambda _url: {"accuracy": 0.90},
+        )
+        with (
+            patch(
+                "sglang.test.accuracy_test_runner.served",
+                return_value=contextlib.nullcontext("http://127.0.0.1:30000"),
+            ),
+            patch(
+                "sglang.test.recompilation_gate.check_no_serving_recompilation",
+                return_value=["shard 0: tpu_serving_compiles=1 (expected 0)"],
+            ),
+        ):
+            res = run_accuracy_test(
+                SimpleNamespace(
+                    model_path="openai/gpt-oss-120b",
+                    variant="bf16",
+                    launcher=None,
+                ),
+                params,
+                base_url="http://127.0.0.1:30000",
+            )
+        self.assertFalse(res.passed)
+        self.assertIn("tpu_serving_compiles=1", res.error)
+
 
 # The cache an op "compiles" into, set per test.
 _OP_CACHE: list[_FakeCache] = []

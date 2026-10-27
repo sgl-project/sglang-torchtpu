@@ -124,6 +124,9 @@ class TestExpertParamStager(CustomTestCase):
         stager.flush(second)
         self.assertTrue(torch.all(first == 7))
         self.assertTrue(torch.all(second == 9))
+        self.assertTrue(stager._pool)
+        stager.flush_all()
+        self.assertFalse(stager._pool)
 
     def test_upload_chunks_preserve_expert_order_and_uneven_last_chunk(self):
         stager = expert_loading.ExpertParamStager()
@@ -155,6 +158,8 @@ class TestExpertParamStager(CustomTestCase):
                 inner.host_param(param).data.fill_(6)
             self.assertIs(expert_loading.get_expert_stager(), outer)
             self.assertTrue(torch.all(param == 6))
+            self.assertFalse(inner._pool)
+            self.assertFalse(inner._staged)
         self.assertIsNone(expert_loading.get_expert_stager())
 
     def test_exception_clears_context_without_uploading_partial_weights(self):

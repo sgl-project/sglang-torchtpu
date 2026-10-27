@@ -521,14 +521,17 @@ def tpu_attention(
             is_causal,
             reason,
         )
+    # torch_tpu's bf16 SDPA is 1.6-2x flash attention's error (4.2e-3 against
+    # 2.6e-3 relative at a 512-token causal text-encoder shape); the fallback
+    # shapes are short, so float32 costs ~0.3 ms a call and lands at 3e-5.
     return F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
+        query.float(),
+        key.float(),
+        value.float(),
         is_causal=is_causal,
         scale=scale,
         enable_gqa=query.shape[1] != key.shape[1],
-    )
+    ).to(query.dtype)
 
 
 class TpuSplashAttentionBackend(SDPABackend):

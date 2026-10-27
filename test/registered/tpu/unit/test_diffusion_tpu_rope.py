@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""On-device check that the TPU RoPE pair swap matches the strided form."""
+"""On-device check that the TPU RoPE pair swap matches the CUDA kernel's numerics."""
 
 import importlib.util
 import unittest
 
 import torch
 
-from sglang.kernels.ops.diffusion.common.fallback_torch import (
-    apply_rotary_embedding_native,
-)
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.utils import is_in_ci
 from sglang_tpu.multimodal_gen.rope import (
@@ -34,27 +31,44 @@ class TestRopePairSwapTpu(unittest.TestCase):
         # Do not turn initialization/lowering failures into a successful skip.
         torch.zeros(1, device="tpu").cpu()
 
-    def test_bf16_eager_matches_the_strided_form_exactly(self):
+    @staticmethod
+    def _cuda_reference(x, cos, sin, interleaved):
+        # The CUDA Triton kernel: float32 tables and math, one rounding to x.dtype.
+        if interleaved:
+            cos, sin = cos[..., ::2], sin[..., ::2]
+        x = x.cpu().float()
+        c, s = cos.cpu().float().unsqueeze(-2), sin.cpu().float().unsqueeze(-2)
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        return torch.stack((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1).flatten(-2)
+
+    def _assert_matches_cuda(self, actual, expected_fp32):
+        expected = expected_fp32.bfloat16().float()
+        actual = actual.cpu().float()
+        # Only float32 rounding-order ties (FMA or not) may flip a bf16 rounding.
+        ulp = expected.abs().clamp_min(2**-126) * 2**-7
+        self.assertTrue(bool(((actual - expected).abs() <= ulp).all()))
+        self.assertLess((actual != expected).float().mean().item(), 1e-3)
+
+    def test_bf16_eager_matches_the_cuda_kernel(self):
         torch.manual_seed(0)
         for head_dim in (64, 128):
             for interleaved in (False, True):
                 with self.subTest(head_dim=head_dim, interleaved=interleaved):
-                    x = torch.randn(33, 4, head_dim).bfloat16().to("tpu")
-                    angles = torch.randn(33, head_dim // 2)
+                    x = (torch.randn(33, 4, head_dim) * 3).bfloat16().to("tpu")
+                    angles = torch.randn(33, head_dim // 2) * 100
                     cos, sin = angles.cos(), angles.sin()
                     if interleaved:
                         cos = cos.repeat_interleave(2, dim=-1)
                         sin = sin.repeat_interleave(2, dim=-1)
                     cos, sin = cos.to("tpu"), sin.to("tpu")
                     actual = apply_rotary_embedding_pair_swap(x, cos, sin, interleaved)
-                    expected = apply_rotary_embedding_native(x, cos, sin, interleaved)
                     self.assertEqual(actual.device.type, "tpu")
-                    torch.testing.assert_close(
-                        actual.cpu(), expected.cpu(), rtol=0, atol=0
+                    self._assert_matches_cuda(
+                        actual, self._cuda_reference(x, cos, sin, interleaved)
                     )
 
-    def test_bf16_compiled_matches_compiled_strided_form(self):
-        # XLA may fuse the two forms differently under torch.compile.
+    def test_bf16_compiled_matches_the_cuda_kernel(self):
+        # XLA may fuse the float32 math (FMA or not) under torch.compile.
         import torch_tpu._internal.compile  # noqa: F401
 
         torch.manual_seed(0)
@@ -80,14 +94,9 @@ class TestRopePairSwapTpu(unittest.TestCase):
         pair_swap = torch.compile(
             apply_rotary_embedding_pair_swap, backend="tpu", dynamic=False
         )
-        native = torch.compile(
-            apply_rotary_embedding_native, backend="tpu", dynamic=False
+        self._assert_matches_cuda(
+            pair_swap(x, cos, sin, False), self._cuda_reference(x, cos, sin, False)
         )
-        actual = pair_swap(x, cos, sin, False).cpu().float()
-        expected = native(x, cos, sin, False).cpu().float()
-        # Within one bf16 ulp of the compiled strided form.
-        ulp = expected.abs().clamp_min(2**-126) * 2**-7
-        self.assertTrue(bool(((actual - expected).abs() <= ulp).all()))
 
 
 if __name__ == "__main__":

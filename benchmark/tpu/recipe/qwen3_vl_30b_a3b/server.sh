@@ -47,11 +47,13 @@ MM_PROCESS_CONFIG='{"image":{"min_pixels":65536,"max_pixels":313600}}'
 # --watchdog-timeout: the EXTEND/decode graph captures outlast the 300s default
 # and trip the watchdog into repeated stack dumps mid-compile.
 # direct tracing compiles the ViT buckets and the VL decoder graphs
-# concurrently (#1216): cold start ~465 s instead of ~2340 s under dynamo, same
-# MMMU-Pro score. A caller's EXTRA_ARGS follows and can pass
-# --tpu-compile-tracer dynamo to compare.
+# concurrently (#1216), and --use-spmd-compile compiles each SPMD-safe warmup
+# graph on one owner rank and broadcasts the executable across TP ranks
+# (#1623: cold start 303 s -> 117 s, peak host RSS 422 -> 189 GiB, same
+# MMMU-Pro score, tpu7x 2x2x1, cache off). A caller's EXTRA_ARGS follows and
+# can pass --no-use-spmd-compile or --tpu-compile-tracer dynamo to compare.
 export EXTRA_ARGS="--trust-remote-code --watchdog-timeout 3600 \
---tpu-compile-tracer direct \
+--tpu-compile-tracer direct --use-spmd-compile \
 --served-model-name ${SERVED_MODEL_NAME:-qwen3-vl-30b-a3b} \
 --mm-process-config $MM_PROCESS_CONFIG${EXTRA_ARGS:+ $EXTRA_ARGS}"
 

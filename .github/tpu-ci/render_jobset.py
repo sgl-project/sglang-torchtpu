@@ -9,7 +9,7 @@ Two modes:
                       --hosts N [--weights-pvc <pvc>] [--name <run-name>]
       every host runs the launch script (it owns model+config); rank-0 runs each file.
 
-The SLICE (topology + pool) is looked up by host count in topology.yaml. Only the render
+The slice shape and Kueue queue are looked up by host count in topology.yaml. Only the render
 vars are substituted; the container's own $spid / ${TPU_WORKER_ID} stay literal.
 ${WEIGHTS_VOLUME}/${WEIGHTS_MOUNT} expand to indented YAML blocks (empty when no PVC),
 as does ${SERVICE_ACCOUNT} (empty -> namespace default KSA).
@@ -36,6 +36,7 @@ import os
 import re
 import sys
 
+import ci_topology
 import yaml
 from ci_register_loader import ci_register as _ci_register
 
@@ -62,19 +63,18 @@ WEIGHTS_VOLUME_TMPL = (
     "                    claimName: {pvc}\n"
     "                    readOnly: true"
 )
-# Pod-level nodeAffinity restricting the pod to this (lane, hosts)'s pools. Indented to sit
-# under the pod spec, same level as nodeSelector. Kueue's ResourceFlavor injects the exact
-# ci-tpu-pool via nodeSelector on admission; this is the outer bound, and it is what keeps a
-# JobSet Kueue is NOT managing off the dev pools (manageJobsWithoutQueueName is false).
-POOL_AFFINITY_TMPL = (
+# Pod-level nodeAffinity restricting the pod to CI pools. Indented to sit under the pod
+# spec, same level as nodeSelector. Kueue's ResourceFlavor injects the exact ci-tpu-pool via
+# nodeSelector on admission; this is the outer bound, and it is what keeps a JobSet Kueue
+# is NOT managing off the dev pools (manageJobsWithoutQueueName is false).
+POOL_AFFINITY = (
     "              affinity:\n"
     "                nodeAffinity:\n"
     "                  requiredDuringSchedulingIgnoredDuringExecution:\n"
     "                    nodeSelectorTerms:\n"
     "                      - matchExpressions:\n"
     "                          - key: ci-tpu-pool\n"
-    "                            operator: In\n"
-    "                            values: [{pools}]"
+    "                            operator: Exists"
 )
 
 
@@ -157,12 +157,8 @@ def main():
     # Plain words only -- the command is inlined into the pod script unquoted.
     ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
-    # Which lane's pools to use. pr-gate and nightly both own 1- and 2-host slices, so a
-    # host count alone no longer identifies a pool (see topology.yaml).
+    # Which lane's Kueue queue to submit to; every lane shares every CI pool of a shape.
     ap.add_argument("--lane", default="pr-gate")
-    # Overrides topology.yaml's `pools` for this (lane, hosts). discover_pools.py supplies
-    # it so a new slice needs no edit there; empty falls back to the static list.
-    ap.add_argument("--pools", default="")
     # P/D mode: hosts per role, each role on its own slice. Both must be set
     # (with --exec); --hosts is ignored in this mode.
     ap.add_argument("--pd-prefill-hosts", type=int, default=0)
@@ -232,19 +228,15 @@ def main():
         weights_pvcs = yaml.safe_load(f)
     a.weights_pvc = weights_pvcs.get(a.weights_pvc, a.weights_pvc)
 
-    lanes = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["lanes"]
-    if a.lane not in lanes:
-        ap.error(f"unknown --lane {a.lane!r}; topology.yaml has {sorted(lanes)}")
-    slices = lanes[a.lane]
+    topo = ci_topology.load(f"{a.dir}/topology.yaml")
+    if a.lane not in topo["lanes"]:
+        ap.error(f"unknown --lane {a.lane!r}; topology.yaml has {topo['lanes']}")
 
     def slice_for(hosts):
-        sl = slices.get(hosts, slices.get(str(hosts)))
-        if not sl:
-            sys.exit(
-                f"no slice for lane={a.lane} hosts={hosts} in topology.yaml "
-                f"(lane has {sorted(slices)})"
-            )
-        return sl
+        shape = ci_topology.shape_for_hosts(topo, hosts)
+        if shape is None:
+            sys.exit(f"no slice shape with {hosts} hosts in topology.yaml")
+        return {"topology": shape, "queue": ci_topology.queue_name(a.lane, hosts)}
 
     if a.pd_prefill_hosts or a.pd_decode_hosts:
         if partitioned:
@@ -293,12 +285,6 @@ def main():
             "    alpha.jobset.sigs.k8s.io/exclusive-topology: "
             "cloud.google.com/gke-nodepool"
         )
-        # Both roles draw from the same discovered pool set (--pools already unions
-        # topology.yaml's entry); Kueue's per-PodSet flavor is what separates the
-        # two roles onto different slices within it.
-        pd_pools = a.pools.split() or list(
-            dict.fromkeys(prefill_slice["pools"] + decode_slice["pools"])
-        )
         pvc = a.weights_pvc
         vals = {
             "IMAGE": a.image,
@@ -311,14 +297,10 @@ def main():
             "DECODE_HOSTS": str(a.pd_decode_hosts),
             "QUEUE": prefill_slice["queue"],
             "PREFILL_TOPOLOGY": prefill_slice["topology"],
-            "PREFILL_POOL_AFFINITY": POOL_AFFINITY_TMPL.format(
-                pools=", ".join(pd_pools)
-            ),
+            # Kueue's per-PodSet flavor puts the two roles on different slices.
+            "PREFILL_POOL_AFFINITY": POOL_AFFINITY,
             "DECODE_TOPOLOGY": decode_slice["topology"],
-            "DECODE_POOL_AFFINITY": POOL_AFFINITY_TMPL.format(
-                pools=", ".join(pd_pools)
-            ),
-            "POOL_LIST": " ".join(pd_pools),
+            "DECODE_POOL_AFFINITY": POOL_AFFINITY,
             "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
             "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
             "SERVICE_ACCOUNT": (
@@ -368,9 +350,6 @@ def main():
 
     sl = slice_for(hosts)
 
-    # Discovered set when --pools is passed (it already unions in topology.yaml's entry).
-    pools = a.pools.split() or sl["pools"]
-
     # Suite mode's deadline scales with the suite (same est_time formula as
     # _tpu-test's poll budget, keeping the two in agreement), discounted for
     # chip sharing when it is on. Exec gets 7200: the combo rows budget WAIT_SECS=2400 for
@@ -399,8 +378,7 @@ def main():
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
         "TOPOLOGY": sl["topology"],
-        "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(pools)),
-        "POOL_LIST": " ".join(pools),
+        "POOL_AFFINITY": POOL_AFFINITY,
         "QUEUE": sl["queue"],
         "RUN_NAME": run_name,
         "SUITE": suite,

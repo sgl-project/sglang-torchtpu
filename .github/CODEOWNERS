@@ -123,70 +123,70 @@
 # Fork-wide default owners. CODEOWNERS is last-match-wins: this line sits below the
 # upstream block so upstream-only owners (no write access here) never shadow it, and
 # above the fork-specific TPU lines, which repeat this list on purpose.
-* @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174
+* @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
 
 # ---- TPU area owners (fork-only, TPU-specific paths only). Keep below the upstream block; last match wins. ----
 
 # TPU backend folder (whole tree). Kept above the narrower blocks below so their
 # more specific owner lists still win on last match.
-/python/sglang/srt/hardware_backend/tpu  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174
+/python/sglang/srt/hardware_backend/tpu  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
 
 # TPU kernels (Pallas attention / MoE / quantized matmul / KV write)
-/sglang_tpu/attention/pallas                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/moe/pallas                                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/kernels                        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/attention_*pallas*.py          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/pallas_*.py                    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/*_moe*.py                      @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/fp8_linear.py                  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/quantized_matmul.py            @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/qk_norm_rope.py                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/kv_*write.py                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/kv_mxint8.py                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/distributed_topk_pallas.py     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/fused_rs_sequence_parallel.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/unit/layers/attention/pallas                          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/unit/layers/moe/pallas                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/unit/test_pallas_*.py                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/unit/test_gmm_v2_*.py                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/unit/test_sc_*.py                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/unit/test_fp8_*.py                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/unit/test_gdn_*.py                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/unit/test_*rpa*.py                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/unit/test_ragged_paged_attention_v3.py            @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
-/benchmark/kernels/pallas_fused_moe                                    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174
+/sglang_tpu/attention/pallas                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/moe/pallas                                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/kernels                        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/attention_*pallas*.py          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/pallas_*.py                    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/*_moe*.py                      @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/fp8_linear.py                  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/quantized_matmul.py            @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/qk_norm_rope.py                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/kv_*write.py                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/kv_mxint8.py                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/distributed_topk_pallas.py     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/sglang_tpu/fused_rs_sequence_parallel.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/unit/layers/attention/pallas                          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/unit/layers/moe/pallas                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_pallas_*.py                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_gmm_v2_*.py                             @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_sc_*.py                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_fp8_*.py                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_gdn_*.py                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_*rpa*.py                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_ragged_paged_attention_v3.py            @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
+/benchmark/kernels/pallas_fused_moe                                    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @yaochengji @rupengliu-meta @yinlin09 @junyanxu @niehen6174 @jcc-google @brianseung-google @wenxindongwork @cjx0709 @JamesBrianD
 
 # P/D disaggregation + KV transfer (raiden, TPU transport, host KV pool)
-/sglang_tpu/disaggregation/tpu                        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/disaggregation/raiden                     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/raiden_*.py          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/kv_copy_worker.py    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/sglang_tpu/kv_pool_host.py      @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/registered/unit/disaggregation/test_raiden_*.py        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/registered/unit/disaggregation/test_tpu_*.py           @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/unit/test_disagg_*.py                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/registered/unit/hardware_backend/tpu/test_*raiden*.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/e2e/pd_reshard_harness.py               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/registered/tpu/e2e/*_pd_*.py                           @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/manual/kv_transfer/test_raiden_*.py                    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/manual/kv_transfer/test_reshard_schedule.py            @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/test/manual/tpu/test_tpu_raiden_*.py                        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
-/.github/tpu-ci/jobset-tpu-pd.yaml                           @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
+/sglang_tpu/disaggregation/tpu                        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/sglang_tpu/disaggregation/raiden                     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/sglang_tpu/raiden_*.py          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/sglang_tpu/kv_copy_worker.py    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/sglang_tpu/kv_pool_host.py      @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/unit/disaggregation/test_raiden_*.py        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/unit/disaggregation/test_tpu_*.py           @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_disagg_*.py                   @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/unit/hardware_backend/tpu/test_*raiden*.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/e2e/pd_reshard_harness.py               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/e2e/*_pd_*.py                           @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/manual/kv_transfer/test_raiden_*.py                    @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/manual/kv_transfer/test_reshard_schedule.py            @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/manual/tpu/test_tpu_raiden_*.py                        @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/.github/tpu-ci/jobset-tpu-pd.yaml                           @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD
 
 # Speculative decoding on TPU (EAGLE3, DFlash, spec compile policy)
-/sglang_tpu/dflash_*.py                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/sglang_tpu/eagle_utils_tpu.py                          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/sglang_tpu/spec_op_*.py                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/sglang_tpu/compilation/spec_decode_compile_policy*.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/test/registered/tpu/unit/test_dflash_*.py                                          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/test/registered/unit/hardware_backend/tpu/test_eagle_*.py                          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/test/registered/unit/hardware_backend/tpu/test_spec_op_precompile.py               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/test/registered/tpu/e2e/*_spec*.py                                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/test/registered/tpu/e2e/*_dflash*.py                                               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/test/registered/tpu/e2e/*_eagle3*.py                                               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/test/registered/tpu/nightly-perf/*_dflash_*.py                                     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/test/registered/tpu/nightly-perf/*_eagle3_*.py                                     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
-/benchmark/tpu/spec                                                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174
+/sglang_tpu/dflash_*.py                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/sglang_tpu/eagle_utils_tpu.py                          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/sglang_tpu/spec_op_*.py                                @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/sglang_tpu/compilation/spec_decode_compile_policy*.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/unit/test_dflash_*.py                                          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/unit/hardware_backend/tpu/test_eagle_*.py                          @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/unit/hardware_backend/tpu/test_spec_op_precompile.py               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/e2e/*_spec*.py                                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/e2e/*_dflash*.py                                               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/e2e/*_eagle3*.py                                               @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/nightly-perf/*_dflash_*.py                                     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/test/registered/tpu/nightly-perf/*_eagle3_*.py                                     @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
+/benchmark/tpu/spec                                                                 @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @junyanxu @yinlin09 @niehen6174 @jcc-google @cjx0709 @JamesBrianD
 
 # Cross-cutting P/D + spec; last so it wins over the two blocks above
-/test/registered/tpu/e2e/*_pd_*spec*.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174
+/test/registered/tpu/e2e/*_pd_*spec*.py  @alexnails @Bob-Chen222 @hlFu @angelayi @zou3519 @qizzzh @wyzhang @pyc96 @madongfly @yinlin09 @junyanxu @niehen6174 @jcc-google @cjx0709 @JamesBrianD

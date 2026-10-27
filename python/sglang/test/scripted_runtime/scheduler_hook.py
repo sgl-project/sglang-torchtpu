@@ -55,11 +55,11 @@ class ScriptedBatchRecord:
 
 
 def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
-    """Run the engine until the server warmup request has been received and
-    fully processed, so scripts never observe foreign warmup traffic."""
+    """Drain warmup and startup cleanup before blocking for script commands."""
     scheduler = ctx.scheduler
     cfg = resolving_view(scheduler.server_args)
-    if cfg.skip_server_warmup:
+    wait_for_freeze = not envs.SGLANG_RUST_SERVER.get()
+    if cfg.skip_server_warmup and not wait_for_freeze:
         logger.info("scripted_runtime: skip_server_warmup set, not driving warmup")
         return
 
@@ -80,10 +80,15 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
                 "scripted_runtime: server warmup did not complete within "
                 f"{WARMUP_DRIVE_TIMEOUT_S}s "
                 f"(work_reqs_seen={proxy.work_reqs_seen}, "
+                f"freeze_gc_reqs_seen={proxy.freeze_gc_reqs_seen}, "
                 f"idle_streak={idle_streak})"
             )
         yield
-        if proxy.work_reqs_seen > 0 and scheduler.is_fully_idle():
+        warmup_seen = cfg.skip_server_warmup or proxy.work_reqs_seen > 0
+        # HTTP readiness now waits for freeze completion, including when warmup
+        # is skipped. Blocking for RunScript first would deadlock startup.
+        freeze_seen = not wait_for_freeze or proxy.freeze_gc_reqs_seen > 0
+        if warmup_seen and freeze_seen and scheduler.is_fully_idle():
             idle_streak += 1
         else:
             idle_streak = 0

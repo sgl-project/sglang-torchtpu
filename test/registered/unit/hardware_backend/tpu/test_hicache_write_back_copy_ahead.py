@@ -1,10 +1,11 @@
 """Unit tests for write_back copy-ahead (sglang_tpu/hicache_write_back_copy_ahead.py).
 
-A real FULL-only ``UnifiedRadixCache`` on CPU with a fake raiden controller
-whose D2H futures complete only when the test says so. Covers the contracts
-the TPU e2e gate cannot isolate: which victims the window copies and how
-many it keeps in flight, that an eviction never waits for the window's own
-copies, and that a victim past the window still takes the synchronous backup.
+A real ``UnifiedRadixCache`` on CPU (FULL-only, FULL+SWA where SWA matters) with
+a fake raiden controller whose D2H futures complete only when the test says so.
+Covers the contracts the TPU e2e gate cannot isolate: which victims the window
+copies and how many it keeps in flight, that an eviction waits for the window's
+copies only when it would otherwise come up short, and that a victim past the
+window still takes the synchronous backup without waiting for the window.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,6 +21,7 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -42,12 +45,13 @@ from sglang_tpu.hicache_write_back_copy_ahead import (
     attach_copy_ahead,
     resolve_copy_ahead_tokens,
 )
-from sglang_tpu.raiden_hybrid_cache_controller import (
-    TpuRaidenHybridCacheController,
-)
 from sglang_tpu.raiden_transfer import NOOP_EVENT
+from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+    TpuDMAHybridCacheController,
+)
 
 FULL = ComponentType.FULL
+SWA = ComponentType.SWA
 
 
 class _FakeFuture:
@@ -88,7 +92,7 @@ class _FakeHostPool:
         self.used = 0
 
 
-class _FakeRaidenController(TpuRaidenHybridCacheController):
+class _FakeRaidenController(TpuDMAHybridCacheController):
     """The controller surface the cache's backup and ack paths touch."""
 
     def __init__(self, *, host_capacity: int, write_policy: str = "write_back"):
@@ -178,6 +182,45 @@ def _build_cache(
     return UnifiedRadixCache(params), allocator
 
 
+def _build_swa_cache(
+    *, kv_size: int = 64, sliding_window_size: int = 16
+) -> tuple[UnifiedRadixCache, SWATokenToKVPoolAllocator]:
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
+    req_to_token_pool = ReqToTokenPool(
+        size=8, max_context_len=128, device="cpu", enable_memory_saver=False
+    )
+    kv_pool = SWAKVPool(
+        size=kv_size,
+        size_swa=kv_size,
+        page_size=1,
+        dtype=torch.bfloat16,
+        head_num=2,
+        head_dim=64,
+        swa_attention_layer_ids=[0],
+        full_attention_layer_ids=[1],
+        device="cpu",
+    )
+    allocator = SWATokenToKVPoolAllocator(
+        size=kv_size,
+        size_swa=kv_size,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device="cpu",
+        kvcache=kv_pool,
+        need_sort=False,
+    )
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+        page_size=1,
+        sliding_window_size=sliding_window_size,
+        tree_components=(FULL, SWA),
+        tree_core_backend="python",
+    )
+    return UnifiedRadixCache(params), allocator
+
+
 def _attach_write_back(
     cache: UnifiedRadixCache, *, host_capacity: int, copy_ahead_tokens: int
 ) -> _FakeRaidenController:
@@ -220,6 +263,8 @@ class TestWriteBackCopyAhead(CustomTestCase):
                 "_evict",
                 "check_hicache_events",
                 "_finish_write_through_ack",
+                "writing_check",
+                "backup_node_for_write_back",
             )
         }
         had_copy_ahead_attr = "_write_back_copy_ahead" in vars(UnifiedRadixCache)
@@ -266,7 +311,9 @@ class TestWriteBackCopyAhead(CustomTestCase):
         self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, set())
         self.assertFalse(cache.tree_core.is_backuped(c))
 
-    def test_eviction_demotes_acked_victims_and_never_waits_for_window_copies(self):
+    def test_eviction_demotes_acked_victims_and_waits_for_window_copies_only_when_short(
+        self,
+    ):
         cache, allocator = _build_cache()
         controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=16)
         a = _insert(cache, allocator, [1] * 8)
@@ -287,17 +334,18 @@ class TestWriteBackCopyAhead(CustomTestCase):
         # The third leaf is now the frontier and its copy is in flight.
         cache.check_hicache_events()
         self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, {c})
-        # Nothing is evictable while it copies; the eviction returns instead of
-        # draining the window's ack as the policy's trailing drain would.
+        # Nothing else is evictable; returning short would retract a request,
+        # so the eviction waits for that copy once and demotes the victim.
         result = cache.evict(EvictParams(num_tokens=8))
-        self.assertEqual(result.num_tokens_evicted, 0)
-        self.assertEqual(controller.waits, [])
-        self.assertFalse(_node(cache, c).evicted)
+        self.assertEqual(result.num_tokens_evicted, 8)
+        self.assertEqual(len(controller.waits), 1)
+        self.assertTrue(_node(cache, c).evicted)
+        self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, set())
 
-    def test_eviction_leaves_window_copies_to_the_step_poll(self):
-        """An eviction never synchronizes ranks for the window: a copy that lands
-        after the step's poll keeps its victim locked until the next step's
-        poll, and the eviction neither runs a collective nor blocks."""
+    def test_short_eviction_finishes_landed_window_copies_without_a_collective(self):
+        """A copy that lands after the step's poll still locks its victim; an
+        eviction that needs the victim finishes the landed ack itself, without
+        a collective or a blocking wait."""
         cache, allocator = _build_cache()
         controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=16)
         a = _insert(cache, allocator, [1] * 8)
@@ -310,12 +358,9 @@ class TestWriteBackCopyAhead(CustomTestCase):
             result = cache.evict(EvictParams(num_tokens=8))
 
         self.assertEqual(polls.call_count, 0)
-        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertEqual(result.num_tokens_evicted, 8)
         self.assertEqual(controller.waits, [])
-        cache.check_hicache_events()
-        cache.evict(EvictParams(num_tokens=8))
         self.assertTrue(_node(cache, a).evicted)
-        self.assertEqual(controller.waits, [])
 
     def test_a_victim_past_the_window_is_backed_up_synchronously(self):
         cache, allocator = _build_cache()
@@ -448,6 +493,185 @@ class TestWriteBackCopyAhead(CustomTestCase):
         self.assertFalse(cache.tree_core.is_backuped(b))
         self.assertEqual(_node(cache, b).component_data[FULL].lock_ref, 0)
         self.assertIn(_node(cache, b), cache.tree_core.evictable_device_leaves)
+
+    def test_synchronous_backup_waits_for_its_own_ack_not_the_window(self):
+        """A victim past the window is backed up synchronously; that wait must
+        not also block on window copies still in flight."""
+        cache, allocator = _build_cache()
+        controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=8)
+        a = _insert(cache, allocator, [1] * 8)
+        b = _insert(cache, allocator, [2] * 8)
+        cache.check_hicache_events()
+        self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, {a})
+
+        result = cache.evict(EvictParams(num_tokens=8))
+
+        self.assertEqual(result.num_tokens_evicted, 8)
+        self.assertTrue(_node(cache, b).evicted)
+        self.assertEqual(len(controller.waits), 1)
+        self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, {a})
+        self.assertEqual(len(controller.ack_write_queue), 1)
+        self.assertEqual(controller.ack_write_queue[0].node_ids, [a])
+
+    def test_barrier_backup_leaves_unrelated_window_copies_queued(self):
+        """The barrier backup run before an internal-state tombstone waits for
+        its own copy only; window copies elsewhere stay with the step's poll."""
+        cache, allocator = _build_cache()
+        controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=8)
+        a = _insert(cache, allocator, [1] * 8)
+        b = _insert(cache, allocator, [2] * 8)
+        cache.check_hicache_events()
+        self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, {a})
+
+        self.assertTrue(cache.backup_node_for_write_back(b))
+
+        self.assertTrue(cache.tree_core.is_backuped(b))
+        self.assertEqual(len(controller.waits), 1)
+        self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, {a})
+        self.assertEqual([ack.node_ids for ack in controller.ack_write_queue], [[a]])
+
+    def test_each_order_keeps_its_copies_in_flight_within_its_share(self):
+        """Copies in flight are locked, so neither walk sees them again; each
+        order must subtract its own, or every step before the acks land adds
+        another share and the window overflows."""
+        cache, allocator = _build_swa_cache(sliding_window_size=4)
+        _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=16)
+        leaves = [_insert(cache, allocator, [k] * 4) for k in range(1, 7)]
+        cache.tree_core.has_swa_host_pool = True
+        copy_ahead = cache._write_back_copy_ahead
+
+        # Full-only copies: the fake controller has no SWA host pool.
+        with (
+            patch.object(
+                cache.components[SWA], "build_hicache_transfers", return_value=None
+            ),
+            patch.object(copy_ahead, "_reserve_swa_host"),
+        ):
+            copy_ahead.refill()
+            copy_ahead.refill()
+
+        self.assertEqual(copy_ahead.pending_node_ids, set(leaves[:4]))
+        self.assertEqual(copy_ahead._inflight(swa=False), 12)
+        self.assertEqual(copy_ahead._inflight(swa=True), 4)
+
+    def test_victim_fitting_beside_copies_in_flight_is_copied(self):
+        """A copy still in flight takes its share of the window once, not twice:
+        a victim that fits in what is left is copied."""
+        cache, allocator = _build_cache()
+        _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=8)
+        a = _insert(cache, allocator, [1] * 8)
+        b = _insert(cache, allocator, [2] * 8)
+        cache.check_hicache_events()
+        copy_ahead = cache._write_back_copy_ahead
+        self.assertEqual(copy_ahead.pending_node_ids, {a})
+
+        copy_ahead.copy_ahead_tokens = 16
+        cache.check_hicache_events()
+
+        self.assertEqual(copy_ahead.pending_node_ids, {a, b})
+
+    def test_victim_crossing_the_window_end_is_not_copied(self):
+        cache, allocator = _build_cache()
+        controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=12)
+        a = _insert(cache, allocator, [1] * 8)
+        b = _insert(cache, allocator, [2] * 8)
+
+        cache.check_hicache_events()
+
+        self.assertEqual(cache._write_back_copy_ahead.pending_node_ids, {a})
+        self.assertEqual(controller.host.used, 8)
+        self.assertFalse(cache.tree_core.is_backuped(b))
+
+    def test_swa_order_is_copied_ahead_even_when_full_victims_fill_the_window(self):
+        """SWA-driven evictions get their own share of the window, and only an
+        internal node whose tombstone would need a synchronous backup (SWA and
+        Full KV both device-only) is copied for it."""
+        cache, allocator = _build_swa_cache(sliding_window_size=4)
+        _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=16)
+        parent = _insert(cache, allocator, [1] * 8)
+        _insert(cache, allocator, [1] * 8 + [2] * 8)
+        _insert(cache, allocator, [3] * 8)
+        cache.tree_core.has_swa_host_pool = True
+        copy_ahead = cache._write_back_copy_ahead
+
+        def copied_for_swa():
+            # Only the SWA order's choices are recorded.
+            with (
+                patch.object(copy_ahead, "_cover_full"),
+                patch.object(copy_ahead, "_keep_copied") as keep,
+                patch.object(copy_ahead_module, "_SWA_WINDOW_DIVISOR", 1),
+            ):
+                copy_ahead.refill()
+            return {call.args[0].id for call in keep.call_args_list}
+
+        self.assertIn(parent, copied_for_swa())
+
+        # The Full order leaves the SWA share free for copies in flight.
+        with (
+            patch.object(copy_ahead, "_cover_full") as cover_full,
+            patch.object(copy_ahead, "_keep_copied"),
+        ):
+            copy_ahead.refill()
+        self.assertEqual(cover_full.call_args.kwargs["budget"], 12)
+
+        # Its SWA already on host: the tombstone needs no backup, so no copy.
+        _node(cache, parent).component_data[SWA].host_value = torch.arange(8)
+        self.assertNotIn(parent, copied_for_swa())
+
+    def test_swa_order_copy_keeps_its_pin_after_it_lands(self):
+        """Once the SWA order's copy of an internal node lands, the node is
+        backed up but still inside the window; dropping its pin would let host
+        pressure reclaim the copy and the node would be copied again."""
+        cache, allocator = _build_swa_cache(sliding_window_size=4)
+        controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=16)
+        parent = _insert(cache, allocator, [1] * 8)
+        _insert(cache, allocator, [1] * 8 + [2] * 8)
+        cache.tree_core.has_swa_host_pool = True
+        copy_ahead = cache._write_back_copy_ahead
+
+        with (
+            patch.object(copy_ahead, "_cover_full"),
+            patch.object(copy_ahead_module, "_SWA_WINDOW_DIVISOR", 1),
+            patch.object(
+                cache.components[SWA], "build_hicache_transfers", return_value=None
+            ),
+            patch.object(copy_ahead, "_reserve_swa_host"),
+        ):
+            cache.check_hicache_events()
+            self.assertIn(parent, copy_ahead.pending_node_ids)
+            copied = copy_ahead.num_backups
+            controller.land_all()
+            cache.check_hicache_events()
+
+        self.assertTrue(cache.tree_core.is_backuped(parent))
+        self.assertGreater(_node(cache, parent).component_data[FULL].host_lock_ref, 0)
+        self.assertEqual(copy_ahead.num_backups, copied)
+
+    def test_window_pin_takes_no_swa_host_lock_on_the_path(self):
+        """A window pin holds only the victim's Full host copy; its SWA window
+        stays on the SWA host LRU."""
+        cache, allocator = _build_swa_cache(sliding_window_size=16)
+        controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=4)
+        a = _insert(cache, allocator, [1] * 8)
+        b = _insert(cache, allocator, [1] * 8 + [2] * 4)
+        leaf = _node(cache, b)
+        # Already on host, so the window pins it without a copy.
+        leaf.component_data[FULL].host_value = controller.host.alloc(4)
+        cache.tree_core._update_duplicate_tracking(leaf)
+        copy_ahead = cache._write_back_copy_ahead
+
+        copy_ahead.refill()
+
+        self.assertEqual(copy_ahead.pending_node_ids, set())
+        self.assertEqual(leaf.component_data[FULL].host_lock_ref, 1)
+        for node_id in (a, b):
+            self.assertEqual(_node(cache, node_id).component_data[SWA].host_lock_ref, 0)
+
+        # Leaving the window releases the receipt it took.
+        copy_ahead.copy_ahead_tokens = 0
+        copy_ahead.refill()
+        self.assertEqual(leaf.component_data[FULL].host_lock_ref, 0)
+        cache.sanity_check()
 
 
 class TestCopyAheadSelection(CustomTestCase):

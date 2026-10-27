@@ -1,4 +1,4 @@
-"""Join TPU warmups after every model runner has submitted its graph grid."""
+"""Submit and join TPU model and eager-operation warmups during startup."""
 
 from __future__ import annotations
 
@@ -62,6 +62,24 @@ _CURRENT: ContextVar[WarmupQueue | None] = ContextVar("tpu_warmup_queue", defaul
 
 def current_warmup_queue() -> WarmupQueue | None:
     return _CURRENT.get()
+
+
+@contextmanager
+def eager_warmup() -> Iterator[Callable[[torch.Tensor], None]]:
+    """Submit the usual D2H boundaries, then join before releasing their buffers."""
+    stream = torch.tpu.current_stream()
+    host_outputs: list[torch.Tensor] = []
+
+    def materialize(value: torch.Tensor) -> None:
+        # D2H materializes views as well as their base buffers, like .cpu().
+        # TorchTPU retains the destination pointer; keep its storage until join.
+        host_outputs.append(value.to("cpu", non_blocking=True))
+
+    try:
+        yield materialize
+    finally:
+        stream.synchronize()
+        host_outputs.clear()
 
 
 @contextmanager

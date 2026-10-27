@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime import scheduler_hook
@@ -23,6 +24,45 @@ def _empty_gen():
 def _raising_gen():
     raise ValueError("scripted-boom")
     yield  # pragma: no cover — makes this a generator function
+
+
+class TestStartupCleanup(CustomTestCase):
+    def test_http_startup_drains_freeze_before_waiting_for_scripts(self):
+        for skip_warmup in (False, True):
+            for pp_size in (1, 2):
+                with self.subTest(skip_warmup=skip_warmup, pp_size=pp_size):
+                    cfg = SimpleNamespace(
+                        skip_server_warmup=skip_warmup,
+                        pp_size=pp_size,
+                        pp_async_batch_depth=1,
+                    )
+                    scheduler = MagicMock()
+                    scheduler.is_fully_idle.return_value = True
+                    proxy = SimpleNamespace(work_reqs_seen=1, freeze_gc_reqs_seen=0)
+                    ctx = SimpleNamespace(
+                        scheduler=scheduler, _tokenizer_recv_proxy=proxy
+                    )
+                    with (
+                        patch.object(
+                            scheduler_hook, "resolving_view", return_value=cfg
+                        ),
+                        patch.object(
+                            scheduler_hook.envs.SGLANG_RUST_SERVER,
+                            "get",
+                            return_value=False,
+                        ),
+                    ):
+                        driver = scheduler_hook._drive_engine_through_warmup(ctx)
+                        rotations = 2 * (pp_size + cfg.pp_async_batch_depth)
+                        # Stay receptive to HTTP cleanup while no script can
+                        # start yet: readiness waits for its acknowledgement.
+                        for _ in range(rotations + 1):
+                            next(driver)
+                        proxy.freeze_gc_reqs_seen = 1
+                        for _ in range(rotations - 1):
+                            next(driver)
+                        with self.assertRaises(StopIteration):
+                            next(driver)
 
 
 class TestAdvanceGenerator(CustomTestCase):
