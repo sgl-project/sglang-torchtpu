@@ -739,8 +739,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             swa_pages = swa_tokens // ps
             # Both pools page in step (alloc_extend / alloc_decode drive them
-            # with one seq_lens), so a rep's peer page is the whole peer page.
-            mapping_indices = self._expand_to_full_pages(full_page_representatives)
+            # with one seq_lens), so a rep's peer page is the whole peer page:
+            # the span of one SWA page around the rep, which is the full page
+            # unless the SWA side pages finer (then a full page holds several
+            # SWA pages, and a caller may free them in separate segments).
+            mapping_indices = self._expand_to_full_pages(
+                full_page_representatives, page=ps
+            )
             if self.swa_attn_allocator.debug_mode:
                 ref = self.full_to_swa_index_mapping[mapping_indices].cpu()
                 assert torch.equal(
@@ -805,6 +810,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_swa_segment(free_index, start_pos=start_pos)
         self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
 
+    def free_swa_beyond_owned(self, row: torch.Tensor, owned_p: int, end_p: int):
+        ps = self.swa_page_size
+        if ps == self.page_size or self._swa_req_ring:
+            # One page for both sides: the full-side alignment already covers
+            # the SWA side (and a ring owns no paged SWA).
+            return
+        start_pos = ceil_div(owned_p, ps) * ps
+        if start_pos < end_p:
+            self.free_swa_segment(row[start_pos:end_p], start_pos=start_pos)
+
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
         if free_index.numel() == 0:
             return
@@ -840,20 +855,24 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
-    def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
+    def _expand_to_full_pages(
+        self, indices: torch.Tensor, page: Optional[int] = None
+    ) -> torch.Tensor:
+        """Every location of the ``page``-sized (default: full) page around each
+        index. Full locations run in page order, so an SWA page's span is the
+        same arithmetic at ``swa_page_size``."""
         # Duplicates are kept: deduplicating would be a torch.unique whose
         # data-dependent output shape synchronizes the scheduler stream, and
         # every consumer ends in the paged free's own page dedup anyway.
-        base = (indices // self.page_size) * self.page_size
-        page_offsets = torch.arange(
-            self.page_size, dtype=indices.dtype, device=indices.device
-        )
+        page = self.page_size if page is None else page
+        base = (indices // page) * page
+        page_offsets = torch.arange(page, dtype=indices.dtype, device=indices.device)
         expanded = (base[:, None] + page_offsets[None, :]).reshape(-1)
         if self.swa_attn_allocator.debug_mode:
             # Reference unique on CPU: the expansion must cover exactly the
             # touched pages, on every caller's real input.
-            got = torch.unique(expanded.cpu() // self.page_size)
-            ref = torch.unique(indices.cpu() // self.page_size)
+            got = torch.unique(expanded.cpu() // page)
+            ref = torch.unique(indices.cpu() // page)
             assert torch.equal(got, ref), "expansion page set mismatch"
         return expanded
 

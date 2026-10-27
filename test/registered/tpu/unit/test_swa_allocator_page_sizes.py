@@ -10,12 +10,19 @@ register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit")
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import swa as swa_module
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 
@@ -27,6 +34,45 @@ SWA_ROWS = 12 * PS
 
 def _t(values):
     return torch.tensor(values, dtype=torch.int64)
+
+
+def _patch_tpu_sub_allocators(case):
+    """The composite picks the TPU sub-allocators at import and call time."""
+    for patcher in (
+        patch.object(swa_module, "_is_tpu", True),
+        patch.object(
+            swa_module,
+            "TpuPagedTokenToKVPoolAllocator",
+            TpuPagedTokenToKVPoolAllocator,
+            create=True,
+        ),
+    ):
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
+def _make_allocator(swa_page_size=PS):
+    return swa_module.SWATokenToKVPoolAllocator(
+        FULL_ROWS,
+        SWA_ROWS,
+        page_size=FULL_PS,
+        dtype=torch.bfloat16,
+        device="cpu",
+        kvcache=_FakeSwaPool(),
+        need_sort=False,
+        swa_page_size=swa_page_size,
+    )
+
+
+def _extend(alloc, prefix, seq, last_loc):
+    return alloc.alloc_extend(
+        prefix_lens=_t([prefix]),
+        prefix_lens_cpu=_t([prefix]),
+        seq_lens=_t([seq]),
+        seq_lens_cpu=_t([seq]),
+        last_loc=_t([last_loc]),
+        extend_num_tokens=seq - prefix,
+    )
 
 
 class _FakeSwaPool(BaseSWAKVPool):
@@ -51,40 +97,13 @@ class _FakeSwaPool(BaseSWAKVPool):
 
 class TestSwaPageSize(CustomTestCase):
     def setUp(self):
-        # The composite picks the TPU sub-allocators at import and call time.
-        for patcher in (
-            patch.object(swa_module, "_is_tpu", True),
-            patch.object(
-                swa_module,
-                "TpuPagedTokenToKVPoolAllocator",
-                TpuPagedTokenToKVPoolAllocator,
-                create=True,
-            ),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        _patch_tpu_sub_allocators(self)
 
     def _make(self, swa_page_size=PS):
-        return swa_module.SWATokenToKVPoolAllocator(
-            FULL_ROWS,
-            SWA_ROWS,
-            page_size=FULL_PS,
-            dtype=torch.bfloat16,
-            device="cpu",
-            kvcache=_FakeSwaPool(),
-            need_sort=False,
-            swa_page_size=swa_page_size,
-        )
+        return _make_allocator(swa_page_size)
 
     def _extend(self, alloc, prefix, seq, last_loc):
-        return alloc.alloc_extend(
-            prefix_lens=_t([prefix]),
-            prefix_lens_cpu=_t([prefix]),
-            seq_lens=_t([seq]),
-            seq_lens_cpu=_t([seq]),
-            last_loc=_t([last_loc]),
-            extend_num_tokens=seq - prefix,
-        )
+        return _extend(alloc, prefix, seq, last_loc)
 
     def _check_mapping(self, alloc, locs):
         """Every full location maps to an SWA slot whose in-page offset is the
@@ -275,6 +294,88 @@ class TestSwaPageSize(CustomTestCase):
         locs = self._extend(alloc, 0, 3 * PS, -1).to(torch.int64)
         self.assertEqual(alloc.swa_available_size(), SWA_ROWS - 2 * FULL_PS)
         self._check_mapping(alloc, locs)
+
+
+class TestReleaseAtTheSwaPage(CustomTestCase):
+    """``release_kv_cache`` on the P/D decode (chunk cache, no prefix sharing):
+    the decode allocation runs to the full page, the request finishes short of
+    it, and every SWA page past the owned rows must come back too."""
+
+    PROMPT = 6  # inside the first SWA page, received whole by the prealloc
+
+    def setUp(self):
+        _patch_tpu_sub_allocators(self)
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+
+    def _release(self, owned, allocated, alloc=None):
+        """Preallocate the prompt, extend to ``allocated`` like the first decode
+        step does (``page_aligned_decode_alloc_lens``), finish at ``owned``."""
+        alloc = _make_allocator() if alloc is None else alloc
+        pool = MagicMock(spec=ReqToTokenPool)
+        pool.req_to_token = torch.zeros((1, 2 * FULL_PS), dtype=torch.int64)
+        cache = SWAChunkCache(
+            CacheInitParams(
+                disable=True,
+                req_to_token_pool=pool,
+                token_to_kv_pool_allocator=alloc,
+                page_size=FULL_PS,
+                sliding_window_size=4 * PS,
+            )
+        )
+        prompt = self.PROMPT
+        locs = alloc.alloc_extend_swa_tail(
+            prefix_lens=_t([0]),
+            prefix_lens_cpu=_t([0]),
+            seq_lens=_t([prompt]),
+            seq_lens_cpu=_t([prompt]),
+            last_loc=_t([-1]),
+            extend_num_tokens=prompt,
+            swa_tail_len=prompt,
+        ).to(torch.int64)
+        more = _extend(alloc, prompt, allocated, int(locs[-1]))
+        self.assertIsNotNone(more, "the decode allocation found no room")
+        pool.req_to_token[0, :allocated] = torch.cat([locs, more.to(torch.int64)])
+        self.assertEqual(alloc.full_available_size(), FULL_ROWS - allocated)
+        self.assertEqual(alloc.swa_available_size(), SWA_ROWS - allocated)
+        req = SimpleNamespace(
+            rid="short",
+            origin_input_ids=list(range(prompt)),
+            output_ids=list(range(prompt, owned)),
+            finished_len=0,  # the stop landed before the last committed token
+            finished=lambda: True,
+            refresh_fill_ids=lambda: None,
+            skip_radix_cache_insert=True,
+            last_node=None,
+            owned_kv_len=lambda: owned,
+            kv=ReqKvInfo(
+                req_pool_idx=0, kv_committed_len=owned, kv_allocated_len=allocated
+            ),
+        )
+        release_kv_cache(req, cache, is_insert=False)
+        return alloc
+
+    def test_finished_request_returns_every_page_of_both_sides(self):
+        for owned, allocated in (
+            (PS - 1, FULL_PS),  # stranded: SWA page 2 of the one full page
+            (PS + 4, FULL_PS),  # nothing stranded: the owned rows reach page 2
+            (PS - 1, 2 * FULL_PS),  # stranded page 2 plus a whole full page
+            (FULL_PS, 2 * FULL_PS),  # owned ends on the full page
+        ):
+            with self.subTest(owned=owned, allocated=allocated):
+                alloc = self._release(owned, allocated)
+                self.assertEqual(alloc.full_available_size(), FULL_ROWS)
+                self.assertEqual(alloc.swa_available_size(), SWA_ROWS)
+                self.assertTrue(torch.all(alloc.full_to_swa_index_mapping[:-1] == 0))
+
+    def test_churn_of_short_requests_holds_no_swa_page(self):
+        """The N5 GSM8K load on the DCP2 decode: hundreds of requests shorter
+        than an SWA page, one after another, with the full pool never filling."""
+        alloc = _make_allocator()
+        for _ in range(3 * SWA_ROWS // PS):
+            self._release(PS - 1, FULL_PS, alloc)
+            self.assertEqual(alloc.swa_available_size(), SWA_ROWS)
 
 
 if __name__ == "__main__":
